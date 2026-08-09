@@ -1,7 +1,7 @@
 cff-version: 1.2.0
 title: "turbozero: fast + parallel AlphaZero"
 abstract: vectorized implementation of AlphaZero/MCTS with training and evaluation utilities
-url: "https://github.com/lowrollr/turbozero"
+url: "https://github.com/jcbmrshll/turbozero"
 authors:
 - family-names: "Marshall" 
   given-names: "Jacob"

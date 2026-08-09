@@ -2,7 +2,7 @@
 name = "turbozero"
 version = "0.1.1"
 description = "vectorized alphazero/mcts in JAX"
-authors = ["lowrollr <92640744+lowrollr@users.noreply.github.com>"]
+authors = ["jcbmrshll <92640744+jcbmrshll@users.noreply.github.com>"]
 license = "Apache-2.0"
 readme = "README.md"
 packages = [

@@ -1,6 +1,6 @@
 # *turbozero* 🏎️ 🏎️ 🏎️ 🏎️
 
-📣 If you're looking for the old PyTorch version of turbozero, it's been moved here: [turbozero_torch](https://github.com/lowrollr/turbozero_torch) 📣
+📣 If you're looking for the old PyTorch version of turbozero, it's been moved here: [turbozero_torch](https://github.com/jcbmrshll/turbozero_torch) 📣
 
 #### *`turbozero`* is a vectorized implementation of [AlphaZero](https://deepmind.google/discover/blog/alphazero-shedding-new-light-on-chess-shogi-and-go/) written in JAX
 
@@ -16,13 +16,13 @@ It contains:
 
 #### *`turbozero`* is *_extendable_*:
  * see an [idea on twitter](https://twitter.com/ptrschmdtnlsn/status/1748800529608888362) for a simple tweak to MCTS?
-      * [implement it](https://github.com/lowrollr/turbozero/blob/main/core/evaluators/mcts/weighted_mcts.py) then [test it](https://github.com/lowrollr/turbozero/blob/main/notebooks/weighted_mcts.ipynb) by extending core components
+      * [implement it](https://github.com/jcbmrshll/turbozero/blob/main/core/evaluators/mcts/weighted_mcts.py) then [test it](https://github.com/jcbmrshll/turbozero/blob/main/notebooks/weighted_mcts.ipynb) by extending core components
   
 #### *`turbozero`* is *_flexible_*:
  * easy to integrate with you custom JAX environment or neural network architecture.
  * Use the provided training and evaluation utilities, or pick and choose the components that you need.
 
-To get started, check out the [Hello World Notebook](https://github.com/lowrollr/turbozero/blob/main/notebooks/hello_world.ipynb)
+To get started, check out the [Hello World Notebook](https://github.com/jcbmrshll/turbozero/blob/main/notebooks/hello_world.ipynb)
 
 ## Installation
 `turbozero` uses `poetry` for dependency management, you can install it with:
@@ -53,10 +53,10 @@ poetry run python -m ipykernel install --user --name turbozero
 ```
 
 ## Issues
-If you use this project and encounter an issue, error, or undesired behavior, please submit a [GitHub Issue](https://github.com/lowrollr/turbozero/issues) and I will do my best to resolve it as soon as I can. You may also contact me directly via `hello@jacob.land`.
+If you use this project and encounter an issue, error, or undesired behavior, please submit a [GitHub Issue](https://github.com/jcbmrshll/turbozero/issues) and I will do my best to resolve it as soon as I can. You may also contact me directly via `hello@jacob.land`.
 
 ## Contributing 
-Contributions, improvements, and fixes are more than welcome! For now I don't have a formal process for this, other than creating a [Pull Request](https://github.com/lowrollr/turbozero/pulls). For large changes, consider creating an [Issue](https://github.com/lowrollr/turbozero/issues) beforehand.
+Contributions, improvements, and fixes are more than welcome! For now I don't have a formal process for this, other than creating a [Pull Request](https://github.com/jcbmrshll/turbozero/pulls). For large changes, consider creating an [Issue](https://github.com/jcbmrshll/turbozero/issues) beforehand.
 
 If you are interested in contributing but don't know what to work on, please reach out. I have plenty of things you could do.
 
@@ -80,6 +80,6 @@ If you found this work useful, please cite it with:
 @software{turbozero,
   author = {Marshall, Jacob},
   title = {{turbozero: fast + parallel AlphaZero}},
-  url = {https://github.com/lowrollr/turbozero}
+  url = {https://github.com/jcbmrshll/turbozero}
 }
 ```
