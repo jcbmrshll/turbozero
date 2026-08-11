@@ -102,6 +102,30 @@ def step_env_and_evaluator(
     output = output.replace(eval_state=eval_state)
     return output, env_state, env_state_metadata, terminated, truncated, rewards
 
+@dataclass(frozen=True)
+class SinglePlayerGameState:
+    """Stores the state of a single-player game for two evaluators playing independently.
+    - `key`: rng
+    - `env_state`: The initial environment state.
+    - `env_state_metadata`: Metadata associated with the initial environment state.
+    - `eval_state_1`: The internal state of the first evaluator.
+    - `eval_state_2`: The internal state of the second evaluator.
+    - `completed_1`: Whether the first evaluator's game is completed.
+    - `completed_2`: Whether the second evaluator's game is completed.
+    - `outcome_1`: The final reward of the first evaluator.
+    - `outcome_2`: The final reward of the second evaluator.
+    """
+    key: jax.random.PRNGKey
+    env_state_1: chex.ArrayTree
+    env_state_2: chex.ArrayTree
+    env_state_metadata_1: StepMetadata
+    env_state_metadata_2: StepMetadata
+    eval_state_1: chex.ArrayTree
+    eval_state_2: chex.ArrayTree
+    completed_1: bool
+    completed_2: bool
+    outcome_1: float
+    outcome_2: float
 
 @dataclass(frozen=True)
 class TwoPlayerGameState:
@@ -141,6 +165,136 @@ class GameFrame:
     p2_value_estimate: chex.Array
     completed: chex.Array
     outcomes: chex.Array
+
+def single_player_play(
+    key: jax.random.PRNGKey,
+    env_state: chex.ArrayTree,
+    env_state_metadata: StepMetadata,
+    eval_state: chex.ArrayTree,
+    evaluator: Evaluator,
+    params: chex.ArrayTree,
+    env_step_fn: EnvStepFn,
+    max_steps: int
+) -> Tuple[chex.ArrayTree, StepMetadata, chex.ArrayTree, bool, float]:
+    """
+    Executes a single player game until completion.
+    
+    Args:
+    - `key`: RNG.
+    - `env_state`: Initial environment state.
+    - `env_state_metadata`: Metadata for the environment state.
+    - `eval_state`: Evaluator's internal state.
+    - `evaluator`: Evaluator to step through the environment.
+    - `params`: Evaluator's parameters.
+    - `env_step_fn`: Function to step the environment.
+    - `max_steps`: Maximum steps to take.
+
+    Returns:
+    - `env_state`: Final environment state.
+    - `env_state_metadata`: Final metadata.
+    - `eval_state`: Final evaluator state.
+    - `completed`: Whether the episode is completed.
+    - `outcome`: The total reward for the game.
+    """
+    def step_fn(carry, _):
+        env_state, env_metadata, eval_state, key = carry
+        step_key, key = jax.random.split(key)
+
+        # Evaluate and take action
+        output = evaluator.evaluate(
+            key=step_key,
+            eval_state=eval_state,
+            env_state=env_state,
+            root_metadata=env_metadata,
+            params=params,
+            env_step_fn=env_step_fn
+        )
+        next_env_state, next_env_metadata = env_step_fn(env_state, output.action)
+        terminated = next_env_metadata.terminated
+        truncated = next_env_metadata.step > max_steps
+        completed = terminated | truncated
+        rewards = next_env_metadata.rewards
+        eval_state = jax.lax.cond(
+            completed,
+            lambda _: eval_state,
+            lambda _: evaluator.step(eval_state, output.action),
+            None
+        )
+        return (next_env_state, next_env_metadata, eval_state, step_key), (completed, rewards)
+
+    # Scan through the steps
+    (env_state, final_metadata, final_eval_state, _), (completed, rewards) = jax.lax.scan(
+        step_fn,
+        (env_state, env_state_metadata, eval_state, key),
+        xs=None,
+        length=max_steps
+    )
+
+    # Determine the outcome
+    final_outcome = jnp.where(completed, rewards.flatten(), 0.0)
+    final_completed = jnp.any(completed)
+    return env_state, final_metadata, final_eval_state, final_completed, final_outcome
+
+def single_player_game(
+    key: jax.random.PRNGKey,
+    evaluator_1: Evaluator,
+    evaluator_2: Evaluator,
+    params_1: chex.ArrayTree,
+    params_2: chex.ArrayTree,
+    env_step_fn: EnvStepFn,
+    env_init_fn: EnvInitFn,
+    max_steps: int
+) -> Tuple[chex.Array, SinglePlayerGameState, chex.Array]:
+    """
+    Simulates a single-player game for two evaluators playing independently.
+
+    Args:
+    - `key`: RNG.
+    - `evaluator_1`: The first evaluator.
+    - `evaluator_2`: The second evaluator.
+    - `params_1`: Parameters for the first evaluator.
+    - `params_2`: Parameters for the second evaluator.
+    - `env_step_fn`: The environment step function.
+    - `env_init_fn`: The environment initialization function.
+    - `max_steps`: Maximum number of steps.
+
+    Returns:
+    - (chex.Array): A tuple of final outcomes for both evaluators.
+    - (SinglePlayerGameState): The final state of the single-player game.
+    """
+    # Initialize RNG
+    init_key, key_1, key_2 = jax.random.split(key, 3)
+
+    # Initialize environment and evaluators
+    env_state, metadata = env_init_fn(init_key)
+    eval_state_1 = evaluator_1.init(template_embedding=env_state)
+    eval_state_2 = evaluator_2.init(template_embedding=env_state)
+
+    # No compilation as function is called only once
+    # Evaluate the game for both evaluators independently
+    env_state_1, metadata_1, eval_state_1, completed_1, outcome_1 = single_player_play(
+        key_1, env_state, metadata, eval_state_1, evaluator_1, params_1, env_step_fn, max_steps
+    )
+    env_state_2, metadata_2, eval_state_2, completed_2, outcome_2 = single_player_play(
+        key_2, env_state, metadata, eval_state_2, evaluator_2, params_2, env_step_fn, max_steps
+    )
+
+    # Create the final game state
+    game_state = SinglePlayerGameState(
+        key=key,
+        env_state_1=env_state_1,
+        env_state_2=env_state_2,
+        env_state_metadata_1=metadata_1,
+        env_state_metadata_2=metadata_2,
+        eval_state_1=eval_state_1,
+        eval_state_2=eval_state_2,
+        completed_1=completed_1,
+        completed_2=completed_2,
+        outcome_1=outcome_1,
+        outcome_2=outcome_2
+    )
+
+    return jnp.array([outcome_1, outcome_2]), game_state, jnp.array([0, 1])
 
 
 def two_player_game_step(
