@@ -1,18 +1,18 @@
 
 from typing import Dict
 
-import chex
+import jax
 import jax.numpy as jnp
 
 from core.evaluators.mcts.state import MCTSTree
 
 
 def normalize_q_values(
-    q_values: chex.Array, 
-    child_n_values: chex.Array, 
+    q_values: jax.Array, 
+    child_n_values: jax.Array, 
     parent_q_value: float,
     epsilon: float
-) -> chex.Array:
+) -> jax.Array:
     """Normalize Q-values to be in the range [0, 1].
     
     Args:
@@ -22,7 +22,7 @@ def normalize_q_values(
     - `epsilon`: small value to avoid division by zero
 
     Returns:
-    - (chex.Array): normalized Q-values
+    - (jax.Array): normalized Q-values
     """
     min_value = jnp.minimum(parent_q_value, jnp.min(q_values, axis=-1))
     max_value = jnp.maximum(parent_q_value, jnp.max(q_values, axis=-1))
