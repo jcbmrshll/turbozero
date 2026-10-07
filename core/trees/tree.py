@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
@@ -13,12 +12,13 @@ from jax.typing import ArrayLike
 @dataclass(frozen=True)
 class Tree[NodeType]:
     """A generic DAG tree data structure that holds arbitrary structured data within nodes."""
+
     # N -> max nodes
     # F -> branching Factor
-    next_free_idx: jax.Array # ()
-    parents: jax.Array # (N)
-    edge_map: jax.Array # (N, F)
-    data: NodeType # structured data with leaves of shape (N, ...)
+    next_free_idx: jax.Array  # ()
+    parents: jax.Array  # (N)
+    edge_map: jax.Array  # (N, F)
+    data: NodeType  # structured data with leaves of shape (N, ...)
 
     NULL_INDEX: ClassVar[int] = -1
     NULL_VALUE: ClassVar[int] = 0
@@ -29,12 +29,10 @@ class Tree[NodeType]:
         """The maximum number of nodes that can be stored in the tree."""
         return self.parents.shape[-1]
 
-
     @property
     def branching_factor(self) -> int:
         """The maximum number of children a node can have."""
         return self.edge_map.shape[-1]
-
 
     def data_at(self, index: ArrayLike) -> NodeType:
         """Returns a node's data at a specific index.
@@ -45,11 +43,7 @@ class Tree[NodeType]:
         Returns:
             NodeType: the data stored at the specified index.
         """
-        return jax.tree_util.tree_map(
-            lambda x: x[index],
-            self.data
-        )
-    
+        return jax.tree_util.tree_map(lambda x: x[index], self.data)
 
     def check_data_type(self, data: NodeType) -> None:
         """Checks if the data type matches the tree's data type.
@@ -57,9 +51,9 @@ class Tree[NodeType]:
         Args:
             data: the data to check.
         """
-        assert isinstance(data, type(self.data)), \
+        assert isinstance(data, type(self.data)), (
             f"data type mismatch, tree contains {type(self.data)} data, but got {type(data)} data."
-
+        )
 
     def is_edge(self, parent_index: ArrayLike, edge_index: ArrayLike) -> jax.Array:
         """Checks if an edge exists from a parent node along a specific edge.
@@ -72,8 +66,7 @@ class Tree[NodeType]:
             jax.Array: whether an edge exists from the parent node along the specified edge.
         """
         return self.edge_map[parent_index, edge_index] != self.NULL_INDEX
-    
-    
+
     def get_child_data(self, x: str, index: ArrayLike, null_value=None) -> jax.Array:
         """Returns a specified data field for all children of a node.
 
@@ -94,10 +87,13 @@ class Tree[NodeType]:
 
         return jnp.where(
             (mapping == self.NULL_INDEX).reshape((-1,) + (1,) * (child_data.ndim - 1)),
-            null_value, child_data)
-    
+            null_value,
+            child_data,
+        )
 
-    def add_node(self, parent_index: ArrayLike, edge_index: ArrayLike, data: NodeType) -> Tree[NodeType]:
+    def add_node(
+        self, parent_index: ArrayLike, edge_index: ArrayLike, data: NodeType
+    ) -> Tree[NodeType]:
         """Adds a new node to the tree at the next free index, if the tree has capacity left.
 
         Is a no-op if the tree is full.
@@ -111,7 +107,7 @@ class Tree[NodeType]:
             Tree[NodeType]: tree with the new node added.
         """
         # check types
-        self.check_data_type(data) 
+        self.check_data_type(data)
         # if the tree is full, tree.next_free_idx will be out of bounds
         in_bounds = self.next_free_idx < self.capacity
         # updating data at this index will be a no-op
@@ -122,15 +118,17 @@ class Tree[NodeType]:
         # so we set it to NULL_INDEX instead when the tree is full
         edge_map_index = jnp.where(in_bounds, self.next_free_idx, self.NULL_INDEX)
         # ...
-        return replace(self,
-            next_free_idx=jnp.where(in_bounds, self.next_free_idx + 1, self.next_free_idx),
+        return replace(
+            self,
+            next_free_idx=jnp.where(
+                in_bounds, self.next_free_idx + 1, self.next_free_idx
+            ),
             parents=self.parents.at[self.next_free_idx].set(parent_index),
             edge_map=self.edge_map.at[parent_index, edge_index].set(edge_map_index),
             data=jax.tree.map(
-                lambda x, y: x.at[self.next_free_idx].set(y),
-                self.data, data)
+                lambda x, y: x.at[self.next_free_idx].set(y), self.data, data
+            ),
         )
-    
 
     def set_root(self, data: NodeType) -> Tree[NodeType]:
         """Sets node data at the root node.
@@ -143,12 +141,13 @@ class Tree[NodeType]:
         """
         self.check_data_type(data)
 
-        return replace(self,
+        return replace(
+            self,
             next_free_idx=jnp.maximum(self.next_free_idx, 1),
             data=jax.tree.map(
-                lambda x, y: x.at[self.ROOT_INDEX].set(y),
-                self.data, data))
-    
+                lambda x, y: x.at[self.ROOT_INDEX].set(y), self.data, data
+            ),
+        )
 
     def update_node(self, index: ArrayLike, data: NodeType) -> Tree[NodeType]:
         """Updates the data of a node at a specific index.
@@ -160,13 +159,16 @@ class Tree[NodeType]:
         Returns:
             Tree[NodeType]: tree with the node data updated.
         """
-        return replace(self,
+        return replace(
+            self,
             data=jax.tree_util.tree_map(
-                lambda x, y: x.at[index].set(y),
-                self.data, data))
-    
-    
-    def _get_translation(self, child_index: ArrayLike) -> tuple[jax.Array, jax.Array, jax.Array]:
+                lambda x, y: x.at[index].set(y), self.data, data
+            ),
+        )
+
+    def _get_translation(
+        self, child_index: ArrayLike
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """Extracts mapping of node_idxs in a particular root subtree (with root at `child_index`) to collapsed indices.
 
         Args:
@@ -184,18 +186,14 @@ class Tree[NodeType]:
         def propagate(_, subtrees):
             # propagates parent subtrees to children
             parents_subtrees = jnp.where(
-                self.parents != self.NULL_INDEX,
-                subtrees[self.parents],
-                0
+                self.parents != self.NULL_INDEX, subtrees[self.parents], 0
             )
             return jnp.where(
-                jnp.greater(parents_subtrees, 0),
-                parents_subtrees,
-                subtrees
+                jnp.greater(parents_subtrees, 0), parents_subtrees, subtrees
             )
 
         # propagate parent subtrees to children, until all nodes are assigned to one of the root subtrees
-        subtrees = jax.lax.fori_loop(0, self.capacity-1, propagate, subtrees)
+        subtrees = jax.lax.fori_loop(0, self.capacity - 1, propagate, subtrees)
 
         # get idx of subtree
         subtree_idx = self.edge_map[self.ROOT_INDEX, child_index]
@@ -207,15 +205,12 @@ class Tree[NodeType]:
         cumsum = jnp.cumsum(nodes_to_retain)
         new_next_node_index = cumsum[-1]
         translation = jnp.where(
-            nodes_to_retain,
-            nodes_to_retain * (cumsum-1),
-            self.NULL_INDEX
+            nodes_to_retain, nodes_to_retain * (cumsum - 1), self.NULL_INDEX
         )
         # get indices of nodes that will be erased
         erase_idxs = slots_aranged >= new_next_node_index
 
         return old_subtree_idxs, translation, erase_idxs
-    
 
     def get_subtree(self, subtree_index: ArrayLike) -> Tree[NodeType]:
         """Extracts a subtree rooted at a specific node index.
@@ -252,34 +247,41 @@ class Tree[NodeType]:
                 # in this case we need to explicitly check for index
                 # mappings to UNVISITED, since otherwise thsese will
                 # map to the value of the last index of the translation
-                x.at[translation].set(jnp.where(
-                    x == null_value,
-                    jnp.full_like(x, null_value, dtype=x.dtype),
-                    translation[x])))
+                x.at[translation].set(
+                    jnp.where(
+                        x == null_value,
+                        jnp.full_like(x, null_value, dtype=x.dtype),
+                        translation[x],
+                    )
+                ),
+            )
 
         def translate_pytree(x, null_value=self.NULL_VALUE):
-            return jax.tree.map(
-                lambda t: translate(t, null_value=null_value), x)
-        
+            return jax.tree.map(lambda t: translate(t, null_value=null_value), x)
+
         # extract subtree using translation functions
-        return replace(self,
+        return replace(
+            self,
             next_free_idx=new_next_node_index,
             parents=translate_idx(self.parents),
             edge_map=translate_idx(self.edge_map),
-            data=translate_pytree(self.data)
+            data=translate_pytree(self.data),
         )
-
 
     def reset(self) -> Tree[NodeType]:
         """Resets the tree to its initial state."""
-        return replace(self,
+        return replace(
+            self,
             next_free_idx=0,
             parents=jnp.full_like(self.parents, self.NULL_INDEX),
             edge_map=jnp.full_like(self.edge_map, self.NULL_INDEX),
-            data=jax.tree.map(jnp.zeros_like, self.data))
-    
+            data=jax.tree.map(jnp.zeros_like, self.data),
+        )
 
-def init_tree[NodeType](max_nodes: int, branching_factor: int, template_data: NodeType) -> Tree[NodeType]:
+
+def init_tree[NodeType](
+    max_nodes: int, branching_factor: int, template_data: NodeType
+) -> Tree[NodeType]:
     """Initializes a new Tree.
 
     Args:
@@ -293,8 +295,12 @@ def init_tree[NodeType](max_nodes: int, branching_factor: int, template_data: No
     return Tree(
         next_free_idx=jnp.array(0, dtype=jnp.int32),
         parents=jnp.full((max_nodes,), fill_value=Tree.NULL_INDEX, dtype=jnp.int32),
-        edge_map=jnp.full((max_nodes, branching_factor), fill_value=Tree.NULL_INDEX, dtype=jnp.int32),
+        edge_map=jnp.full(
+            (max_nodes, branching_factor), fill_value=Tree.NULL_INDEX, dtype=jnp.int32
+        ),
         data=jax.tree_util.tree_map(
             # template leaves can be python scalars (e.g. `turn` in pgx's othello state)
             lambda x: jnp.zeros((max_nodes, *jnp.shape(x)), dtype=jnp.result_type(x)),
-            template_data))
+            template_data,
+        ),
+    )

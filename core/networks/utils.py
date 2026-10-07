@@ -5,13 +5,11 @@ import jax
 
 # name of the vmapped axis networks are applied over;
 # layers that compute statistics across the batch (e.g. eqx.nn.BatchNorm) should use it as their `axis_name`
-BATCH_AXIS = 'batch'
+BATCH_AXIS = "batch"
 
 
 def apply_nn(
-    nn: Callable,
-    nn_state: eqx.nn.State | None,
-    x: jax.Array
+    nn: Callable, nn_state: eqx.nn.State | None, x: jax.Array
 ) -> tuple[tuple[jax.Array, jax.Array], eqx.nn.State | None]:
     """Applies a neural network to a batch of inputs.
 
@@ -31,4 +29,6 @@ def apply_nn(
     """
     if nn_state is None:
         return jax.vmap(nn)(x), None
-    return jax.vmap(nn, axis_name=BATCH_AXIS, in_axes=(0, None), out_axes=(0, None))(x, nn_state)
+    return jax.vmap(nn, axis_name=BATCH_AXIS, in_axes=(0, None), out_axes=(0, None))(
+        x, nn_state
+    )

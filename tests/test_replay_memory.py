@@ -58,7 +58,10 @@ def test_assign_rewards_wraps_around_mid_episode():
     state = buffer.assign_rewards(state, jnp.array([-1.0, 1.0]))
 
     assert state.episode_start_idx == 2
-    np.testing.assert_array_equal(state.buffer.reward, [[-1.0, 1.0], [-1.0, 1.0], [1.0, -1.0], [-1.0, 1.0], [-1.0, 1.0]])
+    np.testing.assert_array_equal(
+        state.buffer.reward,
+        [[-1.0, 1.0], [-1.0, 1.0], [1.0, -1.0], [-1.0, 1.0], [-1.0, 1.0]],
+    )
 
 
 def test_truncate_wraps_around_mid_episode():
@@ -85,10 +88,14 @@ def test_sample_only_returns_finished_populated_entries():
     # two environments, as the trainer stores them (devices, batch, capacity, ...)
     states = [init_single(buffer), init_single(buffer)]
     # env 0: a finished episode (1, 2), then an episode in progress (3)
-    states[0] = buffer.assign_rewards(add(buffer, states[0], [1, 2]), jnp.array([1.0, -1.0]))
+    states[0] = buffer.assign_rewards(
+        add(buffer, states[0], [1, 2]), jnp.array([1.0, -1.0])
+    )
     states[0] = add(buffer, states[0], [3])
     # env 1: a finished episode (4), then a truncated one (5, 6)
-    states[1] = buffer.assign_rewards(add(buffer, states[1], [4]), jnp.array([-1.0, 1.0]))
+    states[1] = buffer.assign_rewards(
+        add(buffer, states[1], [4]), jnp.array([-1.0, 1.0])
+    )
     states[1] = buffer.truncate(add(buffer, states[1], [5, 6]))
     state = jax.tree.map(lambda *x: jnp.stack(x)[None], *states)
 

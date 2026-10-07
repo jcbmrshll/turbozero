@@ -28,4 +28,5 @@ jobs:
       # CPU build of jax, as above: pyright only needs the packages installed to resolve types
       - run: uv sync --locked
       - run: uv run ruff check .
+      - run: uv run ruff format --check .
       - run: uv run pyright

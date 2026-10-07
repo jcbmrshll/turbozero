@@ -43,10 +43,12 @@ class CollectionState:
         buffer_state: state of the replay buffer
         metadata: metadata of the current environment state
     """
+
     eval_state: Any
     env_state: Any
     buffer_state: ReplayBufferState
     metadata: StepMetadata
+
 
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
@@ -61,6 +63,7 @@ class TrainLoopOutput:
         test_states: states of testers
         cur_epoch: current epoch num
     """
+
     collection_state: CollectionState
     train_state: TrainState
     test_states: list[TestState]
@@ -89,7 +92,11 @@ def checkpoint_epochs(ckpt_dir: str) -> list[int]:
     """Epochs with a checkpoint in `ckpt_dir`, in ascending order."""
     if not os.path.isdir(ckpt_dir):
         return []
-    return sorted(int(m.group(1)) for f in os.listdir(ckpt_dir) if (m := re.fullmatch(r"(\d+)\.eqx", f)))
+    return sorted(
+        int(m.group(1))
+        for f in os.listdir(ckpt_dir)
+        if (m := re.fullmatch(r"(\d+)\.eqx", f))
+    )
 
 
 class Trainer:
@@ -98,7 +105,8 @@ class Trainer:
     Maintains state across self-play game collection, training, and testing.
     """
 
-    def __init__(self,
+    def __init__(
+        self,
         batch_size: int,
         train_batch_size: int,
         warmup_steps: int,
@@ -107,7 +115,7 @@ class Trainer:
         nn: eqx.Module,
         loss_fn: LossFn,
         optimizer: optax.GradientTransformation,
-        evaluator: Evaluator,        
+        evaluator: Evaluator,
         memory_buffer: EpisodeReplayBuffer,
         max_episode_steps: int,
         env_step_fn: EnvStepFn,
@@ -123,7 +131,7 @@ class Trainer:
         max_checkpoints: int = 2,
         num_devices: int | None = None,
         wandb_run: Any | None = None,
-        extra_wandb_config: dict | None = None
+        extra_wandb_config: dict | None = None,
     ):
         """Initializes a Trainer.
 
@@ -156,9 +164,11 @@ class Trainer:
             wandb_run: (optional) wandb run object, will continue logging to this run if passed, else a new run is initialized
             extra_wandb_config: (optional) extra config to pass to wandb
         """
-        self.num_devices = num_devices if num_devices is not None else jax.local_device_count()
+        self.num_devices = (
+            num_devices if num_devices is not None else jax.local_device_count()
+        )
         # the devices pmap maps over, used to split host-side minibatches across them
-        self.mesh = Mesh(jax.devices()[:self.num_devices], ('d',))
+        self.mesh = Mesh(jax.devices()[: self.num_devices], ("d",))
         # environment
         self.env_step_fn = env_step_fn
         self.env_init_fn = env_init_fn
@@ -179,23 +189,27 @@ class Trainer:
         self.memory_buffer = memory_buffer
         self.evaluator_train = evaluator
         self.transform_fns = data_transform_fns
-        self.step_train = partial(step_env_and_evaluator,
+        self.step_train = partial(
+            step_env_and_evaluator,
             evaluator=self.evaluator_train,
             env_step_fn=self.env_step_fn,
             env_init_fn=self.env_init_fn,
-            max_steps=self.max_episode_steps
+            max_steps=self.max_episode_steps,
         )
         # training
         self.train_steps_per_epoch = train_steps_per_epoch
         self.train_batch_size = train_batch_size
         # testing
         self.testers = testers
-        self.evaluator_test = evaluator_test if evaluator_test is not None else evaluator
-        self.step_test = partial(step_env_and_evaluator,
+        self.evaluator_test = (
+            evaluator_test if evaluator_test is not None else evaluator
+        )
+        self.step_test = partial(
+            step_env_and_evaluator,
             evaluator=self.evaluator_test,
             env_step_fn=self.env_step_fn,
             env_init_fn=self.env_init_fn,
-            max_steps=self.max_episode_steps
+            max_steps=self.max_episode_steps,
         )
         # checkpoints
         self.ckpt_dir = ckpt_dir
@@ -214,7 +228,6 @@ class Trainer:
         # check batch sizes, etc. are compatible with number of devices
         self.check_size_compatibilities()
 
-
     def init_wandb(self, project_name: str, extra_wandb_config: dict | None):
         """Initializes wandb run.
 
@@ -226,12 +239,10 @@ class Trainer:
             wandb.Run: wandb run
         """
         if extra_wandb_config is None:
-            extra_wandb_config = {} 
+            extra_wandb_config = {}
         return wandb.init(
-            project=project_name,
-            config={**self.get_config(), **extra_wandb_config}
+            project=project_name, config={**self.get_config(), **extra_wandb_config}
         )
-    
 
     def check_size_compatibilities(self):
         """Checks if batch sizes, etc. are compatible with number of devices.
@@ -242,22 +253,24 @@ class Trainer:
         err_fmt = "Batch size must be divisible by the number of devices. Got {b} batch size and {d} devices."
         # check train batch size
         if self.train_batch_size % self.num_devices != 0:
-            raise ValueError(err_fmt.format(b=self.train_batch_size, d=self.num_devices))
+            raise ValueError(
+                err_fmt.format(b=self.train_batch_size, d=self.num_devices)
+            )
         # check collection batch size
         if self.batch_size % self.num_devices != 0:
             raise ValueError(err_fmt.format(b=self.batch_size, d=self.num_devices))
-        # check testers 
+        # check testers
         for tester in self.testers:
             tester.check_size_compatibilities(self.num_devices)
-
 
     def replicate(self, data: Any) -> Any:
         """Places a copy of each array in a data structure on every device, along a new first axis."""
         return jax.device_put(
-            jax.tree.map(lambda x: jnp.broadcast_to(x, (self.num_devices, *jnp.shape(x))), data),
-            NamedSharding(self.mesh, PartitionSpec('d'))
+            jax.tree.map(
+                lambda x: jnp.broadcast_to(x, (self.num_devices, *jnp.shape(x))), data
+            ),
+            NamedSharding(self.mesh, PartitionSpec("d")),
         )
-
 
     def init_train_state(self) -> TrainState:
         """Initializes the training state (params, optimizer, etc.) from `nn` and `nn_state`.
@@ -272,32 +285,28 @@ class Trainer:
             params=params,
             nn_state=self.nn_state,
             opt_state=self.optimizer.init(params),
-            step=jnp.array(0, dtype=jnp.int32)
+            step=jnp.array(0, dtype=jnp.int32),
         )
 
-        
     def get_config(self):
         """Returns a dictionary of the configuration of the trainer. Used for logging/wand."""
         return {
-            'batch_size': self.batch_size,
-            'train_batch_size': self.train_batch_size,
-            'warmup_steps': self.warmup_steps,
-            'collection_steps_per_epoch': self.collection_steps_per_epoch,
-            'train_steps_per_epoch': self.train_steps_per_epoch,
-            'num_devices': self.num_devices,
-            'evaluator_train': self.evaluator_train.__class__.__name__,
-            'evaluator_train_config': self.evaluator_train.get_config(),
-            'evaluator_test': self.evaluator_test.__class__.__name__,
-            'evaluator_test_config': self.evaluator_test.get_config(),
-            'memory_buffer': self.memory_buffer.__class__.__name__,
-            'memory_buffer_config': self.memory_buffer.get_config(),
+            "batch_size": self.batch_size,
+            "train_batch_size": self.train_batch_size,
+            "warmup_steps": self.warmup_steps,
+            "collection_steps_per_epoch": self.collection_steps_per_epoch,
+            "train_steps_per_epoch": self.train_steps_per_epoch,
+            "num_devices": self.num_devices,
+            "evaluator_train": self.evaluator_train.__class__.__name__,
+            "evaluator_train_config": self.evaluator_train.get_config(),
+            "evaluator_test": self.evaluator_test.__class__.__name__,
+            "evaluator_test_config": self.evaluator_test.get_config(),
+            "memory_buffer": self.memory_buffer.__class__.__name__,
+            "memory_buffer_config": self.memory_buffer.get_config(),
         }
-    
-    
-    def collect(self,
-        key: jax.Array,
-        state: CollectionState,
-        params: Any
+
+    def collect(
+        self, key: jax.Array, state: CollectionState, params: Any
     ) -> CollectionState:
         """Collects self-play data for a single step.
 
@@ -313,72 +322,66 @@ class Trainer:
             CollectionState: updated collection state
         """
         # step environment and evaluator
-        eval_output, new_env_state, new_metadata, terminated, truncated, rewards = \
+        eval_output, new_env_state, new_metadata, terminated, truncated, rewards = (
             self.step_train(
-                key = key,
-                env_state = state.env_state,
-                env_state_metadata = state.metadata,
-                eval_state = state.eval_state,
-                params = params
+                key=key,
+                env_state=state.env_state,
+                env_state_metadata=state.metadata,
+                eval_state=state.eval_state,
+                params=params,
             )
-        
+        )
+
         # store experience in replay buffer
         buffer_state = self.memory_buffer.add_experience(
-            state = state.buffer_state,
-            experience = BaseExperience(
+            state=state.buffer_state,
+            experience=BaseExperience(
                 observation_nn=self.state_to_nn_input_fn(state.env_state),
                 policy_mask=state.metadata.action_mask,
                 policy_weights=eval_output.policy_weights,
                 reward=jnp.empty_like(state.metadata.rewards),
-                cur_player_id=state.metadata.cur_player_id
-            )
+                cur_player_id=state.metadata.cur_player_id,
+            ),
         )
-        # apply transforms 
+        # apply transforms
         for transform_fn in self.transform_fns:
             t_policy_mask, t_policy_weights, t_env_state = transform_fn(
-                state.metadata.action_mask,
-                eval_output.policy_weights,
-                state.env_state
+                state.metadata.action_mask, eval_output.policy_weights, state.env_state
             )
             buffer_state = self.memory_buffer.add_experience(
-                state = buffer_state,
-                experience = BaseExperience(
+                state=buffer_state,
+                experience=BaseExperience(
                     observation_nn=self.state_to_nn_input_fn(t_env_state),
                     policy_mask=t_policy_mask,
                     policy_weights=t_policy_weights,
                     reward=jnp.empty_like(state.metadata.rewards),
-                    cur_player_id=state.metadata.cur_player_id
-                )
+                    cur_player_id=state.metadata.cur_player_id,
+                ),
             )
         # assign rewards to buffer if episode is terminated
         buffer_state = jax.lax.cond(
             terminated,
             lambda s: self.memory_buffer.assign_rewards(s, rewards),
             lambda s: s,
-            buffer_state
+            buffer_state,
         )
         # discard the episode's experiences if it hit the step limit without terminating
         # (`truncated` is never set together with `terminated`)
         buffer_state = jax.lax.cond(
-            truncated,
-            self.memory_buffer.truncate,
-            lambda s: s,
-            buffer_state
+            truncated, self.memory_buffer.truncate, lambda s: s, buffer_state
         )
         # return new collection state
-        return replace(state,
+        return replace(
+            state,
             eval_state=eval_output.eval_state,
             env_state=new_env_state,
             buffer_state=buffer_state,
-            metadata=new_metadata
+            metadata=new_metadata,
         )
 
-    @partial(jax.pmap, axis_name='d', static_broadcasted_argnums=(0, 4))
-    def collect_steps(self,
-        key: jax.Array,
-        state: CollectionState,
-        params: Any,
-        num_steps: int
+    @partial(jax.pmap, axis_name="d", static_broadcasted_argnums=(0, 4))
+    def collect_steps(
+        self, key: jax.Array, state: CollectionState, params: Any, num_steps: int
     ) -> CollectionState:
         """Collects self-play data for `num_steps` steps. Mapped across devices.
 
@@ -395,15 +398,14 @@ class Trainer:
             collect = partial(self.collect, params=params)
             keys = jax.random.split(key, num_steps)
             return jax.lax.fori_loop(
-                0, num_steps, 
-                lambda i, s: collect(keys[i], s), 
-                state
+                0, num_steps, lambda i, s: collect(keys[i], s), state
             )
         return state
-    
 
-    @partial(jax.pmap, axis_name='d', static_broadcasted_argnums=(0,))
-    def one_train_step(self, ts: TrainState, batch: BaseExperience) -> tuple[TrainState, dict]:
+    @partial(jax.pmap, axis_name="d", static_broadcasted_argnums=(0,))
+    def one_train_step(
+        self, ts: TrainState, batch: BaseExperience
+    ) -> tuple[TrainState, dict]:
         """Make a single training step.
 
         Args:
@@ -418,29 +420,30 @@ class Trainer:
         grad_fn = eqx.filter_value_and_grad(self.loss_fn, has_aux=True)
         (loss, (metrics, nn_state)), grads = grad_fn(nn, ts.nn_state, batch)
         # apply gradients
-        grads = jax.lax.pmean(grads, axis_name='d')
+        grads = jax.lax.pmean(grads, axis_name="d")
         updates, opt_state = self.optimizer.update(grads, ts.opt_state, ts.params)
         # average nn state (e.g. batchnorm stats) across devices, leaving counters etc. as they are
-        nn_state = jax.tree.map(lambda x: jax.lax.pmean(x, axis_name='d') if eqx.is_inexact_array(x) else x, nn_state)
-        ts = replace(ts,
+        nn_state = jax.tree.map(
+            lambda x: jax.lax.pmean(x, axis_name="d") if eqx.is_inexact_array(x) else x,
+            nn_state,
+        )
+        ts = replace(
+            ts,
             params=optax.apply_updates(ts.params, updates),
             nn_state=nn_state,
             opt_state=opt_state,
-            step=ts.step + 1
+            step=ts.step + 1,
         )
         # return updated train state and metrics
-        metrics = {
-            **metrics,
-            'loss': loss
-        }
+        metrics = {**metrics, "loss": loss}
         return ts, metrics
 
-
-    def train_steps(self,
+    def train_steps(
+        self,
         key: jax.Array,
         collection_state: CollectionState,
         train_state: TrainState,
-        num_steps: int
+        num_steps: int,
     ) -> tuple[CollectionState, TrainState, dict]:
         """Performs `num_steps` training steps.
 
@@ -458,19 +461,23 @@ class Trainer:
                 - updated training state
                 - metrics
         """
-        # get replay memory buffer 
+        # get replay memory buffer
         buffer_state = collection_state.buffer_state
-        
+
         batch_metrics = []
-        
+
         for _ in range(num_steps):
             step_key, key = jax.random.split(key)
             # sample from replay memory
-            batch = self.memory_buffer.sample(buffer_state, step_key, self.train_batch_size)
+            batch = self.memory_buffer.sample(
+                buffer_state, step_key, self.train_batch_size
+            )
             # reshape into minibatch
-            batch = jax.tree.map(lambda x: x.reshape((self.num_devices, -1, *x.shape[1:])), batch)
+            batch = jax.tree.map(
+                lambda x: x.reshape((self.num_devices, -1, *x.shape[1:])), batch
+            )
             # pmap won't reshard a committed array, so place each device's slice on that device
-            batch = jax.device_put(batch, NamedSharding(self.mesh, PartitionSpec('d')))
+            batch = jax.device_put(batch, NamedSharding(self.mesh, PartitionSpec("d")))
             # make training step
             train_state, metrics = self.one_train_step(train_state, batch)
             # append metrics from step
@@ -478,13 +485,15 @@ class Trainer:
                 batch_metrics.append(metrics)
         # take mean of metrics across all training steps
         if batch_metrics:
-            metrics = {k: jnp.stack([m[k] for m in batch_metrics]).mean() for k in batch_metrics[0]}
+            metrics = {
+                k: jnp.stack([m[k] for m in batch_metrics]).mean()
+                for k in batch_metrics[0]
+            }
         else:
             metrics = {}
         # return updated collection state, train state, and metrics
         return collection_state, train_state, metrics
-    
-    
+
     def log_metrics(self, metrics: dict, epoch: int, step: int | None = None):
         """Logs metrics to console and wandb.
 
@@ -500,7 +509,6 @@ class Trainer:
         if self.use_wandb:
             wandb.log(metrics, step)
 
-
     def save_checkpoint(self, train_state: TrainState, epoch: int) -> None:
         """Saves a checkpoint of the training state to `ckpt_dir`.
 
@@ -512,21 +520,24 @@ class Trainer:
         """
         epochs = checkpoint_epochs(self.ckpt_dir)
         if epochs and epochs[-1] >= epoch:
-            raise ValueError(f"{self.ckpt_dir} already has a checkpoint at or after epoch {epoch}, "
-                             "resume from it or use a different ckpt_dir")
+            raise ValueError(
+                f"{self.ckpt_dir} already has a checkpoint at or after epoch {epoch}, "
+                "resume from it or use a different ckpt_dir"
+            )
         # every device holds the same train state, save the first one's
         ckpt = jax.tree.map(lambda x: x[0], train_state)
         # write to a temporary file first so an interrupted save doesn't leave a partial checkpoint
         path = checkpoint_path(self.ckpt_dir, epoch)
-        with open(path + '.tmp', 'wb') as f:
+        with open(path + ".tmp", "wb") as f:
             eqx.tree_serialise_leaves(f, ckpt)
-        os.replace(path + '.tmp', path)
+        os.replace(path + ".tmp", path)
         # delete old checkpoints
-        for old_epoch in epochs[:max(0, len(epochs) + 1 - self.max_checkpoints)]:
+        for old_epoch in epochs[: max(0, len(epochs) + 1 - self.max_checkpoints)]:
             os.remove(checkpoint_path(self.ckpt_dir, old_epoch))
 
-
-    def load_train_state_from_checkpoint(self, path_to_checkpoint: str, epoch: int) -> TrainState:
+    def load_train_state_from_checkpoint(
+        self, path_to_checkpoint: str, epoch: int
+    ) -> TrainState:
         """Loads a training state from a checkpoint.
 
         Args:
@@ -537,10 +548,9 @@ class Trainer:
             TrainState: loaded training state, replicated across devices
         """
         # checkpoints hold a single copy of the train state, so they load on any number of devices
-        with open(checkpoint_path(path_to_checkpoint, epoch), 'rb') as f:
+        with open(checkpoint_path(path_to_checkpoint, epoch), "rb") as f:
             train_state = eqx.tree_deserialise_leaves(f, self.init_train_state())
         return self.replicate(train_state)
-    
 
     def make_template_env_state(self) -> Any:
         """Create a template environment state used for initializing data structures that hold environment states to the correct shape.
@@ -550,8 +560,7 @@ class Trainer:
         """
         env_state, _ = self.env_init_fn(jax.random.PRNGKey(0))
         return env_state
-    
-    
+
     def make_template_experience(self) -> BaseExperience:
         """Create a template experience used for initializing data structures that hold experiences to the correct shape.
 
@@ -564,9 +573,8 @@ class Trainer:
             policy_mask=metadata.action_mask,
             policy_weights=jnp.zeros_like(metadata.action_mask, dtype=jnp.float32),
             reward=jnp.zeros_like(metadata.rewards),
-            cur_player_id=metadata.cur_player_id
+            cur_player_id=metadata.cur_player_id,
         )
-    
 
     def init_collection_state(self, key: jax.Array, batch_size: int) -> CollectionState:
         """Initializes the collection state (see CollectionState).
@@ -587,21 +595,23 @@ class Trainer:
         env_keys = jax.random.split(env_init_key, batch_size)
         env_state, metadata = jax.vmap(self.env_init_fn)(env_keys)
         # init evaluator state
-        eval_state = self.evaluator_train.init_batched(batch_size, template_embedding=self.template_env_state)
+        eval_state = self.evaluator_train.init_batched(
+            batch_size, template_embedding=self.template_env_state
+        )
         # return collection state
         return CollectionState(
             eval_state=eval_state,
             env_state=env_state,
             buffer_state=buffer_state,
-            metadata=metadata
+            metadata=metadata,
         )
-    
 
-    def train_loop(self,
+    def train_loop(
+        self,
         seed: int,
         num_epochs: int,
         eval_every: int = 1,
-        initial_state: TrainLoopOutput | None = None
+        initial_state: TrainLoopOutput | None = None,
     ) -> TrainLoopOutput:
         """Runs the training loop for `num_epochs` epochs. Mostly configured by the Trainer's attributes.
 
@@ -633,62 +643,86 @@ class Trainer:
             cur_epoch = 0
             # initialize collection state
             init_key, key = jax.random.split(key)
-            collection_state = partition(self.init_collection_state(init_key, self.batch_size), self.num_devices)
+            collection_state = partition(
+                self.init_collection_state(init_key, self.batch_size), self.num_devices
+            )
             # initialize train state
             train_state = self.replicate(self.init_train_state())
             params = self.extract_model_params_fn(train_state)
             # initialize tester states
             tester_states = []
             for tester in self.testers:
-                state = jax.pmap(tester.init, axis_name='d')(params=params)
+                state = jax.pmap(tester.init, axis_name="d")(params=params)
                 tester_states.append(state)
-        
+
         # warmup
         # populate replay buffer with initial self-play games
         collect = jax.vmap(self.collect_steps, in_axes=(1, 1, None, None), out_axes=1)
         params = self.extract_model_params_fn(train_state)
         collect_key, key = jax.random.split(key)
-        collect_keys = partition(jax.random.split(collect_key, self.batch_size), self.num_devices)
-        collection_state = collect(collect_keys, collection_state, params, self.warmup_steps)
+        collect_keys = partition(
+            jax.random.split(collect_key, self.batch_size), self.num_devices
+        )
+        collection_state = collect(
+            collect_keys, collection_state, params, self.warmup_steps
+        )
 
         # training loop
         while cur_epoch < num_epochs:
             # collect self-play games
             collect_key, key = jax.random.split(key)
-            collect_keys = partition(jax.random.split(collect_key, self.batch_size), self.num_devices)
-            collection_state = collect(collect_keys, collection_state, params, self.collection_steps_per_epoch)
+            collect_keys = partition(
+                jax.random.split(collect_key, self.batch_size), self.num_devices
+            )
+            collection_state = collect(
+                collect_keys, collection_state, params, self.collection_steps_per_epoch
+            )
             # train
             train_key, key = jax.random.split(key)
-            collection_state, train_state, metrics = self.train_steps(train_key, collection_state, train_state, self.train_steps_per_epoch)
+            collection_state, train_state, metrics = self.train_steps(
+                train_key, collection_state, train_state, self.train_steps_per_epoch
+            )
             params = self.extract_model_params_fn(train_state)
             # log metrics
-            collection_steps = self.batch_size * (cur_epoch+1) * self.collection_steps_per_epoch
+            collection_steps = (
+                self.batch_size * (cur_epoch + 1) * self.collection_steps_per_epoch
+            )
             self.log_metrics(metrics, cur_epoch, step=collection_steps)
 
-            # test 
+            # test
             if cur_epoch % eval_every == 0:
                 for i, test_state in enumerate(tester_states):
                     run_key, key = jax.random.split(key)
                     new_test_state, metrics, rendered = self.testers[i].run(
-                        key=run_key, epoch_num=cur_epoch, max_steps=self.max_episode_steps, num_devices=self.num_devices,
-                        env_step_fn=self.env_step_fn, env_init_fn=self.env_init_fn, evaluator=self.evaluator_test,
-                        state=test_state, params=params)
-                        
+                        key=run_key,
+                        epoch_num=cur_epoch,
+                        max_steps=self.max_episode_steps,
+                        num_devices=self.num_devices,
+                        env_step_fn=self.env_step_fn,
+                        env_init_fn=self.env_init_fn,
+                        evaluator=self.evaluator_test,
+                        state=test_state,
+                        params=params,
+                    )
+
                     if metrics:
                         metrics = {k: v.mean() for k, v in metrics.items()}
                         self.log_metrics(metrics, cur_epoch, step=collection_steps)
                     if rendered and self.run is not None:
-                        self.run.log({f'{self.testers[i].name}_game': wandb.Video(rendered)}, step=collection_steps)
+                        self.run.log(
+                            {f"{self.testers[i].name}_game": wandb.Video(rendered)},
+                            step=collection_steps,
+                        )
                     tester_states[i] = new_test_state
             # save checkpoint
             self.save_checkpoint(train_state, cur_epoch)
             # next epoch
             cur_epoch += 1
-            
+
         # return state so that training can be continued!
         return TrainLoopOutput(
             collection_state=collection_state,
             train_state=train_state,
             test_states=tester_states,
-            cur_epoch=cur_epoch
+            cur_epoch=cur_epoch,
         )

@@ -2,6 +2,7 @@
 
 Every Trainer instance compiles its own self-play, training and testing functions, so the tests
 share one trainer per device count and only change settings that don't affect compilation."""
+
 import os
 import shutil
 from functools import partial
@@ -27,9 +28,14 @@ STEPS_PER_EPOCH = 10
 
 
 def make_trainer(ttt, num_devices, ckpt_dir):
-    config = AZResnetConfig(policy_head_out_size=ttt.num_actions, num_blocks=1, num_channels=4)
-    net, nn_state = eqx.nn.make_with_state(AZResnet)(config, ttt.env.observation_shape, key=jax.random.PRNGKey(0))
-    make_evaluator = partial(AlphaZero(MCTS),
+    config = AZResnetConfig(
+        policy_head_out_size=ttt.num_actions, num_blocks=1, num_channels=4
+    )
+    net, nn_state = eqx.nn.make_with_state(AZResnet)(
+        config, ttt.env.observation_shape, key=jax.random.PRNGKey(0)
+    )
+    make_evaluator = partial(
+        AlphaZero(MCTS),
         eval_fn=make_nn_eval_fn(net, ttt.state_to_nn_input),
         num_iterations=4,
         max_nodes=8,
@@ -61,17 +67,25 @@ def make_trainer(ttt, num_devices, ckpt_dir):
 
 @pytest.fixture(scope="module")
 def trainers(ttt, tmp_path_factory):
-    return {n: make_trainer(ttt, n, tmp_path_factory.mktemp(f"ckpt_{n}_devices")) for n in (1, 2)}
+    return {
+        n: make_trainer(ttt, n, tmp_path_factory.mktemp(f"ckpt_{n}_devices"))
+        for n in (1, 2)
+    }
 
 
 @pytest.fixture(scope="module")
 def trained(trainers):
     """Output of a 2-epoch run on each device count."""
-    return {n: trainer.train_loop(seed=0, num_epochs=2) for n, trainer in trainers.items()}
+    return {
+        n: trainer.train_loop(seed=0, num_epochs=2) for n, trainer in trainers.items()
+    }
 
 
 def leaves_equal(a, b):
-    return all(np.array_equal(x, y) for x, y in zip(jax.tree.leaves(a), jax.tree.leaves(b), strict=True))
+    return all(
+        np.array_equal(x, y)
+        for x, y in zip(jax.tree.leaves(a), jax.tree.leaves(b), strict=True)
+    )
 
 
 @pytest.mark.parametrize("num_devices", [1, 2])
@@ -102,7 +116,9 @@ def test_checkpoint_round_trip(trainers, trained):
 def test_checkpoint_loads_on_other_device_count(trainers, trained):
     restored = trainers[1].load_train_state_from_checkpoint(trainers[2].ckpt_dir, 1)
 
-    for x, y in zip(jax.tree.leaves(restored), jax.tree.leaves(trained[2].train_state), strict=True):
+    for x, y in zip(
+        jax.tree.leaves(restored), jax.tree.leaves(trained[2].train_state), strict=True
+    ):
         np.testing.assert_array_equal(x, y[:1])
 
 
@@ -161,8 +177,9 @@ def test_self_play_uses_latest_params(trainers, monkeypatch):
     # warmup, then one collection per epoch
     assert len(collected) == 4
     for epoch in range(1, 3):
-        assert leaves_equal(collected[epoch + 1], trained_params[epoch - 1]), \
+        assert leaves_equal(collected[epoch + 1], trained_params[epoch - 1]), (
             f"epoch {epoch} self-play did not use the params trained in epoch {epoch - 1}"
+        )
 
 
 def test_train_loop_with_tester_skipping_epochs(trainers, monkeypatch):

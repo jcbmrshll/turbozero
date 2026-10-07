@@ -14,6 +14,7 @@ from core.training.loss_fns import az_default_loss_fn
 class OutputAsParams(eqx.Module):
     """Network whose params are its output (policy logits, value) for each example in the batch,
     so gradients flow straight to the outputs. Its input is the example's index in the batch."""
+
     logits: jax.Array
     value: jax.Array
 
@@ -38,13 +39,19 @@ def experience(rewards, cur_player_id, policy_weights, policy_mask, observation=
 
 def test_masked_policy_loss_is_finite_and_ignores_illegal_logits():
     mask = jnp.array([[True, False, True], [False, True, True]])
-    batch = experience(rewards=[[1, -1], [1, -1]], cur_player_id=[0, 1],
-                       policy_weights=[[0.25, 0.0, 0.75], [0.0, 0.5, 0.5]], policy_mask=mask)
+    batch = experience(
+        rewards=[[1, -1], [1, -1]],
+        cur_player_id=[0, 1],
+        policy_weights=[[0.25, 0.0, 0.75], [0.0, 0.5, 0.5]],
+        policy_mask=mask,
+    )
     logits = jnp.array([[1.0, 50.0, -1.0], [-50.0, 0.5, 0.0]])
 
     loss_fn = partial(az_default_loss_fn, l2_reg_lambda=0.0)
     net = OutputAsParams(logits, jnp.zeros((2, 1)))
-    (loss, (metrics, _)), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(net, None, batch)
+    (loss, (metrics, _)), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(
+        net, None, batch
+    )
 
     assert jnp.isfinite(loss)
     # cross entropy against the softmax over legal actions only
@@ -57,8 +64,12 @@ def test_masked_policy_loss_is_finite_and_ignores_illegal_logits():
 
 def test_value_target_is_outcome_for_player_to_move():
     # the same game seen from each player: player 0 won
-    batch = experience(rewards=[[1, -1], [1, -1]], cur_player_id=[0, 1],
-                       policy_weights=[[0.5, 0.5]] * 2, policy_mask=[[True, True]] * 2)
+    batch = experience(
+        rewards=[[1, -1], [1, -1]],
+        cur_player_id=[0, 1],
+        policy_weights=[[0.5, 0.5]] * 2,
+        policy_mask=[[True, True]] * 2,
+    )
     logits = jnp.zeros((2, 2))
 
     def value_loss(predicted):
@@ -73,15 +84,28 @@ def test_value_target_is_outcome_for_player_to_move():
 
 def test_a_few_optimizer_steps_lower_the_loss():
     config = AZResnetConfig(policy_head_out_size=9, num_blocks=1, num_channels=4)
-    net, nn_state = eqx.nn.make_with_state(AZResnet)(config, (3, 3, 2), key=jax.random.PRNGKey(1))
+    net, nn_state = eqx.nn.make_with_state(AZResnet)(
+        config, (3, 3, 2), key=jax.random.PRNGKey(1)
+    )
     keys = jax.random.split(jax.random.PRNGKey(0), 4)
     batch_size = 16
-    observation = jax.random.bernoulli(keys[0], shape=(batch_size, 3, 3, 2)).astype(jnp.float32)
-    mask = jax.random.bernoulli(keys[1], p=0.7, shape=(batch_size, 9)).at[:, 0].set(True)
-    policy = jax.nn.softmax(jnp.where(mask, jax.random.normal(keys[2], (batch_size, 9)), -jnp.inf))
+    observation = jax.random.bernoulli(keys[0], shape=(batch_size, 3, 3, 2)).astype(
+        jnp.float32
+    )
+    mask = (
+        jax.random.bernoulli(keys[1], p=0.7, shape=(batch_size, 9)).at[:, 0].set(True)
+    )
+    policy = jax.nn.softmax(
+        jnp.where(mask, jax.random.normal(keys[2], (batch_size, 9)), -jnp.inf)
+    )
     outcome = jnp.where(jax.random.bernoulli(keys[3], shape=(batch_size,)), 1.0, -1.0)
-    batch = experience(rewards=jnp.stack([outcome, -outcome], -1), cur_player_id=jnp.arange(batch_size) % 2,
-                       policy_weights=policy, policy_mask=mask, observation=observation)
+    batch = experience(
+        rewards=jnp.stack([outcome, -outcome], -1),
+        cur_player_id=jnp.arange(batch_size) % 2,
+        policy_weights=policy,
+        policy_mask=mask,
+        observation=observation,
+    )
 
     params, static = eqx.partition(net, eqx.is_inexact_array)
     optimizer = optax.adam(1e-2)
@@ -90,7 +114,9 @@ def test_a_few_optimizer_steps_lower_the_loss():
     @jax.jit
     def train_step(params, nn_state, opt_state):
         grad_fn = eqx.filter_value_and_grad(az_default_loss_fn, has_aux=True)
-        (loss, (_, nn_state)), grads = grad_fn(eqx.combine(params, static), nn_state, batch)
+        (loss, (_, nn_state)), grads = grad_fn(
+            eqx.combine(params, static), nn_state, batch
+        )
         updates, opt_state = optimizer.update(grads, opt_state)
         return optax.apply_updates(params, updates), nn_state, opt_state, loss
 

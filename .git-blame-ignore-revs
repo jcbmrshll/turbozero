@@ -1,0 +1,6 @@
+# Commits for `git blame` to skip (bulk formatting changes, no behaviour change).
+# GitHub's blame view uses this file automatically; locally run:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+
+# Reformat repo with ruff format (default settings, line length 88)
+e2e128ecece83884536e9efb0819858179d402b1
