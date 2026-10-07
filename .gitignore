@@ -3,6 +3,8 @@ checkpoints/
 
 # outputs of training runs
 wandb/
+# pgx baseline models, downloaded by pgx.make_baseline_model
+baselines/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
