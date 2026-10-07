@@ -97,8 +97,6 @@ def test_sample_only_returns_finished_populated_entries():
         assert sorted(sample.observation_nn.tolist()) == [1, 2, 4]
 
 
-@pytest.mark.xfail(strict=True, raises=pytest.fail.Exception,
-                   reason="#11: sampling before any episode has finished silently returns unpopulated rows")
 def test_sample_before_any_episode_finished_raises():
     buffer = EpisodeReplayBuffer(capacity=4)
     state = add(buffer, init_single(buffer), [1, 2])

@@ -147,7 +147,10 @@ class EpisodeReplayBuffer:
         Perhaps there is a dimension-agnostic way to do this?
 
         Samples across all batch dimensions, not per-batch/device.
-        
+
+        Not compatible with `jax.jit`: checks on the host that at least one episode has finished,
+        so `state` must hold concrete arrays (as it does when called from `Trainer.train_steps`).
+
         Args:
         - `state`: replay buffer state
         - `key`: rng
@@ -155,11 +158,20 @@ class EpisodeReplayBuffer:
 
         Returns:
         - (BaseExperience): minibatch of size (sample_size, ...)
+
+        Raises:
+        - `ValueError`: if no episode has finished yet, so there is nothing to sample
         """
         masked_weights = jnp.logical_and(
             state.populated,
             state.has_reward
         ).reshape(-1)
+
+        if not masked_weights.any():
+            raise ValueError(
+                "Cannot sample from the replay buffer: no episodes have finished yet. "
+                "Collect more self-play steps before training (e.g. increase `warmup_steps`)."
+            )
 
         num_partitions = state.populated.shape[0]
         num_batches = state.populated.shape[1]
