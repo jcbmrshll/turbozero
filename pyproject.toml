@@ -37,4 +37,11 @@ dev = [
     # environments + pretrained baselines used by the examples (pgx's baseline models need haiku)
     "dm-haiku>=0.0.17",
     "pgx>=2.6.0",
+    "pytest>=9.1.1",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# summarise xfails/xpasses/skips at the end of the run
+addopts = "-ra"
+xfail_strict = true
