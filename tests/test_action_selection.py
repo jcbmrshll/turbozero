@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -64,8 +66,6 @@ def test_puct_with_no_visits_picks_highest_prior():
 MUZERO = MuZeroPUCTSelector()
 
 
-@pytest.mark.xfail(strict=True, raises=TypeError,
-                   reason="#7: MuZeroPUCTSelector calls q_transform with 5 arguments; normalize_q_values takes 4")
 def test_muzero_selector_runs_in_search(make_search, ttt):
     search = make_search(AlphaZero(MCTS), action_selector=MUZERO)
     state, meta = ttt.play([4, 0])
@@ -74,3 +74,38 @@ def test_muzero_selector_runs_in_search(make_search, ttt):
 
     np.testing.assert_allclose(out.policy_weights.sum(), 1.0, rtol=1e-6)
     assert meta.action_mask[out.action]
+
+
+def visited_tree(prior, root_q, child_n, child_q):
+    """Root with every child visited: `child_q` is from each child's perspective, the root's `n` is 1 + the children's."""
+    prior, child_n, child_q = (np.asarray(x) for x in (prior, child_n, child_q))
+    root = replace(MCTS.new_node(policy=jnp.asarray(prior, dtype=jnp.float32), value=0.0,
+                                 embedding=jnp.zeros(()), terminated=False),
+                   n=jnp.array(1 + child_n.sum(), dtype=jnp.int32), q=jnp.float32(root_q))
+    tree = init_tree(8, len(prior), root).set_root(root)
+    for action, (n, q) in enumerate(zip(child_n, child_q)):
+        child = replace(MCTS.new_node(policy=jnp.zeros(len(prior)), value=0.0,
+                                      embedding=jnp.zeros(()), terminated=False),
+                        n=jnp.array(n, dtype=jnp.int32), q=jnp.float32(q))
+        tree = tree.add_node(tree.ROOT_INDEX, action, child)
+    return tree
+
+
+@pytest.mark.parametrize("c1, c2, expected", [(1.25, 19652, 0), (1.25, 1.0, 3), (3.0, 19652, 3)])
+def test_muzero_selector_matches_paper_ucb_score(c1, c2, expected):
+    """MuZero pseudocode `ucb_score`, with values min-max normalized over the parent and its children."""
+    prior = np.array([0.1, 0.5, 0.15, 0.25])
+    child_n = np.array([4, 10, 1, 3])
+    child_q = np.array([-0.5, 0.2, 0.3, -0.1])
+    root_q, discount = 0.1, -1.0
+    tree = visited_tree(prior, root_q, child_n, child_q)
+
+    parent_n = 1 + child_n.sum()
+    value = discount * child_q
+    lo, hi = min(root_q, value.min()), max(root_q, value.max())
+    value_score = (value - lo) / (hi - lo)
+    pb_c = (np.log((parent_n + c2 + 1) / c2) + c1) * np.sqrt(parent_n) / (child_n + 1)
+    ucb = value_score + pb_c * prior
+    assert np.argmax(ucb) == expected
+
+    assert MuZeroPUCTSelector(c1=c1, c2=c2)(tree, tree.ROOT_INDEX, discount) == expected
