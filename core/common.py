@@ -310,7 +310,7 @@ def two_player_game(
     )
 
     # takes a turn for the active player
-    def step_step(state: TwoPlayerGameState, step_num: jax.Array) -> TwoPlayerGameState:
+    def take_turn(state: TwoPlayerGameState, step_num: jax.Array) -> TwoPlayerGameState:
         # players alternate turns, starting with the first player
         use_p1 = (step_num % 2 == 0) == p1_first
         state = jax.lax.cond(
@@ -337,7 +337,7 @@ def two_player_game(
     
     # play the game
     state, frames = jax.lax.scan(
-        step_step,
+        take_turn,
         state,
         xs=jnp.arange(max_steps)
     )
