@@ -33,7 +33,7 @@ venvPath = "."
 venv = ".venv"
 
 [tool.ruff]
-# `ruff check` uses ruff's default rule set (no select/ignore); `ruff format` is not enforced
+# `ruff check` uses ruff's default rule set (no select/ignore); `ruff format` uses its defaults (line length 88)
 
 [dependency-groups]
 dev = [

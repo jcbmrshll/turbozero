@@ -48,10 +48,12 @@ Contributions, improvements, and fixes are more than welcome! For now I don't ha
 
 If you are interested in contributing but don't know what to work on, please reach out. I have plenty of things you could do.
 
-CI runs `uv run ruff check .` and `uv run pyright` alongside the tests. To run ruff automatically on each commit, install the pre-commit hook once:
+CI runs `uv run ruff check .`, `uv run ruff format --check .` and `uv run pyright` alongside the tests. To run ruff (lint + format) automatically on each commit, install the pre-commit hooks once:
 ```
 uv run pre-commit install
 ```
+
+Bulk reformat commits are listed in `.git-blame-ignore-revs`; GitHub's blame view skips them automatically, and `git config blame.ignoreRevsFile .git-blame-ignore-revs` does the same for local `git blame`.
 
 ## References
 Papers/Repos I found helpful.
