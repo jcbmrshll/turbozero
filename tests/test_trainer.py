@@ -117,8 +117,6 @@ def test_save_checkpoint_refuses_existing_epoch(trainers, trained):
     assert leaves_equal(extract_params(restored), extract_params(out.train_state))
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError,
-                   reason="#2: self-play params are only refreshed on epochs where the testers run")
 def test_self_play_uses_latest_params(trainers, monkeypatch):
     trainer = trainers[1]
     monkeypatch.setattr(trainer, "save_checkpoint", lambda *args, **kwargs: None)

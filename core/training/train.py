@@ -633,13 +633,13 @@ class Trainer:
             # train
             train_key, key = jax.random.split(key)
             collection_state, train_state, metrics = self.train_steps(train_key, collection_state, train_state, self.train_steps_per_epoch)
+            params = self.extract_model_params_fn(train_state)
             # log metrics
             collection_steps = self.batch_size * (cur_epoch+1) * self.collection_steps_per_epoch
             self.log_metrics(metrics, cur_epoch, step=collection_steps)
 
             # test 
             if cur_epoch % eval_every == 0:
-                params = self.extract_model_params_fn(train_state)
                 for i, test_state in enumerate(tester_states):
                     run_key, key = jax.random.split(key)
                     new_test_state, metrics, rendered = self.testers[i].run(
