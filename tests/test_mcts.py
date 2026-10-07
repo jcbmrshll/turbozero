@@ -1,4 +1,5 @@
 """Behaviour of the MCTS evaluators on tic-tac-toe, using stub evaluation functions."""
+
 import equinox as eqx
 import jax
 import jax.numpy as jnp
@@ -60,11 +61,14 @@ def test_visit_counts_add_up(make_search, ttt, cls):
     assert root(out.eval_state).n == 1 + root_child_visits(out.eval_state).sum()
 
 
-@pytest.mark.parametrize("cls", [
-    pytest.param(AZ_MCTS, id="AlphaZero(MCTS)"),
-    pytest.param(AZ_WEIGHTED, id="AlphaZero(WeightedMCTS)"),
-    pytest.param(MCTS, id="MCTS"),
-])
+@pytest.mark.parametrize(
+    "cls",
+    [
+        pytest.param(AZ_MCTS, id="AlphaZero(MCTS)"),
+        pytest.param(AZ_WEIGHTED, id="AlphaZero(WeightedMCTS)"),
+        pytest.param(MCTS, id="MCTS"),
+    ],
+)
 def test_policy_weights_are_normalised_and_legal(make_search, ttt, cls):
     out, meta = run_search(make_search(cls), jax.random.PRNGKey(0), MIDGAME_MOVES, ttt)
 
@@ -73,17 +77,22 @@ def test_policy_weights_are_normalised_and_legal(make_search, ttt, cls):
     assert meta.action_mask[out.action]
 
 
-@pytest.mark.parametrize("cls", [
-    pytest.param(AZ_MCTS, id="AlphaZero(MCTS)"),
-    pytest.param(AZ_WEIGHTED, id="AlphaZero(WeightedMCTS)"),
-    pytest.param(MCTS, id="MCTS"),
-])
+@pytest.mark.parametrize(
+    "cls",
+    [
+        pytest.param(AZ_MCTS, id="AlphaZero(MCTS)"),
+        pytest.param(AZ_WEIGHTED, id="AlphaZero(WeightedMCTS)"),
+        pytest.param(MCTS, id="MCTS"),
+    ],
+)
 def test_no_root_visits_to_illegal_moves(make_search, ttt, cls):
     out, meta = run_search(make_search(cls), jax.random.PRNGKey(0), MIDGAME_MOVES, ttt)
 
     tree = out.eval_state
     np.testing.assert_array_equal(root_child_visits(tree)[~meta.action_mask], 0)
-    np.testing.assert_array_equal(tree.edge_map[tree.ROOT_INDEX][~meta.action_mask], tree.NULL_INDEX)
+    np.testing.assert_array_equal(
+        tree.edge_map[tree.ROOT_INDEX][~meta.action_mask], tree.NULL_INDEX
+    )
 
 
 @pytest.mark.parametrize("cls", ALL_SEARCHES)
@@ -107,8 +116,13 @@ TACTICS_SEARCHES = [
 @pytest.mark.parametrize("first_player", [0, 1])
 @pytest.mark.parametrize("cls", TACTICS_SEARCHES)
 def test_finds_forced_win(make_search, ttt, cls, first_player):
-    out, _ = run_search(make_search(cls), jax.random.PRNGKey(0), WIN_MOVES, ttt,
-                        key_init=ttt.first_player_keys[first_player])
+    out, _ = run_search(
+        make_search(cls),
+        jax.random.PRNGKey(0),
+        WIN_MOVES,
+        ttt,
+        key_init=ttt.first_player_keys[first_player],
+    )
 
     assert out.action == WINNING_ACTION
     # a won position is worth more than a draw to the player to move
@@ -116,13 +130,21 @@ def test_finds_forced_win(make_search, ttt, cls, first_player):
 
 
 @pytest.mark.parametrize("first_player", [0, 1])
-@pytest.mark.parametrize("cls", [
-    pytest.param(AZ_MCTS, id="AlphaZero(MCTS)"),
-    pytest.param(AZ_WEIGHTED, id="AlphaZero(WeightedMCTS)"),
-])
+@pytest.mark.parametrize(
+    "cls",
+    [
+        pytest.param(AZ_MCTS, id="AlphaZero(MCTS)"),
+        pytest.param(AZ_WEIGHTED, id="AlphaZero(WeightedMCTS)"),
+    ],
+)
 def test_blocks_forced_loss(make_search, ttt, cls, first_player):
-    out, _ = run_search(make_search(cls), jax.random.PRNGKey(0), BLOCK_MOVES, ttt,
-                        key_init=ttt.first_player_keys[first_player])
+    out, _ = run_search(
+        make_search(cls),
+        jax.random.PRNGKey(0),
+        BLOCK_MOVES,
+        ttt,
+        key_init=ttt.first_player_keys[first_player],
+    )
 
     assert out.action == BLOCKING_ACTION
 
@@ -184,7 +206,9 @@ def test_temperature_zero_picks_most_visited_move(make_search, ttt):
     state, meta = ttt.play(MIDGAME_MOVES)
     keys = jax.random.split(jax.random.PRNGKey(0), 8)
 
-    out = jax.vmap(search.evaluate, in_axes=(0, None, None, None))(keys, search.init(), state, meta)
+    out = jax.vmap(search.evaluate, in_axes=(0, None, None, None))(
+        keys, search.init(), state, meta
+    )
 
     for action, weights in zip(out.action, out.policy_weights):
         assert weights[action] == weights.max()
@@ -195,7 +219,9 @@ def test_dirichlet_noise_keeps_prior_normalised_and_masked(make_search, ttt):
     state, meta = ttt.play(MIDGAME_MOVES)
     keys = jax.random.split(jax.random.PRNGKey(0), 8)
 
-    out = jax.vmap(search.evaluate, in_axes=(0, None, None, None))(keys, search.init(), state, meta)
+    out = jax.vmap(search.evaluate, in_axes=(0, None, None, None))(
+        keys, search.init(), state, meta
+    )
 
     priors = out.eval_state.data.p[:, 0]
     np.testing.assert_allclose(priors.sum(axis=-1), 1.0, rtol=1e-6)
@@ -224,7 +250,9 @@ def fixed_logits(x):
 # module-level so each eval fn is a single object, which lets make_search reuse compiled searches
 EVAL_FNS = {
     "make_nn_eval_fn": make_nn_eval_fn(FixedLogitsNet(), lambda s: s.observation),
-    "make_nn_eval_fn_no_params_callable": make_nn_eval_fn_no_params_callable(fixed_logits, lambda s: s.observation),
+    "make_nn_eval_fn_no_params_callable": make_nn_eval_fn_no_params_callable(
+        fixed_logits, lambda s: s.observation
+    ),
 }
 
 
@@ -233,7 +261,9 @@ def masked_softmax(logits, mask):
 
 
 @pytest.mark.parametrize("eval_fn_name", EVAL_FNS)
-@pytest.mark.parametrize("cls", [pytest.param(AZ_MCTS, id="AlphaZero(MCTS)"), pytest.param(MCTS, id="MCTS")])
+@pytest.mark.parametrize(
+    "cls", [pytest.param(AZ_MCTS, id="AlphaZero(MCTS)"), pytest.param(MCTS, id="MCTS")]
+)
 def test_prior_is_softmax_of_masked_logits(make_search, ttt, cls, eval_fn_name):
     # the search runs from the initial position, where every move is legal, so plain MCTS's
     # missing root mask (#4) does not affect this test; children are masked
@@ -251,7 +281,11 @@ def test_prior_is_softmax_of_masked_logits(make_search, ttt, cls, eval_fn_name):
     for idx in range(1, num_nodes):
         node = tree.data_at(idx)
         if not node.terminated:
-            np.testing.assert_allclose(node.p, masked_softmax(LOGITS, node.embedding.legal_action_mask), atol=1e-6)
+            np.testing.assert_allclose(
+                node.p,
+                masked_softmax(LOGITS, node.embedding.legal_action_mask),
+                atol=1e-6,
+            )
 
 
 class KeyRecordingMCTS(MCTS):
@@ -278,8 +312,13 @@ class KeyRecordingMCTS(MCTS):
 
 
 def test_evaluate_gives_every_consumer_an_independent_key(ttt):
-    search = KeyRecordingMCTS(eval_fn=lambda *_: (jnp.zeros(ttt.num_actions), 0.0), action_selector=PUCTSelector(),
-                              branching_factor=ttt.num_actions, max_nodes=8, num_iterations=4)
+    search = KeyRecordingMCTS(
+        eval_fn=lambda *_: (jnp.zeros(ttt.num_actions), 0.0),
+        action_selector=PUCTSelector(),
+        branching_factor=ttt.num_actions,
+        max_nodes=8,
+        num_iterations=4,
+    )
     state, meta = ttt.play([])
     tree = search.init(template_embedding=state)
     key = jax.random.PRNGKey(0)
@@ -288,13 +327,18 @@ def test_evaluate_gives_every_consumer_an_independent_key(ttt):
     jax.effects_barrier()
 
     names = [name for name, _ in search.recorded]
-    assert sorted(names) == sorted(["update_root", "sample_root_action"] + ["iterate"] * search.num_iterations)
+    assert sorted(names) == sorted(
+        ["update_root", "sample_root_action"] + ["iterate"] * search.num_iterations
+    )
     keys = [tuple(k.tolist()) for _, k in search.recorded]
     assert tuple(np.asarray(key).tolist()) not in keys
     assert len(set(keys)) == len(keys)
     # no consumer's key is a split of another consumer's key
     # (the search used to split the action-sampling key into the iteration keys)
     for _, k in search.recorded:
-        children = {tuple(c.tolist()) for n in range(2, search.num_iterations + 1)
-                    for c in np.asarray(jax.random.split(k, n))}
+        children = {
+            tuple(c.tolist())
+            for n in range(2, search.num_iterations + 1)
+            for c in np.asarray(jax.random.split(k, n))
+        }
         assert not children & set(keys)

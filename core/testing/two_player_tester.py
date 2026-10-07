@@ -1,4 +1,3 @@
-
 from dataclasses import dataclass, replace
 from functools import partial
 from typing import Any
@@ -19,11 +18,13 @@ class TwoPlayerTestState(TestState):
     Attributes:
         best_params: best performing parameters
     """
+
     best_params: Any
 
 
 class TwoPlayerTester(BaseTester):
     """Implements a tester that evaluates an agent against the best performing parameters found so far in a two-player game."""
+
     def __init__(self, num_episodes: int, *args, **kwargs):
         """Initializes a TwoPlayerTester.
 
@@ -33,8 +34,7 @@ class TwoPlayerTester(BaseTester):
         super().__init__(*args, num_keys=num_episodes, **kwargs)
         self.num_episodes = num_episodes
 
-
-    def init(self, params: Any, **kwargs) -> TwoPlayerTestState: #pylint: disable=unused-argument
+    def init(self, params: Any, **kwargs) -> TwoPlayerTestState:  # pylint: disable=unused-argument
         """Initializes the internal state of the TwoPlayerTester.
 
         Args:
@@ -42,7 +42,6 @@ class TwoPlayerTester(BaseTester):
                 - can just be the initial parameters of the agent
         """
         return TwoPlayerTestState(best_params=params)
-    
 
     def check_size_compatibilities(self, num_devices: int) -> None:
         """Checks if tester configuration is compatible with number of devices being utilized.
@@ -51,12 +50,21 @@ class TwoPlayerTester(BaseTester):
             num_devices: number of devices
         """
         if self.num_episodes % num_devices != 0:
-            raise ValueError(f"{self.__class__.__name__}: number of episodes ({self.num_episodes}) must be divisible by number of devices ({num_devices})")
+            raise ValueError(
+                f"{self.__class__.__name__}: number of episodes ({self.num_episodes}) must be divisible by number of devices ({num_devices})"
+            )
 
-
-    @partial(jax.pmap, axis_name='d', static_broadcasted_argnums=(0, 1, 2, 3, 4))
-    def test(self, max_steps: int, env_step_fn: EnvStepFn, env_init_fn: EnvInitFn, evaluator: Evaluator,
-        keys: jax.Array, state: TwoPlayerTestState, params: Any) -> tuple[TwoPlayerTestState, dict, Any, jax.Array]:
+    @partial(jax.pmap, axis_name="d", static_broadcasted_argnums=(0, 1, 2, 3, 4))
+    def test(
+        self,
+        max_steps: int,
+        env_step_fn: EnvStepFn,
+        env_init_fn: EnvInitFn,
+        evaluator: Evaluator,
+        keys: jax.Array,
+        state: TwoPlayerTestState,
+        params: Any,
+    ) -> tuple[TwoPlayerTestState, dict, Any, jax.Array]:
         """Test the agent against the best performing parameters found so far in a two-player game.
 
         Args:
@@ -76,32 +84,31 @@ class TwoPlayerTester(BaseTester):
                 - player ids from the test (used for rendering)
         """
 
-        game_fn = partial(two_player_game,
-            evaluator_1 = evaluator,
-            evaluator_2 = evaluator,
-            params_1 = params,
-            params_2 = state.best_params,
-            env_step_fn = env_step_fn,
-            env_init_fn = env_init_fn,
-            max_steps = max_steps
+        game_fn = partial(
+            two_player_game,
+            evaluator_1=evaluator,
+            evaluator_2=evaluator,
+            params_1=params,
+            params_2=state.best_params,
+            env_step_fn=env_step_fn,
+            env_init_fn=env_init_fn,
+            max_steps=max_steps,
         )
 
         results, frames, p_ids = jax.vmap(game_fn)(keys)
         frames = jax.tree.map(lambda x: x[0], frames)
         p_ids = p_ids[0]
-        
+
         avg = results[:, 0].mean()
 
-        metrics = {
-            f"{self.name}_avg_outcome": avg
-        }
+        metrics = {f"{self.name}_avg_outcome": avg}
 
         # decide on the mean across all devices so best_params stays identical on every device
         best_params = jax.lax.cond(
-            jax.lax.pmean(avg, axis_name='d') > 0.0,
+            jax.lax.pmean(avg, axis_name="d") > 0.0,
             lambda _: params,
             lambda _: state.best_params,
-            None
+            None,
         )
 
         return replace(state, best_params=best_params), metrics, frames, p_ids

@@ -95,7 +95,11 @@ def make_rot_transform_fn(amnt: int):
         idxs = jnp.arange(64).reshape(8, 8)
         new_idxs = jnp.rot90(idxs, amnt, axes=(0, 1)).flatten()
         action_ids = action_ids.at[:64].set(new_idxs)
-        return mask[..., action_ids], policy[..., action_ids], state.replace(observation=new_obs)
+        return (
+            mask[..., action_ids],
+            policy[..., action_ids],
+            state.replace(observation=new_obs),
+        )
 
     return rot_transform_fn
 
@@ -118,8 +122,12 @@ def main():
     parser = argparse.ArgumentParser(description="AlphaZero on Othello.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--eval-every", type=int, default=5, help="epochs between test games")
-    parser.add_argument("--wandb", metavar="PROJECT", default="", help="log to this wandb project")
+    parser.add_argument(
+        "--eval-every", type=int, default=5, help="epochs between test games"
+    )
+    parser.add_argument(
+        "--wandb", metavar="PROJECT", default="", help="log to this wandb project"
+    )
     parser.add_argument(
         "--render",
         metavar="DIR",
@@ -155,15 +163,20 @@ def main():
 
     # baselines: pgx's pretrained model (others are listed at
     # https://sotets.uk/pgx/api/#pgx.BaselineModelId) and the greedy tile counter
-    pretrained = make_nn_eval_fn_no_params_callable(pgx.make_baseline_model("othello_v0"), state_to_nn_input)
+    pretrained = make_nn_eval_fn_no_params_callable(
+        pgx.make_baseline_model("othello_v0"), state_to_nn_input
+    )
     greedy = make_nn_eval_fn_no_params_callable(greedy_eval, state_to_nn_input)
 
     render_fn = None
     if args.render is not None:
         # imported here since it needs cairo (on Ubuntu: apt-get install libcairo2-dev)
         from core.testing.utils import render_pgx_2p
+
         os.makedirs(args.render, exist_ok=True)
-        render_fn = partial(render_pgx_2p, p1_label="Black", p2_label="White", duration=900)
+        render_fn = partial(
+            render_pgx_2p, p1_label="Black", p2_label="White", duration=900
+        )
 
     testers = [
         TwoPlayerBaseline(
@@ -201,7 +214,9 @@ def main():
         data_transform_fns=[make_rot_transform_fn(i) for i in range(1, 4)],
         wandb_project_name=args.wandb,
     )
-    trainer.train_loop(seed=args.seed, num_epochs=args.epochs, eval_every=args.eval_every)
+    trainer.train_loop(
+        seed=args.seed, num_epochs=args.epochs, eval_every=args.eval_every
+    )
 
 
 if __name__ == "__main__":

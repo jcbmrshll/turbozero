@@ -1,4 +1,3 @@
-
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
@@ -26,8 +25,15 @@ class BaseTester:
 
     A Tester may maintain its own internal state.
     """
-    def __init__(self, num_keys: int, epochs_per_test: int = 1, render_fn: Callable | None = None, 
-                 render_dir: str = '/tmp/turbozero/', name: str | None = None):
+
+    def __init__(
+        self,
+        num_keys: int,
+        epochs_per_test: int = 1,
+        render_fn: Callable | None = None,
+        render_dir: str = "/tmp/turbozero/",
+        name: str | None = None,
+    ):
         """Initializes a Tester.
 
         Args:
@@ -49,16 +55,13 @@ class BaseTester:
             name = self.__class__.__name__
         self.name = name
 
-
-    def init(self, *args, **kwargs) -> TestState: #pylint: disable=unused-argument
+    def init(self, *args, **kwargs) -> TestState:  # pylint: disable=unused-argument
         """Initializes the internal state of the Tester."""
         return TestState()
 
-
-    def check_size_compatibilities(self, num_devices: int) -> None: #pylint: disable=unused-argument
+    def check_size_compatibilities(self, num_devices: int) -> None:  # pylint: disable=unused-argument
         """Checks if tester configuration is compatible with number of devices being utilized."""
         return
-
 
     def split_keys(self, key: jax.Array, num_devices: int) -> jax.Array:
         """Splits keys across devices.
@@ -75,10 +78,19 @@ class BaseTester:
         keys = partition(keys, num_devices)
         return keys
 
-
-    def run(self, key: jax.Array, epoch_num: int, max_steps: int, num_devices: int, #pylint: disable=unused-argument 
-        env_step_fn: EnvStepFn, env_init_fn: EnvInitFn, evaluator: Evaluator, state: TestState,
-        params: Any, *args) -> tuple[TestState, dict, str | None]:
+    def run(
+        self,
+        key: jax.Array,
+        epoch_num: int,
+        max_steps: int,
+        num_devices: int,  # pylint: disable=unused-argument
+        env_step_fn: EnvStepFn,
+        env_init_fn: EnvInitFn,
+        evaluator: Evaluator,
+        state: TestState,
+        params: Any,
+        *args,
+    ) -> tuple[TestState, dict, str | None]:
         """Runs the test, if the current epoch is an epoch that should be tested on (i.e. `epoch_num % epochs_per_test == 0`).
 
         If a render function is provided, saves a .gif of the first episode of the test.
@@ -106,9 +118,10 @@ class BaseTester:
 
         if epoch_num % self.epochs_per_test == 0:
             # run test
-            state, metrics, frames, p_ids = self.test(max_steps, env_step_fn, \
-                                                      env_init_fn, evaluator, keys, state, params)
-            
+            state, metrics, frames, p_ids = self.test(
+                max_steps, env_step_fn, env_init_fn, evaluator, keys, state, params
+            )
+
             if self.render_fn is not None:
                 # render first episode to .gif
                 # get frames from first episode
@@ -116,18 +129,30 @@ class BaseTester:
                 # get player ids from first episode
                 p_ids = p_ids[0]
                 # get list of frames: the initial state, then one per step
-                frame_list = [jax.device_get(jax.tree.map(itemgetter(i), frames)) for i in range(max_steps + 1)]
+                frame_list = [
+                    jax.device_get(jax.tree.map(itemgetter(i), frames))
+                    for i in range(max_steps + 1)
+                ]
                 # render frames to .gif
-                path_to_rendering = self.render_fn(frame_list, p_ids, f"{self.name}_{epoch_num}", self.render_dir)
+                path_to_rendering = self.render_fn(
+                    frame_list, p_ids, f"{self.name}_{epoch_num}", self.render_dir
+                )
             else:
                 path_to_rendering = None
             return state, metrics, path_to_rendering
         return state, {}, None
 
-    
-    @partial(jax.pmap, axis_name='d', static_broadcasted_argnums=(0, 1, 2, 3, 4))
-    def test(self, max_steps: int, env_step_fn: EnvStepFn, env_init_fn: EnvInitFn, evaluator: Evaluator,
-        keys: jax.Array, state: TestState, params: Any) -> tuple[TestState, dict, Any, jax.Array]:
+    @partial(jax.pmap, axis_name="d", static_broadcasted_argnums=(0, 1, 2, 3, 4))
+    def test(
+        self,
+        max_steps: int,
+        env_step_fn: EnvStepFn,
+        env_init_fn: EnvInitFn,
+        evaluator: Evaluator,
+        keys: jax.Array,
+        state: TestState,
+        params: Any,
+    ) -> tuple[TestState, dict, Any, jax.Array]:
         """Run the test implemented by the Tester. Parallelized across devices.
 
         Implemented by subclasses.

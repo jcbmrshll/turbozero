@@ -40,22 +40,34 @@ def random_q_cases(num_cases, unvisited):
 
 def test_normalize_q_values_matches_mctx_when_all_children_visited():
     for q, n, parent_q in random_q_cases(20, unvisited=False):
-        np.testing.assert_allclose(normalize_q_values(q, n, parent_q, EPS), mctx_qtransform(q, n, parent_q, EPS),
-                                   atol=1e-6)
+        np.testing.assert_allclose(
+            normalize_q_values(q, n, parent_q, EPS),
+            mctx_qtransform(q, n, parent_q, EPS),
+            atol=1e-6,
+        )
 
 
 def test_normalize_q_values_ignores_unvisited_children():
     q, n, parent_q = jnp.array([0.6, 0.9, 0.0, 0.0]), jnp.array([3, 3, 0, 0]), 0.75
-    np.testing.assert_allclose(normalize_q_values(q, n, parent_q, EPS), [0.0, 1.0, 0.0, 0.0], atol=1e-6)
+    np.testing.assert_allclose(
+        normalize_q_values(q, n, parent_q, EPS), [0.0, 1.0, 0.0, 0.0], atol=1e-6
+    )
 
     for q, n, parent_q in random_q_cases(20, unvisited=True):
-        np.testing.assert_allclose(normalize_q_values(q, n, parent_q, EPS), mctx_qtransform(q, n, parent_q, EPS),
-                                   atol=1e-6)
+        np.testing.assert_allclose(
+            normalize_q_values(q, n, parent_q, EPS),
+            mctx_qtransform(q, n, parent_q, EPS),
+            atol=1e-6,
+        )
 
 
 def root_only_tree(prior):
-    node = MCTS.new_node(policy=jnp.asarray(prior, dtype=jnp.float32), value=0.0,
-                         embedding=jnp.zeros(()), terminated=False)
+    node = MCTS.new_node(
+        policy=jnp.asarray(prior, dtype=jnp.float32),
+        value=0.0,
+        embedding=jnp.zeros(()),
+        terminated=False,
+    )
     return init_tree(8, len(prior), node).set_root(node)
 
 
@@ -81,19 +93,35 @@ def test_muzero_selector_runs_in_search(make_search, ttt):
 def visited_tree(prior, root_q, child_n, child_q):
     """Root with every child visited: `child_q` is from each child's perspective, the root's `n` is 1 + the children's."""
     prior, child_n, child_q = (np.asarray(x) for x in (prior, child_n, child_q))
-    root = replace(MCTS.new_node(policy=jnp.asarray(prior, dtype=jnp.float32), value=0.0,
-                                 embedding=jnp.zeros(()), terminated=False),
-                   n=jnp.array(1 + child_n.sum(), dtype=jnp.int32), q=jnp.float32(root_q))
+    root = replace(
+        MCTS.new_node(
+            policy=jnp.asarray(prior, dtype=jnp.float32),
+            value=0.0,
+            embedding=jnp.zeros(()),
+            terminated=False,
+        ),
+        n=jnp.array(1 + child_n.sum(), dtype=jnp.int32),
+        q=jnp.float32(root_q),
+    )
     tree = init_tree(8, len(prior), root).set_root(root)
     for action, (n, q) in enumerate(zip(child_n, child_q)):
-        child = replace(MCTS.new_node(policy=jnp.zeros(len(prior)), value=0.0,
-                                      embedding=jnp.zeros(()), terminated=False),
-                        n=jnp.array(n, dtype=jnp.int32), q=jnp.float32(q))
+        child = replace(
+            MCTS.new_node(
+                policy=jnp.zeros(len(prior)),
+                value=0.0,
+                embedding=jnp.zeros(()),
+                terminated=False,
+            ),
+            n=jnp.array(n, dtype=jnp.int32),
+            q=jnp.float32(q),
+        )
         tree = tree.add_node(tree.ROOT_INDEX, action, child)
     return tree
 
 
-@pytest.mark.parametrize("c1, c2, expected", [(1.25, 19652, 0), (1.25, 1.0, 3), (3.0, 19652, 3)])
+@pytest.mark.parametrize(
+    "c1, c2, expected", [(1.25, 19652, 0), (1.25, 1.0, 3), (3.0, 19652, 3)]
+)
 def test_muzero_selector_matches_paper_ucb_score(c1, c2, expected):
     """MuZero pseudocode `ucb_score`, with values min-max normalized over the parent and its children."""
     prior = np.array([0.1, 0.5, 0.15, 0.25])

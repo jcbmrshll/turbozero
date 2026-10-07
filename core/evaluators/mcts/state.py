@@ -1,4 +1,3 @@
-
 from dataclasses import dataclass
 from operator import itemgetter
 from typing import Any
@@ -24,6 +23,7 @@ class MCTSNode:
         terminated: whether the environment state is terminal
         embedding: environment state
     """
+
     n: jax.Array
     p: jax.Array
     q: jax.Array
@@ -37,7 +37,7 @@ class MCTSNode:
 
 
 # an MCTSTree is a Tree containing MCTSNodes
-MCTSTree = Tree[MCTSNode] 
+MCTSTree = Tree[MCTSNode]
 
 
 @jax.tree_util.register_dataclass
@@ -49,6 +49,7 @@ class TraversalState:
         parent: parent node index
         action: action taken from parent
     """
+
     parent: ArrayLike
     action: jax.Array
 
@@ -63,6 +64,7 @@ class BackpropState:
         value: value to backpropagate
         tree: search tree
     """
+
     node_idx: ArrayLike
     value: ArrayLike
     tree: MCTSTree
@@ -77,6 +79,7 @@ class MCTSOutput(EvalOutput):
         eval_state: The updated internal state of the Evaluator.
         policy_weights: The policy weights assigned to each action.
     """
+
     eval_state: MCTSTree
     policy_weights: jax.Array
 
@@ -97,20 +100,25 @@ def tree_to_graph(tree, batch_id=0):
     for n_i in range(tree.parents.shape[1]):
         node = jax.tree_util.tree_map(itemgetter((batch_id, n_i)), tree.data)
         if node.n.item() > 0:
-            graph.node(str(n_i), str({
-                "i": str(n_i),
-                "n": str(node.n.item()),
-                "q": f"{node.q.item():.2f}",
-                "t": str(node.terminated.item())
-            }))
+            graph.node(
+                str(n_i),
+                str(
+                    {
+                        "i": str(n_i),
+                        "n": str(node.n.item()),
+                        "q": f"{node.q.item():.2f}",
+                        "t": str(node.terminated.item()),
+                    }
+                ),
+            )
 
             child_visits = get_child_visits_no_batch(tree, n_i)
             mapping = tree.edge_map[batch_id, n_i]
             for a_i in range(tree.edge_map.shape[2]):
                 v_a = child_visits[a_i].item()
                 if v_a > 0:
-                    graph.edge(str(n_i), str(mapping[a_i]), f'{a_i}:{node.p[a_i]:.4f}')
+                    graph.edge(str(n_i), str(mapping[a_i]), f"{a_i}:{node.p[a_i]:.4f}")
         else:
             break
-    
+
     return graph

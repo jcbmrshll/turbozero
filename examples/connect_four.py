@@ -64,7 +64,9 @@ def state_to_nn_input(state):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="AlphaZero on Connect Four with weighted MCTS.")
+    parser = argparse.ArgumentParser(
+        description="AlphaZero on Connect Four with weighted MCTS."
+    )
     parser.add_argument("--search", choices=["weighted", "mcts"], default="weighted")
     parser.add_argument(
         "--q-temperature",
@@ -74,7 +76,9 @@ def main():
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--wandb", metavar="PROJECT", default="", help="log to this wandb project")
+    parser.add_argument(
+        "--wandb", metavar="PROJECT", default="", help="log to this wandb project"
+    )
     args = parser.parse_args()
 
     resnet, resnet_state = eqx.nn.make_with_state(AZResnet)(

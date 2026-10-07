@@ -1,4 +1,3 @@
-
 from dataclasses import dataclass, replace
 from typing import Any, cast
 
@@ -15,7 +14,7 @@ from core.evaluators.mcts.state import BackpropState, MCTSNode, MCTSTree
 @dataclass(frozen=True)
 class WeightedMCTSNode(MCTSNode):
     # Weighted MCTS needs access to the original raw value returned by the leaf evaluation
-    r: jax.Array # raw value 
+    r: jax.Array  # raw value
 
 
 class WeightedMCTS(MCTS):
@@ -33,17 +32,14 @@ class WeightedMCTS(MCTS):
         super().__init__(*args, **kwargs)
         self.q_temperature = q_temperature
 
-
     def get_config(self) -> dict:
         """Returns the configuration of the WeightedMCTS evaluator. Used for logging."""
-        return {
-            "q_temperature": self.q_temperature,
-            **super().get_config()
-        }
-
+        return {"q_temperature": self.q_temperature, **super().get_config()}
 
     @staticmethod
-    def new_node(policy: jax.Array, value: ArrayLike, embedding: Any, terminated: ArrayLike) -> WeightedMCTSNode:
+    def new_node(
+        policy: jax.Array, value: ArrayLike, embedding: Any, terminated: ArrayLike
+    ) -> WeightedMCTSNode:
         """Create a new WeightedMCTSNode.
 
         Args:
@@ -61,12 +57,16 @@ class WeightedMCTS(MCTS):
             q=jnp.array(value, dtype=jnp.float32),
             r=jnp.array(value, dtype=jnp.float32),
             terminated=jnp.array(terminated, dtype=jnp.bool_),
-            embedding=embedding
+            embedding=embedding,
         )
 
-
     @staticmethod
-    def update_root_node(root_node: MCTSNode, root_policy: jax.Array, root_value: ArrayLike, root_embedding: Any) -> WeightedMCTSNode:
+    def update_root_node(
+        root_node: MCTSNode,
+        root_policy: jax.Array,
+        root_value: ArrayLike,
+        root_embedding: Any,
+    ) -> WeightedMCTSNode:
         """Updates the root node.
 
         - if the tree is empty, create a new node
@@ -84,16 +84,18 @@ class WeightedMCTS(MCTS):
         # WeightedMCTS trees hold WeightedMCTSNodes (see `new_node`), which the MCTSTree annotation can't express
         root_node = cast(WeightedMCTSNode, root_node)
         visited = root_node.n > 0
-        return replace(root_node,
+        return replace(
+            root_node,
             p=root_policy,
             q=jnp.where(visited, root_node.q, root_value),
             r=jnp.where(visited, root_node.r, root_value),
             n=jnp.where(visited, root_node.n, 1),
-            embedding=root_embedding
+            embedding=root_embedding,
         )
 
-
-    def backpropagate(self, key: jax.Array, tree: MCTSTree, parent: ArrayLike, value: ArrayLike) -> MCTSTree:
+    def backpropagate(
+        self, key: jax.Array, tree: MCTSTree, parent: ArrayLike, value: ArrayLike
+    ) -> MCTSTree:
         """Backpropagate weighted sums of child q-values and update visit counts.
 
         Args:
@@ -105,37 +107,50 @@ class WeightedMCTS(MCTS):
         Returns:
             MCTSTree: updated search tree
         """
+
         def body_fn(state: BackpropState) -> BackpropState:
             node_idx, tree = state.node_idx, state.tree
             # get node data (WeightedMCTS trees hold WeightedMCTSNodes, see `new_node`)
             node = cast(WeightedMCTSNode, tree.data_at(node_idx))
-            # get q values, visit counts of children 
-            child_q_values = tree.get_child_data('q', node_idx) * self.discount
-            child_n_values = tree.get_child_data('n', node_idx)
+            # get q values, visit counts of children
+            child_q_values = tree.get_child_data("q", node_idx) * self.discount
+            child_n_values = tree.get_child_data("n", node_idx)
 
             # normalize q-values to [0, 1]
             # (only used to compute the weights, the backed-up value stays on the network's value scale)
-            normalized_q_values = normalize_q_values(child_q_values, child_n_values, node.q, jnp.finfo(node.q).eps)
+            normalized_q_values = normalize_q_values(
+                child_q_values, child_n_values, node.q, jnp.finfo(node.q).eps
+            )
 
             if self.q_temperature > 0:
                 # if temperature > 0, apply temperature to the softmax logits
                 # mask out unvisited action a[i] so softmax(a)[i] = 0.0
                 q_values_masked = jnp.where(
-                    child_n_values > 0, normalized_q_values / self.q_temperature, jnp.finfo(normalized_q_values).min
+                    child_n_values > 0,
+                    normalized_q_values / self.q_temperature,
+                    jnp.finfo(normalized_q_values).min,
                 )
             else:
                 # if temperature == 0, select max q-value amongst visited children
                 # apply random noise to break ties amongst nodes w/ same number of visits
                 # (fold in the node index so each node on the path gets independent noise)
                 node_key = jax.random.fold_in(key, node_idx)
-                noise = jax.random.uniform(node_key, shape=normalized_q_values.shape, maxval=self.tiebreak_noise)
+                noise = jax.random.uniform(
+                    node_key,
+                    shape=normalized_q_values.shape,
+                    maxval=self.tiebreak_noise,
+                )
                 noisy_q_values = jnp.where(
-                    child_n_values > 0, normalized_q_values + noise, jnp.finfo(normalized_q_values).min
+                    child_n_values > 0,
+                    normalized_q_values + noise,
+                    jnp.finfo(normalized_q_values).min,
                 )
 
                 # mask out all values except for max value index
                 # so softmax output at a[max_index] = 1 and 0 everywhere else
-                max_vector = jnp.full_like(noisy_q_values, jnp.finfo(noisy_q_values).min)
+                max_vector = jnp.full_like(
+                    noisy_q_values, jnp.finfo(noisy_q_values).min
+                )
                 index_of_max = jnp.argmax(noisy_q_values)
                 max_vector = max_vector.at[index_of_max].set(1)
                 q_values_masked = max_vector
@@ -152,10 +167,13 @@ class WeightedMCTS(MCTS):
             # update search tree
             tree = tree.update_node(node_idx, node)
             # backprop to parent node
-            return BackpropState(node_idx=tree.parents[node_idx], value=value, tree=tree)
-        
+            return BackpropState(
+                node_idx=tree.parents[node_idx], value=value, tree=tree
+            )
+
         state = jax.lax.while_loop(
-            lambda s: s.node_idx != s.tree.NULL_INDEX, body_fn, 
-            BackpropState(node_idx=parent, value=value, tree=tree)
+            lambda s: s.node_idx != s.tree.NULL_INDEX,
+            body_fn,
+            BackpropState(node_idx=parent, value=value, tree=tree),
         )
         return state.tree

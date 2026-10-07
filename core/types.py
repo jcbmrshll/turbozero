@@ -21,6 +21,7 @@ class StepMetadata:
         cur_player_id: current player id
         step: step number
     """
+
     rewards: jax.Array
     action_mask: jax.Array
     terminated: jax.Array
@@ -39,6 +40,7 @@ class TrainState:
         opt_state: optimizer state
         step: number of training steps taken
     """
+
     params: Any
     nn_state: eqx.nn.State | None
     opt_state: optax.OptState
@@ -46,10 +48,15 @@ class TrainState:
 
 
 EnvStepFn = Callable[[Any, jax.Array], tuple[Any, StepMetadata]]
-EnvInitFn = Callable[[jax.Array], tuple[Any, StepMetadata]]  
-DataTransformFn = Callable[[jax.Array, jax.Array, Any], tuple[jax.Array, jax.Array, Any]]
+EnvInitFn = Callable[[jax.Array], tuple[Any, StepMetadata]]
+DataTransformFn = Callable[
+    [jax.Array, jax.Array, Any], tuple[jax.Array, jax.Array, Any]
+]
 Params = Any
 EvalFn = Callable[[Any, Params, jax.Array], tuple[jax.Array, jax.Array]]
-LossFn = Callable[[Any, eqx.nn.State | None, BaseExperience], tuple[jax.Array, tuple[dict, eqx.nn.State | None]]]
+LossFn = Callable[
+    [Any, eqx.nn.State | None, BaseExperience],
+    tuple[jax.Array, tuple[dict, eqx.nn.State | None]],
+]
 ExtractModelParamsFn = Callable[[TrainState], Any]
 StateToNNInputFn = Callable[[Any], jax.Array]

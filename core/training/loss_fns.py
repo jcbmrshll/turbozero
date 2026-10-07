@@ -9,8 +9,12 @@ from core.memory.replay_memory import BaseExperience
 from core.networks.utils import apply_nn
 
 
-def az_default_loss_fn(nn: Any, nn_state: eqx.nn.State | None, experience: BaseExperience,
-                       l2_reg_lambda: float = 0.0001) -> tuple[jax.Array, tuple[dict, eqx.nn.State | None]]:
+def az_default_loss_fn(
+    nn: Any,
+    nn_state: eqx.nn.State | None,
+    experience: BaseExperience,
+    l2_reg_lambda: float = 0.0001,
+) -> tuple[jax.Array, tuple[dict, eqx.nn.State | None]]:
     """Implements the default AlphaZero loss function.
 
     = Policy Loss + Value Loss + L2 Regularization
@@ -32,36 +36,34 @@ def az_default_loss_fn(nn: Any, nn_state: eqx.nn.State | None, experience: BaseE
     """
 
     # get predictions
-    (pred_policy, pred_value), nn_state = apply_nn(nn, nn_state, experience.observation_nn)
+    (pred_policy, pred_value), nn_state = apply_nn(
+        nn, nn_state, experience.observation_nn
+    )
 
     # set invalid actions in policy to -inf
     pred_policy = jnp.where(
-        experience.policy_mask,
-        pred_policy,
-        jnp.finfo(jnp.float32).min
+        experience.policy_mask, pred_policy, jnp.finfo(jnp.float32).min
     )
 
     # compute policy loss
-    policy_loss = optax.softmax_cross_entropy(pred_policy, experience.policy_weights).mean()
+    policy_loss = optax.softmax_cross_entropy(
+        pred_policy, experience.policy_weights
+    ).mean()
     # select appropriate value from experience.reward
     current_player = experience.cur_player_id
-    target_value = experience.reward[jnp.arange(experience.reward.shape[0]), current_player]
+    target_value = experience.reward[
+        jnp.arange(experience.reward.shape[0]), current_player
+    ]
     # compute MSE value loss
     value_loss = optax.l2_loss(pred_value.squeeze(), target_value).mean()
 
     # compute L2 regularization
     l2_reg = l2_reg_lambda * jax.tree_util.tree_reduce(
         lambda x, y: x + y,
-        jax.tree.map(
-            lambda x: (x ** 2).sum(),
-            eqx.filter(nn, eqx.is_inexact_array)
-        )
+        jax.tree.map(lambda x: (x**2).sum(), eqx.filter(nn, eqx.is_inexact_array)),
     )
 
     # total loss
     loss = policy_loss + value_loss + l2_reg
-    aux_metrics = {
-        'policy_loss': policy_loss,
-        'value_loss': value_loss
-    }
+    aux_metrics = {"policy_loss": policy_loss, "value_loss": value_loss}
     return loss, (aux_metrics, nn_state)

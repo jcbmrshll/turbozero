@@ -1,4 +1,3 @@
-
 from dataclasses import dataclass
 from typing import Any
 
@@ -16,6 +15,7 @@ class EvalOutput:
         action: The action to take.
         policy_weights: The policy weights assigned to each action.
     """
+
     eval_state: Any
     action: jax.Array
     policy_weights: jax.Array
@@ -36,24 +36,24 @@ class Evaluator:
         """
         self.discount = discount
 
-
     def init(self, *args, **kwargs) -> Any:
         """Initializes the internal state of the Evaluator."""
         raise NotImplementedError()
 
-
     def init_batched(self, batch_size: int, *args, **kwargs) -> Any:
         """Initializes the internal state of the Evaluator across a batch dimension."""
         tree = self.init(*args, **kwargs)
-        return jax.tree.map(lambda x: jnp.broadcast_to(x, (batch_size,) + x.shape), tree)
-
+        return jax.tree.map(
+            lambda x: jnp.broadcast_to(x, (batch_size,) + x.shape), tree
+        )
 
     def reset(self, state: Any) -> Any:
         """Resets the internal state of the Evaluator."""
         raise NotImplementedError()
 
-
-    def evaluate(self, key: jax.Array, eval_state: Any, env_state: Any, *args, **kwargs) -> EvalOutput:
+    def evaluate(
+        self, key: jax.Array, eval_state: Any, env_state: Any, *args, **kwargs
+    ) -> EvalOutput:
         """Evaluates the environment state.
 
         Args:
@@ -69,7 +69,6 @@ class Evaluator:
         """
         raise NotImplementedError()
 
-
     def step(self, state: Any, action: jax.Array) -> Any:  # pylint: disable=unused-argument
         """Updates the internal state of the Evaluator.
 
@@ -82,7 +81,6 @@ class Evaluator:
         """
         return state
 
-
     def get_value(self, state: Any) -> jax.Array:
         """Extracts the state value estimate (for the current/root environment state) from the internal state of the Evaluator.
 
@@ -94,7 +92,6 @@ class Evaluator:
         """
         raise NotImplementedError()
 
-
     def get_config(self) -> dict:
         """Returns the configuration of the Evaluator. Used for logging."""
-        return {'discount': self.discount}
+        return {"discount": self.discount}
