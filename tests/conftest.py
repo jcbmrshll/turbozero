@@ -116,6 +116,56 @@ def play(moves, key=None):
     return state, meta
 
 
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class FixedLengthState:
+    """State of `make_fixed_length_env`: steps taken so far, and the player to move."""
+    step: jax.Array
+    current_player: jax.Array
+
+
+def make_fixed_length_env(length, rewards=(1.0, -1.0), num_actions=2):
+    """Two-player environment that terminates after exactly `length` steps, whatever the actions.
+
+    Players alternate, starting with player 0. Every action is legal, and the terminal step pays `rewards`
+    (indexed by player id); every other step pays 0.
+    """
+    rewards = jnp.asarray(rewards, dtype=jnp.float32)
+
+    def metadata(state):
+        terminated = state.step >= length
+        return StepMetadata(
+            rewards=jnp.where(terminated, rewards, 0.0),
+            action_mask=jnp.ones((num_actions,), dtype=jnp.bool_),
+            terminated=terminated,
+            cur_player_id=state.current_player,
+            step=state.step,
+        )
+
+    def init_fn(key):  # pylint: disable=unused-argument
+        state = FixedLengthState(step=jnp.array(0, dtype=jnp.int32), current_player=jnp.array(0, dtype=jnp.int32))
+        return state, metadata(state)
+
+    def step_fn(state, action):  # pylint: disable=unused-argument
+        state = FixedLengthState(step=state.step + 1, current_player=1 - state.current_player)
+        return state, metadata(state)
+
+    return SimpleNamespace(
+        length=length,
+        rewards=rewards,
+        num_actions=num_actions,
+        init_fn=init_fn,
+        step_fn=step_fn,
+        state_to_nn_input=lambda state: jnp.stack([state.step, state.current_player]).astype(jnp.float32),
+    )
+
+
+@pytest.fixture(scope="session")
+def fixed_length_env():
+    """Factory for deterministic fixed-length environments, see `make_fixed_length_env`."""
+    return make_fixed_length_env
+
+
 @pytest.fixture(scope="session")
 def ttt():
     """Tic-tac-toe environment helpers."""

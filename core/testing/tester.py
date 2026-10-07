@@ -113,8 +113,8 @@ class BaseTester:
                 frames = jax.tree.map(lambda x: x[0], frames)
                 # get player ids from first episode
                 p_ids = p_ids[0]
-                # get list of frames
-                frame_list = [jax.device_get(jax.tree.map(lambda x: x[i], frames)) for i in range(max_steps)]
+                # get list of frames: the initial state, then one per step
+                frame_list = [jax.device_get(jax.tree.map(lambda x: x[i], frames)) for i in range(max_steps + 1)]
                 # render frames to .gif
                 path_to_rendering = self.render_fn(frame_list, p_ids, f"{self.name}_{epoch_num}", self.render_dir)
             else:

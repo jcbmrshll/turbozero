@@ -57,7 +57,8 @@ def step_env_and_evaluator(
         evaluator: The Evaluator.
         env_step_fn: The environment step function.
         env_init_fn: The environment initialization function.
-        max_steps: The maximum number of environment steps per episode.
+        max_steps: The maximum number of environment steps per episode. An episode that has taken
+            `max_steps` steps without terminating is truncated, so no episode runs longer than `max_steps` steps.
         reset: Whether to reset the environment and evaluator state if the episode is terminated or truncated.
 
     Returns:
@@ -66,7 +67,8 @@ def step_env_and_evaluator(
             - `env_state`: The updated environment state.
             - `env_state_metadata`: Metadata associated with the updated environment state.
             - `terminated`: Whether the episode is terminated.
-            - `truncated`: Whether the episode is truncated.
+            - `truncated`: Whether the episode reached `max_steps` steps without terminating.
+              Never true together with `terminated`: an episode that terminates on its last allowed step is terminated.
             - `rewards`: Rewards emitted by the environment.
     """
     key, evaluate_key = jax.random.split(key)
@@ -83,7 +85,8 @@ def step_env_and_evaluator(
     env_state, env_state_metadata = env_step_fn(env_state, output.action)
     # check for termination and truncation
     terminated = env_state_metadata.terminated
-    truncated = env_state_metadata.step > max_steps 
+    # `step` counts the steps taken so far, so this is the episode's `max_steps`-th step
+    truncated = ~terminated & (env_state_metadata.step >= max_steps)
     # reset the environment and evaluator state if the episode is terminated or truncated
     # else, update the evaluator state
     rewards = env_state_metadata.rewards
@@ -170,7 +173,7 @@ def two_player_game_step(
         env_step_fn: The environment step function.
         env_init_fn: The environment initialization function.
         use_p1: Whether to use the first evaluator.
-        max_steps: The maximum number of steps per episode.
+        max_steps: The maximum number of steps per episode (see `step_env_and_evaluator`).
 
     Returns:
         TwoPlayerGameState: The updated game state.
@@ -258,12 +261,14 @@ def two_player_game(
         params_2: The parameters of the second evaluator.
         env_step_fn: The environment step function.
         env_init_fn: The environment initialization function.
-        max_steps: The maximum number of steps per episode.
+        max_steps: The maximum number of steps per episode. A game still in progress after `max_steps` steps
+            is truncated: it is marked completed and scored with the rewards of its last step (0 for pgx games).
 
     Returns:
         Tuple[jax.Array, TwoPlayerGameState, jax.Array]:
             - `outcomes`: The outcomes of the game (final rewards) for each player.
-            - `frames`: Frames collected from the game (used for rendering)
+            - `frames`: Frames collected from the game (used for rendering), `max_steps + 1` of them:
+              the initial state, then the state after each step.
             - `p_ids`: The player ids of the two evaluators. [evaluator_1_id, evaluator_2_id]
     """
     # init rng

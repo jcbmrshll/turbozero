@@ -125,7 +125,8 @@ class Trainer:
             optimizer: optax optimizer
             evaluator: the `Evaluator` to use during self-play
             memory_buffer: replay memory buffer class, used to store self-play experiences
-            max_episode_steps: maximum number of steps in an episode
+            max_episode_steps: maximum number of steps in an episode. Self-play episodes still running after this many
+                steps are truncated and their experiences discarded; an episode that terminates on its last allowed step is kept.
             env_step_fn: environment step function (env_state, action) -> (new_env_state, metadata)
             env_init_fn: environment initialization function (key) -> (env_state, metadata)
             state_to_nn_input_fn: function to convert environment state to neural network input
@@ -342,7 +343,8 @@ class Trainer:
             lambda s: s,
             buffer_state
         )
-        # truncate episode experiences in buffer if episode is too long
+        # discard the episode's experiences if it hit the step limit without terminating
+        # (`truncated` is never set together with `terminated`)
         buffer_state = jax.lax.cond(
             truncated,
             self.memory_buffer.truncate,
