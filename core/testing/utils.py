@@ -1,4 +1,5 @@
 
+import io
 import os
 
 import xml.etree.ElementTree as ET
@@ -6,34 +7,43 @@ import cairosvg
 from PIL import Image
 
 def render_pgx_2p(frames, p_ids, title, frame_dir, p1_label='Black', p2_label='White', duration=900):
-    """Really messy render function for rendering frames from a 2-player game from a PGX environment to a .gif."""
-    digit_length = len(str(len(frames)))
+    """Really messy render function for rendering frames from a 2-player game from a PGX environment to a .gif.
+
+    Intermediate frames are rendered in memory: the only file written is `{frame_dir}/{title}.gif`.
+    `frame_dir` is created if it does not exist.
+
+    Args:
+        frames: `GameFrame`s of one episode; rendering stops after the first completed frame
+        p_ids: player ids of the trained agent and its opponent
+        title: name of the .gif (without extension)
+        frame_dir: directory to save the .gif to
+        p1_label: label of the player who moves first
+        p2_label: label of the player who moves second
+        duration: duration of each frame in milliseconds
+
+    Returns:
+        str: path to the .gif
+    """
     trained_agent_color = p1_label if frames[0].env_state.current_player == p_ids[0] else p2_label
     opponent_color = p2_label if trained_agent_color == p1_label else p1_label
     agent_win = False
     opp_win = False
     draw = False
     images = []
-    for i,frame in enumerate(frames):
+    for frame in frames:
         env_state = frame.env_state
         if frame.completed.item():
-            num = '9' * digit_length
-            env_state.save_svg(f"{frame_dir}/{num}.svg", color_theme='dark')
             agent_win = frame.outcomes[p_ids[0]] > frame.outcomes[p_ids[1]]
             opp_win = frame.outcomes[p_ids[1]] > frame.outcomes[p_ids[0]]
             draw = frame.outcomes[0] == frame.outcomes[1]
-    
-        else:
-            num = str(i).zfill(digit_length)
-            env_state.save_svg(f"{frame_dir}/{num}.svg", color_theme='dark')
-        
-        tree = ET.parse(f"{frame_dir}/{num}.svg")
-        root = tree.getroot()
+
+        root = ET.fromstring(env_state.to_svg(color_theme='dark'))
 
         viewBox = root.attrib.get('viewBox', None)
         if viewBox:
             viewBox = viewBox.split()
             viewBox = [float(v) for v in viewBox]
+            original_width = viewBox[2]
             original_height = viewBox[3]
         else:
             original_width = float(root.attrib.get('width', 0))
@@ -62,20 +72,15 @@ def render_pgx_2p(frames, p_ids, title, frame_dir, p1_label='Black', p2_label='W
 
         root.append(p1_text)
         root.append(p2_text)
-    
-        tree.write(f"{frame_dir}/{num}.svg", encoding='utf-8', xml_declaration=True)
 
-        cairosvg.svg2png(url=f"{frame_dir}/{num}.svg", write_to=f"{frame_dir}/{num}.png")
-        images.append(f"{frame_dir}/{num}.png")
+        png = io.BytesIO()
+        cairosvg.svg2png(bytestring=ET.tostring(root, encoding='utf-8'), write_to=png)
+        png.seek(0)
+        images.append(Image.open(png))
         if frame.completed.item():
             break
 
-
-    images = [Image.open(png) for png in images]
-
-    gif_path = f"{frame_dir}/{title}.gif"
+    os.makedirs(frame_dir, exist_ok=True)
+    gif_path = os.path.join(frame_dir, f"{title}.gif")
     images[0].save(gif_path, save_all=True, append_images=images[1:] + ([images[-1]] * 2), duration=duration, loop=0)
-    
-    os.system(f"rm {frame_dir}/*.svg")
-    os.system(f"rm {frame_dir}/*.png")
     return gif_path

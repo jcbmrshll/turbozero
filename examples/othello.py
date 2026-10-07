@@ -15,7 +15,6 @@ and hardware.
 """
 
 import argparse
-import os
 from functools import partial
 
 import equinox as eqx
@@ -157,7 +156,6 @@ def main():
     if args.render is not None:
         # imported here since it needs cairo (on Ubuntu: apt-get install libcairo2-dev)
         from core.testing.utils import render_pgx_2p
-        os.makedirs(args.render, exist_ok=True)
         render_fn = partial(render_pgx_2p, p1_label="Black", p2_label="White", duration=900)
 
     testers = [
