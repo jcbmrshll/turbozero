@@ -20,6 +20,7 @@ It contains:
   
 #### *`turbozero`* is *_flexible_*:
  * easy to integrate with you custom JAX environment or neural network architecture.
+      * networks are [Equinox](https://github.com/patrick-kidger/equinox) modules, trained with [Optax](https://github.com/google-deepmind/optax); see [`apply_nn`](https://github.com/jcbmrshll/turbozero/blob/main/core/networks/utils.py) for the calling convention
  * Use the provided training and evaluation utilities, or pick and choose the components that you need.
 
 To get started, check out the [Othello example](https://github.com/jcbmrshll/turbozero/blob/main/examples/othello.py), which walks through each component

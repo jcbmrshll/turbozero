@@ -6,6 +6,7 @@ from functools import partial
 import os
 import shutil
 
+import equinox as eqx
 import jax
 import numpy as np
 import optax
@@ -19,14 +20,15 @@ from core.memory.replay_memory import EpisodeReplayBuffer
 from core.networks.azresnet import AZResnet, AZResnetConfig
 from core.testing.two_player_tester import TwoPlayerTester
 from core.training.loss_fns import az_default_loss_fn
-from core.training.train import Trainer, extract_params
+from core.training.train import Trainer, checkpoint_epochs, extract_params
 
 # warmup is longer than a tic-tac-toe game, so the buffer holds finished episodes before training starts
 STEPS_PER_EPOCH = 10
 
 
 def make_trainer(ttt, num_devices, ckpt_dir):
-    net = AZResnet(AZResnetConfig(policy_head_out_size=ttt.num_actions, num_blocks=1, num_channels=4))
+    config = AZResnetConfig(policy_head_out_size=ttt.num_actions, num_blocks=1, num_channels=4)
+    net, nn_state = eqx.nn.make_with_state(AZResnet)(config, ttt.env.observation_shape, key=jax.random.PRNGKey(0))
     make_evaluator = partial(AlphaZero(MCTS),
         eval_fn=make_nn_eval_fn(net, ttt.state_to_nn_input),
         num_iterations=4,
@@ -41,6 +43,7 @@ def make_trainer(ttt, num_devices, ckpt_dir):
         collection_steps_per_epoch=STEPS_PER_EPOCH,
         train_steps_per_epoch=1,
         nn=net,
+        nn_state=nn_state,
         loss_fn=partial(az_default_loss_fn, l2_reg_lambda=1e-4),
         optimizer=optax.adam(1e-3),
         evaluator=make_evaluator(temperature=1.0),
@@ -84,7 +87,7 @@ def test_train_loop_runs(trainers, trained, num_devices):
             np.testing.assert_array_equal(x[device], x[0])
     buffer_state = out.collection_state.buffer_state
     assert (buffer_state.populated & buffer_state.has_reward).any()
-    assert sorted(os.listdir(trainers[num_devices].ckpt_dir)) == ["0", "1"]
+    assert sorted(os.listdir(trainers[num_devices].ckpt_dir)) == ["0.eqx", "1.eqx"]
 
 
 def test_checkpoint_round_trip(trainers, trained):
@@ -96,13 +99,30 @@ def test_checkpoint_round_trip(trainers, trained):
     assert leaves_equal(restored.opt_state, out.train_state.opt_state)
 
 
+def test_checkpoint_loads_on_other_device_count(trainers, trained):
+    restored = trainers[1].load_train_state_from_checkpoint(trainers[2].ckpt_dir, 1)
+
+    for x, y in zip(jax.tree.leaves(restored), jax.tree.leaves(trained[2].train_state), strict=True):
+        np.testing.assert_array_equal(x, y[:1])
+
+
+def test_save_checkpoint_keeps_max_checkpoints(ttt, trainers, trained, tmp_path):
+    ckpt_dir = tmp_path / "ckpt"
+    shutil.copytree(trainers[2].ckpt_dir, ckpt_dir)
+    trainer = make_trainer(ttt, 2, ckpt_dir)
+
+    trainer.save_checkpoint(trained[2].train_state, 2)
+
+    assert checkpoint_epochs(str(ckpt_dir)) == [1, 2]
+
+
 def test_new_trainer_keeps_existing_checkpoints(ttt, trainers, trained, tmp_path):
     ckpt_dir = tmp_path / "ckpt"
     shutil.copytree(trainers[2].ckpt_dir, ckpt_dir)
 
     make_trainer(ttt, 2, ckpt_dir)
 
-    assert sorted(os.listdir(ckpt_dir)) == ["0", "1"]
+    assert sorted(os.listdir(ckpt_dir)) == ["0.eqx", "1.eqx"]
 
 
 def test_save_checkpoint_refuses_existing_epoch(trainers, trained):
@@ -112,7 +132,7 @@ def test_save_checkpoint_refuses_existing_epoch(trainers, trained):
     with pytest.raises(ValueError, match="already has a checkpoint"):
         trainer.save_checkpoint(out.train_state, 1)
 
-    assert sorted(os.listdir(trainer.ckpt_dir)) == ["0", "1"]
+    assert sorted(os.listdir(trainer.ckpt_dir)) == ["0.eqx", "1.eqx"]
     restored = trainer.load_train_state_from_checkpoint(trainer.ckpt_dir, 1)
     assert leaves_equal(extract_params(restored), extract_params(out.train_state))
 

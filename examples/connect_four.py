@@ -15,6 +15,8 @@ The hyperparameters here are only an example; tune them for your task and hardwa
 import argparse
 from functools import partial
 
+import equinox as eqx
+import jax
 import optax
 import pgx
 
@@ -74,11 +76,15 @@ def main():
     parser.add_argument("--wandb", metavar="PROJECT", default="", help="log to this wandb project")
     args = parser.parse_args()
 
-    resnet = AZResnet(AZResnetConfig(
-        policy_head_out_size=env.num_actions,
-        num_blocks=4,
-        num_channels=16,
-    ))
+    resnet, resnet_state = eqx.nn.make_with_state(AZResnet)(
+        AZResnetConfig(
+            policy_head_out_size=env.num_actions,
+            num_blocks=4,
+            num_channels=16,
+        ),
+        env.observation_shape,
+        key=jax.random.PRNGKey(args.seed),
+    )
 
     if args.search == "weighted":
         search, search_kwargs = WeightedMCTS, {"q_temperature": args.q_temperature}
@@ -104,6 +110,7 @@ def main():
         # roughly one pass over each epoch's new samples
         train_steps_per_epoch=(batch_size * MAX_STEPS) // train_batch_size,
         nn=resnet,
+        nn_state=resnet_state,
         loss_fn=partial(az_default_loss_fn, l2_reg_lambda=0.0001),
         optimizer=optax.adam(5e-3),
         # self-play samples moves in proportion to visit counts; test games play the most-visited

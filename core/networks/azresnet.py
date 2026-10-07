@@ -1,7 +1,12 @@
 
 from dataclasses import dataclass
+from typing import List, Tuple
 
-import flax.linen as nn
+import equinox as eqx
+import jax
+import jax.numpy as jnp
+
+from core.networks.utils import BATCH_AXIS
 
 
 @dataclass
@@ -16,50 +21,96 @@ class AZResnetConfig:
     num_channels: int
 
 
-class ResidualBlock(nn.Module):
-    """Residual block for AlphaZero ResNet model.
-    - `channels`: number of channels"""
-    channels: int
-
-    @nn.compact
-    def __call__(self, x, train: bool):
-        y = nn.Conv(features=self.channels, kernel_size=(3,3), strides=(1,1), padding='SAME', use_bias=False)(x)
-        y = nn.BatchNorm(use_running_average=not train)(y)
-        y = nn.relu(y)
-        y = nn.Conv(features=self.channels, kernel_size=(3,3), strides=(1,1), padding='SAME', use_bias=False)(y)
-        y = nn.BatchNorm(use_running_average=not train)(y)
-        return nn.relu(x + y)
+def conv(in_channels: int, out_channels: int, kernel_size: int, key: jax.Array) -> eqx.nn.Conv2d:
+    return eqx.nn.Conv2d(in_channels, out_channels, kernel_size, padding='SAME', use_bias=False, key=key)
 
 
-class AZResnet(nn.Module):
+def batch_norm(channels: int) -> eqx.nn.BatchNorm:
+    return eqx.nn.BatchNorm(channels, axis_name=BATCH_AXIS, mode='batch')
+
+
+class ResidualBlock(eqx.Module):
+    """Residual block for AlphaZero ResNet model."""
+    conv1: eqx.nn.Conv2d
+    bn1: eqx.nn.BatchNorm
+    conv2: eqx.nn.Conv2d
+    bn2: eqx.nn.BatchNorm
+
+    def __init__(self, channels: int, *, key: jax.Array):
+        """
+        Args:
+        - `channels`: number of channels
+        - `key`: rng used to initialize parameters
+        """
+        key1, key2 = jax.random.split(key)
+        self.conv1 = conv(channels, channels, 3, key1)
+        self.bn1 = batch_norm(channels)
+        self.conv2 = conv(channels, channels, 3, key2)
+        self.bn2 = batch_norm(channels)
+
+    def __call__(self, x: jax.Array, state: eqx.nn.State) -> Tuple[jax.Array, eqx.nn.State]:
+        y, state = self.bn1(self.conv1(x), state)
+        y = jax.nn.relu(y)
+        y, state = self.bn2(self.conv2(y), state)
+        return jax.nn.relu(x + y), state
+
+
+class AZResnet(eqx.Module):
     """Implements the AlphaZero ResNet model.
-    - `config`: network configuration"""
-    config: AZResnetConfig
+    Uses BatchNorm, so create it with its state: `eqx.nn.make_with_state(AZResnet)(config, input_shape, key=key)`"""
+    stem_conv: eqx.nn.Conv2d
+    stem_bn: eqx.nn.BatchNorm
+    blocks: List[ResidualBlock]
+    policy_conv: eqx.nn.Conv2d
+    policy_bn: eqx.nn.BatchNorm
+    policy_linear: eqx.nn.Linear
+    value_conv: eqx.nn.Conv2d
+    value_bn: eqx.nn.BatchNorm
+    value_linear: eqx.nn.Linear
 
-    @nn.compact
-    def __call__(self, x, train: bool):
+    def __init__(self, config: AZResnetConfig, input_shape: Tuple[int, int, int], *, key: jax.Array):
+        """
+        Args:
+        - `config`: network configuration
+        - `input_shape`: shape of a single (unbatched) input, (height, width, channels)
+        - `key`: rng used to initialize parameters
+        """
+        height, width, in_channels = input_shape
+        keys = jax.random.split(key, config.num_blocks + 5)
         # initial conv layer
-        x = nn.Conv(features=self.config.num_channels, kernel_size=(3,3), strides=(1,1), padding='SAME', use_bias=False)(x)
-        x = nn.BatchNorm(use_running_average=not train)(x)
-        x = nn.relu(x)
+        self.stem_conv = conv(in_channels, config.num_channels, 3, keys[0])
+        self.stem_bn = batch_norm(config.num_channels)
+        # residual blocks
+        self.blocks = [ResidualBlock(config.num_channels, key=k) for k in keys[5:]]
+        # policy head
+        self.policy_conv = conv(config.num_channels, 2, 1, keys[1])
+        self.policy_bn = batch_norm(2)
+        self.policy_linear = eqx.nn.Linear(2 * height * width, config.policy_head_out_size, key=keys[2])
+        # value head
+        self.value_conv = conv(config.num_channels, 1, 1, keys[3])
+        self.value_bn = batch_norm(1)
+        self.value_linear = eqx.nn.Linear(height * width, 1, key=keys[4])
+
+    def __call__(self, x: jax.Array, state: eqx.nn.State) -> Tuple[Tuple[jax.Array, jax.Array], eqx.nn.State]:
+        # inputs are channels-last (and may be e.g. boolean), equinox convolutions are channels-first
+        x = jnp.moveaxis(x, -1, 0).astype(self.stem_conv.weight.dtype)
+        # initial conv layer
+        x, state = self.stem_bn(self.stem_conv(x), state)
+        x = jax.nn.relu(x)
 
         # residual blocks
-        for _ in range(self.config.num_blocks):
-            x = ResidualBlock(channels=self.config.num_channels)(x, train=train)
+        for block in self.blocks:
+            x, state = block(x, state)
 
         # policy head
-        policy = nn.Conv(features=2, kernel_size=(1,1), strides=(1,1), padding='SAME', use_bias=False)(x)
-        policy = nn.BatchNorm(use_running_average=not train)(policy)
-        policy = nn.relu(policy)
-        policy = policy.reshape((policy.shape[0], -1))
-        policy = nn.Dense(features=self.config.policy_head_out_size)(policy)
+        policy, state = self.policy_bn(self.policy_conv(x), state)
+        policy = jax.nn.relu(policy)
+        policy = self.policy_linear(policy.reshape(-1))
 
         # value head
-        value = nn.Conv(features=1, kernel_size=(1,1), strides=(1,1), padding='SAME', use_bias=False)(x)
-        value = nn.BatchNorm(use_running_average=not train)(value)
-        value = nn.relu(value)
-        value = value.reshape((value.shape[0], -1))
-        value = nn.Dense(features=1)(value)
-        value = nn.tanh(value)
+        value, state = self.value_bn(self.value_conv(x), state)
+        value = jax.nn.relu(value)
+        value = self.value_linear(value.reshape(-1))
+        value = jnp.tanh(value)
 
-        return policy, value
+        return (policy, value), state

@@ -18,6 +18,8 @@ import argparse
 import os
 from functools import partial
 
+import equinox as eqx
+import jax
 import jax.numpy as jnp
 import optax
 import pgx
@@ -122,12 +124,17 @@ def main():
     )
     args = parser.parse_args()
 
-    # the residual network from the AlphaZero paper; any flax.linen module works
-    resnet = AZResnet(AZResnetConfig(
-        policy_head_out_size=env.num_actions,
-        num_blocks=4,
-        num_channels=32,
-    ))
+    # the residual network from the AlphaZero paper; any equinox module works (see
+    # core.networks.utils.apply_nn). It uses BatchNorm, so it's created along with its state
+    resnet, resnet_state = eqx.nn.make_with_state(AZResnet)(
+        AZResnetConfig(
+            policy_head_out_size=env.num_actions,
+            num_blocks=4,
+            num_channels=32,
+        ),
+        env.observation_shape,
+        key=jax.random.PRNGKey(args.seed),
+    )
 
     # AlphaZero takes an arbitrary search backend, here classic MCTS. Temperature 1.0
     # samples moves in proportion to visit counts, for exploration during self-play
@@ -173,6 +180,7 @@ def main():
         collection_steps_per_epoch=256,
         train_steps_per_epoch=64,
         nn=resnet,
+        nn_state=resnet_state,
         loss_fn=partial(az_default_loss_fn, l2_reg_lambda=0.0),
         optimizer=optax.adam(1e-3),
         evaluator=evaluator,

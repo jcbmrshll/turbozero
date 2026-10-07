@@ -1,16 +1,17 @@
 
-from typing import Any, Tuple
+from typing import Any, Optional, Tuple
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import optax
-from flax.training.train_state import TrainState
 
 from core.memory.replay_memory import BaseExperience
+from core.networks.utils import apply_nn
 
 
-def az_default_loss_fn(params: Any, train_state: TrainState, experience: BaseExperience, 
-                       l2_reg_lambda: float = 0.0001) -> Tuple[jax.Array, Tuple[Any, optax.OptState]]:
+def az_default_loss_fn(nn: Any, nn_state: Optional[eqx.nn.State], experience: BaseExperience,
+                       l2_reg_lambda: float = 0.0001) -> Tuple[jax.Array, Tuple[dict, Optional[eqx.nn.State]]]:
     """ Implements the default AlphaZero loss function.
     
     = Policy Loss + Value Loss + L2 Regularization
@@ -18,31 +19,21 @@ def az_default_loss_fn(params: Any, train_state: TrainState, experience: BaseExp
     Value Loss: L2 loss between predicted value and target value
     
     Args:
-    - `params`: the parameters of the neural network
-    - `train_state`: flax TrainState (holds optimizer and other state)
+    - `nn`: the neural network (an equinox module, see core.networks.utils.apply_nn), differentiated with respect to its floating point arrays
+    - `nn_state`: state of the neural network (e.g. BatchNorm statistics), None for stateless networks
     - `experience`: experience sampled from replay buffer
         - stores the observation, target policy, target value
     - `l2_reg_lambda`: L2 regularization weight (default = 1e-4)
 
     Returns:
-    - (loss, (aux_metrics, updates))
+    - (loss, (aux_metrics, nn_state))
         - `loss`: total loss
         - `aux_metrics`: auxiliary metrics (policy_loss, value_loss)
-        - `updates`: optimizer updates
+        - `nn_state`: updated state of the neural network
     """
 
-    # get batch_stats if using batch_norm
-    variables = {'params': params, 'batch_stats': train_state.batch_stats} \
-        if hasattr(train_state, 'batch_stats') else {'params': params}
-    mutables = ['batch_stats'] if hasattr(train_state, 'batch_stats') else []
-
     # get predictions
-    (pred_policy, pred_value), updates = train_state.apply_fn(
-        variables, 
-        x=experience.observation_nn,
-        train=True,
-        mutable=mutables
-    )
+    (pred_policy, pred_value), nn_state = apply_nn(nn, nn_state, experience.observation_nn)
 
     # set invalid actions in policy to -inf
     pred_policy = jnp.where(
@@ -64,7 +55,7 @@ def az_default_loss_fn(params: Any, train_state: TrainState, experience: BaseExp
         lambda x, y: x + y,
         jax.tree.map(
             lambda x: (x ** 2).sum(),
-            params
+            eqx.filter(nn, eqx.is_inexact_array)
         )
     )
 
@@ -74,4 +65,4 @@ def az_default_loss_fn(params: Any, train_state: TrainState, experience: BaseExp
         'policy_loss': policy_loss,
         'value_loss': value_loss
     }
-    return loss, (aux_metrics, updates)
+    return loss, (aux_metrics, nn_state)
