@@ -6,10 +6,12 @@ import flax.linen as nn
 
 @dataclass
 class AZResnetConfig:
-    """Configuration for AlphaZero ResNet model:
-    - `policy_head_out_size`: output size of the policy head (number of actions)
-    - `num_blocks`: number of residual blocks
-    - `num_channels`: number of channels in each residual block
+    """Configuration for AlphaZero ResNet model.
+
+    Attributes:
+        policy_head_out_size: output size of the policy head (number of actions)
+        num_blocks: number of residual blocks
+        num_channels: number of channels in each residual block
     """
     policy_head_out_size: int
     num_blocks: int
@@ -18,7 +20,10 @@ class AZResnetConfig:
 
 class ResidualBlock(nn.Module):
     """Residual block for AlphaZero ResNet model.
-    - `channels`: number of channels"""
+
+    Attributes:
+        channels: number of channels
+    """
     channels: int
 
     @nn.compact
@@ -33,7 +38,10 @@ class ResidualBlock(nn.Module):
 
 class AZResnet(nn.Module):
     """Implements the AlphaZero ResNet model.
-    - `config`: network configuration"""
+
+    Attributes:
+        config: network configuration
+    """
     config: AZResnetConfig
 
     @nn.compact

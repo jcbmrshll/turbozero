@@ -6,8 +6,7 @@ import cairosvg
 from PIL import Image
 
 def render_pgx_2p(frames, p_ids, title, frame_dir, p1_label='Black', p2_label='White', duration=900):
-    """really messy render function for rendering frames from a 2-player game
-    from a PGX environment to a .gif"""
+    """Really messy render function for rendering frames from a 2-player game from a PGX environment to a .gif."""
     digit_length = len(str(len(frames)))
     trained_agent_color = p1_label if frames[0].env_state.current_player == p_ids[0] else p2_label
     opponent_color = p2_label if trained_agent_color == p1_label else p1_label

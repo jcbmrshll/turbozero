@@ -11,13 +11,13 @@ def make_nn_eval_fn(
     state_to_nn_input_fn: Callable[[chex.ArrayTree], chex.Array]
 ) -> Callable[[chex.ArrayTree, chex.ArrayTree, chex.PRNGKey], Tuple[chex.Array, chex.Array]]:
     """Creates a leaf evaluation function using a neural network (state, params) -> (policy, value).
-    
+
     Args:
-    - `nn`: The neural network module.
-    - `state_to_nn_input_fn`: A function that converts the state to the input format expected by the neural network.
+        nn: The neural network module.
+        state_to_nn_input_fn: A function that converts the state to the input format expected by the neural network.
 
     Returns:
-    - `eval_fn`: A function that evaluates the state using the neural network (state, params) -> (policy, value)
+        Callable: A function that evaluates the state using the neural network (state, params) -> (policy, value)
     """
     
     def eval_fn(state, params, *args):
@@ -34,13 +34,13 @@ def make_nn_eval_fn_no_params_callable(
     state_to_nn_input_fn: Callable[[chex.ArrayTree], chex.Array]
 ) -> Callable[[chex.ArrayTree, chex.ArrayTree, chex.PRNGKey], Tuple[chex.Array, chex.Array]]:
     """Creates a leaf evaluation function that uses a stateless neural net evaluation function (state) -> (policy, value).
-    
+
     Args:
-    - `nn`: The stateless evaluation function.
-    - `state_to_nn_input_fn`: A function that converts the state to the input format expected by the neural network
+        nn: The stateless evaluation function.
+        state_to_nn_input_fn: A function that converts the state to the input format expected by the neural network
 
     Returns:
-    - `eval_fn`: A function that evaluates the state using the neural network (state) -> (policy, value)
+        Callable: A function that evaluates the state using the neural network (state) -> (policy, value)
     """
 
     def eval_fn(state, *args):

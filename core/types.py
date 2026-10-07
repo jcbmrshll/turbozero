@@ -11,11 +11,13 @@ from core.memory.replay_memory import BaseExperience
 @chex.dataclass(frozen=True)
 class StepMetadata:
     """Metadata for a step in the environment.
-    - `rewards`: rewards received by the players
-    - `action_mask`: mask of valid actions
-    - `terminated`: whether the environment is terminated
-    - `cur_player_id`: current player id
-    - `step`: step number
+
+    Attributes:
+        rewards: rewards received by the players
+        action_mask: mask of valid actions
+        terminated: whether the environment is terminated
+        cur_player_id: current player id
+        step: step number
     """
     rewards: chex.Array
     action_mask: chex.Array

@@ -15,18 +15,20 @@ from core.types import EnvInitFn, EnvStepFn
 @dataclass(frozen=True)
 class TwoPlayerTestState(TestState):
     """Internal state of a TwoPlayerTester. Stores the best parameters found so far.
-    - `best_params`: best performing parameters
+
+    Attributes:
+        best_params: best performing parameters
     """
     best_params: chex.ArrayTree
 
 
 class TwoPlayerTester(BaseTester):
-    """Implements a tester that evaluates an agent against the best performing parameters 
-    found so far in a two-player game."""
+    """Implements a tester that evaluates an agent against the best performing parameters found so far in a two-player game."""
     def __init__(self, num_episodes: int, *args, **kwargs):
-        """
+        """Initializes a TwoPlayerTester.
+
         Args:
-        - `num_episodes`: number of episodes to play in each test
+            num_episodes: number of episodes to play in each test
         """
         super().__init__(*args, num_keys=num_episodes, **kwargs)
         self.num_episodes = num_episodes
@@ -34,18 +36,19 @@ class TwoPlayerTester(BaseTester):
 
     def init(self, params: chex.ArrayTree, **kwargs) -> TwoPlayerTestState: #pylint: disable=unused-argument
         """Initializes the internal state of the TwoPlayerTester.
+
         Args:
-        - `params`: initial parameters to store as the best performing
-            - can just be the initial parameters of the agent
+            params: initial parameters to store as the best performing
+                - can just be the initial parameters of the agent
         """
         return TwoPlayerTestState(best_params=params)
     
 
     def check_size_compatibilities(self, num_devices: int) -> None:
         """Checks if tester configuration is compatible with number of devices being utilized.
-        
+
         Args:
-        - `num_devices`: number of devices
+            num_devices: number of devices
         """
         if self.num_episodes % num_devices != 0:
             raise ValueError(f"{self.__class__.__name__}: number of episodes ({self.num_episodes}) must be divisible by number of devices ({num_devices})")
@@ -55,22 +58,22 @@ class TwoPlayerTester(BaseTester):
     def test(self, max_steps: int, env_step_fn: EnvStepFn, env_init_fn: EnvInitFn, evaluator: Evaluator,
         keys: chex.PRNGKey, state: TwoPlayerTestState, params: chex.ArrayTree) -> Tuple[TwoPlayerTestState, Dict, chex.ArrayTree, chex.Array]:
         """Test the agent against the best performing parameters found so far in a two-player game.
-        
+
         Args:
-        - `max_steps`: maximum number of steps per episode
-        - `env_step_fn`: environment step function
-        - `env_init_fn`: environment initialization function
-        - `evaluator`: the agent evaluator
-        - `keys`: rng
-        - `state`: internal state of the tester
-        - `params`: nn parameters used by agent
-        
+            max_steps: maximum number of steps per episode
+            env_step_fn: environment step function
+            env_init_fn: environment initialization function
+            evaluator: the agent evaluator
+            keys: rng
+            state: internal state of the tester
+            params: nn parameters used by agent
+
         Returns:
-        - (TwoPlayerTestState, Dict, chex.ArrayTree, chex.Array)
-            - updated internal state of the tester
-            - metrics from the test
-            - frames from the test (used for rendering)
-            - player ids from the test (used for rendering)
+            Tuple[TwoPlayerTestState, Dict, chex.ArrayTree, chex.Array]:
+                - updated internal state of the tester
+                - metrics from the test
+                - frames from the test (used for rendering)
+                - player ids from the test (used for rendering)
         """
 
         game_fn = partial(two_player_game,

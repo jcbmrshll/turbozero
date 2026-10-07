@@ -12,11 +12,13 @@ from core.trees.tree import Tree
 @dataclass(frozen=True)
 class MCTSNode:
     """Base MCTS node data strucutre.
-    - `n`: visit count
-    - `p`: policy vector
-    - `q`: cumulative value estimate / visit count
-    - `terminated`: whether the environment state is terminal
-    - `embedding`: environment state
+
+    Attributes:
+        n: visit count
+        p: policy vector
+        q: cumulative value estimate / visit count
+        terminated: whether the environment state is terminal
+        embedding: environment state
     """
     n: jnp.number
     p: chex.Array
@@ -26,7 +28,7 @@ class MCTSNode:
 
     @property
     def w(self) -> jnp.number:
-        """cumulative value estimate"""
+        """Cumulative value estimate."""
         return self.q * self.n
 
 
@@ -37,8 +39,10 @@ MCTSTree = Tree[MCTSNode]
 @dataclass(frozen=True)
 class TraversalState:
     """State used during traversal step of MCTS.
-    - `parent`: parent node index
-    - `action`: action taken from parent
+
+    Attributes:
+        parent: parent node index
+        action: action taken from parent
     """
     parent: int
     action: int
@@ -47,9 +51,11 @@ class TraversalState:
 @dataclass(frozen=True)
 class BackpropState:
     """State used during backpropagation step of MCTS.
-    - `node_idx`: current node
-    - `value`: value to backpropagate
-    - `tree`: search tree
+
+    Attributes:
+        node_idx: current node
+        value: value to backpropagate
+        tree: search tree
     """
     node_idx: int
     value: float
@@ -59,8 +65,10 @@ class BackpropState:
 @dataclass(frozen=True)
 class MCTSOutput(EvalOutput):
     """Output of an MCTS evaluation. See EvalOutput.
-    - `eval_state`: The updated internal state of the Evaluator.
-    - `policy_weights`: The policy weights assigned to each action.
+
+    Attributes:
+        eval_state: The updated internal state of the Evaluator.
+        policy_weights: The policy weights assigned to each action.
     """
     eval_state: MCTSTree
     policy_weights: chex.Array

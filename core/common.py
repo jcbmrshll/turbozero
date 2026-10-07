@@ -14,14 +14,15 @@ def partition(
     num_partitions: int
 ) -> chex.ArrayTree:
     """Partition each array in a data structure into num_partitions along the first axis.
+
     e.g. partitions an array of shape (N, ...) into (num_partitions, N//num_partitions, ...)
 
     Args:
-    - `data`: ArrayTree to partition
-    - `num_partitions`: number of partitions
+        data: ArrayTree to partition
+        num_partitions: number of partitions
 
     Returns:
-    - (chex.ArrayTree): partitioned ArrayTree
+        chex.ArrayTree: partitioned ArrayTree
     """
     return jax.tree_map(
         lambda x: x.reshape(num_partitions, x.shape[0] // num_partitions, *x.shape[1:]),
@@ -41,32 +42,33 @@ def step_env_and_evaluator(
     max_steps: int,
     reset: bool = True
 ) -> Tuple[EvalOutput, chex.ArrayTree,  StepMetadata, bool, bool, chex.Array]:
-    """
+    """Steps the environment and evaluator.
+
     - Evaluates the environment state with the Evaluator and selects an action.
     - Performs a step in the environment with the selected action.
     - Updates the internal state of the Evaluator.
     - Optionally resets the environment and evaluator state if the episode is terminated or truncated.
 
     Args:
-    - `key`: rng
-    - `env_state`: The environment state to evaluate.
-    - `env_state_metadata`: Metadata associated with the environment state.
-    - `eval_state`: The internal state of the Evaluator.
-    - `params`: nn parameters used by the Evaluator.
-    - `evaluator`: The Evaluator.
-    - `env_step_fn`: The environment step function.
-    - `env_init_fn`: The environment initialization function.
-    - `max_steps`: The maximum number of environment steps per episode.
-    - `reset`: Whether to reset the environment and evaluator state if the episode is terminated or truncated.
+        key: rng
+        env_state: The environment state to evaluate.
+        env_state_metadata: Metadata associated with the environment state.
+        eval_state: The internal state of the Evaluator.
+        params: nn parameters used by the Evaluator.
+        evaluator: The Evaluator.
+        env_step_fn: The environment step function.
+        env_init_fn: The environment initialization function.
+        max_steps: The maximum number of environment steps per episode.
+        reset: Whether to reset the environment and evaluator state if the episode is terminated or truncated.
 
     Returns:
-    - (EvalOutput, chex.ArrayTree, StepMetadata, bool, bool, chex.Array)
-        - `output`: The output of the evaluation.
-        - `env_state`: The updated environment state.
-        - `env_state_metadata`: Metadata associated with the updated environment state.
-        - `terminated`: Whether the episode is terminated.
-        - `truncated`: Whether the episode is truncated.
-        - `rewards`: Rewards emitted by the environment.
+        Tuple[EvalOutput, chex.ArrayTree, StepMetadata, bool, bool, chex.Array]:
+            - output: The output of the evaluation.
+            - env_state: The updated environment state.
+            - env_state_metadata: Metadata associated with the updated environment state.
+            - terminated: Whether the episode is terminated.
+            - truncated: Whether the episode is truncated.
+            - rewards: Rewards emitted by the environment.
     """
     key, evaluate_key = jax.random.split(key)
     # evaluate the environment state
@@ -106,15 +108,17 @@ def step_env_and_evaluator(
 @dataclass(frozen=True)
 class TwoPlayerGameState:
     """Stores the state of a two player game using two different evaluators.
-    - `key`: rng
-    - `env_state`: The environment state.
-    - `env_state_metadata`: Metadata associated with the environment state.
-    - `p1_eval_state`: The internal state of the first evaluator.
-    - `p2_eval_state`: The internal state of the second evaluator.
-    - `p1_value_estimate`: The current state value estimate of the first evaluator.
-    - `p2_value_estimate`: The current state value estimate of the second evaluator.
-    - `outcomes`: The outcomes of the game (final rewards) for each player
-    - `completed`: Whether the game is completed.
+
+    Attributes:
+        key: rng
+        env_state: The environment state.
+        env_state_metadata: Metadata associated with the environment state.
+        p1_eval_state: The internal state of the first evaluator.
+        p2_eval_state: The internal state of the second evaluator.
+        p1_value_estimate: The current state value estimate of the first evaluator.
+        p2_value_estimate: The current state value estimate of the second evaluator.
+        outcomes: The outcomes of the game (final rewards) for each player.
+        completed: Whether the game is completed.
     """
     key: jax.random.PRNGKey
     env_state: chex.ArrayTree
@@ -130,11 +134,13 @@ class TwoPlayerGameState:
 @dataclass(frozen=True)
 class GameFrame:
     """Stores information necessary for rendering the environment state in a two-player game.
-    - `env_state`: The environment state.
-    - `p1_value_estimate`: The current state value estimate of the first evaluator.
-    - `p2_value_estimate`: The current state value estimate of the second evaluator.
-    - `completed`: Whether the game is completed.
-    - `outcomes`: The outcomes of the game (final rewards) for each player
+
+    Attributes:
+        env_state: The environment state.
+        p1_value_estimate: The current state value estimate of the first evaluator.
+        p2_value_estimate: The current state value estimate of the second evaluator.
+        completed: Whether the game is completed.
+        outcomes: The outcomes of the game (final rewards) for each player.
     """
     env_state: chex.ArrayTree
     p1_value_estimate: chex.Array
@@ -154,19 +160,19 @@ def two_player_game_step(
     max_steps: int
 ) -> TwoPlayerGameState:
     """Make a single step in a two player game.
-    
+
     Args:
-    - `state`: The current game state.
-    - `p1_evaluator`: The first evaluator.
-    - `p2_evaluator`: The second evaluator.
-    - `params`: The parameters of the active evaluator.
-    - `env_step_fn`: The environment step function.
-    - `env_init_fn`: The environment initialization function.
-    - `use_p1`: Whether to use the first evaluator.
-    - `max_steps`: The maximum number of steps per episode.
-    
+        state: The current game state.
+        p1_evaluator: The first evaluator.
+        p2_evaluator: The second evaluator.
+        params: The parameters of the active evaluator.
+        env_step_fn: The environment step function.
+        env_init_fn: The environment initialization function.
+        use_p1: Whether to use the first evaluator.
+        max_steps: The maximum number of steps per episode.
+
     Returns:
-    - (TwoPlayerGameState): The updated game state.
+        TwoPlayerGameState: The updated game state.
     """
     # determine which evaluator to use based on the current player
     if use_p1:
@@ -241,24 +247,23 @@ def two_player_game(
     env_init_fn: EnvInitFn,
     max_steps: int
 ) -> Tuple[chex.Array, TwoPlayerGameState, chex.Array]:
-    """
-    Play a two player game between two evaluators.
+    """Play a two player game between two evaluators.
 
     Args:
-    - `key`: rng
-    - `evaluator_1`: The first evaluator.
-    - `evaluator_2`: The second evaluator.
-    - `params_1`: The parameters of the first evaluator.
-    - `params_2`: The parameters of the second evaluator.
-    - `env_step_fn`: The environment step function.
-    - `env_init_fn`: The environment initialization function.
-    - `max_steps`: The maximum number of steps per episode.
+        key: rng
+        evaluator_1: The first evaluator.
+        evaluator_2: The second evaluator.
+        params_1: The parameters of the first evaluator.
+        params_2: The parameters of the second evaluator.
+        env_step_fn: The environment step function.
+        env_init_fn: The environment initialization function.
+        max_steps: The maximum number of steps per episode.
 
     Returns:
-    - (chex.Array, TwoPlayerGameState, chex.Array, chex.Array)
-        - `outcomes`: The outcomes of the game (final rewards) for each player.
-        - `frames`: Frames collected from the game (used for rendering)
-        - `p_ids`: The player ids of the two evaluators. [evaluator_1_id, evaluator_2_id]
+        Tuple[chex.Array, TwoPlayerGameState, chex.Array]:
+            - outcomes: The outcomes of the game (final rewards) for each player.
+            - frames: Frames collected from the game (used for rendering)
+            - p_ids: The player ids of the two evaluators. [evaluator_1_id, evaluator_2_id]
     """
     # init rng
     env_key, turn_key, key = jax.random.split(key, 3)

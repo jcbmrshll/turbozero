@@ -18,15 +18,16 @@ class WeightedMCTSNode(MCTSNode):
 
 
 class WeightedMCTS(MCTS):
-    """Weighted MCTS implementation: 
-    - https://twitter.com/ptrschmdtnlsn/status/1748800529608888362
+    """Weighted MCTS implementation.
+
+    https://twitter.com/ptrschmdtnlsn/status/1748800529608888362
     """
 
     def __init__(self, q_temperature: float = 1.0, *args, **kwargs):
         """Initializes a WeightedMCTS evaluator.
-        
+
         Args:
-        - `q_temperature`: temperature to apply to child q-values when backpropagating
+            q_temperature: temperature to apply to child q-values when backpropagating
         """
         super().__init__(*args, **kwargs)
         self.q_temperature = q_temperature
@@ -43,15 +44,15 @@ class WeightedMCTS(MCTS):
     @staticmethod
     def new_node(policy: chex.Array, value: float, embedding: chex.ArrayTree, terminated: bool) -> WeightedMCTSNode:
         """Create a new WeightedMCTSNode.
-        
+
         Args:
-        - `policy`: policy vector
-        - `value`: value estimate
-        - `embedding`: environment state
-        - `terminated`: whether the environment state is terminal
-        
+            policy: policy vector
+            value: value estimate
+            embedding: environment state
+            terminated: whether the environment state is terminal
+
         Returns:
-        - (WeightedMCTSNode): new node
+            WeightedMCTSNode: new node
         """
         return WeightedMCTSNode(
             n=jnp.array(1, dtype=jnp.int32),
@@ -65,18 +66,20 @@ class WeightedMCTS(MCTS):
 
     @staticmethod
     def update_root_node(root_node: MCTSNode, root_policy: chex.Array, root_value: float, root_embedding: chex.ArrayTree) -> WeightedMCTSNode:
-        """ Updates the root node
+        """Updates the root node.
+
         - if the tree is empty, create a new node
         - otherwise, update the existing root node
-        
+
         Args:
-        - `root_node`: root node
-        - `root_policy`: root policy
-        - `root_value`: root value
-        - `root_embedding`: root environment state
-        
+            root_node: root node
+            root_policy: root policy
+            root_value: root value
+            root_embedding: root environment state
+
         Returns:
-        - (WeightedMCTSNode): updated root node"""
+            WeightedMCTSNode: updated root node
+        """
         visited = root_node.n > 0
         return root_node.replace(
             p=root_policy,
@@ -91,13 +94,13 @@ class WeightedMCTS(MCTS):
         """Backpropagate weighted sums of child q-values and update visit counts.
 
         Args:
-        - `key`: rng
-        - `tree`: The search tree.
-        - `parent`: index of the parent node (in most cases, this is the new node added to the tree this iteration)
-        - `value`: expanded node value estimate
+            key: rng
+            tree: The search tree.
+            parent: index of the parent node (in most cases, this is the new node added to the tree this iteration)
+            value: expanded node value estimate
 
         Returns:
-        - `tree`: updated search tree
+            MCTSTree: updated search tree
         """
         def body_fn(state: BackpropState) -> Tuple[int, MCTSTree]:
             node_idx, tree = state.node_idx, state.tree
