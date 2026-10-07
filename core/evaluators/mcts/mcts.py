@@ -121,7 +121,7 @@ class MCTS(Evaluator):
     
 
     def update_root(self, key: jax.Array, tree: MCTSTree, root_embedding: Any, 
-                    params: Any, **kwargs) -> MCTSTree: #pylint: disable=unused-argument
+                    params: Any, root_metadata: StepMetadata, **kwargs) -> MCTSTree: #pylint: disable=unused-argument
         """Populates the root node of an MCTSTree.
         
         Args:
@@ -129,12 +129,14 @@ class MCTS(Evaluator):
         - `tree`: MCTSTree to update
         - `root_embedding`: root environment state
         - `params`: nn parameters
+        - `root_metadata`: metadata of the root environment state
 
         Returns:
         - (MCTSTree): updated MCTSTree
         """
         # evaluate root state
         root_policy_logits, root_value = self.eval_fn(root_embedding, params, key)
+        root_policy_logits = jnp.where(root_metadata.action_mask, root_policy_logits, jnp.finfo(root_policy_logits).min)
         root_policy = jax.nn.softmax(root_policy_logits)
         # update root node
         root_node = tree.data_at(tree.ROOT_INDEX)
