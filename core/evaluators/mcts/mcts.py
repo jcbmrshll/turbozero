@@ -12,10 +12,11 @@ from core.types import EnvStepFn, EvalFn, StepMetadata
 
 class MCTS(Evaluator):
     """Batched implementation of Monte Carlo Tree Search (MCTS).
-    
+
     Not stateful. This class operates on 'MCTSTree' state objects.
-    
-    Compatible with `jax.vmap`, `jax.pmap`, `jax.jit`, etc."""
+
+    Compatible with `jax.vmap`, `jax.pmap`, `jax.jit`, etc.
+    """
     def __init__(self,
         eval_fn: EvalFn,
         action_selector: MCTSActionSelector,
@@ -27,20 +28,21 @@ class MCTS(Evaluator):
         tiebreak_noise: float = 1e-8,
         persist_tree: bool = True
     ):
-        """
+        """Initializes an MCTS evaluator.
+
         Args:
-        - `eval_fn`: leaf node evaluation function (env_state -> (policy_logits, value))
-        - `action_selector`: action selection function (eval_state -> action)
-        - `branching_factor`: max number of actions (== children per node)
-        - `max_nodes`: allocated size of MCTS tree, any additional nodes will not be created, 
+            eval_fn: leaf node evaluation function (env_state -> (policy_logits, value))
+            action_selector: action selection function (eval_state -> action)
+            branching_factor: max number of actions (== children per node)
+            max_nodes: allocated size of MCTS tree, any additional nodes will not be created,
                 but values from out-of-bounds leaf nodes will still backpropagate
-        - `num_iterations`: number of MCTS iterations to perform per evaluate call
-        - `discount`: discount factor for MCTS (default: -1.0)
-            - use a negative discount in two-player games (e.g. -1.0)
-            - use a positive discount in single-player games (e.g. 1.0)
-        - `temperature`: temperature for root action selection (default: 1.0)
-        - `tiebreak_noise`: magnitude of noise to add to policy weights for breaking ties (default: 1e-8)
-        - `persist_tree`: whether to persist search tree state between calls to `evaluate` (default: True)
+            num_iterations: number of MCTS iterations to perform per evaluate call
+            discount: discount factor for MCTS (default: -1.0)
+                - use a negative discount in two-player games (e.g. -1.0)
+                - use a positive discount in single-player games (e.g. 1.0)
+            temperature: temperature for root action selection (default: 1.0)
+            tiebreak_noise: magnitude of noise to add to policy weights for breaking ties (default: 1e-8)
+            persist_tree: whether to persist search tree state between calls to `evaluate` (default: True)
         """
         super().__init__(discount=discount)
         self.eval_fn = eval_fn
@@ -54,7 +56,7 @@ class MCTS(Evaluator):
 
 
     def get_config(self) -> Dict:
-        """returns a config object for checkpoints"""
+        """Returns a config object for checkpoints."""
         return {
             "eval_fn": self.eval_fn.__name__,
             "num_iterations": self.num_iterations,
@@ -78,17 +80,18 @@ class MCTS(Evaluator):
         **kwargs
     ) -> MCTSOutput:
         """Performs `self.num_iterations` MCTS iterations on an `MCTSTree`.
+
         Samples an action to take from the root node after search is completed.
-        
+
         Args:
-        - `eval_state`: `MCTSTree` to evaluate, could be empty or partially complete
-        - `env_state`: current environment state
-        - `root_metadata`: metadata for the root node of the tree
-        - `params`: parameters to pass to the the leaf evaluation function
-        - `env_step_fn`: env step fn: (env_state, action) -> (new_env_state, metadata)
+            eval_state: `MCTSTree` to evaluate, could be empty or partially complete
+            env_state: current environment state
+            root_metadata: metadata for the root node of the tree
+            params: parameters to pass to the the leaf evaluation function
+            env_step_fn: env step fn: (env_state, action) -> (new_env_state, metadata)
 
         Returns:
-        - (MCTSOutput): contains new tree state, selected action, root value, and policy weights
+            MCTSOutput: contains new tree state, selected action, root value, and policy weights
         """
         # store current state metadata in the root node
         key, root_key = jax.random.split(key)
@@ -112,10 +115,10 @@ class MCTS(Evaluator):
         """Returns value estimate of the environment state stored in the root node of the tree.
 
         Args:
-        - `state`: MCTSTree to evaluate
+            state: MCTSTree to evaluate
 
         Returns:
-        - (jax.Array): value estimate of the environment state stored in the root node of the tree
+            jax.Array: value estimate of the environment state stored in the root node of the tree
         """
         return state.data_at(state.ROOT_INDEX).q
     
@@ -123,16 +126,16 @@ class MCTS(Evaluator):
     def update_root(self, key: jax.Array, tree: MCTSTree, root_embedding: Any, 
                     params: Any, root_metadata: StepMetadata, **kwargs) -> MCTSTree: #pylint: disable=unused-argument
         """Populates the root node of an MCTSTree.
-        
+
         Args:
-        - `key`: rng
-        - `tree`: MCTSTree to update
-        - `root_embedding`: root environment state
-        - `params`: nn parameters
-        - `root_metadata`: metadata of the root environment state
+            key: rng
+            tree: MCTSTree to update
+            root_embedding: root environment state
+            params: nn parameters
+            root_metadata: metadata of the root environment state
 
         Returns:
-        - (MCTSTree): updated MCTSTree
+            MCTSTree: updated MCTSTree
         """
         # evaluate root state
         root_policy_logits, root_value = self.eval_fn(root_embedding, params, key)
@@ -145,19 +148,20 @@ class MCTS(Evaluator):
     
     
     def iterate(self, key: jax.Array, tree: MCTSTree, params: Any, env_step_fn: EnvStepFn) -> MCTSTree:
-        """ Performs one iteration of MCTS.
+        """Performs one iteration of MCTS.
+
         1. Traverse to leaf node.
         2. Evaluate Leaf Node
         3. Expand Leaf Node (add to tree)
         4. Backpropagate
 
         Args:
-        - `tree`: MCTSTree to evaluate
-        - `params`: parameters to pass to the the leaf evaluation function
-        - `env_step_fn`: env step fn: (env_state, action) -> (new_env_state, metadata)
+            tree: MCTSTree to evaluate
+            params: parameters to pass to the the leaf evaluation function
+            env_step_fn: env step fn: (env_state, action) -> (new_env_state, metadata)
 
         Returns:
-        - (MCTSTree): updated MCTSTree
+            MCTSTree: updated MCTSTree
         """
         # traverse from root -> leaf
         traversal_state = self.traverse(tree)
@@ -192,15 +196,15 @@ class MCTS(Evaluator):
 
 
     def traverse(self, tree: MCTSTree) -> TraversalState:
-        """ Traverse from the root node until an unvisited leaf node is reached.
-        
+        """Traverse from the root node until an unvisited leaf node is reached.
+
         Args:
-        - `tree`: MCTSTree to evaluate
-        
+            tree: MCTSTree to evaluate
+
         Returns:
-        - (TraversalState): state of the traversal
-            - `parent`: index of the parent node
-            - `action`: action to take from the parent node
+            TraversalState: state of the traversal
+                - parent: index of the parent node
+                - action: action to take from the parent node
         """
 
         # continue while:
@@ -232,15 +236,15 @@ class MCTS(Evaluator):
 
     def backpropagate(self, key: jax.Array, tree: MCTSTree, parent: int, value: float) -> MCTSTree: #pylint: disable=unused-argument
         """Backpropagate the value estimate from the leaf node to the root node and update visit counts.
-        
+
         Args:
-        - `key`: rng
-        - `tree`: MCTSTree to evaluate
-        - `parent`: index of the parent node (in most cases, this is the new node added to the tree this iteration)
-        - `value`: value estimate of the leaf node
+            key: rng
+            tree: MCTSTree to evaluate
+            parent: index of the parent node (in most cases, this is the new node added to the tree this iteration)
+            value: value estimate of the leaf node
 
         Returns:
-        - (MCTSTree): updated search tree
+            MCTSTree: updated search tree
         """
 
         def body_fn(state: BackpropState) -> Tuple[int, MCTSTree]:
@@ -266,13 +270,13 @@ class MCTS(Evaluator):
 
     def sample_root_action(self, key: jax.Array, tree: MCTSTree) -> Tuple[int, jax.Array]:
         """Sample an action based on the root visit counts.
-        
+
         Args:
-        - `key`: rng
-        - `tree`: MCTSTree to evaluate
-        
+            key: rng
+            tree: MCTSTree to evaluate
+
         Returns:
-        - (Tuple[int, jax.Array]): sampled action, normalized policy weights
+            Tuple[int, jax.Array]: sampled action, normalized policy weights
         """
         # get root visit counts
         action_visits = tree.get_child_data('n', tree.ROOT_INDEX)
@@ -306,19 +310,17 @@ class MCTS(Evaluator):
         terminated: Optional[bool] = None,
         embedding: Optional[Any] = None
     ) -> MCTSNode:
-        """ Update the visit counts and value estimate of a node.
+        """Update the visit counts and value estimate of a node.
 
         Args:
-        - `node`: MCTSNode to update
-        - `value`: value estimate to update the node with
-
-        ( we could optionally overwrite the following: )
-        - `p`: policy weights to update the node with
-        - `terminated`: whether the node is terminal
-        - `embedding`: embedding to update the node with
+            node: MCTSNode to update
+            value: value estimate to update the node with
+            p: (optional) policy weights to overwrite the node's policy with
+            terminated: (optional) whether the node is terminal
+            embedding: (optional) embedding to overwrite the node's embedding with
 
         Returns:
-        - (MCTSNode): updated MCTSNode
+            MCTSNode: updated MCTSNode
         """
         # update running value estimate
         q_value = ((node.q * node.n) + value) / (node.n + 1)
@@ -341,17 +343,17 @@ class MCTS(Evaluator):
     @staticmethod
     def new_node(policy: jax.Array, value: float, embedding: Any, terminated: bool) -> MCTSNode:
         """Create a new MCTSNode.
-        
+
         Args:
-        - `policy`: policy weights
-        - `value`: value estimate
-        - `embedding`: environment state embedding
-            - 'embedding' because in some MCTS use-cases, e.g. MuZero, we store an embedding of the state 
-               rather than the state itself. In AlphaZero, this is just the entire environment state.
-        - `terminated`: whether the state is terminal
+            policy: policy weights
+            value: value estimate
+            embedding: environment state embedding
+                - 'embedding' because in some MCTS use-cases, e.g. MuZero, we store an embedding of the state
+                  rather than the state itself. In AlphaZero, this is just the entire environment state.
+            terminated: whether the state is terminal
 
         Returns:
-        - (MCTSNode): initialized MCTSNode
+            MCTSNode: initialized MCTSNode
         """
         return MCTSNode(
             n=jnp.array(1, dtype=jnp.int32), # init visit count to 1
@@ -365,15 +367,15 @@ class MCTS(Evaluator):
     @staticmethod
     def update_root_node(root_node: MCTSNode, root_policy: jax.Array, root_value: float, root_embedding: Any) -> MCTSNode:
         """Update the root node of the search tree.
-        
+
         Args:
-        - `root_node`: node to update
-        - `root_policy`: policy weights
-        - `root_value`: value estimate
-        - `root_embedding`: environment state embedding
-        
+            root_node: node to update
+            root_policy: policy weights
+            root_value: value estimate
+            root_embedding: environment state embedding
+
         Returns:
-        - (MCTSNode): updated root node
+            MCTSNode: updated root node
         """
         visited = root_node.n > 0
         return replace(root_node,
@@ -388,25 +390,25 @@ class MCTS(Evaluator):
 
     def reset(self, state: MCTSTree) -> MCTSTree:
         """Resets the internal state of MCTS.
-        
+
         Args:
-        - `state`: evaluator state
+            state: evaluator state
 
         Returns:
-        - (MCTSTree): reset evaluator state
+            MCTSTree: reset evaluator state
         """
         return state.reset()
 
 
     def step(self, state: MCTSTree, action: int) -> MCTSTree:
         """Update the internal state of MCTS after taking an action in the environment.
-        
+
         Args:
-        - `state`: evaluator state
-        - `action`: action taken in the environment
-        
+            state: evaluator state
+            action: action taken in the environment
+
         Returns:
-        - (MCTSTree): updated evaluator state
+            MCTSTree: updated evaluator state
         """
         
         if self.persist_tree:
@@ -418,13 +420,13 @@ class MCTS(Evaluator):
 
     def init(self, template_embedding: Any, *args, **kwargs) -> MCTSTree: #pylint: disable=arguments-differ
         """Initializes the internal state of the MCTS evaluator.
-        
+
         Args:
-        - `template_embedding`: template environment state embedding
-            - not stored, just used to initialize data structures to the correct shape
+            template_embedding: template environment state embedding
+                - not stored, just used to initialize data structures to the correct shape
 
         Returns:
-        - (MCTSTree): initialized MCTSTree
+            MCTSTree: initialized MCTSTree
         """
         return init_tree(self.max_nodes, self.branching_factor, self.new_node(
             policy=jnp.zeros((self.branching_factor,)),

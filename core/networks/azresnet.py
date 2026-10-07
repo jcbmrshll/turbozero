@@ -1,4 +1,3 @@
-
 from dataclasses import dataclass
 from typing import List, Tuple
 
@@ -11,10 +10,12 @@ from core.networks.utils import BATCH_AXIS
 
 @dataclass
 class AZResnetConfig:
-    """Configuration for AlphaZero ResNet model:
-    - `policy_head_out_size`: output size of the policy head (number of actions)
-    - `num_blocks`: number of residual blocks
-    - `num_channels`: number of channels in each residual block
+    """Configuration for AlphaZero ResNet model.
+
+    Attributes:
+        policy_head_out_size: output size of the policy head (number of actions)
+        num_blocks: number of residual blocks
+        num_channels: number of channels in each residual block
     """
     policy_head_out_size: int
     num_blocks: int
@@ -39,8 +40,8 @@ class ResidualBlock(eqx.Module):
     def __init__(self, channels: int, *, key: jax.Array):
         """
         Args:
-        - `channels`: number of channels
-        - `key`: rng used to initialize parameters
+            channels: number of channels
+            key: rng used to initialize parameters
         """
         key1, key2 = jax.random.split(key)
         self.conv1 = conv(channels, channels, 3, key1)
@@ -57,7 +58,9 @@ class ResidualBlock(eqx.Module):
 
 class AZResnet(eqx.Module):
     """Implements the AlphaZero ResNet model.
-    Uses BatchNorm, so create it with its state: `eqx.nn.make_with_state(AZResnet)(config, input_shape, key=key)`"""
+
+    Uses BatchNorm, so create it with its state: `eqx.nn.make_with_state(AZResnet)(config, input_shape, key=key)`
+    """
     stem_conv: eqx.nn.Conv2d
     stem_bn: eqx.nn.BatchNorm
     blocks: List[ResidualBlock]
@@ -71,9 +74,9 @@ class AZResnet(eqx.Module):
     def __init__(self, config: AZResnetConfig, input_shape: Tuple[int, int, int], *, key: jax.Array):
         """
         Args:
-        - `config`: network configuration
-        - `input_shape`: shape of a single (unbatched) input, (height, width, channels)
-        - `key`: rng used to initialize parameters
+            config: network configuration
+            input_shape: shape of a single (unbatched) input, (height, width, channels)
+            key: rng used to initialize parameters
         """
         height, width, in_channels = input_shape
         keys = jax.random.split(key, config.num_blocks + 5)

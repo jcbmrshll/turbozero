@@ -10,9 +10,11 @@ import jax.numpy as jnp
 @dataclass(frozen=True)
 class EvalOutput:
     """Output of an evaluation.
-    - `eval_state`: The updated internal state of the Evaluator.
-    - `action`: The action to take.
-    - `policy_weights`: The policy weights assigned to each action.
+
+    Attributes:
+        eval_state: The updated internal state of the Evaluator.
+        action: The action to take.
+        policy_weights: The policy weights assigned to each action.
     """
     eval_state: Any
     action: int
@@ -21,6 +23,7 @@ class EvalOutput:
 
 class Evaluator:
     """Base class for Evaluators.
+
     An Evaluator *evaluates* an environment state, and returns an action to take, as well as a 'policy', assigning a weight to each action.
     Evaluators may maintain an internal state, which is updated by the `step` method.
     """
@@ -29,7 +32,7 @@ class Evaluator:
         """Initializes an Evaluator.
 
         Args:
-        - `discount`: The discount factor applied to future rewards/value estimates.
+            discount: The discount factor applied to future rewards/value estimates.
         """
         self.discount = discount
 
@@ -54,15 +57,15 @@ class Evaluator:
         """Evaluates the environment state.
 
         Args:
-        - `key`: rng
-        - `eval_state`: The internal state of the Evaluator.
-        - `env_state`: The environment state to evaluate.
+            key: rng
+            eval_state: The internal state of the Evaluator.
+            env_state: The environment state to evaluate.
 
         Returns:
-        - `EvalOutput`: The output of the evaluation.
-            - `eval_state`: The updated internal state of the Evaluator.
-            - `action`: The action to take.
-            - `policy_weights`: The policy weights assigned to each action.
+            EvalOutput: The output of the evaluation.
+                - eval_state: The updated internal state of the Evaluator.
+                - action: The action to take.
+                - policy_weights: The policy weights assigned to each action.
         """
         raise NotImplementedError()
 
@@ -71,11 +74,11 @@ class Evaluator:
         """Updates the internal state of the Evaluator.
 
         Args:
-        - `state`: The internal state of the Evaluator.
-        - `action`: The action taken in the environment.
+            state: The internal state of the Evaluator.
+            action: The action taken in the environment.
 
         Returns:
-        - (pytree): The updated internal state of the Evaluator.
+            pytree: The updated internal state of the Evaluator.
         """
         return state
 
@@ -84,10 +87,10 @@ class Evaluator:
         """Extracts the state value estimate (for the current/root environment state) from the internal state of the Evaluator.
 
         Args:
-        - `state`: The internal state of the Evaluator.
+            state: The internal state of the Evaluator.
 
         Returns:
-        - `jax.Array`: The value estimate.
+            jax.Array: The value estimate.
         """
         raise NotImplementedError()
 

@@ -11,6 +11,7 @@ from core.types import StepMetadata
 
 class _AlphaZero:
     """AlphaZero-specific logic for MCTS.
+
     Extends MCTS using the `AlphaZero` class, this class serves as a mixin to add AlphaZero-specific logic.
     """
 
@@ -19,11 +20,12 @@ class _AlphaZero:
         dirichlet_epsilon: float = 0.25,
         **kwargs
     ):
-        """
+        """Initializes an AlphaZero evaluator.
+
         Args:
-        - `dirichlet_alpha`: magnitude of Dirichlet noise.
-        - `dirichlet_epsilon`: proportion of root policy composed of Dirichlet noise.
-        (see `MCTS` class for additional configuration)
+            dirichlet_alpha: magnitude of Dirichlet noise.
+            dirichlet_epsilon: proportion of root policy composed of Dirichlet noise.
+            **kwargs: see `MCTS` class for additional configuration
         """
         super().__init__(**kwargs)
         self.dirichlet_alpha = dirichlet_alpha
@@ -41,16 +43,16 @@ class _AlphaZero:
 
     def update_root(self, key: jax.Array, tree: MCTSTree, root_embedding: Any, params: Any, root_metadata: StepMetadata) -> MCTSTree:
         """Populates the root node of the search tree. Adds Dirichlet noise to the root policy.
-        
+
         Args:
-        - `key`: rng
-        - `tree`: The search tree.
-        - `root_embedding`: root environment state.
-        - `params`: nn parameters.
-        - `root_metadata`: metadata of the root environment state
-        
+            key: rng
+            tree: The search tree.
+            root_embedding: root environment state.
+            params: nn parameters.
+            root_metadata: metadata of the root environment state
+
         Returns:
-        - `tree`: The updated search tree.
+            MCTSTree: The updated search tree.
         """
         # evaluate the root state 
         root_key, dir_key = jax.random.split(key, 2)
@@ -81,8 +83,9 @@ class _AlphaZero:
     
 
 class AlphaZero(MCTS):
-    """AlphaZero: Monte Carlo Tree Search + Neural Network Leaf Evaluation
-     - https://arxiv.org/abs/1712.01815
+    """AlphaZero: Monte Carlo Tree Search + Neural Network Leaf Evaluation.
+
+    https://arxiv.org/abs/1712.01815
 
     Most of the work is actually done in the `MCTS` class, which AlphaZero extends.
     This class can take an arbitrary MCTS backend, which is why we use a separate class `_AlphaZero`

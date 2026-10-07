@@ -1,4 +1,3 @@
-
 from typing import Any, Optional, Tuple
 
 import equinox as eqx
@@ -12,24 +11,24 @@ from core.networks.utils import apply_nn
 
 def az_default_loss_fn(nn: Any, nn_state: Optional[eqx.nn.State], experience: BaseExperience,
                        l2_reg_lambda: float = 0.0001) -> Tuple[jax.Array, Tuple[dict, Optional[eqx.nn.State]]]:
-    """ Implements the default AlphaZero loss function.
-    
+    """Implements the default AlphaZero loss function.
+
     = Policy Loss + Value Loss + L2 Regularization
     Policy Loss: Cross-entropy loss between predicted policy and target policy
     Value Loss: L2 loss between predicted value and target value
-    
+
     Args:
-    - `nn`: the neural network (an equinox module, see core.networks.utils.apply_nn), differentiated with respect to its floating point arrays
-    - `nn_state`: state of the neural network (e.g. BatchNorm statistics), None for stateless networks
-    - `experience`: experience sampled from replay buffer
-        - stores the observation, target policy, target value
-    - `l2_reg_lambda`: L2 regularization weight (default = 1e-4)
+        nn: the neural network (an equinox module, see core.networks.utils.apply_nn), differentiated with respect to its floating point arrays
+        nn_state: state of the neural network (e.g. BatchNorm statistics), None for stateless networks
+        experience: experience sampled from replay buffer
+            - stores the observation, target policy, target value
+        l2_reg_lambda: L2 regularization weight (default = 1e-4)
 
     Returns:
-    - (loss, (aux_metrics, nn_state))
-        - `loss`: total loss
-        - `aux_metrics`: auxiliary metrics (policy_loss, value_loss)
-        - `nn_state`: updated state of the neural network
+        Tuple[jax.Array, Tuple[dict, Optional[eqx.nn.State]]]: (loss, (aux_metrics, nn_state))
+            - loss: total loss
+            - aux_metrics: auxiliary metrics (policy_loss, value_loss)
+            - nn_state: updated state of the neural network
     """
 
     # get predictions

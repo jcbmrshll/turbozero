@@ -1,4 +1,3 @@
-
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Tuple
 
@@ -12,11 +11,13 @@ from core.memory.replay_memory import BaseExperience
 @dataclass(frozen=True)
 class StepMetadata:
     """Metadata for a step in the environment.
-    - `rewards`: rewards received by the players
-    - `action_mask`: mask of valid actions
-    - `terminated`: whether the environment is terminated
-    - `cur_player_id`: current player id
-    - `step`: step number
+
+    Attributes:
+        rewards: rewards received by the players
+        action_mask: mask of valid actions
+        terminated: whether the environment is terminated
+        cur_player_id: current player id
+        step: step number
     """
     rewards: jax.Array
     action_mask: jax.Array
@@ -29,10 +30,12 @@ class StepMetadata:
 @dataclass(frozen=True)
 class TrainState:
     """Training state of the neural network.
-    - `params`: trainable parameters, the floating point arrays of the network (`eqx.filter(nn, eqx.is_inexact_array)`)
-    - `nn_state`: state of the network (e.g. BatchNorm statistics), None for stateless networks
-    - `opt_state`: optimizer state
-    - `step`: number of training steps taken
+
+    Attributes:
+        params: trainable parameters, the floating point arrays of the network (`eqx.filter(nn, eqx.is_inexact_array)`)
+        nn_state: state of the network (e.g. BatchNorm statistics), None for stateless networks
+        opt_state: optimizer state
+        step: number of training steps taken
     """
     params: Any
     nn_state: Optional[eqx.nn.State]

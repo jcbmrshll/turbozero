@@ -9,11 +9,13 @@ import jax.numpy as jnp
 @dataclass(frozen=True)
 class BaseExperience:
     """Experience data structure. Stores a training sample.
-    - `reward`: reward for each player in the episode this sample belongs to
-    - `policy_weights`: policy weights
-    - `policy_mask`: mask for policy weights (mask out invalid/illegal actions)
-    - `observation_nn`: observation for neural network input
-    - `cur_player_id`: current player id
+
+    Attributes:
+        reward: reward for each player in the episode this sample belongs to
+        policy_weights: policy weights
+        policy_mask: mask for policy weights (mask out invalid/illegal actions)
+        observation_nn: observation for neural network input
+        cur_player_id: current player id
     """
     reward: jax.Array
     policy_weights: jax.Array
@@ -25,16 +27,19 @@ class BaseExperience:
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class ReplayBufferState:
-    """State of the replay buffer. Stores objects stored in the buffer 
-    and metadata used to determine where to store the next object, as well as 
-    which objects are valid to sample from.
-    - `next_idx`: index where the next experience will be stored
-    - `episode_start_idx`: index where the current episode started, samples are placed in order
-    - `buffer`: buffer of experiences
-    - `populated`: mask for populated buffer indices
-    - `has_reward`: mask for buffer indices that have been assigned a reward
-        - we store samples from in-progress episodes, but don't want to be able to sample them 
-        until the episode is complete
+    """State of the replay buffer.
+
+    Stores objects stored in the buffer and metadata used to determine where to store
+    the next object, as well as which objects are valid to sample from.
+
+    Attributes:
+        next_idx: index where the next experience will be stored
+        episode_start_idx: index where the current episode started, samples are placed in order
+        buffer: buffer of experiences
+        populated: mask for populated buffer indices
+        has_reward: mask for buffer indices that have been assigned a reward
+            - we store samples from in-progress episodes, but don't want to be able to sample them
+              until the episode is complete
     """
     next_idx: int
     episode_start_idx: int
@@ -45,15 +50,17 @@ class ReplayBufferState:
 
 class EpisodeReplayBuffer:
     """Replay buffer, stores trajectories from episodes for training.
-    
-    Compatible with `jax.jit`, `jax.vmap`, and `jax.pmap`."""
+
+    Compatible with `jax.jit`, `jax.vmap`, and `jax.pmap`.
+    """
 
     def __init__(self,
         capacity: int,
     ):
-        """
+        """Initializes an EpisodeReplayBuffer.
+
         Args:
-        - `capacity`: number of experiences to store in the buffer
+            capacity: number of experiences to store in the buffer
         """
         self.capacity = capacity
 
@@ -67,13 +74,14 @@ class EpisodeReplayBuffer:
 
     def add_experience(self, state: ReplayBufferState, experience: BaseExperience) -> ReplayBufferState:
         """Adds an experience to the replay buffer.
-        
+
         Args:
-        - `state`: replay buffer state
-        - `experience`: experience to add
-        
+            state: replay buffer state
+            experience: experience to add
+
         Returns:
-        - (ReplayBufferState): updated replay buffer state"""
+            ReplayBufferState: updated replay buffer state
+        """
         return replace(state,
             buffer = jax.tree_util.tree_map(
                 lambda x, y: x.at[state.next_idx].set(y),
@@ -87,14 +95,14 @@ class EpisodeReplayBuffer:
     
 
     def assign_rewards(self, state: ReplayBufferState, reward: jax.Array) -> ReplayBufferState:
-        """ Assign rewards to the current episode.
-        
+        """Assign rewards to the current episode.
+
         Args:
-        - `state`: replay buffer state
-        - `reward`: rewards to assign (for each player)
+            state: replay buffer state
+            reward: rewards to assign (for each player)
 
         Returns:
-        - (ReplayBufferState): updated replay buffer state
+            ReplayBufferState: updated replay buffer state
         """
         return replace(state,
             episode_start_idx = state.next_idx,
@@ -113,13 +121,14 @@ class EpisodeReplayBuffer:
         state: ReplayBufferState,
     ) -> ReplayBufferState:
         """Truncates the replay buffer, removing all experiences from the current episode.
+
         Use this if we want to discard all experiences from the current episode.
-        
+
         Args:
-        - `state`: replay buffer state
-        
+            state: replay buffer state
+
         Returns:
-        - (ReplayBufferState): updated replay buffer state
+            ReplayBufferState: updated replay buffer state
         """
         # un-assigned trajectory indices have populated set to False
         # so their buffer contents will be overwritten (eventually)
@@ -152,15 +161,15 @@ class EpisodeReplayBuffer:
         so `state` must hold concrete arrays (as it does when called from `Trainer.train_steps`).
 
         Args:
-        - `state`: replay buffer state
-        - `key`: rng
-        - `sample_size`: size of minibatch to sample
+            state: replay buffer state
+            key: rng
+            sample_size: size of minibatch to sample
 
         Returns:
-        - (BaseExperience): minibatch of size (sample_size, ...)
+            BaseExperience: minibatch of size (sample_size, ...)
 
         Raises:
-        - `ValueError`: if no episode has finished yet, so there is nothing to sample
+            ValueError: if no episode has finished yet, so there is nothing to sample
         """
         masked_weights = jnp.logical_and(
             state.populated,
@@ -199,14 +208,14 @@ class EpisodeReplayBuffer:
     
     def init(self, batch_size: int, template_experience: BaseExperience) -> ReplayBufferState:
         """Initializes the replay buffer state.
-        
+
         Args:
-        - `batch_size`: number of parallel environments
-        - `template_experience`: template experience data structure
-            - just used to determine the shape of the replay buffer data
+            batch_size: number of parallel environments
+            template_experience: template experience data structure
+                - just used to determine the shape of the replay buffer data
 
         Returns:
-        - (ReplayBufferState): initialized replay buffer state
+            ReplayBufferState: initialized replay buffer state
         """
         return ReplayBufferState(
             next_idx = jnp.zeros((batch_size,), dtype=jnp.int32),

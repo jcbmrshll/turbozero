@@ -1,4 +1,3 @@
-
 from typing import Callable, Optional, Tuple
 
 import equinox as eqx
@@ -22,12 +21,13 @@ def apply_nn(
         `nn(x, nn_state) -> ((policy_logits, value), nn_state)`
 
     Args:
-    - `nn`: the neural network
-    - `nn_state`: state of the network, None for stateless networks
-    - `x`: batch of inputs
+        nn: the neural network
+        nn_state: state of the network, None for stateless networks
+        x: batch of inputs
 
     Returns:
-    - ((policy_logits, value), nn_state): batched outputs and the updated network state
+        Tuple[Tuple[jax.Array, jax.Array], Optional[eqx.nn.State]]: ((policy_logits, value), nn_state),
+            the batched outputs and the updated network state
     """
     if nn_state is None:
         return jax.vmap(nn)(x), None
