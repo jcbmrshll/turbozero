@@ -21,8 +21,6 @@ BLOCK_MOVES, BLOCKING_ACTION = [0, 4, 8, 2], 6
 # a few moves in, so some actions are illegal
 MIDGAME_MOVES = [4, 0, 8, 2]
 
-XFAIL_4 = pytest.mark.xfail(strict=True, raises=AssertionError,
-                            reason="#4: plain MCTS does not mask illegal actions at the root")
 XFAIL_5 = pytest.mark.xfail(strict=True, raises=AssertionError,
                             reason="#5: WeightedMCTS backs up 0-1 normalised values, so losses look like wins")
 XFAIL_1 = pytest.mark.xfail(strict=True, raises=AssertionError,
@@ -66,7 +64,7 @@ def test_visit_counts_add_up(make_search, ttt, cls):
 @pytest.mark.parametrize("cls", [
     pytest.param(AZ_MCTS, id="AlphaZero(MCTS)"),
     pytest.param(AZ_WEIGHTED, id="AlphaZero(WeightedMCTS)"),
-    pytest.param(MCTS, id="MCTS", marks=XFAIL_4),
+    pytest.param(MCTS, id="MCTS"),
 ])
 def test_policy_weights_are_normalised_and_legal(make_search, ttt, cls):
     out, meta = run_search(make_search(cls), jax.random.PRNGKey(0), MIDGAME_MOVES, ttt)
@@ -79,7 +77,7 @@ def test_policy_weights_are_normalised_and_legal(make_search, ttt, cls):
 @pytest.mark.parametrize("cls", [
     pytest.param(AZ_MCTS, id="AlphaZero(MCTS)"),
     pytest.param(AZ_WEIGHTED, id="AlphaZero(WeightedMCTS)"),
-    pytest.param(MCTS, id="MCTS", marks=XFAIL_4),
+    pytest.param(MCTS, id="MCTS"),
 ])
 def test_no_root_visits_to_illegal_moves(make_search, ttt, cls):
     out, meta = run_search(make_search(cls), jax.random.PRNGKey(0), MIDGAME_MOVES, ttt)
