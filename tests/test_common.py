@@ -44,8 +44,6 @@ def test_two_player_game_first_mover_wins_with_first_legal_play(ttt, scripted):
     np.testing.assert_array_equal(outcomes, expected)
 
 
-@pytest.mark.xfail(strict=True, raises=TypeError,
-                   reason="#9: two_player_game reshapes 2*(max_steps//2) frames to max_steps, so odd values crash")
 def test_two_player_game_with_odd_max_steps(ttt, scripted):
     max_steps = 7
     outcomes, frames, evaluator_1_first = play_games(ttt, scripted.first_legal, scripted.first_legal, max_steps)

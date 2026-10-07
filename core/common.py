@@ -309,14 +309,15 @@ def two_player_game(
         outcomes = state.outcomes
     )
 
-    # takes a turn for each player
-    def step_step(state: TwoPlayerGameState, _) -> TwoPlayerGameState:
-        # take a turn for the active player
+    # takes a turn for the active player
+    def step_step(state: TwoPlayerGameState, step_num: jax.Array) -> TwoPlayerGameState:
+        # players alternate turns, starting with the first player
+        use_p1 = (step_num % 2 == 0) == p1_first
         state = jax.lax.cond(
             state.completed,
             lambda s: s,
             lambda s: jax.lax.cond(
-                p1_first,
+                use_p1,
                 step_p1,
                 step_p2,
                 s
@@ -324,44 +325,22 @@ def two_player_game(
             state
         )
         # collect render frame
-        frame1 = GameFrame(
+        frame = GameFrame(
             env_state = state.env_state,
             p1_value_estimate = state.p1_value_estimate,
             p2_value_estimate = state.p2_value_estimate,
             completed = state.completed,
             outcomes = state.outcomes
         )
-        # take a turn for the other player
-        state = jax.lax.cond(
-            state.completed,
-            lambda s: s,
-            lambda s: jax.lax.cond(
-                p1_first,
-                step_p2,
-                step_p1,
-                s
-            ),
-            state
-        )
-        # collect render frame
-        frame2 = GameFrame(
-            env_state = state.env_state,
-            p1_value_estimate = state.p1_value_estimate,
-            p2_value_estimate = state.p2_value_estimate,
-            completed = state.completed,
-            outcomes = state.outcomes
-        )
-        # return game state and render frames
-        return state, jax.tree.map(lambda x, y: jnp.stack([x, y]), frame1, frame2)
+        # return game state and render frame
+        return state, frame
     
     # play the game
     state, frames = jax.lax.scan(
         step_step,
         state,
-        xs=jnp.arange(max_steps//2)
+        xs=jnp.arange(max_steps)
     )
-    # reshape frames
-    frames = jax.tree.map(lambda x: x.reshape(max_steps, *x.shape[2:]), frames)
     # append initial state to front of frames
     frames = jax.tree.map(lambda i, x: jnp.concatenate([jnp.expand_dims(i, 0), x]), initial_game_frame, frames)
     # return outcome, frames, player ids
