@@ -172,8 +172,7 @@ class Trainer:
         # checkpoints
         self.ckpt_dir = ckpt_dir
         options = ocp.CheckpointManagerOptions(max_to_keep=max_checkpoints, create=True)
-        self.checkpoint_manager = ocp.CheckpointManager(
-            ocp.test_utils.erase_and_create_empty(ckpt_dir), options=options)
+        self.checkpoint_manager = ocp.CheckpointManager(os.path.abspath(ckpt_dir), options=options)
         # wandb
         self.wandb_project_name = wandb_project_name
         self.use_wandb = wandb_project_name != ""
@@ -481,7 +480,10 @@ class Trainer:
         # convert pmap-sharded train_state to a single-device one
         ckpt = jax.tree.map(lambda x: jax.device_get(x), train_state)
         # save checkpoint (async)
-        self.checkpoint_manager.save(epoch, args=ocp.args.StandardSave(ckpt))
+        # orbax skips the save if `ckpt_dir` already holds a checkpoint at or after `epoch`
+        if not self.checkpoint_manager.save(epoch, args=ocp.args.StandardSave(ckpt)):
+            raise ValueError(f"{self.ckpt_dir} already has a checkpoint at or after epoch {epoch}, "
+                             "resume from it or use a different ckpt_dir")
 
 
     def load_train_state_from_checkpoint(self, path_to_checkpoint: str, epoch: int) -> TrainState:
