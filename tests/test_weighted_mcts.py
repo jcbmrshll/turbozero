@@ -34,8 +34,6 @@ def backed_up_root_q(q_temperature, tree):
     return float(tree.data_at(tree.ROOT_INDEX).q)
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError,
-                   reason="#5: q_temperature is applied to the averaged values, not to the softmax weights")
 def test_lower_q_temperature_weights_the_best_child_more():
     # child values already span [0, 1], so normalising them changes nothing and only the
     # temperature differs between the runs
@@ -46,8 +44,6 @@ def test_lower_q_temperature_weights_the_best_child_more():
     assert hot < neutral < cold
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError,
-                   reason="#5: WeightedMCTS writes the 0-1 normalised value into node.q and mixes it with the raw value")
 @pytest.mark.parametrize("q_temperature", [0.5, 1.0])
 def test_backed_up_value_stays_on_the_network_value_scale(q_temperature):
     # every child is losing for the root player, and so is the network's own value for the root
@@ -57,3 +53,17 @@ def test_backed_up_value_stays_on_the_network_value_scale(q_temperature):
     root_q = backed_up_root_q(q_temperature, tree)
 
     assert min(child_values) <= root_q <= max(child_values)
+
+
+@pytest.mark.parametrize("child_values, root_value, expected_weighted", [
+    ([-0.8, -0.6], -0.7, -0.6),
+    # all visited children tie: the unvisited third child must never be picked
+    ([-0.5, -0.5], -0.5, -0.5),
+])
+def test_zero_q_temperature_backs_up_the_best_visited_child(child_values, root_value, expected_weighted):
+    tree = root_with_children(root_q=root_value, root_r=root_value, child_values=child_values)
+    n = 1 + len(child_values)
+
+    root_q = backed_up_root_q(0.0, tree)
+
+    assert root_q == pytest.approx((expected_weighted * n + root_value) / (n + 1))
