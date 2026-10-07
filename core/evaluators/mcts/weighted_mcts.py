@@ -111,33 +111,34 @@ class WeightedMCTS(MCTS):
             child_n_values = tree.get_child_data('n', node_idx)
 
             # normalize q-values to [0, 1]
+            # (only used to compute the weights, the backed-up value stays on the network's value scale)
             normalized_q_values = normalize_q_values(child_q_values, child_n_values, node.q, jnp.finfo(node.q).eps)
-            
+
             if self.q_temperature > 0:
-                # if temperature > 0, apply temperature to q-values
-                q_values = normalized_q_values ** (1/self.q_temperature)
+                # if temperature > 0, apply temperature to the softmax logits
                 # mask out unvisited action a[i] so softmax(a)[i] = 0.0
                 q_values_masked = jnp.where(
-                    child_n_values > 0, normalized_q_values, jnp.finfo(normalized_q_values).min
+                    child_n_values > 0, normalized_q_values / self.q_temperature, jnp.finfo(normalized_q_values).min
                 )
             else:
-                # if temperature == 0, select max q-value
+                # if temperature == 0, select max q-value amongst visited children
                 # apply random noise to break ties amongst nodes w/ same number of visits
                 noise = jax.random.uniform(key, shape=normalized_q_values.shape, maxval=self.tiebreak_noise)
-                noisy_q_values = normalized_q_values + noise
+                noisy_q_values = jnp.where(
+                    child_n_values > 0, normalized_q_values + noise, jnp.finfo(normalized_q_values).min
+                )
 
                 # mask out all values except for max value index
                 # so softmax output at a[max_index] = 1 and 0 everywhere else
                 max_vector = jnp.full_like(noisy_q_values, jnp.finfo(noisy_q_values).min)
                 index_of_max = jnp.argmax(noisy_q_values)
                 max_vector = max_vector.at[index_of_max].set(1)
-                q_values = normalized_q_values
                 q_values_masked = max_vector
 
             # compute weights
             child_weights = jax.nn.softmax(q_values_masked, axis=-1)
-            # computer weighted sum of q-values
-            weighted_value = jnp.sum(child_weights * q_values)
+            # compute weighted sum of (discounted) child q-values
+            weighted_value = jnp.sum(child_weights * child_q_values)
             # update node with weighted value
             node = replace(node, q=weighted_value)
             # adjust node value to ((weighted_value * node_visits) + raw_value) / (node_visits + 1)

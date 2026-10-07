@@ -21,8 +21,6 @@ BLOCK_MOVES, BLOCKING_ACTION = [0, 4, 8, 2], 6
 # a few moves in, so some actions are illegal
 MIDGAME_MOVES = [4, 0, 8, 2]
 
-XFAIL_5 = pytest.mark.xfail(strict=True, raises=AssertionError,
-                            reason="#5: WeightedMCTS backs up 0-1 normalised values, so losses look like wins")
 
 ALL_SEARCHES = [
     pytest.param(AZ_MCTS, id="AlphaZero(MCTS)"),
@@ -117,7 +115,7 @@ def test_finds_forced_win(make_search, ttt, cls, first_player):
 @pytest.mark.parametrize("first_player", [0, 1])
 @pytest.mark.parametrize("cls", [
     pytest.param(AZ_MCTS, id="AlphaZero(MCTS)"),
-    pytest.param(AZ_WEIGHTED, id="AlphaZero(WeightedMCTS)", marks=XFAIL_5),
+    pytest.param(AZ_WEIGHTED, id="AlphaZero(WeightedMCTS)"),
 ])
 def test_blocks_forced_loss(make_search, ttt, cls, first_player):
     out, _ = run_search(make_search(cls), jax.random.PRNGKey(0), BLOCK_MOVES, ttt,
