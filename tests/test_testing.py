@@ -60,3 +60,16 @@ def test_two_player_tester_adopts_params_on_every_device_when_overall_mean_is_po
 
     np.testing.assert_array_equal(metrics["TwoPlayerTester_avg_outcome"], [1.0, 0.0])
     np.testing.assert_array_equal(state.best_params["w"], np.ones((2, 3)))
+
+
+def test_tester_run_on_skipped_epoch_returns_state_unchanged(ttt, scripted):
+    tester = TwoPlayerTester(num_episodes=2, epochs_per_test=2)
+    state = TwoPlayerTestState(best_params=replicate({"w": jnp.zeros(3)}, 2))
+
+    new_state, metrics, rendered = tester.run(key=jax.random.PRNGKey(0), epoch_num=1, max_steps=MAX_STEPS, num_devices=2,
+                                              env_step_fn=ttt.step_fn, env_init_fn=ttt.init_fn, evaluator=scripted.first_legal,
+                                              state=state, params=replicate({"w": jnp.ones(3)}, 2))
+
+    assert new_state is state
+    assert metrics == {}
+    assert rendered is None
