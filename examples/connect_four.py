@@ -14,6 +14,7 @@ The hyperparameters here are only an example; tune them for your task and hardwa
 
 import argparse
 from functools import partial
+from typing import cast
 
 import equinox as eqx
 import jax
@@ -82,7 +83,8 @@ def main():
             num_blocks=4,
             num_channels=16,
         ),
-        env.observation_shape,
+        # pgx types observation_shape as Tuple[int, ...]; for board games it's (height, width, channels)
+        cast(tuple[int, int, int], env.observation_shape),
         key=jax.random.PRNGKey(args.seed),
     )
 

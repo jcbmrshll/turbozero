@@ -17,6 +17,7 @@ and hardware.
 import argparse
 import os
 from functools import partial
+from typing import cast
 
 import equinox as eqx
 import jax
@@ -25,7 +26,10 @@ import optax
 import pgx
 
 from core.evaluators.alphazero import AlphaZero
-from core.evaluators.evaluation_fns import make_nn_eval_fn, make_nn_eval_fn_no_params_callable
+from core.evaluators.evaluation_fns import (
+    make_nn_eval_fn,
+    make_nn_eval_fn_no_params_callable,
+)
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.mcts.mcts import MCTS
 from core.memory.replay_memory import EpisodeReplayBuffer
@@ -132,7 +136,8 @@ def main():
             num_blocks=4,
             num_channels=32,
         ),
-        env.observation_shape,
+        # pgx types observation_shape as Tuple[int, ...]; for board games it's (height, width, channels)
+        cast(tuple[int, int, int], env.observation_shape),
         key=jax.random.PRNGKey(args.seed),
     )
 

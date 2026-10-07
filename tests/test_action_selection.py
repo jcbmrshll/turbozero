@@ -6,7 +6,11 @@ import numpy as np
 import pytest
 
 from core.evaluators.alphazero import AlphaZero
-from core.evaluators.mcts.action_selection import MuZeroPUCTSelector, PUCTSelector, normalize_q_values
+from core.evaluators.mcts.action_selection import (
+    MuZeroPUCTSelector,
+    PUCTSelector,
+    normalize_q_values,
+)
 from core.evaluators.mcts.mcts import MCTS
 from core.trees.tree import init_tree
 

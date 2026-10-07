@@ -1,4 +1,5 @@
 from functools import partial
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -6,6 +7,7 @@ import numpy as np
 
 from core.common import two_player_game
 from core.testing.two_player_tester import TwoPlayerTester, TwoPlayerTestState
+from core.testing.utils import render_pgx_2p
 
 MAX_STEPS = 10
 
@@ -73,3 +75,21 @@ def test_tester_run_on_skipped_epoch_returns_state_unchanged(ttt, scripted):
     assert new_state is state
     assert metrics == {}
     assert rendered is None
+
+
+def test_render_pgx_2p_handles_svgs_with_a_viewbox(tmp_path):
+    # pgx's own SVGs only set width/height; an SVG with a viewBox used to hit an unbound `original_width`
+    class ViewBoxState:
+        current_player = 0
+
+        def save_svg(self, path, color_theme):  # pylint: disable=unused-argument
+            with open(path, "w") as f:
+                f.write('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 50" height="50">'
+                        '<rect width="100" height="50" fill="black"/></svg>')
+
+    frames = [SimpleNamespace(env_state=ViewBoxState(), completed=np.array(done), outcomes=np.array([1.0, -1.0]),
+                              p1_value_estimate=0.5, p2_value_estimate=-0.5) for done in (False, True)]
+
+    render_pgx_2p(frames, p_ids=[0, 1], title="viewbox", frame_dir=str(tmp_path))
+
+    assert (tmp_path / "viewbox.gif").exists()

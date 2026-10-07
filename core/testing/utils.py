@@ -1,9 +1,10 @@
 
 import os
-
 import xml.etree.ElementTree as ET
+
 import cairosvg
 from PIL import Image
+
 
 def render_pgx_2p(frames, p_ids, title, frame_dir, p1_label='Black', p2_label='White', duration=900):
     """Really messy render function for rendering frames from a 2-player game from a PGX environment to a .gif."""
@@ -34,6 +35,7 @@ def render_pgx_2p(frames, p_ids, title, frame_dir, p1_label='Black', p2_label='W
         if viewBox:
             viewBox = viewBox.split()
             viewBox = [float(v) for v in viewBox]
+            original_width = viewBox[2]
             original_height = viewBox[3]
         else:
             original_width = float(root.attrib.get('width', 0))

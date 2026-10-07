@@ -41,8 +41,8 @@ class ReplayBufferState:
             - we store samples from in-progress episodes, but don't want to be able to sample them
               until the episode is complete
     """
-    next_idx: int
-    episode_start_idx: int
+    next_idx: jax.Array
+    episode_start_idx: jax.Array
     buffer: BaseExperience
     populated: jax.Array
     has_reward: jax.Array

@@ -1,4 +1,5 @@
-from typing import Any, Callable, Tuple
+from collections.abc import Callable
+from typing import Any
 
 import equinox as eqx
 import jax
@@ -9,7 +10,7 @@ from core.networks.utils import apply_nn
 def make_nn_eval_fn(
     nn: eqx.Module,
     state_to_nn_input_fn: Callable[[Any], jax.Array]
-) -> Callable[[Any, Any, jax.Array], Tuple[jax.Array, jax.Array]]:
+) -> Callable[[Any, Any, jax.Array], tuple[jax.Array, jax.Array]]:
     """Creates a leaf evaluation function using a neural network (state, params) -> (policy_logits, value).
 
     Args:
@@ -35,9 +36,9 @@ def make_nn_eval_fn(
 
 
 def make_nn_eval_fn_no_params_callable(
-    nn: Callable[[jax.Array], Tuple[jax.Array, jax.Array]],
+    nn: Callable[[jax.Array], tuple[jax.Array, jax.Array]],
     state_to_nn_input_fn: Callable[[Any], jax.Array]
-) -> Callable[[Any, Any, jax.Array], Tuple[jax.Array, jax.Array]]:
+) -> Callable[[Any, Any, jax.Array], tuple[jax.Array, jax.Array]]:
     """Creates a leaf evaluation function that uses a stateless neural net evaluation function (state) -> (policy, value).
 
     Args:

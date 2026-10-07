@@ -2,9 +2,9 @@
 
 Every Trainer instance compiles its own self-play, training and testing functions, so the tests
 share one trainer per device count and only change settings that don't affect compilation."""
-from functools import partial
 import os
 import shutil
+from functools import partial
 
 import equinox as eqx
 import jax

@@ -1,14 +1,24 @@
 
 from dataclasses import replace
 from functools import partial
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
+
 import jax
 import jax.numpy as jnp
+from jax.typing import ArrayLike
+
 from core.evaluators.evaluator import Evaluator
 from core.evaluators.mcts.action_selection import MCTSActionSelector
-from core.evaluators.mcts.state import BackpropState, MCTSNode, MCTSTree, TraversalState, MCTSOutput
+from core.evaluators.mcts.state import (
+    BackpropState,
+    MCTSNode,
+    MCTSOutput,
+    MCTSTree,
+    TraversalState,
+)
 from core.trees.tree import init_tree
 from core.types import EnvStepFn, EvalFn, StepMetadata
+
 
 class MCTS(Evaluator):
     """Batched implementation of Monte Carlo Tree Search (MCTS).
@@ -55,7 +65,7 @@ class MCTS(Evaluator):
         self.persist_tree = persist_tree
 
 
-    def get_config(self) -> Dict:
+    def get_config(self) -> dict:
         """Returns a config object for checkpoints."""
         return {
             "eval_fn": self.eval_fn.__name__,
@@ -211,7 +221,7 @@ class MCTS(Evaluator):
         # continue while:
         # - there is an existing edge corresponding to the chosen action
         # - AND the child node connected to that edge is not terminal
-        def cond_fn(state: TraversalState) -> bool:
+        def cond_fn(state: TraversalState) -> jax.Array:
             return jnp.logical_and(
                 tree.is_edge(state.parent, state.action),
                 ~(tree.data_at(tree.edge_map[state.parent, state.action]).terminated)
@@ -235,7 +245,7 @@ class MCTS(Evaluator):
         )
 
 
-    def backpropagate(self, key: jax.Array, tree: MCTSTree, parent: int, value: float) -> MCTSTree: #pylint: disable=unused-argument
+    def backpropagate(self, key: jax.Array, tree: MCTSTree, parent: ArrayLike, value: ArrayLike) -> MCTSTree: #pylint: disable=unused-argument
         """Backpropagate the value estimate from the leaf node to the root node and update visit counts.
 
         Args:
@@ -248,7 +258,7 @@ class MCTS(Evaluator):
             MCTSTree: updated search tree
         """
 
-        def body_fn(state: BackpropState) -> Tuple[int, MCTSTree]:
+        def body_fn(state: BackpropState) -> BackpropState:
             node_idx, value, tree = state.node_idx, state.value, state.tree
             # apply discount to value estimate
             value *= self.discount
@@ -269,7 +279,7 @@ class MCTS(Evaluator):
         return state.tree
 
 
-    def sample_root_action(self, key: jax.Array, tree: MCTSTree) -> Tuple[int, jax.Array]:
+    def sample_root_action(self, key: jax.Array, tree: MCTSTree) -> tuple[jax.Array, jax.Array]:
         """Sample an action based on the root visit counts.
 
         Args:
@@ -277,7 +287,7 @@ class MCTS(Evaluator):
             tree: MCTSTree to evaluate
 
         Returns:
-            Tuple[int, jax.Array]: sampled action, normalized policy weights
+            Tuple[jax.Array, jax.Array]: sampled action, normalized policy weights
         """
         # get root visit counts
         action_visits = tree.get_child_data('n', tree.ROOT_INDEX)
@@ -306,10 +316,10 @@ class MCTS(Evaluator):
     @staticmethod
     def visit_node(
         node: MCTSNode,
-        value: float,
-        p: Optional[jax.Array] = None,
-        terminated: Optional[bool] = None,
-        embedding: Optional[Any] = None
+        value: ArrayLike,
+        p: jax.Array | None = None,
+        terminated: ArrayLike | None = None,
+        embedding: Any | None = None
     ) -> MCTSNode:
         """Update the visit counts and value estimate of a node.
 
@@ -342,7 +352,7 @@ class MCTS(Evaluator):
     
 
     @staticmethod
-    def new_node(policy: jax.Array, value: float, embedding: Any, terminated: bool) -> MCTSNode:
+    def new_node(policy: jax.Array, value: ArrayLike, embedding: Any, terminated: ArrayLike) -> MCTSNode:
         """Create a new MCTSNode.
 
         Args:
@@ -366,7 +376,7 @@ class MCTS(Evaluator):
     
 
     @staticmethod
-    def update_root_node(root_node: MCTSNode, root_policy: jax.Array, root_value: float, root_embedding: Any) -> MCTSNode:
+    def update_root_node(root_node: MCTSNode, root_policy: jax.Array, root_value: ArrayLike, root_embedding: Any) -> MCTSNode:
         """Update the root node of the search tree.
 
         Args:
@@ -401,7 +411,7 @@ class MCTS(Evaluator):
         return state.reset()
 
 
-    def step(self, state: MCTSTree, action: int) -> MCTSTree:
+    def step(self, state: MCTSTree, action: jax.Array) -> MCTSTree:
         """Update the internal state of MCTS after taking an action in the environment.
 
         Args:

@@ -1,21 +1,35 @@
-from dataclasses import dataclass, replace
-from functools import partial
 import os
 import re
-from typing import Any, List, Optional, Tuple
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
+from functools import partial
+from typing import Any
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh, NamedSharding, PartitionSpec
 import optax
 import wandb
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from core.common import partition, step_env_and_evaluator
 from core.evaluators.evaluator import Evaluator
-from core.memory.replay_memory import BaseExperience, EpisodeReplayBuffer, ReplayBufferState
+from core.memory.replay_memory import (
+    BaseExperience,
+    EpisodeReplayBuffer,
+    ReplayBufferState,
+)
 from core.testing.tester import BaseTester, TestState
-from core.types import DataTransformFn, EnvInitFn, EnvStepFn, ExtractModelParamsFn, LossFn, StateToNNInputFn, StepMetadata, TrainState
+from core.types import (
+    DataTransformFn,
+    EnvInitFn,
+    EnvStepFn,
+    ExtractModelParamsFn,
+    LossFn,
+    StateToNNInputFn,
+    StepMetadata,
+    TrainState,
+)
 
 
 @jax.tree_util.register_dataclass
@@ -49,7 +63,7 @@ class TrainLoopOutput:
     """
     collection_state: CollectionState
     train_state: TrainState
-    test_states: List[TestState]
+    test_states: list[TestState]
     cur_epoch: int
 
 
@@ -71,7 +85,7 @@ def checkpoint_path(ckpt_dir: str, epoch: int) -> str:
     return os.path.join(ckpt_dir, f"{epoch}.eqx")
 
 
-def checkpoint_epochs(ckpt_dir: str) -> List[int]:
+def checkpoint_epochs(ckpt_dir: str) -> list[int]:
     """Epochs with a checkpoint in `ckpt_dir`, in ascending order."""
     if not os.path.isdir(ckpt_dir):
         return []
@@ -99,17 +113,17 @@ class Trainer:
         env_step_fn: EnvStepFn,
         env_init_fn: EnvInitFn,
         state_to_nn_input_fn: StateToNNInputFn,
-        testers: List[BaseTester],
-        nn_state: Optional[eqx.nn.State] = None,
-        evaluator_test: Optional[Evaluator] = None,
-        data_transform_fns: List[DataTransformFn] = [],
-        extract_model_params_fn: Optional[ExtractModelParamsFn] = extract_params,
+        testers: Sequence[BaseTester],
+        nn_state: eqx.nn.State | None = None,
+        evaluator_test: Evaluator | None = None,
+        data_transform_fns: Sequence[DataTransformFn] = (),
+        extract_model_params_fn: ExtractModelParamsFn = extract_params,
         wandb_project_name: str = "",
         ckpt_dir: str = "/tmp/turbozero_checkpoints",
         max_checkpoints: int = 2,
-        num_devices: Optional[int] = None,
-        wandb_run: Optional[Any] = None,
-        extra_wandb_config: Optional[dict] = None
+        num_devices: int | None = None,
+        wandb_run: Any | None = None,
+        extra_wandb_config: dict | None = None
     ):
         """Initializes a Trainer.
 
@@ -201,7 +215,7 @@ class Trainer:
         self.check_size_compatibilities()
 
 
-    def init_wandb(self, project_name: str, extra_wandb_config: Optional[dict]):
+    def init_wandb(self, project_name: str, extra_wandb_config: dict | None):
         """Initializes wandb run.
 
         Args:
@@ -389,7 +403,7 @@ class Trainer:
     
 
     @partial(jax.pmap, axis_name='d', static_broadcasted_argnums=(0,))
-    def one_train_step(self, ts: TrainState, batch: BaseExperience) -> Tuple[TrainState, dict]:
+    def one_train_step(self, ts: TrainState, batch: BaseExperience) -> tuple[TrainState, dict]:
         """Make a single training step.
 
         Args:
@@ -427,7 +441,7 @@ class Trainer:
         collection_state: CollectionState,
         train_state: TrainState,
         num_steps: int
-    ) -> Tuple[CollectionState, TrainState, dict]:
+    ) -> tuple[CollectionState, TrainState, dict]:
         """Performs `num_steps` training steps.
 
         Each step consists of sampling a minibatch from the replay buffer and updating the parameters.
@@ -464,14 +478,14 @@ class Trainer:
                 batch_metrics.append(metrics)
         # take mean of metrics across all training steps
         if batch_metrics:
-            metrics = {k: jnp.stack([m[k] for m in batch_metrics]).mean() for k in batch_metrics[0].keys()}
+            metrics = {k: jnp.stack([m[k] for m in batch_metrics]).mean() for k in batch_metrics[0]}
         else:
             metrics = {}
         # return updated collection state, train state, and metrics
         return collection_state, train_state, metrics
     
     
-    def log_metrics(self, metrics: dict, epoch: int, step: Optional[int] = None):
+    def log_metrics(self, metrics: dict, epoch: int, step: int | None = None):
         """Logs metrics to console and wandb.
 
         Args:
@@ -587,8 +601,8 @@ class Trainer:
         seed: int,
         num_epochs: int,
         eval_every: int = 1,
-        initial_state: Optional[TrainLoopOutput] = None
-    ) -> Tuple[CollectionState, TrainState]:
+        initial_state: TrainLoopOutput | None = None
+    ) -> TrainLoopOutput:
         """Runs the training loop for `num_epochs` epochs. Mostly configured by the Trainer's attributes.
 
         - Collects self-play episdoes across a batch of environments.

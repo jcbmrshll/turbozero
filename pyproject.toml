@@ -28,15 +28,22 @@ build-backend = "hatchling.build"
 packages = ["core"]
 
 [tool.pyright]
+include = ["core", "tests", "examples"]
 venvPath = "."
 venv = ".venv"
+
+[tool.ruff]
+# `ruff check` uses ruff's default rule set (no select/ignore); `ruff format` is not enforced
 
 [dependency-groups]
 dev = [
     # environments + pretrained baselines used by the examples (pgx's baseline models need haiku)
     "dm-haiku>=0.0.17",
     "pgx>=2.6.0",
+    "pre-commit>=4.6.2",
+    "pyright>=1.1.414",
     "pytest>=9.1.1",
+    "ruff>=0.16.10",
 ]
 
 [tool.pytest.ini_options]

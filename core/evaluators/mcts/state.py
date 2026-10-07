@@ -1,10 +1,12 @@
 
 from dataclasses import dataclass
+from operator import itemgetter
 from typing import Any
 
 import graphviz
 import jax
 import jax.numpy as jnp
+from jax.typing import ArrayLike
 
 from core.evaluators.evaluator import EvalOutput
 from core.trees.tree import Tree
@@ -22,14 +24,14 @@ class MCTSNode:
         terminated: whether the environment state is terminal
         embedding: environment state
     """
-    n: jnp.number
+    n: jax.Array
     p: jax.Array
-    q: jnp.number
-    terminated: jnp.number
+    q: jax.Array
+    terminated: jax.Array
     embedding: Any
 
     @property
-    def w(self) -> jnp.number:
+    def w(self) -> jax.Array:
         """Cumulative value estimate."""
         return self.q * self.n
 
@@ -47,8 +49,8 @@ class TraversalState:
         parent: parent node index
         action: action taken from parent
     """
-    parent: int
-    action: int
+    parent: ArrayLike
+    action: jax.Array
 
 
 @jax.tree_util.register_dataclass
@@ -61,8 +63,8 @@ class BackpropState:
         value: value to backpropagate
         tree: search tree
     """
-    node_idx: int
-    value: float
+    node_idx: ArrayLike
+    value: ArrayLike
     tree: MCTSTree
 
 
@@ -93,7 +95,7 @@ def tree_to_graph(tree, batch_id=0):
         )
 
     for n_i in range(tree.parents.shape[1]):
-        node = jax.tree_util.tree_map(lambda x: x[batch_id, n_i], tree.data)
+        node = jax.tree_util.tree_map(itemgetter((batch_id, n_i)), tree.data)
         if node.n.item() > 0:
             graph.node(str(n_i), str({
                 "i": str(n_i),

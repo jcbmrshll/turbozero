@@ -17,3 +17,15 @@ jobs:
       # CPU build of jax: no --extra cuda, the runners have no GPU (tests/conftest.py also forces CPU)
       - run: uv sync --locked
       - run: uv run pytest
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      # CPU build of jax, as above: pyright only needs the packages installed to resolve types
+      - run: uv sync --locked
+      - run: uv run ruff check .
+      - run: uv run pyright
