@@ -11,24 +11,24 @@ from core.memory.replay_memory import BaseExperience
 
 def az_default_loss_fn(params: Any, train_state: TrainState, experience: BaseExperience, 
                        l2_reg_lambda: float = 0.0001) -> Tuple[jax.Array, Tuple[Any, optax.OptState]]:
-    """ Implements the default AlphaZero loss function.
-    
+    """Implements the default AlphaZero loss function.
+
     = Policy Loss + Value Loss + L2 Regularization
     Policy Loss: Cross-entropy loss between predicted policy and target policy
     Value Loss: L2 loss between predicted value and target value
-    
+
     Args:
-    - `params`: the parameters of the neural network
-    - `train_state`: flax TrainState (holds optimizer and other state)
-    - `experience`: experience sampled from replay buffer
-        - stores the observation, target policy, target value
-    - `l2_reg_lambda`: L2 regularization weight (default = 1e-4)
+        params: the parameters of the neural network
+        train_state: flax TrainState (holds optimizer and other state)
+        experience: experience sampled from replay buffer
+            - stores the observation, target policy, target value
+        l2_reg_lambda: L2 regularization weight (default = 1e-4)
 
     Returns:
-    - (loss, (aux_metrics, updates))
-        - `loss`: total loss
-        - `aux_metrics`: auxiliary metrics (policy_loss, value_loss)
-        - `updates`: optimizer updates
+        Tuple[chex.Array, Tuple[chex.ArrayTree, optax.OptState]]: (loss, (aux_metrics, updates))
+            - loss: total loss
+            - aux_metrics: auxiliary metrics (policy_loss, value_loss)
+            - updates: optimizer updates
     """
 
     # get batch_stats if using batch_norm

@@ -14,15 +14,15 @@ def normalize_q_values(
     epsilon: float
 ) -> jax.Array:
     """Normalize Q-values to be in the range [0, 1].
-    
+
     Args:
-    - `q_values`: Q-values to normalize
-    - `child_n_values`: visit counts of child nodes
-    - `parent_q_value`: Q-value of the parent node
-    - `epsilon`: small value to avoid division by zero
+        q_values: Q-values to normalize
+        child_n_values: visit counts of child nodes
+        parent_q_value: Q-value of the parent node
+        epsilon: small value to avoid division by zero
 
     Returns:
-    - (jax.Array): normalized Q-values
+        jax.Array: normalized Q-values
     """
     # unvisited children take the parent's value so they don't affect the range
     safe_q_values = jnp.where(child_n_values > 0, q_values, parent_q_value)
@@ -36,14 +36,15 @@ def normalize_q_values(
 
 class MCTSActionSelector:
     """Base class for action selection in MCTS.
-    
+
     Is callable, selects an action given a search tree state.
     """
 
     def __init__(self, epsilon: float = 1e-8): 
-        """
+        """Initializes an MCTSActionSelector.
+
         Args:
-        - `epsilon`: small value to avoid division by zero
+            epsilon: small value to avoid division by zero
         """
         self.epsilon = epsilon
 
@@ -62,19 +63,21 @@ class MCTSActionSelector:
 
 class PUCTSelector(MCTSActionSelector):
     """PUCT (Polynomial Upper Confidence Trees) action selector.
-    
-    This is the algorithm used for action selection within AlphaZero."""
+
+    This is the algorithm used for action selection within AlphaZero.
+    """
 
     def __init__(self, 
         c: float = 1.0,
         epsilon: float = 1e-8, 
         q_transform = normalize_q_values
     ):
-        """
+        """Initializes a PUCTSelector.
+
         Args:
-        - `c`: exploration constant (larger values encourage exploration)
-        - `epsilon`: small value to avoid division by zero
-        - `q_transform`: function applied to q-values before selection
+            c: exploration constant (larger values encourage exploration)
+            epsilon: small value to avoid division by zero
+            q_transform: function applied to q-values before selection
         """
         super().__init__(epsilon=epsilon)
         self.c = c
@@ -94,12 +97,12 @@ class PUCTSelector(MCTSActionSelector):
         """Selects an action given a search tree state.
 
         Args:
-        - `tree`: search tree
-        - `index`: index of the node in the search tree to select an action to take from
-        - `discount`: discount factor
+            tree: search tree
+            index: index of the node in the search tree to select an action to take from
+            discount: discount factor
 
         Returns:
-        - (int): id of action to take
+            int: id of action to take
         """
         # get child q-values
         node = tree.data_at(index)
@@ -127,12 +130,13 @@ class MuZeroPUCTSelector(MCTSActionSelector):
         epsilon: float = 1e-8,
         q_transform = normalize_q_values
     ):
-        """
+        """Initializes a MuZeroPUCTSelector.
+
         Args:
-        - `c1`: 1st exploration constant
-        - `c2`: 2nd exploration constant
-        - `epsilon`: small value to avoid division by zero
-        - `q_transform`: function applied to q-values before selection
+            c1: 1st exploration constant
+            c2: 2nd exploration constant
+            epsilon: small value to avoid division by zero
+            q_transform: function applied to q-values before selection
         """
         super().__init__(epsilon=epsilon)
         self.c1 = c1
@@ -153,12 +157,12 @@ class MuZeroPUCTSelector(MCTSActionSelector):
         """Selects an action given a search tree state.
 
         Args:
-        - `tree`: search tree
-        - `index`: index of the node in the search tree to select an action to take from
-        - `discount`: discount factor
+            tree: search tree
+            index: index of the node in the search tree to select an action to take from
+            discount: discount factor
 
         Returns:
-        - (int): id of action to take
+            int: id of action to take
         """
         # get child q-values
         node = tree.data_at(index)

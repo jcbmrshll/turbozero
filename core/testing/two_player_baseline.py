@@ -15,11 +15,12 @@ class TwoPlayerBaseline(BaseTester):
 
     def __init__(self, num_episodes: int, baseline_evaluator: Evaluator, baseline_params: Optional[Any] = None, 
                  *args, **kwargs):
-        """
+        """Initializes a TwoPlayerBaseline tester.
+
         Args:
-        - `num_episodes`: number of episodes to evaluate against the baseline
-        - `baseline_evaluator`: the baseline evaluator to evaluate against
-        - `baseline_params`: (optional) the parameters of the baseline evaluator
+            num_episodes: number of episodes to evaluate against the baseline
+            baseline_evaluator: the baseline evaluator to evaluate against
+            baseline_params: (optional) the parameters of the baseline evaluator
         """
         super().__init__(num_keys=num_episodes, *args, **kwargs)
         self.num_episodes = num_episodes
@@ -31,9 +32,9 @@ class TwoPlayerBaseline(BaseTester):
 
     def check_size_compatibilities(self, num_devices: int) -> None:
         """Checks if tester configuration is compatible with number of devices being utilized.
-        
+
         Args:
-        - `num_devices`: number of devices
+            num_devices: number of devices
         """
         if self.num_episodes % num_devices != 0:
             raise ValueError(f"{self.__class__.__name__}: number of episodes ({self.num_episodes}) must be divisible by number of devices ({num_devices})")
@@ -43,22 +44,22 @@ class TwoPlayerBaseline(BaseTester):
     def test(self, max_steps: int, env_step_fn: EnvStepFn, env_init_fn: EnvInitFn, evaluator: Evaluator,
         keys: jax.Array, state: TestState, params: Any) -> Tuple[TestState, Dict, GameFrame, jax.Array]:
         """Test the agent against the baseline evaluator in a two-player game.
-        
+
         Args:
-        - `max_steps`: maximum number of steps per episode
-        - `env_step_fn`: environment step function
-        - `env_init_fn`: environment initialization function
-        - `evaluator`: the agent evaluator
-        - `keys`: rng
-        - `state`: internal state of the tester
-        - `params`: nn parameters used by agent
-        
+            max_steps: maximum number of steps per episode
+            env_step_fn: environment step function
+            env_init_fn: environment initialization function
+            evaluator: the agent evaluator
+            keys: rng
+            state: internal state of the tester
+            params: nn parameters used by agent
+
         Returns:
-        - (TestState, Dict, GameFrame, jax.Array)
-            - updated internal state of the tester
-            - metrics from the test
-            - frames from the first episode of the test
-            - player ids from the first episode of the test
+            Tuple[TestState, Dict, GameFrame, jax.Array]:
+                - updated internal state of the tester
+                - metrics from the test
+                - frames from the first episode of the test
+                - player ids from the first episode of the test
         """
 
         game_fn = partial(two_player_game,
