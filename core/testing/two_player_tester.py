@@ -1,7 +1,7 @@
 
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import Any, Dict, Tuple
+from typing import Any
 
 import jax
 
@@ -56,7 +56,7 @@ class TwoPlayerTester(BaseTester):
 
     @partial(jax.pmap, axis_name='d', static_broadcasted_argnums=(0, 1, 2, 3, 4))
     def test(self, max_steps: int, env_step_fn: EnvStepFn, env_init_fn: EnvInitFn, evaluator: Evaluator,
-        keys: jax.Array, state: TwoPlayerTestState, params: Any) -> Tuple[TwoPlayerTestState, Dict, Any, jax.Array]:
+        keys: jax.Array, state: TwoPlayerTestState, params: Any) -> tuple[TwoPlayerTestState, dict, Any, jax.Array]:
         """Test the agent against the best performing parameters found so far in a two-player game.
 
         Args:

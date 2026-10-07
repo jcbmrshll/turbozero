@@ -1,8 +1,8 @@
 
-from typing import Dict
 
 import jax
 import jax.numpy as jnp
+from jax.typing import ArrayLike
 
 from core.evaluators.mcts.state import MCTSTree
 
@@ -10,8 +10,8 @@ from core.evaluators.mcts.state import MCTSTree
 def normalize_q_values(
     q_values: jax.Array, 
     child_n_values: jax.Array, 
-    parent_q_value: float,
-    epsilon: float
+    parent_q_value: ArrayLike,
+    epsilon: ArrayLike
 ) -> jax.Array:
     """Normalize Q-values to be in the range [0, 1].
 
@@ -49,12 +49,12 @@ class MCTSActionSelector:
         self.epsilon = epsilon
 
 
-    def __call__(self, tree: MCTSTree, index: int, discount: float) -> int:
+    def __call__(self, tree: MCTSTree, index: ArrayLike, discount: float) -> jax.Array:
         """Selects an action given a search tree state. Implemented by subclasses."""
         raise NotImplementedError()
 
 
-    def get_config(self) -> Dict:
+    def get_config(self) -> dict:
         """Returns the configuration of the action selector. Used for logging."""
         return {
             "epsilon": self.epsilon
@@ -84,7 +84,7 @@ class PUCTSelector(MCTSActionSelector):
         self.q_transform = q_transform
 
 
-    def get_config(self) -> Dict:
+    def get_config(self) -> dict:
         """Returns the configuration of the PUCT action selector. Used for logging."""
         return {
             "c": self.c,
@@ -93,7 +93,7 @@ class PUCTSelector(MCTSActionSelector):
         }
 
 
-    def __call__(self, tree: MCTSTree, index: int, discount: float) -> int:
+    def __call__(self, tree: MCTSTree, index: ArrayLike, discount: float) -> jax.Array:
         """Selects an action given a search tree state.
 
         Args:
@@ -102,7 +102,7 @@ class PUCTSelector(MCTSActionSelector):
             discount: discount factor
 
         Returns:
-            int: id of action to take
+            jax.Array: id of action to take
         """
         # get child q-values
         node = tree.data_at(index)
@@ -144,7 +144,7 @@ class MuZeroPUCTSelector(MCTSActionSelector):
         self.q_transform = q_transform
     
 
-    def get_config(self) -> Dict:
+    def get_config(self) -> dict:
         """Returns the configuration of the MuZero PUCT action selector. Used for logging."""
         return {
             "c1": self.c1,
@@ -153,7 +153,7 @@ class MuZeroPUCTSelector(MCTSActionSelector):
             **super().get_config()
         }
 
-    def __call__(self, tree: MCTSTree, index: int, discount: float) -> int:
+    def __call__(self, tree: MCTSTree, index: ArrayLike, discount: float) -> jax.Array:
         """Selects an action given a search tree state.
 
         Args:
@@ -162,7 +162,7 @@ class MuZeroPUCTSelector(MCTSActionSelector):
             discount: discount factor
 
         Returns:
-            int: id of action to take
+            jax.Array: id of action to take
         """
         # get child q-values
         node = tree.data_at(index)

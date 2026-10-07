@@ -1,20 +1,21 @@
 
 from dataclasses import dataclass, replace
-from typing import Any, Dict, Tuple
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
+from jax.typing import ArrayLike
 
+from core.evaluators.mcts.action_selection import normalize_q_values
 from core.evaluators.mcts.mcts import MCTS
 from core.evaluators.mcts.state import BackpropState, MCTSNode, MCTSTree
-from core.evaluators.mcts.action_selection import normalize_q_values
 
 
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class WeightedMCTSNode(MCTSNode):
     # Weighted MCTS needs access to the original raw value returned by the leaf evaluation
-    r: float # raw value 
+    r: jax.Array # raw value 
 
 
 class WeightedMCTS(MCTS):
@@ -33,7 +34,7 @@ class WeightedMCTS(MCTS):
         self.q_temperature = q_temperature
 
 
-    def get_config(self) -> Dict:
+    def get_config(self) -> dict:
         """Returns the configuration of the WeightedMCTS evaluator. Used for logging."""
         return {
             "q_temperature": self.q_temperature,
@@ -42,7 +43,7 @@ class WeightedMCTS(MCTS):
 
 
     @staticmethod
-    def new_node(policy: jax.Array, value: float, embedding: Any, terminated: bool) -> WeightedMCTSNode:
+    def new_node(policy: jax.Array, value: ArrayLike, embedding: Any, terminated: ArrayLike) -> WeightedMCTSNode:
         """Create a new WeightedMCTSNode.
 
         Args:
@@ -65,7 +66,7 @@ class WeightedMCTS(MCTS):
 
 
     @staticmethod
-    def update_root_node(root_node: MCTSNode, root_policy: jax.Array, root_value: float, root_embedding: Any) -> WeightedMCTSNode:
+    def update_root_node(root_node: MCTSNode, root_policy: jax.Array, root_value: ArrayLike, root_embedding: Any) -> WeightedMCTSNode:
         """Updates the root node.
 
         - if the tree is empty, create a new node
@@ -80,6 +81,8 @@ class WeightedMCTS(MCTS):
         Returns:
             WeightedMCTSNode: updated root node
         """
+        # WeightedMCTS trees hold WeightedMCTSNodes (see `new_node`), which the MCTSTree annotation can't express
+        root_node = cast(WeightedMCTSNode, root_node)
         visited = root_node.n > 0
         return replace(root_node,
             p=root_policy,
@@ -90,7 +93,7 @@ class WeightedMCTS(MCTS):
         )
 
 
-    def backpropagate(self, key: jax.Array, tree: MCTSTree, parent: int, value: float) -> MCTSTree:
+    def backpropagate(self, key: jax.Array, tree: MCTSTree, parent: ArrayLike, value: ArrayLike) -> MCTSTree:
         """Backpropagate weighted sums of child q-values and update visit counts.
 
         Args:
@@ -102,10 +105,10 @@ class WeightedMCTS(MCTS):
         Returns:
             MCTSTree: updated search tree
         """
-        def body_fn(state: BackpropState) -> Tuple[int, MCTSTree]:
+        def body_fn(state: BackpropState) -> BackpropState:
             node_idx, tree = state.node_idx, state.tree
-            # get node data
-            node = tree.data_at(node_idx)
+            # get node data (WeightedMCTS trees hold WeightedMCTSNodes, see `new_node`)
+            node = cast(WeightedMCTSNode, tree.data_at(node_idx))
             # get q values, visit counts of children 
             child_q_values = tree.get_child_data('q', node_idx) * self.discount
             child_n_values = tree.get_child_data('n', node_idx)

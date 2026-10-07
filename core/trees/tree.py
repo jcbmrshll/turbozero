@@ -1,23 +1,24 @@
 
 from __future__ import annotations
+
 from dataclasses import dataclass, replace
-from typing import Any, ClassVar, Generic, Tuple, TypeVar
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
+from jax.typing import ArrayLike
 
-NodeType = TypeVar('NodeType')
 
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
-class Tree(Generic[NodeType]):
+class Tree[NodeType]:
     """A generic DAG tree data structure that holds arbitrary structured data within nodes."""
     # N -> max nodes
     # F -> branching Factor
     next_free_idx: jax.Array # ()
     parents: jax.Array # (N)
     edge_map: jax.Array # (N, F)
-    data: Any # structured data with leaves of shape (N, ...)
+    data: NodeType # structured data with leaves of shape (N, ...)
 
     NULL_INDEX: ClassVar[int] = -1
     NULL_VALUE: ClassVar[int] = 0
@@ -35,7 +36,7 @@ class Tree(Generic[NodeType]):
         return self.edge_map.shape[-1]
 
 
-    def data_at(self, index: int) -> NodeType:
+    def data_at(self, index: ArrayLike) -> NodeType:
         """Returns a node's data at a specific index.
 
         Args:
@@ -60,7 +61,7 @@ class Tree(Generic[NodeType]):
             f"data type mismatch, tree contains {type(self.data)} data, but got {type(data)} data."
 
 
-    def is_edge(self, parent_index: int, edge_index: int) -> bool:
+    def is_edge(self, parent_index: ArrayLike, edge_index: ArrayLike) -> jax.Array:
         """Checks if an edge exists from a parent node along a specific edge.
 
         Args:
@@ -68,12 +69,12 @@ class Tree(Generic[NodeType]):
             edge_index: the index of the edge to check.
 
         Returns:
-            bool: whether an edge exists from the parent node along the specified edge.
+            jax.Array: whether an edge exists from the parent node along the specified edge.
         """
         return self.edge_map[parent_index, edge_index] != self.NULL_INDEX
     
     
-    def get_child_data(self, x: str, index: int, null_value=None) -> jax.Array:
+    def get_child_data(self, x: str, index: ArrayLike, null_value=None) -> jax.Array:
         """Returns a specified data field for all children of a node.
 
         Args:
@@ -96,7 +97,7 @@ class Tree(Generic[NodeType]):
             null_value, child_data)
     
 
-    def add_node(self, parent_index: int, edge_index: int, data: NodeType) -> Tree[NodeType]:
+    def add_node(self, parent_index: ArrayLike, edge_index: ArrayLike, data: NodeType) -> Tree[NodeType]:
         """Adds a new node to the tree at the next free index, if the tree has capacity left.
 
         Is a no-op if the tree is full.
@@ -149,7 +150,7 @@ class Tree(Generic[NodeType]):
                 self.data, data))
     
 
-    def update_node(self, index: int, data: NodeType) -> Tree:
+    def update_node(self, index: ArrayLike, data: NodeType) -> Tree[NodeType]:
         """Updates the data of a node at a specific index.
 
         Args:
@@ -157,7 +158,7 @@ class Tree(Generic[NodeType]):
             data: the new data to store at the specified index.
 
         Returns:
-            Tree: tree with the node data updated.
+            Tree[NodeType]: tree with the node data updated.
         """
         return replace(self,
             data=jax.tree_util.tree_map(
@@ -165,7 +166,7 @@ class Tree(Generic[NodeType]):
                 self.data, data))
     
     
-    def _get_translation(self, child_index: int) -> Tuple[jax.Array, jax.Array, jax.Array]:
+    def _get_translation(self, child_index: ArrayLike) -> tuple[jax.Array, jax.Array, jax.Array]:
         """Extracts mapping of node_idxs in a particular root subtree (with root at `child_index`) to collapsed indices.
 
         Args:
@@ -216,7 +217,7 @@ class Tree(Generic[NodeType]):
         return old_subtree_idxs, translation, erase_idxs
     
 
-    def get_subtree(self, subtree_index: int) -> Tree:
+    def get_subtree(self, subtree_index: ArrayLike) -> Tree[NodeType]:
         """Extracts a subtree rooted at a specific node index.
 
         Collapses subtree into a new tree with the root node at index 0, and children in subsequent indices.
@@ -225,7 +226,7 @@ class Tree(Generic[NodeType]):
             subtree_index: the edge index (from the root node) of the node to use as the new root.
 
         Returns:
-            Tree: the subtree rooted at the specified node index.
+            Tree[NodeType]: the subtree rooted at the specified node index.
         """
         # get subtree translation
         old_subtree_idxs, translation, erase_idxs = self._get_translation(subtree_index)
@@ -269,7 +270,7 @@ class Tree(Generic[NodeType]):
         )
 
 
-    def reset(self) -> Tree:
+    def reset(self) -> Tree[NodeType]:
         """Resets the tree to its initial state."""
         return replace(self,
             next_free_idx=0,
@@ -278,7 +279,7 @@ class Tree(Generic[NodeType]):
             data=jax.tree.map(jnp.zeros_like, self.data))
     
 
-def init_tree(max_nodes: int, branching_factor: int, template_data: NodeType) -> Tree:
+def init_tree[NodeType](max_nodes: int, branching_factor: int, template_data: NodeType) -> Tree[NodeType]:
     """Initializes a new Tree.
 
     Args:
@@ -287,7 +288,7 @@ def init_tree(max_nodes: int, branching_factor: int, template_data: NodeType) ->
         template_data: template of node data
 
     Returns:
-        Tree: a new tree with the specified parameters.
+        Tree[NodeType]: a new tree with the specified parameters.
     """
     return Tree(
         next_free_idx=jnp.array(0, dtype=jnp.int32),

@@ -1,7 +1,9 @@
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Callable, Dict, Optional, Tuple
+from operator import itemgetter
+from typing import Any
 
 import jax
 
@@ -24,8 +26,8 @@ class BaseTester:
 
     A Tester may maintain its own internal state.
     """
-    def __init__(self, num_keys: int, epochs_per_test: int = 1, render_fn: Optional[Callable] = None, 
-                 render_dir: str = '/tmp/turbozero/', name: Optional[str] = None):
+    def __init__(self, num_keys: int, epochs_per_test: int = 1, render_fn: Callable | None = None, 
+                 render_dir: str = '/tmp/turbozero/', name: str | None = None):
         """Initializes a Tester.
 
         Args:
@@ -48,7 +50,7 @@ class BaseTester:
         self.name = name
 
 
-    def init(self, **kwargs) -> TestState: #pylint: disable=unused-argument
+    def init(self, *args, **kwargs) -> TestState: #pylint: disable=unused-argument
         """Initializes the internal state of the Tester."""
         return TestState()
 
@@ -76,7 +78,7 @@ class BaseTester:
 
     def run(self, key: jax.Array, epoch_num: int, max_steps: int, num_devices: int, #pylint: disable=unused-argument 
         env_step_fn: EnvStepFn, env_init_fn: EnvInitFn, evaluator: Evaluator, state: TestState,
-        params: Any, *args) -> Tuple[TestState, Dict, str]:
+        params: Any, *args) -> tuple[TestState, dict, str | None]:
         """Runs the test, if the current epoch is an epoch that should be tested on (i.e. `epoch_num % epochs_per_test == 0`).
 
         If a render function is provided, saves a .gif of the first episode of the test.
@@ -93,7 +95,7 @@ class BaseTester:
             params: nn parameters used by agent
 
         Returns:
-            Tuple[TestState, Dict, str]:
+            Tuple[TestState, Dict, str | None]:
                 - updated internal state of the tester
                 - metrics from the test
                 - path to .gif of the first episode of the test (if render function provided, otherwise None)
@@ -114,7 +116,7 @@ class BaseTester:
                 # get player ids from first episode
                 p_ids = p_ids[0]
                 # get list of frames: the initial state, then one per step
-                frame_list = [jax.device_get(jax.tree.map(lambda x: x[i], frames)) for i in range(max_steps + 1)]
+                frame_list = [jax.device_get(jax.tree.map(itemgetter(i), frames)) for i in range(max_steps + 1)]
                 # render frames to .gif
                 path_to_rendering = self.render_fn(frame_list, p_ids, f"{self.name}_{epoch_num}", self.render_dir)
             else:
@@ -125,7 +127,7 @@ class BaseTester:
     
     @partial(jax.pmap, axis_name='d', static_broadcasted_argnums=(0, 1, 2, 3, 4))
     def test(self, max_steps: int, env_step_fn: EnvStepFn, env_init_fn: EnvInitFn, evaluator: Evaluator,
-        keys: jax.Array, state: TestState, params: Any) -> Tuple[TestState, Dict, Any, jax.Array]:
+        keys: jax.Array, state: TestState, params: Any) -> tuple[TestState, dict, Any, jax.Array]:
         """Run the test implemented by the Tester. Parallelized across devices.
 
         Implemented by subclasses.

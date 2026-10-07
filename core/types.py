@@ -1,11 +1,13 @@
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Tuple
+from typing import Any
 
 import equinox as eqx
 import jax
 import optax
 
 from core.memory.replay_memory import BaseExperience
+
 
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
@@ -21,9 +23,9 @@ class StepMetadata:
     """
     rewards: jax.Array
     action_mask: jax.Array
-    terminated: bool
-    cur_player_id: int
-    step: int
+    terminated: jax.Array
+    cur_player_id: jax.Array
+    step: jax.Array
 
 
 @jax.tree_util.register_dataclass
@@ -38,16 +40,16 @@ class TrainState:
         step: number of training steps taken
     """
     params: Any
-    nn_state: Optional[eqx.nn.State]
+    nn_state: eqx.nn.State | None
     opt_state: optax.OptState
     step: jax.Array
 
 
-EnvStepFn = Callable[[Any, int], Tuple[Any, StepMetadata]]
-EnvInitFn = Callable[[jax.Array], Tuple[Any, StepMetadata]]  
-DataTransformFn = Callable[[jax.Array, jax.Array, Any], Tuple[jax.Array, jax.Array, Any]]
+EnvStepFn = Callable[[Any, jax.Array], tuple[Any, StepMetadata]]
+EnvInitFn = Callable[[jax.Array], tuple[Any, StepMetadata]]  
+DataTransformFn = Callable[[jax.Array, jax.Array, Any], tuple[jax.Array, jax.Array, Any]]
 Params = Any
-EvalFn = Callable[[Any, Params, jax.Array], Tuple[jax.Array, float]]
-LossFn = Callable[[Any, Optional[eqx.nn.State], BaseExperience], Tuple[jax.Array, Tuple[dict, Optional[eqx.nn.State]]]]
+EvalFn = Callable[[Any, Params, jax.Array], tuple[jax.Array, jax.Array]]
+LossFn = Callable[[Any, eqx.nn.State | None, BaseExperience], tuple[jax.Array, tuple[dict, eqx.nn.State | None]]]
 ExtractModelParamsFn = Callable[[TrainState], Any]
 StateToNNInputFn = Callable[[Any], jax.Array]

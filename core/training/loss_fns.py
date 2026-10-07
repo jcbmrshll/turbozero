@@ -1,4 +1,4 @@
-from typing import Any, Optional, Tuple
+from typing import Any
 
 import equinox as eqx
 import jax
@@ -9,8 +9,8 @@ from core.memory.replay_memory import BaseExperience
 from core.networks.utils import apply_nn
 
 
-def az_default_loss_fn(nn: Any, nn_state: Optional[eqx.nn.State], experience: BaseExperience,
-                       l2_reg_lambda: float = 0.0001) -> Tuple[jax.Array, Tuple[dict, Optional[eqx.nn.State]]]:
+def az_default_loss_fn(nn: Any, nn_state: eqx.nn.State | None, experience: BaseExperience,
+                       l2_reg_lambda: float = 0.0001) -> tuple[jax.Array, tuple[dict, eqx.nn.State | None]]:
     """Implements the default AlphaZero loss function.
 
     = Policy Loss + Value Loss + L2 Regularization

@@ -1,15 +1,15 @@
 
-from typing import Any, Dict
+from typing import Any
 
-import jax 
+import jax
 import jax.numpy as jnp
 
-from core.evaluators.mcts.state import MCTSTree
 from core.evaluators.mcts.mcts import MCTS
+from core.evaluators.mcts.state import MCTSTree
 from core.types import StepMetadata
 
 
-class _AlphaZero:
+class _AlphaZero(MCTS):
     """AlphaZero-specific logic for MCTS.
 
     Extends MCTS using the `AlphaZero` class, this class serves as a mixin to add AlphaZero-specific logic.
@@ -32,16 +32,16 @@ class _AlphaZero:
         self.dirichlet_epsilon = dirichlet_epsilon
 
 
-    def get_config(self) -> Dict:
+    def get_config(self) -> dict:
         """Returns the configuration of the AlphaZero evaluator. Used for logging."""
         return {
             "dirichlet_alpha": self.dirichlet_alpha,
             "dirichlet_epsilon": self.dirichlet_epsilon,
-            **super().get_config() #pylint: disable=no-member
+            **super().get_config()
         }
 
 
-    def update_root(self, key: jax.Array, tree: MCTSTree, root_embedding: Any, params: Any, root_metadata: StepMetadata) -> MCTSTree:
+    def update_root(self, key: jax.Array, tree: MCTSTree, root_embedding: Any, params: Any, root_metadata: StepMetadata, **kwargs) -> MCTSTree: #pylint: disable=unused-argument
         """Populates the root node of the search tree. Adds Dirichlet noise to the root policy.
 
         Args:
@@ -56,7 +56,7 @@ class _AlphaZero:
         """
         # evaluate the root state 
         root_key, dir_key = jax.random.split(key, 2)
-        root_policy_logits, root_value = self.eval_fn(root_embedding, params, root_key) #pylint: disable=no-member
+        root_policy_logits, root_value = self.eval_fn(root_embedding, params, root_key)
         root_policy = jax.nn.softmax(root_policy_logits)
 
         # add Dirichlet noise to the root policy
@@ -78,7 +78,7 @@ class _AlphaZero:
 
         # update the root node
         root_node = tree.data_at(tree.ROOT_INDEX)
-        root_node = self.update_root_node(root_node, renorm_policy, root_value, root_embedding) #pylint: disable=no-member
+        root_node = self.update_root_node(root_node, renorm_policy, root_value, root_embedding)
         return tree.set_root(root_node)
     
 

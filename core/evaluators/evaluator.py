@@ -1,6 +1,6 @@
 
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -17,7 +17,7 @@ class EvalOutput:
         policy_weights: The policy weights assigned to each action.
     """
     eval_state: Any
-    action: int
+    action: jax.Array
     policy_weights: jax.Array
 
 
@@ -53,7 +53,7 @@ class Evaluator:
         raise NotImplementedError()
 
 
-    def evaluate(self, key: jax.Array, eval_state: Any, env_state: Any, **kwargs) -> EvalOutput:
+    def evaluate(self, key: jax.Array, eval_state: Any, env_state: Any, *args, **kwargs) -> EvalOutput:
         """Evaluates the environment state.
 
         Args:
@@ -95,6 +95,6 @@ class Evaluator:
         raise NotImplementedError()
 
 
-    def get_config(self) -> Dict:
+    def get_config(self) -> dict:
         """Returns the configuration of the Evaluator. Used for logging."""
         return {'discount': self.discount}

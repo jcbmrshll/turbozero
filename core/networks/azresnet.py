@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from typing import List, Tuple
 
 import equinox as eqx
 import jax
@@ -49,7 +48,7 @@ class ResidualBlock(eqx.Module):
         self.conv2 = conv(channels, channels, 3, key2)
         self.bn2 = batch_norm(channels)
 
-    def __call__(self, x: jax.Array, state: eqx.nn.State) -> Tuple[jax.Array, eqx.nn.State]:
+    def __call__(self, x: jax.Array, state: eqx.nn.State) -> tuple[jax.Array, eqx.nn.State]:
         y, state = self.bn1(self.conv1(x), state)
         y = jax.nn.relu(y)
         y, state = self.bn2(self.conv2(y), state)
@@ -63,7 +62,7 @@ class AZResnet(eqx.Module):
     """
     stem_conv: eqx.nn.Conv2d
     stem_bn: eqx.nn.BatchNorm
-    blocks: List[ResidualBlock]
+    blocks: list[ResidualBlock]
     policy_conv: eqx.nn.Conv2d
     policy_bn: eqx.nn.BatchNorm
     policy_linear: eqx.nn.Linear
@@ -71,7 +70,7 @@ class AZResnet(eqx.Module):
     value_bn: eqx.nn.BatchNorm
     value_linear: eqx.nn.Linear
 
-    def __init__(self, config: AZResnetConfig, input_shape: Tuple[int, int, int], *, key: jax.Array):
+    def __init__(self, config: AZResnetConfig, input_shape: tuple[int, int, int], *, key: jax.Array):
         """
         Args:
             config: network configuration
@@ -94,7 +93,7 @@ class AZResnet(eqx.Module):
         self.value_bn = batch_norm(1)
         self.value_linear = eqx.nn.Linear(height * width, 1, key=keys[4])
 
-    def __call__(self, x: jax.Array, state: eqx.nn.State) -> Tuple[Tuple[jax.Array, jax.Array], eqx.nn.State]:
+    def __call__(self, x: jax.Array, state: eqx.nn.State) -> tuple[tuple[jax.Array, jax.Array], eqx.nn.State]:
         # inputs are channels-last (and may be e.g. boolean), equinox convolutions are channels-first
         x = jnp.moveaxis(x, -1, 0).astype(self.stem_conv.weight.dtype)
         # initial conv layer

@@ -1,12 +1,14 @@
 
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import Any, Tuple
+from typing import Any
 
 import jax
 import jax.numpy as jnp
+
 from core.evaluators.evaluator import EvalOutput, Evaluator
 from core.types import EnvInitFn, EnvStepFn, StepMetadata
+
 
 def partition(
     data: Any,
@@ -40,7 +42,7 @@ def step_env_and_evaluator(
     env_init_fn: EnvInitFn,
     max_steps: int,
     reset: bool = True
-) -> Tuple[EvalOutput, Any,  StepMetadata, bool, bool, jax.Array]:
+) -> tuple[EvalOutput, Any,  StepMetadata, jax.Array, jax.Array, jax.Array]:
     """Steps the environment and evaluator.
 
     - Evaluates the environment state with the Evaluator and selects an action.
@@ -62,7 +64,7 @@ def step_env_and_evaluator(
         reset: Whether to reset the environment and evaluator state if the episode is terminated or truncated.
 
     Returns:
-        Tuple[EvalOutput, Any, StepMetadata, bool, bool, jax.Array]:
+        Tuple[EvalOutput, Any, StepMetadata, jax.Array, jax.Array, jax.Array]:
             - `output`: The output of the evaluation.
             - `env_state`: The updated environment state.
             - `env_state_metadata`: Metadata associated with the updated environment state.
@@ -130,8 +132,8 @@ class TwoPlayerGameState:
     p2_eval_state: Any
     p1_value_estimate: jax.Array
     p2_value_estimate: jax.Array
-    outcomes: float
-    completed: bool
+    outcomes: jax.Array
+    completed: jax.Array
 
 
 @jax.tree_util.register_dataclass
@@ -250,7 +252,7 @@ def two_player_game(
     env_step_fn: EnvStepFn,
     env_init_fn: EnvInitFn,
     max_steps: int
-) -> Tuple[jax.Array, TwoPlayerGameState, jax.Array]:
+) -> tuple[jax.Array, GameFrame, jax.Array]:
     """Play a two player game between two evaluators.
 
     Args:
@@ -265,7 +267,7 @@ def two_player_game(
             is truncated: it is marked completed and scored with the rewards of its last step (0 for pgx games).
 
     Returns:
-        Tuple[jax.Array, TwoPlayerGameState, jax.Array]:
+        Tuple[jax.Array, GameFrame, jax.Array]:
             - `outcomes`: The outcomes of the game (final rewards) for each player.
             - `frames`: Frames collected from the game (used for rendering), `max_steps + 1` of them:
               the initial state, then the state after each step.
@@ -320,7 +322,7 @@ def two_player_game(
     )
 
     # takes a turn for the active player
-    def take_turn(state: TwoPlayerGameState, step_num: jax.Array) -> TwoPlayerGameState:
+    def take_turn(state: TwoPlayerGameState, step_num: jax.Array) -> tuple[TwoPlayerGameState, GameFrame]:
         # players alternate turns, starting with the first player
         use_p1 = (step_num % 2 == 0) == p1_first
         state = jax.lax.cond(

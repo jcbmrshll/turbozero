@@ -1,9 +1,10 @@
 
 from functools import partial
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 import jax
 import jax.numpy as jnp
+
 from core.common import GameFrame, two_player_game
 from core.evaluators.evaluator import Evaluator
 from core.testing.tester import BaseTester, TestState
@@ -13,7 +14,7 @@ from core.types import EnvInitFn, EnvStepFn
 class TwoPlayerBaseline(BaseTester):
     """Implements a tester that evaluates an agent against a baseline evaluator in a two-player game."""
 
-    def __init__(self, num_episodes: int, baseline_evaluator: Evaluator, baseline_params: Optional[Any] = None, 
+    def __init__(self, num_episodes: int, baseline_evaluator: Evaluator, baseline_params: Any | None = None, 
                  *args, **kwargs):
         """Initializes a TwoPlayerBaseline tester.
 
@@ -22,7 +23,7 @@ class TwoPlayerBaseline(BaseTester):
             baseline_evaluator: the baseline evaluator to evaluate against
             baseline_params: (optional) the parameters of the baseline evaluator
         """
-        super().__init__(num_keys=num_episodes, *args, **kwargs)
+        super().__init__(*args, num_keys=num_episodes, **kwargs)
         self.num_episodes = num_episodes
         self.baseline_evaluator = baseline_evaluator
         if baseline_params is None:
@@ -42,7 +43,7 @@ class TwoPlayerBaseline(BaseTester):
 
     @partial(jax.pmap, axis_name='d', static_broadcasted_argnums=(0, 1, 2, 3, 4))
     def test(self, max_steps: int, env_step_fn: EnvStepFn, env_init_fn: EnvInitFn, evaluator: Evaluator,
-        keys: jax.Array, state: TestState, params: Any) -> Tuple[TestState, Dict, GameFrame, jax.Array]:
+        keys: jax.Array, state: TestState, params: Any) -> tuple[TestState, dict, GameFrame, jax.Array]:
         """Test the agent against the baseline evaluator in a two-player game.
 
         Args:

@@ -10,6 +10,7 @@ os.environ["XLA_FLAGS"] = " ".join(
 from dataclasses import dataclass, replace
 from functools import cache
 from types import SimpleNamespace
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -21,7 +22,6 @@ from core.evaluators.evaluator import EvalOutput, Evaluator
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.mcts.mcts import MCTS
 from core.types import StepMetadata
-
 
 env = pgx.make("tic_tac_toe")
 
@@ -204,14 +204,14 @@ def make_search():
     @cache
     def factory(cls=None, eval_fn=uniform_eval_fn, **kwargs):
         cls = AlphaZero(MCTS) if cls is None else cls
-        config = dict(
-            eval_fn=eval_fn,
-            action_selector=PUCTSelector(),
-            branching_factor=env.num_actions,
-            max_nodes=80,
-            num_iterations=32,
-            temperature=0.0,
-        )
+        config: dict[str, Any] = {
+            "eval_fn": eval_fn,
+            "action_selector": PUCTSelector(),
+            "branching_factor": env.num_actions,
+            "max_nodes": 80,
+            "num_iterations": 32,
+            "temperature": 0.0,
+        }
         config.update(kwargs)
         evaluator = cls(**config)
         template, _ = init_fn(jax.random.PRNGKey(0))

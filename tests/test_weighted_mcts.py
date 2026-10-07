@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from core.evaluators.mcts.action_selection import PUCTSelector
+from core.evaluators.mcts.state import MCTSTree
 from core.evaluators.mcts.weighted_mcts import WeightedMCTS
 from core.trees.tree import init_tree
 
@@ -24,7 +25,8 @@ def root_with_children(root_q, root_r, child_values):
         new = WeightedMCTS.new_node(policy=jnp.full((3,), 1 / 3), value=q, embedding=jnp.zeros(()), terminated=False)
         return replace(new, r=jnp.array(r, dtype=jnp.float32), n=jnp.array(n, dtype=jnp.int32))
 
-    tree = init_tree(8, 3, node(0.0, 0.0, 0)).set_root(node(root_q, root_r, 1 + len(child_values)))
+    tree: MCTSTree = init_tree(8, 3, node(0.0, 0.0, 0))
+    tree = tree.set_root(node(root_q, root_r, 1 + len(child_values)))
     for action, value in enumerate(child_values):
         tree = tree.add_node(tree.ROOT_INDEX, action, node(-value, -value, 1))
     return tree

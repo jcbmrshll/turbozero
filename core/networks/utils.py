@@ -1,4 +1,4 @@
-from typing import Callable, Optional, Tuple
+from collections.abc import Callable
 
 import equinox as eqx
 import jax
@@ -10,9 +10,9 @@ BATCH_AXIS = 'batch'
 
 def apply_nn(
     nn: Callable,
-    nn_state: Optional[eqx.nn.State],
+    nn_state: eqx.nn.State | None,
     x: jax.Array
-) -> Tuple[Tuple[jax.Array, jax.Array], Optional[eqx.nn.State]]:
+) -> tuple[tuple[jax.Array, jax.Array], eqx.nn.State | None]:
     """Applies a neural network to a batch of inputs.
 
     As is the convention in equinox, networks act on a single (unbatched) input:

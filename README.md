@@ -48,6 +48,11 @@ Contributions, improvements, and fixes are more than welcome! For now I don't ha
 
 If you are interested in contributing but don't know what to work on, please reach out. I have plenty of things you could do.
 
+CI runs `uv run ruff check .` and `uv run pyright` alongside the tests. To run ruff automatically on each commit, install the pre-commit hook once:
+```
+uv run pre-commit install
+```
+
 ## References
 Papers/Repos I found helpful.
 
