@@ -16,41 +16,28 @@ It contains:
 
 #### *`turbozero`* is *_extendable_*:
  * see an [idea on twitter](https://twitter.com/ptrschmdtnlsn/status/1748800529608888362) for a simple tweak to MCTS?
-      * [implement it](https://github.com/jcbmrshll/turbozero/blob/main/core/evaluators/mcts/weighted_mcts.py) then [test it](https://github.com/jcbmrshll/turbozero/blob/main/notebooks/weighted_mcts.ipynb) by extending core components
+      * [implement it](https://github.com/jcbmrshll/turbozero/blob/main/core/evaluators/mcts/weighted_mcts.py) then [test it](https://github.com/jcbmrshll/turbozero/blob/main/examples/connect_four.py) by extending core components
   
 #### *`turbozero`* is *_flexible_*:
  * easy to integrate with you custom JAX environment or neural network architecture.
  * Use the provided training and evaluation utilities, or pick and choose the components that you need.
 
-To get started, check out the [Hello World Notebook](https://github.com/jcbmrshll/turbozero/blob/main/notebooks/hello_world.ipynb)
+To get started, check out the [Othello example](https://github.com/jcbmrshll/turbozero/blob/main/examples/othello.py), which walks through each component
 
 ## Installation
-`turbozero` uses `poetry` for dependency management, you can install it with:
+`turbozero` uses [`uv`](https://docs.astral.sh/uv/) for dependency management. With `uv` installed, run:
 ```
-pip install poetry==1.7.1
+./install.sh
 ```
-Then, to install dependencies:
-```
-poetry install
-```
-If you're using a GPU/TPU/etc., after running the previous command you'll need to install the device-specific version of JAX.
+This creates a `.venv` with all dependencies. If an NVIDIA GPU is present it installs the CUDA 13 build of JAX (requires NVIDIA driver >= 580), otherwise the CPU build. Re-run `./install.sh` rather than a bare `uv sync`, which would remove the GPU libraries. For other accelerators, see https://docs.jax.dev/en/latest/installation.html.
 
-For a GPU w/ CUDA 12:
+## Examples
+Example training scripts live in `examples/`:
 ```
-poetry source add jax https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+uv run examples/othello.py         # AlphaZero vs. pgx's pretrained Othello model and a greedy baseline
+uv run examples/connect_four.py    # AlphaZero with weighted MCTS on Connect Four
 ```
-to point poetry towards JAX cuda releases, then use
-```
-poetry add jax[cuda12_pip]==0.4.35
-```
-to install the CUDA 12 release for JAX. See https://jax.readthedocs.io/en/latest/installation.html for other devices/cuda versions.
-
-I have tested this project with CUDA 11 and CUDA 12.
-
-To launch an ipython kernel, run:
-```
-poetry run python -m ipykernel install --user --name turbozero
-```
+Pass `--help` to see their options, e.g. `--wandb PROJECT` to log to Weights & Biases.
 
 ## Issues
 If you use this project and encounter an issue, error, or undesired behavior, please submit a [GitHub Issue](https://github.com/jcbmrshll/turbozero/issues) and I will do my best to resolve it as soon as I can. You may also contact me directly via `hello@jacob.land`.
