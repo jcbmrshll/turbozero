@@ -1,8 +1,8 @@
 
+from dataclasses import replace
 from functools import partial
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 import jax
-import chex
 import jax.numpy as jnp
 from core.evaluators.evaluator import Evaluator
 from core.evaluators.mcts.action_selection import MCTSActionSelector
@@ -71,11 +71,11 @@ class MCTS(Evaluator):
 
 
     def evaluate(self, #pylint: disable=arguments-differ
-        key: chex.PRNGKey,
+        key: jax.Array,
         eval_state: MCTSTree, 
-        env_state: chex.ArrayTree,
+        env_state: Any,
         root_metadata: StepMetadata,
-        params: chex.ArrayTree,
+        params: Any,
         env_step_fn: EnvStepFn,
         **kwargs
     ) -> MCTSOutput:
@@ -111,20 +111,20 @@ class MCTS(Evaluator):
         )
     
 
-    def get_value(self, state: MCTSTree) -> chex.Array:
+    def get_value(self, state: MCTSTree) -> jax.Array:
         """Returns value estimate of the environment state stored in the root node of the tree.
 
         Args:
             state: MCTSTree to evaluate
 
         Returns:
-            chex.Array: value estimate of the environment state stored in the root node of the tree
+            jax.Array: value estimate of the environment state stored in the root node of the tree
         """
         return state.data_at(state.ROOT_INDEX).q
     
 
-    def update_root(self, key: chex.PRNGKey, tree: MCTSTree, root_embedding: chex.ArrayTree, 
-                    params: chex.ArrayTree, **kwargs) -> MCTSTree: #pylint: disable=unused-argument
+    def update_root(self, key: jax.Array, tree: MCTSTree, root_embedding: Any, 
+                    params: Any, root_metadata: StepMetadata, **kwargs) -> MCTSTree: #pylint: disable=unused-argument
         """Populates the root node of an MCTSTree.
 
         Args:
@@ -132,12 +132,14 @@ class MCTS(Evaluator):
             tree: MCTSTree to update
             root_embedding: root environment state
             params: nn parameters
+            root_metadata: metadata of the root environment state
 
         Returns:
             MCTSTree: updated MCTSTree
         """
         # evaluate root state
         root_policy_logits, root_value = self.eval_fn(root_embedding, params, key)
+        root_policy_logits = jnp.where(root_metadata.action_mask, root_policy_logits, jnp.finfo(root_policy_logits).min)
         root_policy = jax.nn.softmax(root_policy_logits)
         # update root node
         root_node = tree.data_at(tree.ROOT_INDEX)
@@ -145,7 +147,7 @@ class MCTS(Evaluator):
         return tree.set_root(root_node)
     
     
-    def iterate(self, key: chex.PRNGKey, tree: MCTSTree, params: chex.ArrayTree, env_step_fn: EnvStepFn) -> MCTSTree:
+    def iterate(self, key: jax.Array, tree: MCTSTree, params: Any, env_step_fn: EnvStepFn) -> MCTSTree:
         """Performs one iteration of MCTS.
 
         1. Traverse to leaf node.
@@ -232,7 +234,7 @@ class MCTS(Evaluator):
         )
 
 
-    def backpropagate(self, key: chex.PRNGKey, tree: MCTSTree, parent: int, value: float) -> MCTSTree: #pylint: disable=unused-argument
+    def backpropagate(self, key: jax.Array, tree: MCTSTree, parent: int, value: float) -> MCTSTree: #pylint: disable=unused-argument
         """Backpropagate the value estimate from the leaf node to the root node and update visit counts.
 
         Args:
@@ -266,7 +268,7 @@ class MCTS(Evaluator):
         return state.tree
 
 
-    def sample_root_action(self, key: chex.PRNGKey, tree: MCTSTree) -> Tuple[int, chex.Array]:
+    def sample_root_action(self, key: jax.Array, tree: MCTSTree) -> Tuple[int, jax.Array]:
         """Sample an action based on the root visit counts.
 
         Args:
@@ -274,7 +276,7 @@ class MCTS(Evaluator):
             tree: MCTSTree to evaluate
 
         Returns:
-            Tuple[int, chex.Array]: sampled action, normalized policy weights
+            Tuple[int, jax.Array]: sampled action, normalized policy weights
         """
         # get root visit counts
         action_visits = tree.get_child_data('n', tree.ROOT_INDEX)
@@ -304,9 +306,9 @@ class MCTS(Evaluator):
     def visit_node(
         node: MCTSNode,
         value: float,
-        p: Optional[chex.Array] = None,
+        p: Optional[jax.Array] = None,
         terminated: Optional[bool] = None,
-        embedding: Optional[chex.ArrayTree] = None
+        embedding: Optional[Any] = None
     ) -> MCTSNode:
         """Update the visit counts and value estimate of a node.
 
@@ -329,7 +331,7 @@ class MCTS(Evaluator):
             terminated = node.terminated
         if embedding is None:
             embedding = node.embedding
-        return node.replace(
+        return replace(node,
             n=node.n + 1, # increment visit count
             q=q_value,
             p=p,
@@ -339,7 +341,7 @@ class MCTS(Evaluator):
     
 
     @staticmethod
-    def new_node(policy: chex.Array, value: float, embedding: chex.ArrayTree, terminated: bool) -> MCTSNode:
+    def new_node(policy: jax.Array, value: float, embedding: Any, terminated: bool) -> MCTSNode:
         """Create a new MCTSNode.
 
         Args:
@@ -363,7 +365,7 @@ class MCTS(Evaluator):
     
 
     @staticmethod
-    def update_root_node(root_node: MCTSNode, root_policy: chex.Array, root_value: float, root_embedding: chex.ArrayTree) -> MCTSNode:
+    def update_root_node(root_node: MCTSNode, root_policy: jax.Array, root_value: float, root_embedding: Any) -> MCTSNode:
         """Update the root node of the search tree.
 
         Args:
@@ -376,7 +378,7 @@ class MCTS(Evaluator):
             MCTSNode: updated root node
         """
         visited = root_node.n > 0
-        return root_node.replace(
+        return replace(root_node,
             p=root_policy,
             # keep old value estimate if the node has already been visited
             q=jnp.where(visited, root_node.q, root_value), 
@@ -416,7 +418,7 @@ class MCTS(Evaluator):
         return state.reset()
 
 
-    def init(self, template_embedding: chex.ArrayTree, *args, **kwargs) -> MCTSTree: #pylint: disable=arguments-differ
+    def init(self, template_embedding: Any, *args, **kwargs) -> MCTSTree: #pylint: disable=arguments-differ
         """Initializes the internal state of the MCTS evaluator.
 
         Args:

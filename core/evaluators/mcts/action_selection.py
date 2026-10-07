@@ -1,18 +1,18 @@
 
 from typing import Dict
 
-import chex
+import jax
 import jax.numpy as jnp
 
 from core.evaluators.mcts.state import MCTSTree
 
 
 def normalize_q_values(
-    q_values: chex.Array, 
-    child_n_values: chex.Array, 
+    q_values: jax.Array, 
+    child_n_values: jax.Array, 
     parent_q_value: float,
     epsilon: float
-) -> chex.Array:
+) -> jax.Array:
     """Normalize Q-values to be in the range [0, 1].
 
     Args:
@@ -22,10 +22,12 @@ def normalize_q_values(
         epsilon: small value to avoid division by zero
 
     Returns:
-        chex.Array: normalized Q-values
+        jax.Array: normalized Q-values
     """
-    min_value = jnp.minimum(parent_q_value, jnp.min(q_values, axis=-1))
-    max_value = jnp.maximum(parent_q_value, jnp.max(q_values, axis=-1))
+    # unvisited children take the parent's value so they don't affect the range
+    safe_q_values = jnp.where(child_n_values > 0, q_values, parent_q_value)
+    min_value = jnp.minimum(parent_q_value, jnp.min(safe_q_values, axis=-1))
+    max_value = jnp.maximum(parent_q_value, jnp.max(safe_q_values, axis=-1))
     completed_by_min = jnp.where(child_n_values > 0, q_values, min_value)
     normalized = (completed_by_min - min_value) / (
         jnp.maximum(max_value - min_value, epsilon))
@@ -170,7 +172,7 @@ class MuZeroPUCTSelector(MCTSActionSelector):
         # get child visit counts
         n_values = tree.get_child_data('n', index)
         # normalize/transform q-values
-        q_values = self.q_transform(discounted_q_values, q_values, n_values, node.q, self.epsilon)
+        q_values = self.q_transform(discounted_q_values, n_values, node.q, self.epsilon)
         # calculate U-values
         base_term = node.p * jnp.sqrt(node.n) / (n_values + 1)
         log_term = jnp.log((node.n + self.c2 + 1) / self.c2) + self.c1

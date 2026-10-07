@@ -1,8 +1,7 @@
 
+from dataclasses import dataclass, replace
 from functools import partial
-from typing import Tuple
-import chex
-from chex import dataclass
+from typing import Any, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -10,9 +9,9 @@ from core.evaluators.evaluator import EvalOutput, Evaluator
 from core.types import EnvInitFn, EnvStepFn, StepMetadata
 
 def partition(
-    data: chex.ArrayTree,
+    data: Any,
     num_partitions: int
-) -> chex.ArrayTree:
+) -> Any:
     """Partition each array in a data structure into num_partitions along the first axis.
 
     e.g. partitions an array of shape (N, ...) into (num_partitions, N//num_partitions, ...)
@@ -22,26 +21,26 @@ def partition(
         num_partitions: number of partitions
 
     Returns:
-        chex.ArrayTree: partitioned ArrayTree
+        pytree: partitioned pytree
     """
-    return jax.tree_map(
+    return jax.tree.map(
         lambda x: x.reshape(num_partitions, x.shape[0] // num_partitions, *x.shape[1:]),
         data
     )
 
 
 def step_env_and_evaluator(
-    key: jax.random.PRNGKey,
-    env_state: chex.ArrayTree,
+    key: jax.Array,
+    env_state: Any,
     env_state_metadata: StepMetadata,
-    eval_state: chex.ArrayTree,
-    params: chex.ArrayTree,
+    eval_state: Any,
+    params: Any,
     evaluator: Evaluator,
     env_step_fn: EnvStepFn,
     env_init_fn: EnvInitFn,
     max_steps: int,
     reset: bool = True
-) -> Tuple[EvalOutput, chex.ArrayTree,  StepMetadata, bool, bool, chex.Array]:
+) -> Tuple[EvalOutput, Any,  StepMetadata, bool, bool, jax.Array]:
     """Steps the environment and evaluator.
 
     - Evaluates the environment state with the Evaluator and selects an action.
@@ -62,13 +61,13 @@ def step_env_and_evaluator(
         reset: Whether to reset the environment and evaluator state if the episode is terminated or truncated.
 
     Returns:
-        Tuple[EvalOutput, chex.ArrayTree, StepMetadata, bool, bool, chex.Array]:
-            - output: The output of the evaluation.
-            - env_state: The updated environment state.
-            - env_state_metadata: Metadata associated with the updated environment state.
-            - terminated: Whether the episode is terminated.
-            - truncated: Whether the episode is truncated.
-            - rewards: Rewards emitted by the environment.
+        Tuple[EvalOutput, Any, StepMetadata, bool, bool, jax.Array]:
+            - `output`: The output of the evaluation.
+            - `env_state`: The updated environment state.
+            - `env_state_metadata`: Metadata associated with the updated environment state.
+            - `terminated`: Whether the episode is terminated.
+            - `truncated`: Whether the episode is truncated.
+            - `rewards`: Rewards emitted by the environment.
     """
     key, evaluate_key = jax.random.split(key)
     # evaluate the environment state
@@ -101,10 +100,11 @@ def step_env_and_evaluator(
         lambda _: (env_state, env_state_metadata),
         None
     )
-    output = output.replace(eval_state=eval_state)
+    output = replace(output, eval_state=eval_state)
     return output, env_state, env_state_metadata, terminated, truncated, rewards
 
 
+@jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class TwoPlayerGameState:
     """Stores the state of a two player game using two different evaluators.
@@ -120,17 +120,18 @@ class TwoPlayerGameState:
         outcomes: The outcomes of the game (final rewards) for each player.
         completed: Whether the game is completed.
     """
-    key: jax.random.PRNGKey
-    env_state: chex.ArrayTree
+    key: jax.Array
+    env_state: Any
     env_state_metadata: StepMetadata
-    p1_eval_state: chex.ArrayTree
-    p2_eval_state: chex.ArrayTree
-    p1_value_estimate: chex.Array
-    p2_value_estimate: chex.Array
+    p1_eval_state: Any
+    p2_eval_state: Any
+    p1_value_estimate: jax.Array
+    p2_value_estimate: jax.Array
     outcomes: float
     completed: bool
 
 
+@jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class GameFrame:
     """Stores information necessary for rendering the environment state in a two-player game.
@@ -142,18 +143,18 @@ class GameFrame:
         completed: Whether the game is completed.
         outcomes: The outcomes of the game (final rewards) for each player.
     """
-    env_state: chex.ArrayTree
-    p1_value_estimate: chex.Array
-    p2_value_estimate: chex.Array
-    completed: chex.Array
-    outcomes: chex.Array
+    env_state: Any
+    p1_value_estimate: jax.Array
+    p2_value_estimate: jax.Array
+    completed: jax.Array
+    outcomes: jax.Array
 
 
 def two_player_game_step(
     state: TwoPlayerGameState,
     p1_evaluator: Evaluator,
     p2_evaluator: Evaluator,
-    params: chex.ArrayTree,
+    params: Any,
     env_step_fn: EnvStepFn,
     env_init_fn: EnvInitFn,
     use_p1: bool,
@@ -220,7 +221,7 @@ def two_player_game_step(
     else:
         p1_eval_state, p2_eval_state = other_eval_state, active_eval_state
         p1_value_estimate, p2_value_estimate = other_value_estimate, active_value_estimate
-    return state.replace(
+    return replace(state,
         key = key,
         env_state = env_state,
         env_state_metadata = env_state_metadata,
@@ -238,15 +239,15 @@ def two_player_game_step(
 
 
 def two_player_game(
-    key: jax.random.PRNGKey,
+    key: jax.Array,
     evaluator_1: Evaluator,
     evaluator_2: Evaluator,
-    params_1: chex.ArrayTree,
-    params_2: chex.ArrayTree,
+    params_1: Any,
+    params_2: Any,
     env_step_fn: EnvStepFn,
     env_init_fn: EnvInitFn,
     max_steps: int
-) -> Tuple[chex.Array, TwoPlayerGameState, chex.Array]:
+) -> Tuple[jax.Array, TwoPlayerGameState, jax.Array]:
     """Play a two player game between two evaluators.
 
     Args:
@@ -260,10 +261,10 @@ def two_player_game(
         max_steps: The maximum number of steps per episode.
 
     Returns:
-        Tuple[chex.Array, TwoPlayerGameState, chex.Array]:
-            - outcomes: The outcomes of the game (final rewards) for each player.
-            - frames: Frames collected from the game (used for rendering)
-            - p_ids: The player ids of the two evaluators. [evaluator_1_id, evaluator_2_id]
+        Tuple[jax.Array, TwoPlayerGameState, jax.Array]:
+            - `outcomes`: The outcomes of the game (final rewards) for each player.
+            - `frames`: Frames collected from the game (used for rendering)
+            - `p_ids`: The player ids of the two evaluators. [evaluator_1_id, evaluator_2_id]
     """
     # init rng
     env_key, turn_key, key = jax.random.split(key, 3)
@@ -313,14 +314,15 @@ def two_player_game(
         outcomes = state.outcomes
     )
 
-    # takes a turn for each player
-    def step_step(state: TwoPlayerGameState, _) -> TwoPlayerGameState:
-        # take a turn for the active player
+    # takes a turn for the active player
+    def take_turn(state: TwoPlayerGameState, step_num: jax.Array) -> TwoPlayerGameState:
+        # players alternate turns, starting with the first player
+        use_p1 = (step_num % 2 == 0) == p1_first
         state = jax.lax.cond(
             state.completed,
             lambda s: s,
             lambda s: jax.lax.cond(
-                p1_first,
+                use_p1,
                 step_p1,
                 step_p2,
                 s
@@ -328,45 +330,23 @@ def two_player_game(
             state
         )
         # collect render frame
-        frame1 = GameFrame(
+        frame = GameFrame(
             env_state = state.env_state,
             p1_value_estimate = state.p1_value_estimate,
             p2_value_estimate = state.p2_value_estimate,
             completed = state.completed,
             outcomes = state.outcomes
         )
-        # take a turn for the other player
-        state = jax.lax.cond(
-            state.completed,
-            lambda s: s,
-            lambda s: jax.lax.cond(
-                p1_first,
-                step_p2,
-                step_p1,
-                s
-            ),
-            state
-        )
-        # collect render frame
-        frame2 = GameFrame(
-            env_state = state.env_state,
-            p1_value_estimate = state.p1_value_estimate,
-            p2_value_estimate = state.p2_value_estimate,
-            completed = state.completed,
-            outcomes = state.outcomes
-        )
-        # return game state and render frames
-        return state, jax.tree_map(lambda x, y: jnp.stack([x, y]), frame1, frame2)
+        # return game state and render frame
+        return state, frame
     
     # play the game
     state, frames = jax.lax.scan(
-        step_step,
+        take_turn,
         state,
-        xs=jnp.arange(max_steps//2)
+        xs=jnp.arange(max_steps)
     )
-    # reshape frames
-    frames = jax.tree_map(lambda x: x.reshape(max_steps, *x.shape[2:]), frames)
     # append initial state to front of frames
-    frames = jax.tree_map(lambda i, x: jnp.concatenate([jnp.expand_dims(i, 0), x]), initial_game_frame, frames)
+    frames = jax.tree.map(lambda i, x: jnp.concatenate([jnp.expand_dims(i, 0), x]), initial_game_frame, frames)
     # return outcome, frames, player ids
     return jnp.array([state.outcomes[p1_id], state.outcomes[p2_id]]), frames, jnp.array([p1_id, p2_id])

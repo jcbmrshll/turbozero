@@ -1,7 +1,6 @@
 
-from typing import Dict
+from typing import Any, Dict
 
-import chex
 import jax 
 import jax.numpy as jnp
 
@@ -42,7 +41,7 @@ class _AlphaZero:
         }
 
 
-    def update_root(self, key: chex.PRNGKey, tree: MCTSTree, root_embedding: chex.ArrayTree, params: chex.ArrayTree, root_metadata: StepMetadata) -> MCTSTree:
+    def update_root(self, key: jax.Array, tree: MCTSTree, root_embedding: Any, params: Any, root_metadata: StepMetadata) -> MCTSTree:
         """Populates the root node of the search tree. Adds Dirichlet noise to the root policy.
 
         Args:

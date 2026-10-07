@@ -1,0 +1,59 @@
+"""WeightedMCTS backup: a node's value is a softmax-weighted average of its children's values,
+sharpened by `q_temperature`, mixed with the network's raw value for the node."""
+from dataclasses import replace
+
+import jax
+import jax.numpy as jnp
+import pytest
+
+from core.evaluators.mcts.action_selection import PUCTSelector
+from core.evaluators.mcts.weighted_mcts import WeightedMCTS
+from core.trees.tree import init_tree
+
+
+def weighted_mcts(q_temperature):
+    return WeightedMCTS(q_temperature=q_temperature, eval_fn=lambda *_: (jnp.zeros(3), 0.0),
+                        action_selector=PUCTSelector(), branching_factor=3, max_nodes=8, num_iterations=1)
+
+
+def root_with_children(root_q, root_r, child_values):
+    """A root with one visit per child. `child_values` are from the root player's perspective,
+    so children store their negation (the value for the player to move at the child)."""
+    def node(q, r, n):
+        new = WeightedMCTS.new_node(policy=jnp.full((3,), 1 / 3), value=q, embedding=jnp.zeros(()), terminated=False)
+        return replace(new, r=jnp.array(r, dtype=jnp.float32), n=jnp.array(n, dtype=jnp.int32))
+
+    tree = init_tree(8, 3, node(0.0, 0.0, 0)).set_root(node(root_q, root_r, 1 + len(child_values)))
+    for action, value in enumerate(child_values):
+        tree = tree.add_node(tree.ROOT_INDEX, action, node(-value, -value, 1))
+    return tree
+
+
+def backed_up_root_q(q_temperature, tree):
+    tree = weighted_mcts(q_temperature).backpropagate(jax.random.PRNGKey(0), tree, tree.ROOT_INDEX, 0.0)
+    return float(tree.data_at(tree.ROOT_INDEX).q)
+
+
+@pytest.mark.xfail(strict=True, raises=AssertionError,
+                   reason="#5: q_temperature is applied to the averaged values, not to the softmax weights")
+def test_lower_q_temperature_weights_the_best_child_more():
+    # child values already span [0, 1], so normalising them changes nothing and only the
+    # temperature differs between the runs
+    tree = root_with_children(root_q=0.5, root_r=0.0, child_values=[0.0, 1.0, 0.5])
+
+    hot, neutral, cold = (backed_up_root_q(t, tree) for t in (4.0, 1.0, 0.25))
+
+    assert hot < neutral < cold
+
+
+@pytest.mark.xfail(strict=True, raises=AssertionError,
+                   reason="#5: WeightedMCTS writes the 0-1 normalised value into node.q and mixes it with the raw value")
+@pytest.mark.parametrize("q_temperature", [0.5, 1.0])
+def test_backed_up_value_stays_on_the_network_value_scale(q_temperature):
+    # every child is losing for the root player, and so is the network's own value for the root
+    child_values = [-0.8, -0.6]
+    tree = root_with_children(root_q=-0.7, root_r=-0.7, child_values=child_values)
+
+    root_q = backed_up_root_q(q_temperature, tree)
+
+    assert min(child_values) <= root_q <= max(child_values)

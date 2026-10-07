@@ -1,14 +1,15 @@
 
-from typing import Callable, Tuple
+from dataclasses import dataclass
+from typing import Any, Callable, Tuple
 
-import chex
 from flax.training.train_state import TrainState
 import jax
 import optax
 
 from core.memory.replay_memory import BaseExperience
 
-@chex.dataclass(frozen=True)
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
 class StepMetadata:
     """Metadata for a step in the environment.
 
@@ -19,18 +20,18 @@ class StepMetadata:
         cur_player_id: current player id
         step: step number
     """
-    rewards: chex.Array
-    action_mask: chex.Array
+    rewards: jax.Array
+    action_mask: jax.Array
     terminated: bool
     cur_player_id: int
     step: int
     
 
-EnvStepFn = Callable[[chex.ArrayTree, int], Tuple[chex.ArrayTree, StepMetadata]]
-EnvInitFn = Callable[[jax.random.PRNGKey], Tuple[chex.ArrayTree, StepMetadata]]  
-DataTransformFn = Callable[[chex.Array, chex.Array, chex.ArrayTree], Tuple[chex.Array, chex.Array, chex.ArrayTree]]
-Params = chex.ArrayTree
-EvalFn = Callable[[chex.ArrayTree, Params, jax.random.PRNGKey], Tuple[chex.Array, float]]
-LossFn = Callable[[chex.ArrayTree, TrainState, BaseExperience], Tuple[chex.Array, Tuple[chex.ArrayTree, optax.OptState]]]
-ExtractModelParamsFn = Callable[[TrainState], chex.ArrayTree]
-StateToNNInputFn = Callable[[chex.ArrayTree], chex.Array]
+EnvStepFn = Callable[[Any, int], Tuple[Any, StepMetadata]]
+EnvInitFn = Callable[[jax.Array], Tuple[Any, StepMetadata]]  
+DataTransformFn = Callable[[jax.Array, jax.Array, Any], Tuple[jax.Array, jax.Array, Any]]
+Params = Any
+EvalFn = Callable[[Any, Params, jax.Array], Tuple[jax.Array, float]]
+LossFn = Callable[[Any, TrainState, BaseExperience], Tuple[jax.Array, Tuple[Any, optax.OptState]]]
+ExtractModelParamsFn = Callable[[TrainState], Any]
+StateToNNInputFn = Callable[[Any], jax.Array]

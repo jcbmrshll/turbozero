@@ -1,11 +1,7 @@
 
-
-
-
 from functools import partial
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
-import chex
 import jax
 import jax.numpy as jnp
 from core.common import GameFrame, two_player_game
@@ -17,7 +13,7 @@ from core.types import EnvInitFn, EnvStepFn
 class TwoPlayerBaseline(BaseTester):
     """Implements a tester that evaluates an agent against a baseline evaluator in a two-player game."""
 
-    def __init__(self, num_episodes: int, baseline_evaluator: Evaluator, baseline_params: Optional[chex.ArrayTree] = None, 
+    def __init__(self, num_episodes: int, baseline_evaluator: Evaluator, baseline_params: Optional[Any] = None, 
                  *args, **kwargs):
         """Initializes a TwoPlayerBaseline tester.
 
@@ -46,7 +42,7 @@ class TwoPlayerBaseline(BaseTester):
 
     @partial(jax.pmap, axis_name='d', static_broadcasted_argnums=(0, 1, 2, 3, 4))
     def test(self, max_steps: int, env_step_fn: EnvStepFn, env_init_fn: EnvInitFn, evaluator: Evaluator,
-        keys: chex.PRNGKey, state: TestState, params: chex.ArrayTree) -> Tuple[TestState, Dict, GameFrame, chex.Array]:
+        keys: jax.Array, state: TestState, params: Any) -> Tuple[TestState, Dict, GameFrame, jax.Array]:
         """Test the agent against the baseline evaluator in a two-player game.
 
         Args:
@@ -59,7 +55,7 @@ class TwoPlayerBaseline(BaseTester):
             params: nn parameters used by agent
 
         Returns:
-            Tuple[TestState, Dict, GameFrame, chex.Array]:
+            Tuple[TestState, Dict, GameFrame, jax.Array]:
                 - updated internal state of the tester
                 - metrics from the test
                 - frames from the first episode of the test
@@ -77,7 +73,7 @@ class TwoPlayerBaseline(BaseTester):
         )
 
         results, frames, p_ids = jax.vmap(game_fn)(keys)
-        frames = jax.tree_map(lambda x: x[0], frames)
+        frames = jax.tree.map(lambda x: x[0], frames)
         p_ids = p_ids[0]
         
         avg = results[:, 0].mean()

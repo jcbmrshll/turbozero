@@ -1,12 +1,12 @@
 
-from typing import Dict
+from dataclasses import dataclass
+from typing import Any, Dict
 
-import chex
 import jax
 import jax.numpy as jnp
-from chex import dataclass
 
 
+@jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class EvalOutput:
     """Output of an evaluation.
@@ -16,9 +16,9 @@ class EvalOutput:
         action: The action to take.
         policy_weights: The policy weights assigned to each action.
     """
-    eval_state: chex.ArrayTree
+    eval_state: Any
     action: int
-    policy_weights: chex.Array
+    policy_weights: jax.Array
 
 
 class Evaluator:
@@ -37,23 +37,23 @@ class Evaluator:
         self.discount = discount
 
 
-    def init(self, *args, **kwargs) -> chex.ArrayTree:
+    def init(self, *args, **kwargs) -> Any:
         """Initializes the internal state of the Evaluator."""
         raise NotImplementedError()
 
 
-    def init_batched(self, batch_size: int, *args, **kwargs) -> chex.ArrayTree:
+    def init_batched(self, batch_size: int, *args, **kwargs) -> Any:
         """Initializes the internal state of the Evaluator across a batch dimension."""
         tree = self.init(*args, **kwargs)
-        return jax.tree_map(lambda x: jnp.broadcast_to(x, (batch_size,) + x.shape), tree)
+        return jax.tree.map(lambda x: jnp.broadcast_to(x, (batch_size,) + x.shape), tree)
 
 
-    def reset(self, state: chex.ArrayTree) -> chex.ArrayTree:
+    def reset(self, state: Any) -> Any:
         """Resets the internal state of the Evaluator."""
         raise NotImplementedError()
 
 
-    def evaluate(self, key: chex.PRNGKey, eval_state: chex.ArrayTree, env_state: chex.ArrayTree, **kwargs) -> EvalOutput:
+    def evaluate(self, key: jax.Array, eval_state: Any, env_state: Any, **kwargs) -> EvalOutput:
         """Evaluates the environment state.
 
         Args:
@@ -70,7 +70,7 @@ class Evaluator:
         raise NotImplementedError()
 
 
-    def step(self, state: chex.ArrayTree, action: chex.Array) -> chex.ArrayTree:  # pylint: disable=unused-argument
+    def step(self, state: Any, action: jax.Array) -> Any:  # pylint: disable=unused-argument
         """Updates the internal state of the Evaluator.
 
         Args:
@@ -78,19 +78,19 @@ class Evaluator:
             action: The action taken in the environment.
 
         Returns:
-            chex.ArrayTree: The updated internal state of the Evaluator.
+            pytree: The updated internal state of the Evaluator.
         """
         return state
 
 
-    def get_value(self, state: chex.ArrayTree) -> chex.Array:
+    def get_value(self, state: Any) -> jax.Array:
         """Extracts the state value estimate (for the current/root environment state) from the internal state of the Evaluator.
 
         Args:
             state: The internal state of the Evaluator.
 
         Returns:
-            chex.Array: The value estimate.
+            jax.Array: The value estimate.
         """
         raise NotImplementedError()
 

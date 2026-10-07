@@ -1,6 +1,7 @@
 
-import chex
-from chex import dataclass
+from dataclasses import dataclass
+from typing import Any
+
 import graphviz
 import jax
 import jax.numpy as jnp
@@ -9,6 +10,7 @@ from core.evaluators.evaluator import EvalOutput
 from core.trees.tree import Tree
 
 
+@jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class MCTSNode:
     """Base MCTS node data strucutre.
@@ -21,10 +23,10 @@ class MCTSNode:
         embedding: environment state
     """
     n: jnp.number
-    p: chex.Array
+    p: jax.Array
     q: jnp.number
     terminated: jnp.number
-    embedding: chex.ArrayTree
+    embedding: Any
 
     @property
     def w(self) -> jnp.number:
@@ -36,6 +38,7 @@ class MCTSNode:
 MCTSTree = Tree[MCTSNode] 
 
 
+@jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class TraversalState:
     """State used during traversal step of MCTS.
@@ -48,6 +51,7 @@ class TraversalState:
     action: int
 
 
+@jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class BackpropState:
     """State used during backpropagation step of MCTS.
@@ -62,6 +66,7 @@ class BackpropState:
     tree: MCTSTree
 
 
+@jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class MCTSOutput(EvalOutput):
     """Output of an MCTS evaluation. See EvalOutput.
@@ -71,7 +76,7 @@ class MCTSOutput(EvalOutput):
         policy_weights: The policy weights assigned to each action.
     """
     eval_state: MCTSTree
-    policy_weights: chex.Array
+    policy_weights: jax.Array
 
 
 def tree_to_graph(tree, batch_id=0):

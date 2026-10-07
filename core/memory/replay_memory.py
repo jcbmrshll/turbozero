@@ -1,10 +1,11 @@
 
-import chex
-from chex import dataclass
+from dataclasses import dataclass, replace
+
 import jax
 import jax.numpy as jnp
 
 
+@jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class BaseExperience:
     """Experience data structure. Stores a training sample.
@@ -16,13 +17,14 @@ class BaseExperience:
         observation_nn: observation for neural network input
         cur_player_id: current player id
     """
-    reward: chex.Array
-    policy_weights: chex.Array
-    policy_mask: chex.Array
-    observation_nn: chex.Array
-    cur_player_id: chex.Array
+    reward: jax.Array
+    policy_weights: jax.Array
+    policy_mask: jax.Array
+    observation_nn: jax.Array
+    cur_player_id: jax.Array
 
 
+@jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class ReplayBufferState:
     """State of the replay buffer.
@@ -42,8 +44,8 @@ class ReplayBufferState:
     next_idx: int
     episode_start_idx: int
     buffer: BaseExperience
-    populated: chex.Array
-    has_reward: chex.Array
+    populated: jax.Array
+    has_reward: jax.Array
 
 
 class EpisodeReplayBuffer:
@@ -80,7 +82,7 @@ class EpisodeReplayBuffer:
         Returns:
             ReplayBufferState: updated replay buffer state
         """
-        return state.replace(
+        return replace(state,
             buffer = jax.tree_util.tree_map(
                 lambda x, y: x.at[state.next_idx].set(y),
                 state.buffer,
@@ -92,7 +94,7 @@ class EpisodeReplayBuffer:
         )
     
 
-    def assign_rewards(self, state: ReplayBufferState, reward: chex.Array) -> ReplayBufferState:
+    def assign_rewards(self, state: ReplayBufferState, reward: jax.Array) -> ReplayBufferState:
         """Assign rewards to the current episode.
 
         Args:
@@ -102,10 +104,10 @@ class EpisodeReplayBuffer:
         Returns:
             ReplayBufferState: updated replay buffer state
         """
-        return state.replace(
+        return replace(state,
             episode_start_idx = state.next_idx,
             has_reward = jnp.full_like(state.has_reward, True),
-            buffer = state.buffer.replace(
+            buffer = replace(state.buffer,
                 reward = jnp.where(
                     ~state.has_reward[..., None],
                     reward[None, ...],
@@ -132,7 +134,7 @@ class EpisodeReplayBuffer:
         # so their buffer contents will be overwritten (eventually)
         # and cannot be sampled
         # so there's no need to overwrite them with zeros here
-        return state.replace(
+        return replace(state,
             next_idx = state.episode_start_idx,
             has_reward = jnp.full_like(state.has_reward, True),
             populated = jnp.where(
@@ -145,9 +147,9 @@ class EpisodeReplayBuffer:
     # assumes input is batched!! (dont vmap/pmap)
     def sample(self,
         state: ReplayBufferState,
-        key: jax.random.PRNGKey,
+        key: jax.Array,
         sample_size: int
-    ) -> chex.ArrayTree:
+    ) -> BaseExperience:
         """Samples experiences from the replay buffer.
 
         Assumes the buffer has two batch dimensions, so shape = (devices, batch_size, capacity, ...)
@@ -155,18 +157,30 @@ class EpisodeReplayBuffer:
 
         Samples across all batch dimensions, not per-batch/device.
 
+        Not compatible with `jax.jit`: checks on the host that at least one episode has finished,
+        so `state` must hold concrete arrays (as it does when called from `Trainer.train_steps`).
+
         Args:
             state: replay buffer state
             key: rng
             sample_size: size of minibatch to sample
 
         Returns:
-            chex.ArrayTree: minibatch of size (sample_size, ...)
+            BaseExperience: minibatch of size (sample_size, ...)
+
+        Raises:
+            ValueError: if no episode has finished yet, so there is nothing to sample
         """
         masked_weights = jnp.logical_and(
             state.populated,
             state.has_reward
         ).reshape(-1)
+
+        if not masked_weights.any():
+            raise ValueError(
+                "Cannot sample from the replay buffer: no episodes have finished yet. "
+                "Collect more self-play steps before training (e.g. increase `warmup_steps`)."
+            )
 
         num_partitions = state.populated.shape[0]
         num_batches = state.populated.shape[1]
