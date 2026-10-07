@@ -24,8 +24,10 @@ def normalize_q_values(
     Returns:
     - (jax.Array): normalized Q-values
     """
-    min_value = jnp.minimum(parent_q_value, jnp.min(q_values, axis=-1))
-    max_value = jnp.maximum(parent_q_value, jnp.max(q_values, axis=-1))
+    # unvisited children take the parent's value so they don't affect the range
+    safe_q_values = jnp.where(child_n_values > 0, q_values, parent_q_value)
+    min_value = jnp.minimum(parent_q_value, jnp.min(safe_q_values, axis=-1))
+    max_value = jnp.maximum(parent_q_value, jnp.max(safe_q_values, axis=-1))
     completed_by_min = jnp.where(child_n_values > 0, q_values, min_value)
     normalized = (completed_by_min - min_value) / (
         jnp.maximum(max_value - min_value, epsilon))

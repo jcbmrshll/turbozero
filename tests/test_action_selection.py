@@ -40,8 +40,6 @@ def test_normalize_q_values_matches_mctx_when_all_children_visited():
                                    atol=1e-6)
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError,
-                   reason="#3: normalize_q_values takes min/max over unvisited children, which read as 0")
 def test_normalize_q_values_ignores_unvisited_children():
     q, n, parent_q = jnp.array([0.6, 0.9, 0.0, 0.0]), jnp.array([3, 3, 0, 0]), 0.75
     np.testing.assert_allclose(normalize_q_values(q, n, parent_q, EPS), [0.0, 1.0, 0.0, 0.0], atol=1e-6)
