@@ -93,8 +93,9 @@ class TwoPlayerTester(BaseTester):
             f"{self.name}_avg_outcome": avg
         }
 
+        # decide on the mean across all devices so best_params stays identical on every device
         best_params = jax.lax.cond(
-            avg > 0.0,
+            jax.lax.pmean(avg, axis_name='d') > 0.0,
             lambda _: params,
             lambda _: state.best_params,
             None
