@@ -166,7 +166,7 @@ class MuZeroPUCTSelector(MCTSActionSelector):
         # get child visit counts
         n_values = tree.get_child_data('n', index)
         # normalize/transform q-values
-        q_values = self.q_transform(discounted_q_values, q_values, n_values, node.q, self.epsilon)
+        q_values = self.q_transform(discounted_q_values, n_values, node.q, self.epsilon)
         # calculate U-values
         base_term = node.p * jnp.sqrt(node.n) / (n_values + 1)
         log_term = jnp.log((node.n + self.c2 + 1) / self.c2) + self.c1
