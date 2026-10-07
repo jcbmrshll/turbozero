@@ -4,6 +4,7 @@ from dataclasses import replace
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from core.evaluators.mcts.action_selection import PUCTSelector
@@ -67,3 +68,21 @@ def test_zero_q_temperature_backs_up_the_best_visited_child(child_values, root_v
     root_q = backed_up_root_q(0.0, tree)
 
     assert root_q == pytest.approx((expected_weighted * n + root_value) / (n + 1))
+
+
+def test_zero_q_temperature_draws_independent_tiebreak_noise_at_each_node(monkeypatch):
+    tree = root_with_children(root_q=0.0, root_r=0.0, child_values=[0.0, 0.0])
+    recorded = []
+    uniform = jax.random.uniform
+
+    def recording_uniform(key, *args, **kwargs):
+        jax.debug.callback(lambda k: recorded.append(tuple(np.asarray(k).tolist())), key)
+        return uniform(key, *args, **kwargs)
+
+    monkeypatch.setattr(jax.random, "uniform", recording_uniform)
+    # backpropagate from a child, so the loop visits the child and then the root
+    weighted_mcts(0.0).backpropagate(jax.random.PRNGKey(0), tree, 1, 0.0)
+    jax.effects_barrier()
+
+    assert len(recorded) == 2
+    assert recorded[0] != recorded[1]

@@ -123,7 +123,9 @@ class WeightedMCTS(MCTS):
             else:
                 # if temperature == 0, select max q-value amongst visited children
                 # apply random noise to break ties amongst nodes w/ same number of visits
-                noise = jax.random.uniform(key, shape=normalized_q_values.shape, maxval=self.tiebreak_noise)
+                # (fold in the node index so each node on the path gets independent noise)
+                node_key = jax.random.fold_in(key, node_idx)
+                noise = jax.random.uniform(node_key, shape=normalized_q_values.shape, maxval=self.tiebreak_noise)
                 noisy_q_values = jnp.where(
                     child_n_values > 0, normalized_q_values + noise, jnp.finfo(normalized_q_values).min
                 )

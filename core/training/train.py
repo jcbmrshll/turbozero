@@ -611,6 +611,8 @@ class Trainer:
             train_state = initial_state.train_state
             tester_states = initial_state.test_states
             cur_epoch = initial_state.cur_epoch
+            # don't replay the keys the original run used from epoch 0
+            key = jax.random.fold_in(key, cur_epoch)
         else:
             cur_epoch = 0
             # initialize collection state

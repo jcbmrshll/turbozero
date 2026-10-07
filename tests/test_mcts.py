@@ -7,6 +7,7 @@ import pytest
 
 from core.evaluators.alphazero import AlphaZero
 from core.evaluators.evaluation_fns import make_nn_eval_fn, make_nn_eval_fn_no_params_callable
+from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.mcts.mcts import MCTS
 from core.evaluators.mcts.weighted_mcts import WeightedMCTS
 
@@ -249,3 +250,49 @@ def test_prior_is_softmax_of_masked_logits(make_search, ttt, cls, eval_fn_name):
         node = tree.data_at(idx)
         if not node.terminated:
             np.testing.assert_allclose(node.p, masked_softmax(LOGITS, node.embedding.legal_action_mask), atol=1e-6)
+
+
+class KeyRecordingMCTS(MCTS):
+    """MCTS whose root update, iterations and action sampling only record the key each one receives."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.recorded = []
+
+    def record(self, name, key):
+        jax.debug.callback(lambda k: self.recorded.append((name, np.asarray(k))), key)
+
+    def update_root(self, key, tree, root_embedding, params, root_metadata, **kwargs):
+        self.record("update_root", key)
+        return tree
+
+    def iterate(self, key, tree, params, env_step_fn):
+        self.record("iterate", key)
+        return tree
+
+    def sample_root_action(self, key, tree):
+        self.record("sample_root_action", key)
+        return jnp.array(0), jnp.zeros((self.branching_factor,))
+
+
+def test_evaluate_gives_every_consumer_an_independent_key(ttt):
+    search = KeyRecordingMCTS(eval_fn=lambda *_: (jnp.zeros(ttt.num_actions), 0.0), action_selector=PUCTSelector(),
+                              branching_factor=ttt.num_actions, max_nodes=8, num_iterations=4)
+    state, meta = ttt.play([])
+    tree = search.init(template_embedding=state)
+    key = jax.random.PRNGKey(0)
+
+    search.evaluate(key, tree, state, meta, params=None, env_step_fn=ttt.step_fn)
+    jax.effects_barrier()
+
+    names = [name for name, _ in search.recorded]
+    assert sorted(names) == sorted(["update_root", "sample_root_action"] + ["iterate"] * search.num_iterations)
+    keys = [tuple(k.tolist()) for _, k in search.recorded]
+    assert tuple(np.asarray(key).tolist()) not in keys
+    assert len(set(keys)) == len(keys)
+    # no consumer's key is a split of another consumer's key
+    # (the search used to split the action-sampling key into the iteration keys)
+    for _, k in search.recorded:
+        children = {tuple(c.tolist()) for n in range(2, search.num_iterations + 1)
+                    for c in np.asarray(jax.random.split(k, n))}
+        assert not children & set(keys)

@@ -84,6 +84,7 @@ class MCTS(Evaluator):
         Samples an action to take from the root node after search is completed.
 
         Args:
+            key: rng
             eval_state: `MCTSTree` to evaluate, could be empty or partially complete
             env_state: current environment state
             root_metadata: metadata for the root node of the tree
@@ -94,16 +95,16 @@ class MCTS(Evaluator):
             MCTSOutput: contains new tree state, selected action, root value, and policy weights
         """
         # store current state metadata in the root node
-        key, root_key = jax.random.split(key)
+        root_key, iterate_key, sample_key = jax.random.split(key, 3)
         eval_state = self.update_root(root_key, eval_state, env_state, params, root_metadata=root_metadata)
         # perform 'num_iterations' iterations of MCTS
         iterate = partial(self.iterate, params=params, env_step_fn=env_step_fn)
 
-        iterate_keys = jax.random.split(key, self.num_iterations)
+        iterate_keys = jax.random.split(iterate_key, self.num_iterations)
         eval_state, _ = jax.lax.scan(lambda state, k: (iterate(k, state), None), eval_state, iterate_keys)
         # sample action based on root visit counts
         # (also get normalized policy weights for training purposes)
-        action, policy_weights = self.sample_root_action(key, eval_state)
+        action, policy_weights = self.sample_root_action(sample_key, eval_state)
         return MCTSOutput(
             eval_state=eval_state,
             action=action,
