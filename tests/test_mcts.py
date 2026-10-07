@@ -23,8 +23,6 @@ MIDGAME_MOVES = [4, 0, 8, 2]
 
 XFAIL_5 = pytest.mark.xfail(strict=True, raises=AssertionError,
                             reason="#5: WeightedMCTS backs up 0-1 normalised values, so losses look like wins")
-XFAIL_1 = pytest.mark.xfail(strict=True, raises=AssertionError,
-                            reason="#1: eval fns return softmax probabilities and MCTS applies softmax again")
 
 ALL_SEARCHES = [
     pytest.param(AZ_MCTS, id="AlphaZero(MCTS)"),
@@ -237,7 +235,6 @@ def masked_softmax(logits, mask):
 
 @pytest.mark.parametrize("eval_fn_name", EVAL_FNS)
 @pytest.mark.parametrize("cls", [pytest.param(AZ_MCTS, id="AlphaZero(MCTS)"), pytest.param(MCTS, id="MCTS")])
-@XFAIL_1
 def test_prior_is_softmax_of_masked_logits(make_search, ttt, cls, eval_fn_name):
     # the search runs from the initial position, where every move is legal, so plain MCTS's
     # missing root mask (#4) does not affect this test; children are masked
