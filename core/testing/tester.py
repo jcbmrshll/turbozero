@@ -75,6 +75,7 @@ class BaseTester:
         env_step_fn: EnvStepFn, env_init_fn: EnvInitFn, evaluator: Evaluator, state: TestState,
         params: Any, *args) -> Tuple[TestState, Dict, str]:
         """Runs the test, if the current epoch is an epoch that should be tested on
+        (i.e. `epoch_num % epochs_per_test == 0`).
         
         If a render function is provided, saves a .gif of the first episode of the test.
 
@@ -94,6 +95,7 @@ class BaseTester:
             - updated internal state of the tester
             - metrics from the test
             - path to .gif of the first episode of the test (if render function provided, otherwise None)
+            - on epochs that are not tested, returns `state` unchanged, empty metrics, and None
         """
         # split keys across devices
         keys = self.split_keys(key, num_devices)
@@ -116,7 +118,8 @@ class BaseTester:
             else:
                 path_to_rendering = None
             return state, metrics, path_to_rendering
-        
+        return state, {}, None
+
     
     @partial(jax.pmap, axis_name='d', static_broadcasted_argnums=(0, 1, 2, 3, 4))
     def test(self, max_steps: int, env_step_fn: EnvStepFn, env_init_fn: EnvInitFn, evaluator: Evaluator,

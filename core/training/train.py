@@ -647,8 +647,9 @@ class Trainer:
                         env_step_fn=self.env_step_fn, env_init_fn=self.env_init_fn, evaluator=self.evaluator_test,
                         state=test_state, params=params)
                         
-                    metrics = {k: v.mean() for k, v in metrics.items()}
-                    self.log_metrics(metrics, cur_epoch, step=collection_steps)
+                    if metrics:
+                        metrics = {k: v.mean() for k, v in metrics.items()}
+                        self.log_metrics(metrics, cur_epoch, step=collection_steps)
                     if rendered and self.run is not None:
                         self.run.log({f'{self.testers[i].name}_game': wandb.Video(rendered)}, step=collection_steps)
                     tester_states[i] = new_test_state
