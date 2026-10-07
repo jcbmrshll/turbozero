@@ -1,5 +1,5 @@
 """Behaviour of the MCTS evaluators on tic-tac-toe, using stub evaluation functions."""
-import flax.linen as nn
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -209,13 +209,11 @@ LOGITS = jnp.array([2.0, -1.0, 0.5, 0.0, 3.0, -2.0, 1.0, 0.25, -0.5])
 VALUE = 0.1
 
 
-class FixedLogitsNet(nn.Module):
+class FixedLogitsNet(eqx.Module):
     """Parameter-free network that outputs LOGITS and VALUE for every input."""
 
-    @nn.compact
-    def __call__(self, x, train: bool):  # pylint: disable=unused-argument
-        batch = x.shape[0]
-        return jnp.broadcast_to(LOGITS, (batch, LOGITS.shape[0])), jnp.full((batch, 1), VALUE)
+    def __call__(self, x):  # pylint: disable=unused-argument
+        return LOGITS, jnp.array([VALUE])
 
 
 def fixed_logits(x):
@@ -241,7 +239,9 @@ def test_prior_is_softmax_of_masked_logits(make_search, ttt, cls, eval_fn_name):
     no_noise = {"dirichlet_epsilon": 0.0} if cls is AZ_MCTS else {}
     search = make_search(cls, eval_fn=EVAL_FNS[eval_fn_name], **no_noise)
     state, meta = ttt.play([])
-    out = search.evaluate(jax.random.PRNGKey(0), search.init(), state, meta, {})
+    # (nn_params, nn_state) for make_nn_eval_fn, ignored by the other eval fn
+    params = (eqx.filter(FixedLogitsNet(), eqx.is_inexact_array), None)
+    out = search.evaluate(jax.random.PRNGKey(0), search.init(), state, meta, params)
     tree = out.eval_state
     assert meta.action_mask.all()
 

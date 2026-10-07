@@ -1,25 +1,21 @@
-
 from dataclasses import dataclass, replace
 from functools import partial
 import os
-import shutil
+import re
 from typing import Any, List, Optional, Tuple
 
-import flax
-from flax.training.train_state import TrainState
-from flax.training import orbax_utils
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 import optax
-import orbax.checkpoint as ocp
 import wandb
 
 from core.common import partition, step_env_and_evaluator
 from core.evaluators.evaluator import Evaluator
 from core.memory.replay_memory import BaseExperience, EpisodeReplayBuffer, ReplayBufferState
 from core.testing.tester import BaseTester, TestState
-from core.types import DataTransformFn, EnvInitFn, EnvStepFn, ExtractModelParamsFn, LossFn, StateToNNInputFn, StepMetadata
+from core.types import DataTransformFn, EnvInitFn, EnvStepFn, ExtractModelParamsFn, LossFn, StateToNNInputFn, StepMetadata, TrainState
 
 
 @jax.tree_util.register_dataclass
@@ -47,7 +43,7 @@ class TrainLoopOutput:
 
     Attributes:
         collection_state: state of self-play episode collection.
-        train_state: flax TrainState, holds optimizer state, model params
+        train_state: TrainState, holds model params and state, optimizer state
         test_states: states of testers
         cur_epoch: current epoch num
     """
@@ -57,11 +53,6 @@ class TrainLoopOutput:
     cur_epoch: int
 
 
-class TrainStateWithBS(TrainState):
-    """Custom flax TrainState to handle BatchNorm."""
-    batch_stats: Any
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         
-
 def extract_params(state: TrainState) -> Any:
     """Extracts model parameters from TrainState.
 
@@ -69,11 +60,22 @@ def extract_params(state: TrainState) -> Any:
         state: TrainState containing model parameters
 
     Returns:
-        pytree: model parameters
+        Tuple[Any, Optional[eqx.nn.State]]: model parameters and state (nn_params, nn_state), as used by
+            core.evaluators.evaluation_fns.make_nn_eval_fn
     """
-    if hasattr(state, 'batch_stats'):
-        return {'params': state.params, 'batch_stats': state.batch_stats}
-    return {'params': state.params}
+    return state.params, state.nn_state
+
+
+def checkpoint_path(ckpt_dir: str, epoch: int) -> str:
+    """Path of the checkpoint for `epoch` in `ckpt_dir`."""
+    return os.path.join(ckpt_dir, f"{epoch}.eqx")
+
+
+def checkpoint_epochs(ckpt_dir: str) -> List[int]:
+    """Epochs with a checkpoint in `ckpt_dir`, in ascending order."""
+    if not os.path.isdir(ckpt_dir):
+        return []
+    return sorted(int(m.group(1)) for f in os.listdir(ckpt_dir) if (m := re.fullmatch(r"(\d+)\.eqx", f)))
 
 
 class Trainer:
@@ -88,7 +90,7 @@ class Trainer:
         warmup_steps: int,
         collection_steps_per_epoch: int,
         train_steps_per_epoch: int,
-        nn: flax.linen.Module,
+        nn: eqx.Module,
         loss_fn: LossFn,
         optimizer: optax.GradientTransformation,
         evaluator: Evaluator,        
@@ -98,6 +100,7 @@ class Trainer:
         env_init_fn: EnvInitFn,
         state_to_nn_input_fn: StateToNNInputFn,
         testers: List[BaseTester],
+        nn_state: Optional[eqx.nn.State] = None,
         evaluator_test: Optional[Evaluator] = None,
         data_transform_fns: List[DataTransformFn] = [],
         extract_model_params_fn: Optional[ExtractModelParamsFn] = extract_params,
@@ -117,7 +120,7 @@ class Trainer:
                 - This is used to populate the replay memory with some initial samples
             collection_steps_per_epoch: # of steps (per batch) to collect via self-play in each epoch
             train_steps_per_epoch: # of training steps to take in each epoch
-            nn: flax.linen.Module containing configured neural network
+            nn: neural network (an equinox module, see core.networks.utils.apply_nn), training starts from its parameters
             loss_fn: loss function for training (see core.training.loss_fns)
             optimizer: optax optimizer
             evaluator: the `Evaluator` to use during self-play
@@ -127,6 +130,7 @@ class Trainer:
             env_init_fn: environment initialization function (key) -> (env_state, metadata)
             state_to_nn_input_fn: function to convert environment state to neural network input
             testers: list of testers to evaluate the agent against (see core.testing.tester)
+            nn_state: (optional) initial state of `nn` for stateful networks (e.g. with BatchNorm), from `eqx.nn.make_with_state`
             evaluator_test: (optional) evaluator to use during testing. If not provided, `evaluator` is used.
             data_transform_fns: (optional) list of data transform functions to apply to self-play experiences (e.g. rotation, reflection, etc.)
             extract_model_params_fn: (optional) function to extract model parameters from TrainState
@@ -148,6 +152,8 @@ class Trainer:
         # nn
         self.state_to_nn_input_fn = state_to_nn_input_fn
         self.nn = nn
+        self.nn_static = eqx.filter(nn, eqx.is_inexact_array, inverse=True)
+        self.nn_state = nn_state
         self.loss_fn = loss_fn
         self.optimizer = optimizer
         self.extract_model_params_fn = extract_model_params_fn
@@ -178,8 +184,8 @@ class Trainer:
         )
         # checkpoints
         self.ckpt_dir = ckpt_dir
-        options = ocp.CheckpointManagerOptions(max_to_keep=max_checkpoints, create=True)
-        self.checkpoint_manager = ocp.CheckpointManager(os.path.abspath(ckpt_dir), options=options)
+        self.max_checkpoints = max_checkpoints
+        os.makedirs(ckpt_dir, exist_ok=True)
         # wandb
         self.wandb_project_name = wandb_project_name
         self.use_wandb = wandb_project_name != ""
@@ -230,36 +236,28 @@ class Trainer:
             tester.check_size_compatibilities(self.num_devices)
 
 
-    @partial(jax.pmap, axis_name='d', static_broadcasted_argnums=(0,))
-    def init_train_state(self, key: jax.Array) -> TrainState:
-        """Initializes the training state (params, optimizer, etc.) partitions across devices.
+    def replicate(self, data: Any) -> Any:
+        """Places a copy of each array in a data structure on every device, along a new first axis."""
+        return jax.device_put(
+            jax.tree.map(lambda x: jnp.broadcast_to(x, (self.num_devices, *jnp.shape(x))), data),
+            NamedSharding(self.mesh, PartitionSpec('d'))
+        )
 
-        Args:
-            key: rng
+
+    def init_train_state(self) -> TrainState:
+        """Initializes the training state (params, optimizer, etc.) from `nn` and `nn_state`.
+
+        Not replicated across devices.
 
         Returns:
             TrainState: initialized training state
         """
-        # get template env state
-        sample_env_state = self.make_template_env_state()
-        # get sample nn input
-        sample_obs = self.state_to_nn_input_fn(sample_env_state)
-        # initialize nn parameters
-        variables = self.nn.init(key, sample_obs[None, ...], train=False)
-        params = variables['params']
-        # handle batchnorm
-        if 'batch_stats' in variables:
-            return TrainStateWithBS.create(
-                apply_fn=self.nn.apply,
-                params=params,
-                tx=self.optimizer,
-                batch_stats=variables['batch_stats']
-            )
-        # init TrrainState
-        return TrainState.create(
-            apply_fn=self.nn.apply,
+        params = eqx.filter(self.nn, eqx.is_inexact_array)
+        return TrainState(
             params=params,
-            tx=self.optimizer,
+            nn_state=self.nn_state,
+            opt_state=self.optimizer.init(params),
+            step=jnp.array(0, dtype=jnp.int32)
         )
 
         
@@ -400,14 +398,20 @@ class Trainer:
             Tuple[TrainState, dict]: updated TrainState and metrics
         """
         # calculate loss, get gradients
-        grad_fn = jax.value_and_grad(self.loss_fn, has_aux=True)
-        (loss, (metrics, updates)), grads = grad_fn(ts.params, ts, batch)
+        nn = eqx.combine(ts.params, self.nn_static)
+        grad_fn = eqx.filter_value_and_grad(self.loss_fn, has_aux=True)
+        (loss, (metrics, nn_state)), grads = grad_fn(nn, ts.nn_state, batch)
         # apply gradients
         grads = jax.lax.pmean(grads, axis_name='d')
-        ts = ts.apply_gradients(grads=grads)
-        # update batchnorm stats
-        if hasattr(ts, 'batch_stats'):
-            ts = ts.replace(batch_stats=jax.lax.pmean(updates['batch_stats'], axis_name='d'))
+        updates, opt_state = self.optimizer.update(grads, ts.opt_state, ts.params)
+        # average nn state (e.g. batchnorm stats) across devices, leaving counters etc. as they are
+        nn_state = jax.tree.map(lambda x: jax.lax.pmean(x, axis_name='d') if eqx.is_inexact_array(x) else x, nn_state)
+        ts = replace(ts,
+            params=optax.apply_updates(ts.params, updates),
+            nn_state=nn_state,
+            opt_state=opt_state,
+            step=ts.step + 1
+        )
         # return updated train state and metrics
         metrics = {
             **metrics,
@@ -482,19 +486,28 @@ class Trainer:
 
 
     def save_checkpoint(self, train_state: TrainState, epoch: int) -> None:
-        """Saves an orbax checkpoint of the training state.
+        """Saves a checkpoint of the training state to `ckpt_dir`.
+
+        Deletes the oldest checkpoints so that at most `max_checkpoints` remain.
 
         Args:
             train_state: current training state
             epoch: current epoch
         """
-        # convert pmap-sharded train_state to a single-device one
-        ckpt = jax.tree.map(lambda x: jax.device_get(x), train_state)
-        # save checkpoint (async)
-        # orbax skips the save if `ckpt_dir` already holds a checkpoint at or after `epoch`
-        if not self.checkpoint_manager.save(epoch, args=ocp.args.StandardSave(ckpt)):
+        epochs = checkpoint_epochs(self.ckpt_dir)
+        if epochs and epochs[-1] >= epoch:
             raise ValueError(f"{self.ckpt_dir} already has a checkpoint at or after epoch {epoch}, "
                              "resume from it or use a different ckpt_dir")
+        # every device holds the same train state, save the first one's
+        ckpt = jax.tree.map(lambda x: x[0], train_state)
+        # write to a temporary file first so an interrupted save doesn't leave a partial checkpoint
+        path = checkpoint_path(self.ckpt_dir, epoch)
+        with open(path + '.tmp', 'wb') as f:
+            eqx.tree_serialise_leaves(f, ckpt)
+        os.replace(path + '.tmp', path)
+        # delete old checkpoints
+        for old_epoch in epochs[:max(0, len(epochs) + 1 - self.max_checkpoints)]:
+            os.remove(checkpoint_path(self.ckpt_dir, old_epoch))
 
 
     def load_train_state_from_checkpoint(self, path_to_checkpoint: str, epoch: int) -> TrainState:
@@ -505,24 +518,12 @@ class Trainer:
             epoch: epoch to load
 
         Returns:
-            TrainState: loaded training state
+            TrainState: loaded training state, replicated across devices
         """
-        # create dummy TrainState
-        key = jax.random.PRNGKey(0)
-        init_key, key = jax.random.split(key)
-        init_keys = jnp.tile(init_key[None], (self.num_devices, 1))
-        dummy_state = self.init_train_state(init_keys)
-        # load checkpoint
-        train_state = self.checkpoint_manager.restore(
-                epoch, 
-                items=dummy_state, 
-                directory=path_to_checkpoint,
-                # allowing for saved checkpoints on different number of jax devices (unsafe)
-                restore_kwargs={
-                    'strict': False,
-                    }
-                )
-        return train_state
+        # checkpoints hold a single copy of the train state, so they load on any number of devices
+        with open(checkpoint_path(path_to_checkpoint, epoch), 'rb') as f:
+            train_state = eqx.tree_deserialise_leaves(f, self.init_train_state())
+        return self.replicate(train_state)
     
 
     def make_template_env_state(self) -> Any:
@@ -616,9 +617,7 @@ class Trainer:
             init_key, key = jax.random.split(key)
             collection_state = partition(self.init_collection_state(init_key, self.batch_size), self.num_devices)
             # initialize train state
-            init_key, key = jax.random.split(key)
-            init_keys = jnp.tile(init_key[None], (self.num_devices, 1))
-            train_state = self.init_train_state(init_keys)
+            train_state = self.replicate(self.init_train_state())
             params = self.extract_model_params_fn(train_state)
             # initialize tester states
             tester_states = []
@@ -664,14 +663,10 @@ class Trainer:
                         self.run.log({f'{self.testers[i].name}_game': wandb.Video(rendered)}, step=collection_steps)
                     tester_states[i] = new_test_state
             # save checkpoint
-            # make sure previous save task has finished 
-            self.checkpoint_manager.wait_until_finished()
             self.save_checkpoint(train_state, cur_epoch)
             # next epoch
             cur_epoch += 1
             
-        # make sure last save task has finished
-        self.checkpoint_manager.wait_until_finished() #
         # return state so that training can be continued!
         return TrainLoopOutput(
             collection_state=collection_state,
