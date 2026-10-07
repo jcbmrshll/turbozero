@@ -1,9 +1,8 @@
 
+from dataclasses import dataclass, replace
 from functools import partial
-from typing import Dict, Tuple
+from typing import Any, Dict, Tuple
 
-import chex
-from chex import dataclass
 import jax
 
 from core.common import two_player_game
@@ -12,12 +11,13 @@ from core.testing.tester import BaseTester, TestState
 from core.types import EnvInitFn, EnvStepFn
 
 
+@jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class TwoPlayerTestState(TestState):
     """Internal state of a TwoPlayerTester. Stores the best parameters found so far.
     - `best_params`: best performing parameters
     """
-    best_params: chex.ArrayTree
+    best_params: Any
 
 
 class TwoPlayerTester(BaseTester):
@@ -32,7 +32,7 @@ class TwoPlayerTester(BaseTester):
         self.num_episodes = num_episodes
 
 
-    def init(self, params: chex.ArrayTree, **kwargs) -> TwoPlayerTestState: #pylint: disable=unused-argument
+    def init(self, params: Any, **kwargs) -> TwoPlayerTestState: #pylint: disable=unused-argument
         """Initializes the internal state of the TwoPlayerTester.
         Args:
         - `params`: initial parameters to store as the best performing
@@ -53,7 +53,7 @@ class TwoPlayerTester(BaseTester):
 
     @partial(jax.pmap, axis_name='d', static_broadcasted_argnums=(0, 1, 2, 3, 4))
     def test(self, max_steps: int, env_step_fn: EnvStepFn, env_init_fn: EnvInitFn, evaluator: Evaluator,
-        keys: chex.PRNGKey, state: TwoPlayerTestState, params: chex.ArrayTree) -> Tuple[TwoPlayerTestState, Dict, chex.ArrayTree, chex.Array]:
+        keys: jax.Array, state: TwoPlayerTestState, params: Any) -> Tuple[TwoPlayerTestState, Dict, Any, jax.Array]:
         """Test the agent against the best performing parameters found so far in a two-player game.
         
         Args:
@@ -66,7 +66,7 @@ class TwoPlayerTester(BaseTester):
         - `params`: nn parameters used by agent
         
         Returns:
-        - (TwoPlayerTestState, Dict, chex.ArrayTree, chex.Array)
+        - (TwoPlayerTestState, Dict, Any, jax.Array)
             - updated internal state of the tester
             - metrics from the test
             - frames from the test (used for rendering)
@@ -84,7 +84,7 @@ class TwoPlayerTester(BaseTester):
         )
 
         results, frames, p_ids = jax.vmap(game_fn)(keys)
-        frames = jax.tree_map(lambda x: x[0], frames)
+        frames = jax.tree.map(lambda x: x[0], frames)
         p_ids = p_ids[0]
         
         avg = results[:, 0].mean()
@@ -100,4 +100,4 @@ class TwoPlayerTester(BaseTester):
             None
         )
 
-        return state.replace(best_params=best_params), metrics, frames, p_ids
+        return replace(state, best_params=best_params), metrics, frames, p_ids

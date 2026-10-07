@@ -1,16 +1,16 @@
 
+from dataclasses import dataclass, replace
 from functools import partial
 import os
 import shutil
 from typing import Any, List, Optional, Tuple
 
-import chex
-from chex import dataclass
 import flax
 from flax.training.train_state import TrainState
 from flax.training import orbax_utils
 import jax
 import jax.numpy as jnp
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 import optax
 import orbax.checkpoint as ocp
 import wandb
@@ -22,6 +22,7 @@ from core.testing.tester import BaseTester, TestState
 from core.types import DataTransformFn, EnvInitFn, EnvStepFn, ExtractModelParamsFn, LossFn, StateToNNInputFn, StepMetadata
 
 
+@jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class CollectionState:
     """Stores state of self-play episode collection. Persists across generations.
@@ -30,11 +31,12 @@ class CollectionState:
     - `buffer_state`: state of the replay buffer
     - `metadata`: metadata of the current environment state
     """
-    eval_state: chex.ArrayTree
-    env_state: chex.ArrayTree
+    eval_state: Any
+    env_state: Any
     buffer_state: ReplayBufferState
     metadata: StepMetadata
 
+@jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class TrainLoopOutput:
     """
@@ -53,17 +55,17 @@ class TrainLoopOutput:
 
 class TrainStateWithBS(TrainState):
     """Custom flax TrainState to handle BatchNorm"""
-    batch_stats: chex.ArrayTree
+    batch_stats: Any
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          
 
-def extract_params(state: TrainState) -> chex.ArrayTree:
+def extract_params(state: TrainState) -> Any:
     """Extracts model parameters from TrainState.
     
     Args:
     - `state`: TrainState containing model parameters
 
     Returns:
-    - (chex.ArrayTree): model parameters
+    - (pytree): model parameters
     """
     if hasattr(state, 'batch_stats'):
         return {'params': state.params, 'batch_stats': state.batch_stats}
@@ -129,6 +131,8 @@ class Trainer:
         - `extra_wandb_config`: (optional) extra config to pass to wandb
         """
         self.num_devices = num_devices if num_devices is not None else jax.local_device_count()
+        # the devices pmap maps over, used to split host-side minibatches across them
+        self.mesh = Mesh(jax.devices()[:self.num_devices], ('d',))
         # environment
         self.env_step_fn = env_step_fn
         self.env_init_fn = env_init_fn
@@ -218,7 +222,7 @@ class Trainer:
 
 
     @partial(jax.pmap, axis_name='d', static_broadcasted_argnums=(0,))
-    def init_train_state(self, key: jax.random.PRNGKey) -> TrainState:
+    def init_train_state(self, key: jax.Array) -> TrainState:
         """Initializes the training state (params, optimizer, etc.) partitions across devices.
         
         Args:
@@ -269,9 +273,9 @@ class Trainer:
     
     
     def collect(self,
-        key: jax.random.PRNGKey,
+        key: jax.Array,
         state: CollectionState,
-        params: chex.ArrayTree
+        params: Any
     ) -> CollectionState:
         """
         - Collects self-play data for a single step. 
@@ -339,7 +343,7 @@ class Trainer:
             buffer_state
         )
         # return new collection state
-        return state.replace(
+        return replace(state,
             eval_state=eval_output.eval_state,
             env_state=new_env_state,
             buffer_state=buffer_state,
@@ -348,9 +352,9 @@ class Trainer:
 
     @partial(jax.pmap, axis_name='d', static_broadcasted_argnums=(0, 4))
     def collect_steps(self,
-        key: chex.PRNGKey,
+        key: jax.Array,
         state: CollectionState,
-        params: chex.ArrayTree,
+        params: Any,
         num_steps: int
     ) -> CollectionState:
         """Collects self-play data for `num_steps` steps. Mapped across devices.
@@ -404,7 +408,7 @@ class Trainer:
 
 
     def train_steps(self,
-        key: chex.PRNGKey,
+        key: jax.Array,
         collection_state: CollectionState,
         train_state: TrainState,
         num_steps: int
@@ -434,7 +438,9 @@ class Trainer:
             # sample from replay memory
             batch = self.memory_buffer.sample(buffer_state, step_key, self.train_batch_size)
             # reshape into minibatch
-            batch = jax.tree_map(lambda x: x.reshape((self.num_devices, -1, *x.shape[1:])), batch)
+            batch = jax.tree.map(lambda x: x.reshape((self.num_devices, -1, *x.shape[1:])), batch)
+            # pmap won't reshard a committed array, so place each device's slice on that device
+            batch = jax.device_put(batch, NamedSharding(self.mesh, PartitionSpec('d')))
             # make training step
             train_state, metrics = self.one_train_step(train_state, batch)
             # append metrics from step
@@ -473,7 +479,7 @@ class Trainer:
         - `epoch`: current epoch
         """
         # convert pmap-sharded train_state to a single-device one
-        ckpt = jax.tree_map(lambda x: jax.device_get(x), train_state)
+        ckpt = jax.tree.map(lambda x: jax.device_get(x), train_state)
         # save checkpoint (async)
         self.checkpoint_manager.save(epoch, args=ocp.args.StandardSave(ckpt))
 
@@ -506,12 +512,12 @@ class Trainer:
         return train_state
     
 
-    def make_template_env_state(self) -> chex.ArrayTree:
+    def make_template_env_state(self) -> Any:
         """Create a template environment state used for initializing data structures 
         that hold environment states to the correct shape.
         
         Returns:
-        - (chex.ArrayTree): template environment state
+        - (pytree): template environment state
         """
         env_state, _ = self.env_init_fn(jax.random.PRNGKey(0))
         return env_state
@@ -534,7 +540,7 @@ class Trainer:
         )
     
 
-    def init_collection_state(self, key: jax.random.PRNGKey, batch_size: int) -> CollectionState:
+    def init_collection_state(self, key: jax.Array, batch_size: int) -> CollectionState:
         """Initializes the collection state (see CollectionState).
         
         Args:

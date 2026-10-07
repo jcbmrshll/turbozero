@@ -1,7 +1,6 @@
 
-from typing import Tuple
+from typing import Any, Tuple
 
-import chex
 import jax
 import jax.numpy as jnp
 import optax
@@ -10,8 +9,8 @@ from flax.training.train_state import TrainState
 from core.memory.replay_memory import BaseExperience
 
 
-def az_default_loss_fn(params: chex.ArrayTree, train_state: TrainState, experience: BaseExperience, 
-                       l2_reg_lambda: float = 0.0001) -> Tuple[chex.Array, Tuple[chex.ArrayTree, optax.OptState]]:
+def az_default_loss_fn(params: Any, train_state: TrainState, experience: BaseExperience, 
+                       l2_reg_lambda: float = 0.0001) -> Tuple[jax.Array, Tuple[Any, optax.OptState]]:
     """ Implements the default AlphaZero loss function.
     
     = Policy Loss + Value Loss + L2 Regularization
@@ -63,7 +62,7 @@ def az_default_loss_fn(params: chex.ArrayTree, train_state: TrainState, experien
     # compute L2 regularization
     l2_reg = l2_reg_lambda * jax.tree_util.tree_reduce(
         lambda x, y: x + y,
-        jax.tree_map(
+        jax.tree.map(
             lambda x: (x ** 2).sum(),
             params
         )

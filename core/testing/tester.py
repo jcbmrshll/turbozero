@@ -1,9 +1,8 @@
 
+from dataclasses import dataclass
 from functools import partial
-from typing import Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
-import chex
-from chex import dataclass
 import jax
 
 from core.common import partition
@@ -11,6 +10,7 @@ from core.evaluators.evaluator import Evaluator
 from core.types import EnvInitFn, EnvStepFn
 
 
+@jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class TestState:
     """Base class for TestState."""
@@ -56,14 +56,14 @@ class BaseTester:
         return
 
 
-    def split_keys(self, key: chex.PRNGKey, num_devices: int) -> chex.PRNGKey:
+    def split_keys(self, key: jax.Array, num_devices: int) -> jax.Array:
         """Splits keys across devices.
         Args:
         - `key`: rng
         - `num_devices`: number of devices
         
         Returns:
-        - (chex.PRNGKey): keys split across devices
+        - (jax.Array): keys split across devices
         """
         # partition keys across devices (do this here so its reproducible no matter the number of devices used)
         keys = jax.random.split(key, self.num_keys)
@@ -71,9 +71,9 @@ class BaseTester:
         return keys
 
 
-    def run(self, key: chex.PRNGKey, epoch_num: int, max_steps: int, num_devices: int, #pylint: disable=unused-argument 
+    def run(self, key: jax.Array, epoch_num: int, max_steps: int, num_devices: int, #pylint: disable=unused-argument 
         env_step_fn: EnvStepFn, env_init_fn: EnvInitFn, evaluator: Evaluator, state: TestState,
-        params: chex.ArrayTree, *args) -> Tuple[TestState, Dict, str]:
+        params: Any, *args) -> Tuple[TestState, Dict, str]:
         """Runs the test, if the current epoch is an epoch that should be tested on
         
         If a render function is provided, saves a .gif of the first episode of the test.
@@ -106,11 +106,11 @@ class BaseTester:
             if self.render_fn is not None:
                 # render first episode to .gif
                 # get frames from first episode
-                frames = jax.tree_map(lambda x: x[0], frames)
+                frames = jax.tree.map(lambda x: x[0], frames)
                 # get player ids from first episode
                 p_ids = p_ids[0]
                 # get list of frames
-                frame_list = [jax.device_get(jax.tree_map(lambda x: x[i], frames)) for i in range(max_steps)]
+                frame_list = [jax.device_get(jax.tree.map(lambda x: x[i], frames)) for i in range(max_steps)]
                 # render frames to .gif
                 path_to_rendering = self.render_fn(frame_list, p_ids, f"{self.name}_{epoch_num}", self.render_dir)
             else:
@@ -120,7 +120,7 @@ class BaseTester:
     
     @partial(jax.pmap, axis_name='d', static_broadcasted_argnums=(0, 1, 2, 3, 4))
     def test(self, max_steps: int, env_step_fn: EnvStepFn, env_init_fn: EnvInitFn, evaluator: Evaluator,
-        keys: chex.PRNGKey, state: TestState, params: chex.ArrayTree) -> Tuple[TestState, Dict, chex.ArrayTree, chex.Array]:
+        keys: jax.Array, state: TestState, params: Any) -> Tuple[TestState, Dict, Any, jax.Array]:
         """Run the test implemented by the Tester. Parallelized across devices.
 
         Implemented by subclasses.
@@ -135,7 +135,7 @@ class BaseTester:
         - `params`: nn parameters used by agent
 
         Returns:
-        - (TestState, Dict, chex.ArrayTree, chex.Array)
+        - (TestState, Dict, Any, jax.Array)
             - updated internal state of the tester
             - metrics from the test
             - frames from the test (used to produce renderings)

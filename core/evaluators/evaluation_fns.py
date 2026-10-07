@@ -1,15 +1,14 @@
 
-from typing import Callable, Tuple
+from typing import Any, Callable, Tuple
 
-import chex
 import flax
 import jax
 
 
 def make_nn_eval_fn(
     nn: flax.linen.Module,
-    state_to_nn_input_fn: Callable[[chex.ArrayTree], chex.Array]
-) -> Callable[[chex.ArrayTree, chex.ArrayTree, chex.PRNGKey], Tuple[chex.Array, chex.Array]]:
+    state_to_nn_input_fn: Callable[[Any], jax.Array]
+) -> Callable[[Any, Any, jax.Array], Tuple[jax.Array, jax.Array]]:
     """Creates a leaf evaluation function using a neural network (state, params) -> (policy, value).
     
     Args:
@@ -30,9 +29,9 @@ def make_nn_eval_fn(
 
 
 def make_nn_eval_fn_no_params_callable(
-    nn: Callable[[chex.Array], Tuple[chex.Array, chex.Array]],
-    state_to_nn_input_fn: Callable[[chex.ArrayTree], chex.Array]
-) -> Callable[[chex.ArrayTree, chex.ArrayTree, chex.PRNGKey], Tuple[chex.Array, chex.Array]]:
+    nn: Callable[[jax.Array], Tuple[jax.Array, jax.Array]],
+    state_to_nn_input_fn: Callable[[Any], jax.Array]
+) -> Callable[[Any, Any, jax.Array], Tuple[jax.Array, jax.Array]]:
     """Creates a leaf evaluation function that uses a stateless neural net evaluation function (state) -> (policy, value).
     
     Args:

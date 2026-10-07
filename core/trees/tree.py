@@ -1,22 +1,23 @@
 
 from __future__ import annotations
-from typing import Tuple, TypeVar, Generic, ClassVar
-import chex
-from chex import dataclass
+from dataclasses import dataclass, replace
+from typing import Any, ClassVar, Generic, Tuple, TypeVar
+
 import jax
 import jax.numpy as jnp
 
 NodeType = TypeVar('NodeType')
 
+@jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class Tree(Generic[NodeType]):
     """A generic DAG tree data structure that holds arbitrary structured data within nodes."""
     # N -> max nodes
     # F -> branching Factor
-    next_free_idx: chex.Array # ()
-    parents: chex.Array # (N)
-    edge_map: chex.Array # (N, F)
-    data: chex.ArrayTree # structured data with leaves of shape (N, ...)
+    next_free_idx: jax.Array # ()
+    parents: jax.Array # (N)
+    edge_map: jax.Array # (N, F)
+    data: Any # structured data with leaves of shape (N, ...)
 
     NULL_INDEX: ClassVar[int] = -1
     NULL_VALUE: ClassVar[int] = 0
@@ -75,7 +76,7 @@ class Tree(Generic[NodeType]):
         return self.edge_map[parent_index, edge_index] != self.NULL_INDEX
     
     
-    def get_child_data(self, x: str, index: int, null_value=None) -> chex.ArrayTree:
+    def get_child_data(self, x: str, index: int, null_value=None) -> jax.Array:
         """returns a specified data field for all children of a node
 
         Args:
@@ -84,7 +85,7 @@ class Tree(Generic[NodeType]):
         - `null_value`: the value to use for children that do not exist
 
         Returns:
-        - (chex.ArrayTree): the extracted data field for all children of the parent node
+        - (jax.Array): the extracted data field for all children of the parent node
         """
         assert hasattr(self.data, x), f"field {x} not found in node data."
 
@@ -122,11 +123,11 @@ class Tree(Generic[NodeType]):
         # so we set it to NULL_INDEX instead when the tree is full
         edge_map_index = jnp.where(in_bounds, self.next_free_idx, self.NULL_INDEX)
         # ...
-        return self.replace( #pylint: disable=no-member
+        return replace(self,
             next_free_idx=jnp.where(in_bounds, self.next_free_idx + 1, self.next_free_idx),
             parents=self.parents.at[self.next_free_idx].set(parent_index),
             edge_map=self.edge_map.at[parent_index, edge_index].set(edge_map_index),
-            data=jax.tree_map(
+            data=jax.tree.map(
                 lambda x, y: x.at[self.next_free_idx].set(y),
                 self.data, data)
         )
@@ -143,9 +144,9 @@ class Tree(Generic[NodeType]):
         """
         self.check_data_type(data)
 
-        return self.replace( #pylint: disable=no-member
+        return replace(self,
             next_free_idx=jnp.maximum(self.next_free_idx, 1),
-            data=jax.tree_map(
+            data=jax.tree.map(
                 lambda x, y: x.at[self.ROOT_INDEX].set(y),
                 self.data, data))
     
@@ -160,20 +161,20 @@ class Tree(Generic[NodeType]):
         Returns:
         - (Tree): tree with the node data updated.
         """
-        return self.replace( #pylint: disable=no-member
+        return replace(self,
             data=jax.tree_util.tree_map(
                 lambda x, y: x.at[index].set(y),
                 self.data, data))
     
     
-    def _get_translation(self, child_index: int) -> Tuple[chex.Array, chex.Array, chex.Array]:
+    def _get_translation(self, child_index: int) -> Tuple[jax.Array, jax.Array, jax.Array]:
         """Extracts mapping of node_idxs in a particular root subtree (with root at `child_index`) to collapsed indices.
         
         Args:
         - `child_index`: the index of the child node to use as the root of the subtree.
 
         Returns:
-        - (Tuple[chex.Array, chex.Array, chex.Array]): 
+        - (Tuple[jax.Array, jax.Array, jax.Array]): 
             - old_subtree_idxs: the indices of the nodes in the subtree rooted at `child_index`.
             - translation: the mapping from the old indices to the new indices after collapsing the subtree.
             - erase_idxs: the indices of the nodes that will be erased after collapsing the subtree.
@@ -257,11 +258,11 @@ class Tree(Generic[NodeType]):
                     translation[x])))
 
         def translate_pytree(x, null_value=self.NULL_VALUE):
-            return jax.tree_map(
+            return jax.tree.map(
                 lambda t: translate(t, null_value=null_value), x)
         
         # extract subtree using translation functions
-        return self.replace( #pylint: disable=no-member
+        return replace(self,
             next_free_idx=new_next_node_index,
             parents=translate_idx(self.parents),
             edge_map=translate_idx(self.edge_map),
@@ -271,11 +272,11 @@ class Tree(Generic[NodeType]):
 
     def reset(self) -> Tree:
         """Resets the tree to its initial state."""
-        return self.replace( #pylint: disable=no-member
+        return replace(self,
             next_free_idx=0,
             parents=jnp.full_like(self.parents, self.NULL_INDEX),
             edge_map=jnp.full_like(self.edge_map, self.NULL_INDEX),
-            data=jax.tree_map(jnp.zeros_like, self.data))
+            data=jax.tree.map(jnp.zeros_like, self.data))
     
 
 def init_tree(max_nodes: int, branching_factor: int, template_data: NodeType) -> Tree:
@@ -294,5 +295,6 @@ def init_tree(max_nodes: int, branching_factor: int, template_data: NodeType) ->
         parents=jnp.full((max_nodes,), fill_value=Tree.NULL_INDEX, dtype=jnp.int32),
         edge_map=jnp.full((max_nodes, branching_factor), fill_value=Tree.NULL_INDEX, dtype=jnp.int32),
         data=jax.tree_util.tree_map(
-            lambda x: jnp.zeros((max_nodes, *x.shape), dtype=x.dtype),
+            # template leaves can be python scalars (e.g. `turn` in pgx's othello state)
+            lambda x: jnp.zeros((max_nodes, *jnp.shape(x)), dtype=jnp.result_type(x)),
             template_data))

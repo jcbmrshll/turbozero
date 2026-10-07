@@ -1,8 +1,7 @@
 
-from typing import Dict, Tuple
+from dataclasses import dataclass, replace
+from typing import Any, Dict, Tuple
 
-import chex
-from chex import dataclass
 import jax
 import jax.numpy as jnp
 
@@ -11,6 +10,7 @@ from core.evaluators.mcts.state import BackpropState, MCTSNode, MCTSTree
 from core.evaluators.mcts.action_selection import normalize_q_values
 
 
+@jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class WeightedMCTSNode(MCTSNode):
     # Weighted MCTS needs access to the original raw value returned by the leaf evaluation
@@ -41,7 +41,7 @@ class WeightedMCTS(MCTS):
 
 
     @staticmethod
-    def new_node(policy: chex.Array, value: float, embedding: chex.ArrayTree, terminated: bool) -> WeightedMCTSNode:
+    def new_node(policy: jax.Array, value: float, embedding: Any, terminated: bool) -> WeightedMCTSNode:
         """Create a new WeightedMCTSNode.
         
         Args:
@@ -64,7 +64,7 @@ class WeightedMCTS(MCTS):
 
 
     @staticmethod
-    def update_root_node(root_node: MCTSNode, root_policy: chex.Array, root_value: float, root_embedding: chex.ArrayTree) -> WeightedMCTSNode:
+    def update_root_node(root_node: MCTSNode, root_policy: jax.Array, root_value: float, root_embedding: Any) -> WeightedMCTSNode:
         """ Updates the root node
         - if the tree is empty, create a new node
         - otherwise, update the existing root node
@@ -78,7 +78,7 @@ class WeightedMCTS(MCTS):
         Returns:
         - (WeightedMCTSNode): updated root node"""
         visited = root_node.n > 0
-        return root_node.replace(
+        return replace(root_node,
             p=root_policy,
             q=jnp.where(visited, root_node.q, root_value),
             r=jnp.where(visited, root_node.r, root_value),
@@ -87,7 +87,7 @@ class WeightedMCTS(MCTS):
         )
 
 
-    def backpropagate(self, key: chex.PRNGKey, tree: MCTSTree, parent: int, value: float) -> MCTSTree:
+    def backpropagate(self, key: jax.Array, tree: MCTSTree, parent: int, value: float) -> MCTSTree:
         """Backpropagate weighted sums of child q-values and update visit counts.
 
         Args:
@@ -136,7 +136,7 @@ class WeightedMCTS(MCTS):
             # computer weighted sum of q-values
             weighted_value = jnp.sum(child_weights * q_values)
             # update node with weighted value
-            node = node.replace(q=weighted_value)
+            node = replace(node, q=weighted_value)
             # adjust node value to ((weighted_value * node_visits) + raw_value) / (node_visits + 1)
             # and increment visit count
             node = self.visit_node(node, node.r)
