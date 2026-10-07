@@ -96,8 +96,6 @@ def test_checkpoint_round_trip(trainers, trained):
     assert leaves_equal(restored.opt_state, out.train_state.opt_state)
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError,
-                   reason="#10: Trainer.__init__ erases existing checkpoints in ckpt_dir")
 def test_new_trainer_keeps_existing_checkpoints(ttt, trainers, trained, tmp_path):
     ckpt_dir = tmp_path / "ckpt"
     shutil.copytree(trainers[2].ckpt_dir, ckpt_dir)
@@ -105,6 +103,18 @@ def test_new_trainer_keeps_existing_checkpoints(ttt, trainers, trained, tmp_path
     make_trainer(ttt, 2, ckpt_dir)
 
     assert sorted(os.listdir(ckpt_dir)) == ["0", "1"]
+
+
+def test_save_checkpoint_refuses_existing_epoch(trainers, trained):
+    trainer, out = trainers[2], trained[2]
+
+    # e.g. a fresh run started in a directory that already holds checkpoints
+    with pytest.raises(ValueError, match="already has a checkpoint"):
+        trainer.save_checkpoint(out.train_state, 1)
+
+    assert sorted(os.listdir(trainer.ckpt_dir)) == ["0", "1"]
+    restored = trainer.load_train_state_from_checkpoint(trainer.ckpt_dir, 1)
+    assert leaves_equal(extract_params(restored), extract_params(out.train_state))
 
 
 @pytest.mark.xfail(strict=True, raises=AssertionError,
