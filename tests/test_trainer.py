@@ -145,8 +145,6 @@ def test_self_play_uses_latest_params(trainers, monkeypatch):
             f"epoch {epoch} self-play did not use the params trained in epoch {epoch - 1}"
 
 
-@pytest.mark.xfail(strict=True, raises=TypeError,
-                   reason="#8: BaseTester.run returns None on epochs it skips, and train_loop unpacks 3 values")
 def test_train_loop_with_tester_skipping_epochs(trainers, monkeypatch):
     trainer = trainers[1]
     monkeypatch.setattr(trainer, "save_checkpoint", lambda *args, **kwargs: None)
