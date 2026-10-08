@@ -260,6 +260,36 @@ def masked_softmax(logits, mask):
     return jax.nn.softmax(jnp.where(mask, logits, -jnp.inf))
 
 
+@pytest.mark.parametrize("alpha", [0.03, 0.3, 2.0])
+def test_dirichlet_noise_is_mixed_in_over_legal_moves_only(make_search, ttt, alpha):
+    epsilon = 0.25
+    search = make_search(
+        AZ_MCTS,
+        eval_fn=EVAL_FNS["make_nn_eval_fn_no_params_callable"],
+        dirichlet_alpha=alpha,
+        dirichlet_epsilon=epsilon,
+    )
+    state, meta = ttt.play(MIDGAME_MOVES)
+    keys = jax.random.split(jax.random.PRNGKey(0), 512)
+
+    out = jax.vmap(search.evaluate, in_axes=(0, None, None, None))(
+        keys, search.init(), state, meta
+    )
+
+    # what's left after taking out the network's share is the noise: a distribution
+    # over the legal moves, carrying exactly `epsilon` of the root prior
+    prior = masked_softmax(LOGITS, meta.action_mask)
+    noise = (out.eval_state.data.p[:, 0] - (1 - epsilon) * prior) / epsilon
+    assert (noise > -1e-5).all()
+    np.testing.assert_allclose(noise.sum(axis=-1), 1.0, rtol=1e-5)
+    np.testing.assert_allclose(noise[:, ~meta.action_mask], 0.0, atol=1e-6)
+    # a symmetric Dirichlet: each legal move gets an equal share on average
+    legal = int(meta.action_mask.sum())
+    np.testing.assert_allclose(
+        noise[:, meta.action_mask].mean(axis=0), 1 / legal, atol=0.06
+    )
+
+
 @pytest.mark.parametrize("eval_fn_name", EVAL_FNS)
 @pytest.mark.parametrize(
     "cls", [pytest.param(AZ_MCTS, id="AlphaZero(MCTS)"), pytest.param(MCTS, id="MCTS")]
