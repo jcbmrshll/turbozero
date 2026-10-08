@@ -1,9 +1,10 @@
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import Any
+from typing import Any, cast
 
 import jax
 
+from core import sharding
 from core.common import two_player_game
 from core.evaluators.evaluator import Evaluator
 from core.testing.tester import BaseTester, TestState
@@ -54,7 +55,6 @@ class TwoPlayerTester(BaseTester):
                 f"{self.__class__.__name__}: number of episodes ({self.num_episodes}) must be divisible by number of devices ({num_devices})"
             )
 
-    @partial(jax.pmap, axis_name="d", static_broadcasted_argnums=(0, 1, 2, 3, 4))
     def test(
         self,
         max_steps: int,
@@ -62,7 +62,7 @@ class TwoPlayerTester(BaseTester):
         env_init_fn: EnvInitFn,
         evaluator: Evaluator,
         keys: jax.Array,
-        state: TwoPlayerTestState,
+        state: TestState,
         params: Any,
     ) -> tuple[TwoPlayerTestState, dict, Any, jax.Array]:
         """Test the agent against the best performing parameters found so far in a two-player game.
@@ -83,6 +83,7 @@ class TwoPlayerTester(BaseTester):
                 - frames from the test (used for rendering)
                 - player ids from the test (used for rendering)
         """
+        state = cast(TwoPlayerTestState, state)
 
         game_fn = partial(
             two_player_game,
@@ -105,7 +106,7 @@ class TwoPlayerTester(BaseTester):
 
         # decide on the mean across all devices so best_params stays identical on every device
         best_params = jax.lax.cond(
-            jax.lax.pmean(avg, axis_name="d") > 0.0,
+            jax.lax.pmean(avg, axis_name=sharding.AXIS) > 0.0,
             lambda _: params,
             lambda _: state.best_params,
             None,

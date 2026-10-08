@@ -46,7 +46,6 @@ class TwoPlayerBaseline(BaseTester):
                 f"{self.__class__.__name__}: number of episodes ({self.num_episodes}) must be divisible by number of devices ({num_devices})"
             )
 
-    @partial(jax.pmap, axis_name="d", static_broadcasted_argnums=(0, 1, 2, 3, 4))
     def test(
         self,
         max_steps: int,

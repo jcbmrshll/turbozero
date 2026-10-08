@@ -5,8 +5,9 @@ from operator import itemgetter
 from typing import Any
 
 import jax
+from jax.sharding import Mesh, PartitionSpec
 
-from core.common import partition
+from core import sharding
 from core.evaluators.evaluator import Evaluator
 from core.types import EnvInitFn, EnvStepFn
 
@@ -71,12 +72,11 @@ class BaseTester:
             num_devices: number of devices
 
         Returns:
-            jax.Array: keys split across devices
+            jax.Array: `num_keys` keys, sharded across devices
         """
-        # partition keys across devices (do this here so its reproducible no matter the number of devices used)
+        # split into `num_keys` keys before sharding them, so the keys don't depend on the number of devices used
         keys = jax.random.split(key, self.num_keys)
-        keys = partition(keys, num_devices)
-        return keys
+        return sharding.shard(keys, sharding.make_mesh(num_devices))
 
     def run(
         self,
@@ -118,8 +118,15 @@ class BaseTester:
 
         if epoch_num % self.epochs_per_test == 0:
             # run test
-            state, metrics, frames, p_ids = self.test(
-                max_steps, env_step_fn, env_init_fn, evaluator, keys, state, params
+            state, metrics, frames, p_ids = self.test_on_devices(
+                sharding.make_mesh(num_devices),
+                max_steps,
+                env_step_fn,
+                env_init_fn,
+                evaluator,
+                keys,
+                state,
+                params,
             )
 
             if self.render_fn is not None:
@@ -142,7 +149,62 @@ class BaseTester:
             return state, metrics, path_to_rendering
         return state, {}, None
 
-    @partial(jax.pmap, axis_name="d", static_broadcasted_argnums=(0, 1, 2, 3, 4))
+    @partial(jax.jit, static_argnums=(0, 1, 2, 3, 4, 5))
+    def test_on_devices(
+        self,
+        mesh: Mesh,
+        max_steps: int,
+        env_step_fn: EnvStepFn,
+        env_init_fn: EnvInitFn,
+        evaluator: Evaluator,
+        keys: jax.Array,
+        state: TestState,
+        params: Any,
+    ) -> tuple[TestState, dict, Any, jax.Array]:
+        """Runs `test` on every device of `mesh`, each on its shard of `keys`.
+
+        Args:
+            mesh: mesh to run on (see `core.sharding.make_mesh`)
+            max_steps: maximum number of steps per episode
+            env_step_fn: environment step function
+            env_init_fn: environment initialization function
+            evaluator: evaluator used by agent
+            keys: rng, one key per episode, sharded across `mesh` (see `split_keys`)
+            state: internal state of the tester, replicated
+            params: nn parameters used by agent, replicated
+
+        Returns:
+            Tuple[TestState, Dict, Any, jax.Array]:
+                - updated internal state of the tester (replicated)
+                - metrics from the test, one value per device along the first axis
+                - frames from the test, one episode per device along the first axis
+                - player ids from the test, one episode per device along the first axis
+        """
+
+        def test(
+            keys: jax.Array, state: TestState, params: Any
+        ) -> tuple[TestState, dict, Any, jax.Array]:
+            state, metrics, frames, p_ids = self.test(
+                max_steps, env_step_fn, env_init_fn, evaluator, keys, state, params
+            )
+            # stack each device's metrics and frames along a new device axis
+            metrics, frames, p_ids = jax.tree.map(
+                lambda x: x[None], (metrics, frames, p_ids)
+            )
+            return state, metrics, frames, p_ids
+
+        return sharding.shard_map(
+            test,
+            mesh=mesh,
+            in_specs=(PartitionSpec(sharding.AXIS), PartitionSpec(), PartitionSpec()),
+            out_specs=(
+                PartitionSpec(),
+                PartitionSpec(sharding.AXIS),
+                PartitionSpec(sharding.AXIS),
+                PartitionSpec(sharding.AXIS),
+            ),
+        )(keys, state, params)
+
     def test(
         self,
         max_steps: int,
@@ -153,24 +215,26 @@ class BaseTester:
         state: TestState,
         params: Any,
     ) -> tuple[TestState, dict, Any, jax.Array]:
-        """Run the test implemented by the Tester. Parallelized across devices.
+        """Run the test implemented by the Tester, on one device. Parallelized across devices by `test_on_devices`.
 
-        Implemented by subclasses.
+        Implemented by subclasses. Runs per device, inside `core.sharding.shard_map` over `core.sharding.AXIS`:
+        `keys` holds this device's share of the episodes. The returned state must be the same on every device,
+        reduce across devices with collectives over `core.sharding.AXIS` (e.g. `jax.lax.pmean`) to decide on it.
 
         Args:
             max_steps: maximum number of steps per episode
             env_step_fn: environment step function
             env_init_fn: environment initialization function
             evaluator: evaluator used by agent
-            keys: rng
+            keys: rng, one key per episode on this device
             state: internal state of the tester
             params: nn parameters used by agent
 
         Returns:
             Tuple[TestState, Dict, Any, jax.Array]:
                 - updated internal state of the tester
-                - metrics from the test
-                - frames from the test (used to produce renderings)
-                - player ids from the test (used to produce renderings)
+                - metrics from the test, on this device
+                - frames from this device's first episode (used to produce renderings)
+                - player ids from this device's first episode (used to produce renderings)
         """
         raise NotImplementedError()

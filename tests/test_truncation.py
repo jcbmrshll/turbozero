@@ -225,11 +225,8 @@ def test_tester_renders_every_frame_up_to_the_final_state(fixed_length_env, scri
         rendered.extend(frames)
         return "rendering"
 
-    def replicate(tree):
-        return jax.tree.map(lambda x: jnp.stack([x] * 2), tree)
-
     tester = TwoPlayerTester(num_episodes=2, render_fn=render_fn)
-    state = TwoPlayerTestState(best_params=replicate({"w": jnp.zeros(3)}))
+    state = TwoPlayerTestState(best_params={"w": jnp.zeros(3)})
 
     _, _, path = tester.run(
         key=jax.random.PRNGKey(0),
@@ -240,7 +237,7 @@ def test_tester_renders_every_frame_up_to_the_final_state(fixed_length_env, scri
         env_init_fn=env.init_fn,
         evaluator=scripted.first_legal,
         state=state,
-        params=replicate({"w": jnp.ones(3)}),
+        params={"w": jnp.ones(3)},
     )
 
     assert path == "rendering"
