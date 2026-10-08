@@ -60,27 +60,24 @@ class _AlphaZero(MCTS):
         # evaluate the root state
         root_key, dir_key = jax.random.split(key, 2)
         root_policy_logits, root_value = self.eval_fn(root_embedding, params, root_key)
-        root_policy = jax.nn.softmax(root_policy_logits)
+        mask = root_metadata.action_mask
+        min_logit = jnp.finfo(root_policy_logits.dtype).min
+        root_policy = jax.nn.softmax(jnp.where(mask, root_policy_logits, min_logit))
 
-        # add Dirichlet noise to the root policy
-        dirichlet_noise = jax.random.dirichlet(
-            dir_key,
-            alpha=jnp.full([tree.branching_factor], fill_value=self.dirichlet_alpha),
-        )
+        # Dirichlet noise over the legal actions only, as in AlphaZero (its root has a child per legal move,
+        # and each gets a share of the noise): the softmax of independent log-Gamma(alpha) draws is a
+        # Dirichlet(alpha) sample, computed in log space so small alphas don't underflow
+        log_gamma = jax.random.loggamma(dir_key, self.dirichlet_alpha, mask.shape)
+        dirichlet_noise = jax.nn.softmax(jnp.where(mask, log_gamma, min_logit))
+        # both are distributions over the legal actions, so their mix is too
         noisy_policy = ((1 - self.dirichlet_epsilon) * root_policy) + (
             self.dirichlet_epsilon * dirichlet_noise
         )
-        # re-normalize the policy
-        new_logits = jnp.log(jnp.maximum(noisy_policy, jnp.finfo(noisy_policy).tiny))
-        policy = jnp.where(
-            root_metadata.action_mask, new_logits, jnp.finfo(noisy_policy).min
-        )
-        renorm_policy = jax.nn.softmax(policy)
 
         # update the root node
         root_node = tree.data_at(tree.ROOT_INDEX)
         root_node = self.update_root_node(
-            root_node, renorm_policy, root_value, root_embedding
+            root_node, noisy_policy, root_value, root_embedding
         )
         return tree.set_root(root_node)
 

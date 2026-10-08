@@ -5,6 +5,7 @@ share one trainer per device count and only change settings that don't affect co
 
 import os
 import shutil
+from dataclasses import replace
 from functools import partial
 
 import equinox as eqx
@@ -221,6 +222,9 @@ def test_train_loop_logs_to_monitor(trainers, monitor_server, monkeypatch):
             "policy_loss",
             "value_loss",
             "TwoPlayerTester_avg_outcome",
+            "selfplay_episodes",
+            "buffer_distinct_positions",
+            "buffer_distinct_fraction",
         } <= logged
     # each test's first game went to the server as raw arrays, for it to render
     episodes = sorted(
@@ -243,3 +247,49 @@ def test_crashed_train_loop_marks_run_crashed(trainers, monitor_server, monkeypa
         trainer.train_loop(seed=0, num_epochs=1)
 
     assert monitor_server.get(f"/api/runs/{monitor.run_id}")["status"] == "crashed"
+
+
+@pytest.mark.parametrize(
+    "rewards, max_episode_steps, episodes, draws",
+    [
+        ((1.0, -1.0), 3, 2, 0),
+        ((0.0, 0.0), 3, 2, 2),
+        # truncated episodes aren't counted
+        ((0.0, 0.0), 2, 0, 0),
+    ],
+)
+def test_collect_counts_terminated_episodes_and_draws(
+    fixed_length_env,
+    scripted,
+    make_collector,
+    tmp_path,
+    rewards,
+    max_episode_steps,
+    episodes,
+    draws,
+):
+    env = fixed_length_env(length=3, rewards=rewards)
+    collect = make_collector(env, scripted.first_legal, max_episode_steps, tmp_path)
+
+    state = collect(num_steps=7)
+
+    assert (int(state.episodes[0]), int(state.draws[0])) == (episodes, draws)
+
+
+def test_selfplay_metrics_cover_the_epochs_episodes(trainers, trained):
+    trainer, after = trainers[2], trained[2].collection_state
+    before = replace(
+        after, episodes=after.episodes - 1, draws=after.draws - (after.draws > 0)
+    )
+
+    metrics = trainer.selfplay_metrics(before, after)
+
+    num_envs = after.episodes.size
+    assert metrics["selfplay_episodes"] == num_envs
+    assert metrics["selfplay_draw_fraction"] == (after.draws > 0).sum() / num_envs
+    buffer_state = after.buffer_state
+    sampleable = (buffer_state.populated & buffer_state.has_reward).sum()
+    assert 0 < metrics["buffer_distinct_positions"] <= sampleable
+    assert metrics["buffer_distinct_fraction"] == pytest.approx(
+        metrics["buffer_distinct_positions"] / sampleable
+    )

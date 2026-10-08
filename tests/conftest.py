@@ -13,12 +13,14 @@ import json
 import threading
 import urllib.request
 from dataclasses import dataclass, replace
-from functools import cache
+from functools import cache, partial
 from types import SimpleNamespace
 from typing import Any
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
+import optax
 import pgx
 import pytest
 
@@ -26,7 +28,10 @@ from core.evaluators.alphazero import AlphaZero
 from core.evaluators.evaluator import EvalOutput, Evaluator
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.mcts.mcts import MCTS
+from core.memory.replay_memory import EpisodeReplayBuffer
 from core.monitor.server import make_server
+from core.training.loss_fns import az_default_loss_fn
+from core.training.train import Trainer
 from core.types import StepMetadata
 
 env = pgx.make("tic_tac_toe")
@@ -251,6 +256,49 @@ def make_search():
 
     def make(cls=None, eval_fn=uniform_eval_fn, **kwargs):
         return factory(cls, eval_fn, **kwargs)
+
+    return make
+
+
+@pytest.fixture(scope="session")
+def make_collector():
+    """Factory for self-play collection in a single environment, through a `Trainer`'s `collect`.
+
+    `make_collector(env, evaluator, max_episode_steps, ckpt_dir, **trainer_kwargs)` returns
+    `collect(num_steps)`: the `CollectionState` after `num_steps` steps from the initial state.
+    """
+
+    def make(env, evaluator, max_episode_steps, ckpt_dir, **trainer_kwargs):
+        nn = eqx.nn.Linear(2, env.num_actions, key=jax.random.PRNGKey(0))
+        trainer = Trainer(
+            batch_size=1,
+            train_batch_size=1,
+            warmup_steps=0,
+            collection_steps_per_epoch=1,
+            train_steps_per_epoch=1,
+            nn=nn,
+            loss_fn=az_default_loss_fn,
+            optimizer=optax.sgd(1e-3),
+            evaluator=evaluator,
+            memory_buffer=EpisodeReplayBuffer(capacity=16),
+            max_episode_steps=max_episode_steps,
+            env_step_fn=env.step_fn,
+            env_init_fn=env.init_fn,
+            state_to_nn_input_fn=env.state_to_nn_input,
+            testers=[],
+            ckpt_dir=str(ckpt_dir),
+            num_devices=1,
+            **trainer_kwargs,
+        )
+        step = jax.jit(jax.vmap(partial(trainer.collect, params=None)))
+
+        def collect(num_steps):
+            state = trainer.init_collection_state(jax.random.PRNGKey(0), batch_size=1)
+            for i in range(num_steps):
+                state = step(jax.random.split(jax.random.PRNGKey(i), 1), state)
+            return state
+
+        return collect
 
     return make
 
