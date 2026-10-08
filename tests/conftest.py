@@ -9,6 +9,9 @@ os.environ["XLA_FLAGS"] = " ".join(
     [os.environ.get("XLA_FLAGS", ""), "--xla_force_host_platform_device_count=2"]
 ).strip()
 
+import json
+import threading
+import urllib.request
 from dataclasses import dataclass, replace
 from functools import cache
 from types import SimpleNamespace
@@ -23,6 +26,7 @@ from core.evaluators.alphazero import AlphaZero
 from core.evaluators.evaluator import EvalOutput, Evaluator
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.mcts.mcts import MCTS
+from core.monitor.server import make_server
 from core.types import StepMetadata
 
 env = pgx.make("tic_tac_toe")
@@ -258,3 +262,23 @@ def scripted():
         first_legal=ScriptedEvaluator("first_legal"),
         resign=ScriptedEvaluator("resign"),
     )
+
+
+@pytest.fixture
+def monitor_server(tmp_path):
+    """A monitor server on a free port, storing runs in a temporary directory.
+
+    Returns a namespace with its `url`, `dir`, and `get(path)` to read its API as JSON.
+    """
+    server = make_server("127.0.0.1", 0, str(tmp_path / "runs"))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    def get(path):
+        with urllib.request.urlopen(url + path) as resp:
+            return json.loads(resp.read())
+
+    yield SimpleNamespace(url=url, dir=tmp_path / "runs", get=get)
+    server.shutdown()
+    server.server_close()

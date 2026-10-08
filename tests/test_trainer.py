@@ -18,6 +18,8 @@ from core.evaluators.evaluation_fns import make_nn_eval_fn
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.mcts.mcts import MCTS
 from core.memory.replay_memory import EpisodeReplayBuffer
+from core.monitor import Monitor
+from core.monitor.renderers import pgx_two_player_episode
 from core.networks.azresnet import AZResnet, AZResnetConfig
 from core.testing.two_player_tester import TwoPlayerTester
 from core.training.loss_fns import az_default_loss_fn
@@ -190,3 +192,54 @@ def test_train_loop_with_tester_skipping_epochs(trainers, monkeypatch):
     out = trainer.train_loop(seed=0, num_epochs=2)
 
     assert out.cur_epoch == 2
+
+
+def test_train_loop_logs_to_monitor(trainers, monitor_server, monkeypatch):
+    trainer = trainers[1]
+    monitor = Monitor(monitor_server.url, project="tests")
+    monkeypatch.setattr(trainer, "save_checkpoint", lambda *args, **kwargs: None)
+    monkeypatch.setattr(trainer, "monitor", monitor)
+    monkeypatch.setattr(trainer, "extra_config", {"note": "hello"})
+    monkeypatch.setattr(trainer.testers[0], "episode_fn", pgx_two_player_episode())
+
+    trainer.train_loop(seed=0, num_epochs=2)
+
+    meta = monitor_server.get(f"/api/runs/{monitor.run_id}")
+    assert (meta["status"], meta["step"], meta["seed"], meta["num_epochs"]) == (
+        "finished",
+        1,
+        0,
+        2,
+    )
+    assert meta["config"]["batch_size"] == trainer.batch_size
+    assert meta["config"]["note"] == "hello"
+    rows = monitor_server.get(f"/api/runs/{monitor.run_id}/metrics")["rows"]
+    for epoch in range(2):
+        logged = {k for r in rows if r["step"] == epoch for k in r}
+        assert {
+            "loss",
+            "policy_loss",
+            "value_loss",
+            "TwoPlayerTester_avg_outcome",
+        } <= logged
+    # each test's first game went to the server as raw arrays, for it to render
+    episodes = sorted(
+        p.name for p in (monitor_server.dir / monitor.run_id / "episodes").iterdir()
+    )
+    assert episodes == ["TwoPlayerTester_game-0.npz", "TwoPlayerTester_game-1.npz"]
+
+
+def test_crashed_train_loop_marks_run_crashed(trainers, monitor_server, monkeypatch):
+    trainer = trainers[1]
+    monitor = Monitor(monitor_server.url, project="tests")
+    monkeypatch.setattr(trainer, "monitor", monitor)
+
+    def crash(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(trainer, "train_steps", crash)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        trainer.train_loop(seed=0, num_epochs=1)
+
+    assert monitor_server.get(f"/api/runs/{monitor.run_id}")["status"] == "crashed"

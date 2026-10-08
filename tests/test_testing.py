@@ -1,13 +1,15 @@
+import xml.etree.ElementTree as ET
 from functools import partial
-from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
 from core.common import two_player_game
+from core.evaluators.random_evaluator import RandomEvaluator
+from core.monitor.renderers import _caption
+from core.testing.two_player_baseline import TwoPlayerBaseline
 from core.testing.two_player_tester import TwoPlayerTester, TwoPlayerTestState
-from core.testing.utils import render_pgx_2p
 
 MAX_STEPS = 10
 
@@ -109,29 +111,84 @@ def test_tester_run_on_skipped_epoch_returns_state_unchanged(ttt, scripted):
     assert rendered is None
 
 
-def test_render_pgx_2p_handles_svgs_with_a_viewbox(tmp_path):
-    # pgx's own SVGs only set width/height; an SVG with a viewBox used to hit an unbound `original_width`
-    class ViewBoxState:
-        current_player = 0
+def test_caption_handles_svgs_with_a_viewbox():
+    # pgx's own SVGs only set width/height; an SVG with a viewBox (and no width) must work too
+    svg = (
+        b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 50" height="50">'
+        b'<rect width="100" height="50" fill="black"/></svg>'
+    )
 
-        def save_svg(self, path, color_theme):  # pylint: disable=unused-argument
-            with open(path, "w") as f:
-                f.write(
-                    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 50" height="50">'
-                    '<rect width="100" height="50" fill="black"/></svg>'
-                )
+    root = ET.fromstring(_caption(svg, ["agent", "opponent"]))
 
-    frames = [
-        SimpleNamespace(
-            env_state=ViewBoxState(),
-            completed=np.array(done),
-            outcomes=np.array([1.0, -1.0]),
-            p1_value_estimate=0.5,
-            p2_value_estimate=-0.5,
+    # the viewBox and height grow by a fifth, for a strip holding a line per player
+    assert root.attrib["viewBox"] == "0.0 0.0 100.0 60.0"
+    assert float(root.attrib["height"]) == 60.0
+    texts = [el.text for el in root.iter("{http://www.w3.org/2000/svg}text")]
+    assert texts == ["agent", "opponent"]
+
+
+def test_caption_handles_pgx_svgs():
+    svg = (
+        b'<svg xmlns="http://www.w3.org/2000/svg" width="240.0" height="240.0">'
+        b'<rect width="240" height="240" fill="black"/></svg>'
+    )
+
+    root = ET.fromstring(_caption(svg, ["agent", "opponent"]))
+
+    assert float(root.attrib["height"]) == 288.0
+    assert "viewBox" not in root.attrib
+
+
+def test_random_evaluator_plays_legal_moves_uniformly(ttt):
+    evaluator = RandomEvaluator()
+    state, meta = ttt.play([0, 4])
+    eval_state = evaluator.init()
+    keys = jax.random.split(jax.random.PRNGKey(0), 7000)
+
+    actions = jax.vmap(
+        lambda k: evaluator.evaluate(k, eval_state, state, root_metadata=meta).action
+    )(keys)
+
+    counts = np.bincount(np.asarray(actions), minlength=ttt.num_actions)
+    assert counts[0] == counts[4] == 0
+    # 7 legal squares, 1000 picks each expected
+    np.testing.assert_allclose(counts[np.asarray(meta.action_mask)], 1000, rtol=0.1)
+
+
+def test_two_player_baseline_reports_win_and_loss_rates(ttt, scripted):
+    assert jax.local_device_count() >= 2
+    # both sides take the lowest free square, so whoever moves first wins: device 0 gets a key
+    # the agent wins, device 1 one it loses
+    game = jax.vmap(
+        partial(
+            two_player_game,
+            evaluator_1=scripted.first_legal,
+            evaluator_2=scripted.first_legal,
+            params_1=None,
+            params_2=None,
+            env_step_fn=ttt.step_fn,
+            env_init_fn=ttt.init_fn,
+            max_steps=MAX_STEPS,
         )
-        for done in (False, True)
-    ]
+    )
+    candidates = jax.random.split(jax.random.PRNGKey(0), 16)
+    outcomes, _, _ = game(candidates)
+    win_key = candidates[np.flatnonzero(outcomes[:, 0] == 1)[0]]
+    loss_key = candidates[np.flatnonzero(outcomes[:, 0] == -1)[0]]
+    keys = jnp.stack([win_key, loss_key])[:, None]
 
-    render_pgx_2p(frames, p_ids=[0, 1], title="viewbox", frame_dir=str(tmp_path))
+    tester = TwoPlayerBaseline(
+        num_episodes=2, baseline_evaluator=scripted.first_legal, name="baseline"
+    )
+    _, metrics, _, _ = tester.test(
+        MAX_STEPS,
+        ttt.step_fn,
+        ttt.init_fn,
+        scripted.first_legal,
+        keys,
+        replicate(tester.init(params=None), 2),
+        replicate({"w": jnp.ones(3)}, 2),
+    )
 
-    assert (tmp_path / "viewbox.gif").exists()
+    np.testing.assert_array_equal(metrics["baseline_win_rate"], [1.0, 0.0])
+    np.testing.assert_array_equal(metrics["baseline_loss_rate"], [0.0, 1.0])

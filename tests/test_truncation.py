@@ -216,22 +216,24 @@ def test_two_player_game_on_tic_tac_toe_hitting_the_step_limit(ttt, scripted):
     assert not frames.env_state.terminated[-1]
 
 
-def test_tester_renders_every_frame_up_to_the_final_state(fixed_length_env, scripted):
+def test_tester_episode_has_every_frame_up_to_the_final_state(
+    fixed_length_env, scripted
+):
     max_steps = 4
     env = fixed_length_env(length=max_steps)
-    rendered = []
+    packed = []
 
-    def render_fn(frames, p_ids, title, render_dir):  # pylint: disable=unused-argument
-        rendered.extend(frames)
-        return "rendering"
+    def episode_fn(frames, p_ids):  # pylint: disable=unused-argument
+        packed.append(frames)
+        return "episode"
 
     def replicate(tree):
         return jax.tree.map(lambda x: jnp.stack([x] * 2), tree)
 
-    tester = TwoPlayerTester(num_episodes=2, render_fn=render_fn)
+    tester = TwoPlayerTester(num_episodes=2, episode_fn=episode_fn)
     state = TwoPlayerTestState(best_params=replicate({"w": jnp.zeros(3)}))
 
-    _, _, path = tester.run(
+    _, _, episode = tester.run(
         key=jax.random.PRNGKey(0),
         epoch_num=0,
         max_steps=max_steps,
@@ -243,6 +245,9 @@ def test_tester_renders_every_frame_up_to_the_final_state(fixed_length_env, scri
         params=replicate({"w": jnp.ones(3)}),
     )
 
-    assert path == "rendering"
-    assert [int(f.env_state.step) for f in rendered] == list(range(max_steps + 1))
-    assert rendered[-1].completed
+    assert episode == "episode"
+    [frames] = packed
+    # one transfer off the device: numpy arrays stacked along time
+    assert isinstance(frames.completed, np.ndarray)
+    assert frames.env_state.step.tolist() == list(range(max_steps + 1))
+    assert frames.completed[-1]

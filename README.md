@@ -37,8 +37,17 @@ Example training scripts live in `examples/`:
 ```
 uv run examples/othello.py         # AlphaZero vs. pgx's pretrained Othello model and a greedy baseline
 uv run examples/connect_four.py    # AlphaZero with weighted MCTS on Connect Four
+uv run examples/tic_tac_toe.py     # sanity check: trains in a minute or two on CPU, tested against a random player
 ```
-Pass `--help` to see their options, e.g. `--wandb PROJECT` to log to Weights & Biases.
+Pass `--help` to see their options.
+
+## Monitoring runs
+Training runs can push their metrics, config and test games to a small local dashboard. Anything that isn't training happens in the monitor server: the training loop hands off raw test games and the server renders them, so it never waits on drawing or the network:
+```
+uv run turbozero-monitor               # http://localhost:8008, runs stored in ./runs
+uv run examples/othello.py --monitor   # in another shell
+```
+In your own scripts, pass `monitor=Monitor(project="...")` (from `core.monitor`) to the `Trainer`, and `episode_fn=pgx_two_player_episode()` (from `core.monitor.renderers`) to testers of two-player pgx games to see their games. Rendering needs the cairo system library on the machine running the monitor (on Ubuntu: `apt-get install libcairo2`). Logging never interrupts training: if the server is down, the run keeps going and says so once.
 
 ## Issues
 If you use this project and encounter an issue, error, or undesired behavior, please submit a [GitHub Issue](https://github.com/jcbmrshll/turbozero/issues) and I will do my best to resolve it as soon as I can. You may also contact me directly via `hello@jacob.land`.
