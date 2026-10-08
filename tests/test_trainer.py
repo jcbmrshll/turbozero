@@ -3,16 +3,19 @@
 Every Trainer instance compiles its own self-play, training and testing functions, so the tests
 share one trainer per device count and only change settings that don't affect compilation."""
 
+import math
 import os
 import shutil
 from functools import partial
 
 import equinox as eqx
 import jax
+import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
 
+from core import sharding
 from core.evaluators.alphazero import AlphaZero
 from core.evaluators.evaluation_fns import make_nn_eval_fn
 from core.evaluators.mcts.action_selection import PUCTSelector
@@ -27,13 +30,36 @@ from core.training.train import Trainer, checkpoint_epochs, extract_params
 STEPS_PER_EPOCH = 10
 
 
-def make_trainer(ttt, num_devices, ckpt_dir):
-    config = AZResnetConfig(
-        policy_head_out_size=ttt.num_actions, num_blocks=1, num_channels=4
-    )
-    net, nn_state = eqx.nn.make_with_state(AZResnet)(
-        config, ttt.env.observation_shape, key=jax.random.PRNGKey(0)
-    )
+class MLPNet(eqx.Module):
+    """Small stateless policy/value network."""
+
+    mlp: eqx.nn.MLP
+
+    def __init__(self, input_shape, num_actions, key):
+        self.mlp = eqx.nn.MLP(
+            math.prod(input_shape), num_actions + 1, width_size=16, depth=1, key=key
+        )
+
+    def __call__(self, x):
+        out = self.mlp(x.reshape(-1).astype(jnp.float32))
+        return out[:-1], out[-1]
+
+
+def make_trainer(ttt, num_devices, ckpt_dir, stateless=False):
+    if stateless:
+        net, nn_state = (
+            MLPNet(
+                ttt.env.observation_shape, ttt.num_actions, key=jax.random.PRNGKey(0)
+            ),
+            None,
+        )
+    else:
+        config = AZResnetConfig(
+            policy_head_out_size=ttt.num_actions, num_blocks=1, num_channels=4
+        )
+        net, nn_state = eqx.nn.make_with_state(AZResnet)(
+            config, ttt.env.observation_shape, key=jax.random.PRNGKey(0)
+        )
     make_evaluator = partial(
         AlphaZero(MCTS),
         eval_fn=make_nn_eval_fn(net, ttt.state_to_nn_input),
@@ -43,8 +69,8 @@ def make_trainer(ttt, num_devices, ckpt_dir):
         action_selector=PUCTSelector(),
     )
     return Trainer(
-        batch_size=2 * num_devices,
-        train_batch_size=4 * num_devices,
+        batch_size=4,
+        train_batch_size=8,
         warmup_steps=STEPS_PER_EPOCH,
         collection_steps_per_epoch=STEPS_PER_EPOCH,
         train_steps_per_epoch=1,
@@ -93,12 +119,20 @@ def test_train_loop_runs(trainers, trained, num_devices):
     out = trained[num_devices]
 
     assert out.cur_epoch == 2
-    np.testing.assert_array_equal(out.train_state.step, [2] * num_devices)
+    assert out.train_state.step == 2
     assert all(np.isfinite(x).all() for x in jax.tree.leaves(out.train_state.params))
-    # gradients are averaged across devices, so every device holds the same params
-    for x in jax.tree.leaves(extract_params(out.train_state)):
-        for device in range(1, num_devices):
-            np.testing.assert_array_equal(x[device], x[0])
+    # self-play environments are split across devices, the train and test states are replicated
+    for x in jax.tree.leaves(out.collection_state):
+        assert x.shape[0] == trainers[num_devices].batch_size
+        assert x.sharding.shard_shape(x.shape)[0] == x.shape[0] // num_devices
+        assert len(x.sharding.device_set) == num_devices
+    for x in jax.tree.leaves((out.train_state, out.test_states)):
+        assert (
+            x.sharding.is_fully_replicated and len(x.sharding.device_set) == num_devices
+        )
+        # gradients and network state are averaged across devices, so every device holds the same copy
+        copies = [np.asarray(shard.data) for shard in x.addressable_shards]
+        assert all(np.array_equal(c, copies[0]) for c in copies)
     buffer_state = out.collection_state.buffer_state
     assert (buffer_state.populated & buffer_state.has_reward).any()
     assert sorted(os.listdir(trainers[num_devices].ckpt_dir)) == ["0.eqx", "1.eqx"]
@@ -116,10 +150,9 @@ def test_checkpoint_round_trip(trainers, trained):
 def test_checkpoint_loads_on_other_device_count(trainers, trained):
     restored = trainers[1].load_train_state_from_checkpoint(trainers[2].ckpt_dir, 1)
 
-    for x, y in zip(
-        jax.tree.leaves(restored), jax.tree.leaves(trained[2].train_state), strict=True
-    ):
-        np.testing.assert_array_equal(x, y[:1])
+    assert leaves_equal(restored, trained[2].train_state)
+    for x in jax.tree.leaves(restored):
+        assert x.sharding.is_fully_replicated and len(x.sharding.device_set) == 1
 
 
 def test_save_checkpoint_keeps_max_checkpoints(ttt, trainers, trained, tmp_path):
@@ -190,3 +223,42 @@ def test_train_loop_with_tester_skipping_epochs(trainers, monkeypatch):
     out = trainer.train_loop(seed=0, num_epochs=2)
 
     assert out.cur_epoch == 2
+
+
+def test_train_steps_without_finished_episodes_raises(trainers):
+    trainer = trainers[2]
+    collection_state = sharding.shard(
+        trainer.init_collection_state(jax.random.PRNGKey(0), trainer.batch_size),
+        trainer.mesh,
+    )
+
+    with pytest.raises(ValueError, match="no episodes have finished"):
+        trainer.train_steps(
+            jax.random.PRNGKey(0),
+            collection_state,
+            trainer.replicate(trainer.init_train_state()),
+            1,
+        )
+
+
+def test_training_does_not_depend_on_device_count(ttt, tmp_path):
+    # self-play and sampling don't depend on the number of devices, and with a stateless network the mean of the
+    # per-device gradients is the gradient of the whole minibatch, so the runs only differ by float rounding.
+    # (BatchNorm normalizes each device's part of the minibatch with its own statistics, as under pmap,
+    # so a network with BatchNorm trains differently on different numbers of devices.)
+    out = {
+        n: make_trainer(ttt, n, tmp_path / str(n), stateless=True).train_loop(
+            seed=0, num_epochs=3
+        )
+        for n in (1, 2)
+    }
+
+    # self-play made the same moves, so the replay buffers match exactly
+    assert leaves_equal(
+        out[1].collection_state.buffer_state, out[2].collection_state.buffer_state
+    )
+    for x, y in zip(jax.tree.leaves(out[1]), jax.tree.leaves(out[2]), strict=True):
+        if np.issubdtype(np.asarray(x).dtype, np.inexact):
+            np.testing.assert_allclose(x, y, rtol=1e-5, atol=1e-6)
+        else:
+            np.testing.assert_array_equal(x, y)

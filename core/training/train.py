@@ -10,9 +10,10 @@ import jax
 import jax.numpy as jnp
 import optax
 import wandb
-from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from jax.sharding import PartitionSpec
 
-from core.common import partition, step_env_and_evaluator
+from core import sharding
+from core.common import step_env_and_evaluator
 from core.evaluators.evaluator import Evaluator
 from core.memory.replay_memory import (
     BaseExperience,
@@ -37,6 +38,9 @@ from core.types import (
 class CollectionState:
     """Stores state of self-play episode collection. Persists across generations.
 
+    Every array is batched along its first axis, one entry per self-play environment,
+    and sharded across devices along it.
+
     Attributes:
         eval_state: state of the evaluator
         env_state: state of the environment
@@ -59,7 +63,7 @@ class TrainLoopOutput:
 
     Attributes:
         collection_state: state of self-play episode collection.
-        train_state: TrainState, holds model params and state, optimizer state
+        train_state: TrainState, holds model params and state, optimizer state (replicated across devices)
         test_states: states of testers
         cur_epoch: current epoch num
     """
@@ -167,8 +171,8 @@ class Trainer:
         self.num_devices = (
             num_devices if num_devices is not None else jax.local_device_count()
         )
-        # the devices pmap maps over, used to split host-side minibatches across them
-        self.mesh = Mesh(jax.devices()[: self.num_devices], ("d",))
+        # self-play environments, test episodes and training minibatches are split across the devices of this mesh
+        self.mesh = sharding.make_mesh(self.num_devices)
         # environment
         self.env_step_fn = env_step_fn
         self.env_init_fn = env_init_fn
@@ -264,13 +268,8 @@ class Trainer:
             tester.check_size_compatibilities(self.num_devices)
 
     def replicate(self, data: Any) -> Any:
-        """Places a copy of each array in a data structure on every device, along a new first axis."""
-        return jax.device_put(
-            jax.tree.map(
-                lambda x: jnp.broadcast_to(x, (self.num_devices, *jnp.shape(x))), data
-            ),
-            NamedSharding(self.mesh, PartitionSpec("d")),
-        )
+        """Places a copy of each array in a data structure on every device."""
+        return sharding.replicate(data, self.mesh)
 
     def init_train_state(self) -> TrainState:
         """Initializes the training state (params, optimizer, etc.) from `nn` and `nn_state`.
@@ -379,52 +378,76 @@ class Trainer:
             metadata=new_metadata,
         )
 
-    @partial(jax.pmap, axis_name="d", static_broadcasted_argnums=(0, 4))
+    @partial(jax.jit, static_argnums=(0, 4))
     def collect_steps(
         self, key: jax.Array, state: CollectionState, params: Any, num_steps: int
     ) -> CollectionState:
-        """Collects self-play data for `num_steps` steps. Mapped across devices.
+        """Collects self-play data for `num_steps` steps in every environment.
+
+        Per device, inside `sharding.shard_map`: the environments are independent, so each device steps
+        the environments in its shard of `state`, without communicating with the others.
 
         Args:
-            key: rng
+            key: rng, one key per environment (sharded like `state`)
             state: current collection state
-            params: model parameters
+            params: model parameters (replicated)
             num_steps: number of self-play steps to collect
 
         Returns:
             CollectionState: updated collection state
         """
         if num_steps > 0:
-            collect = partial(self.collect, params=params)
-            keys = jax.random.split(key, num_steps)
-            return jax.lax.fori_loop(
-                0, num_steps, lambda i, s: collect(keys[i], s), state
-            )
+
+            def collect_env(
+                key: jax.Array, state: CollectionState, params: Any
+            ) -> CollectionState:
+                keys = jax.random.split(key, num_steps)
+                return jax.lax.fori_loop(
+                    0, num_steps, lambda i, s: self.collect(keys[i], s, params), state
+                )
+
+            return sharding.shard_map(
+                jax.vmap(collect_env, in_axes=(0, 0, None)),
+                mesh=self.mesh,
+                in_specs=(
+                    PartitionSpec(sharding.AXIS),
+                    PartitionSpec(sharding.AXIS),
+                    PartitionSpec(),
+                ),
+                out_specs=PartitionSpec(sharding.AXIS),
+            )(key, state, params)
         return state
 
-    @partial(jax.pmap, axis_name="d", static_broadcasted_argnums=(0,))
-    def one_train_step(
+    def train_step(
         self, ts: TrainState, batch: BaseExperience
     ) -> tuple[TrainState, dict]:
-        """Make a single training step.
+        """Make a single training step on this device's part of a minibatch.
+
+        Runs per device, inside `sharding.shard_map` over `sharding.AXIS` (see `train_epoch`):
+        gradients, network state (e.g. BatchNorm statistics) and metrics are averaged across devices,
+        so every device makes the same update.
 
         Args:
             ts: TrainState
-            batch: minibatch of experiences
+            batch: this device's part of the minibatch
 
         Returns:
-            Tuple[TrainState, dict]: updated TrainState and metrics
+            tuple[TrainState, dict]: updated TrainState and metrics
         """
         # calculate loss, get gradients
         nn = eqx.combine(ts.params, self.nn_static)
         grad_fn = eqx.filter_value_and_grad(self.loss_fn, has_aux=True)
         (loss, (metrics, nn_state)), grads = grad_fn(nn, ts.nn_state, batch)
         # apply gradients
-        grads = jax.lax.pmean(grads, axis_name="d")
+        grads = jax.lax.pmean(grads, axis_name=sharding.AXIS)
         updates, opt_state = self.optimizer.update(grads, ts.opt_state, ts.params)
         # average nn state (e.g. batchnorm stats) across devices, leaving counters etc. as they are
         nn_state = jax.tree.map(
-            lambda x: jax.lax.pmean(x, axis_name="d") if eqx.is_inexact_array(x) else x,
+            lambda x: (
+                jax.lax.pmean(x, axis_name=sharding.AXIS)
+                if eqx.is_inexact_array(x)
+                else x
+            ),
             nn_state,
         )
         ts = replace(
@@ -436,7 +459,104 @@ class Trainer:
         )
         # return updated train state and metrics
         metrics = {**metrics, "loss": loss}
-        return ts, metrics
+        return ts, jax.lax.pmean(metrics, axis_name=sharding.AXIS)
+
+    def sample_minibatch(
+        self, key: jax.Array, buffer_state: ReplayBufferState, mask: jax.Array
+    ) -> BaseExperience:
+        """Samples a minibatch from the replay buffers of all devices, and returns this device's part of it.
+
+        Runs per device, inside `sharding.shard_map` over `sharding.AXIS` (see `train_epoch`).
+        Every device draws the same `train_batch_size` entries, uniformly without replacement
+        from those marked in `mask`, and receives a contiguous `train_batch_size // num_devices` of them.
+
+        Args:
+            key: rng (the same on every device)
+            buffer_state: this device's shard of the replay buffer, (batch_size // num_devices, capacity, ...)
+            mask: entries that can be sampled, across all devices' buffers, (batch_size, capacity)
+
+        Returns:
+            BaseExperience: this device's part of the minibatch, (train_batch_size // num_devices, ...)
+        """
+        env_idx, item_idx = jnp.unravel_index(
+            self.memory_buffer.sample_indices(key, mask, self.train_batch_size),
+            mask.shape,
+        )
+        # this device holds a contiguous block of environments, look up the sampled entries that fall in it
+        num_local_envs = buffer_state.populated.shape[0]
+        env_idx = env_idx - jax.lax.axis_index(sharding.AXIS) * num_local_envs
+        is_local = (env_idx >= 0) & (env_idx < num_local_envs)
+        env_idx = jnp.where(is_local, env_idx, 0)
+
+        def gather(x: jax.Array) -> jax.Array:
+            x = x[env_idx, item_idx]
+            x = jnp.where(is_local.reshape(-1, *[1] * (x.ndim - 1)), x, 0)
+            # every entry is held by exactly one device, so summing across devices assembles the minibatch;
+            # psum_scatter does so while leaving each device only its part of it
+            dtype = x.dtype
+            if dtype == jnp.bool_:
+                x = x.astype(jnp.uint8)
+            return jax.lax.psum_scatter(
+                x, sharding.AXIS, scatter_dimension=0, tiled=True
+            ).astype(dtype)
+
+        return jax.tree.map(gather, buffer_state.buffer)
+
+    @partial(jax.jit, static_argnums=(0, 4))
+    def train_epoch(
+        self,
+        key: jax.Array,
+        buffer_state: ReplayBufferState,
+        train_state: TrainState,
+        num_steps: int,
+    ) -> tuple[TrainState, dict]:
+        """Performs `num_steps` training steps, compiled into a single `jax.lax.scan`.
+
+        Each step samples a minibatch from the replay buffer (see `sample_minibatch`) and updates the parameters
+        (see `train_step`). Per device, inside `sharding.shard_map`: each device keeps its shard of the replay buffer
+        and a copy of the train state, collectives combine them.
+
+        Does not check that the replay buffer holds a finished episode to sample, see `train_steps`.
+
+        Args:
+            key: rng
+            buffer_state: replay buffer state (sharded across devices)
+            train_state: current training state (replicated)
+            num_steps: number of training steps to perform
+
+        Returns:
+            tuple[TrainState, dict]: updated training state and metrics (mean across steps)
+        """
+
+        @partial(
+            sharding.shard_map,
+            mesh=self.mesh,
+            in_specs=(PartitionSpec(), PartitionSpec(sharding.AXIS), PartitionSpec()),
+            out_specs=(PartitionSpec(), PartitionSpec()),
+        )
+        def train(
+            key: jax.Array, buffer_state: ReplayBufferState, train_state: TrainState
+        ) -> tuple[TrainState, dict]:
+            # the buffer doesn't change while training, so gather which entries can be sampled once per epoch
+            mask = jax.lax.all_gather(
+                self.memory_buffer.sample_mask(buffer_state), sharding.AXIS, tiled=True
+            )
+
+            def step(
+                carry: tuple[jax.Array, TrainState], _
+            ) -> tuple[tuple[jax.Array, TrainState], dict]:
+                key, ts = carry
+                step_key, key = jax.random.split(key)
+                batch = self.sample_minibatch(step_key, buffer_state, mask)
+                ts, metrics = self.train_step(ts, batch)
+                return (key, ts), metrics
+
+            (_, train_state), metrics = jax.lax.scan(
+                step, (key, train_state), length=num_steps
+            )
+            return train_state, jax.tree.map(jnp.mean, metrics)
+
+        return train(key, buffer_state, train_state)
 
     def train_steps(
         self,
@@ -448,6 +568,7 @@ class Trainer:
         """Performs `num_steps` training steps.
 
         Each step consists of sampling a minibatch from the replay buffer and updating the parameters.
+        The minibatch is sampled uniformly without replacement from the finished episodes in all devices' buffers.
 
         Args:
             key: rng
@@ -456,42 +577,21 @@ class Trainer:
             num_steps: number of training steps to perform
 
         Returns:
-            Tuple[CollectionState, TrainState, dict]:
+            tuple[CollectionState, TrainState, dict]:
                 - updated collection state
                 - updated training state
                 - metrics
+
+        Raises:
+            ValueError: if no episode has finished yet, so there is nothing to sample
         """
-        # get replay memory buffer
-        buffer_state = collection_state.buffer_state
-
-        batch_metrics = []
-
-        for _ in range(num_steps):
-            step_key, key = jax.random.split(key)
-            # sample from replay memory
-            batch = self.memory_buffer.sample(
-                buffer_state, step_key, self.train_batch_size
-            )
-            # reshape into minibatch
-            batch = jax.tree.map(
-                lambda x: x.reshape((self.num_devices, -1, *x.shape[1:])), batch
-            )
-            # pmap won't reshard a committed array, so place each device's slice on that device
-            batch = jax.device_put(batch, NamedSharding(self.mesh, PartitionSpec("d")))
-            # make training step
-            train_state, metrics = self.one_train_step(train_state, batch)
-            # append metrics from step
-            if metrics:
-                batch_metrics.append(metrics)
-        # take mean of metrics across all training steps
-        if batch_metrics:
-            metrics = {
-                k: jnp.stack([m[k] for m in batch_metrics]).mean()
-                for k in batch_metrics[0]
-            }
-        else:
-            metrics = {}
-        # return updated collection state, train state, and metrics
+        if num_steps == 0:
+            return collection_state, train_state, {}
+        # the buffer doesn't change while training, so checking once covers every step
+        self.memory_buffer.check_can_sample(collection_state.buffer_state)
+        train_state, metrics = self.train_epoch(
+            key, collection_state.buffer_state, train_state, num_steps
+        )
         return collection_state, train_state, metrics
 
     def log_metrics(self, metrics: dict, epoch: int, step: int | None = None):
@@ -524,12 +624,11 @@ class Trainer:
                 f"{self.ckpt_dir} already has a checkpoint at or after epoch {epoch}, "
                 "resume from it or use a different ckpt_dir"
             )
-        # every device holds the same train state, save the first one's
-        ckpt = jax.tree.map(lambda x: x[0], train_state)
         # write to a temporary file first so an interrupted save doesn't leave a partial checkpoint
         path = checkpoint_path(self.ckpt_dir, epoch)
         with open(path + ".tmp", "wb") as f:
-            eqx.tree_serialise_leaves(f, ckpt)
+            # the train state is replicated, so this saves a single copy of it
+            eqx.tree_serialise_leaves(f, train_state)
         os.replace(path + ".tmp", path)
         # delete old checkpoints
         for old_epoch in epochs[: max(0, len(epochs) + 1 - self.max_checkpoints)]:
@@ -643,27 +742,23 @@ class Trainer:
             cur_epoch = 0
             # initialize collection state
             init_key, key = jax.random.split(key)
-            collection_state = partition(
-                self.init_collection_state(init_key, self.batch_size), self.num_devices
+            collection_state = sharding.shard(
+                self.init_collection_state(init_key, self.batch_size), self.mesh
             )
             # initialize train state
             train_state = self.replicate(self.init_train_state())
             params = self.extract_model_params_fn(train_state)
             # initialize tester states
-            tester_states = []
-            for tester in self.testers:
-                state = jax.pmap(tester.init, axis_name="d")(params=params)
-                tester_states.append(state)
+            tester_states = [tester.init(params=params) for tester in self.testers]
 
         # warmup
         # populate replay buffer with initial self-play games
-        collect = jax.vmap(self.collect_steps, in_axes=(1, 1, None, None), out_axes=1)
         params = self.extract_model_params_fn(train_state)
         collect_key, key = jax.random.split(key)
-        collect_keys = partition(
-            jax.random.split(collect_key, self.batch_size), self.num_devices
+        collect_keys = sharding.shard(
+            jax.random.split(collect_key, self.batch_size), self.mesh
         )
-        collection_state = collect(
+        collection_state = self.collect_steps(
             collect_keys, collection_state, params, self.warmup_steps
         )
 
@@ -671,10 +766,10 @@ class Trainer:
         while cur_epoch < num_epochs:
             # collect self-play games
             collect_key, key = jax.random.split(key)
-            collect_keys = partition(
-                jax.random.split(collect_key, self.batch_size), self.num_devices
+            collect_keys = sharding.shard(
+                jax.random.split(collect_key, self.batch_size), self.mesh
             )
-            collection_state = collect(
+            collection_state = self.collect_steps(
                 collect_keys, collection_state, params, self.collection_steps_per_epoch
             )
             # train
