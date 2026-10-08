@@ -4,6 +4,7 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from core.common import two_player_game
 from core.evaluators.random_evaluator import RandomEvaluator
@@ -192,3 +193,59 @@ def test_two_player_baseline_reports_win_and_loss_rates(ttt, scripted):
 
     np.testing.assert_array_equal(metrics["baseline_win_rate"], [1.0, 0.0])
     np.testing.assert_array_equal(metrics["baseline_loss_rate"], [0.0, 1.0])
+
+
+def test_two_player_game_with_a_fixed_first_player(ttt, scripted):
+    # both sides take the lowest free square, so whoever moves first wins, whatever the key
+    keys = jax.random.split(jax.random.PRNGKey(0), 8)
+    for p1_first, expected in ((True, 1.0), (False, -1.0)):
+        outcomes, _, _ = jax.vmap(
+            partial(
+                two_player_game,
+                evaluator_1=scripted.first_legal,
+                evaluator_2=scripted.first_legal,
+                params_1=None,
+                params_2=None,
+                env_step_fn=ttt.step_fn,
+                env_init_fn=ttt.init_fn,
+                max_steps=MAX_STEPS,
+                p1_first=p1_first,
+            )
+        )(keys)
+        np.testing.assert_array_equal(outcomes[:, 0], expected)
+
+
+def test_two_player_baseline_balances_the_first_player(ttt, scripted):
+    # whoever moves first wins, so with the agent first in exactly half the games it wins half
+    keys = jax.random.split(jax.random.PRNGKey(0), 8).reshape(2, 4, -1)
+    tester = TwoPlayerBaseline(
+        num_episodes=8,
+        baseline_evaluator=scripted.first_legal,
+        balance_first_player=True,
+        name="baseline",
+    )
+    _, metrics, _, _ = tester.test(
+        MAX_STEPS,
+        ttt.step_fn,
+        ttt.init_fn,
+        scripted.first_legal,
+        keys,
+        replicate(tester.init(params=None), 2),
+        replicate({"w": jnp.ones(3)}, 2),
+    )
+
+    np.testing.assert_array_equal(metrics["baseline_win_rate"], [0.5, 0.5])
+    np.testing.assert_array_equal(metrics["baseline_loss_rate"], [0.5, 0.5])
+
+
+def test_balanced_two_player_baseline_needs_an_even_number_of_episodes_per_device(
+    scripted,
+):
+    tester = TwoPlayerBaseline(
+        num_episodes=6,
+        baseline_evaluator=scripted.first_legal,
+        balance_first_player=True,
+    )
+    tester.check_size_compatibilities(3)  # 2 per device
+    with pytest.raises(ValueError, match="even number of episodes per device"):
+        tester.check_size_compatibilities(2)  # 3 per device
