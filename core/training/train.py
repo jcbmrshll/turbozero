@@ -534,6 +534,19 @@ class Trainer:
         if self.monitor is not None:
             self.monitor.log(epoch, metrics)
 
+    def set_activity(self, text: str | None, echo: bool = False) -> None:
+        """Tells the monitor what the training loop is doing now, so the dashboard can show
+        what a slow step is busy with.
+
+        Args:
+            text: what the loop is doing, None once it's done
+            echo: also print it to the console
+        """
+        if echo and text is not None:
+            print(text, flush=True)
+        if self.monitor is not None:
+            self.monitor.activity(text)
+
     def save_checkpoint(self, train_state: TrainState, epoch: int) -> None:
         """Saves a checkpoint of the training state to `ckpt_dir`.
 
@@ -715,6 +728,8 @@ class Trainer:
 
         # warmup
         # populate replay buffer with initial self-play games
+        if self.warmup_steps > 0:
+            self.set_activity(f"warmup self-play ({self.warmup_steps} steps)")
         collect = jax.vmap(self.collect_steps, in_axes=(1, 1, None, None), out_axes=1)
         params = self.extract_model_params_fn(train_state)
         collect_key, key = jax.random.split(key)
@@ -733,6 +748,7 @@ class Trainer:
                 jax.random.split(collect_key, self.batch_size), self.num_devices
             )
             prev_collection_state = collection_state
+            self.set_activity(f"epoch {cur_epoch}: self-play")
             collection_state = collect(
                 collect_keys, collection_state, params, self.collection_steps_per_epoch
             )
@@ -740,6 +756,7 @@ class Trainer:
                 prev_collection_state, collection_state
             )
             # train
+            self.set_activity(f"epoch {cur_epoch}: training")
             train_key, key = jax.random.split(key)
             collection_state, train_state, metrics = self.train_steps(
                 train_key, collection_state, train_state, self.train_steps_per_epoch
@@ -752,6 +769,9 @@ class Trainer:
             if cur_epoch % eval_every == 0:
                 for i, test_state in enumerate(tester_states):
                     run_key, key = jax.random.split(key)
+                    self.set_activity(
+                        f"epoch {cur_epoch}: testing {self.testers[i].name}"
+                    )
                     new_test_state, metrics, episode = self.testers[i].run(
                         key=run_key,
                         epoch_num=cur_epoch,
@@ -762,6 +782,10 @@ class Trainer:
                         evaluator=self.evaluator_test,
                         state=test_state,
                         params=params,
+                        log_fn=partial(self.log_metrics, epoch=cur_epoch),
+                        activity_fn=lambda text, epoch=cur_epoch: self.set_activity(
+                            f"epoch {epoch}: {text}", echo=True
+                        ),
                     )
 
                     if metrics:
@@ -774,6 +798,7 @@ class Trainer:
                         )
                     tester_states[i] = new_test_state
             # save checkpoint
+            self.set_activity(f"epoch {cur_epoch}: saving checkpoint")
             self.save_checkpoint(train_state, cur_epoch)
             # next epoch
             cur_epoch += 1

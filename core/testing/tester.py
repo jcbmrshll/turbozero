@@ -90,6 +90,8 @@ class BaseTester:
         state: TestState,
         params: Any,
         *args,
+        log_fn: Callable[[dict], None] | None = None,  # pylint: disable=unused-argument
+        activity_fn: Callable[[str], None] | None = None,  # pylint: disable=unused-argument
     ) -> tuple[TestState, dict, Any]:
         """Runs the test, if the current epoch is an epoch that should be tested on (i.e. `epoch_num % epochs_per_test == 0`).
 
@@ -105,6 +107,10 @@ class BaseTester:
             evaluator: evaluator used by agent
             state: internal state of the tester
             params: nn parameters used by agent
+            log_fn: (optional) logs metrics right away, for testers that run in stages and have
+                results before they finish; whatever they log this way they don't also return
+            activity_fn: (optional) reports what a long test is doing now, e.g. which opponent
+                it's playing
 
         Returns:
             Tuple[TestState, Dict, Any]:

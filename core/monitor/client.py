@@ -2,6 +2,7 @@
 
     monitor = Monitor("http://localhost:8008", project="othello")
     monitor.start(config=trainer.get_config())
+    monitor.activity("self-play (epoch 3)")
     monitor.log(epoch, {"loss": 0.41, "greedy_game": Episode("pgx_two_player", ...)})
     monitor.finish()
 
@@ -9,6 +10,10 @@
 on a background thread: `log` only queues its values, so the training loop never
 waits on encoding, copies off the device or the network. Logging never raises: if
 the server is down the run keeps training and the failure is reported once.
+
+While a run is going, a heartbeat thread resends its current activity every
+`HEARTBEAT_S` seconds, so the dashboard can tell a run that is busy with something
+slow (it shows what, and for how long) from one that has died.
 """
 
 import io
@@ -27,6 +32,8 @@ import numpy as np
 from core.monitor.media import encode_media
 
 DEFAULT_URL = "http://localhost:8008"
+# seconds between heartbeats; the dashboard calls a run stale after a few missed ones
+HEARTBEAT_S = 30.0
 
 
 class Episode:
@@ -72,6 +79,9 @@ class Monitor:
         # (function, args) to call in order on the sender thread
         self._queue: queue.Queue = queue.Queue()
         self._sender: threading.Thread | None = None
+        self._activity: str | None = None
+        # set to stop the current heartbeat thread; each thread gets its own
+        self._stop_heartbeat: threading.Event | None = None
 
     def _request(
         self,
@@ -137,6 +147,8 @@ class Monitor:
         """Create the run on the server. Does nothing if the run already exists, so
         continuing training keeps logging to the same run."""
         if self.run_id is not None:
+            # a continued run: log to the same run, with its heartbeat back on
+            self._start_heartbeat(self.run_id)
             return
         meta = self._post_json(
             "/api/runs",
@@ -145,8 +157,36 @@ class Monitor:
         if meta is None:
             print("monitor: logging is off for this run", file=sys.stderr)
             return
-        self.run_id = meta["id"]
-        print(f"monitor: {self.url}/run/{self.run_id}")
+        run_id: str = meta["id"]
+        self.run_id = run_id
+        print(f"monitor: {self.url}/run/{run_id}")
+        self._start_heartbeat(run_id)
+
+    def _start_heartbeat(self, run_id: str) -> None:
+        if self._stop_heartbeat is not None and not self._stop_heartbeat.is_set():
+            return
+        self._stop_heartbeat = threading.Event()
+        threading.Thread(
+            target=self._heartbeat, args=(run_id, self._stop_heartbeat), daemon=True
+        ).start()
+
+    def _heartbeat(self, run_id: str, stop: threading.Event) -> None:
+        """Resend the current activity every `HEARTBEAT_S` seconds until `stop` is set."""
+        while not stop.wait(HEARTBEAT_S):
+            # anything already queued will mark the run alive when it's sent
+            if self._queue.empty():
+                self._enqueue(self._post_activity, run_id, self._activity)
+
+    def _post_activity(self, run_id: str, activity: str | None) -> None:
+        self._post_json(f"/api/runs/{run_id}/activity", {"activity": activity})
+
+    def activity(self, text: str | None) -> None:
+        """Say what the run is doing now, e.g. "testing: ladder vs pgx1024". The dashboard
+        shows it with how long it has been going; None clears it."""
+        self._activity = text
+        if self.run_id is None:
+            return
+        self._enqueue(self._post_activity, self.run_id, text)
 
     def log(self, step: int, data: dict[str, Any]) -> None:
         """Queue scalars, media and episodes for one step; they're sent in the
@@ -194,6 +234,9 @@ class Monitor:
         sent."""
         if self.run_id is None:
             return
+        if self._stop_heartbeat is not None:
+            self._stop_heartbeat.set()
+        self._activity = None
         self._enqueue(
             self._post_json, f"/api/runs/{self.run_id}/finish", {"status": status}
         )

@@ -5,8 +5,8 @@
 const SERIES = ["--s1", "--s2", "--s3", "--s4", "--s5", "--s6"].map((v) => `var(${v})`);
 const POLL_MS = 2000;
 const RUNS_POLL_MS = 5000;
-// a running run that hasn't logged for this long is probably dead
-const STALE_S = 180;
+// a running run sends a heartbeat every 30s; one silent for this long is probably dead
+const STALE_S = 120;
 // the stat tiles, in order, when the run logs them; each tester's outcome follows
 const HEADLINE = ["loss", "policy_loss", "value_loss"];
 // testers log "<tester name>_avg_outcome"; they share one chart
@@ -107,6 +107,12 @@ function status(run) {
   return run.status;
 }
 
+// what a running run says it's doing now, and for how long: "ladder: playing pgx64 · 2m 10s"
+function activity(run) {
+  if (run.status !== "running" || !run.activity) return "";
+  return `${run.activity} · ${duration(Date.now() / 1000 - run.activity_since)}`;
+}
+
 const tip = document.getElementById("tip");
 function showTip(x, y, ...children) {
   tip.replaceChildren(...children);
@@ -164,6 +170,7 @@ function renderSide() {
           h("span", { class: "name", text: run.name }),
           h("span", { class: "step", text: progress(run) }),
           h("span", { class: "when", text: `${started(run.created)} · ${ago(run.updated)}` }),
+          activity(run) && h("span", { class: "doing", text: activity(run) }),
         ),
       );
     }
@@ -313,6 +320,8 @@ function renderHead() {
       { class: "meta" },
       h("span", { class: `dot ${st}` }),
       h("span", { text: st }),
+      activity(run) && sep(),
+      activity(run) && h("span", { class: "doing", text: activity(run) }),
       sep(),
       run.seed != null && h("span", { text: `seed ${run.seed}` }),
       run.seed != null && sep(),
