@@ -12,8 +12,10 @@ The list, `xot-openings.txt`, is Matthias Berg's "large" XOT list
 
 from pathlib import Path
 
+import jax
+import jax.numpy as jnp
 import numpy as np
-from game import action
+from game import action, env, metadata
 
 XOT_PATH = Path(__file__).parent / "xot-openings.txt"
 
@@ -30,3 +32,43 @@ def load_xot(path: str | Path = XOT_PATH) -> np.ndarray:
         [[action(line[i : i + 2]) for i in range(0, len(line), 2)] for line in lines],
         dtype=np.int32,
     )
+
+
+def split_xot(
+    openings: np.ndarray, num_test: int = 2000, seed: int = 0
+) -> tuple[np.ndarray, np.ndarray]:
+    """Splits the openings into ones to train from and held-out ones to test on, so that
+    tests don't start from positions the network was trained on. The same `seed` always
+    gives the same split.
+
+    Returns:
+        (train openings, test openings)
+    """
+    order = np.random.default_rng(seed).permutation(len(openings))
+    return openings[order[num_test:]], openings[order[:num_test]]
+
+
+def make_xot_init_fn(openings: np.ndarray, standard_start_fraction: float):
+    """An env init fn (see game.init_fn) that starts most episodes from a random one of
+    `openings`, already played, and the rest (`standard_start_fraction` of them) from the
+    standard start, so that the network still learns the first moves too."""
+    moves = jnp.asarray(openings)
+
+    def init_fn(key):
+        init_key, pick_key, standard_key = jax.random.split(key, 3)
+        state = env.init(init_key)
+        opening = moves[jax.random.randint(pick_key, (), 0, len(moves))]
+        from_opening = jax.random.uniform(standard_key) >= standard_start_fraction
+
+        def play(ply, state):
+            # play the opening's moves, or leave the standard start as it is
+            return jax.tree.map(
+                lambda new, old: jnp.where(from_opening, new, old),
+                env.step(state, opening[ply]),
+                state,
+            )
+
+        state = jax.lax.fori_loop(0, moves.shape[1], play, state)
+        return state, metadata(state)
+
+    return init_fn

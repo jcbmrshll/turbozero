@@ -1,15 +1,17 @@
 # Othello
 
 AlphaZero on Othello: training, and evaluating the result against pgx's pretrained
-Othello model and against [Edax](https://github.com/abulmo/edax-reversi), a strong
-open-source Othello engine.
+Othello model and against two strong open-source Othello engines,
+[Edax](https://github.com/abulmo/edax-reversi) and
+[Egaroucid](https://github.com/Nyanyan/Egaroucid).
 
 | File | |
 |---|---|
 | `train.py` | Trains a network by self-play, testing it on a ladder of opponents as it goes |
 | `eval_pgx.py` | Plays a checkpoint against pgx's pretrained model at several search budgets |
-| `vs_edax.py` | Plays a checkpoint against Edax at several search depths, from XOT openings |
-| `setup_edax.sh` | Builds Edax for `vs_edax.py` |
+| `vs_engine.py` | Plays a checkpoint against Edax or Egaroucid at several search depths, from XOT openings |
+| `engines.py` | Edax and Egaroucid, each driven over GTP |
+| `setup_edax.sh`, `setup_egaroucid.sh` | Build the engines for `vs_engine.py` |
 | `game.py` | What the scripts share: the environment, board symmetries, network, evaluators |
 | `xot.py`, `xot-openings.txt` | The XOT opening list |
 
@@ -21,7 +23,10 @@ uv run examples/othello/train.py --monitor --ckpt-dir runs/othello
 ```
 
 Self-play runs in 1024 games at once, searching 64 MCTS iterations a move, and each
-position is stored with its 7 symmetric copies (rotations and reflections). Every 5
+position is stored with its 7 symmetric copies (rotations and reflections). Most games
+(85% by default, see `--standard-starts`) start from an XOT opening rather than the
+standard start, which keeps self-play varied; 2,000 of the openings are held out of
+self-play for evaluation. Every 5
 epochs, the network plays a ladder of opponents, easiest first: a random player, a
 greedy tile counter, then pgx's pretrained model searching 1, 4, 16, 64 and 256
 iterations a move against our 64. It moves up past each rung it scores at least 0.55
@@ -41,15 +46,19 @@ Checkpoints from `train.py` are named after their epoch (`199.eqx` is the last o
 uv run examples/othello/eval_pgx.py runs/othello/199.eqx --pgx-sims 64 256 1024
 
 examples/othello/setup_edax.sh                      # once
-uv run examples/othello/vs_edax.py runs/othello/199.eqx --sims 400 --levels 4 6 8 10
+examples/othello/setup_egaroucid.sh                 # once
+uv run examples/othello/vs_engine.py runs/othello/199.eqx --engine edax --sims 400 --levels 4 6 8 10
+uv run examples/othello/vs_engine.py runs/othello/199.eqx --engine egaroucid --levels 2 4 6
 ```
 
-`vs_edax.py` plays Edax with its opening book off, at a fixed search depth ("level")
-and one thread per game, all games against a level at once. Edax and our agent (at
-temperature 0, without root noise) are both deterministic, so games start from **XOT
-openings**: a list of 10,784 eight-move openings that each end in a position Edax judges
-nearly even. Each opening is played twice, with the colors swapped. This is how OLIVAW,
-an AlphaZero-style Othello program, was compared with Edax
+`vs_engine.py` plays the engine with its opening book off, at a fixed search depth
+("level") and one thread per game, with many games at once: each has its own engine
+process (an Egaroucid process takes about 1.3 GB, so it runs as many as memory allows).
+The engines and our agent (at temperature 0, without root noise) are all deterministic,
+so games start from **XOT openings**: a list of 10,784 eight-move openings that each end
+in a position Edax judges nearly even, drawn from the ones held out of self-play. Each
+opening is played twice, with the colors swapped. This is how OLIVAW, an AlphaZero-style
+Othello program, was compared with Edax
 ([Norelli & Panconesi, 2022](https://arxiv.org/abs/2103.17228)).
 
 The run above scored, out of 256 games against each depth (128 openings), searching
@@ -63,5 +72,6 @@ The run above scored, out of 256 games against each depth (128 openings), search
 
 `xot-openings.txt` is Matthias Berg's large XOT list
 ([berg.earthlingz.de/xot](https://berg.earthlingz.de/xot/)), as also distributed with
-Egaroucid, NBoard and othello-sensei. Edax is Richard Delorme's, under the GPL;
-`setup_edax.sh` builds it from its repository, it isn't part of turbozero.
+Egaroucid, NBoard and othello-sensei. Edax (Richard Delorme) and Egaroucid (Takuto
+Yamana) are under the GPL; the setup scripts build them from their repositories, they
+aren't part of turbozero.

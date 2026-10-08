@@ -3,7 +3,8 @@ tile counter, then pgx's pretrained Othello model searching more and more.
 
 Self-play games are collected in parallel across a batch of environments (and across
 every available GPU), with Monte Carlo Tree Search run on each of them; the network
-then trains on minibatches sampled from replay memory.
+then trains on minibatches sampled from replay memory. Most self-play games start from
+XOT openings (see xot.py), which keeps them varied.
 
     uv run examples/othello/train.py
     uv run examples/othello/train.py --epochs 20 --monitor
@@ -19,7 +20,7 @@ model (our agent searching 64 iterations a move), it scored 0.82 against the mod
 searching 64, 0.74 against it searching 256, and 0.57 against it searching 1024
 (draws count half).
 
-Checkpoints go to --ckpt-dir; `eval_pgx.py` and `vs_edax.py` evaluate them further (see
+Checkpoints go to --ckpt-dir; `eval_pgx.py` and `vs_engine.py` evaluate them further (see
 README.md). The hyperparameters here are only an example; tune them for your task and
 hardware.
 """
@@ -40,6 +41,7 @@ from game import (
     state_to_nn_input,
     step_fn,
 )
+from xot import load_xot, make_xot_init_fn, split_xot
 
 from core.evaluators.alphazero import AlphaZero
 from core.evaluators.evaluation_fns import (
@@ -67,6 +69,13 @@ def main():
         "--sims", type=int, default=64, help="MCTS iterations per self-play move"
     )
     parser.add_argument(
+        "--standard-starts",
+        type=float,
+        default=0.15,
+        help="fraction of self-play games from the standard start; the rest start from "
+        "XOT openings (1 for none)",
+    )
+    parser.add_argument(
         "--eval-every", type=int, default=5, help="epochs between test games"
     )
     parser.add_argument(
@@ -74,6 +83,7 @@ def main():
         default=None,
         help="where to save checkpoints (default: a new temporary directory)",
     )
+    parser.add_argument("--name", default=None, help="the run's name on the monitor")
     parser.add_argument(
         "--monitor",
         nargs="?",
@@ -83,6 +93,11 @@ def main():
         help=f"log to a turbozero monitor (default {DEFAULT_URL}); start it with `uv run turbozero-monitor`",
     )
     args = parser.parse_args()
+
+    # self-play starts most games from XOT openings (see xot.py) for varied, balanced
+    # games; the openings held out for vs_engine.py are left out
+    xot_train, _ = split_xot(load_xot())
+    selfplay_init_fn = make_xot_init_fn(xot_train, args.standard_starts)
 
     # the residual network from the AlphaZero paper (see game.py), with its BatchNorm state
     resnet, resnet_state = make_network(args.blocks, args.channels, seed=args.seed)
@@ -144,13 +159,17 @@ def main():
         memory_buffer=EpisodeReplayBuffer(capacity=3000),
         max_episode_steps=80,
         env_step_fn=step_fn,
-        env_init_fn=init_fn,
+        env_init_fn=selfplay_init_fn,
+        # the ladder's games start from the standard start
+        test_env_init_fn=init_fn,
         state_to_nn_input_fn=state_to_nn_input,
         testers=testers,
         evaluator_test=evaluator_test,
         # add each sample's 7 symmetric copies
         data_transform_fns=SYMMETRY_TRANSFORM_FNS,
-        monitor=Monitor(args.monitor, project="othello") if args.monitor else None,
+        monitor=Monitor(args.monitor, project="othello", name=args.name)
+        if args.monitor
+        else None,
         ckpt_dir=args.ckpt_dir or tempfile.mkdtemp(prefix="turbozero-othello-"),
     )
     trainer.train_loop(

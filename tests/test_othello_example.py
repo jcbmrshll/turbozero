@@ -11,7 +11,7 @@ import numpy as np
 # the example's scripts import their sibling modules
 sys.path.insert(0, str(Path(__file__).parents[1] / "examples" / "othello"))
 import game as othello
-from xot import load_xot
+from xot import load_xot, make_xot_init_fn, split_xot
 
 
 def legal_moves(obs):
@@ -96,3 +96,71 @@ def test_xot_openings_are_legal_eight_move_games():
     assert not bool(states.terminated.any())
     # the openings are distinct
     assert len({tuple(o) for o in openings}) == len(openings)
+
+
+def test_xot_split_is_disjoint_and_repeatable():
+    openings = load_xot()
+    train, test = split_xot(openings)
+    assert len(test) == 2000 and len(train) == len(openings) - 2000
+    assert not {tuple(o) for o in train} & {tuple(o) for o in test}
+    np.testing.assert_array_equal(split_xot(openings)[1], test)
+
+
+def test_xot_init_fn_starts_from_openings_or_the_standard_start():
+    openings = load_xot()[:50]
+    keys = jax.random.split(jax.random.PRNGKey(0), 400)
+    # every game from an opening: 8 moves in, on one of the openings' boards
+    states, meta = jax.vmap(make_xot_init_fn(openings, 0.0))(keys)
+    assert (np.asarray(meta.step) == 8).all()
+    played = jax.vmap(othello.env.init)(
+        jax.random.split(jax.random.PRNGKey(1), len(openings))
+    )
+    step = jax.jit(jax.vmap(othello.env.step))
+    for ply in range(openings.shape[1]):
+        played = step(played, jnp.asarray(openings[:, ply]))
+    boards = {np.asarray(o).tobytes() for o in played.observation}
+    assert all(np.asarray(o).tobytes() in boards for o in states.observation)
+    # every game from the standard start
+    _, meta = jax.vmap(make_xot_init_fn(openings, 1.0))(keys)
+    assert (np.asarray(meta.step) == 0).all()
+    # a mix
+    _, meta = jax.vmap(make_xot_init_fn(openings, 0.25))(keys)
+    assert 0.15 < (np.asarray(meta.step) == 0).mean() < 0.35
+
+
+def test_engines_read_their_boards(monkeypatch):
+    from engines import Edax, Egaroucid
+
+    # what each engine's showboard prints (after GTPEngine.command strips the "= ")
+    edax_board = """A B C D E F G H
+1 - - - - - - - - 1
+2 - - - - - - - - 2 * to move
+3 - . O * - - - - 3
+4 - - . O * - - - 4 *: discs =  3    moves =  4
+5 - - - * O . - - 5 O: discs =  3    moves =  5"""
+    egaroucid_board = "a b c d e f g h\n" + "\n".join(
+        f"  {r} " + " ".join(row)
+        for r, row in enumerate(
+            ["........", "........", "..OX....", "...OX...", "...XO...",
+             "........", "........", "XXXXXXXX"],
+            start=1,
+        )
+    )  # fmt: skip
+    for cls, board, expected in (
+        (Edax, edax_board, (3, 3)),
+        (Egaroucid, egaroucid_board, (11, 3)),
+    ):
+        engine = cls.__new__(cls)  # no process
+        monkeypatch.setattr(engine, "command", lambda _, board=board: board)
+        assert engine.discs() == expected
+
+
+def test_engines_are_never_sent_passes(monkeypatch):
+    from engines import Edax
+
+    engine = Edax.__new__(Edax)
+    sent = []
+    monkeypatch.setattr(engine, "command", sent.append)
+    engine.play("b", othello.action("d3"))
+    engine.play("w", othello.PASS)
+    assert sent == ["play b d3"]

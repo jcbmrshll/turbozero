@@ -1,6 +1,6 @@
 #!/bin/sh
 # Builds Edax (https://github.com/abulmo/edax-reversi), a strong open-source Othello
-# engine, for vs_edax.py: the source at a pinned commit and its evaluation weights,
+# engine, for vs_engine.py: the source at a pinned commit and its evaluation weights,
 # into ~/.cache/turbozero/othello/edax (or $EDAX_DIR).
 #
 #     examples/othello/setup_edax.sh            # for this CPU (ARCH=native)

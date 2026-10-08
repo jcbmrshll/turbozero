@@ -129,6 +129,7 @@ class Trainer:
         testers: Sequence[BaseTester],
         nn_state: eqx.nn.State | None = None,
         evaluator_test: Evaluator | None = None,
+        test_env_init_fn: EnvInitFn | None = None,
         selfplay_exploration: SelfPlayExploration | None = None,
         data_transform_fns: Sequence[DataTransformFn] = (),
         extract_model_params_fn: ExtractModelParamsFn = extract_params,
@@ -160,6 +161,8 @@ class Trainer:
             testers: list of testers to evaluate the agent against (see core.testing.tester)
             nn_state: (optional) initial state of `nn` for stateful networks (e.g. with BatchNorm), from `eqx.nn.make_with_state`
             evaluator_test: (optional) evaluator to use during testing. If not provided, `evaluator` is used.
+            test_env_init_fn: (optional) environment initialization function for test episodes, e.g. to test from
+                the standard start while self-play starts from varied positions. If not provided, `env_init_fn` is used.
             selfplay_exploration: (optional) chooses the move self-play plays from the evaluator's output,
                 e.g. to play random moves some of the time (see core.training.exploration). The evaluator's
                 policy weights stay the training target. If not provided, self-play plays the evaluator's move.
@@ -181,6 +184,9 @@ class Trainer:
         # environment
         self.env_step_fn = env_step_fn
         self.env_init_fn = env_init_fn
+        self.test_env_init_fn = (
+            test_env_init_fn if test_env_init_fn is not None else env_init_fn
+        )
         self.max_episode_steps = max_episode_steps
         self.template_env_state = self.make_template_env_state()
         # nn
@@ -224,7 +230,7 @@ class Trainer:
             step_env_and_evaluator,
             evaluator=self.evaluator_test,
             env_step_fn=self.env_step_fn,
-            env_init_fn=self.env_init_fn,
+            env_init_fn=self.test_env_init_fn,
             max_steps=self.max_episode_steps,
         )
         # checkpoints
@@ -778,7 +784,7 @@ class Trainer:
                         max_steps=self.max_episode_steps,
                         num_devices=self.num_devices,
                         env_step_fn=self.env_step_fn,
-                        env_init_fn=self.env_init_fn,
+                        env_init_fn=self.test_env_init_fn,
                         evaluator=self.evaluator_test,
                         state=test_state,
                         params=params,
