@@ -29,6 +29,7 @@ from core.evaluators.evaluator import EvalOutput, Evaluator
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.mcts.mcts import MCTS
 from core.memory.replay_memory import EpisodeReplayBuffer
+from core.monitor import client
 from core.monitor.server import make_server
 from core.training.loss_fns import az_default_loss_fn
 from core.training.train import Trainer
@@ -310,6 +311,13 @@ def scripted():
         first_legal=ScriptedEvaluator("first_legal"),
         resign=ScriptedEvaluator("resign"),
     )
+
+
+@pytest.fixture(autouse=True)
+def no_monitor_heartbeat(monkeypatch):
+    """Monitors in tests don't send heartbeats (tests of the heartbeat set their own interval),
+    so the ones a test leaves running don't keep calling a server that has shut down."""
+    monkeypatch.setattr(client, "HEARTBEAT_S", 3600.0)
 
 
 @pytest.fixture

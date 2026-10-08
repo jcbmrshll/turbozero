@@ -5,7 +5,7 @@ the dashboard for browsing them.
 
 Everything lives on disk under the run directory, one folder per run:
 
-    <dir>/<run id>/meta.json      project, name, config, timestamps, status
+    <dir>/<run id>/meta.json      project, name, config, timestamps, status, activity
     <dir>/<run id>/metrics.jsonl  one {"step": ..., "time": ..., <metrics>} per line
     <dir>/<run id>/media.jsonl    one {"key": ..., "step": ..., "file": ...} per line
     <dir>/<run id>/media/         the media files themselves
@@ -210,12 +210,28 @@ class RunStore:
         path.write_bytes(data)
         return path
 
+    def set_activity(self, run_id: str, activity: str | None) -> None:
+        """Record what a running run is doing now. Runs also send their current activity
+        as a heartbeat, so this marks the run alive even when the activity is unchanged;
+        `activity_since` only moves when the activity does."""
+        run_dir = self._dir(run_id)
+        now = time.time()
+        with self.lock:
+            meta = self._read_meta(run_dir)
+            if meta.get("activity") != activity:
+                meta["activity"] = activity
+                meta["activity_since"] = now
+            meta["updated"] = now
+            self._write_meta(run_dir, meta)
+
     def finish(self, run_id: str, status: str) -> None:
         run_dir = self._dir(run_id)
         with self.lock:
             meta = self._read_meta(run_dir)
             meta["status"] = status
             meta["updated"] = time.time()
+            meta["activity"] = None
+            meta["activity_since"] = None
             self._write_meta(run_dir, meta)
 
     def list(self) -> list[dict[str, Any]]:
@@ -347,6 +363,13 @@ class Handler(BaseHTTPRequestHandler):
                         config=body.get("config") or {},
                     )
                     self._json(meta, HTTPStatus.CREATED)
+                case ["api", "runs", run_id, "activity"]:
+                    body = json.loads(self._body())
+                    activity = body.get("activity")
+                    if activity is not None and not isinstance(activity, str):
+                        raise ValueError("activity must be a string or null")
+                    self.store.set_activity(run_id, activity)
+                    self._json({"ok": True})
                 case ["api", "runs", run_id, "log"]:
                     body = json.loads(self._body())
                     self.store.log(run_id, int(body["step"]), body["metrics"])

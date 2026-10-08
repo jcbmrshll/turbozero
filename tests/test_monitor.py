@@ -14,7 +14,7 @@ from PIL import Image
 from PIL.GifImagePlugin import GifImageFile
 
 from core.common import two_player_game
-from core.monitor import Episode, Monitor, Video
+from core.monitor import Episode, Monitor, Video, client
 from core.monitor.renderers import pgx_two_player_episode
 
 
@@ -205,6 +205,57 @@ def test_continued_run_is_running_again(monitor_server):
 
     assert monitor.run_id == run_id
     assert monitor_server.get(f"/api/runs/{run_id}")["status"] == "running"
+
+
+def test_activity_is_shown_until_the_run_finishes(monitor_server):
+    monitor = Monitor(monitor_server.url)
+    monitor.start()
+    monitor.activity("epoch 0: self-play")
+    monitor.flush()
+    meta = monitor_server.get(f"/api/runs/{monitor.run_id}")
+    assert meta["activity"] == "epoch 0: self-play"
+    since = meta["activity_since"]
+
+    # resending the same activity (a heartbeat) keeps when it started
+    monitor.activity("epoch 0: self-play")
+    monitor.flush()
+    meta = monitor_server.get(f"/api/runs/{monitor.run_id}")
+    assert meta["activity_since"] == since
+    assert meta["updated"] >= since
+
+    monitor.activity("epoch 0: training")
+    monitor.flush()
+    meta = monitor_server.get(f"/api/runs/{monitor.run_id}")
+    assert meta["activity"] == "epoch 0: training"
+    assert meta["activity_since"] >= since
+
+    monitor.finish()
+    meta = monitor_server.get(f"/api/runs/{monitor.run_id}")
+    assert meta["status"] == "finished"
+    assert meta["activity"] is None
+
+
+def test_heartbeat_keeps_a_busy_run_fresh(monitor_server, monkeypatch):
+    monkeypatch.setattr(client, "HEARTBEAT_S", 0.05)
+    monitor = Monitor(monitor_server.url)
+    monitor.start()
+    monitor.activity("testing: a slow opponent")
+    monitor.flush()
+    first = monitor_server.get(f"/api/runs/{monitor.run_id}")["updated"]
+
+    # nothing is logged, but the heartbeat still reaches the server
+    deadline = time.time() + 5
+    while monitor_server.get(f"/api/runs/{monitor.run_id}")["updated"] == first:
+        assert time.time() < deadline, "no heartbeat arrived"
+        time.sleep(0.05)
+    meta = monitor_server.get(f"/api/runs/{monitor.run_id}")
+    assert meta["activity"] == "testing: a slow opponent"
+
+    # and stops once the run finishes
+    monitor.finish()
+    finished = monitor_server.get(f"/api/runs/{monitor.run_id}")["updated"]
+    time.sleep(0.3)
+    assert monitor_server.get(f"/api/runs/{monitor.run_id}")["updated"] == finished
 
 
 def test_unreachable_server_never_raises(capsys):

@@ -33,6 +33,11 @@ packages = ["core"]
 include = ["core", "tests", "examples"]
 venvPath = "."
 venv = ".venv"
+# the Othello example's scripts import their sibling modules, and so do its tests
+executionEnvironments = [
+    { root = "examples/othello", extraPaths = ["examples/othello"] },
+    { root = "tests", extraPaths = ["examples/othello"] },
+]
 
 [tool.ruff]
 # `ruff check` uses ruff's default rule set (no select/ignore); `ruff format` uses its defaults (line length 88)

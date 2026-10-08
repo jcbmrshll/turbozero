@@ -14,6 +14,8 @@ from core.evaluators.mcts.state import (
     MCTSOutput,
     MCTSTree,
     TraversalState,
+    backprop_stats,
+    with_backprop_stats,
 )
 from core.trees.tree import init_tree
 from core.types import EnvStepFn, EvalFn, StepMetadata
@@ -203,34 +205,28 @@ class MCTS(Evaluator):
         )
         policy = jax.nn.softmax(policy_logits)
         value = jnp.where(metadata.terminated, player_reward, value)
-        # add leaf node to tree
+        # add leaf node to tree, or update it if it's already there (e.g. a terminal node)
         node_exists = tree.is_edge(parent, action)
         node_idx = tree.edge_map[parent, action]
-
-        node_data = jax.lax.cond(
-            node_exists,
-            lambda: self.visit_node(
-                node=tree.data_at(node_idx),
-                value=value,
-                p=policy,
-                terminated=metadata.terminated,
-                embedding=new_embedding,
-            ),
-            lambda: self.new_node(
-                policy=policy,
-                value=value,
-                embedding=new_embedding,
-                terminated=metadata.terminated,
-            ),
+        # both are computed and one picked node by node: under vmap a lax.cond on `node_exists`
+        # would run both anyway, as a select between whole trees (see `Tree.set_child`)
+        visited = self.visit_node(
+            node=tree.data_at(node_idx),
+            value=value,
+            p=policy,
+            terminated=metadata.terminated,
+            embedding=new_embedding,
         )
-
-        tree = jax.lax.cond(
-            node_exists,
-            lambda: tree.update_node(index=node_idx, data=node_data),
-            lambda: tree.add_node(
-                parent_index=parent, edge_index=action, data=node_data
-            ),
+        new = self.new_node(
+            policy=policy,
+            value=value,
+            embedding=new_embedding,
+            terminated=metadata.terminated,
         )
+        node_data = jax.tree.map(
+            lambda v, n: jnp.where(node_exists, v, n), visited, new
+        )
+        tree = tree.set_child(parent, action, node_data)
         # backpropagate
         return self.backpropagate(key, tree, parent, value)
 
@@ -287,27 +283,27 @@ class MCTS(Evaluator):
         """
 
         def body_fn(state: BackpropState) -> BackpropState:
-            node_idx, value, tree = state.node_idx, state.value, state.tree
+            node_idx, value, stats = state.node_idx, state.value, state.stats
             # apply discount to value estimate
             value *= self.discount
-            node = tree.data_at(node_idx)
+            node = jax.tree.map(lambda x: x[node_idx], stats)
             # increment visit count and update value estimate
             new_node = self.visit_node(node, value)
-            tree = tree.update_node(node_idx, new_node)
+            stats = jax.tree.map(lambda x, y: x.at[node_idx].set(y), stats, new_node)
             # go to parent
             return BackpropState(
-                node_idx=tree.parents[node_idx], value=value, tree=tree
+                node_idx=tree.parents[node_idx], value=value, stats=stats
             )
 
         # backpropagate while the node is a valid node
         # the root has no parent, so the loop will terminate
         # when the parent of the root is visited
         state = jax.lax.while_loop(
-            lambda s: s.node_idx != s.tree.NULL_INDEX,
+            lambda s: s.node_idx != tree.NULL_INDEX,
             body_fn,
-            BackpropState(node_idx=parent, value=value, tree=tree),
+            BackpropState(node_idx=parent, value=value, stats=backprop_stats(tree)),
         )
-        return state.tree
+        return with_backprop_stats(tree, state.stats)
 
     def sample_root_action(
         self, key: jax.Array, tree: MCTSTree

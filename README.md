@@ -23,7 +23,7 @@ It contains:
       * networks are [Equinox](https://github.com/patrick-kidger/equinox) modules, trained with [Optax](https://github.com/google-deepmind/optax); see [`apply_nn`](https://github.com/jcbmrshll/turbozero/blob/main/core/networks/utils.py) for the calling convention
  * Use the provided training and evaluation utilities, or pick and choose the components that you need.
 
-To get started, check out the [Othello example](https://github.com/jcbmrshll/turbozero/blob/main/examples/othello.py), which walks through each component
+To get started, check out the [Othello example](https://github.com/jcbmrshll/turbozero/tree/main/examples/othello), whose training script walks through each component
 
 ## Installation
 `turbozero` uses [`uv`](https://docs.astral.sh/uv/) for dependency management. With `uv` installed, run:
@@ -35,7 +35,7 @@ This creates a `.venv` with all dependencies. If an NVIDIA GPU is present it ins
 ## Examples
 Example training scripts live in `examples/`:
 ```
-uv run examples/othello.py         # AlphaZero vs. pgx's pretrained Othello model and a greedy baseline
+uv run examples/othello/train.py   # AlphaZero, tested on a ladder of opponents up to pgx's pretrained Othello model
 uv run examples/connect_four.py    # AlphaZero with weighted MCTS on Connect Four
 uv run examples/tic_tac_toe.py     # sanity check: trains in a minute or two on CPU, tested against a random player
 ```
@@ -45,7 +45,7 @@ Pass `--help` to see their options.
 Training runs can push their metrics, config and test games to a small local dashboard. Anything that isn't training happens in the monitor server: the training loop hands off raw test games and the server renders them, so it never waits on drawing or the network:
 ```
 uv run turbozero-monitor               # http://localhost:8008, runs stored in ./runs
-uv run examples/othello.py --monitor   # in another shell
+uv run examples/othello/train.py --monitor   # in another shell
 ```
 In your own scripts, pass `monitor=Monitor(project="...")` (from `core.monitor`) to the `Trainer`, and `episode_fn=pgx_two_player_episode()` (from `core.monitor.renderers`) to testers of two-player pgx games to see their games. Rendering needs the cairo system library on the machine running the monitor (on Ubuntu: `apt-get install libcairo2`). Logging never interrupts training: if the server is down, the run keeps going and says so once.
 

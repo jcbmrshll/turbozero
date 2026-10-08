@@ -129,6 +129,7 @@ class Trainer:
         testers: Sequence[BaseTester],
         nn_state: eqx.nn.State | None = None,
         evaluator_test: Evaluator | None = None,
+        test_env_init_fn: EnvInitFn | None = None,
         selfplay_exploration: SelfPlayExploration | None = None,
         data_transform_fns: Sequence[DataTransformFn] = (),
         extract_model_params_fn: ExtractModelParamsFn = extract_params,
@@ -160,6 +161,8 @@ class Trainer:
             testers: list of testers to evaluate the agent against (see core.testing.tester)
             nn_state: (optional) initial state of `nn` for stateful networks (e.g. with BatchNorm), from `eqx.nn.make_with_state`
             evaluator_test: (optional) evaluator to use during testing. If not provided, `evaluator` is used.
+            test_env_init_fn: (optional) environment initialization function for test episodes, e.g. to test from
+                the standard start while self-play starts from varied positions. If not provided, `env_init_fn` is used.
             selfplay_exploration: (optional) chooses the move self-play plays from the evaluator's output,
                 e.g. to play random moves some of the time (see core.training.exploration). The evaluator's
                 policy weights stay the training target. If not provided, self-play plays the evaluator's move.
@@ -181,6 +184,9 @@ class Trainer:
         # environment
         self.env_step_fn = env_step_fn
         self.env_init_fn = env_init_fn
+        self.test_env_init_fn = (
+            test_env_init_fn if test_env_init_fn is not None else env_init_fn
+        )
         self.max_episode_steps = max_episode_steps
         self.template_env_state = self.make_template_env_state()
         # nn
@@ -224,7 +230,7 @@ class Trainer:
             step_env_and_evaluator,
             evaluator=self.evaluator_test,
             env_step_fn=self.env_step_fn,
-            env_init_fn=self.env_init_fn,
+            env_init_fn=self.test_env_init_fn,
             max_steps=self.max_episode_steps,
         )
         # checkpoints
@@ -534,6 +540,19 @@ class Trainer:
         if self.monitor is not None:
             self.monitor.log(epoch, metrics)
 
+    def set_activity(self, text: str | None, echo: bool = False) -> None:
+        """Tells the monitor what the training loop is doing now, so the dashboard can show
+        what a slow step is busy with.
+
+        Args:
+            text: what the loop is doing, None once it's done
+            echo: also print it to the console
+        """
+        if echo and text is not None:
+            print(text, flush=True)
+        if self.monitor is not None:
+            self.monitor.activity(text)
+
     def save_checkpoint(self, train_state: TrainState, epoch: int) -> None:
         """Saves a checkpoint of the training state to `ckpt_dir`.
 
@@ -715,6 +734,8 @@ class Trainer:
 
         # warmup
         # populate replay buffer with initial self-play games
+        if self.warmup_steps > 0:
+            self.set_activity(f"warmup self-play ({self.warmup_steps} steps)")
         collect = jax.vmap(self.collect_steps, in_axes=(1, 1, None, None), out_axes=1)
         params = self.extract_model_params_fn(train_state)
         collect_key, key = jax.random.split(key)
@@ -733,6 +754,7 @@ class Trainer:
                 jax.random.split(collect_key, self.batch_size), self.num_devices
             )
             prev_collection_state = collection_state
+            self.set_activity(f"epoch {cur_epoch}: self-play")
             collection_state = collect(
                 collect_keys, collection_state, params, self.collection_steps_per_epoch
             )
@@ -740,6 +762,7 @@ class Trainer:
                 prev_collection_state, collection_state
             )
             # train
+            self.set_activity(f"epoch {cur_epoch}: training")
             train_key, key = jax.random.split(key)
             collection_state, train_state, metrics = self.train_steps(
                 train_key, collection_state, train_state, self.train_steps_per_epoch
@@ -752,16 +775,23 @@ class Trainer:
             if cur_epoch % eval_every == 0:
                 for i, test_state in enumerate(tester_states):
                     run_key, key = jax.random.split(key)
+                    self.set_activity(
+                        f"epoch {cur_epoch}: testing {self.testers[i].name}"
+                    )
                     new_test_state, metrics, episode = self.testers[i].run(
                         key=run_key,
                         epoch_num=cur_epoch,
                         max_steps=self.max_episode_steps,
                         num_devices=self.num_devices,
                         env_step_fn=self.env_step_fn,
-                        env_init_fn=self.env_init_fn,
+                        env_init_fn=self.test_env_init_fn,
                         evaluator=self.evaluator_test,
                         state=test_state,
                         params=params,
+                        log_fn=partial(self.log_metrics, epoch=cur_epoch),
+                        activity_fn=lambda text, epoch=cur_epoch: self.set_activity(
+                            f"epoch {epoch}: {text}", echo=True
+                        ),
                     )
 
                     if metrics:
@@ -774,6 +804,7 @@ class Trainer:
                         )
                     tester_states[i] = new_test_state
             # save checkpoint
+            self.set_activity(f"epoch {cur_epoch}: saving checkpoint")
             self.save_checkpoint(train_state, cur_epoch)
             # next epoch
             cur_epoch += 1

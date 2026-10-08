@@ -7,7 +7,13 @@ from jax.typing import ArrayLike
 
 from core.evaluators.mcts.action_selection import normalize_q_values
 from core.evaluators.mcts.mcts import MCTS
-from core.evaluators.mcts.state import BackpropState, MCTSNode, MCTSTree
+from core.evaluators.mcts.state import (
+    BackpropState,
+    MCTSNode,
+    MCTSTree,
+    backprop_stats,
+    with_backprop_stats,
+)
 
 
 @jax.tree_util.register_dataclass
@@ -109,12 +115,15 @@ class WeightedMCTS(MCTS):
         """
 
         def body_fn(state: BackpropState) -> BackpropState:
-            node_idx, tree = state.node_idx, state.tree
+            node_idx = state.node_idx
+            # the loop carries only the node statistics (see `backprop_stats`); read them through
+            # the tree outside it, whose structure doesn't change
+            view = replace(tree, data=state.stats)
             # get node data (WeightedMCTS trees hold WeightedMCTSNodes, see `new_node`)
-            node = cast(WeightedMCTSNode, tree.data_at(node_idx))
+            node = cast(WeightedMCTSNode, view.data_at(node_idx))
             # get q values, visit counts of children
-            child_q_values = tree.get_child_data("q", node_idx) * self.discount
-            child_n_values = tree.get_child_data("n", node_idx)
+            child_q_values = view.get_child_data("q", node_idx) * self.discount
+            child_n_values = view.get_child_data("n", node_idx)
 
             # normalize q-values to [0, 1]
             # (only used to compute the weights, the backed-up value stays on the network's value scale)
@@ -164,16 +173,16 @@ class WeightedMCTS(MCTS):
             # adjust node value to ((weighted_value * node_visits) + raw_value) / (node_visits + 1)
             # and increment visit count
             node = self.visit_node(node, node.r)
-            # update search tree
-            tree = tree.update_node(node_idx, node)
+            # update the node's statistics
+            stats = view.update_node(node_idx, node).data
             # backprop to parent node
             return BackpropState(
-                node_idx=tree.parents[node_idx], value=value, tree=tree
+                node_idx=tree.parents[node_idx], value=value, stats=stats
             )
 
         state = jax.lax.while_loop(
-            lambda s: s.node_idx != s.tree.NULL_INDEX,
+            lambda s: s.node_idx != tree.NULL_INDEX,
             body_fn,
-            BackpropState(node_idx=parent, value=value, tree=tree),
+            BackpropState(node_idx=parent, value=value, stats=backprop_stats(tree)),
         )
-        return state.tree
+        return with_backprop_stats(tree, state.stats)

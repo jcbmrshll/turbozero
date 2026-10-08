@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from operator import itemgetter
 from typing import Any
 
@@ -62,12 +62,35 @@ class BackpropState:
     Attributes:
         node_idx: current node
         value: value to backpropagate
-        tree: search tree
+        stats: the search tree's node data without the fields backpropagation never changes
+            (see `backprop_stats`)
     """
 
     node_idx: ArrayLike
     value: ArrayLike
-    tree: MCTSTree
+    stats: MCTSNode
+
+
+def backprop_stats(tree: MCTSTree) -> MCTSNode:
+    """The node data backpropagation reads and updates: everything but the policies and embeddings.
+
+    Backpropagation is a while_loop up the path to the root. Under vmap, a while_loop whose condition
+    differs across the batch selects between the old and the new loop state at every iteration, for
+    every tree in the batch, so it should carry as little as it can: these statistics are a few numbers
+    per node, while the policies and embeddings (a whole environment state per node) are most of the tree.
+    The loop reads everything it doesn't change (structure included) from the tree outside it.
+
+    Returns:
+        MCTSNode: the tree's node data, with `p` and `embedding` set to None
+    """
+    return replace(tree.data, p=None, embedding=None)
+
+
+def with_backprop_stats(tree: MCTSTree, stats: MCTSNode) -> MCTSTree:
+    """The tree with its node data replaced by `stats`, its policies and embeddings put back."""
+    return replace(
+        tree, data=replace(stats, p=tree.data.p, embedding=tree.data.embedding)
+    )
 
 
 @jax.tree_util.register_dataclass

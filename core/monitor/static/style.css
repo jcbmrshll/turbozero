@@ -118,6 +118,14 @@ code {
 .run-row .name { font: 12px var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .run-row .step { font: 11px var(--mono); color: var(--dim); font-variant-numeric: tabular-nums; }
 .run-row .when { grid-column: 2 / 4; font-size: 10.5px; color: var(--dim); }
+.run-row .doing {
+  grid-column: 2 / 4;
+  font-size: 10.5px;
+  color: var(--dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 /* status dots are square, like slick's */
 .dot { width: 8px; height: 8px; flex: none; display: inline-block; background: var(--dim); }

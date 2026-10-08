@@ -167,6 +167,11 @@ class GameFrame:
     outcomes: jax.Array
 
 
+def _select(pred: jax.Array, on_true: Any, on_false: Any) -> Any:
+    """Picks `on_true` or `on_false` leaf by leaf, by a scalar predicate."""
+    return jax.tree.map(lambda t, f: jnp.where(pred, t, f), on_true, on_false)
+
+
 def two_player_game_step(
     state: TwoPlayerGameState,
     p1_evaluator: Evaluator,
@@ -272,6 +277,7 @@ def two_player_game(
     env_step_fn: EnvStepFn,
     env_init_fn: EnvInitFn,
     max_steps: int,
+    p1_first: bool | None = None,
 ) -> tuple[jax.Array, GameFrame, jax.Array]:
     """Play a two player game between two evaluators.
 
@@ -285,6 +291,10 @@ def two_player_game(
         env_init_fn: The environment initialization function.
         max_steps: The maximum number of steps per episode. A game still in progress after `max_steps` steps
             is truncated: it is marked completed and scored with the rewards of its last step (0 for pgx games).
+        p1_first: (optional) whether the first evaluator moves first. Chosen at random from `key` if not given.
+            - Under `vmap`, a random first player makes whose turn it is differ across games, so every step runs
+              both evaluators and keeps one move from each game. Pass it as a fixed value for a batch of games
+              to run only the active evaluator at each step.
 
     Returns:
         Tuple[jax.Array, GameFrame, jax.Array]:
@@ -313,10 +323,11 @@ def two_player_game(
     step_p2 = partial(game_step, params=params_2, use_p1=False)
 
     # determine who goes first
-    first_player = jax.random.randint(turn_key, (), 0, 2)
-    p1_first = first_player == 0
+    p1_moves_first: bool | jax.Array = (
+        jax.random.randint(turn_key, (), 0, 2) == 0 if p1_first is None else p1_first
+    )
     p1_id, p2_id = jax.lax.cond(
-        p1_first,
+        p1_moves_first,
         lambda _: (metadata.cur_player_id, 1 - metadata.cur_player_id),
         lambda _: (1 - metadata.cur_player_id, metadata.cur_player_id),
         None,
@@ -347,13 +358,18 @@ def two_player_game(
         state: TwoPlayerGameState, step_num: jax.Array
     ) -> tuple[TwoPlayerGameState, GameFrame]:
         # players alternate turns, starting with the first player
-        use_p1 = (step_num % 2 == 0) == p1_first
-        state = jax.lax.cond(
-            state.completed,
-            lambda s: s,
-            lambda s: jax.lax.cond(use_p1, step_p1, step_p2, s),
-            state,
-        )
+        use_p1 = (step_num % 2 == 0) == p1_moves_first
+        # Branches whose predicate can differ across a vmapped batch of games are written as selects
+        # rather than lax.cond. vmap turns such a cond into a select anyway, running both branches,
+        # but it does so by batching every operand of the branches, the evaluators' parameters
+        # included: their convolutions then run per game, an order of magnitude slower.
+        if isinstance(p1_moves_first, bool):
+            # the same for every game, so only the active player's evaluator runs
+            new_state = jax.lax.cond(use_p1, step_p1, step_p2, state)
+        else:
+            new_state = _select(use_p1, step_p1(state), step_p2(state))
+        # a completed game keeps its final state
+        state = _select(state.completed, state, new_state)
         # collect render frame
         frame = GameFrame(
             env_state=state.env_state,

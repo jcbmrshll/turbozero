@@ -233,6 +233,57 @@ def test_train_loop_logs_to_monitor(trainers, monitor_server, monkeypatch):
     assert episodes == ["TwoPlayerTester_game-0.npz", "TwoPlayerTester_game-1.npz"]
 
 
+def test_test_games_start_with_test_env_init_fn(trainers, ttt, monkeypatch):
+    trainer = trainers[1]
+    monkeypatch.setattr(trainer, "save_checkpoint", lambda *args, **kwargs: None)
+    used = []
+
+    def tagged(tag):
+        def init_fn(key):
+            # runs when traced, once per compiled use
+            used.append(tag)
+            return ttt.init_fn(key)
+
+        return init_fn
+
+    monkeypatch.setattr(trainer, "env_init_fn", tagged("self-play"))
+    monkeypatch.setattr(trainer, "test_env_init_fn", tagged("test"))
+
+    trainer.train_loop(seed=0, num_epochs=1)
+
+    assert "self-play" in used and "test" in used
+    # the tester got the test init fn, and only it
+    assert used[-1] == "test"
+
+
+def test_train_loop_tells_the_monitor_what_it_is_doing(
+    trainers, monitor_server, monkeypatch
+):
+    trainer = trainers[1]
+    monitor = Monitor(monitor_server.url, project="tests")
+    monkeypatch.setattr(trainer, "save_checkpoint", lambda *args, **kwargs: None)
+    monkeypatch.setattr(trainer, "monitor", monitor)
+    activities = []
+    monkeypatch.setattr(monitor, "activity", activities.append)
+
+    trainer.train_loop(seed=0, num_epochs=2, eval_every=2)
+
+    assert trainer.warmup_steps > 0
+    assert activities == [
+        f"warmup self-play ({trainer.warmup_steps} steps)",
+        "epoch 0: self-play",
+        "epoch 0: training",
+        "epoch 0: testing TwoPlayerTester",
+        "epoch 0: saving checkpoint",
+        "epoch 1: self-play",
+        "epoch 1: training",
+        "epoch 1: saving checkpoint",
+    ]
+    meta = monitor_server.get(f"/api/runs/{monitor.run_id}")
+    assert meta["status"] == "finished"
+    assert meta["activity"] is None
+
+
 def test_crashed_train_loop_marks_run_crashed(trainers, monitor_server, monkeypatch):
     trainer = trainers[1]
     monitor = Monitor(monitor_server.url, project="tests")
