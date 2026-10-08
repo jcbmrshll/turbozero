@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from functools import partial
 from typing import Any
@@ -7,6 +8,9 @@ import jax.numpy as jnp
 
 from core.evaluators.evaluator import EvalOutput, Evaluator
 from core.types import EnvInitFn, EnvStepFn, StepMetadata
+
+# (key, evaluator output, metadata of the state being evaluated) -> action to play
+ChooseActionFn = Callable[[jax.Array, EvalOutput, StepMetadata], jax.Array]
 
 
 def partition(data: Any, num_partitions: int) -> Any:
@@ -38,10 +42,12 @@ def step_env_and_evaluator(
     env_init_fn: EnvInitFn,
     max_steps: int,
     reset: bool = True,
+    choose_action: ChooseActionFn | None = None,
 ) -> tuple[EvalOutput, Any, StepMetadata, jax.Array, jax.Array, jax.Array]:
     """Steps the environment and evaluator.
 
     - Evaluates the environment state with the Evaluator and selects an action.
+    - Optionally replaces the selected action with one chosen by `choose_action`.
     - Performs a step in the environment with the selected action.
     - Updates the internal state of the Evaluator.
     - Optionally resets the environment and evaluator state if the episode is terminated or truncated.
@@ -58,10 +64,13 @@ def step_env_and_evaluator(
         max_steps: The maximum number of environment steps per episode. An episode that has taken
             `max_steps` steps without terminating is truncated, so no episode runs longer than `max_steps` steps.
         reset: Whether to reset the environment and evaluator state if the episode is terminated or truncated.
+        choose_action: (optional) chooses the action to play from the evaluator's output instead,
+            e.g. `core.training.exploration.SelfPlayExploration.choose_action`. The environment and
+            evaluator step with the action it returns; the policy weights are left as they are.
 
     Returns:
         Tuple[EvalOutput, Any, StepMetadata, jax.Array, jax.Array, jax.Array]:
-            - `output`: The output of the evaluation.
+            - `output`: The output of the evaluation, with the action that was played.
             - `env_state`: The updated environment state.
             - `env_state_metadata`: Metadata associated with the updated environment state.
             - `terminated`: Whether the episode is terminated.
@@ -79,6 +88,11 @@ def step_env_and_evaluator(
         params=params,
         env_step_fn=env_step_fn,
     )
+    if choose_action is not None:
+        choose_key, key = jax.random.split(key)
+        output = replace(
+            output, action=choose_action(choose_key, output, env_state_metadata)
+        )
     # take the selected action
     env_state, env_state_metadata = env_step_fn(env_state, output.action)
     # check for termination and truncation

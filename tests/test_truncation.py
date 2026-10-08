@@ -5,18 +5,13 @@ so every episode length below is deterministic."""
 
 from functools import partial
 
-import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 import pytest
 
 from core.common import step_env_and_evaluator, two_player_game
-from core.memory.replay_memory import EpisodeReplayBuffer
 from core.testing.two_player_tester import TwoPlayerTester, TwoPlayerTestState
-from core.training.loss_fns import az_default_loss_fn
-from core.training.train import Trainer
 
 
 def run_steps(env, evaluator, max_steps, num_steps, reset=True):
@@ -88,51 +83,19 @@ def test_episode_terminating_on_its_last_allowed_step_is_terminated_not_truncate
     np.testing.assert_array_equal(rewards, env.rewards)
 
 
-def make_collector(env, evaluator, max_episode_steps, ckpt_dir):
-    """A single-environment Trainer on `env`, returning (jitted collect step, initial collection state)."""
-    nn = eqx.nn.Linear(2, env.num_actions, key=jax.random.PRNGKey(0))
-    trainer = Trainer(
-        batch_size=1,
-        train_batch_size=1,
-        warmup_steps=0,
-        collection_steps_per_epoch=1,
-        train_steps_per_epoch=1,
-        nn=nn,
-        loss_fn=az_default_loss_fn,
-        optimizer=optax.sgd(1e-3),
-        evaluator=evaluator,
-        memory_buffer=EpisodeReplayBuffer(capacity=16),
-        max_episode_steps=max_episode_steps,
-        env_step_fn=env.step_fn,
-        env_init_fn=env.init_fn,
-        state_to_nn_input_fn=env.state_to_nn_input,
-        testers=[],
-        ckpt_dir=str(ckpt_dir),
-        num_devices=1,
-    )
-    collect = jax.jit(jax.vmap(partial(trainer.collect, params=None)))
-    return collect, trainer.init_collection_state(jax.random.PRNGKey(0), batch_size=1)
-
-
-def collect_steps(collect, state, num_steps):
-    for i in range(num_steps):
-        state = collect(jax.random.split(jax.random.PRNGKey(i), 1), state)
-    return state.buffer_state
-
-
 def sampleable(buffer_state):
     return np.asarray(buffer_state.populated & buffer_state.has_reward)[0]
 
 
 def test_collect_keeps_episode_that_terminates_on_its_last_allowed_step(
-    fixed_length_env, scripted, tmp_path
+    fixed_length_env, scripted, make_collector, tmp_path
 ):
     env = fixed_length_env(length=4)
-    collect, state = make_collector(
+    collect = make_collector(
         env, scripted.first_legal, max_episode_steps=4, ckpt_dir=tmp_path
     )
 
-    buffer_state = collect_steps(collect, state, num_steps=4)
+    buffer_state = collect(num_steps=4).buffer_state
 
     np.testing.assert_array_equal(
         np.flatnonzero(sampleable(buffer_state)), np.arange(4)
@@ -149,14 +112,14 @@ def test_collect_keeps_episode_that_terminates_on_its_last_allowed_step(
 
 
 def test_collect_discards_episode_that_hits_the_step_limit(
-    fixed_length_env, scripted, tmp_path
+    fixed_length_env, scripted, make_collector, tmp_path
 ):
     env = fixed_length_env(length=4)
-    collect, state = make_collector(
+    collect = make_collector(
         env, scripted.first_legal, max_episode_steps=3, ckpt_dir=tmp_path
     )
 
-    buffer_state = collect_steps(collect, state, num_steps=3)
+    buffer_state = collect(num_steps=3).buffer_state
 
     assert not sampleable(buffer_state).any()
     # the next episode overwrites the discarded one

@@ -20,6 +20,7 @@ from core.memory.replay_memory import (
 )
 from core.monitor import Monitor
 from core.testing.tester import BaseTester, TestState
+from core.training.exploration import SelfPlayExploration
 from core.types import (
     DataTransformFn,
     EnvInitFn,
@@ -42,12 +43,16 @@ class CollectionState:
         env_state: state of the environment
         buffer_state: state of the replay buffer
         metadata: metadata of the current environment state
+        episodes: number of episodes that have terminated so far (not counting truncated ones)
+        draws: how many of those ended with every player's reward 0
     """
 
     eval_state: Any
     env_state: Any
     buffer_state: ReplayBufferState
     metadata: StepMetadata
+    episodes: jax.Array
+    draws: jax.Array
 
 
 @jax.tree_util.register_dataclass
@@ -124,6 +129,7 @@ class Trainer:
         testers: Sequence[BaseTester],
         nn_state: eqx.nn.State | None = None,
         evaluator_test: Evaluator | None = None,
+        selfplay_exploration: SelfPlayExploration | None = None,
         data_transform_fns: Sequence[DataTransformFn] = (),
         extract_model_params_fn: ExtractModelParamsFn = extract_params,
         monitor: Monitor | None = None,
@@ -154,6 +160,9 @@ class Trainer:
             testers: list of testers to evaluate the agent against (see core.testing.tester)
             nn_state: (optional) initial state of `nn` for stateful networks (e.g. with BatchNorm), from `eqx.nn.make_with_state`
             evaluator_test: (optional) evaluator to use during testing. If not provided, `evaluator` is used.
+            selfplay_exploration: (optional) chooses the move self-play plays from the evaluator's output,
+                e.g. to play random moves some of the time (see core.training.exploration). The evaluator's
+                policy weights stay the training target. If not provided, self-play plays the evaluator's move.
             data_transform_fns: (optional) list of data transform functions to apply to self-play experiences (e.g. rotation, reflection, etc.)
             extract_model_params_fn: (optional) function to extract model parameters from TrainState
             monitor: (optional) `core.monitor.Monitor` to log metrics and test episodes to (see a tester's `episode_fn`)
@@ -189,12 +198,19 @@ class Trainer:
         self.memory_buffer = memory_buffer
         self.evaluator_train = evaluator
         self.transform_fns = data_transform_fns
+        self.selfplay_exploration = selfplay_exploration
         self.step_train = partial(
             step_env_and_evaluator,
             evaluator=self.evaluator_train,
             env_step_fn=self.env_step_fn,
             env_init_fn=self.env_init_fn,
             max_steps=self.max_episode_steps,
+            choose_action=selfplay_exploration.choose_action
+            if selfplay_exploration is not None
+            else None,
+        )
+        self.count_distinct_observations = jax.jit(
+            self.memory_buffer.count_distinct_observations
         )
         # training
         self.train_steps_per_epoch = train_steps_per_epoch
@@ -278,6 +294,9 @@ class Trainer:
             "evaluator_train_config": self.evaluator_train.get_config(),
             "evaluator_test": self.evaluator_test.__class__.__name__,
             "evaluator_test_config": self.evaluator_test.get_config(),
+            "selfplay_exploration_config": self.selfplay_exploration.get_config()
+            if self.selfplay_exploration is not None
+            else None,
             "memory_buffer": self.memory_buffer.__class__.__name__,
             "memory_buffer_config": self.memory_buffer.get_config(),
         }
@@ -354,6 +373,8 @@ class Trainer:
             env_state=new_env_state,
             buffer_state=buffer_state,
             metadata=new_metadata,
+            episodes=state.episodes + terminated,
+            draws=state.draws + (terminated & (rewards == 0).all()),
         )
 
     @partial(jax.pmap, axis_name="d", static_broadcasted_argnums=(0, 4))
@@ -471,6 +492,34 @@ class Trainer:
         # return updated collection state, train state, and metrics
         return collection_state, train_state, metrics
 
+    def selfplay_metrics(self, before: CollectionState, after: CollectionState) -> dict:
+        """Measures how varied self-play is, to spot it collapsing into the same few games.
+
+        Args:
+            before: collection state before this epoch's self-play
+            after: collection state after it
+
+        Returns:
+            dict: metrics
+                - `selfplay_episodes`: episodes that terminated in between
+                - `selfplay_draw_fraction`: fraction of them that ended with every reward 0
+                  (draws, in two-player zero-sum games), omitted if none terminated
+                - `buffer_distinct_positions`: distinct observations among the experiences the
+                  replay buffer can sample (data transforms' outputs count as observations too)
+                - `buffer_distinct_fraction`: that as a fraction of those experiences
+        """
+        episodes = (after.episodes - before.episodes).sum()
+        draws = (after.draws - before.draws).sum()
+        distinct, total = self.count_distinct_observations(after.buffer_state)
+        metrics = {
+            "selfplay_episodes": episodes,
+            "buffer_distinct_positions": distinct,
+            "buffer_distinct_fraction": distinct / jnp.maximum(total, 1),
+        }
+        if episodes > 0:
+            metrics["selfplay_draw_fraction"] = draws / episodes
+        return metrics
+
     def log_metrics(self, metrics: dict, epoch: int):
         """Logs metrics to console and the monitor.
 
@@ -580,6 +629,8 @@ class Trainer:
             env_state=env_state,
             buffer_state=buffer_state,
             metadata=metadata,
+            episodes=jnp.zeros((batch_size,), dtype=jnp.int32),
+            draws=jnp.zeros((batch_size,), dtype=jnp.int32),
         )
 
     def train_loop(
@@ -681,8 +732,12 @@ class Trainer:
             collect_keys = partition(
                 jax.random.split(collect_key, self.batch_size), self.num_devices
             )
+            prev_collection_state = collection_state
             collection_state = collect(
                 collect_keys, collection_state, params, self.collection_steps_per_epoch
+            )
+            selfplay_metrics = self.selfplay_metrics(
+                prev_collection_state, collection_state
             )
             # train
             train_key, key = jax.random.split(key)
@@ -691,7 +746,7 @@ class Trainer:
             )
             params = self.extract_model_params_fn(train_state)
             # log metrics
-            self.log_metrics(metrics, cur_epoch)
+            self.log_metrics({**metrics, **selfplay_metrics}, cur_epoch)
 
             # test
             if cur_epoch % eval_every == 0:
