@@ -190,22 +190,18 @@ def test_tester_episode_has_every_frame_up_to_the_final_state(
         packed.append(frames)
         return "episode"
 
-    def replicate(tree):
-        return jax.tree.map(lambda x: jnp.stack([x] * 2), tree)
-
     tester = TwoPlayerTester(num_episodes=2, episode_fn=episode_fn)
-    state = TwoPlayerTestState(best_params=replicate({"w": jnp.zeros(3)}))
+    state = TwoPlayerTestState(best_params={"w": jnp.zeros(3)})
 
     _, _, episode = tester.run(
         key=jax.random.PRNGKey(0),
         epoch_num=0,
         max_steps=max_steps,
-        num_devices=2,
         env_step_fn=env.step_fn,
         env_init_fn=env.init_fn,
         evaluator=scripted.first_legal,
         state=state,
-        params=replicate({"w": jnp.ones(3)}),
+        params={"w": jnp.ones(3)},
     )
 
     assert episode == "episode"

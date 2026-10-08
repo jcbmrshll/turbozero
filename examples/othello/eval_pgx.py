@@ -56,8 +56,6 @@ def main():
     args = parser.parse_args()
 
     network, params = load_checkpoint(args.checkpoint, args.blocks, args.channels)
-    # the tester runs on every device with pmap: one device here, so add its axis
-    params = jax.tree.map(lambda x: x[None], params)
     agent = make_test_evaluator(make_nn_eval_fn(network, state_to_nn_input), args.sims)
     pretrained = make_nn_eval_fn_no_params_callable(
         pgx.make_baseline_model("othello_v0"), state_to_nn_input
@@ -75,7 +73,7 @@ def main():
             name="pgx",
         )
         start = time.perf_counter()
-        keys = tester.split_keys(jax.random.PRNGKey(args.seed), num_devices=1)
+        keys = tester.split_keys(jax.random.PRNGKey(args.seed))
         _, metrics, _, _ = tester.test(
             80, step_fn, init_fn, agent, keys, TestState(), params
         )

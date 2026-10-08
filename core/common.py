@@ -13,24 +13,6 @@ from core.types import EnvInitFn, EnvStepFn, StepMetadata
 ChooseActionFn = Callable[[jax.Array, EvalOutput, StepMetadata], jax.Array]
 
 
-def partition(data: Any, num_partitions: int) -> Any:
-    """Partition each array in a data structure into num_partitions along the first axis.
-
-    e.g. partitions an array of shape (N, ...) into (num_partitions, N//num_partitions, ...)
-
-    Args:
-        data: ArrayTree to partition
-        num_partitions: number of partitions
-
-    Returns:
-        pytree: partitioned pytree
-    """
-    return jax.tree.map(
-        lambda x: x.reshape(num_partitions, x.shape[0] // num_partitions, *x.shape[1:]),
-        data,
-    )
-
-
 def step_env_and_evaluator(
     key: jax.Array,
     env_state: Any,
