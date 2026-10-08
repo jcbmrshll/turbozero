@@ -13,11 +13,17 @@ the metrics, which rung of the ladder the agent has reached, and a game against 
 last opponent it played, which it renders itself.
 
 The first epoch is slow: nearly all of the training loop is JIT-compiled the first
-time it runs. The hyperparameters here are only an example; tune them for your task
-and hardware.
+time it runs. On one RTX 5080 the rest take about 70s each. With these settings, one
+200-epoch run passed every rung by epoch 65; at the end, in 512 games against pgx's
+model (our agent searching 64 iterations a move), it scored 0.82 against the model
+searching 64, 0.74 against it searching 256, and 0.57 against it searching 1024
+(draws count half).
+
+The hyperparameters here are only an example; tune them for your task and hardware.
 """
 
 import argparse
+import tempfile
 from functools import partial
 from typing import cast
 
@@ -139,9 +145,14 @@ def make_test_evaluator(eval_fn, num_iterations: int = 64) -> MCTS:
 def main():
     parser = argparse.ArgumentParser(description="AlphaZero on Othello.")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument(
         "--eval-every", type=int, default=5, help="epochs between test games"
+    )
+    parser.add_argument(
+        "--ckpt-dir",
+        default=None,
+        help="where to save checkpoints (default: a new temporary directory)",
     )
     parser.add_argument(
         "--monitor",
@@ -158,8 +169,8 @@ def main():
     resnet, resnet_state = eqx.nn.make_with_state(AZResnet)(
         AZResnetConfig(
             policy_head_out_size=env.num_actions,
-            num_blocks=4,
-            num_channels=32,
+            num_blocks=6,
+            num_channels=128,
         ),
         # pgx types observation_shape as Tuple[int, ...]; for board games it's (height, width, channels)
         cast(tuple[int, int, int], env.observation_shape),
@@ -170,8 +181,8 @@ def main():
     # samples moves in proportion to visit counts, for exploration during self-play
     evaluator = AlphaZero(MCTS)(
         eval_fn=make_nn_eval_fn(resnet, state_to_nn_input),
-        num_iterations=32,
-        max_nodes=40,
+        num_iterations=64,
+        max_nodes=128,
         branching_factor=env.num_actions,
         action_selector=PUCTSelector(),
         temperature=1.0,
@@ -210,15 +221,21 @@ def main():
         batch_size=1024,
         train_batch_size=4096,
         warmup_steps=0,
-        collection_steps_per_epoch=256,
-        train_steps_per_epoch=64,
+        collection_steps_per_epoch=128,
+        train_steps_per_epoch=128,
         nn=resnet,
         nn_state=resnet_state,
-        loss_fn=partial(az_default_loss_fn, l2_reg_lambda=0.0),
-        optimizer=optax.adam(1e-3),
+        loss_fn=partial(az_default_loss_fn, l2_reg_lambda=1e-4),
+        # decays to a tenth of the initial learning rate over the run
+        optimizer=optax.adam(
+            optax.cosine_decay_schedule(
+                1e-3, decay_steps=max(args.epochs, 1) * 128, alpha=0.1
+            )
+        ),
         evaluator=evaluator,
         # stores `capacity` samples for each of the `batch_size` environments
-        memory_buffer=EpisodeReplayBuffer(capacity=1000),
+        # (with the 7 symmetric copies of each sample, about 3 epochs of self-play)
+        memory_buffer=EpisodeReplayBuffer(capacity=3000),
         max_episode_steps=80,
         env_step_fn=step_fn,
         env_init_fn=init_fn,
@@ -228,6 +245,7 @@ def main():
         # add each sample's 7 symmetric copies
         data_transform_fns=SYMMETRY_TRANSFORM_FNS,
         monitor=Monitor(args.monitor, project="othello") if args.monitor else None,
+        ckpt_dir=args.ckpt_dir or tempfile.mkdtemp(prefix="turbozero-othello-"),
     )
     trainer.train_loop(
         seed=args.seed, num_epochs=args.epochs, eval_every=args.eval_every
