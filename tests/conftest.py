@@ -4,10 +4,6 @@ import os
 
 # tests always run on CPU, never the GPU
 os.environ["JAX_PLATFORMS"] = "cpu"
-# simulate two devices so the pmap code paths run with more than one device
-os.environ["XLA_FLAGS"] = " ".join(
-    [os.environ.get("XLA_FLAGS", ""), "--xla_force_host_platform_device_count=2"]
-).strip()
 
 import json
 import threading
@@ -288,7 +284,6 @@ def make_collector():
             state_to_nn_input_fn=env.state_to_nn_input,
             testers=[],
             ckpt_dir=str(ckpt_dir),
-            num_devices=1,
             **trainer_kwargs,
         )
         step = jax.jit(jax.vmap(partial(trainer.collect, params=None)))

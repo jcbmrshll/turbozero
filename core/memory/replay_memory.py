@@ -52,7 +52,7 @@ class ReplayBufferState:
 class EpisodeReplayBuffer:
     """Replay buffer, stores trajectories from episodes for training.
 
-    Compatible with `jax.jit`, `jax.vmap`, and `jax.pmap`.
+    Compatible with `jax.jit` and `jax.vmap`.
     """
 
     def __init__(
@@ -143,19 +143,65 @@ class EpisodeReplayBuffer:
             populated=jnp.where(~state.has_reward, False, state.populated),
         )
 
-    # assumes input is batched!! (dont vmap/pmap)
+    def sample_mask(self, state: ReplayBufferState) -> jax.Array:
+        """Marks the buffer entries that can be sampled: populated, and from a finished episode.
+
+        Args:
+            state: replay buffer state
+
+        Returns:
+            jax.Array: boolean mask, same shape as `state.populated`
+        """
+        return jnp.logical_and(state.populated, state.has_reward)
+
+    def check_can_sample(self, state: ReplayBufferState) -> None:
+        """Checks on the host that at least one episode has finished, so there is something to sample.
+
+        Not compatible with `jax.jit`: `state` must hold concrete arrays.
+
+        Args:
+            state: replay buffer state
+
+        Raises:
+            ValueError: if no episode has finished yet
+        """
+        if not self.sample_mask(state).any():
+            raise ValueError(
+                "Cannot sample from the replay buffer: no episodes have finished yet. "
+                "Collect more self-play steps before training (e.g. increase `warmup_steps`)."
+            )
+
+    def sample_indices(
+        self, key: jax.Array, mask: jax.Array, sample_size: int
+    ) -> jax.Array:
+        """Samples entries uniformly, without replacement, from those marked in `mask`.
+
+        Compatible with `jax.jit`. `mask` must mark at least `sample_size` entries,
+        use `check_can_sample` to check that it marks any.
+
+        Args:
+            key: rng
+            mask: mask of entries that can be sampled (see `sample_mask`), any shape
+            sample_size: number of entries to sample
+
+        Returns:
+            jax.Array: indices into the flattened `mask`, shape (sample_size,)
+        """
+        mask = mask.reshape(-1)
+        return jax.random.choice(
+            key, mask.size, shape=(sample_size,), replace=False, p=mask / mask.sum()
+        )
+
     def sample(
         self, state: ReplayBufferState, key: jax.Array, sample_size: int
     ) -> BaseExperience:
         """Samples experiences from the replay buffer.
 
-        Assumes the buffer has two batch dimensions, so shape = (devices, batch_size, capacity, ...)
-        Perhaps there is a dimension-agnostic way to do this?
+        The buffer may have any number of batch dimensions, e.g. (batch_size, capacity, ...);
+        samples are drawn across all of them, not per batch.
 
-        Samples across all batch dimensions, not per-batch/device.
-
-        Not compatible with `jax.jit`: checks on the host that at least one episode has finished,
-        so `state` must hold concrete arrays (as it does when called from `Trainer.train_steps`).
+        Not compatible with `jax.jit`: checks on the host that at least one episode has finished
+        (see `check_can_sample`). Use `sample_mask` and `sample_indices` to sample under `jax.jit`.
 
         Args:
             state: replay buffer state
@@ -168,34 +214,12 @@ class EpisodeReplayBuffer:
         Raises:
             ValueError: if no episode has finished yet, so there is nothing to sample
         """
-        masked_weights = jnp.logical_and(state.populated, state.has_reward).reshape(-1)
-
-        if not masked_weights.any():
-            raise ValueError(
-                "Cannot sample from the replay buffer: no episodes have finished yet. "
-                "Collect more self-play steps before training (e.g. increase `warmup_steps`)."
-            )
-
-        num_partitions = state.populated.shape[0]
-        num_batches = state.populated.shape[1]
-
-        indices = jax.random.choice(
-            key,
-            self.capacity * num_partitions * num_batches,
-            shape=(sample_size,),
-            replace=False,
-            p=masked_weights / masked_weights.sum(),
+        self.check_can_sample(state)
+        mask = self.sample_mask(state)
+        indices = jnp.unravel_index(
+            self.sample_indices(key, mask, sample_size), mask.shape
         )
-
-        partition_indices, batch_indices, item_indices = jnp.unravel_index(
-            indices, (num_partitions, num_batches, self.capacity)
-        )
-
-        sampled_buffer_items = jax.tree_util.tree_map(
-            lambda x: x[partition_indices, batch_indices, item_indices], state.buffer
-        )
-
-        return sampled_buffer_items
+        return jax.tree_util.tree_map(lambda x: x[indices], state.buffer)
 
     def count_distinct_observations(
         self, state: ReplayBufferState

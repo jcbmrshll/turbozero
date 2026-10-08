@@ -28,12 +28,16 @@ class TwoPlayerBaseline(BaseTester):
             num_episodes: number of episodes to evaluate against the baseline
             baseline_evaluator: the baseline evaluator to evaluate against
             baseline_params: (optional) the parameters of the baseline evaluator
-            balance_first_player: the agent moves first in exactly half of each device's episodes,
-                instead of a random half. Only the active player's evaluator runs at each step, which
+            balance_first_player: the agent moves first in exactly half of the episodes, instead of
+                a random half. Only the active player's evaluator runs at each step, which
                 about halves the cost of a test, and the results don't vary with who happened to move
-                first. Needs an even number of episodes per device.
+                first. Needs an even number of episodes.
         """
         super().__init__(*args, num_keys=num_episodes, **kwargs)
+        if balance_first_player and num_episodes % 2 != 0:
+            raise ValueError(
+                f"{self.__class__.__name__}: balance_first_player needs an even number of episodes, got {num_episodes}"
+            )
         self.num_episodes = num_episodes
         self.balance_first_player = balance_first_player
         self.baseline_evaluator = baseline_evaluator
@@ -41,23 +45,7 @@ class TwoPlayerBaseline(BaseTester):
             baseline_params = jnp.array([])
         self.baseline_params = baseline_params
 
-    def check_size_compatibilities(self, num_devices: int) -> None:
-        """Checks if tester configuration is compatible with number of devices being utilized.
-
-        Args:
-            num_devices: number of devices
-        """
-        if self.num_episodes % num_devices != 0:
-            raise ValueError(
-                f"{self.__class__.__name__}: number of episodes ({self.num_episodes}) must be divisible by number of devices ({num_devices})"
-            )
-        if self.balance_first_player and (self.num_episodes // num_devices) % 2 != 0:
-            raise ValueError(
-                f"{self.__class__.__name__}: balance_first_player needs an even number of episodes per device, "
-                f"got {self.num_episodes} episodes over {num_devices} devices"
-            )
-
-    @partial(jax.pmap, axis_name="d", static_broadcasted_argnums=(0, 1, 2, 3, 4))
+    @partial(jax.jit, static_argnums=(0, 1, 2, 3, 4))
     def test(
         self,
         max_steps: int,

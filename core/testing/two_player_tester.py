@@ -43,18 +43,7 @@ class TwoPlayerTester(BaseTester):
         """
         return TwoPlayerTestState(best_params=params)
 
-    def check_size_compatibilities(self, num_devices: int) -> None:
-        """Checks if tester configuration is compatible with number of devices being utilized.
-
-        Args:
-            num_devices: number of devices
-        """
-        if self.num_episodes % num_devices != 0:
-            raise ValueError(
-                f"{self.__class__.__name__}: number of episodes ({self.num_episodes}) must be divisible by number of devices ({num_devices})"
-            )
-
-    @partial(jax.pmap, axis_name="d", static_broadcasted_argnums=(0, 1, 2, 3, 4))
+    @partial(jax.jit, static_argnums=(0, 1, 2, 3, 4))
     def test(
         self,
         max_steps: int,
@@ -103,9 +92,8 @@ class TwoPlayerTester(BaseTester):
 
         metrics = {f"{self.name}_avg_outcome": avg}
 
-        # decide on the mean across all devices so best_params stays identical on every device
         best_params = jax.lax.cond(
-            jax.lax.pmean(avg, axis_name="d") > 0.0,
+            avg > 0.0,
             lambda _: params,
             lambda _: state.best_params,
             None,

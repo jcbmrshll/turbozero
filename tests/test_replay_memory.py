@@ -87,7 +87,7 @@ def test_truncate_wraps_around_mid_episode():
 
 def test_sample_only_returns_finished_populated_entries():
     buffer = EpisodeReplayBuffer(capacity=4)
-    # two environments, as the trainer stores them (devices, batch, capacity, ...)
+    # two environments, as the trainer stores them (batch, capacity, ...)
     states = [init_single(buffer), init_single(buffer)]
     # env 0: a finished episode (1, 2), then an episode in progress (3)
     states[0] = buffer.assign_rewards(
@@ -99,7 +99,7 @@ def test_sample_only_returns_finished_populated_entries():
         add(buffer, states[1], [4]), jnp.array([-1.0, 1.0])
     )
     states[1] = buffer.truncate(add(buffer, states[1], [5, 6]))
-    state = jax.tree.map(lambda *x: jnp.stack(x)[None], *states)
+    state = jax.tree.map(lambda *x: jnp.stack(x), *states)
 
     for seed in range(10):
         sample = buffer.sample(state, jax.random.PRNGKey(seed), 3)
@@ -109,7 +109,7 @@ def test_sample_only_returns_finished_populated_entries():
 def test_sample_before_any_episode_finished_raises():
     buffer = EpisodeReplayBuffer(capacity=4)
     state = add(buffer, init_single(buffer), [1, 2])
-    state = jax.tree.map(lambda x: x[None, None], state)
+    state = jax.tree.map(lambda x: x[None], state)
 
     with pytest.raises(ValueError):
         buffer.sample(state, jax.random.PRNGKey(0), 2)

@@ -9,9 +9,8 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import optax
-from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
-from core.common import partition, step_env_and_evaluator
+from core.common import step_env_and_evaluator
 from core.evaluators.evaluator import Evaluator
 from core.memory.replay_memory import (
     BaseExperience,
@@ -136,7 +135,6 @@ class Trainer:
         monitor: Monitor | None = None,
         ckpt_dir: str = "/tmp/turbozero_checkpoints",
         max_checkpoints: int = 2,
-        num_devices: int | None = None,
         extra_config: dict | None = None,
     ):
         """Initializes a Trainer.
@@ -173,14 +171,8 @@ class Trainer:
                   and later calls (e.g. continuing from `initial_state`) keep logging to it
             ckpt_dir: directory to save checkpoints
             max_checkpoints: maximum number of checkpoints to keep
-            num_devices: (optional) number of devices to use, defaults to jax.local_device_count()
             extra_config: (optional) extra config to record with the monitor's run
         """
-        self.num_devices = (
-            num_devices if num_devices is not None else jax.local_device_count()
-        )
-        # the devices pmap maps over, used to split host-side minibatches across them
-        self.mesh = Mesh(jax.devices()[: self.num_devices], ("d",))
         # environment
         self.env_step_fn = env_step_fn
         self.env_init_fn = env_init_fn
@@ -240,41 +232,9 @@ class Trainer:
         # monitor
         self.monitor = monitor
         self.extra_config = extra_config if extra_config is not None else {}
-        # check batch sizes, etc. are compatible with number of devices
-        self.check_size_compatibilities()
-
-    def check_size_compatibilities(self):
-        """Checks if batch sizes, etc. are compatible with number of devices.
-
-        Calls check_size_compatibilities on each tester.
-        """
-
-        err_fmt = "Batch size must be divisible by the number of devices. Got {b} batch size and {d} devices."
-        # check train batch size
-        if self.train_batch_size % self.num_devices != 0:
-            raise ValueError(
-                err_fmt.format(b=self.train_batch_size, d=self.num_devices)
-            )
-        # check collection batch size
-        if self.batch_size % self.num_devices != 0:
-            raise ValueError(err_fmt.format(b=self.batch_size, d=self.num_devices))
-        # check testers
-        for tester in self.testers:
-            tester.check_size_compatibilities(self.num_devices)
-
-    def replicate(self, data: Any) -> Any:
-        """Places a copy of each array in a data structure on every device, along a new first axis."""
-        return jax.device_put(
-            jax.tree.map(
-                lambda x: jnp.broadcast_to(x, (self.num_devices, *jnp.shape(x))), data
-            ),
-            NamedSharding(self.mesh, PartitionSpec("d")),
-        )
 
     def init_train_state(self) -> TrainState:
         """Initializes the training state (params, optimizer, etc.) from `nn` and `nn_state`.
-
-        Not replicated across devices.
 
         Returns:
             TrainState: initialized training state
@@ -295,7 +255,6 @@ class Trainer:
             "warmup_steps": self.warmup_steps,
             "collection_steps_per_epoch": self.collection_steps_per_epoch,
             "train_steps_per_epoch": self.train_steps_per_epoch,
-            "num_devices": self.num_devices,
             "evaluator_train": self.evaluator_train.__class__.__name__,
             "evaluator_train_config": self.evaluator_train.get_config(),
             "evaluator_test": self.evaluator_test.__class__.__name__,
@@ -383,14 +342,14 @@ class Trainer:
             draws=state.draws + (terminated & (rewards == 0).all()),
         )
 
-    @partial(jax.pmap, axis_name="d", static_broadcasted_argnums=(0, 4))
+    @partial(jax.jit, static_argnums=(0, 4))
     def collect_steps(
         self, key: jax.Array, state: CollectionState, params: Any, num_steps: int
     ) -> CollectionState:
-        """Collects self-play data for `num_steps` steps. Mapped across devices.
+        """Collects self-play data for `num_steps` steps in every environment.
 
         Args:
-            key: rng
+            key: rng, one key per environment
             state: current collection state
             params: model parameters
             num_steps: number of self-play steps to collect
@@ -399,15 +358,17 @@ class Trainer:
             CollectionState: updated collection state
         """
         if num_steps > 0:
-            collect = partial(self.collect, params=params)
-            keys = jax.random.split(key, num_steps)
-            return jax.lax.fori_loop(
-                0, num_steps, lambda i, s: collect(keys[i], s), state
-            )
+
+            def collect_env(key: jax.Array, state: CollectionState) -> CollectionState:
+                keys = jax.random.split(key, num_steps)
+                return jax.lax.fori_loop(
+                    0, num_steps, lambda i, s: self.collect(keys[i], s, params), state
+                )
+
+            return jax.vmap(collect_env)(key, state)
         return state
 
-    @partial(jax.pmap, axis_name="d", static_broadcasted_argnums=(0,))
-    def one_train_step(
+    def train_step(
         self, ts: TrainState, batch: BaseExperience
     ) -> tuple[TrainState, dict]:
         """Make a single training step.
@@ -424,13 +385,7 @@ class Trainer:
         grad_fn = eqx.filter_value_and_grad(self.loss_fn, has_aux=True)
         (loss, (metrics, nn_state)), grads = grad_fn(nn, ts.nn_state, batch)
         # apply gradients
-        grads = jax.lax.pmean(grads, axis_name="d")
         updates, opt_state = self.optimizer.update(grads, ts.opt_state, ts.params)
-        # average nn state (e.g. batchnorm stats) across devices, leaving counters etc. as they are
-        nn_state = jax.tree.map(
-            lambda x: jax.lax.pmean(x, axis_name="d") if eqx.is_inexact_array(x) else x,
-            nn_state,
-        )
         ts = replace(
             ts,
             params=optax.apply_updates(ts.params, updates),
@@ -442,6 +397,54 @@ class Trainer:
         metrics = {**metrics, "loss": loss}
         return ts, metrics
 
+    @partial(jax.jit, static_argnums=(0, 4))
+    def train_epoch(
+        self,
+        key: jax.Array,
+        buffer_state: ReplayBufferState,
+        train_state: TrainState,
+        num_steps: int,
+    ) -> tuple[TrainState, dict]:
+        """Performs `num_steps` training steps, compiled into a single `jax.lax.scan`.
+
+        Each step samples a minibatch from the replay buffer and updates the parameters.
+
+        Does not check that the replay buffer holds a finished episode to sample, see `train_steps`.
+
+        Args:
+            key: rng
+            buffer_state: replay buffer state
+            train_state: current training state
+            num_steps: number of training steps to perform
+
+        Returns:
+            Tuple[TrainState, dict]: updated training state and metrics (mean across steps)
+        """
+        # the buffer doesn't change while training, so find which entries can be sampled once per epoch
+        mask = self.memory_buffer.sample_mask(buffer_state)
+
+        def step(
+            carry: tuple[jax.Array, TrainState], _
+        ) -> tuple[tuple[jax.Array, TrainState], dict]:
+            key, ts = carry
+            step_key, key = jax.random.split(key)
+            # sample from replay memory
+            indices = jnp.unravel_index(
+                self.memory_buffer.sample_indices(
+                    step_key, mask, self.train_batch_size
+                ),
+                mask.shape,
+            )
+            batch = jax.tree.map(lambda x: x[indices], buffer_state.buffer)
+            # make training step
+            ts, metrics = self.train_step(ts, batch)
+            return (key, ts), metrics
+
+        (_, train_state), metrics = jax.lax.scan(
+            step, (key, train_state), length=num_steps
+        )
+        return train_state, jax.tree.map(jnp.mean, metrics)
+
     def train_steps(
         self,
         key: jax.Array,
@@ -452,6 +455,7 @@ class Trainer:
         """Performs `num_steps` training steps.
 
         Each step consists of sampling a minibatch from the replay buffer and updating the parameters.
+        The minibatch is sampled uniformly without replacement from the finished episodes in the buffer.
 
         Args:
             key: rng
@@ -464,38 +468,17 @@ class Trainer:
                 - updated collection state
                 - updated training state
                 - metrics
+
+        Raises:
+            ValueError: if no episode has finished yet, so there is nothing to sample
         """
-        # get replay memory buffer
-        buffer_state = collection_state.buffer_state
-
-        batch_metrics = []
-
-        for _ in range(num_steps):
-            step_key, key = jax.random.split(key)
-            # sample from replay memory
-            batch = self.memory_buffer.sample(
-                buffer_state, step_key, self.train_batch_size
-            )
-            # reshape into minibatch
-            batch = jax.tree.map(
-                lambda x: x.reshape((self.num_devices, -1, *x.shape[1:])), batch
-            )
-            # pmap won't reshard a committed array, so place each device's slice on that device
-            batch = jax.device_put(batch, NamedSharding(self.mesh, PartitionSpec("d")))
-            # make training step
-            train_state, metrics = self.one_train_step(train_state, batch)
-            # append metrics from step
-            if metrics:
-                batch_metrics.append(metrics)
-        # take mean of metrics across all training steps
-        if batch_metrics:
-            metrics = {
-                k: jnp.stack([m[k] for m in batch_metrics]).mean()
-                for k in batch_metrics[0]
-            }
-        else:
-            metrics = {}
-        # return updated collection state, train state, and metrics
+        if num_steps == 0:
+            return collection_state, train_state, {}
+        # the buffer doesn't change while training, so checking once covers every step
+        self.memory_buffer.check_can_sample(collection_state.buffer_state)
+        train_state, metrics = self.train_epoch(
+            key, collection_state.buffer_state, train_state, num_steps
+        )
         return collection_state, train_state, metrics
 
     def selfplay_metrics(self, before: CollectionState, after: CollectionState) -> dict:
@@ -568,12 +551,10 @@ class Trainer:
                 f"{self.ckpt_dir} already has a checkpoint at or after epoch {epoch}, "
                 "resume from it or use a different ckpt_dir"
             )
-        # every device holds the same train state, save the first one's
-        ckpt = jax.tree.map(lambda x: x[0], train_state)
         # write to a temporary file first so an interrupted save doesn't leave a partial checkpoint
         path = checkpoint_path(self.ckpt_dir, epoch)
         with open(path + ".tmp", "wb") as f:
-            eqx.tree_serialise_leaves(f, ckpt)
+            eqx.tree_serialise_leaves(f, train_state)
         os.replace(path + ".tmp", path)
         # delete old checkpoints
         for old_epoch in epochs[: max(0, len(epochs) + 1 - self.max_checkpoints)]:
@@ -589,12 +570,10 @@ class Trainer:
             epoch: epoch to load
 
         Returns:
-            TrainState: loaded training state, replicated across devices
+            TrainState: loaded training state
         """
-        # checkpoints hold a single copy of the train state, so they load on any number of devices
         with open(checkpoint_path(path_to_checkpoint, epoch), "rb") as f:
-            train_state = eqx.tree_deserialise_leaves(f, self.init_train_state())
-        return self.replicate(train_state)
+            return eqx.tree_deserialise_leaves(f, self.init_train_state())
 
     def make_template_env_state(self) -> Any:
         """Create a template environment state used for initializing data structures that hold environment states to the correct shape.
@@ -720,29 +699,21 @@ class Trainer:
             cur_epoch = 0
             # initialize collection state
             init_key, key = jax.random.split(key)
-            collection_state = partition(
-                self.init_collection_state(init_key, self.batch_size), self.num_devices
-            )
+            collection_state = self.init_collection_state(init_key, self.batch_size)
             # initialize train state
-            train_state = self.replicate(self.init_train_state())
+            train_state = self.init_train_state()
             params = self.extract_model_params_fn(train_state)
             # initialize tester states
-            tester_states = []
-            for tester in self.testers:
-                state = jax.pmap(tester.init, axis_name="d")(params=params)
-                tester_states.append(state)
+            tester_states = [tester.init(params=params) for tester in self.testers]
 
         # warmup
         # populate replay buffer with initial self-play games
         if self.warmup_steps > 0:
             self.set_activity(f"warmup self-play ({self.warmup_steps} steps)")
-        collect = jax.vmap(self.collect_steps, in_axes=(1, 1, None, None), out_axes=1)
         params = self.extract_model_params_fn(train_state)
         collect_key, key = jax.random.split(key)
-        collect_keys = partition(
-            jax.random.split(collect_key, self.batch_size), self.num_devices
-        )
-        collection_state = collect(
+        collect_keys = jax.random.split(collect_key, self.batch_size)
+        collection_state = self.collect_steps(
             collect_keys, collection_state, params, self.warmup_steps
         )
 
@@ -750,12 +721,10 @@ class Trainer:
         while cur_epoch < num_epochs:
             # collect self-play games
             collect_key, key = jax.random.split(key)
-            collect_keys = partition(
-                jax.random.split(collect_key, self.batch_size), self.num_devices
-            )
+            collect_keys = jax.random.split(collect_key, self.batch_size)
             prev_collection_state = collection_state
             self.set_activity(f"epoch {cur_epoch}: self-play")
-            collection_state = collect(
+            collection_state = self.collect_steps(
                 collect_keys, collection_state, params, self.collection_steps_per_epoch
             )
             selfplay_metrics = self.selfplay_metrics(
@@ -782,7 +751,6 @@ class Trainer:
                         key=run_key,
                         epoch_num=cur_epoch,
                         max_steps=self.max_episode_steps,
-                        num_devices=self.num_devices,
                         env_step_fn=self.env_step_fn,
                         env_init_fn=self.test_env_init_fn,
                         evaluator=self.evaluator_test,

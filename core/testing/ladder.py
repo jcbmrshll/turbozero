@@ -99,21 +99,11 @@ class LadderTester(BaseTester):
         """Initializes the internal state of the LadderTester: at the bottom of the ladder."""
         return LadderTestState(rung=jnp.array(0, dtype=jnp.int32))
 
-    def check_size_compatibilities(self, num_devices: int) -> None:
-        """Checks if tester configuration is compatible with number of devices being utilized.
-
-        Args:
-            num_devices: number of devices
-        """
-        # every rung plays the same number of episodes, half with the agent moving first
-        self.baselines[0].check_size_compatibilities(num_devices)
-
     def run(
         self,
         key: jax.Array,
         epoch_num: int,
         max_steps: int,
-        num_devices: int,
         env_step_fn: EnvStepFn,
         env_init_fn: EnvInitFn,
         evaluator: Evaluator,
@@ -129,11 +119,10 @@ class LadderTester(BaseTester):
             key: rng
             epoch_num: current epoch number
             max_steps: maximum number of steps per episode
-            num_devices: number of devices
             env_step_fn: environment step function
             env_init_fn: environment initialization function
             evaluator: evaluator used by agent
-            state: internal state of the tester, replicated across devices
+            state: internal state of the tester
             params: nn parameters used by agent
             log_fn: (optional) logs each rung's metrics as soon as it's played, instead of
                 returning them all at the end
@@ -152,7 +141,7 @@ class LadderTester(BaseTester):
         if epoch_num % self.epochs_per_test != 0:
             return state, {}, None
 
-        rung = int(np.asarray(state.rung).reshape(-1)[0])
+        rung = int(state.rung)
         metrics = {}
         episode = None
         while rung < len(self.rungs):
@@ -164,7 +153,7 @@ class LadderTester(BaseTester):
                     f"{self.num_episodes} games)"
                 )
             start = time.perf_counter()
-            keys = baseline.split_keys(rung_key, num_devices)
+            keys = baseline.split_keys(rung_key)
             _, rung_metrics, frames, p_ids = baseline.test(
                 max_steps,
                 env_step_fn,
@@ -192,9 +181,7 @@ class LadderTester(BaseTester):
             else:
                 metrics.update(rung_metrics)
             if self.episode_fn is not None:
-                frames, p_ids = jax.device_get(
-                    (jax.tree.map(lambda x: x[0], frames), p_ids[0])
-                )
+                frames, p_ids = jax.device_get((frames, p_ids))
                 episode = self.episode_fn(frames, p_ids)
             if score < self.promote_score:
                 break

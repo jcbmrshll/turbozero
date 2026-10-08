@@ -5,7 +5,6 @@ from typing import Any
 
 import jax
 
-from core.common import partition
 from core.evaluators.evaluator import Evaluator
 from core.types import EnvInitFn, EnvStepFn
 
@@ -37,8 +36,6 @@ class BaseTester:
         Args:
             num_keys: number of keys to use for tester
                 - often equal to number of episodes
-                - provided on initialization to ensure reproducibility, even when a different number of devices is used
-                - perhaps there is a better way to enforce this
             epochs_per_test: number of epochs between each test
             episode_fn: (optional) packs the first episode of each test for the monitor to render, as
                 `episode_fn(frames, p_ids)`: the episode's `GameFrame`s stacked along a leading time axis
@@ -59,31 +56,22 @@ class BaseTester:
         """Initializes the internal state of the Tester."""
         return TestState()
 
-    def check_size_compatibilities(self, num_devices: int) -> None:  # pylint: disable=unused-argument
-        """Checks if tester configuration is compatible with number of devices being utilized."""
-        return
-
-    def split_keys(self, key: jax.Array, num_devices: int) -> jax.Array:
-        """Splits keys across devices.
+    def split_keys(self, key: jax.Array) -> jax.Array:
+        """Splits a key into `num_keys` keys, one per episode.
 
         Args:
             key: rng
-            num_devices: number of devices
 
         Returns:
-            jax.Array: keys split across devices
+            jax.Array: `num_keys` keys
         """
-        # partition keys across devices (do this here so its reproducible no matter the number of devices used)
-        keys = jax.random.split(key, self.num_keys)
-        keys = partition(keys, num_devices)
-        return keys
+        return jax.random.split(key, self.num_keys)
 
     def run(
         self,
         key: jax.Array,
         epoch_num: int,
         max_steps: int,
-        num_devices: int,  # pylint: disable=unused-argument
         env_step_fn: EnvStepFn,
         env_init_fn: EnvInitFn,
         evaluator: Evaluator,
@@ -101,7 +89,6 @@ class BaseTester:
             key: rng
             epoch_num: current epoch number
             max_steps: maximum number of steps per episode
-            num_devices: number of devices
             env_step_fn: environment step function
             env_init_fn: environment initialization function
             evaluator: evaluator used by agent
@@ -119,8 +106,7 @@ class BaseTester:
                 - the first episode of the test, packed by `episode_fn` (None without one)
                 - on epochs that are not tested, returns `state` unchanged, empty metrics, and None
         """
-        # split keys across devices
-        keys = self.split_keys(key, num_devices)
+        keys = self.split_keys(key)
 
         if epoch_num % self.epochs_per_test == 0:
             # run test
@@ -129,18 +115,16 @@ class BaseTester:
             )
 
             if self.episode_fn is not None:
-                # the first device's episode, copied off the device in one transfer: the initial
-                # state, then one frame per step
-                frames, p_ids = jax.device_get(
-                    (jax.tree.map(lambda x: x[0], frames), p_ids[0])
-                )
+                # the first episode, copied off the device in one transfer: the initial state,
+                # then one frame per step
+                frames, p_ids = jax.device_get((frames, p_ids))
                 episode = self.episode_fn(frames, p_ids)
             else:
                 episode = None
             return state, metrics, episode
         return state, {}, None
 
-    @partial(jax.pmap, axis_name="d", static_broadcasted_argnums=(0, 1, 2, 3, 4))
+    @partial(jax.jit, static_argnums=(0, 1, 2, 3, 4))
     def test(
         self,
         max_steps: int,
@@ -151,16 +135,16 @@ class BaseTester:
         state: TestState,
         params: Any,
     ) -> tuple[TestState, dict, Any, jax.Array]:
-        """Run the test implemented by the Tester. Parallelized across devices.
+        """Run the test implemented by the Tester.
 
-        Implemented by subclasses.
+        Implemented by subclasses, which should jit it (with `self` and the functions as static arguments).
 
         Args:
             max_steps: maximum number of steps per episode
             env_step_fn: environment step function
             env_init_fn: environment initialization function
             evaluator: evaluator used by agent
-            keys: rng
+            keys: rng, one key per episode
             state: internal state of the tester
             params: nn parameters used by agent
 
@@ -168,7 +152,7 @@ class BaseTester:
             Tuple[TestState, Dict, Any, jax.Array]:
                 - updated internal state of the tester
                 - metrics from the test
-                - frames from the test (used to produce renderings)
-                - player ids from the test (used to produce renderings)
+                - frames from the first episode of the test (used to produce renderings)
+                - player ids from the first episode of the test (used to produce renderings)
         """
         raise NotImplementedError()

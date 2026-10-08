@@ -1,7 +1,7 @@
 """End-to-end Trainer runs on tiny tic-tac-toe configurations.
 
 Every Trainer instance compiles its own self-play, training and testing functions, so the tests
-share one trainer per device count and only change settings that don't affect compilation."""
+share one trainer and only change settings that don't affect compilation."""
 
 import os
 import shutil
@@ -30,7 +30,7 @@ from core.training.train import Trainer, checkpoint_epochs, extract_params
 STEPS_PER_EPOCH = 10
 
 
-def make_trainer(ttt, num_devices, ckpt_dir):
+def make_trainer(ttt, ckpt_dir):
     config = AZResnetConfig(
         policy_head_out_size=ttt.num_actions, num_blocks=1, num_channels=4
     )
@@ -46,8 +46,8 @@ def make_trainer(ttt, num_devices, ckpt_dir):
         action_selector=PUCTSelector(),
     )
     return Trainer(
-        batch_size=2 * num_devices,
-        train_batch_size=4 * num_devices,
+        batch_size=2,
+        train_batch_size=4,
         warmup_steps=STEPS_PER_EPOCH,
         collection_steps_per_epoch=STEPS_PER_EPOCH,
         train_steps_per_epoch=1,
@@ -64,24 +64,18 @@ def make_trainer(ttt, num_devices, ckpt_dir):
         state_to_nn_input_fn=ttt.state_to_nn_input,
         testers=[TwoPlayerTester(num_episodes=2)],
         ckpt_dir=str(ckpt_dir),
-        num_devices=num_devices,
     )
 
 
 @pytest.fixture(scope="module")
-def trainers(ttt, tmp_path_factory):
-    return {
-        n: make_trainer(ttt, n, tmp_path_factory.mktemp(f"ckpt_{n}_devices"))
-        for n in (1, 2)
-    }
+def trainer(ttt, tmp_path_factory):
+    return make_trainer(ttt, tmp_path_factory.mktemp("ckpt"))
 
 
 @pytest.fixture(scope="module")
-def trained(trainers):
-    """Output of a 2-epoch run on each device count."""
-    return {
-        n: trainer.train_loop(seed=0, num_epochs=2) for n, trainer in trainers.items()
-    }
+def trained(trainer):
+    """Output of a 2-epoch run."""
+    return trainer.train_loop(seed=0, num_epochs=2)
 
 
 def leaves_equal(a, b):
@@ -91,73 +85,53 @@ def leaves_equal(a, b):
     )
 
 
-@pytest.mark.parametrize("num_devices", [1, 2])
-def test_train_loop_runs(trainers, trained, num_devices):
-    out = trained[num_devices]
-
-    assert out.cur_epoch == 2
-    np.testing.assert_array_equal(out.train_state.step, [2] * num_devices)
-    assert all(np.isfinite(x).all() for x in jax.tree.leaves(out.train_state.params))
-    # gradients are averaged across devices, so every device holds the same params
-    for x in jax.tree.leaves(extract_params(out.train_state)):
-        for device in range(1, num_devices):
-            np.testing.assert_array_equal(x[device], x[0])
-    buffer_state = out.collection_state.buffer_state
+def test_train_loop_runs(trainer, trained):
+    assert trained.cur_epoch == 2
+    assert trained.train_state.step == 2
+    assert all(
+        np.isfinite(x).all() for x in jax.tree.leaves(trained.train_state.params)
+    )
+    buffer_state = trained.collection_state.buffer_state
     assert (buffer_state.populated & buffer_state.has_reward).any()
-    assert sorted(os.listdir(trainers[num_devices].ckpt_dir)) == ["0.eqx", "1.eqx"]
+    assert sorted(os.listdir(trainer.ckpt_dir)) == ["0.eqx", "1.eqx"]
 
 
-def test_checkpoint_round_trip(trainers, trained):
-    trainer, out = trainers[2], trained[2]
-
+def test_checkpoint_round_trip(trainer, trained):
     restored = trainer.load_train_state_from_checkpoint(trainer.ckpt_dir, 1)
 
-    assert leaves_equal(extract_params(restored), extract_params(out.train_state))
-    assert leaves_equal(restored.opt_state, out.train_state.opt_state)
+    assert leaves_equal(extract_params(restored), extract_params(trained.train_state))
+    assert leaves_equal(restored.opt_state, trained.train_state.opt_state)
 
 
-def test_checkpoint_loads_on_other_device_count(trainers, trained):
-    restored = trainers[1].load_train_state_from_checkpoint(trainers[2].ckpt_dir, 1)
-
-    for x, y in zip(
-        jax.tree.leaves(restored), jax.tree.leaves(trained[2].train_state), strict=True
-    ):
-        np.testing.assert_array_equal(x, y[:1])
-
-
-def test_save_checkpoint_keeps_max_checkpoints(ttt, trainers, trained, tmp_path):
+def test_save_checkpoint_keeps_max_checkpoints(ttt, trainer, trained, tmp_path):
     ckpt_dir = tmp_path / "ckpt"
-    shutil.copytree(trainers[2].ckpt_dir, ckpt_dir)
-    trainer = make_trainer(ttt, 2, ckpt_dir)
+    shutil.copytree(trainer.ckpt_dir, ckpt_dir)
 
-    trainer.save_checkpoint(trained[2].train_state, 2)
+    make_trainer(ttt, ckpt_dir).save_checkpoint(trained.train_state, 2)
 
     assert checkpoint_epochs(str(ckpt_dir)) == [1, 2]
 
 
-def test_new_trainer_keeps_existing_checkpoints(ttt, trainers, trained, tmp_path):
+def test_new_trainer_keeps_existing_checkpoints(ttt, trainer, trained, tmp_path):
     ckpt_dir = tmp_path / "ckpt"
-    shutil.copytree(trainers[2].ckpt_dir, ckpt_dir)
+    shutil.copytree(trainer.ckpt_dir, ckpt_dir)
 
-    make_trainer(ttt, 2, ckpt_dir)
+    make_trainer(ttt, ckpt_dir)
 
     assert sorted(os.listdir(ckpt_dir)) == ["0.eqx", "1.eqx"]
 
 
-def test_save_checkpoint_refuses_existing_epoch(trainers, trained):
-    trainer, out = trainers[2], trained[2]
-
+def test_save_checkpoint_refuses_existing_epoch(trainer, trained):
     # e.g. a fresh run started in a directory that already holds checkpoints
     with pytest.raises(ValueError, match="already has a checkpoint"):
-        trainer.save_checkpoint(out.train_state, 1)
+        trainer.save_checkpoint(trained.train_state, 1)
 
     assert sorted(os.listdir(trainer.ckpt_dir)) == ["0.eqx", "1.eqx"]
     restored = trainer.load_train_state_from_checkpoint(trainer.ckpt_dir, 1)
-    assert leaves_equal(extract_params(restored), extract_params(out.train_state))
+    assert leaves_equal(extract_params(restored), extract_params(trained.train_state))
 
 
-def test_self_play_uses_latest_params(trainers, monkeypatch):
-    trainer = trainers[1]
+def test_self_play_uses_latest_params(trainer, monkeypatch):
     monkeypatch.setattr(trainer, "save_checkpoint", lambda *args, **kwargs: None)
     # record the params each self-play collection uses, and the params after each epoch's training
     collected, trained_params = [], []
@@ -185,8 +159,7 @@ def test_self_play_uses_latest_params(trainers, monkeypatch):
         )
 
 
-def test_train_loop_with_tester_skipping_epochs(trainers, monkeypatch):
-    trainer = trainers[1]
+def test_train_loop_with_tester_skipping_epochs(trainer, monkeypatch):
     monkeypatch.setattr(trainer, "save_checkpoint", lambda *args, **kwargs: None)
     monkeypatch.setattr(trainer.testers[0], "epochs_per_test", 2)
 
@@ -195,8 +168,7 @@ def test_train_loop_with_tester_skipping_epochs(trainers, monkeypatch):
     assert out.cur_epoch == 2
 
 
-def test_train_loop_logs_to_monitor(trainers, monitor_server, monkeypatch):
-    trainer = trainers[1]
+def test_train_loop_logs_to_monitor(trainer, monitor_server, monkeypatch):
     monitor = Monitor(monitor_server.url, project="tests")
     monkeypatch.setattr(trainer, "save_checkpoint", lambda *args, **kwargs: None)
     monkeypatch.setattr(trainer, "monitor", monitor)
@@ -233,8 +205,7 @@ def test_train_loop_logs_to_monitor(trainers, monitor_server, monkeypatch):
     assert episodes == ["TwoPlayerTester_game-0.npz", "TwoPlayerTester_game-1.npz"]
 
 
-def test_test_games_start_with_test_env_init_fn(trainers, ttt, monkeypatch):
-    trainer = trainers[1]
+def test_test_games_start_with_test_env_init_fn(trainer, ttt, monkeypatch):
     monkeypatch.setattr(trainer, "save_checkpoint", lambda *args, **kwargs: None)
     used = []
 
@@ -257,9 +228,8 @@ def test_test_games_start_with_test_env_init_fn(trainers, ttt, monkeypatch):
 
 
 def test_train_loop_tells_the_monitor_what_it_is_doing(
-    trainers, monitor_server, monkeypatch
+    trainer, monitor_server, monkeypatch
 ):
-    trainer = trainers[1]
     monitor = Monitor(monitor_server.url, project="tests")
     monkeypatch.setattr(trainer, "save_checkpoint", lambda *args, **kwargs: None)
     monkeypatch.setattr(trainer, "monitor", monitor)
@@ -284,8 +254,7 @@ def test_train_loop_tells_the_monitor_what_it_is_doing(
     assert meta["activity"] is None
 
 
-def test_crashed_train_loop_marks_run_crashed(trainers, monitor_server, monkeypatch):
-    trainer = trainers[1]
+def test_crashed_train_loop_marks_run_crashed(trainer, monitor_server, monkeypatch):
     monitor = Monitor(monitor_server.url, project="tests")
     monkeypatch.setattr(trainer, "monitor", monitor)
 
@@ -327,8 +296,8 @@ def test_collect_counts_terminated_episodes_and_draws(
     assert (int(state.episodes[0]), int(state.draws[0])) == (episodes, draws)
 
 
-def test_selfplay_metrics_cover_the_epochs_episodes(trainers, trained):
-    trainer, after = trainers[2], trained[2].collection_state
+def test_selfplay_metrics_cover_the_epochs_episodes(trainer, trained):
+    after = trained.collection_state
     before = replace(
         after, episodes=after.episodes - 1, draws=after.draws - (after.draws > 0)
     )
@@ -344,3 +313,14 @@ def test_selfplay_metrics_cover_the_epochs_episodes(trainers, trained):
     assert metrics["buffer_distinct_fraction"] == pytest.approx(
         metrics["buffer_distinct_positions"] / sampleable
     )
+
+
+def test_train_steps_without_finished_episodes_raises(trainer):
+    collection_state = trainer.init_collection_state(
+        jax.random.PRNGKey(0), trainer.batch_size
+    )
+
+    with pytest.raises(ValueError, match="no episodes have finished"):
+        trainer.train_steps(
+            jax.random.PRNGKey(0), collection_state, trainer.init_train_state(), 1
+        )
