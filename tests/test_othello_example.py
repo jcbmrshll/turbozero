@@ -1,18 +1,17 @@
-"""The Othello example's symmetry transforms: each must map a position's legal moves to the
-legal moves of the transformed position."""
+"""The Othello example's helpers: its board symmetries must map a position's legal moves to
+the legal moves of the transformed position, and its XOT openings must be legal games."""
 
-import importlib.util
+import sys
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 
-spec = importlib.util.spec_from_file_location(
-    "othello_example", Path(__file__).parents[1] / "examples" / "othello.py"
-)
-assert spec is not None and spec.loader is not None
-othello = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(othello)
+# the example's scripts import their sibling modules
+sys.path.insert(0, str(Path(__file__).parents[1] / "examples" / "othello"))
+import game as othello
+from xot import load_xot
 
 
 def legal_moves(obs):
@@ -69,3 +68,31 @@ def test_symmetries_map_legal_moves_and_policy_with_the_board():
             assert t_policy[64] == 64
         action = jax.random.choice(action_key, 65, p=mask / mask.sum())
         state = step(state, action)
+
+
+def test_square_names_round_trip():
+    assert othello.square(19) == "d3" and othello.action("D3") == 19
+    assert (
+        othello.square(othello.PASS) == "pass"
+        and othello.action("pass") == othello.PASS
+    )
+    for a in range(65):
+        assert othello.action(othello.square(a)) == a
+
+
+def test_xot_openings_are_legal_eight_move_games():
+    openings = load_xot()
+    assert openings.shape == (10784, 8)
+    # every opening, from the start position, playing each move only if it's legal
+    states = jax.vmap(othello.env.init)(
+        jax.random.split(jax.random.PRNGKey(0), len(openings))
+    )
+    step = jax.jit(jax.vmap(othello.env.step))
+    for ply in range(8):
+        moves = jnp.asarray(openings[:, ply])
+        legal = states.legal_action_mask[jnp.arange(len(openings)), moves]
+        assert bool(legal.all()), f"an illegal move at ply {ply}"
+        states = step(states, moves)
+    assert not bool(states.terminated.any())
+    # the openings are distinct
+    assert len({tuple(o) for o in openings}) == len(openings)

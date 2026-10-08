@@ -5,8 +5,8 @@ Self-play games are collected in parallel across a batch of environments (and ac
 every available GPU), with Monte Carlo Tree Search run on each of them; the network
 then trains on minibatches sampled from replay memory.
 
-    uv run examples/othello.py
-    uv run examples/othello.py --epochs 20 --monitor
+    uv run examples/othello/train.py
+    uv run examples/othello/train.py --epochs 20 --monitor
 
 Start the monitor first, in another shell, with `uv run turbozero-monitor`. It shows
 the metrics, which rung of the ladder the agent has reached, and a game against the
@@ -19,19 +19,27 @@ model (our agent searching 64 iterations a move), it scored 0.82 against the mod
 searching 64, 0.74 against it searching 256, and 0.57 against it searching 1024
 (draws count half).
 
-The hyperparameters here are only an example; tune them for your task and hardware.
+Checkpoints go to --ckpt-dir; `eval_pgx.py` and `vs_edax.py` evaluate them further (see
+README.md). The hyperparameters here are only an example; tune them for your task and
+hardware.
 """
 
 import argparse
 import tempfile
 from functools import partial
-from typing import cast
 
-import equinox as eqx
-import jax
-import jax.numpy as jnp
-import optax
 import pgx
+from game import (
+    SYMMETRY_TRANSFORM_FNS,
+    env,
+    greedy_eval,
+    init_fn,
+    make_network,
+    make_optimizer,
+    make_test_evaluator,
+    state_to_nn_input,
+    step_fn,
+)
 
 from core.evaluators.alphazero import AlphaZero
 from core.evaluators.evaluation_fns import (
@@ -44,108 +52,20 @@ from core.evaluators.random_evaluator import RandomEvaluator
 from core.memory.replay_memory import EpisodeReplayBuffer
 from core.monitor import DEFAULT_URL, Monitor
 from core.monitor.renderers import pgx_two_player_episode
-from core.networks.azresnet import AZResnet, AZResnetConfig
 from core.testing.ladder import LadderTester, Rung
 from core.training.loss_fns import az_default_loss_fn
 from core.training.train import Trainer
-from core.types import StepMetadata
-
-# vectorized environments pair well with batched AlphaZero; pgx has many more:
-# https://sotets.uk/pgx/othello/
-env = pgx.make("othello")
-
-
-# turbozero interfaces with an environment through a step fn (state, action) and an
-# init fn (key), each returning the new state along with the StepMetadata it needs:
-# rewards for each player, a mask of legal actions, whether the episode has
-# terminated, the id of the player to move, and the step number
-def step_fn(state, action):
-    state = env.step(state, action)
-    return state, metadata(state)
-
-
-def init_fn(key):
-    state = env.init(key)
-    return state, metadata(state)
-
-
-def metadata(state) -> StepMetadata:
-    return StepMetadata(
-        rewards=state.rewards,
-        action_mask=state.legal_action_mask,
-        terminated=state.terminated,
-        cur_player_id=state.current_player,
-        step=state._step_count,
-    )
-
-
-def state_to_nn_input(state):
-    """Converts an environment state to the network's input. pgx provides this as
-    `state.observation`; other environments may need their own conversion."""
-    return state.observation
-
-
-def greedy_eval(obs):
-    """Values a position by the active player's lead in tiles, with a uniform policy:
-    a baseline that doesn't use a neural network at all."""
-    value = (obs[..., 0].sum() - obs[..., 1].sum()) / 64
-    return jnp.ones((1, env.num_actions)), jnp.array([value])
-
-
-def make_symmetry_transform_fn(quarter_turns: int, transpose: bool):
-    """A DataTransformFn that maps the board through one of its symmetries (an optional
-    transpose, then `quarter_turns` quarter turns), to generate an extra training sample
-    from each self-play step. Othello's rules don't change under any of the board's 8
-    symmetries. The policy mask and weights are mapped to match: only the first 64
-    actions are board squares, the 65th (pass) stays where it is."""
-
-    def transform_fn(mask, policy, state):
-        # we only use state.observation, no need to update the rest of the state fields
-        new_obs = state.observation
-        # idxs[r, c] is the square that ends up at (r, c)
-        idxs = jnp.arange(64).reshape(8, 8)
-        if transpose:
-            new_obs = jnp.swapaxes(new_obs, -3, -2)
-            idxs = idxs.T
-        new_obs = jnp.rot90(new_obs, quarter_turns, axes=(-3, -2))
-        idxs = jnp.rot90(idxs, quarter_turns, axes=(0, 1))
-        action_ids = jnp.arange(65).at[:64].set(idxs.flatten())
-        return (
-            mask[..., action_ids],
-            policy[..., action_ids],
-            state.replace(observation=new_obs),
-        )
-
-    return transform_fn
-
-
-# every symmetry but the identity: 7 extra samples per self-play step
-SYMMETRY_TRANSFORM_FNS = [
-    make_symmetry_transform_fn(quarter_turns, transpose)
-    for transpose in (False, True)
-    for quarter_turns in range(4)
-    if quarter_turns or transpose
-]
-
-
-def make_test_evaluator(eval_fn, num_iterations: int = 64) -> MCTS:
-    """Evaluator used in test games: temperature 0 to always play the most-visited
-    action. Opponents share these settings, so that only the quality of their
-    policy/value estimates and their search budget differ."""
-    return AlphaZero(MCTS)(
-        eval_fn=eval_fn,
-        num_iterations=num_iterations,
-        max_nodes=num_iterations + 16,
-        branching_factor=env.num_actions,
-        action_selector=PUCTSelector(),
-        temperature=0.0,
-    )
 
 
 def main():
     parser = argparse.ArgumentParser(description="AlphaZero on Othello.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--blocks", type=int, default=6, help="residual blocks")
+    parser.add_argument("--channels", type=int, default=128, help="channels per block")
+    parser.add_argument(
+        "--sims", type=int, default=64, help="MCTS iterations per self-play move"
+    )
     parser.add_argument(
         "--eval-every", type=int, default=5, help="epochs between test games"
     )
@@ -164,25 +84,15 @@ def main():
     )
     args = parser.parse_args()
 
-    # the residual network from the AlphaZero paper; any equinox module works (see
-    # core.networks.utils.apply_nn). It uses BatchNorm, so it's created along with its state
-    resnet, resnet_state = eqx.nn.make_with_state(AZResnet)(
-        AZResnetConfig(
-            policy_head_out_size=env.num_actions,
-            num_blocks=6,
-            num_channels=128,
-        ),
-        # pgx types observation_shape as Tuple[int, ...]; for board games it's (height, width, channels)
-        cast(tuple[int, int, int], env.observation_shape),
-        key=jax.random.PRNGKey(args.seed),
-    )
+    # the residual network from the AlphaZero paper (see game.py), with its BatchNorm state
+    resnet, resnet_state = make_network(args.blocks, args.channels, seed=args.seed)
 
     # AlphaZero takes an arbitrary search backend, here classic MCTS. Temperature 1.0
     # samples moves in proportion to visit counts, for exploration during self-play
     evaluator = AlphaZero(MCTS)(
         eval_fn=make_nn_eval_fn(resnet, state_to_nn_input),
-        num_iterations=64,
-        max_nodes=128,
+        num_iterations=args.sims,
+        max_nodes=2 * args.sims,
         branching_factor=env.num_actions,
         action_selector=PUCTSelector(),
         temperature=1.0,
@@ -227,11 +137,7 @@ def main():
         nn_state=resnet_state,
         loss_fn=partial(az_default_loss_fn, l2_reg_lambda=1e-4),
         # decays to a tenth of the initial learning rate over the run
-        optimizer=optax.adam(
-            optax.cosine_decay_schedule(
-                1e-3, decay_steps=max(args.epochs, 1) * 128, alpha=0.1
-            )
-        ),
+        optimizer=make_optimizer(args.epochs * 128),
         evaluator=evaluator,
         # stores `capacity` samples for each of the `batch_size` environments
         # (with the 7 symmetric copies of each sample, about 3 epochs of self-play)
