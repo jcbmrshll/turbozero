@@ -69,6 +69,12 @@ def main():
         "--sims", type=int, default=64, help="MCTS iterations per self-play move"
     )
     parser.add_argument(
+        "--inference-dtype",
+        default="float32",
+        help="dtype the network computes in during self-play and test games, e.g. "
+        "bfloat16 (about twice as fast); it always trains in float32",
+    )
+    parser.add_argument(
         "--standard-starts",
         type=float,
         default=0.15,
@@ -100,7 +106,9 @@ def main():
     selfplay_init_fn = make_xot_init_fn(xot_train, args.standard_starts)
 
     # the residual network from the AlphaZero paper (see game.py), with its BatchNorm state
-    resnet, resnet_state = make_network(args.blocks, args.channels, seed=args.seed)
+    resnet, resnet_state = make_network(
+        args.blocks, args.channels, seed=args.seed, inference_dtype=args.inference_dtype
+    )
 
     # AlphaZero takes an arbitrary search backend, here classic MCTS. Temperature 1.0
     # samples moves in proportion to visit counts, for exploration during self-play
