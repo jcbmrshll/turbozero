@@ -1,5 +1,5 @@
-"""AlphaZero on Othello, tested against pgx's pretrained Othello model and a greedy
-tile-counting baseline.
+"""AlphaZero on Othello, tested on a ladder of opponents: a random player, a greedy
+tile counter, then pgx's pretrained Othello model searching more and more.
 
 Self-play games are collected in parallel across a batch of environments (and across
 every available GPU), with Monte Carlo Tree Search run on each of them; the network
@@ -9,7 +9,8 @@ then trains on minibatches sampled from replay memory.
     uv run examples/othello.py --epochs 20 --monitor
 
 Start the monitor first, in another shell, with `uv run turbozero-monitor`. It shows
-the metrics and a game against each baseline, which it renders itself.
+the metrics, which rung of the ladder the agent has reached, and a game against the
+last opponent it played, which it renders itself.
 
 The first epoch is slow: nearly all of the training loop is JIT-compiled the first
 time it runs. The hyperparameters here are only an example; tune them for your task
@@ -33,11 +34,12 @@ from core.evaluators.evaluation_fns import (
 )
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.mcts.mcts import MCTS
+from core.evaluators.random_evaluator import RandomEvaluator
 from core.memory.replay_memory import EpisodeReplayBuffer
 from core.monitor import DEFAULT_URL, Monitor
 from core.monitor.renderers import pgx_two_player_episode
 from core.networks.azresnet import AZResnet, AZResnetConfig
-from core.testing.two_player_baseline import TwoPlayerBaseline
+from core.testing.ladder import LadderTester, Rung
 from core.training.loss_fns import az_default_loss_fn
 from core.training.train import Trainer
 from core.types import StepMetadata
@@ -84,37 +86,50 @@ def greedy_eval(obs):
     return jnp.ones((1, env.num_actions)), jnp.array([value])
 
 
-def make_rot_transform_fn(amnt: int):
-    """A DataTransformFn that rotates the board by `amnt` quarter turns, to generate
-    an extra training sample from each self-play step. The policy mask and weights
-    are rotated to match: only the first 64 actions are board squares, the 65th
-    (pass) stays where it is."""
+def make_symmetry_transform_fn(quarter_turns: int, transpose: bool):
+    """A DataTransformFn that maps the board through one of its symmetries (an optional
+    transpose, then `quarter_turns` quarter turns), to generate an extra training sample
+    from each self-play step. Othello's rules don't change under any of the board's 8
+    symmetries. The policy mask and weights are mapped to match: only the first 64
+    actions are board squares, the 65th (pass) stays where it is."""
 
-    def rot_transform_fn(mask, policy, state):
-        action_ids = jnp.arange(65)
+    def transform_fn(mask, policy, state):
         # we only use state.observation, no need to update the rest of the state fields
-        new_obs = jnp.rot90(state.observation, amnt, axes=(-3, -2))
-        # map action ids to new action ids
+        new_obs = state.observation
+        # idxs[r, c] is the square that ends up at (r, c)
         idxs = jnp.arange(64).reshape(8, 8)
-        new_idxs = jnp.rot90(idxs, amnt, axes=(0, 1)).flatten()
-        action_ids = action_ids.at[:64].set(new_idxs)
+        if transpose:
+            new_obs = jnp.swapaxes(new_obs, -3, -2)
+            idxs = idxs.T
+        new_obs = jnp.rot90(new_obs, quarter_turns, axes=(-3, -2))
+        idxs = jnp.rot90(idxs, quarter_turns, axes=(0, 1))
+        action_ids = jnp.arange(65).at[:64].set(idxs.flatten())
         return (
             mask[..., action_ids],
             policy[..., action_ids],
             state.replace(observation=new_obs),
         )
 
-    return rot_transform_fn
+    return transform_fn
 
 
-def make_test_evaluator(eval_fn) -> MCTS:
-    """Evaluator used in test games: a larger search budget than self-play, and
-    temperature 0 to always play the most-visited action. Baselines share these
-    settings so that only the quality of the policy/value estimates differs."""
+# every symmetry but the identity: 7 extra samples per self-play step
+SYMMETRY_TRANSFORM_FNS = [
+    make_symmetry_transform_fn(quarter_turns, transpose)
+    for transpose in (False, True)
+    for quarter_turns in range(4)
+    if quarter_turns or transpose
+]
+
+
+def make_test_evaluator(eval_fn, num_iterations: int = 64) -> MCTS:
+    """Evaluator used in test games: temperature 0 to always play the most-visited
+    action. Opponents share these settings, so that only the quality of their
+    policy/value estimates and their search budget differ."""
     return AlphaZero(MCTS)(
         eval_fn=eval_fn,
-        num_iterations=64,
-        max_nodes=80,
+        num_iterations=num_iterations,
+        max_nodes=num_iterations + 16,
         branching_factor=env.num_actions,
         action_selector=PUCTSelector(),
         temperature=0.0,
@@ -163,14 +178,14 @@ def main():
     )
     evaluator_test = make_test_evaluator(make_nn_eval_fn(resnet, state_to_nn_input))
 
-    # baselines: pgx's pretrained model (others are listed at
-    # https://sotets.uk/pgx/api/#pgx.BaselineModelId) and the greedy tile counter
+    # opponents: the greedy tile counter and pgx's pretrained model (others are listed
+    # at https://sotets.uk/pgx/api/#pgx.BaselineModelId)
     pretrained = make_nn_eval_fn_no_params_callable(
         pgx.make_baseline_model("othello_v0"), state_to_nn_input
     )
     greedy = make_nn_eval_fn_no_params_callable(greedy_eval, state_to_nn_input)
 
-    # with a monitor, each test sends its first game for the monitor server to render
+    # with a monitor, each test sends a game for the monitor server to render
     # (drawing it needs the cairo system library there, not here)
     episode_fn = (
         pgx_two_player_episode(p1_label="Black", p2_label="White")
@@ -178,15 +193,16 @@ def main():
         else None
     )
 
-    testers = [
-        TwoPlayerBaseline(
-            num_episodes=128,
-            baseline_evaluator=make_test_evaluator(eval_fn),
-            episode_fn=episode_fn,
-            name=name,
-        )
-        for name, eval_fn in [("pretrained", pretrained), ("greedy", greedy)]
+    # the ladder, easiest first: each test plays the lowest rung the agent hasn't
+    # beaten, and moves up past every rung it scores at least 55% against. Our agent
+    # searches 64 iterations a move throughout; pgx's model searches more and more
+    rungs = [
+        Rung("random", RandomEvaluator()),
+        Rung("greedy", make_test_evaluator(greedy)),
+    ] + [
+        Rung(f"pgx{n}", make_test_evaluator(pretrained, n)) for n in (1, 4, 16, 64, 256)
     ]
+    testers = [LadderTester(num_episodes=128, rungs=rungs, episode_fn=episode_fn)]
 
     # each epoch collects `collection_steps_per_epoch` self-play steps in each of
     # `batch_size` environments, then takes `train_steps_per_epoch` training steps
@@ -209,8 +225,8 @@ def main():
         state_to_nn_input_fn=state_to_nn_input,
         testers=testers,
         evaluator_test=evaluator_test,
-        # rotate each sample by 90, 180 and 270 degrees
-        data_transform_fns=[make_rot_transform_fn(i) for i in range(1, 4)],
+        # add each sample's 7 symmetric copies
+        data_transform_fns=SYMMETRY_TRANSFORM_FNS,
         monitor=Monitor(args.monitor, project="othello") if args.monitor else None,
     )
     trainer.train_loop(
