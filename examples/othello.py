@@ -6,8 +6,10 @@ every available GPU), with Monte Carlo Tree Search run on each of them; the netw
 then trains on minibatches sampled from replay memory.
 
     uv run examples/othello.py
-    uv run examples/othello.py --epochs 20 --wandb turbozero-othello
-    uv run examples/othello.py --render renders
+    uv run examples/othello.py --epochs 20 --monitor
+
+Start the monitor first, in another shell, with `uv run turbozero-monitor`. It shows
+the metrics and a game against each baseline, which it renders itself.
 
 The first epoch is slow: nearly all of the training loop is JIT-compiled the first
 time it runs. The hyperparameters here are only an example; tune them for your task
@@ -15,7 +17,6 @@ and hardware.
 """
 
 import argparse
-import os
 from functools import partial
 from typing import cast
 
@@ -33,6 +34,8 @@ from core.evaluators.evaluation_fns import (
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.mcts.mcts import MCTS
 from core.memory.replay_memory import EpisodeReplayBuffer
+from core.monitor import DEFAULT_URL, Monitor
+from core.monitor.renderers import pgx_two_player_episode
 from core.networks.azresnet import AZResnet, AZResnetConfig
 from core.testing.two_player_baseline import TwoPlayerBaseline
 from core.training.loss_fns import az_default_loss_fn
@@ -126,13 +129,12 @@ def main():
         "--eval-every", type=int, default=5, help="epochs between test games"
     )
     parser.add_argument(
-        "--wandb", metavar="PROJECT", default="", help="log to this wandb project"
-    )
-    parser.add_argument(
-        "--render",
-        metavar="DIR",
+        "--monitor",
+        nargs="?",
+        const=DEFAULT_URL,
         default=None,
-        help="save a .gif of a game against each baseline to DIR (needs the cairo system library)",
+        metavar="URL",
+        help=f"log to a turbozero monitor (default {DEFAULT_URL}); start it with `uv run turbozero-monitor`",
     )
     args = parser.parse_args()
 
@@ -168,22 +170,19 @@ def main():
     )
     greedy = make_nn_eval_fn_no_params_callable(greedy_eval, state_to_nn_input)
 
-    render_fn = None
-    if args.render is not None:
-        # imported here since it needs cairo (on Ubuntu: apt-get install libcairo2-dev)
-        from core.testing.utils import render_pgx_2p
-
-        os.makedirs(args.render, exist_ok=True)
-        render_fn = partial(
-            render_pgx_2p, p1_label="Black", p2_label="White", duration=900
-        )
+    # with a monitor, each test sends its first game for the monitor server to render
+    # (drawing it needs the cairo system library there, not here)
+    episode_fn = (
+        pgx_two_player_episode(p1_label="Black", p2_label="White")
+        if args.monitor
+        else None
+    )
 
     testers = [
         TwoPlayerBaseline(
             num_episodes=128,
             baseline_evaluator=make_test_evaluator(eval_fn),
-            render_fn=render_fn,
-            render_dir=args.render,
+            episode_fn=episode_fn,
             name=name,
         )
         for name, eval_fn in [("pretrained", pretrained), ("greedy", greedy)]
@@ -212,7 +211,7 @@ def main():
         evaluator_test=evaluator_test,
         # rotate each sample by 90, 180 and 270 degrees
         data_transform_fns=[make_rot_transform_fn(i) for i in range(1, 4)],
-        wandb_project_name=args.wandb,
+        monitor=Monitor(args.monitor, project="othello") if args.monitor else None,
     )
     trainer.train_loop(
         seed=args.seed, num_epochs=args.epochs, eval_every=args.eval_every

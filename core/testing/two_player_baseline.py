@@ -93,6 +93,11 @@ class TwoPlayerBaseline(BaseTester):
 
         avg = results[:, 0].mean()
 
-        metrics = {f"{self.name}_avg_outcome": avg}
+        metrics = {
+            f"{self.name}_avg_outcome": avg,
+            # the rest of the games are draws
+            f"{self.name}_win_rate": (results[:, 0] > results[:, 1]).mean(),
+            f"{self.name}_loss_rate": (results[:, 0] < results[:, 1]).mean(),
+        }
 
         return state, metrics, frames, p_ids

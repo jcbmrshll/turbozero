@@ -1,7 +1,6 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
-from operator import itemgetter
 from typing import Any
 
 import jax
@@ -30,8 +29,7 @@ class BaseTester:
         self,
         num_keys: int,
         epochs_per_test: int = 1,
-        render_fn: Callable | None = None,
-        render_dir: str = "/tmp/turbozero/",
+        episode_fn: Callable | None = None,
         name: str | None = None,
     ):
         """Initializes a Tester.
@@ -42,15 +40,17 @@ class BaseTester:
                 - provided on initialization to ensure reproducibility, even when a different number of devices is used
                 - perhaps there is a better way to enforce this
             epochs_per_test: number of epochs between each test
-            render_fn: (optional) function to render frames from a test episode to a .gif
-            render_dir: directory to save .gifs
+            episode_fn: (optional) packs the first episode of each test for the monitor to render, as
+                `episode_fn(frames, p_ids)`: the episode's `GameFrame`s stacked along a leading time axis
+                (`max_steps + 1` of them) and its player ids, both as numpy arrays.
+                - e.g. `core.monitor.renderers.pgx_two_player_episode()`: the monitor server draws the
+                  episode, so the training loop never renders anything
             name: (optional) name of the tester (used for logging and differentiating between testers)
                 - defaults to the class name
         """
         self.num_keys = num_keys
         self.epochs_per_test = epochs_per_test
-        self.render_fn = render_fn
-        self.render_dir = render_dir
+        self.episode_fn = episode_fn
         if name is None:
             name = self.__class__.__name__
         self.name = name
@@ -90,10 +90,10 @@ class BaseTester:
         state: TestState,
         params: Any,
         *args,
-    ) -> tuple[TestState, dict, str | None]:
+    ) -> tuple[TestState, dict, Any]:
         """Runs the test, if the current epoch is an epoch that should be tested on (i.e. `epoch_num % epochs_per_test == 0`).
 
-        If a render function is provided, saves a .gif of the first episode of the test.
+        If an `episode_fn` is provided, packs the first episode of the test for the monitor.
 
         Args:
             key: rng
@@ -107,10 +107,10 @@ class BaseTester:
             params: nn parameters used by agent
 
         Returns:
-            Tuple[TestState, Dict, str | None]:
+            Tuple[TestState, Dict, Any]:
                 - updated internal state of the tester
                 - metrics from the test
-                - path to .gif of the first episode of the test (if render function provided, otherwise None)
+                - the first episode of the test, packed by `episode_fn` (None without one)
                 - on epochs that are not tested, returns `state` unchanged, empty metrics, and None
         """
         # split keys across devices
@@ -122,24 +122,16 @@ class BaseTester:
                 max_steps, env_step_fn, env_init_fn, evaluator, keys, state, params
             )
 
-            if self.render_fn is not None:
-                # render first episode to .gif
-                # get frames from first episode
-                frames = jax.tree.map(lambda x: x[0], frames)
-                # get player ids from first episode
-                p_ids = p_ids[0]
-                # get list of frames: the initial state, then one per step
-                frame_list = [
-                    jax.device_get(jax.tree.map(itemgetter(i), frames))
-                    for i in range(max_steps + 1)
-                ]
-                # render frames to .gif
-                path_to_rendering = self.render_fn(
-                    frame_list, p_ids, f"{self.name}_{epoch_num}", self.render_dir
+            if self.episode_fn is not None:
+                # the first device's episode, copied off the device in one transfer: the initial
+                # state, then one frame per step
+                frames, p_ids = jax.device_get(
+                    (jax.tree.map(lambda x: x[0], frames), p_ids[0])
                 )
+                episode = self.episode_fn(frames, p_ids)
             else:
-                path_to_rendering = None
-            return state, metrics, path_to_rendering
+                episode = None
+            return state, metrics, episode
         return state, {}, None
 
     @partial(jax.pmap, axis_name="d", static_broadcasted_argnums=(0, 1, 2, 3, 4))

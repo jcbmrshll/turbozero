@@ -1,8 +1,8 @@
 checkpoints/
 .vscode/
 
-# outputs of training runs
-wandb/
+# outputs of training runs (turbozero monitor)
+runs/
 # pgx baseline models, downloaded by pgx.make_baseline_model
 baselines/
 

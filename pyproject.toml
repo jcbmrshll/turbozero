@@ -13,8 +13,10 @@ dependencies = [
     "jax>=0.11.2",
     "optax>=0.2.8",
     "pillow>=12.3.0",
-    "wandb>=0.30.0",
 ]
+
+[project.scripts]
+turbozero-monitor = "core.monitor.server:main"
 
 [project.optional-dependencies]
 # GPU build of jax; ./install.sh adds this when it finds an NVIDIA GPU

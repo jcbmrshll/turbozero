@@ -7,7 +7,9 @@ temperature set by `--q-temperature`. Use `--search mcts` to train with classic 
 for comparison. See examples/othello.py for a walk-through of each component.
 
     uv run examples/connect_four.py
-    uv run examples/connect_four.py --search mcts --wandb weighted-mcts-test
+    uv run examples/connect_four.py --search mcts --monitor
+
+Start the monitor first, in another shell, with `uv run turbozero-monitor`.
 
 The hyperparameters here are only an example; tune them for your task and hardware.
 """
@@ -27,6 +29,8 @@ from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.mcts.mcts import MCTS
 from core.evaluators.mcts.weighted_mcts import WeightedMCTS
 from core.memory.replay_memory import EpisodeReplayBuffer
+from core.monitor import DEFAULT_URL, Monitor
+from core.monitor.renderers import pgx_two_player_episode
 from core.networks.azresnet import AZResnet, AZResnetConfig
 from core.testing.two_player_tester import TwoPlayerTester
 from core.training.loss_fns import az_default_loss_fn
@@ -77,7 +81,12 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument(
-        "--wandb", metavar="PROJECT", default="", help="log to this wandb project"
+        "--monitor",
+        nargs="?",
+        const=DEFAULT_URL,
+        default=None,
+        metavar="URL",
+        help=f"log to a turbozero monitor (default {DEFAULT_URL}); start it with `uv run turbozero-monitor`",
     )
     args = parser.parse_args()
 
@@ -127,8 +136,14 @@ def main():
         env_step_fn=step_fn,
         env_init_fn=init_fn,
         state_to_nn_input_fn=state_to_nn_input,
-        testers=[TwoPlayerTester(num_episodes=64)],
-        wandb_project_name=args.wandb,
+        # with a monitor, each test sends its first game for the monitor server to render
+        testers=[
+            TwoPlayerTester(
+                num_episodes=64,
+                episode_fn=pgx_two_player_episode() if args.monitor else None,
+            )
+        ],
+        monitor=Monitor(args.monitor, project="connect_four") if args.monitor else None,
     )
     trainer.train_loop(seed=args.seed, num_epochs=args.epochs)
 

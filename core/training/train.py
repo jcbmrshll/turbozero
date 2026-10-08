@@ -9,7 +9,6 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import optax
-import wandb
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from core.common import partition, step_env_and_evaluator
@@ -19,6 +18,7 @@ from core.memory.replay_memory import (
     EpisodeReplayBuffer,
     ReplayBufferState,
 )
+from core.monitor import Monitor
 from core.testing.tester import BaseTester, TestState
 from core.types import (
     DataTransformFn,
@@ -126,12 +126,11 @@ class Trainer:
         evaluator_test: Evaluator | None = None,
         data_transform_fns: Sequence[DataTransformFn] = (),
         extract_model_params_fn: ExtractModelParamsFn = extract_params,
-        wandb_project_name: str = "",
+        monitor: Monitor | None = None,
         ckpt_dir: str = "/tmp/turbozero_checkpoints",
         max_checkpoints: int = 2,
         num_devices: int | None = None,
-        wandb_run: Any | None = None,
-        extra_wandb_config: dict | None = None,
+        extra_config: dict | None = None,
     ):
         """Initializes a Trainer.
 
@@ -157,12 +156,13 @@ class Trainer:
             evaluator_test: (optional) evaluator to use during testing. If not provided, `evaluator` is used.
             data_transform_fns: (optional) list of data transform functions to apply to self-play experiences (e.g. rotation, reflection, etc.)
             extract_model_params_fn: (optional) function to extract model parameters from TrainState
-            wandb_project_name: (optional) name of wandb project to log to
+            monitor: (optional) `core.monitor.Monitor` to log metrics and test episodes to (see a tester's `episode_fn`)
+                - start the server with `turbozero-monitor`; a run is created on the first `train_loop`,
+                  and later calls (e.g. continuing from `initial_state`) keep logging to it
             ckpt_dir: directory to save checkpoints
             max_checkpoints: maximum number of checkpoints to keep
             num_devices: (optional) number of devices to use, defaults to jax.local_device_count()
-            wandb_run: (optional) wandb run object, will continue logging to this run if passed, else a new run is initialized
-            extra_wandb_config: (optional) extra config to pass to wandb
+            extra_config: (optional) extra config to record with the monitor's run
         """
         self.num_devices = (
             num_devices if num_devices is not None else jax.local_device_count()
@@ -215,34 +215,11 @@ class Trainer:
         self.ckpt_dir = ckpt_dir
         self.max_checkpoints = max_checkpoints
         os.makedirs(ckpt_dir, exist_ok=True)
-        # wandb
-        self.wandb_project_name = wandb_project_name
-        self.use_wandb = wandb_project_name != ""
-        if self.use_wandb:
-            if wandb_run is not None:
-                self.run = wandb_run
-            else:
-                self.run = self.init_wandb(wandb_project_name, extra_wandb_config)
-        else:
-            self.run = None
+        # monitor
+        self.monitor = monitor
+        self.extra_config = extra_config if extra_config is not None else {}
         # check batch sizes, etc. are compatible with number of devices
         self.check_size_compatibilities()
-
-    def init_wandb(self, project_name: str, extra_wandb_config: dict | None):
-        """Initializes wandb run.
-
-        Args:
-            project_name: name of wandb project
-            extra_wandb_config: (optional) extra config to pass to wandb
-
-        Returns:
-            wandb.Run: wandb run
-        """
-        if extra_wandb_config is None:
-            extra_wandb_config = {}
-        return wandb.init(
-            project=project_name, config={**self.get_config(), **extra_wandb_config}
-        )
 
     def check_size_compatibilities(self):
         """Checks if batch sizes, etc. are compatible with number of devices.
@@ -289,7 +266,7 @@ class Trainer:
         )
 
     def get_config(self):
-        """Returns a dictionary of the configuration of the trainer. Used for logging/wand."""
+        """Returns a dictionary of the configuration of the trainer. Used for logging to the monitor."""
         return {
             "batch_size": self.batch_size,
             "train_batch_size": self.train_batch_size,
@@ -494,20 +471,19 @@ class Trainer:
         # return updated collection state, train state, and metrics
         return collection_state, train_state, metrics
 
-    def log_metrics(self, metrics: dict, epoch: int, step: int | None = None):
-        """Logs metrics to console and wandb.
+    def log_metrics(self, metrics: dict, epoch: int):
+        """Logs metrics to console and the monitor.
 
         Args:
             metrics: dictionary of metrics
             epoch: current epoch
-            step: current step
         """
         # log to console
         metrics_str = {k: f"{v.item():.4f}" for k, v in metrics.items()}
         print(f"Epoch {epoch}: {metrics_str}")
-        # log to wandb
-        if self.use_wandb:
-            wandb.log(metrics, step)
+        # log to monitor
+        if self.monitor is not None:
+            self.monitor.log(epoch, metrics)
 
     def save_checkpoint(self, train_state: TrainState, epoch: int) -> None:
         """Saves a checkpoint of the training state to `ckpt_dir`.
@@ -628,6 +604,37 @@ class Trainer:
         Returns:
             TrainLoopOutput: contains train_state, collection_state, test_states, cur_epoch after training loop
         """
+        if self.monitor is not None:
+            self.monitor.start(
+                config={
+                    **self.get_config(),
+                    "run": {
+                        "seed": seed,
+                        "num_epochs": num_epochs,
+                        "eval_every": eval_every,
+                    },
+                    **self.extra_config,
+                }
+            )
+        try:
+            output = self._train_loop(seed, num_epochs, eval_every, initial_state)
+        except BaseException as e:
+            if self.monitor is not None:
+                self.monitor.finish(
+                    "stopped" if isinstance(e, KeyboardInterrupt) else "crashed"
+                )
+            raise
+        if self.monitor is not None:
+            self.monitor.finish()
+        return output
+
+    def _train_loop(
+        self,
+        seed: int,
+        num_epochs: int,
+        eval_every: int,
+        initial_state: TrainLoopOutput | None,
+    ) -> TrainLoopOutput:
         # init rng
         key = jax.random.PRNGKey(seed)
 
@@ -684,16 +691,13 @@ class Trainer:
             )
             params = self.extract_model_params_fn(train_state)
             # log metrics
-            collection_steps = (
-                self.batch_size * (cur_epoch + 1) * self.collection_steps_per_epoch
-            )
-            self.log_metrics(metrics, cur_epoch, step=collection_steps)
+            self.log_metrics(metrics, cur_epoch)
 
             # test
             if cur_epoch % eval_every == 0:
                 for i, test_state in enumerate(tester_states):
                     run_key, key = jax.random.split(key)
-                    new_test_state, metrics, rendered = self.testers[i].run(
+                    new_test_state, metrics, episode = self.testers[i].run(
                         key=run_key,
                         epoch_num=cur_epoch,
                         max_steps=self.max_episode_steps,
@@ -707,11 +711,11 @@ class Trainer:
 
                     if metrics:
                         metrics = {k: v.mean() for k, v in metrics.items()}
-                        self.log_metrics(metrics, cur_epoch, step=collection_steps)
-                    if rendered and self.run is not None:
-                        self.run.log(
-                            {f"{self.testers[i].name}_game": wandb.Video(rendered)},
-                            step=collection_steps,
+                        self.log_metrics(metrics, cur_epoch)
+                    # the monitor server renders the episode, off the training loop
+                    if episode is not None and self.monitor is not None:
+                        self.monitor.log(
+                            cur_epoch, {f"{self.testers[i].name}_game": episode}
                         )
                     tester_states[i] = new_test_state
             # save checkpoint
