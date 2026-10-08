@@ -2,10 +2,17 @@
 
 A sanity check that training works end to end: small and fast enough to train on a
 CPU in a minute or two, and the trained agent should soon win most games against
-the random player and lose almost none. Test games give the agent only
-`--test-iterations` MCTS simulations (1 by default: it plays the move its network
-likes best), so the result measures what the network learned rather than what
-search finds on its own (in a game this small, search alone beats a random player).
+the random player and lose none. Test games search with `--test-iterations` MCTS
+simulations per move, by default as many as self-play does. The network still
+matters at that budget: with an untrained network, search alone loses about 6% of
+its games. `--test-iterations 1` plays the move the network likes best, testing
+what the network learned with no search at all.
+
+Self-play plays a uniformly random move `--random-move-prob` of the time (still
+training on the search's visit counts; not part of AlphaZero, which explores with
+root noise alone). Without it, self-play settles into the same
+few drawn games as the network sharpens, rarely reaches the positions a random
+opponent's blunders create, and the agent keeps losing some of its games.
 
     uv run examples/tic_tac_toe.py
     uv run examples/tic_tac_toe.py --monitor
@@ -34,6 +41,7 @@ from core.monitor import DEFAULT_URL, Monitor
 from core.monitor.renderers import pgx_two_player_episode
 from core.networks.azresnet import AZResnet, AZResnetConfig
 from core.testing.two_player_baseline import TwoPlayerBaseline
+from core.training.exploration import SelfPlayExploration
 from core.training.loss_fns import az_default_loss_fn
 from core.training.train import Trainer
 from core.types import StepMetadata
@@ -42,6 +50,8 @@ env = pgx.make("tic_tac_toe")
 
 # a game lasts at most one move per square
 MAX_STEPS = 9
+# MCTS simulations per self-play move
+SELFPLAY_ITERATIONS = 32
 
 
 def step_fn(state, action):
@@ -73,15 +83,21 @@ def main():
         description="AlphaZero on tic-tac-toe, tested against a random player."
     )
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument(
         "--eval-every", type=int, default=5, help="epochs between test games"
     )
     parser.add_argument(
         "--test-iterations",
         type=int,
-        default=1,
+        default=SELFPLAY_ITERATIONS,
         help="MCTS simulations per move in test games; 1 plays the network's favourite move",
+    )
+    parser.add_argument(
+        "--random-move-prob",
+        type=float,
+        default=0.3,
+        help="probability that a self-play move is uniformly random, to keep self-play varied",
     )
     parser.add_argument(
         "--monitor",
@@ -108,19 +124,18 @@ def main():
     # self-play samples moves in proportion to visit counts, to explore
     evaluator = AlphaZero(MCTS)(
         eval_fn=eval_fn,
-        num_iterations=32,
-        max_nodes=40,
+        num_iterations=SELFPLAY_ITERATIONS,
+        max_nodes=SELFPLAY_ITERATIONS + 8,
         branching_factor=env.num_actions,
         action_selector=PUCTSelector(),
         temperature=1.0,
     )
-    # test games play the most-visited move, with (by default) next to no search, and
-    # without the Dirichlet noise AlphaZero mixes into the root policy to explore: with
-    # 1 simulation, the noise would pick the move instead of the network
+    # test games play the most-visited move, without the Dirichlet noise AlphaZero mixes
+    # into the root policy to explore: the test measures the agent, not its exploration
     evaluator_test = AlphaZero(MCTS)(
         eval_fn=eval_fn,
         num_iterations=args.test_iterations,
-        max_nodes=args.test_iterations + 1,
+        max_nodes=args.test_iterations + 8,
         branching_factor=env.num_actions,
         action_selector=PUCTSelector(),
         temperature=0.0,
@@ -139,6 +154,10 @@ def main():
         optimizer=optax.adam(3e-3),
         evaluator=evaluator,
         evaluator_test=evaluator_test,
+        # the search's visit counts stay the policy target; only the move played changes
+        selfplay_exploration=SelfPlayExploration(
+            random_move_prob=args.random_move_prob
+        ),
         memory_buffer=EpisodeReplayBuffer(capacity=64),
         max_episode_steps=MAX_STEPS,
         env_step_fn=step_fn,
