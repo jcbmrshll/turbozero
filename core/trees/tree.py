@@ -180,20 +180,18 @@ class Tree[NodeType]:
                 - translation: the mapping from the old indices to the new indices after collapsing the subtree.
                 - erase_idxs: the indices of the nodes that will be erased after collapsing the subtree.
         """
-        # initialize each node as its own subtree
-        subtrees = jnp.arange(self.capacity)
-
-        def propagate(_, subtrees):
-            # propagates parent subtrees to children
-            parents_subtrees = jnp.where(
-                self.parents != self.NULL_INDEX, subtrees[self.parents], 0
-            )
-            return jnp.where(
-                jnp.greater(parents_subtrees, 0), parents_subtrees, subtrees
-            )
-
-        # propagate parent subtrees to children, until all nodes are assigned to one of the root subtrees
-        subtrees = jax.lax.fori_loop(0, self.capacity - 1, propagate, subtrees)
+        # label each node with the root child it descends from, by pointer jumping:
+        # each node points at its parent, except the root, the root's children and unused nodes,
+        # which point at themselves (so jumps stop at the root's children)
+        subtrees = jnp.where(
+            self.parents > self.ROOT_INDEX,
+            self.parents,
+            jnp.arange(self.capacity, dtype=self.parents.dtype),
+        )
+        # after k jumps each node points 2^k levels up (or at its root child, if closer),
+        # so ceil(log2(capacity)) jumps cover the deepest possible tree (depth capacity - 1)
+        for _ in range(max(1, (self.capacity - 1).bit_length())):
+            subtrees = subtrees[subtrees]
 
         # get idx of subtree
         subtree_idx = self.edge_map[self.ROOT_INDEX, child_index]
