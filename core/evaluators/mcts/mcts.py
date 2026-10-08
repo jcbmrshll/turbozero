@@ -205,34 +205,28 @@ class MCTS(Evaluator):
         )
         policy = jax.nn.softmax(policy_logits)
         value = jnp.where(metadata.terminated, player_reward, value)
-        # add leaf node to tree
+        # add leaf node to tree, or update it if it's already there (e.g. a terminal node)
         node_exists = tree.is_edge(parent, action)
         node_idx = tree.edge_map[parent, action]
-
-        node_data = jax.lax.cond(
-            node_exists,
-            lambda: self.visit_node(
-                node=tree.data_at(node_idx),
-                value=value,
-                p=policy,
-                terminated=metadata.terminated,
-                embedding=new_embedding,
-            ),
-            lambda: self.new_node(
-                policy=policy,
-                value=value,
-                embedding=new_embedding,
-                terminated=metadata.terminated,
-            ),
+        # both are computed and one picked node by node: under vmap a lax.cond on `node_exists`
+        # would run both anyway, as a select between whole trees (see `Tree.set_child`)
+        visited = self.visit_node(
+            node=tree.data_at(node_idx),
+            value=value,
+            p=policy,
+            terminated=metadata.terminated,
+            embedding=new_embedding,
         )
-
-        tree = jax.lax.cond(
-            node_exists,
-            lambda: tree.update_node(index=node_idx, data=node_data),
-            lambda: tree.add_node(
-                parent_index=parent, edge_index=action, data=node_data
-            ),
+        new = self.new_node(
+            policy=policy,
+            value=value,
+            embedding=new_embedding,
+            terminated=metadata.terminated,
         )
+        node_data = jax.tree.map(
+            lambda v, n: jnp.where(node_exists, v, n), visited, new
+        )
+        tree = tree.set_child(parent, action, node_data)
         # backpropagate
         return self.backpropagate(key, tree, parent, value)
 

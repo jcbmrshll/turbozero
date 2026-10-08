@@ -56,6 +56,44 @@ def test_add_node_is_a_noop_when_full():
     assert_trees_equal(after, full)
 
 
+def test_set_child_adds_a_missing_child_like_add_node():
+    tree = empty_tree().set_root(node(1.0))
+
+    assert_trees_equal(tree.set_child(0, 2, node(5.0)), tree.add_node(0, 2, node(5.0)))
+
+
+def test_set_child_updates_an_existing_child_in_place():
+    tree = empty_tree().set_root(node(1.0)).add_node(0, 2, node(5.0))
+
+    assert_trees_equal(tree.set_child(0, 2, node(7.0)), tree.update_node(1, node(7.0)))
+
+
+def test_set_child_is_a_noop_for_a_missing_child_of_a_full_tree():
+    tree = empty_tree(max_nodes=2).set_root(node(1.0)).add_node(0, 0, node(2.0))
+    assert tree.next_free_idx == tree.capacity
+
+    assert_trees_equal(tree.set_child(0, 1, node(9.0)), tree)
+    # but an existing child of a full tree can still be updated
+    assert_trees_equal(tree.set_child(0, 0, node(9.0)), tree.update_node(1, node(9.0)))
+
+
+def test_set_child_under_vmap_matches_each_tree_alone():
+    # one tree has the child already, one doesn't, one is full
+    trees = [
+        empty_tree(max_nodes=2).set_root(node(1.0)).add_node(0, 1, node(2.0)),
+        empty_tree(max_nodes=2).set_root(node(1.0)),
+        empty_tree(max_nodes=2).set_root(node(1.0)).add_node(0, 0, node(2.0)),
+    ]
+    batch = jax.tree.map(lambda *xs: jnp.stack(xs), *trees)
+
+    out = jax.vmap(lambda t: t.set_child(0, 1, node(9.0)))(batch)
+
+    for i, tree in enumerate(trees):
+        assert_trees_equal(
+            jax.tree.map(lambda x, i=i: x[i], out), tree.set_child(0, 1, node(9.0))
+        )
+
+
 def test_get_child_data_fills_missing_children_with_null_value():
     tree = empty_tree().set_root(node(1.0))
     tree = tree.add_node(0, 0, node(2.0))

@@ -130,6 +130,44 @@ class Tree[NodeType]:
             ),
         )
 
+    def set_child(
+        self, parent_index: ArrayLike, edge_index: ArrayLike, data: NodeType
+    ) -> Tree[NodeType]:
+        """Stores `data` at the child of a node along an edge: updates the child if the edge exists,
+        otherwise adds it as a new node, like `add_node` (a no-op if the tree is full).
+
+        Equivalent to a `lax.cond` between `update_node` and `add_node`, but writes a single node either
+        way. Under vmap, where whether the edge exists differs across trees, such a cond becomes a
+        select between two whole copies of every tree.
+
+        Args:
+            parent_index: the index of the parent node.
+            edge_index: the index of the edge from the parent to the child.
+            data: the data to store at the child.
+
+        Returns:
+            Tree[NodeType]: tree with the child's data stored.
+        """
+        self.check_data_type(data)
+        exists = self.is_edge(parent_index, edge_index)
+        in_bounds = self.next_free_idx < self.capacity
+        # an existing child stays where it is; a new one goes at the next free index, which is out
+        # of bounds (so the writes below are no-ops) when the tree is full
+        index = jnp.where(
+            exists, self.edge_map[parent_index, edge_index], self.next_free_idx
+        )
+        adding = ~exists & in_bounds
+        return replace(
+            self,
+            next_free_idx=jnp.where(adding, self.next_free_idx + 1, self.next_free_idx),
+            # an existing child's parent is already `parent_index`
+            parents=self.parents.at[index].set(parent_index),
+            edge_map=self.edge_map.at[parent_index, edge_index].set(
+                jnp.where(exists | adding, index, self.NULL_INDEX)
+            ),
+            data=jax.tree.map(lambda x, y: x.at[index].set(y), self.data, data),
+        )
+
     def set_root(self, data: NodeType) -> Tree[NodeType]:
         """Sets node data at the root node.
 
