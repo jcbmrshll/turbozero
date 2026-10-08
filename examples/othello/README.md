@@ -34,8 +34,11 @@ against (a draw counts half). See `--help` for the network size, search budget a
 number of epochs.
 
 On one RTX 5080, with the defaults (a 6-block, 128-channel network), an epoch takes
-about 70 seconds and a 200-epoch run about 4 hours. One such run passed every rung of
-the ladder by epoch 65.
+about 63 seconds. One 200-epoch run (with epochs then taking about 70 seconds) passed
+every rung of the ladder by epoch 65. With `--inference-dtype bfloat16` the network
+computes in bfloat16 in self-play and test games (it still trains in float32), and an
+epoch takes about 36 seconds; searching with the same checkpoint, bfloat16 and float32
+play evenly.
 
 ## Evaluating a checkpoint
 
