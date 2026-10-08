@@ -372,3 +372,31 @@ def test_evaluate_gives_every_consumer_an_independent_key(ttt):
             for c in np.asarray(jax.random.split(k, n))
         }
         assert not children & set(keys)
+
+
+@pytest.mark.parametrize("cls", ALL_SEARCHES)
+def test_batched_search_matches_searching_each_tree_alone(make_search, ttt, cls):
+    # under vmap, backpropagation's loop runs until the longest path in the batch is done, and the
+    # trees on shorter paths must come out exactly as if searched alone; searching each tree twice
+    # (the second time on the tree the first left) gives paths of different lengths
+    search = make_search(cls)
+    positions = [
+        ttt.play(moves) for moves in ([], MIDGAME_MOVES, WIN_MOVES, BLOCK_MOVES)
+    ]
+    keys = jax.random.split(jax.random.PRNGKey(0), len(positions))
+
+    def search_twice(key, state, meta):
+        first_key, second_key = jax.random.split(key)
+        out = search.evaluate(first_key, search.init(), state, meta)
+        return search.evaluate(second_key, out.eval_state, state, meta)
+
+    states, metas = jax.tree.map(lambda *xs: jnp.stack(xs), *positions)
+    batched = jax.vmap(search_twice)(keys, states, metas)
+
+    for i, (state, meta) in enumerate(positions):
+        alone = search_twice(keys[i], state, meta)
+        jax.tree.map(
+            lambda b, a, i=i: np.testing.assert_array_equal(b[i], a),
+            batched.eval_state,
+            alone.eval_state,
+        )
