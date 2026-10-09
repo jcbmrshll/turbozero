@@ -30,7 +30,8 @@ class TreePositions:
         min_visits: visits a node needs before it can be stored. Its policy target comes from the
             visits it passed on to its children, one fewer than its own.
         capacity: tree positions (data transforms' copies included) the replay buffer keeps per
-            environment
+            environment. Training samples those stored in the replay window's span of self-play (see
+            `Trainer.tree_sample_mask`), so K times the largest replay window always holds it.
         ratio: tree positions per played position in training batches (OLIVAW's is 1)
         half_life: (optional) epochs over which `ratio` halves; by default it stays constant
         most_visited: store each search's most-visited nodes, as OLIVAW did, rather than sampling

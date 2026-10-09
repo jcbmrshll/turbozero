@@ -84,17 +84,33 @@ OLIVAW (Norelli & Panconesi, section IV-B) and "Lessons from implementing AlphaZ
   nodes visited at least `--tree-min-visits` times, sampled in proportion to their visits
   (`--tree-select most-visited` takes the most visited, as OLIVAW did). Each trains on
   the visit distribution over its children and its q, and gets the 7 symmetric copies
-  too. They're kept in a replay buffer of their own (`--tree-buffer`, by default K times
-  `--buffer`, about 1.4 GB per K on the GPU), and make up a share of each training
-  batch: `--tree-ratio` tree positions per played position, 1 (half the batch) by
-  default, halving every `--tree-half-life` epochs if given. Self-play reuses the
-  played move's subtree in its next search, so a node along the expected line can be
-  stored by several searches in a row; `--tree-discarded-only` only stores nodes outside
-  that subtree, so each position is stored at most once, by the last search it's in.
+  too. They make up a share of each training batch: `--tree-ratio` tree positions per
+  played position, 1 (half the batch) by default, halving every `--tree-half-life` epochs
+  if given. Self-play reuses the played move's subtree in its next search, so a node along
+  the expected line can be stored by several searches in a row, and is often played soon
+  after; `--tree-discarded-only` only stores nodes outside that subtree, so each position
+  is stored at most once, by the last search it's in.
+
+Tree positions follow the replay window (`--buffer`, or `--buffer-schedule`): training
+samples those stored in the moves the window's played positions come from (a window of
+3000 is the last 375 moves, at 8 samples a move), however many positions each move
+stored. They're kept in a replay buffer of their own, by default K times the largest
+window, which holds that span even when every move stores K; `--tree-buffer` sets its
+size instead (a move stores fewer than K when too few nodes qualify, and about 1.3 of 2
+with `--tree-discarded-only`, so a smaller buffer can still hold the whole span).
+
+Each K adds to GPU memory what raising `--buffer` by the window would: 1.45 GB per K at a
+window of 3000. Training holds two copies of the replay memory (the epoch's, and the one
+before it, for the self-play metrics), and preallocates 75% of the GPU, 12 GB of a 16 GB
+card. With a window of 3000, K = 1 fits (it's the memory of `--buffer 6000`, which runs);
+K = 2 is that of `--buffer 9000`, which hasn't been tried. Keeping the buffer in host
+memory would make every training step copy its minibatch over; for a larger K, give
+`--tree-buffer` less than K times the window instead.
 
 The monitor shows, each epoch, the tree positions stored (`tree_positions`, and
-`tree_positions_per_move` out of K), their mean visit count (`tree_mean_visits`), and the
-share of each training batch they made up (`tree_batch_fraction`).
+`tree_positions_per_move` out of K), their mean visit count (`tree_mean_visits`), how many
+training could sample (`tree_buffer_samples`), and the share of each training batch they
+made up (`tree_batch_fraction`).
 
 ## Evaluating a checkpoint
 

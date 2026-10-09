@@ -196,7 +196,8 @@ class Trainer:
             data_transform_fns: (optional) list of data transform functions to apply to self-play experiences (e.g. rotation, reflection, etc.)
             tree_positions: (optional) also train on positions from self-play's search trees, as OLIVAW did
                 (see core.training.tree_positions). They're kept in a replay buffer of their own, and make up
-                a share of each training batch. Needs an MCTS `evaluator`.
+                a share of each training batch, sampled from those stored in the replay window's span of
+                self-play (see `tree_sample_mask`). Needs MCTS self-play evaluators.
             extract_model_params_fn: (optional) function to extract model parameters from TrainState
             monitor: (optional) `core.monitor.Monitor` to log metrics and test episodes to (see a tester's `episode_fn`)
                 - start the server with `turbozero-monitor`; a run is created on the first `train_loop`,
