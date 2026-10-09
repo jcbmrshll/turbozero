@@ -705,8 +705,8 @@ class Trainer:
             collection_state.buffer_state,
             train_state,
             num_steps,
-            tree_buffer_state,
-            jnp.array(num_tree, dtype=jnp.int32),
+            tree_buffer_state=tree_buffer_state,
+            num_tree=jnp.array(num_tree, dtype=jnp.int32),
         )
         metrics = {
             **metrics,

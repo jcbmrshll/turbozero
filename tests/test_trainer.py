@@ -533,7 +533,7 @@ def test_tree_batch_count_decays_and_is_zero_without_tree_positions(
     monkeypatch.setattr(
         trainer,
         "train_epoch",
-        lambda key, buffer_state, train_state, num_steps, tree_state, num_tree: (
+        lambda key, buffer_state, train_state, num_steps, *, num_tree, **kwargs: (
             calls.append(int(num_tree)) or (train_state, {})
         ),
     )
