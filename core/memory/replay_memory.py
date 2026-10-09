@@ -15,6 +15,8 @@ class BaseExperience:
         policy_mask: mask for policy weights (mask out invalid/illegal actions)
         observation_nn: observation for neural network input
         cur_player_id: current player id
+        search_value: the search's value of the position, for the player to move (for a position
+            played in self-play, the root value of the search that chose its move)
     """
 
     reward: jax.Array
@@ -22,6 +24,7 @@ class BaseExperience:
     policy_mask: jax.Array
     observation_nn: jax.Array
     cur_player_id: jax.Array
+    search_value: jax.Array
 
 
 @jax.tree_util.register_dataclass
@@ -92,6 +95,41 @@ class EpisodeReplayBuffer:
             next_idx=(state.next_idx + 1) % self.capacity,
             populated=state.populated.at[state.next_idx].set(True),
             has_reward=state.has_reward.at[state.next_idx].set(False),
+        )
+
+    def add_experiences(
+        self, state: ReplayBufferState, experiences: BaseExperience, valid: jax.Array
+    ) -> ReplayBufferState:
+        """Adds experiences whose targets are already known (e.g. positions from a search tree, see
+        `core.training.tree_positions`), which can be sampled right away.
+
+        Only the experiences marked in `valid` are added, in order, one after another. Keep them in a
+        buffer of their own: `truncate` would discard them along with an episode in progress.
+
+        Args:
+            state: replay buffer state
+            experiences: experiences to add, with a leading dimension of at most `capacity`
+            valid: (num experiences,) which of them to add
+
+        Returns:
+            ReplayBufferState: updated replay buffer state
+        """
+        # the i-th valid experience goes i places after `next_idx`; the rest are written out of bounds,
+        # where the writes are dropped
+        offsets = jnp.cumsum(valid) - 1
+        index = jnp.where(
+            valid, (state.next_idx + offsets) % self.capacity, self.capacity
+        )
+        next_idx = (state.next_idx + valid.sum()) % self.capacity
+        return replace(
+            state,
+            buffer=jax.tree_util.tree_map(
+                lambda x, y: x.at[index].set(y, mode="drop"), state.buffer, experiences
+            ),
+            next_idx=next_idx,
+            episode_start_idx=next_idx,
+            populated=state.populated.at[index].set(True, mode="drop"),
+            has_reward=state.has_reward.at[index].set(True, mode="drop"),
         )
 
     def assign_rewards(
@@ -172,24 +210,25 @@ class EpisodeReplayBuffer:
             )
 
     def sample_indices(
-        self, key: jax.Array, mask: jax.Array, sample_size: int
+        self, key: jax.Array, mask: jax.Array, sample_size: int, replace: bool = False
     ) -> jax.Array:
-        """Samples entries uniformly, without replacement, from those marked in `mask`.
+        """Samples entries uniformly (by default without replacement) from those marked in `mask`.
 
-        Compatible with `jax.jit`. `mask` must mark at least `sample_size` entries,
+        Compatible with `jax.jit`. Without replacement, `mask` must mark at least `sample_size` entries;
         use `check_can_sample` to check that it marks any.
 
         Args:
             key: rng
             mask: mask of entries that can be sampled (see `sample_mask`), any shape
             sample_size: number of entries to sample
+            replace: sample with replacement instead (default: False)
 
         Returns:
             jax.Array: indices into the flattened `mask`, shape (sample_size,)
         """
         mask = mask.reshape(-1)
         return jax.random.choice(
-            key, mask.size, shape=(sample_size,), replace=False, p=mask / mask.sum()
+            key, mask.size, shape=(sample_size,), replace=replace, p=mask / mask.sum()
         )
 
     def sample(

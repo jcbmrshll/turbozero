@@ -233,6 +233,26 @@ class Tree[NodeType]:
             up = up[up]
         return jnp.where(path == sentinel, self.NULL_INDEX, path)
 
+    def root_subtrees(self) -> jax.Array:
+        """Labels each node with the child of the root it descends from (the root, the root's children
+        and unused nodes are labelled with themselves).
+
+        Returns:
+            jax.Array: (capacity,) each node's root child's index
+        """
+        # pointer jumping: each node points at its parent, except the root, the root's children and
+        # unused nodes, which point at themselves (so jumps stop at the root's children)
+        subtrees = jnp.where(
+            self.parents > self.ROOT_INDEX,
+            self.parents,
+            jnp.arange(self.capacity, dtype=self.parents.dtype),
+        )
+        # after k jumps each node points 2^k levels up (or at its root child, if closer),
+        # so ceil(log2(capacity)) jumps cover the deepest possible tree (depth capacity - 1)
+        for _ in range(max(1, (self.capacity - 1).bit_length())):
+            subtrees = subtrees[subtrees]
+        return subtrees
+
     def _get_translation(
         self, child_index: ArrayLike
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -247,18 +267,7 @@ class Tree[NodeType]:
                 - translation: the mapping from the old indices to the new indices after collapsing the subtree.
                 - erase_idxs: the indices of the nodes that will be erased after collapsing the subtree.
         """
-        # label each node with the root child it descends from, by pointer jumping:
-        # each node points at its parent, except the root, the root's children and unused nodes,
-        # which point at themselves (so jumps stop at the root's children)
-        subtrees = jnp.where(
-            self.parents > self.ROOT_INDEX,
-            self.parents,
-            jnp.arange(self.capacity, dtype=self.parents.dtype),
-        )
-        # after k jumps each node points 2^k levels up (or at its root child, if closer),
-        # so ceil(log2(capacity)) jumps cover the deepest possible tree (depth capacity - 1)
-        for _ in range(max(1, (self.capacity - 1).bit_length())):
-            subtrees = subtrees[subtrees]
+        subtrees = self.root_subtrees()
 
         # get idx of subtree
         subtree_idx = self.edge_map[self.ROOT_INDEX, child_index]

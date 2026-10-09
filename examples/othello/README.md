@@ -41,6 +41,32 @@ computes in bfloat16 in self-play and test games (it still trains in float32), a
 epoch takes about 36 seconds; searching with the same checkpoint, bfloat16 and float32
 play evenly.
 
+### Value targets from the search
+
+By default the network learns each played position's value from the game's outcome z.
+Early in a game z says little about the position, while the search's value q is a
+better assessment, if limited by the search's horizon. Two options use q instead, after
+OLIVAW (Norelli & Panconesi, section IV-B) and "Lessons from implementing AlphaZero"
+(Young, Prasad & Abrams):
+
+- `--value-target-q W` trains played positions on `(1 - W)·z + W·q`, with q the root
+  value of the search that chose the move (for the player to move).
+- `--tree-positions K` also trains on up to K positions from each self-play search tree:
+  nodes visited at least `--tree-min-visits` times, sampled in proportion to their visits
+  (`--tree-select most-visited` takes the most visited, as OLIVAW did). Each trains on
+  the visit distribution over its children and its q, and gets the 7 symmetric copies
+  too. They're kept in a replay buffer of their own (`--tree-buffer`, by default K times
+  `--buffer`, about 1.4 GB per K on the GPU), and make up a share of each training
+  batch: `--tree-ratio` tree positions per played position, 1 (half the batch) by
+  default, halving every `--tree-half-life` epochs if given. Self-play reuses the
+  played move's subtree in its next search, so a node along the expected line can be
+  stored by several searches in a row; `--tree-discarded-only` only stores nodes outside
+  that subtree, so each position is stored at most once, by the last search it's in.
+
+The monitor shows, each epoch, the tree positions stored (`tree_positions`, and
+`tree_positions_per_move` out of K), their mean visit count (`tree_mean_visits`), and the
+share of each training batch they made up (`tree_batch_fraction`).
+
 ## Evaluating a checkpoint
 
 Checkpoints from `train.py` are named after their epoch (`199.eqx` is the last of a

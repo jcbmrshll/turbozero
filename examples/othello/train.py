@@ -57,6 +57,7 @@ from core.monitor.renderers import pgx_two_player_episode
 from core.testing.ladder import LadderTester, Rung
 from core.training.loss_fns import az_default_loss_fn
 from core.training.train import Trainer
+from core.training.tree_positions import TreePositions
 
 
 def main():
@@ -107,6 +108,61 @@ def main():
         help="fraction of self-play games from the standard start; the rest start from "
         "XOT openings. Every test game starts from an XOT opening, so by default none "
         "do, and the network never learns the first 8 moves",
+    )
+    parser.add_argument(
+        "--value-target-q",
+        type=float,
+        default=0.0,
+        help="train the value of played positions on a mix of the game's outcome z and the "
+        "search's root value q: (1 - this) * z + this * q (0, the default, is z alone)",
+    )
+    parser.add_argument(
+        "--tree-positions",
+        type=int,
+        default=0,
+        metavar="K",
+        help="also train on up to K positions from each self-play search tree, as OLIVAW "
+        "did: each on its children's visit distribution and its search value q (0, the "
+        "default, for none; see core/training/tree_positions.py)",
+    )
+    parser.add_argument(
+        "--tree-min-visits",
+        type=int,
+        default=16,
+        help="visits a search tree node needs to be stored",
+    )
+    parser.add_argument(
+        "--tree-select",
+        choices=("sample", "most-visited"),
+        default="sample",
+        help="store nodes sampled in proportion to their visits, or the most-visited "
+        "ones (OLIVAW's)",
+    )
+    parser.add_argument(
+        "--tree-discarded-only",
+        action="store_true",
+        help="only store nodes outside the played move's subtree (which the next search "
+        "reuses), so that each position is stored at most once",
+    )
+    parser.add_argument(
+        "--tree-ratio",
+        type=float,
+        default=1.0,
+        help="tree positions per played position in training batches (OLIVAW's 1:1 by "
+        "default: half of each batch)",
+    )
+    parser.add_argument(
+        "--tree-half-life",
+        type=float,
+        default=None,
+        help="epochs over which --tree-ratio halves (by default it stays constant)",
+    )
+    parser.add_argument(
+        "--tree-buffer",
+        type=int,
+        default=None,
+        help="tree positions (with their symmetric copies) kept per environment (default: "
+        "K times --buffer)",
     )
     parser.add_argument(
         "--eval-every",
@@ -201,7 +257,11 @@ def main():
         train_steps_per_epoch=args.train_steps,
         nn=resnet,
         nn_state=resnet_state,
-        loss_fn=partial(az_default_loss_fn, l2_reg_lambda=1e-4),
+        loss_fn=partial(
+            az_default_loss_fn,
+            l2_reg_lambda=1e-4,
+            value_target_q=args.value_target_q,
+        ),
         # decays from --lr to --lr-final over the run
         optimizer=make_optimizer(
             args.epochs * args.train_steps, args.lr, args.lr_final
@@ -218,11 +278,23 @@ def main():
         evaluator_test=evaluator_test,
         # add each sample's 7 symmetric copies
         data_transform_fns=SYMMETRY_TRANSFORM_FNS,
+        tree_positions=TreePositions(
+            per_move=args.tree_positions,
+            min_visits=args.tree_min_visits,
+            capacity=args.tree_buffer or args.tree_positions * args.buffer,
+            ratio=args.tree_ratio,
+            half_life=args.tree_half_life,
+            most_visited=args.tree_select == "most-visited",
+            discarded_only=args.tree_discarded_only,
+        )
+        if args.tree_positions > 0
+        else None,
         monitor=Monitor(args.monitor, project="othello", name=args.name)
         if args.monitor
         else None,
         ckpt_dir=args.ckpt_dir or tempfile.mkdtemp(prefix="turbozero-othello-"),
         keep_every=args.keep_every,
+        extra_config={"value_target_q": args.value_target_q},
     )
     trainer.train_loop(
         seed=args.seed, num_epochs=args.epochs, eval_every=max(args.eval_every, 1)

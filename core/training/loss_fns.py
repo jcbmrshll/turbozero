@@ -14,6 +14,7 @@ def az_default_loss_fn(
     nn_state: eqx.nn.State | None,
     experience: BaseExperience,
     l2_reg_lambda: float = 0.0001,
+    value_target_q: float = 0.0,
 ) -> tuple[jax.Array, tuple[dict, eqx.nn.State | None]]:
     """Implements the default AlphaZero loss function.
 
@@ -21,12 +22,18 @@ def az_default_loss_fn(
     Policy Loss: Cross-entropy loss between predicted policy and target policy
     Value Loss: L2 loss between predicted value and target value
 
+    The target value is the episode's outcome for the player to move, z, or with `value_target_q`
+    a mix of it and the search's value of the position, q: (1 - value_target_q) * z + value_target_q * q
+    (see "Lessons from implementing AlphaZero", Young, Prasad & Abrams, 2018).
+
     Args:
         nn: the neural network (an equinox module, see core.networks.utils.apply_nn), differentiated with respect to its floating point arrays
         nn_state: state of the neural network (e.g. BatchNorm statistics), None for stateless networks
         experience: experience sampled from replay buffer
             - stores the observation, target policy, target value
         l2_reg_lambda: L2 regularization weight (default = 1e-4)
+        value_target_q: weight of the search's value in the target value, from 0 (the outcome alone,
+            the default) to 1 (the search's value alone)
 
     Returns:
         Tuple[jax.Array, Tuple[dict, Optional[eqx.nn.State]]]: (loss, (aux_metrics, nn_state))
@@ -54,6 +61,10 @@ def az_default_loss_fn(
     target_value = experience.reward[
         jnp.arange(experience.reward.shape[0]), current_player
     ]
+    if value_target_q:
+        target_value = (
+            1 - value_target_q
+        ) * target_value + value_target_q * experience.search_value
     # compute MSE value loss
     value_loss = optax.l2_loss(pred_value.squeeze(), target_value).mean()
 
