@@ -9,6 +9,7 @@ openings (see xot.py), which keeps them varied.
     uv run examples/othello/train.py
     uv run examples/othello/train.py --epochs 20 --monitor
     uv run examples/othello/train.py --sims-schedule 0:32,50:64,150:128
+    uv run examples/othello/train.py --buffer-schedule 0:1000,20:3000,35:6000
 
 Start the monitor first, in another shell, with `uv run turbozero-monitor`. It shows
 the metrics, which rung of the ladder the agent has reached, and a game against the
@@ -57,19 +58,19 @@ from core.monitor import DEFAULT_URL, Monitor
 from core.monitor.renderers import pgx_two_player_episode
 from core.testing.ladder import LadderTester, Rung
 from core.training.loss_fns import az_default_loss_fn
-from core.training.schedule import EvaluatorSchedule, parse_schedule
+from core.training.schedule import EvaluatorSchedule, Schedule, parse_schedule
 from core.training.train import Trainer
 from core.training.tree_positions import TreePositions
 
 
-def sims_schedule(text: str) -> list[tuple[int, int]]:
-    """Parses --sims-schedule."""
+def positive_schedule(text: str) -> list[tuple[int, int]]:
+    """Parses --sims-schedule or --buffer-schedule, whose values must be positive."""
     try:
         schedule = parse_schedule(text)
     except ValueError as e:
         raise argparse.ArgumentTypeError(str(e)) from None
-    if any(sims < 1 for _, sims in schedule):
-        raise argparse.ArgumentTypeError(f"iterations must be positive, got {text!r}")
+    if any(value < 1 for _, value in schedule):
+        raise argparse.ArgumentTypeError(f"values must be positive, got {text!r}")
     return schedule
 
 
@@ -85,7 +86,7 @@ def main():
     )
     sims.add_argument(
         "--sims-schedule",
-        type=sims_schedule,
+        type=positive_schedule,
         default=None,
         metavar="EPOCH:SIMS,...",
         help="MCTS iterations per self-play move by epoch instead, e.g. 0:32,50:64,150:128 "
@@ -102,12 +103,23 @@ def main():
     parser.add_argument(
         "--train-steps", type=int, default=128, help="training steps per epoch"
     )
-    parser.add_argument(
+    buffer = parser.add_mutually_exclusive_group()
+    buffer.add_argument(
         "--buffer",
         type=int,
         default=3000,
         help="replay memory: samples kept per environment (with the 7 symmetric copies "
         "of each, 3000 is about 3 epochs of self-play)",
+    )
+    buffer.add_argument(
+        "--buffer-schedule",
+        type=positive_schedule,
+        default=None,
+        metavar="EPOCH:SAMPLES,...",
+        help="replay window by epoch instead: training samples from each environment's "
+        "newest SAMPLES, e.g. 0:1000,20:3000,35:6000 for 1000 from epoch 0, 3000 from "
+        "epoch 20 and 6000 from epoch 35. Replay memory keeps the largest; changing the "
+        "window doesn't compile anything again",
     )
     parser.add_argument(
         "--lr", type=float, default=1e-3, help="the initial learning rate"
@@ -185,7 +197,8 @@ def main():
         type=int,
         default=None,
         help="tree positions (with their symmetric copies) kept per environment (default: "
-        "K times --buffer)",
+        "K times --buffer, or the largest window of --buffer-schedule). Training samples "
+        "those stored in the replay window's span of self-play",
     )
     parser.add_argument(
         "--eval-every",
@@ -281,6 +294,10 @@ def main():
         else []
     )
 
+    # with --buffer-schedule, training samples from fewer of the newest samples early on
+    replay_window = args.buffer_schedule or [(0, args.buffer)]
+    buffer_capacity = max(w for _, w in replay_window)
+
     # each epoch collects `collection_steps_per_epoch` self-play steps in each of
     # `batch_size` environments, then takes `train_steps_per_epoch` training steps
     trainer = Trainer(
@@ -301,8 +318,10 @@ def main():
             args.epochs * args.train_steps, args.lr, args.lr_final
         ),
         evaluator=evaluator,
-        # stores `capacity` samples for each of the `batch_size` environments
-        memory_buffer=EpisodeReplayBuffer(capacity=args.buffer),
+        # stores `capacity` samples for each of the `batch_size` environments: the
+        # largest window, which training samples from the newest of
+        memory_buffer=EpisodeReplayBuffer(capacity=buffer_capacity),
+        replay_window=Schedule(replay_window),
         max_episode_steps=80,
         env_step_fn=step_fn,
         env_init_fn=selfplay_init_fn,
@@ -315,7 +334,7 @@ def main():
         tree_positions=TreePositions(
             per_move=args.tree_positions,
             min_visits=args.tree_min_visits,
-            capacity=args.tree_buffer or args.tree_positions * args.buffer,
+            capacity=args.tree_buffer or args.tree_positions * buffer_capacity,
             ratio=args.tree_ratio,
             half_life=args.tree_half_life,
             most_visited=args.tree_select == "most-visited",

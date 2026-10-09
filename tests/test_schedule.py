@@ -1,7 +1,7 @@
 import pytest
 
 from core.evaluators.random_evaluator import RandomEvaluator
-from core.training.schedule import EvaluatorSchedule, parse_schedule
+from core.training.schedule import EvaluatorSchedule, Schedule, parse_schedule
 
 
 def test_schedule_picks_the_latest_stage_started():
@@ -9,6 +9,24 @@ def test_schedule_picks_the_latest_stage_started():
     schedule = EvaluatorSchedule([(0, a), (5, b), (8, c)])
 
     assert [schedule.at(epoch) for epoch in (0, 4, 5, 7, 8, 100)] == [a, a, b, b, c, c]
+
+
+def test_value_schedule():
+    schedule = Schedule(parse_schedule("0:1000,20:3000,35:6000"))
+
+    assert [schedule.at(epoch) for epoch in (0, 19, 20, 34, 35, 1000)] == [
+        1000,
+        1000,
+        3000,
+        3000,
+        6000,
+        6000,
+    ]
+    assert schedule.get_config() == [
+        {"epoch": 0, "value": 1000},
+        {"epoch": 20, "value": 3000},
+        {"epoch": 35, "value": 6000},
+    ]
 
 
 @pytest.mark.parametrize(
