@@ -73,6 +73,35 @@ class CollectionState:
     tree_written_at: jax.Array | None = None
 
 
+@dataclass(frozen=True)
+class SelfplayCounters:
+    """The counts of a collection state that `Trainer.selfplay_metrics` compares across an epoch's
+    self-play (see `CollectionState`).
+
+    Attributes:
+        episodes: number of episodes that have terminated so far, per environment
+        draws: how many of those were draws
+        tree_positions: number of search tree positions stored so far
+        tree_visits: their visit counts, summed
+    """
+
+    episodes: jax.Array
+    draws: jax.Array
+    tree_positions: jax.Array
+    tree_visits: jax.Array
+
+    @classmethod
+    def of(cls, state: CollectionState) -> "SelfplayCounters":
+        """Copies the counts out of `state`, so that they outlive it when it is donated to
+        `Trainer.collect_steps`."""
+        return cls(
+            episodes=jnp.copy(state.episodes),
+            draws=jnp.copy(state.draws),
+            tree_positions=jnp.copy(state.tree_positions),
+            tree_visits=jnp.copy(state.tree_visits),
+        )
+
+
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class TrainLoopOutput:
@@ -517,8 +546,15 @@ class Trainer:
 
     # the evaluator is a static argument, rather than read from `self` while tracing: `self` is
     # static too, but hashes by identity, so a compiled function reading an attribute of `self`
-    # would keep running for a new value of the attribute
-    @partial(jax.jit, static_argnums=(0, 4), static_argnames=("evaluator",))
+    # would keep running for a new value of the attribute.
+    # `state` is donated: it holds the replay buffers, so self-play updates them in place rather
+    # than in a second copy
+    @partial(
+        jax.jit,
+        static_argnums=(0, 4),
+        static_argnames=("evaluator",),
+        donate_argnames=("state",),
+    )
     def collect_steps(
         self,
         key: jax.Array,
@@ -534,7 +570,8 @@ class Trainer:
 
         Args:
             key: rng, one key per environment
-            state: current collection state
+            state: current collection state, donated: its arrays are deleted, and can't be used
+                after the call
             params: model parameters
             num_steps: number of self-play steps to collect
             evaluator: (optional) the self-play evaluator, whose states `state` holds. If not
@@ -793,12 +830,12 @@ class Trainer:
         return collection_state, train_state, metrics
 
     def selfplay_metrics(
-        self, before: CollectionState, after: CollectionState, epoch: int = 0
+        self, before: SelfplayCounters, after: CollectionState, epoch: int = 0
     ) -> dict:
         """Measures how varied self-play is, to spot it collapsing into the same few games.
 
         Args:
-            before: collection state before this epoch's self-play
+            before: the collection state's counts before this epoch's self-play
             after: collection state after it
             epoch: the epoch, which sets the replay window
 
@@ -977,7 +1014,10 @@ class Trainer:
         # init env state
         env_init_key, key = jax.random.split(key)
         env_keys = jax.random.split(env_init_key, batch_size)
-        env_state, metadata = jax.vmap(self.env_init_fn)(env_keys)
+        # compiled, so that no two of the state's arrays are one array, as an environment's eager
+        # init can return (e.g. its current player, in both the state and the metadata):
+        # `collect_steps` can't be donated the same array twice
+        env_state, metadata = jax.jit(jax.vmap(self.env_init_fn))(env_keys)
         # init evaluator state
         eval_state = self.init_eval_state(evaluator, batch_size)
         # return collection state
@@ -1047,6 +1087,8 @@ class Trainer:
             initial_state: (optional) TrainLoopOutput, used to continue training from a previous state
                 - its collection state must hold the states of the self-play evaluator scheduled for
                   the epoch before `initial_state.cur_epoch`, as one this trainer returned does
+                - its collection state is donated to self-play (see `collect_steps`), so it
+                  can't be used afterwards
 
         Returns:
             TrainLoopOutput: contains train_state, collection_state, test_states, cur_epoch after training loop
@@ -1135,7 +1177,9 @@ class Trainer:
             )
             collect_key, key = jax.random.split(key)
             collect_keys = jax.random.split(collect_key, self.batch_size)
-            prev_collection_state = collection_state
+            # only the counts outlive the state donated to self-play: keeping the whole state
+            # would keep a second copy of the replay buffers
+            before = SelfplayCounters.of(collection_state)
             self.set_activity(f"epoch {cur_epoch}: self-play")
             collection_state = self.collect_steps(
                 collect_keys,
@@ -1145,7 +1189,7 @@ class Trainer:
                 evaluator=evaluator,
             )
             selfplay_metrics = self.selfplay_metrics(
-                prev_collection_state, collection_state, cur_epoch
+                before, collection_state, cur_epoch
             )
             if isinstance(evaluator, MCTS):
                 selfplay_metrics["selfplay_iterations"] = jnp.asarray(

@@ -3,8 +3,10 @@
 Every Trainer instance compiles its own self-play, training and testing functions, so the tests
 share one trainer and only change settings that don't affect compilation."""
 
+import gc
 import os
 import shutil
+import warnings
 from dataclasses import replace
 from functools import partial
 from types import SimpleNamespace
@@ -28,7 +30,12 @@ from core.networks.azresnet import AZResnet, AZResnetConfig
 from core.testing.two_player_tester import TwoPlayerTester
 from core.training.loss_fns import az_default_loss_fn
 from core.training.schedule import EvaluatorSchedule, Schedule
-from core.training.train import Trainer, checkpoint_epochs, extract_params
+from core.training.train import (
+    SelfplayCounters,
+    Trainer,
+    checkpoint_epochs,
+    extract_params,
+)
 from core.training.tree_positions import TreePositions
 
 # warmup is longer than a tic-tac-toe game, so the buffer holds finished episodes before training starts
@@ -96,9 +103,13 @@ def make_trainer(ttt, ckpt_dir, schedule=None, root_visits_added=None, **kwargs)
             ]
         )
     )
-    kwargs = {"evaluator_test": make_evaluator(temperature=0.0), **kwargs}
+    kwargs = {
+        "batch_size": 2,
+        "memory_buffer": EpisodeReplayBuffer(capacity=32),
+        "evaluator_test": make_evaluator(temperature=0.0),
+        **kwargs,
+    }
     return Trainer(
-        batch_size=2,
         train_batch_size=4,
         warmup_steps=STEPS_PER_EPOCH,
         collection_steps_per_epoch=STEPS_PER_EPOCH,
@@ -108,7 +119,6 @@ def make_trainer(ttt, ckpt_dir, schedule=None, root_visits_added=None, **kwargs)
         loss_fn=partial(az_default_loss_fn, l2_reg_lambda=1e-4),
         optimizer=optax.adam(1e-3),
         evaluator=evaluator,
-        memory_buffer=EpisodeReplayBuffer(capacity=32),
         max_episode_steps=10,
         env_step_fn=ttt.step_fn,
         env_init_fn=ttt.init_fn,
@@ -228,6 +238,78 @@ def test_train_loop_with_tester_skipping_epochs(trainer, monkeypatch):
     out = trainer.train_loop(seed=0, num_epochs=2)
 
     assert out.cur_epoch == 2
+
+
+def test_self_play_updates_the_collection_state_in_place(trainer):
+    state = trainer.init_collection_state(jax.random.PRNGKey(0), trainer.batch_size)
+    keys = jax.random.split(jax.random.PRNGKey(1), trainer.batch_size)
+    params = extract_params(trainer.init_train_state())
+    evaluator = trainer.selfplay_schedule.at(0)
+    state_bytes = sum(x.nbytes for x in jax.tree.leaves(state))
+
+    for num_steps in (0, 1):
+        analysis = (
+            Trainer.collect_steps.lower(
+                trainer, keys, state, params, num_steps, evaluator=evaluator
+            )
+            .compile()
+            .memory_analysis()
+        )
+        # every array of the returned state reuses the memory of the given one's
+        assert analysis is not None
+        assert analysis.alias_size_in_bytes == state_bytes
+
+    counters = SelfplayCounters.of(state)
+    new_state = trainer.collect_steps(keys, state, params, 1)
+
+    assert all(x.is_deleted() for x in jax.tree.leaves(state))
+    assert not any(x.is_deleted() for x in jax.tree.leaves(new_state))
+    # the copied counts outlive the donated state
+    assert not any(x.is_deleted() for x in vars(counters).values())
+
+
+def test_train_loop_keeps_one_copy_of_the_replay_buffers(ttt, tmp_path, monkeypatch):
+    # a number of environments and buffer capacities no other test's arrays have, so the
+    # collection states' replay buffers are the live arrays of their shapes
+    shapes = [(3, 37), (3, 41)]
+    trainer = make_trainer(
+        ttt,
+        tmp_path / "ckpt",
+        batch_size=3,
+        memory_buffer=EpisodeReplayBuffer(capacity=37),
+        tree_positions=TreePositions(per_move=2, min_visits=2, capacity=41),
+    )
+    monkeypatch.setattr(trainer, "save_checkpoint", lambda *args, **kwargs: None)
+
+    def buffer_bytes(arrays):
+        return sum(x.nbytes for x in arrays if x.shape[:2] in shapes)
+
+    # (bytes in one collection state's replay buffers, bytes in all live ones), as each epoch's
+    # training starts: after its self-play metrics
+    measured = []
+    train_steps = trainer.train_steps
+
+    def spy_train_steps(key, collection_state, *args, **kwargs):
+        gc.collect()
+        measured.append(
+            (
+                buffer_bytes(jax.tree.leaves(collection_state)),
+                buffer_bytes(jax.live_arrays()),
+            )
+        )
+        return train_steps(key, collection_state, *args, **kwargs)
+
+    monkeypatch.setattr(trainer, "train_steps", spy_train_steps)
+
+    with warnings.catch_warnings():
+        # every donated array is reused
+        warnings.filterwarnings("error", message="Some donated buffers were not usable")
+        trainer.train_loop(seed=0, num_epochs=2)
+
+    assert len(measured) == 2
+    for one, live in measured:
+        assert one > 0
+        assert live == one
 
 
 def test_train_loop_logs_to_monitor(trainer, monitor_server, monkeypatch):
@@ -364,7 +446,9 @@ def test_collect_counts_terminated_episodes_and_draws(
 def test_selfplay_metrics_cover_the_epochs_episodes(trainer, trained):
     after = trained.collection_state
     before = replace(
-        after, episodes=after.episodes - 1, draws=after.draws - (after.draws > 0)
+        SelfplayCounters.of(after),
+        episodes=after.episodes - 1,
+        draws=after.draws - (after.draws > 0),
     )
 
     metrics = trainer.selfplay_metrics(before, after)
@@ -771,7 +855,8 @@ def windowed(ttt, tmp_path_factory):
     train_steps = trainer.train_steps
 
     def spy_train_steps(key, collection_state, *args, **kwargs):
-        run.buffers.append(collection_state.buffer_state)
+        # copied: the next epoch's self-play is donated the buffer
+        run.buffers.append(jax.tree.map(np.asarray, collection_state.buffer_state))
         return train_steps(key, collection_state, *args, **kwargs)
 
     with pytest.MonkeyPatch.context() as mp:

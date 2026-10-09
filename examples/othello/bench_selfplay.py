@@ -138,7 +138,9 @@ def main():
 
     # compile the timed call
     t = time.perf_counter()
-    jax.block_until_ready(collect(keys(key), state, params, args.steps))
+    # `collect` donates the state it's given
+    state = collect(keys(key), state, params, args.steps)
+    jax.block_until_ready(state)
     print(f"compile + first call ({args.steps} steps): {time.perf_counter() - t:.1f}s")
 
     times = []
