@@ -3,8 +3,8 @@ tile counter, then pgx's pretrained Othello model searching more and more.
 
 Self-play games are collected in parallel across a batch of environments (and across
 every available GPU), with Monte Carlo Tree Search run on each of them; the network
-then trains on minibatches sampled from replay memory. Most self-play games start from
-XOT openings (see xot.py), which keeps them varied.
+then trains on minibatches sampled from replay memory. Self-play games start from XOT
+openings (see xot.py), which keeps them varied.
 
     uv run examples/othello/train.py
     uv run examples/othello/train.py --epochs 20 --monitor
@@ -35,14 +35,13 @@ from game import (
     SYMMETRY_TRANSFORM_FNS,
     env,
     greedy_eval,
-    init_fn,
     make_network,
     make_optimizer,
     make_test_evaluator,
     state_to_nn_input,
     step_fn,
 )
-from xot import load_xot, make_xot_init_fn, split_xot
+from xot import load_xot, make_xot_init_fn
 
 from core.evaluators.alphazero import AlphaZero
 from core.evaluators.evaluation_fns import (
@@ -70,6 +69,32 @@ def main():
         "--sims", type=int, default=64, help="MCTS iterations per self-play move"
     )
     parser.add_argument(
+        "--train-batch",
+        type=int,
+        default=4096,
+        help="samples per training step; with a big network, halve it (and double "
+        "--train-steps) if training runs out of memory",
+    )
+    parser.add_argument(
+        "--train-steps", type=int, default=128, help="training steps per epoch"
+    )
+    parser.add_argument(
+        "--buffer",
+        type=int,
+        default=3000,
+        help="replay memory: samples kept per environment (with the 7 symmetric copies "
+        "of each, 3000 is about 3 epochs of self-play)",
+    )
+    parser.add_argument(
+        "--lr", type=float, default=1e-3, help="the initial learning rate"
+    )
+    parser.add_argument(
+        "--lr-final",
+        type=float,
+        default=1e-4,
+        help="the learning rate at the end of the run (it decays along a cosine)",
+    )
+    parser.add_argument(
         "--inference-dtype",
         default="float32",
         help="dtype the network computes in during self-play and test games, e.g. "
@@ -78,17 +103,29 @@ def main():
     parser.add_argument(
         "--standard-starts",
         type=float,
-        default=0.15,
+        default=0.0,
         help="fraction of self-play games from the standard start; the rest start from "
-        "XOT openings (1 for none)",
+        "XOT openings. Every test game starts from an XOT opening, so by default none "
+        "do, and the network never learns the first 8 moves",
     )
     parser.add_argument(
-        "--eval-every", type=int, default=5, help="epochs between test games"
+        "--eval-every",
+        type=int,
+        default=5,
+        help="epochs between test games on the ladder (0 for none, e.g. when "
+        "watch.py plays checkpoints against an engine instead)",
     )
     parser.add_argument(
         "--ckpt-dir",
         default=None,
         help="where to save checkpoints (default: a new temporary directory)",
+    )
+    parser.add_argument(
+        "--keep-every",
+        type=int,
+        default=None,
+        help="also keep every checkpoint whose epoch is a multiple of this (otherwise "
+        "only the 2 newest are kept)",
     )
     parser.add_argument("--name", default=None, help="the run's name on the monitor")
     parser.add_argument(
@@ -101,10 +138,11 @@ def main():
     )
     args = parser.parse_args()
 
-    # self-play starts most games from XOT openings (see xot.py) for varied, balanced
-    # games; the openings held out for vs_engine.py are left out
-    xot_train, _ = split_xot(load_xot())
-    selfplay_init_fn = make_xot_init_fn(xot_train, args.standard_starts)
+    # self-play starts games from XOT openings (see xot.py) for varied, balanced
+    # games
+    selfplay_init_fn = make_xot_init_fn(load_xot(), args.standard_starts)
+    # test games all start from XOT openings
+    test_init_fn = make_xot_init_fn(load_xot(), standard_start_fraction=0)
 
     # the residual network from the AlphaZero paper (see game.py), with its BatchNorm state
     resnet, resnet_state = make_network(
@@ -147,30 +185,34 @@ def main():
     ] + [
         Rung(f"pgx{n}", make_test_evaluator(pretrained, n)) for n in (1, 4, 16, 64, 256)
     ]
-    testers = [LadderTester(num_episodes=128, rungs=rungs, episode_fn=episode_fn)]
+    testers = (
+        [LadderTester(num_episodes=128, rungs=rungs, episode_fn=episode_fn)]
+        if args.eval_every > 0
+        else []
+    )
 
     # each epoch collects `collection_steps_per_epoch` self-play steps in each of
     # `batch_size` environments, then takes `train_steps_per_epoch` training steps
     trainer = Trainer(
         batch_size=1024,
-        train_batch_size=4096,
+        train_batch_size=args.train_batch,
         warmup_steps=0,
         collection_steps_per_epoch=128,
-        train_steps_per_epoch=128,
+        train_steps_per_epoch=args.train_steps,
         nn=resnet,
         nn_state=resnet_state,
         loss_fn=partial(az_default_loss_fn, l2_reg_lambda=1e-4),
-        # decays to a tenth of the initial learning rate over the run
-        optimizer=make_optimizer(args.epochs * 128),
+        # decays from --lr to --lr-final over the run
+        optimizer=make_optimizer(
+            args.epochs * args.train_steps, args.lr, args.lr_final
+        ),
         evaluator=evaluator,
         # stores `capacity` samples for each of the `batch_size` environments
-        # (with the 7 symmetric copies of each sample, about 3 epochs of self-play)
-        memory_buffer=EpisodeReplayBuffer(capacity=3000),
+        memory_buffer=EpisodeReplayBuffer(capacity=args.buffer),
         max_episode_steps=80,
         env_step_fn=step_fn,
         env_init_fn=selfplay_init_fn,
-        # the ladder's games start from the standard start
-        test_env_init_fn=init_fn,
+        test_env_init_fn=test_init_fn,
         state_to_nn_input_fn=state_to_nn_input,
         testers=testers,
         evaluator_test=evaluator_test,
@@ -180,9 +222,10 @@ def main():
         if args.monitor
         else None,
         ckpt_dir=args.ckpt_dir or tempfile.mkdtemp(prefix="turbozero-othello-"),
+        keep_every=args.keep_every,
     )
     trainer.train_loop(
-        seed=args.seed, num_epochs=args.epochs, eval_every=args.eval_every
+        seed=args.seed, num_epochs=args.epochs, eval_every=max(args.eval_every, 1)
     )
 
 

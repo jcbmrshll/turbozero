@@ -34,20 +34,6 @@ def load_xot(path: str | Path = XOT_PATH) -> np.ndarray:
     )
 
 
-def split_xot(
-    openings: np.ndarray, num_test: int = 2000, seed: int = 0
-) -> tuple[np.ndarray, np.ndarray]:
-    """Splits the openings into ones to train from and held-out ones to test on, so that
-    tests don't start from positions the network was trained on. The same `seed` always
-    gives the same split.
-
-    Returns:
-        (train openings, test openings)
-    """
-    order = np.random.default_rng(seed).permutation(len(openings))
-    return openings[order[num_test:]], openings[order[:num_test]]
-
-
 def make_xot_init_fn(openings: np.ndarray, standard_start_fraction: float):
     """An env init fn (see game.init_fn) that starts most episodes from a random one of
     `openings`, already played, and the rest (`standard_start_fraction` of them) from the

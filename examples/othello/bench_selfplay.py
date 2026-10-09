@@ -29,7 +29,7 @@ from game import (
     state_to_nn_input,
     step_fn,
 )
-from xot import load_xot, make_xot_init_fn, split_xot
+from xot import load_xot, make_xot_init_fn
 
 from core.evaluators.alphazero import AlphaZero
 from core.evaluators.evaluation_fns import make_nn_eval_fn
@@ -42,7 +42,6 @@ from core.training.train import Trainer
 
 def make_trainer(args) -> tuple[Trainer, tuple]:
     """A trainer set up like train.py's, and the parameters to self-play with."""
-    xot_train, _ = split_xot(load_xot())
     if args.ckpt:
         resnet, params = load_checkpoint(
             args.ckpt, args.blocks, args.channels, args.dtype
@@ -77,7 +76,7 @@ def make_trainer(args) -> tuple[Trainer, tuple]:
         ),
         max_episode_steps=80,
         env_step_fn=step_fn,
-        env_init_fn=make_xot_init_fn(xot_train, 0.15),
+        env_init_fn=make_xot_init_fn(load_xot(), 0.0),
         state_to_nn_input_fn=state_to_nn_input,
         testers=[],
         data_transform_fns=SYMMETRY_TRANSFORM_FNS,

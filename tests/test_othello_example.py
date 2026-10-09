@@ -11,7 +11,7 @@ import numpy as np
 # the example's scripts import their sibling modules
 sys.path.insert(0, str(Path(__file__).parents[1] / "examples" / "othello"))
 import game as othello
-from xot import load_xot, make_xot_init_fn, split_xot
+from xot import load_xot, make_xot_init_fn
 
 
 def legal_moves(obs):
@@ -96,14 +96,6 @@ def test_xot_openings_are_legal_eight_move_games():
     assert not bool(states.terminated.any())
     # the openings are distinct
     assert len({tuple(o) for o in openings}) == len(openings)
-
-
-def test_xot_split_is_disjoint_and_repeatable():
-    openings = load_xot()
-    train, test = split_xot(openings)
-    assert len(test) == 2000 and len(train) == len(openings) - 2000
-    assert not {tuple(o) for o in train} & {tuple(o) for o in test}
-    np.testing.assert_array_equal(split_xot(openings)[1], test)
 
 
 def test_xot_init_fn_starts_from_openings_or_the_standard_start():

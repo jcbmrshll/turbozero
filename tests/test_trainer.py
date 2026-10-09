@@ -30,7 +30,7 @@ from core.training.train import Trainer, checkpoint_epochs, extract_params
 STEPS_PER_EPOCH = 10
 
 
-def make_trainer(ttt, ckpt_dir):
+def make_trainer(ttt, ckpt_dir, **kwargs):
     config = AZResnetConfig(
         policy_head_out_size=ttt.num_actions, num_blocks=1, num_channels=4
     )
@@ -64,6 +64,7 @@ def make_trainer(ttt, ckpt_dir):
         state_to_nn_input_fn=ttt.state_to_nn_input,
         testers=[TwoPlayerTester(num_episodes=2)],
         ckpt_dir=str(ckpt_dir),
+        **kwargs,
     )
 
 
@@ -110,6 +111,16 @@ def test_save_checkpoint_keeps_max_checkpoints(ttt, trainer, trained, tmp_path):
     make_trainer(ttt, ckpt_dir).save_checkpoint(trained.train_state, 2)
 
     assert checkpoint_epochs(str(ckpt_dir)) == [1, 2]
+
+
+def test_save_checkpoint_keeps_every(ttt, trained, tmp_path):
+    trainer = make_trainer(ttt, tmp_path / "ckpt", keep_every=3)
+
+    for epoch in range(8):
+        trainer.save_checkpoint(trained.train_state, epoch)
+
+    # multiples of 3 stay, besides the 2 newest of the rest
+    assert checkpoint_epochs(trainer.ckpt_dir) == [0, 3, 5, 6, 7]
 
 
 def test_new_trainer_keeps_existing_checkpoints(ttt, trainer, trained, tmp_path):

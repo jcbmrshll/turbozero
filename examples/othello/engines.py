@@ -97,7 +97,8 @@ class GTPEngine:
 class Edax(GTPEngine):
     name = "edax"
     setup_script = "setup_edax.sh"
-    memory_per_process = 100 << 20
+    # mostly its hash table (2^22 entries, about 130 MB); measured at about 165 MB
+    memory_per_process = 170 << 20
 
     @classmethod
     def installed(cls, engine_dir: Path) -> bool:

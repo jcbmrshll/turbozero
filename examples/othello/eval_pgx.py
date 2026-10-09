@@ -4,8 +4,9 @@ estimates.
 
     uv run examples/othello/eval_pgx.py CHECKPOINT --pgx-sims 64 256 1024 --games 512
 
-Both sides search with MCTS at temperature 0, with AlphaZero's root noise for variety;
-our agent moves first in exactly half the games.
+Games start from XOT openings (see `xot.py`), as in `vs_engine.py`. Both sides search
+with MCTS at temperature 0, with AlphaZero's root noise for variety; our agent moves
+first (plays black) in exactly half the games.
 """
 
 import argparse
@@ -15,12 +16,12 @@ import jax
 import numpy as np
 import pgx
 from game import (
-    init_fn,
     load_checkpoint,
     make_test_evaluator,
     state_to_nn_input,
     step_fn,
 )
+from xot import load_xot, make_xot_init_fn
 
 from core.evaluators.evaluation_fns import (
     make_nn_eval_fn,
@@ -55,6 +56,7 @@ def main():
     parser.add_argument("--seed", type=int, default=1)
     args = parser.parse_args()
 
+    init_fn = make_xot_init_fn(load_xot(), standard_start_fraction=0)
     network, params = load_checkpoint(args.checkpoint, args.blocks, args.channels)
     agent = make_test_evaluator(make_nn_eval_fn(network, state_to_nn_input), args.sims)
     pretrained = make_nn_eval_fn_no_params_callable(

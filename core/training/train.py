@@ -135,6 +135,7 @@ class Trainer:
         monitor: Monitor | None = None,
         ckpt_dir: str = "/tmp/turbozero_checkpoints",
         max_checkpoints: int = 2,
+        keep_every: int | None = None,
         extra_config: dict | None = None,
     ):
         """Initializes a Trainer.
@@ -171,6 +172,7 @@ class Trainer:
                   and later calls (e.g. continuing from `initial_state`) keep logging to it
             ckpt_dir: directory to save checkpoints
             max_checkpoints: maximum number of checkpoints to keep
+            keep_every: (optional) also keep every checkpoint whose epoch is a multiple of this, beyond `max_checkpoints`
             extra_config: (optional) extra config to record with the monitor's run
         """
         # environment
@@ -228,6 +230,7 @@ class Trainer:
         # checkpoints
         self.ckpt_dir = ckpt_dir
         self.max_checkpoints = max_checkpoints
+        self.keep_every = keep_every
         os.makedirs(ckpt_dir, exist_ok=True)
         # monitor
         self.monitor = monitor
@@ -539,7 +542,8 @@ class Trainer:
     def save_checkpoint(self, train_state: TrainState, epoch: int) -> None:
         """Saves a checkpoint of the training state to `ckpt_dir`.
 
-        Deletes the oldest checkpoints so that at most `max_checkpoints` remain.
+        Deletes the oldest checkpoints so that at most `max_checkpoints` remain, besides
+        those kept by `keep_every`.
 
         Args:
             train_state: current training state
@@ -557,6 +561,10 @@ class Trainer:
             eqx.tree_serialise_leaves(f, train_state)
         os.replace(path + ".tmp", path)
         # delete old checkpoints
+        if self.keep_every is not None:
+            epochs = [e for e in epochs if e % self.keep_every != 0]
+            if epoch % self.keep_every == 0:
+                return
         for old_epoch in epochs[: max(0, len(epochs) + 1 - self.max_checkpoints)]:
             os.remove(checkpoint_path(self.ckpt_dir, old_epoch))
 

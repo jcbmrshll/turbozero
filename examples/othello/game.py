@@ -134,11 +134,15 @@ def make_network(
     )
 
 
-def make_optimizer(total_steps: int) -> optax.GradientTransformation:
-    """Adam, with the learning rate decaying from 1e-3 to a tenth of that over
-    `total_steps` training steps."""
+def make_optimizer(
+    total_steps: int, lr: float = 1e-3, lr_final: float = 1e-4
+) -> optax.GradientTransformation:
+    """Adam, with the learning rate decaying from `lr` to `lr_final` over
+    `total_steps` training steps, along a cosine."""
     return optax.adam(
-        optax.cosine_decay_schedule(1e-3, decay_steps=max(total_steps, 1), alpha=0.1)
+        optax.cosine_decay_schedule(
+            lr, decay_steps=max(total_steps, 1), alpha=lr_final / lr
+        )
     )
 
 

@@ -5,19 +5,21 @@ at a series of fixed search depths.
     uv run examples/othello/vs_engine.py CHECKPOINT --engine edax --levels 2 4 6 8 --sims 400
 
 Games start from XOT openings (see `xot.py`), each played twice with the colors
-swapped, so that two deterministic players give varied, balanced games. By default the
-openings are drawn from the ones `train.py` holds out of self-play. The engine searches
+swapped, so that two deterministic players give varied, balanced games. The same
+`--seed` always draws the same openings, so checkpoints play the same games. The engine searches
 to the given depth ("level", in its own terms) with its opening book off; our agent runs
 `--sims` MCTS iterations a move at temperature 0, keeping its search tree between moves,
 without the root noise used in self-play. This is how OLIVAW was compared with Edax
 (https://arxiv.org/abs/2103.17228).
 
 Games are played in batches: our agent's moves are searched together on the
-accelerator, and each game has its own engine process (see `engines.py`), as many at a
-time as memory allows. Each game's result is checked against the engine's own board.
+accelerator, and each game has its own engine process (see `engines.py`): as many at a
+time as fit in a quarter of the available memory, up to 128, since the machine may be
+shared. Each game's result is checked against the engine's own board.
 """
 
 import argparse
+import json
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -37,7 +39,7 @@ from game import (
     state_to_nn_input,
     step_fn,
 )
-from xot import XOT_PATH, load_xot, split_xot
+from xot import XOT_PATH, load_xot
 
 from core.evaluators.evaluation_fns import make_nn_eval_fn
 
@@ -149,9 +151,11 @@ def available_memory() -> int:
     return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
 
 
-def max_parallel_games(engine: type[GTPEngine]) -> int:
-    """How many engine processes fit in the memory available now, leaving some spare."""
-    return max(2, int(0.7 * available_memory() / engine.memory_per_process) // 2 * 2)
+def max_parallel_games(engine: type[GTPEngine], limit: int = 128) -> int:
+    """How many engine processes to run at once: as many as fit in a quarter of the
+    memory available now (the machine may be shared), up to `limit`."""
+    fit = int(0.25 * available_memory() / engine.memory_per_process)
+    return max(2, min(fit, limit) // 2 * 2)
 
 
 def main():
@@ -182,7 +186,8 @@ def main():
         "--parallel",
         type=int,
         default=None,
-        help="games at a time (default: as many as memory allows, up to all of them)",
+        help="games at a time (default: as many as fit in a quarter of the available "
+        "memory, up to 128)",
     )
     parser.add_argument(
         "--stop-below",
@@ -195,9 +200,10 @@ def main():
     )
     parser.add_argument("--xot", default=XOT_PATH, help="the XOT opening list")
     parser.add_argument(
-        "--all-openings",
-        action="store_true",
-        help="draw from every XOT opening, not just the ones train.py holds out",
+        "--results",
+        type=Path,
+        default=None,
+        help="also append each level's result to this file, as a line of JSON",
     )
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
@@ -228,9 +234,6 @@ def main():
         jax.vmap(lambda tree, state, a: (evaluator.step(tree, a), env.step(state, a)))
     )
     xot = load_xot(args.xot)
-    if not args.all_openings:
-        # the openings train.py holds out of self-play
-        _, xot = split_xot(xot)
     num_games = 2 * args.openings
     parallel = min(num_games, args.parallel or max_parallel_games(engine))
     rng = np.random.default_rng(args.seed)
@@ -269,11 +272,28 @@ def main():
                     for e in engines:
                         e.close()
             mean, se = score(results)
+            seconds = time.perf_counter() - start
+            if args.results is not None:
+                with open(args.results, "a") as f:
+                    record = {
+                        "checkpoint": args.checkpoint,
+                        "engine": engine.name,
+                        "level": level,
+                        "sims": args.sims,
+                        "games": num_games,
+                        "score": float(mean),
+                        "se": float(se),
+                        "win": float((results > 0).mean()),
+                        "draw": float((results == 0).mean()),
+                        "loss": float((results < 0).mean()),
+                        "seconds": round(seconds, 1),
+                    }
+                    f.write(json.dumps(record) + "\n")
             print(
                 f"  {engine.name} level {level:2d}: score {mean:.3f} ± {se:.3f}  "
                 f"(win {(results > 0).mean():.3f}, draw {(results == 0).mean():.3f}, "
                 f"loss {(results < 0).mean():.3f}; as black {score(results[we_black])[0]:.2f}, "
-                f"as white {score(results[~we_black])[0]:.2f})  {time.perf_counter() - start:.0f}s",
+                f"as white {score(results[~we_black])[0]:.2f})  {seconds:.0f}s",
                 flush=True,
             )
             if mean < args.stop_below:
