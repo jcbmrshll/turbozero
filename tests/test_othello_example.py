@@ -1,5 +1,6 @@
 """The Othello example's helpers: its board symmetries must map a position's legal moves to
-the legal moves of the transformed position, and its XOT openings must be legal games."""
+the legal moves of the transformed position (search tree positions' too), and its XOT openings
+must be legal games."""
 
 import sys
 from pathlib import Path
@@ -12,6 +13,11 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parents[1] / "examples" / "othello"))
 import game as othello
 from xot import load_xot, make_xot_init_fn
+
+from core.evaluators.alphazero import AlphaZero
+from core.evaluators.mcts.action_selection import PUCTSelector
+from core.evaluators.mcts.mcts import MCTS
+from core.training.tree_positions import select_nodes, tree_experiences
 
 
 def legal_moves(obs):
@@ -68,6 +74,87 @@ def test_symmetries_map_legal_moves_and_policy_with_the_board():
             assert t_policy[64] == 64
         action = jax.random.choice(action_key, 65, p=mask / mask.sum())
         state = step(state, action)
+
+
+def test_the_player_to_move_changes_every_step_passes_included():
+    """MCTS keeps each node's value from the perspective of the player to move there, negating it
+    from one level to the next (discount -1), so it relies on the players taking turns: in pgx's
+    Othello a player with no move passes (action 64), and the turn passes too."""
+
+    @jax.jit
+    @jax.vmap
+    def game(key):
+        def step(carry, key):
+            state, done = carry
+            action = jax.random.categorical(
+                key, jnp.where(state.legal_action_mask, 0.0, -jnp.inf)
+            )
+            next_state = othello.env.step(state, action)
+            out = (
+                ~done & (next_state.current_player == state.current_player),
+                ~done & (action == othello.PASS),
+            )
+            return (next_state, done | next_state.terminated), out
+
+        state = othello.env.init(key)
+        _, (same_player, passed) = jax.lax.scan(
+            step, (state, jnp.array(False)), jax.random.split(key, 80)
+        )
+        return same_player, passed
+
+    same_player, passed = game(jax.random.split(jax.random.PRNGKey(0), 64))
+    assert passed.any()
+    assert not same_player.any()
+
+
+def test_tree_positions_symmetric_copies_are_legal():
+    def uniform(state, params, key):
+        return jnp.zeros((65,)), jnp.array(0.0)
+
+    evaluator = AlphaZero(MCTS)(
+        eval_fn=uniform,
+        num_iterations=32,
+        max_nodes=48,
+        branching_factor=65,
+        action_selector=PUCTSelector(),
+    )
+    state, metadata = make_xot_init_fn(load_xot()[:1], 0.0)(jax.random.PRNGKey(0))
+    tree = jax.jit(evaluator.evaluate, static_argnames="env_step_fn")(
+        key=jax.random.PRNGKey(0),
+        eval_state=evaluator.init(template_embedding=state),
+        env_state=state,
+        root_metadata=metadata,
+        params=None,
+        env_step_fn=othello.step_fn,
+    ).eval_state
+    indices, valid = select_nodes(jax.random.PRNGKey(0), tree, num=4, min_visits=2)
+    samples, sample_valid = tree_experiences(
+        tree,
+        indices,
+        valid,
+        othello.step_fn,
+        othello.state_to_nn_input,
+        othello.SYMMETRY_TRANSFORM_FNS,
+    )
+    samples = jax.tree.map(np.asarray, samples)
+    assert valid.sum() == 4 and sample_valid.shape == (32,)
+
+    def sample(i):
+        return jax.tree.map(lambda x: x[i], samples)
+
+    for i in range(4):
+        original = sample(i)
+        for copy in map(sample, range(i, 32, 4)):
+            assert np.array_equal(legal_moves(copy.observation_nn), copy.policy_mask)
+            assert not copy.policy_weights[~copy.policy_mask].any()
+            # each legal move keeps its weight
+            assert np.array_equal(
+                np.sort(copy.policy_weights[copy.policy_mask]),
+                np.sort(original.policy_weights[original.policy_mask]),
+            )
+            assert copy.search_value == original.search_value
+            assert np.array_equal(copy.reward, original.reward)
+            assert copy.cur_player_id == original.cur_player_id
 
 
 def test_square_names_round_trip():

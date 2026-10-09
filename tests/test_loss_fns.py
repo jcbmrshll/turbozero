@@ -26,7 +26,14 @@ class OutputAsParams(eqx.Module):
         return self.logits[x], self.value[x]
 
 
-def experience(rewards, cur_player_id, policy_weights, policy_mask, observation=None):
+def experience(
+    rewards,
+    cur_player_id,
+    policy_weights,
+    policy_mask,
+    observation=None,
+    search_value=None,
+):
     batch = len(cur_player_id)
     return BaseExperience(
         reward=jnp.asarray(rewards, dtype=jnp.float32),
@@ -34,6 +41,9 @@ def experience(rewards, cur_player_id, policy_weights, policy_mask, observation=
         policy_mask=jnp.asarray(policy_mask),
         observation_nn=jnp.arange(batch) if observation is None else observation,
         cur_player_id=jnp.asarray(cur_player_id, dtype=jnp.int32),
+        search_value=jnp.zeros((batch,))
+        if search_value is None
+        else jnp.asarray(search_value, dtype=jnp.float32),
     )
 
 
@@ -80,6 +90,32 @@ def test_value_target_is_outcome_for_player_to_move():
     assert value_loss([1.0, -1.0]) == 0.0
     # optax.l2_loss is 0.5 * squared error
     np.testing.assert_allclose(value_loss([-1.0, 1.0]), 0.5 * 4, rtol=1e-6)
+
+
+def test_value_target_mixes_in_the_search_value():
+    # player 0 won; the search valued the positions at 0.5 and 0.2 for the player to move
+    batch = experience(
+        rewards=[[1, -1], [1, -1]],
+        cur_player_id=[0, 1],
+        policy_weights=[[0.5, 0.5]] * 2,
+        policy_mask=[[True, True]] * 2,
+        search_value=[0.5, 0.2],
+    )
+    net = OutputAsParams(jnp.zeros((2, 2)), jnp.zeros((2, 1)))
+
+    def value_loss(value_target_q):
+        _, (metrics, _) = az_default_loss_fn(
+            net, None, batch, l2_reg_lambda=0.0, value_target_q=value_target_q
+        )
+        return float(metrics["value_loss"])
+
+    def expected(targets):
+        return 0.5 * np.mean(np.square(targets))
+
+    # the outcome alone by default, the search value alone at 1, and an even mix at 0.5
+    np.testing.assert_allclose(value_loss(0.0), expected([1.0, -1.0]), rtol=1e-6)
+    np.testing.assert_allclose(value_loss(1.0), expected([0.5, 0.2]), rtol=1e-6)
+    np.testing.assert_allclose(value_loss(0.5), expected([0.75, -0.4]), rtol=1e-6)
 
 
 def test_a_few_optimizer_steps_lower_the_loss():

@@ -60,6 +60,43 @@ def step_env_and_evaluator(
               Never true together with `terminated`: an episode that terminates on its last allowed step is terminated.
             - `rewards`: Rewards emitted by the environment.
     """
+    return search_and_step(
+        key,
+        env_state,
+        env_state_metadata,
+        eval_state,
+        params,
+        evaluator,
+        env_step_fn,
+        env_init_fn,
+        max_steps,
+        reset,
+        choose_action,
+    )[:6]
+
+
+def search_and_step(
+    key: jax.Array,
+    env_state: Any,
+    env_state_metadata: StepMetadata,
+    eval_state: Any,
+    params: Any,
+    evaluator: Evaluator,
+    env_step_fn: EnvStepFn,
+    env_init_fn: EnvInitFn,
+    max_steps: int,
+    reset: bool = True,
+    choose_action: ChooseActionFn | None = None,
+) -> tuple[EvalOutput, Any, StepMetadata, jax.Array, jax.Array, jax.Array, Any]:
+    """`step_env_and_evaluator`, also returning the evaluator's state as the evaluation left it, before
+    the evaluator stepped: e.g. the whole search tree, and its root value (`Evaluator.get_value`).
+
+    Args: see `step_env_and_evaluator`.
+
+    Returns:
+        Tuple[EvalOutput, Any, StepMetadata, jax.Array, jax.Array, jax.Array, Any]:
+            what `step_env_and_evaluator` returns, then the evaluator's state after the evaluation
+    """
     key, evaluate_key = jax.random.split(key)
     # evaluate the environment state
     output = evaluator.evaluate(
@@ -97,8 +134,17 @@ def step_env_and_evaluator(
         lambda _: (env_state, env_state_metadata),
         None,
     )
+    searched_eval_state = output.eval_state
     output = replace(output, eval_state=eval_state)
-    return output, env_state, env_state_metadata, terminated, truncated, rewards
+    return (
+        output,
+        env_state,
+        env_state_metadata,
+        terminated,
+        truncated,
+        rewards,
+        searched_eval_state,
+    )
 
 
 @jax.tree_util.register_dataclass

@@ -7,15 +7,18 @@ import os
 import shutil
 from dataclasses import replace
 from functools import partial
+from types import SimpleNamespace
 
 import equinox as eqx
 import jax
+import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
 
 from core.evaluators.alphazero import AlphaZero
 from core.evaluators.evaluation_fns import make_nn_eval_fn
+from core.evaluators.evaluator import EvalOutput, Evaluator
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.mcts.mcts import MCTS
 from core.memory.replay_memory import EpisodeReplayBuffer
@@ -24,8 +27,9 @@ from core.monitor.renderers import pgx_two_player_episode
 from core.networks.azresnet import AZResnet, AZResnetConfig
 from core.testing.two_player_tester import TwoPlayerTester
 from core.training.loss_fns import az_default_loss_fn
-from core.training.schedule import EvaluatorSchedule
+from core.training.schedule import EvaluatorSchedule, Schedule
 from core.training.train import Trainer, checkpoint_epochs, extract_params
+from core.training.tree_positions import TreePositions
 
 # warmup is longer than a tic-tac-toe game, so the buffer holds finished episodes before training starts
 STEPS_PER_EPOCH = 10
@@ -254,6 +258,8 @@ def test_train_loop_logs_to_monitor(trainer, monitor_server, monkeypatch):
             "TwoPlayerTester_avg_outcome",
             "selfplay_episodes",
             "selfplay_iterations",
+            "replay_window",
+            "buffer_samples",
             "buffer_distinct_positions",
             "buffer_distinct_fraction",
         } <= logged
@@ -385,6 +391,206 @@ def test_train_steps_without_finished_episodes_raises(trainer):
         )
 
 
+class CountingEvaluator(Evaluator):
+    """Plays the first legal action; its state counts its evaluations this episode, and is its value."""
+
+    def __init__(self):
+        super().__init__(discount=-1.0)
+
+    def init(self, *args, **kwargs):
+        return jnp.array(0, dtype=jnp.int32)
+
+    def reset(self, state):
+        return jnp.zeros_like(state)
+
+    def evaluate(self, key, eval_state, env_state, root_metadata, **kwargs):
+        action = jnp.argmax(root_metadata.action_mask)
+        return EvalOutput(
+            eval_state=eval_state + 1,
+            action=action,
+            policy_weights=jax.nn.one_hot(action, root_metadata.action_mask.shape[-1]),
+        )
+
+    def get_value(self, state):
+        return state.astype(jnp.float32)
+
+
+def test_collect_stores_the_searchs_root_value(
+    fixed_length_env, make_collector, tmp_path
+):
+    env = fixed_length_env(length=3)
+    collect = make_collector(env, CountingEvaluator(), 10, tmp_path)
+
+    buffer_state = collect(num_steps=4).buffer_state
+
+    # the value as the evaluation left it: not after the evaluator stepped, nor after it was reset
+    # at the end of the episode
+    np.testing.assert_array_equal(
+        buffer_state.buffer.search_value[0, :4], [1.0, 2.0, 3.0, 1.0]
+    )
+
+
+def ttt_transpose(mask, policy, state):
+    """Tic-tac-toe's board transpose, as a data transform."""
+    perm = jnp.arange(9).reshape(3, 3).T.reshape(-1)
+    return (
+        mask[perm],
+        policy[perm],
+        state.replace(observation=jnp.swapaxes(state.observation, 0, 1)),
+    )
+
+
+@pytest.fixture(scope="module", params=[False, True], ids=["all", "discarded_only"])
+def tree_trainer(ttt, tmp_path_factory, request):
+    return make_trainer(
+        ttt,
+        tmp_path_factory.mktemp("ckpt"),
+        data_transform_fns=[ttt_transpose],
+        tree_positions=TreePositions(
+            per_move=2, min_visits=2, capacity=256, discarded_only=request.param
+        ),
+    )
+
+
+def test_train_loop_with_tree_positions(tree_trainer, monkeypatch):
+    monkeypatch.setattr(tree_trainer, "save_checkpoint", lambda *args, **kwargs: None)
+    logged = []
+    monkeypatch.setattr(
+        tree_trainer, "log_metrics", lambda metrics, epoch: logged.append(metrics)
+    )
+
+    out = tree_trainer.train_loop(seed=0, num_epochs=2)
+
+    epochs = [m for m in logged if "loss" in m]
+    assert len(epochs) == 2
+    for metrics in epochs:
+        assert np.isfinite(metrics["loss"])
+        # 1:1, of 4 samples
+        assert metrics["tree_batch_fraction"] == 0.5
+        assert metrics["tree_positions"] > 0
+        assert 0 < metrics["tree_positions_per_move"] <= 2
+        assert metrics["tree_mean_visits"] >= 2
+
+    state = out.collection_state
+    tree_buffer = tree_trainer.tree_buffer
+    tree_state = state.tree_buffer_state
+    sampleable = np.asarray(tree_buffer.sample_mask(tree_state))
+    # each stored position, and its transposed copy
+    assert sampleable.sum() == 2 * int(state.tree_positions.sum())
+    samples = jax.tree.map(lambda x: np.asarray(x)[sampleable], tree_state.buffer)
+    np.testing.assert_allclose(samples.policy_weights.sum(-1), 1.0, rtol=1e-6)
+    assert not samples.policy_weights[~samples.policy_mask].any()
+    rows = np.arange(len(samples.reward))
+    np.testing.assert_allclose(
+        samples.reward[rows, samples.cur_player_id], samples.search_value
+    )
+    np.testing.assert_allclose(
+        samples.reward[rows, 1 - samples.cur_player_id], -samples.search_value
+    )
+
+
+def test_tree_position_sampler_fills_the_first_places(tree_trainer):
+    trainer = tree_trainer
+    template = trainer.make_template_experience()
+    batch = jax.tree.map(lambda x: jnp.stack([x] * trainer.train_batch_size), template)
+    tree_state = trainer.tree_buffer.init(2, template)
+    # one tree position, told apart by its search value
+    tree_state = replace(
+        tree_state,
+        buffer=replace(
+            tree_state.buffer,
+            search_value=tree_state.buffer.search_value.at[1, 5].set(7.0),
+        ),
+        populated=tree_state.populated.at[1, 5].set(True),
+    )
+
+    for num_tree, expected in [(3, [7, 7, 7, 0]), (0, [0, 0, 0, 0])]:
+        add = trainer.tree_position_sampler(
+            tree_state, trainer.tree_buffer.sample_mask(tree_state), jnp.array(num_tree)
+        )
+        mixed = add(jax.random.PRNGKey(0), batch)
+        np.testing.assert_array_equal(mixed.search_value, expected)
+
+    # with no tree positions to sample (and so none asked for), the batch is left as it was
+    empty = trainer.tree_buffer.init(2, template)
+    mixed = trainer.tree_position_sampler(
+        empty, trainer.tree_buffer.sample_mask(empty), jnp.array(0)
+    )(jax.random.PRNGKey(0), batch)
+    assert jax.tree.all(jax.tree.map(np.array_equal, mixed, batch))
+
+
+def test_tree_positions_follow_the_replay_windows_span_of_self_play(
+    tree_trainer, monkeypatch
+):
+    trainer = tree_trainer
+    state = trainer.init_collection_state(jax.random.PRNGKey(0), trainer.batch_size)
+    tree_state = state.tree_buffer_state
+    # 20 moves made; six tree positions, stored 17, 16, 10, 5, 1 and 20 moves ago
+    state = replace(
+        state,
+        moves=jnp.full_like(state.moves, 20),
+        tree_buffer_state=replace(
+            tree_state, populated=tree_state.populated.at[:, :6].set(True)
+        ),
+        tree_written_at=state.tree_written_at.at[:, :6].set(
+            jnp.array([3, 4, 10, 15, 19, 0])
+        ),
+    )
+    # one data transform: a window of 32 played entries spans 16 moves, one of 8 spans 4
+    monkeypatch.setattr(trainer, "replay_window", Schedule([(0, 32), (1, 8)]))
+
+    for epoch, expected in [(0, [1, 2, 3, 4]), (1, [4])]:
+        mask = np.asarray(trainer.tree_sample_mask(state, epoch))
+        for env in range(trainer.batch_size):
+            assert np.flatnonzero(mask[env]).tolist() == expected
+
+
+def test_tree_batch_count_decays_and_is_zero_without_tree_positions(
+    tree_trainer, monkeypatch
+):
+    trainer = tree_trainer
+    collection_state = trainer.init_collection_state(
+        jax.random.PRNGKey(0), trainer.batch_size
+    )
+    # pretend a finished episode, a minibatch's worth, is in the replay buffer
+    collection_state = replace(
+        collection_state,
+        buffer_state=replace(
+            collection_state.buffer_state,
+            populated=collection_state.buffer_state.populated.at[:, :2].set(True),
+            next_idx=collection_state.buffer_state.next_idx + 2,
+        ),
+    )
+    calls = []
+    monkeypatch.setattr(
+        trainer,
+        "train_epoch",
+        lambda key, buffer_state, train_state, num_steps, window, *, num_tree, **kwargs: (
+            calls.append(int(num_tree)) or (train_state, {})
+        ),
+    )
+    train_state = trainer.init_train_state()
+    key = jax.random.PRNGKey(0)
+
+    # no tree positions stored yet
+    _, _, metrics = trainer.train_steps(key, collection_state, train_state, 1)
+    assert calls[-1] == 0 and metrics["tree_batch_fraction"] == 0
+
+    tree_state = collection_state.tree_buffer_state
+    collection_state = replace(
+        collection_state,
+        tree_buffer_state=replace(
+            tree_state, populated=tree_state.populated.at[:, 0].set(True)
+        ),
+    )
+    monkeypatch.setattr(
+        trainer, "tree_positions", replace(trainer.tree_positions, half_life=1.0)
+    )
+    for epoch, num_tree in [(0, 2), (1, 1), (10, 0)]:
+        trainer.train_steps(key, collection_state, train_state, 1, epoch=epoch)
+        assert calls[-1] == num_tree
+
+
 @pytest.fixture
 def scheduled(ttt, tmp_path, monkeypatch):
     """`scheduled(schedule)`: a Trainer whose self-play follows `schedule` (see `make_trainer`),
@@ -489,4 +695,166 @@ def test_schedule_needs_a_test_evaluator(ttt, tmp_path):
     with pytest.raises(ValueError, match="evaluator_test"):
         make_trainer(
             ttt, tmp_path, schedule=[(0, 2, 4), (1, 4, 8)], evaluator_test=None
+        )
+
+
+def test_tree_positions_with_a_search_budget_schedule(ttt, tmp_path, monkeypatch):
+    trainer = make_trainer(
+        ttt,
+        tmp_path,
+        schedule=[(0, 4, 8), (1, 16, 32)],
+        tree_positions=TreePositions(per_move=2, min_visits=2, capacity=256),
+    )
+    monkeypatch.setattr(trainer, "save_checkpoint", lambda *args, **kwargs: None)
+    logged = []
+    monkeypatch.setattr(
+        trainer, "log_metrics", lambda metrics, epoch: logged.append(metrics)
+    )
+
+    trainer.train_loop(seed=0, num_epochs=2, eval_every=2)
+
+    first, second = [m for m in logged if "loss" in m]
+    assert first["tree_positions"] > 0 and second["tree_positions"] > 0
+    # bigger searches, more visited nodes
+    assert second["tree_mean_visits"] > first["tree_mean_visits"]
+
+
+# per environment: the buffer holds 32 entries, and each epoch adds 10 (warmup adds 10 too), so
+# the window binds in the first two epochs and holds the whole buffer in the third
+WINDOWS = [(0, 16), (1, 24), (2, 32)]
+
+
+def window_mask(buffer_state, window):
+    """The entries training can sample from the `window` newest of each environment's,
+    worked out entry by entry."""
+    populated = np.asarray(buffer_state.populated)
+    has_reward = np.asarray(buffer_state.has_reward)
+    next_idx = np.asarray(buffer_state.next_idx)
+    num_envs, capacity = populated.shape
+    mask = np.zeros_like(populated)
+    for env in range(num_envs):
+        for age in range(min(window, capacity)):
+            i = (next_idx[env] - 1 - age) % capacity
+            mask[env, i] = populated[env, i] and has_reward[env, i]
+    return mask
+
+
+@pytest.fixture(scope="module")
+def windowed(ttt, tmp_path_factory):
+    """A 3-epoch run whose replay window follows `WINDOWS`, recording what it logged, the buffer
+    each epoch trained on, which entries training could sample and which it sampled, and how many
+    times it traced a training step."""
+    trainer = make_trainer(
+        ttt, tmp_path_factory.mktemp("ckpt"), replay_window=Schedule(WINDOWS)
+    )
+    run = SimpleNamespace(trainer=trainer, logged={}, buffers=[], sampled=[], traces=0)
+
+    train_step = trainer.train_step
+
+    def counting_train_step(ts, batch):
+        # runs once each time training is traced
+        run.traces += 1
+        return train_step(ts, batch)
+
+    buffer = trainer.memory_buffer
+    sample_indices = buffer.sample_indices
+
+    def spy_sample_indices(key, mask, sample_size):
+        indices = sample_indices(key, mask, sample_size)
+        jax.debug.callback(
+            lambda m, i: run.sampled.append((np.asarray(m), np.asarray(i))),
+            mask,
+            indices,
+        )
+        return indices
+
+    train_steps = trainer.train_steps
+
+    def spy_train_steps(key, collection_state, *args, **kwargs):
+        run.buffers.append(collection_state.buffer_state)
+        return train_steps(key, collection_state, *args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(trainer, "train_step", counting_train_step)
+        mp.setattr(buffer, "sample_indices", spy_sample_indices)
+        mp.setattr(trainer, "train_steps", spy_train_steps)
+        mp.setattr(
+            trainer,
+            "log_metrics",
+            lambda metrics, epoch: run.logged.setdefault(epoch, metrics),
+        )
+        run.out = trainer.train_loop(seed=0, num_epochs=3)
+        jax.effects_barrier()
+        yield run
+
+
+def test_replay_window_follows_its_schedule(windowed):
+    assert [int(windowed.logged[e]["replay_window"]) for e in range(3)] == [16, 24, 32]
+    # the buffer's metrics count the window's samples, the ones training samples from
+    for epoch, (buffer_state, (_, window)) in enumerate(
+        zip(windowed.buffers, WINDOWS, strict=True)
+    ):
+        assert (
+            windowed.logged[epoch]["buffer_samples"]
+            == window_mask(buffer_state, window).sum()
+        )
+    assert windowed.trainer.get_config()["replay_window"] == [
+        {"epoch": epoch, "value": window} for epoch, window in WINDOWS
+    ]
+
+
+def test_training_samples_only_from_the_replay_window(windowed):
+    # one training step per epoch
+    assert len(windowed.sampled) == len(windowed.buffers) == 3
+    for (mask, indices), buffer_state, (_, window) in zip(
+        windowed.sampled, windowed.buffers, WINDOWS, strict=True
+    ):
+        expected = window_mask(buffer_state, window)
+        np.testing.assert_array_equal(mask, expected)
+        assert expected.reshape(-1)[indices].all()
+    # the window left out finished episodes in the first epoch
+    first = windowed.buffers[0]
+    assert window_mask(first, 16).sum() < (first.populated & first.has_reward).sum()
+
+
+def test_changing_the_replay_window_does_not_recompile(windowed):
+    trainer = windowed.trainer
+    # three windows, one trace of training, and one of the buffer's metrics
+    assert windowed.traces == 1
+    assert trainer.count_distinct_observations._cache_size() == 1
+
+    def train(num_steps, window):
+        trainer.train_epoch(
+            jax.random.PRNGKey(0),
+            windowed.out.collection_state.buffer_state,
+            windowed.out.train_state,
+            num_steps,
+            jnp.array(window, dtype=jnp.int32),
+        )
+
+    train(1, 20)
+    assert windowed.traces == 1
+    # what does recompile is counted: a different number of steps
+    train(2, 20)
+    assert windowed.traces == 2
+
+
+@pytest.mark.parametrize(
+    "replay_window", [0, 33, Schedule([(0, 8), (5, 64)]), Schedule([(0, 0)])]
+)
+def test_replay_window_must_fit_the_buffer(ttt, tmp_path, replay_window):
+    with pytest.raises(ValueError, match="replay windows must be between 1 and"):
+        make_trainer(ttt, tmp_path, replay_window=replay_window)
+
+
+def test_train_steps_with_too_few_samples_in_the_window_raises(ttt, tmp_path, trained):
+    # each environment's newest entry, at most: fewer than a minibatch of 4
+    trainer = make_trainer(ttt, tmp_path, replay_window=1)
+
+    with pytest.raises(ValueError, match="can be sampled"):
+        trainer.train_steps(
+            jax.random.PRNGKey(0),
+            trained.collection_state,
+            trainer.init_train_state(),
+            1,
         )

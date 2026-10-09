@@ -1,6 +1,6 @@
 import os
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
 from typing import Any
@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import optax
 
-from core.common import step_env_and_evaluator
+from core.common import search_and_step, step_env_and_evaluator
 from core.evaluators.evaluator import Evaluator
 from core.evaluators.mcts.mcts import MCTS
 from core.memory.replay_memory import (
@@ -21,7 +21,12 @@ from core.memory.replay_memory import (
 from core.monitor import Monitor
 from core.testing.tester import BaseTester, TestState
 from core.training.exploration import SelfPlayExploration
-from core.training.schedule import EvaluatorSchedule, describe
+from core.training.schedule import EvaluatorSchedule, Schedule, describe
+from core.training.tree_positions import (
+    TreePositions,
+    select_nodes,
+    tree_experiences,
+)
 from core.types import (
     DataTransformFn,
     EnvInitFn,
@@ -46,6 +51,13 @@ class CollectionState:
         metadata: metadata of the current environment state
         episodes: number of episodes that have terminated so far (not counting truncated ones)
         draws: how many of those ended with every player's reward 0
+        tree_positions: number of search tree positions stored so far (not counting transformed copies,
+            see `Trainer`'s `tree_positions`)
+        tree_visits: their visit counts, summed
+        moves: number of self-play moves made so far
+        tree_buffer_state: state of the replay buffer of search tree positions, None without them
+        tree_written_at: for each entry of the tree position replay buffer, the number of moves made
+            before it was written (see `Trainer.tree_sample_mask`), None without tree positions
     """
 
     eval_state: Any
@@ -54,6 +66,11 @@ class CollectionState:
     metadata: StepMetadata
     episodes: jax.Array
     draws: jax.Array
+    tree_positions: jax.Array
+    tree_visits: jax.Array
+    moves: jax.Array
+    tree_buffer_state: ReplayBufferState | None = None
+    tree_written_at: jax.Array | None = None
 
 
 @jax.tree_util.register_dataclass
@@ -129,10 +146,12 @@ class Trainer:
         state_to_nn_input_fn: StateToNNInputFn,
         testers: Sequence[BaseTester],
         nn_state: eqx.nn.State | None = None,
+        replay_window: int | Schedule[int] | None = None,
         evaluator_test: Evaluator | None = None,
         test_env_init_fn: EnvInitFn | None = None,
         selfplay_exploration: SelfPlayExploration | None = None,
         data_transform_fns: Sequence[DataTransformFn] = (),
+        tree_positions: TreePositions | None = None,
         extract_model_params_fn: ExtractModelParamsFn = extract_params,
         monitor: Monitor | None = None,
         ckpt_dir: str = "/tmp/turbozero_checkpoints",
@@ -163,6 +182,10 @@ class Trainer:
             state_to_nn_input_fn: function to convert environment state to neural network input
             testers: list of testers to evaluate the agent against (see core.testing.tester)
             nn_state: (optional) initial state of `nn` for stateful networks (e.g. with BatchNorm), from `eqx.nn.make_with_state`
+            replay_window: (optional) how many of each environment's newest replay buffer entries training samples
+                from, at most `memory_buffer.capacity`, or a `Schedule` of it by epoch, e.g. to sample only recent
+                data early on, while the network changes quickly, and more later. Changing it doesn't recompile.
+                If not provided, the whole buffer.
             evaluator_test: (optional) evaluator to use during testing. If not provided, `evaluator` is used
                 (required with a schedule of several evaluators).
             test_env_init_fn: (optional) environment initialization function for test episodes, e.g. to test from
@@ -171,6 +194,10 @@ class Trainer:
                 e.g. to play random moves some of the time (see core.training.exploration). The evaluator's
                 policy weights stay the training target. If not provided, self-play plays the evaluator's move.
             data_transform_fns: (optional) list of data transform functions to apply to self-play experiences (e.g. rotation, reflection, etc.)
+            tree_positions: (optional) also train on positions from self-play's search trees, as OLIVAW did
+                (see core.training.tree_positions). They're kept in a replay buffer of their own, and make up
+                a share of each training batch, sampled from those stored in the replay window's span of
+                self-play (see `tree_sample_mask`). Needs MCTS self-play evaluators.
             extract_model_params_fn: (optional) function to extract model parameters from TrainState
             monitor: (optional) `core.monitor.Monitor` to log metrics and test episodes to (see a tester's `episode_fn`)
                 - start the server with `turbozero-monitor`; a run is created on the first `train_loop`,
@@ -201,6 +228,22 @@ class Trainer:
         self.warmup_steps = warmup_steps
         self.collection_steps_per_epoch = collection_steps_per_epoch
         self.memory_buffer = memory_buffer
+        # a constant window is a schedule with one stage
+        if replay_window is None:
+            replay_window = memory_buffer.capacity
+        self.replay_window = (
+            replay_window
+            if isinstance(replay_window, Schedule)
+            else Schedule([(0, replay_window)])
+        )
+        if not all(
+            0 < window <= memory_buffer.capacity
+            for _, window in self.replay_window.stages
+        ):
+            raise ValueError(
+                f"replay windows must be between 1 and the replay buffer's capacity, "
+                f"{memory_buffer.capacity}, got {self.replay_window.get_config()}"
+            )
         # a single evaluator is a schedule with one stage
         self.selfplay_schedule = (
             evaluator
@@ -209,6 +252,16 @@ class Trainer:
         )
         self.transform_fns = data_transform_fns
         self.selfplay_exploration = selfplay_exploration
+        if tree_positions is not None and not all(
+            isinstance(e, MCTS) for _, e in self.selfplay_schedule.stages
+        ):
+            raise ValueError("tree_positions needs MCTS self-play evaluators")
+        self.tree_positions = tree_positions
+        self.tree_buffer = (
+            EpisodeReplayBuffer(capacity=tree_positions.capacity)
+            if tree_positions is not None
+            else None
+        )
         self.count_distinct_observations = jax.jit(
             self.memory_buffer.count_distinct_observations
         )
@@ -282,6 +335,10 @@ class Trainer:
             else None,
             "memory_buffer": self.memory_buffer.__class__.__name__,
             "memory_buffer_config": self.memory_buffer.get_config(),
+            "replay_window": self.replay_window.get_config(),
+            "tree_positions": self.tree_positions.get_config()
+            if self.tree_positions is not None
+            else None,
         }
 
     def collect(
@@ -308,23 +365,33 @@ class Trainer:
         """
         if evaluator is None:
             evaluator = self.selfplay_schedule.at(0)
+        tree_key = None
+        if self.tree_positions is not None:
+            key, tree_key = jax.random.split(key)
         # step environment and evaluator
-        eval_output, new_env_state, new_metadata, terminated, truncated, rewards = (
-            step_env_and_evaluator(
-                key=key,
-                env_state=state.env_state,
-                env_state_metadata=state.metadata,
-                eval_state=state.eval_state,
-                params=params,
-                evaluator=evaluator,
-                env_step_fn=self.env_step_fn,
-                env_init_fn=self.env_init_fn,
-                max_steps=self.max_episode_steps,
-                choose_action=self.selfplay_exploration.choose_action
-                if self.selfplay_exploration is not None
-                else None,
-            )
+        (
+            eval_output,
+            new_env_state,
+            new_metadata,
+            terminated,
+            truncated,
+            rewards,
+            searched_eval_state,
+        ) = search_and_step(
+            key=key,
+            env_state=state.env_state,
+            env_state_metadata=state.metadata,
+            eval_state=state.eval_state,
+            params=params,
+            evaluator=evaluator,
+            env_step_fn=self.env_step_fn,
+            env_init_fn=self.env_init_fn,
+            max_steps=self.max_episode_steps,
+            choose_action=self.selfplay_exploration.choose_action
+            if self.selfplay_exploration is not None
+            else None,
         )
+        search_value = evaluator.get_value(searched_eval_state)
 
         # store experience in replay buffer
         buffer_state = self.memory_buffer.add_experience(
@@ -335,6 +402,7 @@ class Trainer:
                 policy_weights=eval_output.policy_weights,
                 reward=jnp.empty_like(state.metadata.rewards),
                 cur_player_id=state.metadata.cur_player_id,
+                search_value=search_value,
             ),
         )
         # apply transforms
@@ -350,6 +418,7 @@ class Trainer:
                     policy_weights=t_policy_weights,
                     reward=jnp.empty_like(state.metadata.rewards),
                     cur_player_id=state.metadata.cur_player_id,
+                    search_value=search_value,
                 ),
             )
         # assign rewards to buffer if episode is terminated
@@ -364,6 +433,18 @@ class Trainer:
         buffer_state = jax.lax.cond(
             truncated, self.memory_buffer.truncate, lambda s: s, buffer_state
         )
+        if tree_key is not None:
+            # the tree the next search reuses: the played move's subtree, unless the episode ended
+            reused = jnp.where(
+                terminated | truncated,
+                searched_eval_state.NULL_INDEX,
+                searched_eval_state.edge_map[
+                    searched_eval_state.ROOT_INDEX, eval_output.action
+                ],
+            )
+            state = self.store_tree_positions(
+                tree_key, state, searched_eval_state, reused, evaluator
+            )
         # return new collection state
         return replace(
             state,
@@ -373,6 +454,65 @@ class Trainer:
             metadata=new_metadata,
             episodes=state.episodes + terminated,
             draws=state.draws + (terminated & (rewards == 0).all()),
+            moves=state.moves + 1,
+        )
+
+    def store_tree_positions(
+        self,
+        key: jax.Array,
+        state: CollectionState,
+        tree: Any,
+        reused: jax.Array,
+        evaluator: Evaluator,
+    ) -> CollectionState:
+        """Stores positions from a self-play search tree in the tree position replay buffer
+        (see `tree_positions`), with their transformed copies.
+
+        Args:
+            key: rng
+            state: current collection state
+            tree: the search tree, after the search
+            reused: the root child whose subtree the next search reuses, NULL_INDEX for none
+            evaluator: the self-play evaluator that searched the tree
+
+        Returns:
+            CollectionState: updated collection state
+        """
+        assert self.tree_positions is not None and self.tree_buffer is not None
+        assert state.tree_buffer_state is not None and state.tree_written_at is not None
+        assert isinstance(evaluator, MCTS)
+        indices, valid = select_nodes(
+            key,
+            tree,
+            self.tree_positions.per_move,
+            self.tree_positions.min_visits,
+            self.tree_positions.most_visited,
+            reused
+            if self.tree_positions.discarded_only and evaluator.persist_tree
+            else None,
+        )
+        experiences, valid_experiences = tree_experiences(
+            tree,
+            indices,
+            valid,
+            self.env_step_fn,
+            self.state_to_nn_input_fn,
+            self.transform_fns,
+        )
+        written = self.tree_buffer.write_indices(
+            state.tree_buffer_state, valid_experiences
+        )
+        return replace(
+            state,
+            tree_buffer_state=self.tree_buffer.add_experiences(
+                state.tree_buffer_state, experiences, valid_experiences
+            ),
+            tree_written_at=state.tree_written_at.at[written].set(
+                state.moves, mode="drop"
+            ),
+            tree_positions=state.tree_positions + valid.sum(),
+            tree_visits=state.tree_visits
+            + jnp.where(valid, tree.data.n[indices], 0).sum(),
         )
 
     # the evaluator is a static argument, rather than read from `self` while tracing: `self` is
@@ -453,24 +593,42 @@ class Trainer:
         buffer_state: ReplayBufferState,
         train_state: TrainState,
         num_steps: int,
+        window: jax.Array,
+        tree_buffer_state: ReplayBufferState | None = None,
+        tree_mask: jax.Array | None = None,
+        num_tree: jax.Array | None = None,
     ) -> tuple[TrainState, dict]:
         """Performs `num_steps` training steps, compiled into a single `jax.lax.scan`.
 
         Each step samples a minibatch from the replay buffer and updates the parameters.
 
-        Does not check that the replay buffer holds a finished episode to sample, see `train_steps`.
+        Does not check that the replay buffer holds enough entries to sample, see `train_steps`.
 
         Args:
             key: rng
             buffer_state: replay buffer state
             train_state: current training state
             num_steps: number of training steps to perform
+            window: entries per environment, newest first, to sample from (see
+                `EpisodeReplayBuffer.sample_mask`), a traced value so that changing it doesn't recompile
+            tree_buffer_state: (optional) state of the search tree positions' replay buffer
+                (see `tree_positions`), to sample the first `num_tree` samples of each minibatch from
+            tree_mask: the tree positions that can be sampled (see `tree_sample_mask`)
+            num_tree: number of tree positions in each minibatch, a traced value so that changing it
+                doesn't recompile. With none to sample, it must be 0.
 
         Returns:
             Tuple[TrainState, dict]: updated training state and metrics (mean across steps)
         """
         # the buffer doesn't change while training, so find which entries can be sampled once per epoch
-        mask = self.memory_buffer.sample_mask(buffer_state)
+        mask = self.memory_buffer.sample_mask(buffer_state, window)
+        add_tree_positions = (
+            self.tree_position_sampler(tree_buffer_state, tree_mask, num_tree)
+            if tree_buffer_state is not None
+            and tree_mask is not None
+            and num_tree is not None
+            else None
+        )
 
         def step(
             carry: tuple[jax.Array, TrainState], _
@@ -485,6 +643,9 @@ class Trainer:
                 mask.shape,
             )
             batch = jax.tree.map(lambda x: x[indices], buffer_state.buffer)
+            if add_tree_positions is not None:
+                tree_key, key = jax.random.split(key)
+                batch = add_tree_positions(tree_key, batch)
             # make training step
             ts, metrics = self.train_step(ts, batch)
             return (key, ts), metrics
@@ -494,23 +655,93 @@ class Trainer:
         )
         return train_state, jax.tree.map(jnp.mean, metrics)
 
+    def tree_sample_mask(self, state: CollectionState, epoch: int) -> jax.Array:
+        """Marks the tree positions (see `tree_positions`) training can sample in `epoch`: those stored
+        within the replay window's span of self-play.
+
+        The replay window (see `replay_window`) holds each environment's newest W played positions,
+        with data transforms' copies: its last W / (1 + number of data transforms) moves. Tree
+        positions are sampled from the ones stored in as many moves, however many each move stored.
+
+        Args:
+            state: current collection state
+            epoch: the current epoch, which sets the replay window
+
+        Returns:
+            jax.Array: boolean mask, the shape of the tree position buffer's `populated`
+        """
+        assert self.tree_buffer is not None
+        assert state.tree_buffer_state is not None and state.tree_written_at is not None
+        moves = -(-self.replay_window.at(epoch) // (1 + len(self.transform_fns)))
+        # positions the last move stored are 1 move old
+        age = state.moves[..., None] - state.tree_written_at
+        return self.tree_buffer.sample_mask(state.tree_buffer_state) & (age <= moves)
+
+    def tree_position_sampler(
+        self,
+        tree_buffer_state: ReplayBufferState,
+        mask: jax.Array,
+        num_tree: jax.Array,
+    ) -> Callable[[jax.Array, BaseExperience], BaseExperience]:
+        """Makes a function that puts tree positions (see `tree_positions`) into a minibatch: it
+        replaces the first `num_tree` samples of a minibatch with ones sampled from the tree position
+        replay buffer, uniformly with replacement (so however few there are).
+
+        Args:
+            tree_buffer_state: state of the tree position replay buffer, which doesn't change while
+                the function is used
+            mask: the tree positions to sample from (see `tree_sample_mask`)
+            num_tree: number of tree positions per minibatch; with none in `mask`, it must be 0
+
+        Returns:
+            Callable[[jax.Array, BaseExperience], BaseExperience]: (rng, minibatch) -> minibatch
+        """
+        assert self.tree_buffer is not None
+        tree_buffer = self.tree_buffer
+        # with nothing to sample, sample anything: `num_tree` is 0, so none of it is used
+        mask = mask | ~mask.any()
+        is_tree = jnp.arange(self.train_batch_size) < num_tree
+
+        def add_tree_positions(key: jax.Array, batch: BaseExperience) -> BaseExperience:
+            indices = jnp.unravel_index(
+                tree_buffer.sample_indices(
+                    key, mask, self.train_batch_size, replace=True
+                ),
+                mask.shape,
+            )
+            return jax.tree.map(
+                lambda x, b: jnp.where(
+                    is_tree.reshape((-1,) + (1,) * (b.ndim - 1)), x[indices], b
+                ),
+                tree_buffer_state.buffer,
+                batch,
+            )
+
+        return add_tree_positions
+
     def train_steps(
         self,
         key: jax.Array,
         collection_state: CollectionState,
         train_state: TrainState,
         num_steps: int,
+        epoch: int = 0,
     ) -> tuple[CollectionState, TrainState, dict]:
         """Performs `num_steps` training steps.
 
         Each step consists of sampling a minibatch from the replay buffer and updating the parameters.
-        The minibatch is sampled uniformly without replacement from the finished episodes in the buffer.
+        The minibatch is sampled uniformly without replacement from the finished episodes in the buffer's
+        replay window (see `replay_window`). With `tree_positions`, a share of it is sampled (uniformly,
+        with replacement) from the search tree positions stored in the same span of self-play instead
+        (see `tree_sample_mask`).
 
         Args:
             key: rng
             collection_state: current collection state
             train_state: current training state
             num_steps: number of training steps to perform
+            epoch: the current epoch, which sets the replay window, and the share of tree positions
+                (see `TreePositions.ratio_at`)
 
         Returns:
             Tuple[CollectionState, TrainState, dict]:
@@ -519,43 +750,93 @@ class Trainer:
                 - metrics
 
         Raises:
-            ValueError: if no episode has finished yet, so there is nothing to sample
+            ValueError: if no episode has finished yet, or the replay window holds fewer samples than a
+                minibatch
         """
         if num_steps == 0:
             return collection_state, train_state, {}
+        window = self.replay_window.at(epoch)
         # the buffer doesn't change while training, so checking once covers every step
-        self.memory_buffer.check_can_sample(collection_state.buffer_state)
-        train_state, metrics = self.train_epoch(
-            key, collection_state.buffer_state, train_state, num_steps
+        self.memory_buffer.check_can_sample(
+            collection_state.buffer_state, window, self.train_batch_size
         )
+        if self.tree_positions is None:
+            train_state, metrics = self.train_epoch(
+                key,
+                collection_state.buffer_state,
+                train_state,
+                num_steps,
+                jnp.array(window, dtype=jnp.int32),
+            )
+            return collection_state, train_state, metrics
+        tree_mask = self.tree_sample_mask(collection_state, epoch)
+        num_tree = (
+            self.tree_positions.batch_count(epoch, self.train_batch_size)
+            if tree_mask.any()
+            else 0
+        )
+        train_state, metrics = self.train_epoch(
+            key,
+            collection_state.buffer_state,
+            train_state,
+            num_steps,
+            jnp.array(window, dtype=jnp.int32),
+            tree_buffer_state=collection_state.tree_buffer_state,
+            tree_mask=tree_mask,
+            num_tree=jnp.array(num_tree, dtype=jnp.int32),
+        )
+        metrics = {
+            **metrics,
+            "tree_batch_fraction": jnp.array(num_tree / self.train_batch_size),
+            "tree_buffer_samples": tree_mask.sum(),
+        }
         return collection_state, train_state, metrics
 
-    def selfplay_metrics(self, before: CollectionState, after: CollectionState) -> dict:
+    def selfplay_metrics(
+        self, before: CollectionState, after: CollectionState, epoch: int = 0
+    ) -> dict:
         """Measures how varied self-play is, to spot it collapsing into the same few games.
 
         Args:
             before: collection state before this epoch's self-play
             after: collection state after it
+            epoch: the epoch, which sets the replay window
 
         Returns:
             dict: metrics
                 - `selfplay_episodes`: episodes that terminated in between
                 - `selfplay_draw_fraction`: fraction of them that ended with every reward 0
                   (draws, in two-player zero-sum games), omitted if none terminated
-                - `buffer_distinct_positions`: distinct observations among the experiences the
-                  replay buffer can sample (data transforms' outputs count as observations too)
+                - `replay_window`: entries per environment training samples from (see `replay_window`)
+                - `buffer_samples`: experiences in the replay window training can sample
+                - `buffer_distinct_positions`: distinct observations among them (data
+                  transforms' outputs count as observations too)
                 - `buffer_distinct_fraction`: that as a fraction of those experiences
+                - with `tree_positions`: `tree_positions` stored in between (not counting transformed
+                  copies), `tree_positions_per_move`, and their `tree_mean_visits`
         """
         episodes = (after.episodes - before.episodes).sum()
         draws = (after.draws - before.draws).sum()
-        distinct, total = self.count_distinct_observations(after.buffer_state)
+        window = self.replay_window.at(epoch)
+        distinct, total = self.count_distinct_observations(
+            after.buffer_state, jnp.array(window, dtype=jnp.int32)
+        )
         metrics = {
             "selfplay_episodes": episodes,
+            "replay_window": jnp.array(window),
+            "buffer_samples": total,
             "buffer_distinct_positions": distinct,
             "buffer_distinct_fraction": distinct / jnp.maximum(total, 1),
         }
         if episodes > 0:
             metrics["selfplay_draw_fraction"] = draws / episodes
+        if self.tree_positions is not None:
+            positions = (after.tree_positions - before.tree_positions).sum()
+            visits = (after.tree_visits - before.tree_visits).sum()
+            moves = self.collection_steps_per_epoch * after.tree_positions.size
+            metrics["tree_positions"] = positions
+            metrics["tree_positions_per_move"] = positions / max(moves, 1)
+            metrics["tree_mean_visits"] = visits / jnp.maximum(positions, 1)
         return metrics
 
     def log_metrics(self, metrics: dict, epoch: int):
@@ -651,6 +932,7 @@ class Trainer:
             policy_weights=jnp.zeros_like(metadata.action_mask, dtype=jnp.float32),
             reward=jnp.zeros_like(metadata.rewards),
             cur_player_id=metadata.cur_player_id,
+            search_value=jnp.zeros((), dtype=jnp.float32),
         )
 
     def init_eval_state(self, evaluator: Evaluator, batch_size: int) -> Any:
@@ -687,6 +969,11 @@ class Trainer:
         template_experience = self.make_template_experience()
         # init buffer state
         buffer_state = self.memory_buffer.init(batch_size, template_experience)
+        tree_buffer_state = (
+            self.tree_buffer.init(batch_size, template_experience)
+            if self.tree_buffer is not None
+            else None
+        )
         # init env state
         env_init_key, key = jax.random.split(key)
         env_keys = jax.random.split(env_init_key, batch_size)
@@ -701,6 +988,15 @@ class Trainer:
             metadata=metadata,
             episodes=jnp.zeros((batch_size,), dtype=jnp.int32),
             draws=jnp.zeros((batch_size,), dtype=jnp.int32),
+            tree_positions=jnp.zeros((batch_size,), dtype=jnp.int32),
+            tree_visits=jnp.zeros((batch_size,), dtype=jnp.int32),
+            moves=jnp.zeros((batch_size,), dtype=jnp.int32),
+            tree_buffer_state=tree_buffer_state,
+            tree_written_at=jnp.zeros(
+                (batch_size, self.tree_buffer.capacity), dtype=jnp.int32
+            )
+            if self.tree_buffer is not None
+            else None,
         )
 
     def follow_schedule(
@@ -849,7 +1145,7 @@ class Trainer:
                 evaluator=evaluator,
             )
             selfplay_metrics = self.selfplay_metrics(
-                prev_collection_state, collection_state
+                prev_collection_state, collection_state, cur_epoch
             )
             if isinstance(evaluator, MCTS):
                 selfplay_metrics["selfplay_iterations"] = jnp.asarray(
@@ -859,7 +1155,11 @@ class Trainer:
             self.set_activity(f"epoch {cur_epoch}: training")
             train_key, key = jax.random.split(key)
             collection_state, train_state, metrics = self.train_steps(
-                train_key, collection_state, train_state, self.train_steps_per_epoch
+                train_key,
+                collection_state,
+                train_state,
+                self.train_steps_per_epoch,
+                epoch=cur_epoch,
             )
             params = self.extract_model_params_fn(train_state)
             # log metrics
