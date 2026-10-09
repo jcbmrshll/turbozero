@@ -111,15 +111,22 @@ SYMMETRY_TRANSFORM_FNS = [
 ]
 
 
-def make_network(num_blocks: int, num_channels: int, seed: int = 0):
+def make_network(
+    num_blocks: int,
+    num_channels: int,
+    seed: int = 0,
+    inference_dtype: str = "float32",
+):
     """The residual network from the AlphaZero paper; any equinox module works (see
     core.networks.utils.apply_nn). It uses BatchNorm, so it's created along with its
-    state: returns (network, state)."""
+    state: returns (network, state). It computes in `inference_dtype` when it isn't
+    training, e.g. in self-play."""
     return eqx.nn.make_with_state(AZResnet)(
         AZResnetConfig(
             policy_head_out_size=env.num_actions,
             num_blocks=num_blocks,
             num_channels=num_channels,
+            inference_dtype=inference_dtype,
         ),
         # pgx types observation_shape as Tuple[int, ...]; for board games it's (height, width, channels)
         cast(tuple[int, int, int], env.observation_shape),
@@ -135,14 +142,18 @@ def make_optimizer(total_steps: int) -> optax.GradientTransformation:
     )
 
 
-def load_checkpoint(path: str, num_blocks: int, num_channels: int):
+def load_checkpoint(
+    path: str, num_blocks: int, num_channels: int, inference_dtype: str = "float32"
+):
     """Loads the network saved in a training checkpoint (see `train.py`).
 
     Returns:
         (network, (params, network state)): the network, and the parameters and state
         to evaluate it with, as `core.evaluators.evaluation_fns.make_nn_eval_fn` takes them
     """
-    network, network_state = make_network(num_blocks, num_channels)
+    network, network_state = make_network(
+        num_blocks, num_channels, inference_dtype=inference_dtype
+    )
     params = eqx.filter(network, eqx.is_inexact_array)
     # the optimizer state's structure doesn't depend on the schedule's length
     template = TrainState(

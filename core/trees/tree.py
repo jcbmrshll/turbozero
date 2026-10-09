@@ -204,6 +204,35 @@ class Tree[NodeType]:
             ),
         )
 
+    def path_to_root(self, index: ArrayLike) -> jax.Array:
+        """The nodes on the path from a node up to the root: the node, its parent, its parent's parent, and
+        so on up to the root, then NULL_INDEX for the rest of the `capacity` entries.
+
+        Found by pointer jumping rather than by following parents one at a time, so it takes the same
+        work for every path: under vmap, a loop up each tree's path would run until the longest path in
+        the batch was done, and on GPU every iteration of a loop waits on the host.
+
+        Args:
+            index: the index of the node to start from.
+
+        Returns:
+            jax.Array: (capacity,) the path's node indices, padded with NULL_INDEX.
+        """
+        # `capacity` stands in for NULL_INDEX (the root's parent), and is its own parent
+        sentinel = self.capacity
+        up = jnp.append(
+            jnp.where(self.parents == self.NULL_INDEX, sentinel, self.parents),
+            sentinel,
+        )
+        # entry i of the path is i levels above `index`: jump 2^k levels for each bit k of i,
+        # with `up` pointing 2^k levels up at the k-th jump
+        levels = jnp.arange(self.capacity)
+        path = jnp.full((self.capacity,), index, dtype=up.dtype)
+        for k in range(max(1, (self.capacity - 1).bit_length())):
+            path = jnp.where((levels >> k) & 1, up[path], path)
+            up = up[up]
+        return jnp.where(path == sentinel, self.NULL_INDEX, path)
+
     def _get_translation(
         self, child_index: ArrayLike
     ) -> tuple[jax.Array, jax.Array, jax.Array]:

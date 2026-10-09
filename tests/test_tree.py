@@ -309,3 +309,37 @@ def test_get_subtree_reused_over_several_steps(get_subtree, seed):
             tree = tree.add_node(p, e, node(v))
             num_nodes = idx + 1
         assert_trees_equal(tree, build_tree(num_nodes, parents, edge_map, values))
+
+
+# path_to_root vs. following parents one at a time
+
+
+def reference_path(parents, index):
+    path = []
+    while index != Tree.NULL_INDEX:
+        path.append(index)
+        index = parents[index]
+    return path + [Tree.NULL_INDEX] * (len(parents) - len(path))
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_path_to_root_matches_reference(seed):
+    rng = random.Random(seed)
+    tree = random_tree(rng, max_nodes=rng.choice([1, 2, 12, 33]))
+    num_nodes, parents = tree[0], tree[1]
+    path_to_root = jax.jit(build_tree(*tree).path_to_root)
+    for index in range(num_nodes):
+        np.testing.assert_array_equal(
+            path_to_root(index), reference_path(parents, index)
+        )
+
+
+@pytest.mark.parametrize("max_nodes", [2, 3, 64, 257])
+def test_path_to_root_of_deep_chain(max_nodes):
+    # one long path from the root: depth == capacity - 1
+    parents = [Tree.NULL_INDEX] + list(range(max_nodes - 1))
+    edge_map = [[Tree.NULL_INDEX] * BRANCHING for _ in range(max_nodes)]
+    tree = build_tree(max_nodes, parents, edge_map, [0.0] * max_nodes)
+    np.testing.assert_array_equal(
+        tree.path_to_root(max_nodes - 1), list(range(max_nodes - 1, -1, -1))
+    )

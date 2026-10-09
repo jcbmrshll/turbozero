@@ -9,7 +9,6 @@ from jax.typing import ArrayLike
 from core.evaluators.evaluator import Evaluator
 from core.evaluators.mcts.action_selection import MCTSActionSelector
 from core.evaluators.mcts.state import (
-    BackpropState,
     MCTSNode,
     MCTSOutput,
     MCTSTree,
@@ -282,28 +281,29 @@ class MCTS(Evaluator):
             MCTSTree: updated search tree
         """
 
-        def body_fn(state: BackpropState) -> BackpropState:
-            node_idx, value, stats = state.node_idx, state.value, state.stats
-            # apply discount to value estimate
-            value *= self.discount
-            node = jax.tree.map(lambda x: x[node_idx], stats)
-            # increment visit count and update value estimate
-            new_node = self.visit_node(node, value)
-            stats = jax.tree.map(lambda x, y: x.at[node_idx].set(y), stats, new_node)
-            # go to parent
-            return BackpropState(
-                node_idx=tree.parents[node_idx], value=value, stats=stats
+        # every node from `parent` up to the root is visited once, all at the same time (rather than
+        # in a loop up the path, see `Tree.path_to_root`)
+        path = tree.path_to_root(parent)
+        # the value is discounted once more at each level up
+        if abs(self.discount) == 1:
+            # flip signs rather than multiply: exactly the values a loop up the path computes, and
+            # without a product XLA could fuse into the update below (an FMA rounds differently)
+            levels = jnp.arange(1, tree.capacity + 1)
+            values = jnp.where(
+                (self.discount == -1) & (levels % 2 == 1), jnp.negative(value), value
             )
-
-        # backpropagate while the node is a valid node
-        # the root has no parent, so the loop will terminate
-        # when the parent of the root is visited
-        state = jax.lax.while_loop(
-            lambda s: s.node_idx != tree.NULL_INDEX,
-            body_fn,
-            BackpropState(node_idx=parent, value=value, stats=backprop_stats(tree)),
+        else:
+            values = value * jnp.cumprod(jnp.full(path.shape, self.discount))
+        # entries past the root point out of bounds, so their writes are dropped
+        index = jnp.where(path == tree.NULL_INDEX, tree.capacity, path)
+        stats = backprop_stats(tree)
+        nodes = jax.tree.map(lambda x: x[index], stats)
+        # increment visit counts and update value estimates
+        visited = self.visit_node(nodes, values)
+        stats = jax.tree.map(
+            lambda x, y: x.at[index].set(y, mode="drop"), stats, visited
         )
-        return with_backprop_stats(tree, state.stats)
+        return with_backprop_stats(tree, stats)
 
     def sample_root_action(
         self, key: jax.Array, tree: MCTSTree
