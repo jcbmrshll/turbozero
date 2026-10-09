@@ -8,6 +8,7 @@ openings (see xot.py), which keeps them varied.
 
     uv run examples/othello/train.py
     uv run examples/othello/train.py --epochs 20 --monitor
+    uv run examples/othello/train.py --sims-schedule 0:32,50:64,150:128
 
 Start the monitor first, in another shell, with `uv run turbozero-monitor`. It shows
 the metrics, which rung of the ladder the agent has reached, and a game against the
@@ -56,8 +57,20 @@ from core.monitor import DEFAULT_URL, Monitor
 from core.monitor.renderers import pgx_two_player_episode
 from core.testing.ladder import LadderTester, Rung
 from core.training.loss_fns import az_default_loss_fn
+from core.training.schedule import EvaluatorSchedule, parse_schedule
 from core.training.train import Trainer
 from core.training.tree_positions import TreePositions
+
+
+def sims_schedule(text: str) -> list[tuple[int, int]]:
+    """Parses --sims-schedule."""
+    try:
+        schedule = parse_schedule(text)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+    if any(sims < 1 for _, sims in schedule):
+        raise argparse.ArgumentTypeError(f"iterations must be positive, got {text!r}")
+    return schedule
 
 
 def main():
@@ -66,8 +79,18 @@ def main():
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--blocks", type=int, default=6, help="residual blocks")
     parser.add_argument("--channels", type=int, default=128, help="channels per block")
-    parser.add_argument(
+    sims = parser.add_mutually_exclusive_group()
+    sims.add_argument(
         "--sims", type=int, default=64, help="MCTS iterations per self-play move"
+    )
+    sims.add_argument(
+        "--sims-schedule",
+        type=sims_schedule,
+        default=None,
+        metavar="EPOCH:SIMS,...",
+        help="MCTS iterations per self-play move by epoch instead, e.g. 0:32,50:64,150:128 "
+        "for 32 from epoch 0, 64 from epoch 50 and 128 from epoch 150. Each change "
+        "compiles self-play again, so keep them few",
     )
     parser.add_argument(
         "--train-batch",
@@ -206,14 +229,25 @@ def main():
     )
 
     # AlphaZero takes an arbitrary search backend, here classic MCTS. Temperature 1.0
-    # samples moves in proportion to visit counts, for exploration during self-play
-    evaluator = AlphaZero(MCTS)(
-        eval_fn=make_nn_eval_fn(resnet, state_to_nn_input),
-        num_iterations=args.sims,
-        max_nodes=2 * args.sims,
-        branching_factor=env.num_actions,
-        action_selector=PUCTSelector(),
-        temperature=1.0,
+    # samples moves in proportion to visit counts, for exploration during self-play.
+    # With --sims-schedule, a search for each stage: each takes over at its epoch,
+    # starting from empty trees sized for it (see core.training.schedule)
+    selfplay_eval_fn = make_nn_eval_fn(resnet, state_to_nn_input)
+    evaluator = EvaluatorSchedule(
+        [
+            (
+                epoch,
+                AlphaZero(MCTS)(
+                    eval_fn=selfplay_eval_fn,
+                    num_iterations=sims,
+                    max_nodes=2 * sims,
+                    branching_factor=env.num_actions,
+                    action_selector=PUCTSelector(),
+                    temperature=1.0,
+                ),
+            )
+            for epoch, sims in args.sims_schedule or [(0, args.sims)]
+        ]
     )
     evaluator_test = make_test_evaluator(make_nn_eval_fn(resnet, state_to_nn_input))
 

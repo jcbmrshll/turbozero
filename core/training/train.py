@@ -21,6 +21,7 @@ from core.memory.replay_memory import (
 from core.monitor import Monitor
 from core.testing.tester import BaseTester, TestState
 from core.training.exploration import SelfPlayExploration
+from core.training.schedule import EvaluatorSchedule, describe
 from core.training.tree_positions import (
     TreePositions,
     select_nodes,
@@ -132,7 +133,7 @@ class Trainer:
         nn: eqx.Module,
         loss_fn: LossFn,
         optimizer: optax.GradientTransformation,
-        evaluator: Evaluator,
+        evaluator: Evaluator | EvaluatorSchedule,
         memory_buffer: EpisodeReplayBuffer,
         max_episode_steps: int,
         env_step_fn: EnvStepFn,
@@ -164,7 +165,9 @@ class Trainer:
             nn: neural network (an equinox module, see core.networks.utils.apply_nn), training starts from its parameters
             loss_fn: loss function for training (see core.training.loss_fns)
             optimizer: optax optimizer
-            evaluator: the `Evaluator` to use during self-play
+            evaluator: the `Evaluator` to use during self-play, or an `EvaluatorSchedule` of evaluators
+                that take over from one another at given epochs (e.g. searching more MCTS iterations
+                later in training)
             memory_buffer: replay memory buffer class, used to store self-play experiences
             max_episode_steps: maximum number of steps in an episode. Self-play episodes still running after this many
                 steps are truncated and their experiences discarded; an episode that terminates on its last allowed step is kept.
@@ -173,7 +176,8 @@ class Trainer:
             state_to_nn_input_fn: function to convert environment state to neural network input
             testers: list of testers to evaluate the agent against (see core.testing.tester)
             nn_state: (optional) initial state of `nn` for stateful networks (e.g. with BatchNorm), from `eqx.nn.make_with_state`
-            evaluator_test: (optional) evaluator to use during testing. If not provided, `evaluator` is used.
+            evaluator_test: (optional) evaluator to use during testing. If not provided, `evaluator` is used
+                (required with a schedule of several evaluators).
             test_env_init_fn: (optional) environment initialization function for test episodes, e.g. to test from
                 the standard start while self-play starts from varied positions. If not provided, `env_init_fn` is used.
             selfplay_exploration: (optional) chooses the move self-play plays from the evaluator's output,
@@ -213,26 +217,23 @@ class Trainer:
         self.warmup_steps = warmup_steps
         self.collection_steps_per_epoch = collection_steps_per_epoch
         self.memory_buffer = memory_buffer
-        self.evaluator_train = evaluator
+        # a single evaluator is a schedule with one stage
+        self.selfplay_schedule = (
+            evaluator
+            if isinstance(evaluator, EvaluatorSchedule)
+            else EvaluatorSchedule([(0, evaluator)])
+        )
         self.transform_fns = data_transform_fns
         self.selfplay_exploration = selfplay_exploration
-        if tree_positions is not None and not isinstance(evaluator, MCTS):
-            raise ValueError("tree_positions needs an MCTS evaluator")
+        if tree_positions is not None and not all(
+            isinstance(e, MCTS) for _, e in self.selfplay_schedule.stages
+        ):
+            raise ValueError("tree_positions needs MCTS self-play evaluators")
         self.tree_positions = tree_positions
         self.tree_buffer = (
             EpisodeReplayBuffer(capacity=tree_positions.capacity)
             if tree_positions is not None
             else None
-        )
-        self.step_train = partial(
-            search_and_step,
-            evaluator=self.evaluator_train,
-            env_step_fn=self.env_step_fn,
-            env_init_fn=self.env_init_fn,
-            max_steps=self.max_episode_steps,
-            choose_action=selfplay_exploration.choose_action
-            if selfplay_exploration is not None
-            else None,
         )
         self.count_distinct_observations = jax.jit(
             self.memory_buffer.count_distinct_observations
@@ -242,9 +243,13 @@ class Trainer:
         self.train_batch_size = train_batch_size
         # testing
         self.testers = testers
-        self.evaluator_test = (
-            evaluator_test if evaluator_test is not None else evaluator
-        )
+        if evaluator_test is None:
+            if len(self.selfplay_schedule.stages) > 1:
+                raise ValueError(
+                    "pass an evaluator_test with a schedule of self-play evaluators"
+                )
+            evaluator_test = self.selfplay_schedule.at(0)
+        self.evaluator_test = evaluator_test
         self.step_test = partial(
             step_env_and_evaluator,
             evaluator=self.evaluator_test,
@@ -276,15 +281,26 @@ class Trainer:
         )
 
     def get_config(self):
-        """Returns a dictionary of the configuration of the trainer. Used for logging to the monitor."""
+        """Returns a dictionary of the configuration of the trainer. Used for logging to the monitor.
+
+        With a schedule of several self-play evaluators, `evaluator_train` is the first, and
+        `selfplay_schedule` lists them all.
+        """
+        evaluator_train = self.selfplay_schedule.at(0)
+        schedule = self.selfplay_schedule
         return {
             "batch_size": self.batch_size,
             "train_batch_size": self.train_batch_size,
             "warmup_steps": self.warmup_steps,
             "collection_steps_per_epoch": self.collection_steps_per_epoch,
             "train_steps_per_epoch": self.train_steps_per_epoch,
-            "evaluator_train": self.evaluator_train.__class__.__name__,
-            "evaluator_train_config": self.evaluator_train.get_config(),
+            "evaluator_train": evaluator_train.__class__.__name__,
+            "evaluator_train_config": evaluator_train.get_config(),
+            **(
+                {"selfplay_schedule": schedule.get_config()}
+                if len(schedule.stages) > 1
+                else {}
+            ),
             "evaluator_test": self.evaluator_test.__class__.__name__,
             "evaluator_test_config": self.evaluator_test.get_config(),
             "selfplay_exploration_config": self.selfplay_exploration.get_config()
@@ -298,7 +314,11 @@ class Trainer:
         }
 
     def collect(
-        self, key: jax.Array, state: CollectionState, params: Any
+        self,
+        key: jax.Array,
+        state: CollectionState,
+        params: Any,
+        evaluator: Evaluator | None = None,
     ) -> CollectionState:
         """Collects self-play data for a single step.
 
@@ -309,10 +329,14 @@ class Trainer:
             key: rng
             state: current collection state (environment, evaluator, replay buffer)
             params: model parameters
+            evaluator: (optional) the self-play evaluator, whose states `state` holds. If not
+                provided, the first in the schedule.
 
         Returns:
             CollectionState: updated collection state
         """
+        if evaluator is None:
+            evaluator = self.selfplay_schedule.at(0)
         tree_key = None
         if self.tree_positions is not None:
             key, tree_key = jax.random.split(key)
@@ -325,14 +349,21 @@ class Trainer:
             truncated,
             rewards,
             searched_eval_state,
-        ) = self.step_train(
+        ) = search_and_step(
             key=key,
             env_state=state.env_state,
             env_state_metadata=state.metadata,
             eval_state=state.eval_state,
             params=params,
+            evaluator=evaluator,
+            env_step_fn=self.env_step_fn,
+            env_init_fn=self.env_init_fn,
+            max_steps=self.max_episode_steps,
+            choose_action=self.selfplay_exploration.choose_action
+            if self.selfplay_exploration is not None
+            else None,
         )
-        search_value = self.evaluator_train.get_value(searched_eval_state)
+        search_value = evaluator.get_value(searched_eval_state)
 
         # store experience in replay buffer
         buffer_state = self.memory_buffer.add_experience(
@@ -384,7 +415,7 @@ class Trainer:
                 ],
             )
             state = self.store_tree_positions(
-                tree_key, state, searched_eval_state, reused
+                tree_key, state, searched_eval_state, reused, evaluator
             )
         # return new collection state
         return replace(
@@ -398,7 +429,12 @@ class Trainer:
         )
 
     def store_tree_positions(
-        self, key: jax.Array, state: CollectionState, tree: Any, reused: jax.Array
+        self,
+        key: jax.Array,
+        state: CollectionState,
+        tree: Any,
+        reused: jax.Array,
+        evaluator: Evaluator,
     ) -> CollectionState:
         """Stores positions from a self-play search tree in the tree position replay buffer
         (see `tree_positions`), with their transformed copies.
@@ -408,13 +444,14 @@ class Trainer:
             state: current collection state
             tree: the search tree, after the search
             reused: the root child whose subtree the next search reuses, NULL_INDEX for none
+            evaluator: the self-play evaluator that searched the tree
 
         Returns:
             CollectionState: updated collection state
         """
         assert self.tree_positions is not None and self.tree_buffer is not None
         assert state.tree_buffer_state is not None
-        assert isinstance(self.evaluator_train, MCTS)
+        assert isinstance(evaluator, MCTS)
         indices, valid = select_nodes(
             key,
             tree,
@@ -422,7 +459,7 @@ class Trainer:
             self.tree_positions.min_visits,
             self.tree_positions.most_visited,
             reused
-            if self.tree_positions.discarded_only and self.evaluator_train.persist_tree
+            if self.tree_positions.discarded_only and evaluator.persist_tree
             else None,
         )
         experiences, valid_experiences = tree_experiences(
@@ -443,17 +480,30 @@ class Trainer:
             + jnp.where(valid, tree.data.n[indices], 0).sum(),
         )
 
-    @partial(jax.jit, static_argnums=(0, 4))
+    # the evaluator is a static argument, rather than read from `self` while tracing: `self` is
+    # static too, but hashes by identity, so a compiled function reading an attribute of `self`
+    # would keep running for a new value of the attribute
+    @partial(jax.jit, static_argnums=(0, 4), static_argnames=("evaluator",))
     def collect_steps(
-        self, key: jax.Array, state: CollectionState, params: Any, num_steps: int
+        self,
+        key: jax.Array,
+        state: CollectionState,
+        params: Any,
+        num_steps: int,
+        *,
+        evaluator: Evaluator | None = None,
     ) -> CollectionState:
         """Collects self-play data for `num_steps` steps in every environment.
+
+        Compiled once for each evaluator.
 
         Args:
             key: rng, one key per environment
             state: current collection state
             params: model parameters
             num_steps: number of self-play steps to collect
+            evaluator: (optional) the self-play evaluator, whose states `state` holds. If not
+                provided, the first in the schedule.
 
         Returns:
             CollectionState: updated collection state
@@ -463,7 +513,10 @@ class Trainer:
             def collect_env(key: jax.Array, state: CollectionState) -> CollectionState:
                 keys = jax.random.split(key, num_steps)
                 return jax.lax.fori_loop(
-                    0, num_steps, lambda i, s: self.collect(keys[i], s, params), state
+                    0,
+                    num_steps,
+                    lambda i, s: self.collect(keys[i], s, params, evaluator),
+                    state,
                 )
 
             return jax.vmap(collect_env)(key, state)
@@ -794,16 +847,36 @@ class Trainer:
             search_value=jnp.zeros((), dtype=jnp.float32),
         )
 
-    def init_collection_state(self, key: jax.Array, batch_size: int) -> CollectionState:
+    def init_eval_state(self, evaluator: Evaluator, batch_size: int) -> Any:
+        """Initializes a self-play evaluator's states, one per environment.
+
+        Args:
+            evaluator: the self-play evaluator
+            batch_size: number of parallel environments
+
+        Returns:
+            pytree: the evaluator's states
+        """
+        return evaluator.init_batched(
+            batch_size, template_embedding=self.template_env_state
+        )
+
+    def init_collection_state(
+        self, key: jax.Array, batch_size: int, evaluator: Evaluator | None = None
+    ) -> CollectionState:
         """Initializes the collection state (see CollectionState).
 
         Args:
             key: rng
             batch_size: number of parallel environments
+            evaluator: (optional) the self-play evaluator to initialize states for. If not
+                provided, the first in the schedule.
 
         Returns:
             CollectionState: initialized collection state
         """
+        if evaluator is None:
+            evaluator = self.selfplay_schedule.at(0)
         # make template experience
         template_experience = self.make_template_experience()
         # init buffer state
@@ -818,9 +891,7 @@ class Trainer:
         env_keys = jax.random.split(env_init_key, batch_size)
         env_state, metadata = jax.vmap(self.env_init_fn)(env_keys)
         # init evaluator state
-        eval_state = self.evaluator_train.init_batched(
-            batch_size, template_embedding=self.template_env_state
-        )
+        eval_state = self.init_eval_state(evaluator, batch_size)
         # return collection state
         return CollectionState(
             eval_state=eval_state,
@@ -833,6 +904,34 @@ class Trainer:
             tree_visits=jnp.zeros((batch_size,), dtype=jnp.int32),
             tree_buffer_state=tree_buffer_state,
         )
+
+    def follow_schedule(
+        self, epoch: int, evaluator: Evaluator, collection_state: CollectionState
+    ) -> tuple[Evaluator, CollectionState]:
+        """Switches self-play to the evaluator scheduled for `epoch`, if it isn't `evaluator`.
+
+        The new evaluator's states replace the old one's, initialized from scratch: they may
+        differ in shape (e.g. MCTS trees with a different `max_nodes`). Games in progress
+        carry on. Self-play is compiled again for the new evaluator, the first time it plays.
+
+        Args:
+            epoch: the epoch about to start
+            evaluator: the evaluator whose states `collection_state` holds
+            collection_state: current collection state
+
+        Returns:
+            Tuple[Evaluator, CollectionState]: the evaluator for `epoch`, and the collection
+                state with its states
+        """
+        scheduled = self.selfplay_schedule.at(epoch)
+        if scheduled is evaluator:
+            return evaluator, collection_state
+        self.set_activity(
+            f"epoch {epoch}: self-play switches to {describe(scheduled)} (compiling)",
+            echo=True,
+        )
+        eval_state = self.init_eval_state(scheduled, collection_state.episodes.shape[0])
+        return scheduled, replace(collection_state, eval_state=eval_state)
 
     def train_loop(
         self,
@@ -852,6 +951,8 @@ class Trainer:
             num_epochs: number of epochs to run the training loop for
             eval_every: number of epochs between evaluations
             initial_state: (optional) TrainLoopOutput, used to continue training from a previous state
+                - its collection state must hold the states of the self-play evaluator scheduled for
+                  the epoch before `initial_state.cur_epoch`, as one this trainer returned does
 
         Returns:
             TrainLoopOutput: contains train_state, collection_state, test_states, cur_epoch after training loop
@@ -898,11 +999,16 @@ class Trainer:
             cur_epoch = initial_state.cur_epoch
             # don't replay the keys the original run used from epoch 0
             key = jax.random.fold_in(key, cur_epoch)
+            # the evaluator whose states the collection state holds
+            evaluator = self.selfplay_schedule.at(max(cur_epoch - 1, 0))
         else:
             cur_epoch = 0
             # initialize collection state
+            evaluator = self.selfplay_schedule.at(0)
             init_key, key = jax.random.split(key)
-            collection_state = self.init_collection_state(init_key, self.batch_size)
+            collection_state = self.init_collection_state(
+                init_key, self.batch_size, evaluator
+            )
             # initialize train state
             train_state = self.init_train_state()
             params = self.extract_model_params_fn(train_state)
@@ -911,28 +1017,46 @@ class Trainer:
 
         # warmup
         # populate replay buffer with initial self-play games
+        evaluator, collection_state = self.follow_schedule(
+            cur_epoch, evaluator, collection_state
+        )
         if self.warmup_steps > 0:
             self.set_activity(f"warmup self-play ({self.warmup_steps} steps)")
         params = self.extract_model_params_fn(train_state)
         collect_key, key = jax.random.split(key)
         collect_keys = jax.random.split(collect_key, self.batch_size)
         collection_state = self.collect_steps(
-            collect_keys, collection_state, params, self.warmup_steps
+            collect_keys,
+            collection_state,
+            params,
+            self.warmup_steps,
+            evaluator=evaluator,
         )
 
         # training loop
         while cur_epoch < num_epochs:
             # collect self-play games
+            evaluator, collection_state = self.follow_schedule(
+                cur_epoch, evaluator, collection_state
+            )
             collect_key, key = jax.random.split(key)
             collect_keys = jax.random.split(collect_key, self.batch_size)
             prev_collection_state = collection_state
             self.set_activity(f"epoch {cur_epoch}: self-play")
             collection_state = self.collect_steps(
-                collect_keys, collection_state, params, self.collection_steps_per_epoch
+                collect_keys,
+                collection_state,
+                params,
+                self.collection_steps_per_epoch,
+                evaluator=evaluator,
             )
             selfplay_metrics = self.selfplay_metrics(
                 prev_collection_state, collection_state
             )
+            if isinstance(evaluator, MCTS):
+                selfplay_metrics["selfplay_iterations"] = jnp.asarray(
+                    evaluator.num_iterations
+                )
             # train
             self.set_activity(f"epoch {cur_epoch}: training")
             train_key, key = jax.random.split(key)
