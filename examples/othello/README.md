@@ -34,6 +34,17 @@ epochs; past that, play it against Edax instead (`--eval-every 0` turns the ladd
 off, and `watch.py`, below, plays an engine as it trains). See `--help` for the
 network size, search budget and number of epochs.
 
+The self-play search budget can grow over a run: `--sims-schedule 0:32,50:64,150:128`
+searches 32 iterations a move from epoch 0, 64 from epoch 50 and 128 from epoch 150,
+instead of `--sims` throughout. OLIVAW did this in three stages, doubling each time:
+100 iterations a move, 200 from about generation 4 and 400 from about generation 11,
+of 20 (`0:100,4:200,11:400`, counting its generations as epochs).
+Cheap searches are enough while the network learns the basics, and deeper ones refine
+its policy later. Each change compiles self-play again, as the first epoch does, so
+keep changes few; games in progress carry on, searching from new, empty trees. Test
+games, `eval_pgx.py`, `vs_engine.py` and `watch.py` keep their own budgets. The
+monitor plots the budget as `selfplay_iterations`.
+
 On one RTX 5080, with the defaults (a 6-block, 128-channel network), an epoch takes
 about 63 seconds. One 200-epoch run (with epochs then taking about 70 seconds) passed
 every rung of the ladder by epoch 65. With `--inference-dtype bfloat16` the network

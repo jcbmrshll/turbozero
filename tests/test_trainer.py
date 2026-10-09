@@ -24,27 +24,75 @@ from core.monitor.renderers import pgx_two_player_episode
 from core.networks.azresnet import AZResnet, AZResnetConfig
 from core.testing.two_player_tester import TwoPlayerTester
 from core.training.loss_fns import az_default_loss_fn
+from core.training.schedule import EvaluatorSchedule
 from core.training.train import Trainer, checkpoint_epochs, extract_params
 
 # warmup is longer than a tic-tac-toe game, so the buffer holds finished episodes before training starts
 STEPS_PER_EPOCH = 10
 
 
-def make_trainer(ttt, ckpt_dir, **kwargs):
+class RootVisitCounter(AlphaZero(MCTS)):
+    """AlphaZero that appends to `root_visits_added` how many visits each search adds to the
+    root's children: its number of iterations, given a tree with room for every node the
+    search adds."""
+
+    def __init__(self, root_visits_added: list, **kwargs):
+        super().__init__(**kwargs)
+        self.root_visits_added = root_visits_added
+
+    def evaluate(
+        self, key, eval_state, env_state, root_metadata, params, env_step_fn, **kwargs
+    ):
+        def root_visits(tree):
+            return tree.get_child_data("n", tree.ROOT_INDEX).sum()
+
+        output = super().evaluate(
+            key, eval_state, env_state, root_metadata, params, env_step_fn, **kwargs
+        )
+        jax.debug.callback(
+            lambda n: self.root_visits_added.extend(np.ravel(n).tolist()),
+            root_visits(output.eval_state) - root_visits(eval_state),
+        )
+        return output
+
+
+def make_trainer(ttt, ckpt_dir, schedule=None, root_visits_added=None, **kwargs):
+    """A Trainer for tic-tac-toe. With `schedule`, (first epoch, num_iterations, max_nodes)
+    triples, self-play follows a schedule of `RootVisitCounter`s that record to
+    `root_visits_added`."""
     config = AZResnetConfig(
         policy_head_out_size=ttt.num_actions, num_blocks=1, num_channels=4
     )
     net, nn_state = eqx.nn.make_with_state(AZResnet)(
         config, ttt.env.observation_shape, key=jax.random.PRNGKey(0)
     )
+    evaluator_kwargs = {
+        "eval_fn": make_nn_eval_fn(net, ttt.state_to_nn_input),
+        "branching_factor": ttt.num_actions,
+        "action_selector": PUCTSelector(),
+    }
     make_evaluator = partial(
-        AlphaZero(MCTS),
-        eval_fn=make_nn_eval_fn(net, ttt.state_to_nn_input),
-        num_iterations=4,
-        max_nodes=8,
-        branching_factor=ttt.num_actions,
-        action_selector=PUCTSelector(),
+        AlphaZero(MCTS), num_iterations=4, max_nodes=8, **evaluator_kwargs
     )
+    evaluator = (
+        make_evaluator(temperature=1.0)
+        if schedule is None
+        else EvaluatorSchedule(
+            [
+                (
+                    epoch,
+                    RootVisitCounter(
+                        root_visits_added if root_visits_added is not None else [],
+                        num_iterations=n,
+                        max_nodes=m,
+                        **evaluator_kwargs,
+                    ),
+                )
+                for epoch, n, m in schedule
+            ]
+        )
+    )
+    kwargs = {"evaluator_test": make_evaluator(temperature=0.0), **kwargs}
     return Trainer(
         batch_size=2,
         train_batch_size=4,
@@ -55,8 +103,7 @@ def make_trainer(ttt, ckpt_dir, **kwargs):
         nn_state=nn_state,
         loss_fn=partial(az_default_loss_fn, l2_reg_lambda=1e-4),
         optimizer=optax.adam(1e-3),
-        evaluator=make_evaluator(temperature=1.0),
-        evaluator_test=make_evaluator(temperature=0.0),
+        evaluator=evaluator,
         memory_buffer=EpisodeReplayBuffer(capacity=32),
         max_episode_steps=10,
         env_step_fn=ttt.step_fn,
@@ -148,9 +195,9 @@ def test_self_play_uses_latest_params(trainer, monkeypatch):
     collected, trained_params = [], []
     collect_steps, train_steps = trainer.collect_steps, trainer.train_steps
 
-    def spy_collect_steps(key, state, params, num_steps):
+    def spy_collect_steps(key, state, params, num_steps, **kwargs):
         collected.append(params)
-        return collect_steps(key, state, params, num_steps)
+        return collect_steps(key, state, params, num_steps, **kwargs)
 
     def spy_train_steps(*args, **kwargs):
         collection_state, train_state, metrics = train_steps(*args, **kwargs)
@@ -206,6 +253,7 @@ def test_train_loop_logs_to_monitor(trainer, monitor_server, monkeypatch):
             "value_loss",
             "TwoPlayerTester_avg_outcome",
             "selfplay_episodes",
+            "selfplay_iterations",
             "buffer_distinct_positions",
             "buffer_distinct_fraction",
         } <= logged
@@ -334,4 +382,111 @@ def test_train_steps_without_finished_episodes_raises(trainer):
     with pytest.raises(ValueError, match="no episodes have finished"):
         trainer.train_steps(
             jax.random.PRNGKey(0), collection_state, trainer.init_train_state(), 1
+        )
+
+
+@pytest.fixture
+def scheduled(ttt, tmp_path, monkeypatch):
+    """`scheduled(schedule)`: a Trainer whose self-play follows `schedule` (see `make_trainer`),
+    and the visits each `collect_steps` call's searches added to the root, one set per call."""
+
+    def make(schedule):
+        root_visits_added, calls = [], []
+        trainer = make_trainer(
+            ttt,
+            tmp_path / "ckpt",
+            schedule=schedule,
+            root_visits_added=root_visits_added,
+        )
+        collect_steps = trainer.collect_steps
+
+        def spy_collect_steps(*args, **kwargs):
+            state = collect_steps(*args, **kwargs)
+            # wait for the searches' callbacks
+            jax.effects_barrier()
+            calls.append(set(root_visits_added))
+            root_visits_added.clear()
+            return state
+
+        monkeypatch.setattr(trainer, "collect_steps", spy_collect_steps)
+        return trainer, calls
+
+    return make
+
+
+def capacity(collection_state):
+    return collection_state.eval_state.parents.shape[-1]
+
+
+def test_schedule_switch_changes_the_search(scheduled):
+    # both stages' trees are the same size, so the switch changes no array shapes: if
+    # self-play kept running the first stage's compiled search, only the root's visit counts
+    # would show it
+    trainer, calls = scheduled([(0, 2, 64), (1, 6, 64)])
+
+    trainer.train_loop(seed=0, num_epochs=3)
+
+    # warmup, then epochs 0, 1, 2
+    assert calls == [{2}, {2}, {6}, {6}]
+
+
+def test_schedule_switch_reinitializes_search_trees(scheduled):
+    trainer, calls = scheduled([(0, 2, 32), (1, 6, 64)])
+
+    out = trainer.train_loop(seed=0, num_epochs=2)
+
+    assert calls == [{2}, {2}, {6}]
+    assert capacity(out.collection_state) == 64
+
+
+def test_continuing_across_a_schedule_switch(scheduled):
+    trainer, calls = scheduled([(0, 2, 32), (1, 6, 64)])
+
+    first = trainer.train_loop(seed=0, num_epochs=1)
+    assert capacity(first.collection_state) == 32
+    calls.clear()
+    # continues into the second stage, then within it
+    second = trainer.train_loop(seed=0, num_epochs=2, initial_state=first)
+    assert capacity(second.collection_state) == 64
+    third = trainer.train_loop(seed=0, num_epochs=3, initial_state=second)
+    assert capacity(third.collection_state) == 64
+    # each continuation starts with a warmup
+    assert calls == [{6}, {6}, {6}, {6}]
+    assert checkpoint_epochs(trainer.ckpt_dir) == [1, 2]
+
+
+def test_schedule_logs_iterations_and_config(scheduled, monkeypatch):
+    trainer, _ = scheduled([(0, 2, 32), (1, 6, 64)])
+    logged = {}
+    monkeypatch.setattr(
+        trainer, "log_metrics", lambda metrics, epoch: logged.setdefault(epoch, metrics)
+    )
+    activities = []
+    monkeypatch.setattr(
+        trainer, "set_activity", lambda text, echo=False: activities.append(text)
+    )
+
+    trainer.train_loop(seed=0, num_epochs=2)
+
+    assert [int(logged[epoch]["selfplay_iterations"]) for epoch in (0, 1)] == [2, 6]
+    assert (
+        "epoch 1: self-play switches to RootVisitCounter, 6 iterations a move "
+        "(compiling)" in activities
+    )
+    config = trainer.get_config()
+    assert config["evaluator_train_config"]["num_iterations"] == 2
+    assert [
+        (
+            stage["epoch"],
+            stage["config"]["num_iterations"],
+            stage["config"]["max_nodes"],
+        )
+        for stage in config["selfplay_schedule"]
+    ] == [(0, 2, 32), (1, 6, 64)]
+
+
+def test_schedule_needs_a_test_evaluator(ttt, tmp_path):
+    with pytest.raises(ValueError, match="evaluator_test"):
+        make_trainer(
+            ttt, tmp_path, schedule=[(0, 2, 4), (1, 4, 8)], evaluator_test=None
         )
