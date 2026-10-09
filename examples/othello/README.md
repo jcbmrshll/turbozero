@@ -45,6 +45,24 @@ keep changes few; games in progress carry on, searching from new, empty trees. T
 games, `eval_pgx.py`, `vs_engine.py` and `watch.py` keep their own budgets. The
 monitor plots the budget as `selfplay_iterations`.
 
+So can the replay window, how far back in replay memory training samples:
+`--buffer-schedule 0:1000,20:3000,35:6000` samples from each environment's newest 1000
+samples from epoch 0, 3000 from epoch 20 and 6000 from epoch 35, instead of `--buffer`'s
+throughout. Self-play adds 1024 an epoch (128 moves, each with its 7 symmetric copies),
+so that's about the last epoch, then the last 3, then the last 6. Early on the network
+changes quickly and older data is stale; later it's nearly as good as new, and the
+extra variety steadies training. OLIVAW widened its window from the last 2 generations
+to the last 5, and KataGo grows its window with the total amount of data. Replay memory
+holds the largest window throughout, and changing the window doesn't compile anything
+again. The monitor plots it as `replay_window`, and the samples in it as
+`buffer_samples`.
+
+The window sets how old the data training samples is, not how often each sample is
+trained on: on average, that's the samples training takes each epoch over the samples
+self-play adds, whatever the window. With the defaults, 128 steps of 4096 samples
+against 1024 environments adding 1024 samples each, it's 0.5. `--train-steps` changes
+it (or `--train-batch`).
+
 On one RTX 5080, with the defaults (a 6-block, 128-channel network), an epoch takes
 about 63 seconds. One 200-epoch run (with epochs then taking about 70 seconds) passed
 every rung of the ladder by epoch 65. With `--inference-dtype bfloat16` the network

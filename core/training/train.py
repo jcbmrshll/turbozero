@@ -21,7 +21,7 @@ from core.memory.replay_memory import (
 from core.monitor import Monitor
 from core.testing.tester import BaseTester, TestState
 from core.training.exploration import SelfPlayExploration
-from core.training.schedule import EvaluatorSchedule, describe
+from core.training.schedule import EvaluatorSchedule, Schedule, describe
 from core.types import (
     DataTransformFn,
     EnvInitFn,
@@ -129,6 +129,7 @@ class Trainer:
         state_to_nn_input_fn: StateToNNInputFn,
         testers: Sequence[BaseTester],
         nn_state: eqx.nn.State | None = None,
+        replay_window: int | Schedule[int] | None = None,
         evaluator_test: Evaluator | None = None,
         test_env_init_fn: EnvInitFn | None = None,
         selfplay_exploration: SelfPlayExploration | None = None,
@@ -163,6 +164,10 @@ class Trainer:
             state_to_nn_input_fn: function to convert environment state to neural network input
             testers: list of testers to evaluate the agent against (see core.testing.tester)
             nn_state: (optional) initial state of `nn` for stateful networks (e.g. with BatchNorm), from `eqx.nn.make_with_state`
+            replay_window: (optional) how many of each environment's newest replay buffer entries training samples
+                from, at most `memory_buffer.capacity`, or a `Schedule` of it by epoch, e.g. to sample only recent
+                data early on, while the network changes quickly, and more later. Changing it doesn't recompile.
+                If not provided, the whole buffer.
             evaluator_test: (optional) evaluator to use during testing. If not provided, `evaluator` is used
                 (required with a schedule of several evaluators).
             test_env_init_fn: (optional) environment initialization function for test episodes, e.g. to test from
@@ -201,6 +206,22 @@ class Trainer:
         self.warmup_steps = warmup_steps
         self.collection_steps_per_epoch = collection_steps_per_epoch
         self.memory_buffer = memory_buffer
+        # a constant window is a schedule with one stage
+        if replay_window is None:
+            replay_window = memory_buffer.capacity
+        self.replay_window = (
+            replay_window
+            if isinstance(replay_window, Schedule)
+            else Schedule([(0, replay_window)])
+        )
+        if not all(
+            0 < window <= memory_buffer.capacity
+            for _, window in self.replay_window.stages
+        ):
+            raise ValueError(
+                f"replay windows must be between 1 and the replay buffer's capacity, "
+                f"{memory_buffer.capacity}, got {self.replay_window.get_config()}"
+            )
         # a single evaluator is a schedule with one stage
         self.selfplay_schedule = (
             evaluator
@@ -282,6 +303,7 @@ class Trainer:
             else None,
             "memory_buffer": self.memory_buffer.__class__.__name__,
             "memory_buffer_config": self.memory_buffer.get_config(),
+            "replay_window": self.replay_window.get_config(),
         }
 
     def collect(
@@ -453,24 +475,27 @@ class Trainer:
         buffer_state: ReplayBufferState,
         train_state: TrainState,
         num_steps: int,
+        window: jax.Array,
     ) -> tuple[TrainState, dict]:
         """Performs `num_steps` training steps, compiled into a single `jax.lax.scan`.
 
         Each step samples a minibatch from the replay buffer and updates the parameters.
 
-        Does not check that the replay buffer holds a finished episode to sample, see `train_steps`.
+        Does not check that the replay buffer holds enough entries to sample, see `train_steps`.
 
         Args:
             key: rng
             buffer_state: replay buffer state
             train_state: current training state
             num_steps: number of training steps to perform
+            window: entries per environment, newest first, to sample from (see
+                `EpisodeReplayBuffer.sample_mask`), a traced value so that changing it doesn't recompile
 
         Returns:
             Tuple[TrainState, dict]: updated training state and metrics (mean across steps)
         """
         # the buffer doesn't change while training, so find which entries can be sampled once per epoch
-        mask = self.memory_buffer.sample_mask(buffer_state)
+        mask = self.memory_buffer.sample_mask(buffer_state, window)
 
         def step(
             carry: tuple[jax.Array, TrainState], _
@@ -500,17 +525,20 @@ class Trainer:
         collection_state: CollectionState,
         train_state: TrainState,
         num_steps: int,
+        epoch: int = 0,
     ) -> tuple[CollectionState, TrainState, dict]:
         """Performs `num_steps` training steps.
 
         Each step consists of sampling a minibatch from the replay buffer and updating the parameters.
-        The minibatch is sampled uniformly without replacement from the finished episodes in the buffer.
+        The minibatch is sampled uniformly without replacement from the finished episodes in the buffer's
+        replay window (see `replay_window`).
 
         Args:
             key: rng
             collection_state: current collection state
             train_state: current training state
             num_steps: number of training steps to perform
+            epoch: the current epoch, which sets the replay window
 
         Returns:
             Tuple[CollectionState, TrainState, dict]:
@@ -519,38 +547,56 @@ class Trainer:
                 - metrics
 
         Raises:
-            ValueError: if no episode has finished yet, so there is nothing to sample
+            ValueError: if no episode has finished yet, or the replay window holds fewer samples than a
+                minibatch
         """
         if num_steps == 0:
             return collection_state, train_state, {}
+        window = self.replay_window.at(epoch)
         # the buffer doesn't change while training, so checking once covers every step
-        self.memory_buffer.check_can_sample(collection_state.buffer_state)
+        self.memory_buffer.check_can_sample(
+            collection_state.buffer_state, window, self.train_batch_size
+        )
         train_state, metrics = self.train_epoch(
-            key, collection_state.buffer_state, train_state, num_steps
+            key,
+            collection_state.buffer_state,
+            train_state,
+            num_steps,
+            jnp.array(window, dtype=jnp.int32),
         )
         return collection_state, train_state, metrics
 
-    def selfplay_metrics(self, before: CollectionState, after: CollectionState) -> dict:
+    def selfplay_metrics(
+        self, before: CollectionState, after: CollectionState, epoch: int = 0
+    ) -> dict:
         """Measures how varied self-play is, to spot it collapsing into the same few games.
 
         Args:
             before: collection state before this epoch's self-play
             after: collection state after it
+            epoch: the epoch, which sets the replay window
 
         Returns:
             dict: metrics
                 - `selfplay_episodes`: episodes that terminated in between
                 - `selfplay_draw_fraction`: fraction of them that ended with every reward 0
                   (draws, in two-player zero-sum games), omitted if none terminated
-                - `buffer_distinct_positions`: distinct observations among the experiences the
-                  replay buffer can sample (data transforms' outputs count as observations too)
+                - `replay_window`: entries per environment training samples from (see `replay_window`)
+                - `buffer_samples`: experiences in the replay window training can sample
+                - `buffer_distinct_positions`: distinct observations among them (data
+                  transforms' outputs count as observations too)
                 - `buffer_distinct_fraction`: that as a fraction of those experiences
         """
         episodes = (after.episodes - before.episodes).sum()
         draws = (after.draws - before.draws).sum()
-        distinct, total = self.count_distinct_observations(after.buffer_state)
+        window = self.replay_window.at(epoch)
+        distinct, total = self.count_distinct_observations(
+            after.buffer_state, jnp.array(window, dtype=jnp.int32)
+        )
         metrics = {
             "selfplay_episodes": episodes,
+            "replay_window": jnp.array(window),
+            "buffer_samples": total,
             "buffer_distinct_positions": distinct,
             "buffer_distinct_fraction": distinct / jnp.maximum(total, 1),
         }
@@ -849,7 +895,7 @@ class Trainer:
                 evaluator=evaluator,
             )
             selfplay_metrics = self.selfplay_metrics(
-                prev_collection_state, collection_state
+                prev_collection_state, collection_state, cur_epoch
             )
             if isinstance(evaluator, MCTS):
                 selfplay_metrics["selfplay_iterations"] = jnp.asarray(
@@ -859,7 +905,11 @@ class Trainer:
             self.set_activity(f"epoch {cur_epoch}: training")
             train_key, key = jax.random.split(key)
             collection_state, train_state, metrics = self.train_steps(
-                train_key, collection_state, train_state, self.train_steps_per_epoch
+                train_key,
+                collection_state,
+                train_state,
+                self.train_steps_per_epoch,
+                epoch=cur_epoch,
             )
             params = self.extract_model_params_fn(train_state)
             # log metrics

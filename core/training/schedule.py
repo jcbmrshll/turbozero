@@ -15,7 +15,32 @@ def check_epochs(epochs: Sequence[int]) -> None:
         raise ValueError(f"the schedule's epochs must increase, got {list(epochs)}")
 
 
-class EvaluatorSchedule:
+class Schedule[T]:
+    """Values that take over from one another at given epochs, piecewise constant, e.g. the
+    replay window (see `Trainer`'s `replay_window`):
+
+        Schedule([(0, 1000), (20, 3000), (35, 6000)])
+    """
+
+    def __init__(self, stages: Sequence[tuple[int, T]]):
+        """Initializes a Schedule.
+
+        Args:
+            stages: (first epoch, value) pairs, in increasing order of epoch, starting at epoch 0
+        """
+        check_epochs([epoch for epoch, _ in stages])
+        self.stages = tuple(stages)
+
+    def at(self, epoch: int) -> T:
+        """The value for `epoch`."""
+        return [value for start, value in self.stages if start <= epoch][-1]
+
+    def get_config(self) -> list[dict]:
+        """Returns each stage's first epoch and value. Used for logging."""
+        return [{"epoch": epoch, "value": value} for epoch, value in self.stages]
+
+
+class EvaluatorSchedule(Schedule[Evaluator]):
     """Self-play evaluators that take over from one another at given epochs, e.g. to search
     more MCTS iterations a move as training goes on:
 
@@ -30,20 +55,6 @@ class EvaluatorSchedule:
     evaluator's states (e.g. MCTS trees) are initialized again, since the new evaluator's
     may differ in shape; games in progress carry on, searching from an empty tree.
     """
-
-    def __init__(self, stages: Sequence[tuple[int, Evaluator]]):
-        """Initializes an EvaluatorSchedule.
-
-        Args:
-            stages: (first epoch, evaluator) pairs, in increasing order of epoch, starting
-                at epoch 0
-        """
-        check_epochs([epoch for epoch, _ in stages])
-        self.stages = tuple(stages)
-
-    def at(self, epoch: int) -> Evaluator:
-        """The evaluator that plays `epoch`."""
-        return [evaluator for start, evaluator in self.stages if start <= epoch][-1]
 
     def get_config(self) -> list[dict]:
         """Returns each stage's first epoch and evaluator config. Used for logging."""
