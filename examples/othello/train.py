@@ -26,6 +26,15 @@ searching 64, 0.74 against it searching 256, and 0.57 against it searching 1024
 Checkpoints go to --ckpt-dir; `eval_pgx.py` and `vs_engine.py` evaluate them further (see
 README.md). The hyperparameters here are only an example; tune them for your task and
 hardware.
+
+With --save-state-at or --save-state-every, the whole training state (network, optimizer,
+replay buffers, games in progress, rng) is saved there too, to continue the run exactly
+with --resume, or to fork short runs from with --init-from (see README.md):
+
+    uv run examples/othello/train.py --epochs 150 --lr-final 1e-3 --save-state-at 150 --ckpt-dir runs/trunk
+    uv run examples/othello/train.py --epochs 30 --init-from runs/trunk --ckpt-dir runs/fork-control
+    uv run examples/othello/train.py --epochs 200 --save-state-every 10 --ckpt-dir runs/long
+    uv run examples/othello/train.py --epochs 200 --save-state-every 10 --ckpt-dir runs/long --resume
 """
 
 import argparse
@@ -61,6 +70,19 @@ from core.training.loss_fns import az_default_loss_fn
 from core.training.schedule import EvaluatorSchedule, Schedule, parse_schedule
 from core.training.train import Trainer
 from core.training.tree_positions import TreePositions
+
+
+def epoch_list(text: str) -> list[int]:
+    """Parses --save-state-at: epochs separated by commas."""
+    try:
+        epochs = [int(epoch) for epoch in text.split(",")]
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected epochs separated by commas, e.g. 50,150, got {text!r}"
+        ) from None
+    if any(epoch < 1 for epoch in epochs):
+        raise argparse.ArgumentTypeError(f"epochs must be positive, got {text!r}")
+    return epochs
 
 
 def positive_schedule(text: str) -> list[tuple[int, int]]:
@@ -219,6 +241,45 @@ def main():
         help="also keep every checkpoint whose epoch is a multiple of this (otherwise "
         "only the 2 newest are kept)",
     )
+    parser.add_argument(
+        "--save-state-at",
+        type=epoch_list,
+        default=[],
+        metavar="EPOCHS",
+        help="also save the whole training state (with the replay buffers: a few GB) to "
+        "--ckpt-dir as state-<EPOCH>.npz once this many epochs are done, e.g. 150 or "
+        "50,150, to fork runs from with --init-from",
+    )
+    parser.add_argument(
+        "--save-state-every",
+        type=int,
+        default=None,
+        metavar="N",
+        help="also save the whole training state every N epochs, keeping the newest, to "
+        "continue the run with --resume if it stops",
+    )
+    init = parser.add_mutually_exclusive_group()
+    init.add_argument(
+        "--init-from",
+        default=None,
+        metavar="PATH",
+        help="fork a new run from a saved state (state-<EPOCH>.npz, or a --ckpt-dir to take "
+        "the newest from): it starts at epoch 0, with its own schedules, games and seed, "
+        "from the saved network, optimizer state (the learning rate decaying anew from "
+        "--lr) and replay buffers. Needs the same --blocks and --channels; --buffer may "
+        "differ (each environment's newest entries are kept)",
+    )
+    parser.add_argument(
+        "--init-without-buffers",
+        action="store_true",
+        help="with --init-from, start with empty replay buffers instead",
+    )
+    init.add_argument(
+        "--resume",
+        action="store_true",
+        help="continue the run in --ckpt-dir from its newest saved state, exactly as if it "
+        "hadn't stopped; pass the run's own arguments",
+    )
     parser.add_argument("--name", default=None, help="the run's name on the monitor")
     parser.add_argument(
         "--monitor",
@@ -229,6 +290,10 @@ def main():
         help=f"log to a turbozero monitor (default {DEFAULT_URL}); start it with `uv run turbozero-monitor`",
     )
     args = parser.parse_args()
+    if args.resume and args.ckpt_dir is None:
+        parser.error("--resume needs the run's --ckpt-dir")
+    if args.init_without_buffers and args.init_from is None:
+        parser.error("--init-without-buffers needs --init-from")
 
     # self-play starts games from XOT openings (see xot.py) for varied, balanced
     # games
@@ -347,10 +412,17 @@ def main():
         else None,
         ckpt_dir=args.ckpt_dir or tempfile.mkdtemp(prefix="turbozero-othello-"),
         keep_every=args.keep_every,
+        save_state_at=args.save_state_at,
+        save_state_every=args.save_state_every,
         extra_config={"value_target_q": args.value_target_q},
     )
     trainer.train_loop(
-        seed=args.seed, num_epochs=args.epochs, eval_every=max(args.eval_every, 1)
+        seed=args.seed,
+        num_epochs=args.epochs,
+        eval_every=max(args.eval_every, 1),
+        initial_state=trainer.resume() if args.resume else None,
+        fork_from=args.init_from,
+        fork_replay_buffers=not args.init_without_buffers,
     )
 
 

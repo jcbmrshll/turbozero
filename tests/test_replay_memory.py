@@ -347,3 +347,42 @@ def test_count_distinct_observations_in_the_window():
     assert buffer.count_distinct_observations(state, 3) == (3, 3)
     assert buffer.count_distinct_observations(state, 4) == (3, 4)
     assert buffer.count_distinct_observations(state) == (3, 5)
+
+
+@pytest.mark.parametrize("capacity", [3, 5, 9])
+def test_resized_keeps_the_newest_entries_at_their_ages(capacity):
+    buffer = EpisodeReplayBuffer(capacity=5)
+    # wrapped around: index 0 holds 6, index 1 holds 7
+    state = buffer.assign_rewards(
+        add(buffer, init_single(buffer), [1, 2, 3, 4, 5, 6, 7]), jnp.array([1.0, -1.0])
+    )
+    state = jax.tree.map(lambda x: np.asarray(x)[None], state)
+    resized = EpisodeReplayBuffer(capacity=capacity)
+
+    new_state, (ids,) = resized.resized(state, state.buffer.observation_nn + 100)
+
+    for window in range(1, capacity + 1):
+        expected = [3, 4, 5, 6, 7][-window:]
+        assert sampleable(resized, new_state, window) == expected
+    np.testing.assert_array_equal(
+        ids[new_state.populated],
+        new_state.buffer.observation_nn[new_state.populated] + 100,
+    )
+    # and it goes on as a buffer of the new capacity
+    new_state = jax.tree.map(lambda x: jnp.asarray(x[0]), new_state)
+    new_state = resized.assign_rewards(
+        add(resized, new_state, [8]), jnp.array([1.0, -1.0])
+    )
+    assert sampleable(resized, new_state) == [3, 4, 5, 6, 7, 8][-capacity:]
+
+
+def test_resized_needs_no_episode_in_progress():
+    buffer = EpisodeReplayBuffer(capacity=5)
+    state = add(buffer, init_single(buffer), [1, 2])
+    state = jax.tree.map(lambda x: np.asarray(x)[None], state)
+
+    with pytest.raises(ValueError, match="episode in progress"):
+        EpisodeReplayBuffer(capacity=3).resized(state)
+    # without it
+    state, _ = EpisodeReplayBuffer(capacity=3).resized(buffer.truncate(state))
+    assert not state.populated.any()

@@ -10,6 +10,7 @@ import warnings
 from dataclasses import replace
 from functools import partial
 from types import SimpleNamespace
+from typing import cast
 
 import equinox as eqx
 import jax
@@ -35,6 +36,9 @@ from core.training.train import (
     Trainer,
     checkpoint_epochs,
     extract_params,
+    read_state_meta,
+    state_epochs,
+    state_path,
 )
 from core.training.tree_positions import TreePositions
 
@@ -107,6 +111,7 @@ def make_trainer(ttt, ckpt_dir, schedule=None, root_visits_added=None, **kwargs)
         "batch_size": 2,
         "memory_buffer": EpisodeReplayBuffer(capacity=32),
         "evaluator_test": make_evaluator(temperature=0.0),
+        "optimizer": optax.adam(1e-3),
         **kwargs,
     }
     return Trainer(
@@ -117,7 +122,6 @@ def make_trainer(ttt, ckpt_dir, schedule=None, root_visits_added=None, **kwargs)
         nn=net,
         nn_state=nn_state,
         loss_fn=partial(az_default_loss_fn, l2_reg_lambda=1e-4),
-        optimizer=optax.adam(1e-3),
         evaluator=evaluator,
         max_episode_steps=10,
         env_step_fn=ttt.step_fn,
@@ -740,8 +744,8 @@ def test_continuing_across_a_schedule_switch(scheduled):
     assert capacity(second.collection_state) == 64
     third = trainer.train_loop(seed=0, num_epochs=3, initial_state=second)
     assert capacity(third.collection_state) == 64
-    # each continuation starts with a warmup
-    assert calls == [{6}, {6}, {6}, {6}]
+    # each continuation picks up exactly where the run stopped: epochs 1 and 2, no warmup
+    assert calls == [{6}, {6}]
     assert checkpoint_epochs(trainer.ckpt_dir) == [1, 2]
 
 
@@ -943,3 +947,442 @@ def test_train_steps_with_too_few_samples_in_the_window_raises(ttt, tmp_path, tr
             trainer.init_train_state(),
             1,
         )
+
+
+# saved training states: resuming a run, and forking new ones from it
+
+
+def snapshot(tree):
+    """A host copy of `tree`'s arrays, which outlives their donation to self-play."""
+    return jax.tree.map(np.asarray, tree)
+
+
+def record_metrics(trainer, monkeypatch):
+    """Records what `trainer` logs, by epoch."""
+    logged = {}
+    monkeypatch.setattr(
+        trainer,
+        "log_metrics",
+        lambda metrics, epoch: logged.setdefault(epoch, {}).update(snapshot(metrics)),
+    )
+    return logged
+
+
+RESUMED_CONFIGS = {
+    "plain": {},
+    # self-play's search changes before the saved state, and after it
+    "tree_positions_and_schedules": {
+        "schedule": [(0, 2, 8), (1, 4, 16), (3, 6, 16)],
+        "tree_positions": TreePositions(per_move=2, min_visits=2, capacity=64),
+        "data_transform_fns": [ttt_transpose],
+        "replay_window": Schedule([(0, 16), (3, 32)]),
+    },
+}
+
+
+@pytest.mark.parametrize(
+    "config", RESUMED_CONFIGS.values(), ids=list(RESUMED_CONFIGS.keys())
+)
+def test_resumed_run_is_bit_identical(ttt, tmp_path, monkeypatch, config):
+    straight = make_trainer(ttt, tmp_path / "straight", **config)
+    straight_logged = record_metrics(straight, monkeypatch)
+    expected = snapshot(straight.train_loop(seed=0, num_epochs=4))
+
+    # stops after 3 epochs, with its state saved after 2
+    stopped = make_trainer(ttt, tmp_path / "resumed", save_state_at=[2], **config)
+    stopped.train_loop(seed=0, num_epochs=3)
+    assert state_epochs(stopped.ckpt_dir) == [2]
+    assert checkpoint_epochs(stopped.ckpt_dir) == [1, 2]
+    # a new trainer, as in a new process, continues from the state
+    resumed = make_trainer(ttt, tmp_path / "resumed", **config)
+    logged = record_metrics(resumed, monkeypatch)
+    state = resumed.resume()
+    # epoch 2's checkpoint is from after the state: the continued run saves it again
+    assert checkpoint_epochs(resumed.ckpt_dir) == [1]
+    # the seed is the saved run's rng's, whatever is passed
+    output = resumed.train_loop(seed=123, num_epochs=4, initial_state=state)
+
+    # train state, replay buffers, games, search trees, testers' states, rng
+    assert jax.tree.all(jax.tree.map(np.array_equal, snapshot(output), expected))
+    assert logged.keys() == {2, 3}
+    for epoch in (2, 3):
+        assert logged[epoch].keys() == straight_logged[epoch].keys()
+        for name, value in logged[epoch].items():
+            np.testing.assert_array_equal(
+                value, straight_logged[epoch][name], err_msg=f"epoch {epoch}: {name}"
+            )
+    assert checkpoint_epochs(resumed.ckpt_dir) == [2, 3]
+    assert leaves_equal(
+        resumed.load_train_state_from_checkpoint(resumed.ckpt_dir, 3),
+        expected.train_state,
+    )
+
+
+def test_continuing_in_memory_is_bit_identical(trainer, monkeypatch):
+    monkeypatch.setattr(trainer, "save_checkpoint", lambda *args, **kwargs: None)
+    expected = snapshot(trainer.train_loop(seed=0, num_epochs=3))
+
+    first = trainer.train_loop(seed=0, num_epochs=1)
+    output = trainer.train_loop(seed=0, num_epochs=3, initial_state=first)
+
+    assert jax.tree.all(jax.tree.map(np.array_equal, snapshot(output), expected))
+
+
+def test_states_are_saved_at_and_every(ttt, trained, tmp_path):
+    trainer = make_trainer(ttt, tmp_path, save_state_at=[3], save_state_every=2)
+    assert [e for e in range(1, 9) if trainer.should_save_state(e)] == [2, 3, 4, 6, 8]
+
+    for epoch in (2, 3, 4, 6):
+        trainer.save_state(replace(trained, cur_epoch=epoch))
+
+    # the newest, and those at save_state_at
+    assert state_epochs(trainer.ckpt_dir) == [3, 6]
+    meta = read_state_meta(state_path(trainer.ckpt_dir, 6))
+    assert (meta["epoch"], meta["num_envs"], meta["buffer_capacity"]) == (6, 2, 32)
+    assert meta["config"]["batch_size"] == 2 and meta["parent"] is None
+
+
+# the trunk's and its forks' optimizer: a learning rate schedule, whose step count a fork restarts
+def schedule_optimizer():
+    return optax.adam(optax.linear_schedule(1e-3, 1e-4, 100))
+
+
+def optimizer_states(train_state):
+    """The states of `schedule_optimizer`'s Adam and learning rate schedule."""
+    adam, schedule = cast(tuple, train_state.opt_state)
+    return adam, schedule
+
+
+TREE_POSITIONS = TreePositions(per_move=2, min_visits=2, capacity=64)
+
+
+@pytest.fixture(scope="module")
+def trunk(ttt, tmp_path_factory):
+    """A 2-epoch run with tree positions that saves its state at the end, the state's path, and a
+    host copy of the run's output."""
+    trainer = make_trainer(
+        ttt,
+        tmp_path_factory.mktemp("trunk"),
+        save_state_at=[2],
+        tree_positions=TREE_POSITIONS,
+        optimizer=schedule_optimizer(),
+    )
+    output = snapshot(trainer.train_loop(seed=0, num_epochs=2))
+    return SimpleNamespace(
+        trainer=trainer, path=state_path(trainer.ckpt_dir, 2), output=output
+    )
+
+
+def test_fork_starts_from_the_saved_network_optimizer_and_buffers(ttt, trunk, tmp_path):
+    fork = make_trainer(
+        ttt, tmp_path, tree_positions=TREE_POSITIONS, optimizer=schedule_optimizer()
+    )
+    key = jax.random.PRNGKey(7)
+
+    collection_state, train_state = fork.fork_state(trunk.path, key)
+
+    saved = trunk.output
+    assert leaves_equal(extract_params(train_state), extract_params(saved.train_state))
+    # Adam's moments (and its bias correction's step count) carry on; the learning rate
+    # schedule starts over
+    adam, schedule = optimizer_states(train_state)
+    saved_adam, saved_schedule = optimizer_states(saved.train_state)
+    assert leaves_equal(adam, saved_adam) and int(adam.count) == 2
+    assert int(saved_schedule.count) == 2 and int(schedule.count) == 0
+    assert int(train_state.step) == 0
+    # the replay buffer as saved, without the entries of the games that were in progress
+    buffer, saved_buffer = (
+        collection_state.buffer_state,
+        saved.collection_state.buffer_state,
+    )
+    assert not saved_buffer.has_reward.all()
+    assert leaves_equal(buffer.buffer, saved_buffer.buffer)
+    np.testing.assert_array_equal(
+        buffer.populated, saved_buffer.populated & saved_buffer.has_reward
+    )
+    np.testing.assert_array_equal(buffer.next_idx, saved_buffer.episode_start_idx)
+    assert np.asarray(buffer.has_reward).all()
+    # the tree positions as saved, and the move counts their ages are measured by
+    assert leaves_equal(
+        collection_state.tree_buffer_state, saved.collection_state.tree_buffer_state
+    )
+    for name in ("tree_written_at", "moves"):
+        np.testing.assert_array_equal(
+            getattr(collection_state, name), getattr(saved.collection_state, name)
+        )
+    # new games, and search trees for the fork's evaluator
+    env_state, metadata, eval_state = fork.init_games(
+        key, fork.batch_size, fork.selfplay_schedule.at(0)
+    )
+    assert leaves_equal(
+        (
+            collection_state.env_state,
+            collection_state.metadata,
+            collection_state.eval_state,
+        ),
+        (env_state, metadata, eval_state),
+    )
+
+
+def test_fork_trains_on_its_own_schedules(ttt, trunk, tmp_path, monkeypatch):
+    # tree positions aside (see test_fork_from_a_run_with_or_without_tree_positions)
+    fork = make_trainer(
+        ttt,
+        tmp_path,
+        schedule=[(0, 2, 8), (1, 6, 8)],
+        replay_window=Schedule([(0, 8), (1, 32)]),
+        optimizer=schedule_optimizer(),
+    )
+    logged = record_metrics(fork, monkeypatch)
+    sampled = []
+    sample_indices = fork.memory_buffer.sample_indices
+
+    def spy_sample_indices(key, mask, sample_size):
+        indices = sample_indices(key, mask, sample_size)
+        jax.debug.callback(lambda m: sampled.append(np.asarray(m)), mask)
+        return indices
+
+    monkeypatch.setattr(fork.memory_buffer, "sample_indices", spy_sample_indices)
+    buffers = []
+    train_steps = fork.train_steps
+
+    def spy_train_steps(key, collection_state, *args, **kwargs):
+        buffers.append(snapshot(collection_state.buffer_state))
+        return train_steps(key, collection_state, *args, **kwargs)
+
+    monkeypatch.setattr(fork, "train_steps", spy_train_steps)
+
+    output = fork.train_loop(seed=1, num_epochs=2, fork_from=trunk.path)
+    jax.effects_barrier()
+
+    # epoch 0 trains on the trunk's buffer, with the fork's 20 newest entries (warmup's and
+    # epoch 0's), sampling only the 8 newest
+    first = buffers[0]
+    assert by_age(first)[0][:, 20:].any()
+    np.testing.assert_array_equal(sampled[0], window_mask(first, 8))
+    assert window_mask(first, 8).sum() < window_mask(first, 32).sum()
+    assert [int(logged[e]["replay_window"]) for e in (0, 1)] == [8, 32]
+    assert [int(logged[e]["selfplay_iterations"]) for e in (0, 1)] == [2, 6]
+    # the learning rate schedule went on from 0: one step a epoch
+    assert int(optimizer_states(output.train_state)[1].count) == 2
+    assert checkpoint_epochs(fork.ckpt_dir) == [0, 1]
+
+
+def by_age(buffer_state, *entry_data):
+    """Which of a replay buffer's entries can be sampled, and the entries (with `entry_data`'s),
+    each environment's newest first."""
+    next_idx = np.asarray(buffer_state.next_idx)
+    capacity = buffer_state.populated.shape[1]
+    index = (next_idx[:, None] - 1 - np.arange(capacity)) % capacity
+
+    def take(x):
+        x = np.asarray(x)
+        return np.take_along_axis(
+            x, index.reshape(index.shape + (1,) * (x.ndim - 2)), 1
+        )
+
+    sampleable = take(
+        np.asarray(buffer_state.populated) & np.asarray(buffer_state.has_reward)
+    )
+    return sampleable, jax.tree.map(take, (buffer_state.buffer, *entry_data))
+
+
+@pytest.mark.parametrize("capacity", [16, 48])
+def test_fork_resizes_the_replay_buffers(ttt, trunk, tmp_path, capacity):
+    fork = make_trainer(
+        ttt,
+        tmp_path,
+        memory_buffer=EpisodeReplayBuffer(capacity=capacity),
+        tree_positions=replace(TREE_POSITIONS, capacity=2 * capacity),
+        optimizer=schedule_optimizer(),
+    )
+
+    loaded, _ = fork.fork_state(trunk.path, jax.random.PRNGKey(0))
+
+    saved = trunk.output.collection_state
+    pairs = [
+        # without the games in progress
+        (
+            by_age(
+                replace(
+                    saved.buffer_state, next_idx=saved.buffer_state.episode_start_idx
+                )
+            ),
+            by_age(loaded.buffer_state),
+            min(32, capacity),
+        ),
+        (
+            by_age(saved.tree_buffer_state, saved.tree_written_at),
+            by_age(loaded.tree_buffer_state, loaded.tree_written_at),
+            min(64, 2 * capacity),
+        ),
+    ]
+    for (saved_ok, saved_data), (ok, data), kept in pairs:
+        # each environment's newest entries, as many as fit, at the same ages
+        np.testing.assert_array_equal(ok[:, :kept], saved_ok[:, :kept])
+        assert not ok[:, kept:].any()
+        for x, y in zip(
+            jax.tree.leaves(data), jax.tree.leaves(saved_data), strict=True
+        ):
+            np.testing.assert_array_equal(
+                x[:, :kept][ok[:, :kept]], y[:, :kept][ok[:, :kept]]
+            )
+        if kept < saved_ok.shape[1]:
+            assert ok.sum() < saved_ok.sum()
+        else:
+            assert ok.sum() == saved_ok.sum()
+    assert np.asarray(loaded.buffer_state.next_idx).tolist() == [0, 0]
+
+
+def test_fork_without_replay_buffers(ttt, trunk, tmp_path):
+    # the number of environments needn't match without them
+    fork = make_trainer(ttt, tmp_path, batch_size=3, optimizer=schedule_optimizer())
+
+    collection_state, train_state = fork.fork_state(
+        trunk.path, jax.random.PRNGKey(0), replay_buffers=False
+    )
+
+    assert leaves_equal(
+        extract_params(train_state), extract_params(trunk.output.train_state)
+    )
+    assert int(optimizer_states(train_state)[1].count) == 0
+    assert collection_state.episodes.shape == (3,)
+    assert not np.asarray(collection_state.buffer_state.populated).any()
+
+
+def test_fork_from_a_run_with_or_without_tree_positions(ttt, trunk, trained, tmp_path):
+    # the trunk has tree positions; a fork without them leaves them out
+    fork = make_trainer(ttt, tmp_path / "without", optimizer=schedule_optimizer())
+    collection_state, _ = fork.fork_state(trunk.path, jax.random.PRNGKey(0))
+    assert collection_state.tree_buffer_state is None
+    assert collection_state.tree_written_at is None
+    # a fork with them, from a run without, starts with none stored
+    plain = make_trainer(ttt, tmp_path / "plain")
+    path = plain.save_state(trained)
+    fork = make_trainer(ttt, tmp_path / "with", tree_positions=TREE_POSITIONS)
+    collection_state, _ = fork.fork_state(path, jax.random.PRNGKey(0))
+    assert collection_state.tree_buffer_state is not None
+    assert not np.asarray(collection_state.tree_buffer_state.populated).any()
+    assert np.asarray(collection_state.buffer_state.populated).any()
+
+
+def test_fork_records_its_parent(ttt, trunk, tmp_path, monitor_server, monkeypatch):
+    monitor = Monitor(monitor_server.url, project="tests")
+    fork = make_trainer(
+        ttt,
+        tmp_path,
+        monitor=monitor,
+        save_state_at=[1],
+        tree_positions=TREE_POSITIONS,
+        optimizer=schedule_optimizer(),
+    )
+
+    # a directory: its newest state
+    fork.train_loop(seed=1, num_epochs=1, fork_from=trunk.trainer.ckpt_dir)
+
+    parent = {
+        "path": os.path.abspath(trunk.path),
+        "epoch": 2,
+        "replay_buffers": True,
+        "monitor_run": None,
+        "parent": None,
+    }
+    assert (
+        monitor_server.get(f"/api/runs/{monitor.run_id}")["config"]["parent"] == parent
+    )
+    # the fork's own saved states record it, for forks of the fork
+    meta = read_state_meta(state_path(fork.ckpt_dir, 1))
+    assert (meta["parent"], meta["monitor_run"]) == (parent, monitor.run_id)
+    # a resumed fork goes on logging to its monitor run, and records the same parent
+    resumed = make_trainer(
+        ttt,
+        tmp_path,
+        monitor=Monitor(monitor_server.url, project="tests"),
+        tree_positions=TREE_POSITIONS,
+        optimizer=schedule_optimizer(),
+    )
+    monkeypatch.setattr(resumed, "save_checkpoint", lambda *args, **kwargs: None)
+    resumed.train_loop(seed=1, num_epochs=2, initial_state=resumed.resume())
+    assert resumed.monitor is not None and resumed.monitor.run_id == monitor.run_id
+    assert resumed.parent == parent
+    meta = monitor_server.get(f"/api/runs/{monitor.run_id}")
+    assert (meta["status"], meta["step"]) == ("finished", 1)
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"batch_size": 3}, "saved with 2 self-play environments, this run has 3"),
+        (
+            {"memory_buffer": EpisodeReplayBuffer(capacity=16)},
+            "replay buffer capacity of 32, this run's is 16",
+        ),
+        (
+            {"tree_positions": None},
+            "tree position buffer capacity of 64, this run's is None",
+        ),
+        # search trees of a different size
+        (
+            {"schedule": [(0, 4, 16)]},
+            "the saved collection state doesn't match this run's",
+        ),
+        ({"optimizer": optax.sgd(1e-3)}, "the saved train state has"),
+    ],
+)
+def test_resume_rejects_a_different_configuration(ttt, trunk, tmp_path, kwargs, match):
+    trainer = make_trainer(
+        ttt,
+        tmp_path,
+        **{
+            "tree_positions": TREE_POSITIONS,
+            "optimizer": schedule_optimizer(),
+            **kwargs,
+        },
+    )
+
+    with pytest.raises(ValueError, match=match):
+        trainer.resume(trunk.path)
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"batch_size": 3}, "saved with 2 self-play environments, this run has 3"),
+        ({"optimizer": optax.sgd(1e-3)}, "the saved train state has"),
+    ],
+)
+def test_fork_rejects_a_different_configuration(ttt, trunk, tmp_path, kwargs, match):
+    trainer = make_trainer(
+        ttt, tmp_path, **{"optimizer": schedule_optimizer(), **kwargs}
+    )
+
+    with pytest.raises(ValueError, match=match):
+        trainer.fork_state(trunk.path, jax.random.PRNGKey(0))
+
+
+def test_loaded_states_are_donated_to_self_play(ttt, trunk, tmp_path, monkeypatch):
+    trainer = make_trainer(
+        ttt, tmp_path, tree_positions=TREE_POSITIONS, optimizer=schedule_optimizer()
+    )
+    monkeypatch.setattr(trainer, "save_checkpoint", lambda *args, **kwargs: None)
+    given = []
+    collect_steps = trainer.collect_steps
+
+    def spy_collect_steps(key, state, *args, **kwargs):
+        given.append(state)
+        return collect_steps(key, state, *args, **kwargs)
+
+    monkeypatch.setattr(trainer, "collect_steps", spy_collect_steps)
+
+    with warnings.catch_warnings():
+        # every array loaded is new, and reused by self-play in place
+        warnings.filterwarnings("error", message="Some donated buffers were not usable")
+        resumed = trainer.resume(trunk.path)
+        trainer.train_loop(seed=0, num_epochs=3, initial_state=resumed)
+        first_resumed = len(given)
+        trainer.train_loop(seed=0, num_epochs=1, fork_from=trunk.path)
+
+    # the loaded states were donated to the first self-play, and nothing read them after
+    assert all(x.is_deleted() for x in jax.tree.leaves(resumed.collection_state))
+    assert given[0] is resumed.collection_state
+    assert all(x.is_deleted() for x in jax.tree.leaves(given[first_resumed]))
