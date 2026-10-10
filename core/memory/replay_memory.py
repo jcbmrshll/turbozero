@@ -2,6 +2,7 @@ from dataclasses import dataclass, replace
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 
 @jax.tree_util.register_dataclass
@@ -192,6 +193,54 @@ class EpisodeReplayBuffer:
             has_reward=jnp.full_like(state.has_reward, True),
             populated=jnp.where(~state.has_reward, False, state.populated),
         )
+
+    def resized(
+        self, state: ReplayBufferState, *entry_data: np.ndarray
+    ) -> tuple[ReplayBufferState, list[np.ndarray]]:
+        """Copies a replay buffer state of any capacity, held in numpy arrays (e.g. loaded from a
+        file), into one of this buffer's capacity, on the host.
+
+        Each environment keeps its newest entries, as many as fit, at the same ages (see
+        `sample_mask`), so a window samples the same entries as before. With more capacity
+        than `state`, the oldest places are left empty.
+
+        Args:
+            state: replay buffer state, with a batch dimension in front of the capacity
+                dimension, and no episode in progress (see `truncate`)
+            entry_data: (optional) more arrays with an entry per place in the buffer, shaped
+                (batch size, capacity, ...), to copy along with it (e.g. `Trainer`'s
+                `tree_written_at`)
+
+        Returns:
+            Tuple[ReplayBufferState, list[np.ndarray]]: the resized state, and `entry_data`
+                resized alike
+        """
+        next_idx = np.asarray(state.next_idx)
+        if not np.array_equal(next_idx, state.episode_start_idx):
+            raise ValueError(
+                "can't resize a replay buffer with an episode in progress; truncate it first"
+            )
+        old_capacity = state.populated.shape[1]
+        # place j holds the entry of age capacity - 1 - j, so the next one goes to place 0
+        age = self.capacity - 1 - np.arange(self.capacity)
+        source = (next_idx[:, None] - 1 - age) % old_capacity
+        kept = np.broadcast_to(age < old_capacity, source.shape)
+
+        def copy(x, empty=0):
+            x = np.asarray(x)
+            index = source.reshape(source.shape + (1,) * (x.ndim - 2))
+            mask = kept.reshape(index.shape)
+            return np.where(mask, np.take_along_axis(x, index, axis=1), empty)
+
+        resized = replace(
+            state,
+            next_idx=np.zeros_like(next_idx),
+            episode_start_idx=np.zeros_like(next_idx),
+            buffer=jax.tree.map(copy, state.buffer),
+            populated=copy(state.populated, False),
+            has_reward=copy(state.has_reward, True),
+        )
+        return resized, [copy(x) for x in entry_data]
 
     def sample_mask(
         self, state: ReplayBufferState, window: jax.Array | int | None = None

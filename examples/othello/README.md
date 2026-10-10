@@ -112,6 +112,52 @@ The monitor shows, each epoch, the tree positions stored (`tree_positions`, and
 training could sample (`tree_buffer_samples`), and the share of each training batch they
 made up (`tree_batch_fraction`).
 
+### Resuming and forking runs
+
+Checkpoints hold only the network and optimizer state. `--save-state-at 50,150` also
+saves the whole training state once 50 and 150 epochs are done, as `state-50.npz` and
+`state-150.npz` in `--ckpt-dir`: the network, optimizer state, replay buffers, games in
+progress with their search trees, the ladder's rung and the rng. `--save-state-every 10`
+saves one every 10 epochs and keeps only the newest of these. A state takes about as much
+disk space as replay memory takes GPU memory, about 1.45 GB per 3000 samples per
+environment, and K times that again with `--tree-positions K`.
+
+`--resume` continues the run in `--ckpt-dir` from its newest state; pass the run's own
+arguments. It carries on exactly as if it hadn't stopped (on the CPU the result is
+bit-identical; on a GPU, convolution autotuning may differ between processes). It logs
+to the same monitor run, which then holds the epochs between the state and the stop
+twice, and deletes the checkpoints saved after the state, which it saves again.
+
+```
+uv run examples/othello/train.py --epochs 200 --save-state-every 10 --ckpt-dir runs/long
+uv run examples/othello/train.py --epochs 200 --save-state-every 10 --ckpt-dir runs/long --resume
+```
+
+`--init-from` forks a new run from a state (a `state-<epoch>.npz`, or a directory to take
+the newest from). The fork is a run of its own: it starts at epoch 0, with its own
+`--epochs`, seed and schedules (`--lr` to `--lr-final`, `--sims-schedule`,
+`--buffer-schedule`, all counted from its epoch 0), new games and search trees, and its
+own `--ckpt-dir`. It starts from the saved network, Adam's moments, and the replay
+buffers, so its first epochs train on as much data as the run it was forked from did
+(the entries of the games in progress are dropped). `--init-without-buffers` starts with
+empty buffers instead. The network size must match. The replay memory may differ in
+size: each environment's newest samples are kept, as many as fit. The monitor's config
+records the parent state as `parent`, and so does every state the fork saves.
+
+This makes it cheap to compare settings late in training. Short runs from scratch only
+show which settings learn fastest early on. Instead, train one long trunk at a constant
+learning rate (`--lr-final` equal to `--lr`), save its state, and fork short runs from it
+that differ in one setting each, alongside a control fork with the trunk's settings:
+
+```
+uv run examples/othello/train.py --epochs 150 --lr 1e-3 --lr-final 1e-3 \
+    --save-state-at 150 --eval-every 0 --ckpt-dir runs/trunk
+uv run examples/othello/train.py --epochs 30 --init-from runs/trunk/state-150.npz \
+    --eval-every 0 --ckpt-dir runs/trunk150-control
+uv run examples/othello/train.py --epochs 30 --init-from runs/trunk/state-150.npz \
+    --sims 128 --eval-every 0 --ckpt-dir runs/trunk150-sims128
+```
+
 ## Evaluating a checkpoint
 
 Checkpoints from `train.py` are named after their epoch (`199.eqx` is the last of a

@@ -1,6 +1,8 @@
+import json
 import os
 import re
-from collections.abc import Callable, Sequence
+import zipfile
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
 from typing import Any
@@ -8,6 +10,7 @@ from typing import Any
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 
 from core.common import search_and_step, step_env_and_evaluator
@@ -113,13 +116,16 @@ class TrainLoopOutput:
         collection_state: state of self-play episode collection.
         train_state: TrainState, holds model params and state, optimizer state
         test_states: states of testers
-        cur_epoch: current epoch num
+        cur_epoch: current epoch num: the number of epochs done
+        key: (optional) the training loop's rng, for the next epoch. With it, a run continued
+            from this state carries on exactly as if it hadn't stopped (see `Trainer.train_loop`).
     """
 
     collection_state: CollectionState
     train_state: TrainState
     test_states: list[TestState]
     cur_epoch: int
+    key: jax.Array | None = None
 
 
 def extract_params(state: TrainState) -> Any:
@@ -142,12 +148,94 @@ def checkpoint_path(ckpt_dir: str, epoch: int) -> str:
 
 def checkpoint_epochs(ckpt_dir: str) -> list[int]:
     """Epochs with a checkpoint in `ckpt_dir`, in ascending order."""
+    return _epochs_in(ckpt_dir, r"(\d+)\.eqx")
+
+
+def state_path(ckpt_dir: str, epoch: int) -> str:
+    """Path of the state saved after `epoch` epochs in `ckpt_dir` (see `Trainer.save_state`)."""
+    return os.path.join(ckpt_dir, f"state-{epoch}.npz")
+
+
+def state_epochs(ckpt_dir: str) -> list[int]:
+    """Numbers of epochs done at which `ckpt_dir` holds a saved state, in ascending order."""
+    return _epochs_in(ckpt_dir, r"state-(\d+)\.npz")
+
+
+def _epochs_in(ckpt_dir: str, pattern: str) -> list[int]:
     if not os.path.isdir(ckpt_dir):
         return []
     return sorted(
-        int(m.group(1))
-        for f in os.listdir(ckpt_dir)
-        if (m := re.fullmatch(r"(\d+)\.eqx", f))
+        int(m.group(1)) for f in os.listdir(ckpt_dir) if (m := re.fullmatch(pattern, f))
+    )
+
+
+def latest_state_path(path: str) -> str:
+    """`path` if it's a saved state, or the newest saved state in the directory `path`."""
+    if not os.path.isdir(path):
+        return path
+    epochs = state_epochs(path)
+    if not epochs:
+        raise FileNotFoundError(
+            f"no saved state (state-<epoch>.npz) in {path}: a run saves one at the epochs "
+            "given by the Trainer's save_state_at and save_state_every"
+        )
+    return state_path(path, epochs[-1])
+
+
+def read_state_meta(path: str) -> dict:
+    """The metadata of a saved state (see `Trainer.save_state`): the epochs done, the run's
+    configuration, its monitor run and parent, and what each array is."""
+    with np.load(path) as saved:
+        return json.loads(str(saved["meta"]))
+
+
+# saved states' format, recorded in their metadata
+STATE_FORMAT = 1
+
+
+def _describe(tree: Any) -> list[tuple[str, tuple[int, ...], str]]:
+    """Each leaf's path, shape and dtype, in the order `jax.tree.leaves` gives them (leaves may
+    be `jax.ShapeDtypeStruct`s)."""
+    described = []
+    for path, x in jax.tree_util.tree_flatten_with_path(tree)[0]:
+        if not hasattr(x, "dtype"):
+            x = np.asarray(x)
+        described.append((jax.tree_util.keystr(path), tuple(x.shape), str(x.dtype)))
+    return described
+
+
+def _to_host(x: Any) -> np.ndarray:
+    """`x` as a numpy array, through a temporary array on the CPU device if there is one: for an
+    accelerator's array, `np.asarray` would keep the host copy on it, for as long as it lives."""
+    if not isinstance(x, jax.Array):
+        return np.asarray(x)
+    try:
+        cpu = jax.devices("cpu")[0]
+    except RuntimeError:
+        return np.asarray(x)
+    return np.asarray(jax.device_put(x, cpu))
+
+
+def _to_device(x: Any) -> jax.Array:
+    """A new device array holding `x`, sharing memory with nothing else, so that it can be
+    donated (see `Trainer.collect_steps`)."""
+    return jnp.array(x, copy=True)
+
+
+def restart_schedules(opt_state: Any) -> Any:
+    """`opt_state` with its learning rate schedules' step counts back at 0 (optax's
+    `ScaleByScheduleState` and `InjectHyperparamsState`), so that they start over.
+
+    Everything else (e.g. Adam's moments, and the step count of its bias correction) is
+    kept."""
+
+    def is_schedule(x: Any) -> bool:
+        return isinstance(x, optax.ScaleByScheduleState | optax.InjectHyperparamsState)
+
+    return jax.tree.map(
+        lambda x: x._replace(count=jnp.zeros_like(x.count)) if is_schedule(x) else x,
+        opt_state,
+        is_leaf=is_schedule,
     )
 
 
@@ -186,6 +274,8 @@ class Trainer:
         ckpt_dir: str = "/tmp/turbozero_checkpoints",
         max_checkpoints: int = 2,
         keep_every: int | None = None,
+        save_state_at: Collection[int] = (),
+        save_state_every: int | None = None,
         extra_config: dict | None = None,
     ):
         """Initializes a Trainer.
@@ -234,6 +324,12 @@ class Trainer:
             ckpt_dir: directory to save checkpoints
             max_checkpoints: maximum number of checkpoints to keep
             keep_every: (optional) also keep every checkpoint whose epoch is a multiple of this, beyond `max_checkpoints`
+            save_state_at: (optional) numbers of epochs done after which to save the whole training state to
+                `ckpt_dir` too (see `save_state`), to continue the run from (see `resume`) or fork new runs
+                from (see `train_loop`'s `fork_from`). Kept.
+            save_state_every: (optional) also save the whole training state after every this many epochs,
+                keeping only the newest of these, to `resume` the run from if it stops. A state takes
+                as much disk space as the replay buffers' device memory.
             extra_config: (optional) extra config to record with the monitor's run
         """
         # environment
@@ -317,10 +413,15 @@ class Trainer:
         self.ckpt_dir = ckpt_dir
         self.max_checkpoints = max_checkpoints
         self.keep_every = keep_every
+        self.save_state_at = frozenset(save_state_at)
+        self.save_state_every = save_state_every
         os.makedirs(ckpt_dir, exist_ok=True)
         # monitor
         self.monitor = monitor
         self.extra_config = extra_config if extra_config is not None else {}
+        # the saved state this run was forked from (see `train_loop`), recorded in the monitor's
+        # config and in states the run saves
+        self.parent: dict | None = None
 
     def init_train_state(self) -> TrainState:
         """Initializes the training state (params, optimizer, etc.) from `nn` and `nn_state`.
@@ -947,6 +1048,378 @@ class Trainer:
         with open(checkpoint_path(path_to_checkpoint, epoch), "rb") as f:
             return eqx.tree_deserialise_leaves(f, self.init_train_state())
 
+    def should_save_state(self, epochs_done: int) -> bool:
+        """Whether to save the whole training state after `epochs_done` epochs (see
+        `save_state_at` and `save_state_every`)."""
+        return epochs_done in self.save_state_at or (
+            self.save_state_every is not None
+            and epochs_done % self.save_state_every == 0
+        )
+
+    def save_state(self, state: TrainLoopOutput) -> str:
+        """Saves the whole training state to `ckpt_dir`, as `state-<epochs done>.npz`: the train
+        state, the collection state (with the replay buffers), the testers' states, the number of
+        epochs done and the training loop's rng.
+
+        The run continues from it exactly (see `resume`), and new runs fork from it (see
+        `train_loop`'s `fork_from`). It also records the run's configuration, its monitor run, and
+        the state the run was forked from, if any (see `read_state_meta`).
+
+        With `save_state_every`, deletes the states saved before it at multiples of it, besides
+        those at `save_state_at`.
+
+        Arrays are copied to the host one at a time, as they're written, so it takes about the
+        host memory of the largest. Loading takes about that of the replay buffers.
+
+        Args:
+            state: the training loop's state, with its rng (`key`), as `train_loop` returns it
+
+        Returns:
+            str: the saved state's path
+        """
+        if state.key is None:
+            raise ValueError("can't save a training state without its rng (`key`)")
+        parts = {
+            "train_state": state.train_state,
+            "collection_state": state.collection_state,
+            "test_states": state.test_states,
+        }
+        meta = {
+            "format": STATE_FORMAT,
+            "epoch": state.cur_epoch,
+            "num_envs": int(state.collection_state.episodes.shape[0]),
+            "buffer_capacity": self.memory_buffer.capacity,
+            "tree_buffer_capacity": self.tree_buffer.capacity
+            if self.tree_buffer is not None
+            else None,
+            "monitor_run": self.monitor.run_id if self.monitor is not None else None,
+            "parent": self.parent,
+            "config": {**self.get_config(), **self.extra_config},
+            "leaves": {part: _describe(tree) for part, tree in parts.items()},
+        }
+        arrays = {
+            "meta": np.array(json.dumps(meta, default=str)),
+            "key": state.key,
+            **{
+                f"{part}.{i}": x
+                for part, tree in parts.items()
+                for i, x in enumerate(jax.tree.leaves(tree))
+            },
+        }
+        path = state_path(self.ckpt_dir, state.cur_epoch)
+        # write to a temporary file first so an interrupted save doesn't leave a partial state.
+        # As np.savez does, but copying one array at a time to the host (see `_to_host`)
+        with zipfile.ZipFile(path + ".tmp", "w", allowZip64=True) as f:
+            for name, x in arrays.items():
+                with f.open(f"{name}.npy", "w", force_zip64=True) as entry:
+                    np.lib.format.write_array(entry, _to_host(x), allow_pickle=False)
+        os.replace(path + ".tmp", path)
+        if self.save_state_every is not None:
+            for epoch in state_epochs(self.ckpt_dir):
+                if (
+                    epoch < state.cur_epoch
+                    and epoch % self.save_state_every == 0
+                    and epoch not in self.save_state_at
+                ):
+                    os.remove(state_path(self.ckpt_dir, epoch))
+        return path
+
+    def load_state(self, path: str) -> TrainLoopOutput:
+        """Loads a state saved by `save_state`, to continue its run exactly: pass it to
+        `train_loop` as its `initial_state` (see `resume`, which also takes care of the run's
+        checkpoints and monitor run).
+
+        The trainer must be configured as the run's was: the number of environments, replay
+        buffer capacities, network, optimizer, self-play evaluator (the one scheduled for the last
+        epoch done) and testers must match, so that every array does.
+
+        Args:
+            path: the saved state
+
+        Returns:
+            TrainLoopOutput: the run's state, in new device arrays, with its rng
+
+        Raises:
+            ValueError: if the saved state doesn't fit this trainer
+        """
+        with np.load(path) as saved:
+            meta = self._check_meta(path, json.loads(str(saved["meta"])))
+            self._check_sizes(path, meta, resizable=False)
+            epoch = meta["epoch"]
+            # the evaluator whose states the collection state holds
+            evaluator = self.selfplay_schedule.at(max(epoch - 1, 0))
+            train_template = jax.eval_shape(self.init_train_state)
+            train_state = self._load_part(saved, meta, "train_state", train_template)
+            collection_state = self._load_part(
+                saved,
+                meta,
+                "collection_state",
+                jax.eval_shape(
+                    lambda: self.init_collection_state(
+                        jax.random.PRNGKey(0), self.batch_size, evaluator
+                    )
+                ),
+            )
+            test_states = self._load_part(
+                saved,
+                meta,
+                "test_states",
+                jax.eval_shape(
+                    lambda params: [t.init(params=params) for t in self.testers],
+                    self.extract_model_params_fn(train_template),
+                ),
+            )
+            key = _to_device(saved["key"])
+        return TrainLoopOutput(
+            collection_state=collection_state,
+            train_state=train_state,
+            test_states=test_states,
+            cur_epoch=epoch,
+            key=key,
+        )
+
+    def resume(self, path: str | None = None) -> TrainLoopOutput:
+        """Loads the newest state saved in `ckpt_dir` (or `path`, a saved state or a directory
+        of them) to continue its run exactly, with `train_loop`'s `initial_state`.
+
+        With the run's configuration (see `load_state`), the continued run is the same as if it
+        hadn't stopped (its rng is saved, so `train_loop`'s seed is unused), given deterministic computations (e.g. on the CPU; GPU convolutions'
+        autotuning may differ). It logs to the run's monitor run (whose metrics then hold the
+        epochs between the state and the stop twice), and deletes the checkpoints saved after
+        the state, which it saves again.
+
+        Args:
+            path: (optional) the saved state, or a directory to take the newest from. If not
+                provided, `ckpt_dir`.
+
+        Returns:
+            TrainLoopOutput: the run's state, for `train_loop`'s `initial_state`
+        """
+        path = latest_state_path(path if path is not None else self.ckpt_dir)
+        state = self.load_state(path)
+        meta = read_state_meta(path)
+        current = json.loads(
+            json.dumps({**self.get_config(), **self.extra_config}, default=str)
+        )
+        changed = sorted(
+            k
+            for k in current.keys() | meta["config"].keys()
+            if current.get(k) != meta["config"].get(k)
+        )
+        if changed:
+            print(
+                f"warning: resuming {path} with a different configuration: {changed}",
+                flush=True,
+            )
+        self.parent = meta["parent"]
+        if self.monitor is not None and self.monitor.run_id is None:
+            self.monitor.run_id = meta["monitor_run"]
+        for epoch in checkpoint_epochs(self.ckpt_dir):
+            if epoch >= state.cur_epoch:
+                os.remove(checkpoint_path(self.ckpt_dir, epoch))
+        print(f"resuming from {path}: {state.cur_epoch} epochs done", flush=True)
+        return state
+
+    def fork_state(
+        self, path: str, key: jax.Array, replay_buffers: bool = True
+    ) -> tuple[CollectionState, TrainState]:
+        """The states a run forked from a saved state (see `train_loop`'s `fork_from`) starts with.
+
+        - the train state: the saved network and optimizer state, with the step count and the
+          learning rate schedules' (see `restart_schedules`) back at 0
+        - with `replay_buffers`, the collection state: the saved replay buffers (and tree
+          positions', if both runs have them), with self-play's games and the evaluator's states
+          (e.g. search trees) initialized anew, for the evaluator scheduled for epoch 0. The
+          entries of the games in progress are discarded. A buffer of a different capacity
+          keeps each environment's newest entries (see `EpisodeReplayBuffer.resized`).
+        - without, a new collection state, as a run from scratch starts with
+
+        The number of environments, network and optimizer must match the saved run's.
+
+        Args:
+            path: the saved state (see `save_state`)
+            key: rng, for the games
+            replay_buffers: load the replay buffers (default), or start with empty ones
+
+        Returns:
+            Tuple[CollectionState, TrainState]: the collection state and train state
+
+        Raises:
+            ValueError: if the saved state doesn't fit this trainer
+        """
+        with np.load(path) as saved:
+            meta = self._check_meta(path, json.loads(str(saved["meta"])))
+            train_state = self._load_part(
+                saved, meta, "train_state", jax.eval_shape(self.init_train_state)
+            )
+            train_state = replace(
+                train_state,
+                opt_state=restart_schedules(train_state.opt_state),
+                step=jnp.zeros_like(train_state.step),
+            )
+            if not replay_buffers:
+                return self.init_collection_state(key, self.batch_size), train_state
+            self._check_sizes(path, meta, resizable=True)
+            index = {
+                leaf_path: i
+                for i, (leaf_path, _, _) in enumerate(
+                    meta["leaves"]["collection_state"]
+                )
+            }
+
+            def get(leaf_path: str) -> np.ndarray:
+                if leaf_path not in index:
+                    raise ValueError(f"{path} has no collection state{leaf_path}")
+                return saved[f"collection_state.{index[leaf_path]}"]
+
+            counters = {
+                name: _to_device(get(f".{name}"))
+                for name in (
+                    "episodes",
+                    "draws",
+                    "tree_positions",
+                    "tree_visits",
+                    "moves",
+                )
+            }
+            buffer_state, _ = self._load_buffer(
+                get, ".buffer_state", self.memory_buffer
+            )
+            tree_buffer_state, tree_written_at = None, None
+            if self.tree_buffer is not None:
+                if meta["tree_buffer_capacity"] is not None:
+                    tree_buffer_state, (tree_written_at,) = self._load_buffer(
+                        get, ".tree_buffer_state", self.tree_buffer, ".tree_written_at"
+                    )
+                else:
+                    print(
+                        f"fork: {path} has no tree positions, the tree position buffer "
+                        "starts empty",
+                        flush=True,
+                    )
+                    tree_buffer_state = self.tree_buffer.init(
+                        self.batch_size, self.make_template_experience()
+                    )
+                    tree_written_at = jnp.zeros(
+                        (self.batch_size, self.tree_buffer.capacity), dtype=jnp.int32
+                    )
+        env_state, metadata, eval_state = self.init_games(
+            key, self.batch_size, self.selfplay_schedule.at(0)
+        )
+        collection_state = CollectionState(
+            eval_state=eval_state,
+            env_state=env_state,
+            buffer_state=buffer_state,
+            metadata=metadata,
+            tree_buffer_state=tree_buffer_state,
+            tree_written_at=tree_written_at,
+            **counters,
+        )
+        return collection_state, train_state
+
+    def _check_meta(self, path: str, meta: dict) -> dict:
+        if meta.get("format") != STATE_FORMAT:
+            raise ValueError(
+                f"{path} is a saved state of format {meta.get('format')}, this version reads "
+                f"format {STATE_FORMAT}"
+            )
+        return meta
+
+    def _check_sizes(self, path: str, meta: dict, resizable: bool) -> None:
+        """Checks that a saved state's number of environments, and unless `resizable` its replay
+        buffers' capacities, are this trainer's."""
+        if meta["num_envs"] != self.batch_size:
+            raise ValueError(
+                f"{path} was saved with {meta['num_envs']} self-play environments, this run "
+                f"has {self.batch_size}: they must be the same"
+            )
+        if resizable:
+            return
+        tree_capacity = (
+            self.tree_buffer.capacity if self.tree_buffer is not None else None
+        )
+        for name, saved, ours in [
+            ("replay buffer", meta["buffer_capacity"], self.memory_buffer.capacity),
+            ("tree position buffer", meta["tree_buffer_capacity"], tree_capacity),
+        ]:
+            if saved != ours:
+                raise ValueError(
+                    f"{path} was saved with a {name} capacity of {saved}, this run's is "
+                    f"{ours}: continuing a run needs the same (a fork can differ)"
+                )
+
+    def _load_part(self, saved: Any, meta: dict, part: str, template: Any) -> Any:
+        """Loads part of a saved state (see `save_state`) into new device arrays, checking each
+        array's shape and dtype against `template`'s (e.g. from `jax.eval_shape`)."""
+        expected = _describe(template)
+        described = [
+            (leaf_path, tuple(shape), dtype)
+            for leaf_path, shape, dtype in meta["leaves"][part]
+        ]
+        name = part.replace("_", " ")
+        if len(described) != len(expected):
+            raise ValueError(
+                f"the saved {name} has {len(described)} arrays, this run's has "
+                f"{len(expected)}: was it saved with different settings (e.g. the network, "
+                "optimizer, self-play search, tree positions or testers)?"
+            )
+        mismatched = [
+            f"  {leaf_path}: saved {s_shape} {s_dtype}, this run's {shape} {dtype}"
+            for (leaf_path, shape, dtype), (_, s_shape, s_dtype) in zip(
+                expected, described, strict=True
+            )
+            if (s_shape, s_dtype) != (shape, dtype)
+        ]
+        if mismatched:
+            raise ValueError(
+                f"the saved {name} doesn't match this run's:\n"
+                + "\n".join(mismatched[:8])
+            )
+        return jax.tree.unflatten(
+            jax.tree.structure(template),
+            [_to_device(saved[f"{part}.{i}"]) for i in range(len(expected))],
+        )
+
+    def _load_buffer(
+        self,
+        get: Callable[[str], np.ndarray],
+        prefix: str,
+        buffer: EpisodeReplayBuffer,
+        *entry_paths: str,
+    ) -> tuple[ReplayBufferState, list[jax.Array]]:
+        """Loads a saved collection state's replay buffer (at `prefix`) into `buffer`'s capacity,
+        without the entries of games in progress, with arrays at `entry_paths` that have an
+        entry per place in it (see `EpisodeReplayBuffer.resized`)."""
+        template = jax.eval_shape(
+            lambda: buffer.init(self.batch_size, self.make_template_experience())
+        )
+        arrays = []
+        for leaf_path, shape, dtype in _describe(template):
+            x = get(prefix + leaf_path)
+            # all but the capacity dimension must match
+            if str(x.dtype) != dtype or (x.shape[:1] + x.shape[2:]) != (
+                shape[:1] + shape[2:]
+            ):
+                raise ValueError(
+                    f"the saved collection state{prefix}{leaf_path} is {x.shape} {x.dtype}, "
+                    f"this run's {shape} {dtype}, which only differ in the buffer's capacity"
+                )
+            arrays.append(x)
+        state = jax.tree.unflatten(jax.tree.structure(template), arrays)
+        entry_data = [get(p) for p in entry_paths]
+        # the games in progress don't carry on: their entries would never get rewards
+        state = jax.tree.map(np.asarray, buffer.truncate(state))
+        capacity = state.populated.shape[1]
+        if capacity != buffer.capacity:
+            name = "tree position" if buffer is self.tree_buffer else "replay"
+            print(
+                f"fork: resizing the saved {name} buffer from {capacity} to "
+                f"{buffer.capacity} entries per environment",
+                flush=True,
+            )
+            state, entry_data = buffer.resized(state, *entry_data)
+        return jax.tree.map(_to_device, state), [_to_device(x) for x in entry_data]
+
     def make_template_env_state(self) -> Any:
         """Create a template environment state used for initializing data structures that hold environment states to the correct shape.
 
@@ -1011,15 +1484,7 @@ class Trainer:
             if self.tree_buffer is not None
             else None
         )
-        # init env state
-        env_init_key, key = jax.random.split(key)
-        env_keys = jax.random.split(env_init_key, batch_size)
-        # compiled, so that no two of the state's arrays are one array, as an environment's eager
-        # init can return (e.g. its current player, in both the state and the metadata):
-        # `collect_steps` can't be donated the same array twice
-        env_state, metadata = jax.jit(jax.vmap(self.env_init_fn))(env_keys)
-        # init evaluator state
-        eval_state = self.init_eval_state(evaluator, batch_size)
+        env_state, metadata, eval_state = self.init_games(key, batch_size, evaluator)
         # return collection state
         return CollectionState(
             eval_state=eval_state,
@@ -1038,6 +1503,28 @@ class Trainer:
             if self.tree_buffer is not None
             else None,
         )
+
+    def init_games(
+        self, key: jax.Array, batch_size: int, evaluator: Evaluator
+    ) -> tuple[Any, StepMetadata, Any]:
+        """Initializes self-play's games, one per environment, and the evaluator's states.
+
+        Args:
+            key: rng
+            batch_size: number of parallel environments
+            evaluator: the self-play evaluator
+
+        Returns:
+            Tuple[Any, StepMetadata, Any]: the environment states, their metadata, and the
+                evaluator's states
+        """
+        env_init_key, _ = jax.random.split(key)
+        env_keys = jax.random.split(env_init_key, batch_size)
+        # compiled, so that no two of the state's arrays are one array, as an environment's eager
+        # init can return (e.g. its current player, in both the state and the metadata):
+        # `collect_steps` can't be donated the same array twice
+        env_state, metadata = jax.jit(jax.vmap(self.env_init_fn))(env_keys)
+        return env_state, metadata, self.init_eval_state(evaluator, batch_size)
 
     def follow_schedule(
         self, epoch: int, evaluator: Evaluator, collection_state: CollectionState
@@ -1073,6 +1560,8 @@ class Trainer:
         num_epochs: int,
         eval_every: int = 1,
         initial_state: TrainLoopOutput | None = None,
+        fork_from: str | None = None,
+        fork_replay_buffers: bool = True,
     ) -> TrainLoopOutput:
         """Runs the training loop for `num_epochs` epochs. Mostly configured by the Trainer's attributes.
 
@@ -1080,19 +1569,49 @@ class Trainer:
         - Trains the neural network on the collected experiences.
         - Tests the agent on a set of Testers, which evaluate the agent's performance.
 
+        Saves a checkpoint of the train state every epoch, and the whole training state after the
+        epochs set by `save_state_at` and `save_state_every` (see `save_state`).
+
         Args:
             seed: rng seed (int)
-            num_epochs: number of epochs to run the training loop for
+            num_epochs: number of epochs to run the training loop for, in all: a continued run
+                stops after this many epochs, counting those done before
             eval_every: number of epochs between evaluations
             initial_state: (optional) TrainLoopOutput, used to continue training from a previous state
                 - its collection state must hold the states of the self-play evaluator scheduled for
                   the epoch before `initial_state.cur_epoch`, as one this trainer returned does
+                - with its `key` (as `train_loop` and `resume` return it), the run continues
+                  exactly as if it hadn't stopped, and `seed` is unused. Without, the rng is
+                  `seed`'s, folded with the epoch, and self-play starts with `warmup_steps`.
                 - its collection state is donated to self-play (see `collect_steps`), so it
                   can't be used afterwards
+            fork_from: (optional) a saved state (see `save_state`), or a directory to take the
+                newest from, to fork a new run from. It's a run from scratch at epoch 0 (with its
+                own schedules, rng, games and testers), except that it starts with the saved
+                network and optimizer state (its learning rate schedule starting over), and its
+                replay buffers (see `fork_state`). The monitor run's config records it as
+                `parent`. Not with `initial_state`.
+            fork_replay_buffers: with `fork_from`, start with its replay buffers (default), or with
+                empty ones
 
         Returns:
-            TrainLoopOutput: contains train_state, collection_state, test_states, cur_epoch after training loop
+            TrainLoopOutput: contains train_state, collection_state, test_states, cur_epoch after
+                training loop, and the rng to continue it with
         """
+        if fork_from is not None:
+            if initial_state is not None:
+                raise ValueError("pass initial_state or fork_from, not both")
+            fork_from = latest_state_path(fork_from)
+            meta = read_state_meta(fork_from)
+            self.parent = {
+                "path": os.path.abspath(fork_from),
+                "epoch": meta["epoch"],
+                "replay_buffers": fork_replay_buffers,
+                "monitor_run": meta["monitor_run"],
+                "parent": meta["parent"],
+            }
+        elif initial_state is None:
+            self.parent = None
         if self.monitor is not None:
             self.monitor.start(
                 config={
@@ -1102,11 +1621,19 @@ class Trainer:
                         "num_epochs": num_epochs,
                         "eval_every": eval_every,
                     },
+                    **({"parent": self.parent} if self.parent is not None else {}),
                     **self.extra_config,
                 }
             )
         try:
-            output = self._train_loop(seed, num_epochs, eval_every, initial_state)
+            output = self._train_loop(
+                seed,
+                num_epochs,
+                eval_every,
+                initial_state,
+                fork_from,
+                fork_replay_buffers,
+            )
         except BaseException as e:
             if self.monitor is not None:
                 self.monitor.finish(
@@ -1123,9 +1650,13 @@ class Trainer:
         num_epochs: int,
         eval_every: int,
         initial_state: TrainLoopOutput | None,
+        fork_from: str | None = None,
+        fork_replay_buffers: bool = True,
     ) -> TrainLoopOutput:
         # init rng
         key = jax.random.PRNGKey(seed)
+        # an exact continuation picks up where the run stopped, without a warmup
+        exact = initial_state is not None and initial_state.key is not None
 
         # initialize states
         if initial_state:
@@ -1133,41 +1664,51 @@ class Trainer:
             train_state = initial_state.train_state
             tester_states = initial_state.test_states
             cur_epoch = initial_state.cur_epoch
-            # don't replay the keys the original run used from epoch 0
-            key = jax.random.fold_in(key, cur_epoch)
+            if initial_state.key is not None:
+                key = initial_state.key
+            else:
+                # don't replay the keys the original run used from epoch 0
+                key = jax.random.fold_in(key, cur_epoch)
             # the evaluator whose states the collection state holds
             evaluator = self.selfplay_schedule.at(max(cur_epoch - 1, 0))
         else:
             cur_epoch = 0
-            # initialize collection state
             evaluator = self.selfplay_schedule.at(0)
             init_key, key = jax.random.split(key)
-            collection_state = self.init_collection_state(
-                init_key, self.batch_size, evaluator
-            )
-            # initialize train state
-            train_state = self.init_train_state()
+            if fork_from is None:
+                # initialize collection state
+                collection_state = self.init_collection_state(
+                    init_key, self.batch_size, evaluator
+                )
+                # initialize train state
+                train_state = self.init_train_state()
+            else:
+                self.set_activity(f"loading {fork_from}", echo=True)
+                collection_state, train_state = self.fork_state(
+                    fork_from, init_key, fork_replay_buffers
+                )
             params = self.extract_model_params_fn(train_state)
             # initialize tester states
             tester_states = [tester.init(params=params) for tester in self.testers]
 
-        # warmup
-        # populate replay buffer with initial self-play games
         evaluator, collection_state = self.follow_schedule(
             cur_epoch, evaluator, collection_state
         )
-        if self.warmup_steps > 0:
-            self.set_activity(f"warmup self-play ({self.warmup_steps} steps)")
         params = self.extract_model_params_fn(train_state)
-        collect_key, key = jax.random.split(key)
-        collect_keys = jax.random.split(collect_key, self.batch_size)
-        collection_state = self.collect_steps(
-            collect_keys,
-            collection_state,
-            params,
-            self.warmup_steps,
-            evaluator=evaluator,
-        )
+        if not exact:
+            # warmup
+            # populate replay buffer with initial self-play games
+            if self.warmup_steps > 0:
+                self.set_activity(f"warmup self-play ({self.warmup_steps} steps)")
+            collect_key, key = jax.random.split(key)
+            collect_keys = jax.random.split(collect_key, self.batch_size)
+            collection_state = self.collect_steps(
+                collect_keys,
+                collection_state,
+                params,
+                self.warmup_steps,
+                evaluator=evaluator,
+            )
 
         # training loop
         while cur_epoch < num_epochs:
@@ -1245,6 +1786,17 @@ class Trainer:
             self.save_checkpoint(train_state, cur_epoch)
             # next epoch
             cur_epoch += 1
+            if self.should_save_state(cur_epoch):
+                self.set_activity(f"epoch {cur_epoch - 1}: saving the training state")
+                self.save_state(
+                    TrainLoopOutput(
+                        collection_state=collection_state,
+                        train_state=train_state,
+                        test_states=tester_states,
+                        cur_epoch=cur_epoch,
+                        key=key,
+                    )
+                )
 
         # return state so that training can be continued!
         return TrainLoopOutput(
@@ -1252,4 +1804,5 @@ class Trainer:
             train_state=train_state,
             test_states=tester_states,
             cur_epoch=cur_epoch,
+            key=key,
         )
