@@ -35,11 +35,13 @@ def test_the_mask_selects_the_convolution_and_linear_weights():
         ".policy_conv.weight",
         ".policy_linear.weight",
         ".value_conv.weight",
+        ".value_hidden.weight",
         ".value_linear.weight",
     }
     # the rest: the linear layers' biases and the BatchNorms' scales and offsets
     assert {path for path, decayed in mask.items() if not decayed} == {
         ".policy_linear.bias",
+        ".value_hidden.bias",
         ".value_linear.bias",
     } | {
         f".{bn}.{param}"

@@ -108,7 +108,8 @@ def unfolded(net: AZResnet, state, x):
     policy = jax.nn.relu(conv_bn(net.policy_conv, net.policy_bn, x))
     value = jax.nn.relu(conv_bn(net.value_conv, net.value_bn, x))
     policy = net.policy_linear(policy.reshape(-1))
-    value = jnp.tanh(net.value_linear(value.reshape(-1)))
+    value = jax.nn.relu(net.value_hidden(value.reshape(-1)))
+    value = jnp.tanh(net.value_linear(value))
     return policy, value
 
 

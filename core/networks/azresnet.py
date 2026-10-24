@@ -15,6 +15,7 @@ class AZResnetConfig:
         policy_head_out_size: output size of the policy head (number of actions)
         num_blocks: number of residual blocks
         num_channels: number of channels in each residual block
+        value_hidden_size: width of the value head's hidden layer (AlphaZero's: 256)
         inference_dtype: dtype the network computes in, in inference mode (see `eqx.nn.inference_mode`),
             e.g. "bfloat16" for faster self-play
         train_dtype: dtype the convolutions compute in, in training, e.g. "bfloat16" for mixed precision:
@@ -30,6 +31,7 @@ class AZResnetConfig:
     policy_head_out_size: int
     num_blocks: int
     num_channels: int
+    value_hidden_size: int = 256
     inference_dtype: str = "float32"
     train_dtype: str = "float32"
     remat: bool = False
@@ -164,6 +166,7 @@ class AZResnet(eqx.Module):
     policy_linear: eqx.nn.Linear
     value_conv: eqx.nn.Conv2d
     value_bn: eqx.nn.BatchNorm
+    value_hidden: eqx.nn.Linear
     value_linear: eqx.nn.Linear
     inference_dtype: str = eqx.field(static=True)
     train_dtype: str = eqx.field(static=True)
@@ -183,22 +186,25 @@ class AZResnet(eqx.Module):
             key: rng used to initialize parameters
         """
         height, width, in_channels = input_shape
-        keys = jax.random.split(key, config.num_blocks + 5)
+        keys = jax.random.split(key, config.num_blocks + 6)
         # initial conv layer
         self.stem_conv = conv(in_channels, config.num_channels, 3, keys[0])
         self.stem_bn = batch_norm(config.num_channels)
         # residual blocks
-        self.blocks = [ResidualBlock(config.num_channels, key=k) for k in keys[5:]]
+        self.blocks = [ResidualBlock(config.num_channels, key=k) for k in keys[6:]]
         # policy head
         self.policy_conv = conv(config.num_channels, 2, 1, keys[1])
         self.policy_bn = batch_norm(2)
         self.policy_linear = eqx.nn.Linear(
             2 * height * width, config.policy_head_out_size, key=keys[2]
         )
-        # value head
+        # value head, as AlphaZero's: a 1x1 convolution to one channel, then a hidden layer
         self.value_conv = conv(config.num_channels, 1, 1, keys[3])
         self.value_bn = batch_norm(1)
-        self.value_linear = eqx.nn.Linear(height * width, 1, key=keys[4])
+        self.value_hidden = eqx.nn.Linear(
+            height * width, config.value_hidden_size, key=keys[4]
+        )
+        self.value_linear = eqx.nn.Linear(config.value_hidden_size, 1, key=keys[5])
         self.inference_dtype = config.inference_dtype
         self.train_dtype = config.train_dtype
         self.remat = config.remat
@@ -232,7 +238,8 @@ class AZResnet(eqx.Module):
         # value head
         value, state = conv_bn(self.value_conv, self.value_bn, x, state, dtype)
         value = jax.nn.relu(value)
-        value = self.value_linear(value.reshape(-1).astype(jnp.float32))
+        value = jax.nn.relu(self.value_hidden(value.reshape(-1).astype(jnp.float32)))
+        value = self.value_linear(value)
         value = jnp.tanh(value)
 
         return (policy, value), state
