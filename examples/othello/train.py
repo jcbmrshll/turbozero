@@ -188,7 +188,13 @@ def main():
         "--inference-dtype",
         default="float32",
         help="dtype the network computes in during self-play and test games, e.g. "
-        "bfloat16 (about twice as fast); it always trains in float32",
+        "bfloat16 (about twice as fast)",
+    )
+    parser.add_argument(
+        "--train-dtype",
+        default="float32",
+        help="dtype the network's convolutions compute in during training, e.g. bfloat16 "
+        "for mixed precision: its parameters, BatchNorm and heads stay in float32",
     )
     parser.add_argument(
         "--standard-starts",
@@ -339,6 +345,7 @@ def main():
         args.channels,
         seed=args.seed,
         inference_dtype=args.inference_dtype,
+        train_dtype=args.train_dtype,
         remat=args.remat,
     )
 

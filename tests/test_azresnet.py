@@ -69,13 +69,14 @@ def test_inference_folds_batch_norm_into_the_convolution(dtype, tolerance):
     )
 
 
-def make_net(inference_dtype="float32", remat=False):
+def make_net(inference_dtype="float32", remat=False, train_dtype="float32"):
     """A tiny AZResnet; the same parameters whatever its static options."""
     config = AZResnetConfig(
         policy_head_out_size=5,
         num_blocks=1,
         num_channels=4,
         inference_dtype=inference_dtype,
+        train_dtype=train_dtype,
         remat=remat,
     )
     return eqx.nn.make_with_state(AZResnet)(
@@ -165,6 +166,40 @@ def test_static_options_do_not_change_training():
         np.testing.assert_allclose(a, b, rtol=1e-5, atol=1e-7)
     for a, b in zip(inference, inference_remat, strict=True):
         np.testing.assert_array_equal(a, b)
+
+
+def test_mixed_precision_training_stays_close_to_float32():
+    # bfloat16 convolutions: the loss, the gradients (float32, as the parameters are) and the
+    # BatchNorm statistics (float32) within bfloat16's rounding of float32 training's
+    def loss(net, state, x):
+        (policy, value), state = apply_nn(net, state, x)
+        return (policy**2).mean() + (value**2).mean(), state
+
+    @eqx.filter_jit
+    def run(net, state, x):
+        (value, state), grads = eqx.filter_value_and_grad(loss, has_aux=True)(
+            net, state, x
+        )
+        return value, grads, state
+
+    net32, state = make_net()
+    net16, _ = make_net(train_dtype="bfloat16")
+    x = observations(np.random.default_rng(0), batch_size=16)
+    loss32, grads32, state32 = run(net32, state, x)
+    loss16, grads16, state16 = run(net16, state, x)
+
+    np.testing.assert_allclose(loss16, loss32, rtol=2e-2)
+    leaves16, leaves32 = jax.tree.leaves(grads16), jax.tree.leaves(grads32)
+    assert all(a.dtype == b.dtype == jnp.float32 for a, b in zip(leaves16, leaves32))
+    # bfloat16 rounding through the network: the whole gradient within about 10%, pointing the same way
+    a, b = (
+        np.concatenate([np.ravel(x) for x in leaves]) for leaves in (leaves16, leaves32)
+    )
+    assert np.linalg.norm(a - b) <= 0.15 * np.linalg.norm(b)
+    assert a @ b >= 0.99 * np.linalg.norm(a) * np.linalg.norm(b)
+    for a, b in zip(jax.tree.leaves(state16), jax.tree.leaves(state32), strict=True):
+        assert a.dtype == b.dtype
+        np.testing.assert_allclose(a, b, rtol=2e-2, atol=2e-2)
 
 
 @eqx.filter_jit

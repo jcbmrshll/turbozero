@@ -16,7 +16,11 @@ class AZResnetConfig:
         num_blocks: number of residual blocks
         num_channels: number of channels in each residual block
         inference_dtype: dtype the network computes in, in inference mode (see `eqx.nn.inference_mode`),
-            e.g. "bfloat16" for faster self-play; it trains in float32 either way
+            e.g. "bfloat16" for faster self-play
+        train_dtype: dtype the convolutions compute in, in training, e.g. "bfloat16" for mixed precision:
+            the parameters, BatchNorm, the activations between residual blocks and the heads stay in
+            float32, and the gradients reach the float32 parameters. bfloat16 has float32's exponent
+            range, so the loss needs no scaling
         remat: in training, keep only each residual block's input for the backward pass, and compute
             the activations inside the block again from it (gradient checkpointing, see `jax.checkpoint`):
             training takes much less memory, for about one more forward pass of compute. The
@@ -27,6 +31,7 @@ class AZResnetConfig:
     num_blocks: int
     num_channels: int
     inference_dtype: str = "float32"
+    train_dtype: str = "float32"
     remat: bool = False
 
 
@@ -84,14 +89,16 @@ def conv_bn(
     state: eqx.nn.State,
     dtype: jnp.dtype,
 ) -> tuple[jax.Array, eqx.nn.State]:
-    """A convolution followed by BatchNorm.
+    """A convolution followed by BatchNorm. The convolution computes in `dtype`.
 
+    In training, BatchNorm normalizes in float32 (its batch statistics are too coarse in bfloat16).
     In inference mode BatchNorm is a fixed per-channel affine map (see `inference_affine`), so it's
     folded into the convolution's weights and a bias: one pass over the activations instead of two (or
-    more). The folded convolution computes in `dtype`.
+    more).
     """
     if not bn.inference:
-        return bn(conv(x), state)
+        cast = eqx.tree_at(lambda c: c.weight, conv, conv.weight.astype(dtype))
+        return bn(cast(x.astype(dtype)).astype(jnp.float32), state)
     scale, offset = inference_affine(bn, state)
     weight = conv.weight * scale.reshape(-1, 1, 1, 1)
     folded = eqx.tree_at(lambda c: c.weight, conv, weight.astype(dtype))
@@ -119,16 +126,16 @@ class ResidualBlock(eqx.Module):
         self.bn2 = batch_norm(channels)
 
     def __call__(
-        self, x: jax.Array, state: eqx.nn.State
+        self, x: jax.Array, state: eqx.nn.State, dtype: jnp.dtype
     ) -> tuple[jax.Array, eqx.nn.State]:
-        y, state = conv_bn(self.conv1, self.bn1, x, state, x.dtype)
+        y, state = conv_bn(self.conv1, self.bn1, x, state, dtype)
         y = jax.nn.relu(y)
-        y, state = conv_bn(self.conv2, self.bn2, y, state, x.dtype)
+        y, state = conv_bn(self.conv2, self.bn2, y, state, dtype)
         return jax.nn.relu(x + y), state
 
 
 def checkpointed(
-    block: ResidualBlock, x: jax.Array, state: eqx.nn.State
+    block: ResidualBlock, x: jax.Array, state: eqx.nn.State, dtype: jnp.dtype
 ) -> tuple[jax.Array, eqx.nn.State]:
     """Applies `block` under `jax.checkpoint`: differentiating it saves only its inputs, and computes
     its activations again in the backward pass."""
@@ -138,7 +145,7 @@ def checkpointed(
     def apply(
         params: ResidualBlock, x: jax.Array, state: eqx.nn.State
     ) -> tuple[jax.Array, eqx.nn.State]:
-        return eqx.combine(params, static)(x, state)
+        return eqx.combine(params, static)(x, state, dtype)
 
     return apply(params, x, state)
 
@@ -159,6 +166,7 @@ class AZResnet(eqx.Module):
     value_bn: eqx.nn.BatchNorm
     value_linear: eqx.nn.Linear
     inference_dtype: str = eqx.field(static=True)
+    train_dtype: str = eqx.field(static=True)
     remat: bool = eqx.field(static=True)
 
     def __init__(
@@ -192,16 +200,16 @@ class AZResnet(eqx.Module):
         self.value_bn = batch_norm(1)
         self.value_linear = eqx.nn.Linear(height * width, 1, key=keys[4])
         self.inference_dtype = config.inference_dtype
+        self.train_dtype = config.train_dtype
         self.remat = config.remat
 
     def __call__(
         self, x: jax.Array, state: eqx.nn.State
     ) -> tuple[tuple[jax.Array, jax.Array], eqx.nn.State]:
-        # the convolutions and the activations between them use the inference dtype in inference mode
-        dtype = (
-            jnp.dtype(self.inference_dtype)
-            if self.stem_bn.inference
-            else self.stem_conv.weight.dtype
+        # the convolutions compute in the inference dtype in inference mode (and so do the activations
+        # between them), in the train dtype in training
+        dtype = jnp.dtype(
+            self.inference_dtype if self.stem_bn.inference else self.train_dtype
         )
         # inputs are channels-last (and may be e.g. boolean), equinox convolutions are channels-first
         x = jnp.moveaxis(x, -1, 0).astype(dtype)
@@ -212,9 +220,9 @@ class AZResnet(eqx.Module):
         # residual blocks
         for block in self.blocks:
             if self.remat and not self.stem_bn.inference:
-                x, state = checkpointed(block, x, state)
+                x, state = checkpointed(block, x, state, dtype)
             else:
-                x, state = block(x, state)
+                x, state = block(x, state, dtype)
 
         # policy head
         policy, state = conv_bn(self.policy_conv, self.policy_bn, x, state, dtype)
