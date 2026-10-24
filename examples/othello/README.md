@@ -193,7 +193,7 @@ uv run examples/othello/train.py --epochs 30 --init-from runs/trunk/state-150.np
 ## Evaluating a checkpoint
 
 Checkpoints from `train.py` are named after their epoch (`199.eqx` is the last of a
-200-epoch run). Pass the network size if it isn't the default.
+200-epoch run). Pass the run's `--net` if it isn't the default.
 
 ```
 uv run examples/othello/eval_pgx.py runs/othello/199.eqx --pgx-sims 64 256 1024

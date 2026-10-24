@@ -102,8 +102,14 @@ def main():
     parser = argparse.ArgumentParser(description="AlphaZero on Othello.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=200)
-    parser.add_argument("--blocks", type=int, default=6, help="residual blocks")
-    parser.add_argument("--channels", type=int, default=128, help="channels per block")
+    parser.add_argument(
+        "--net",
+        default="resnet:6x128",
+        help="the network: KIND:DEPTHxWIDTH[,FIELD=VALUE...], e.g. resnet:10x128 for "
+        "AlphaZero's ResNet with 10 blocks of 128 channels, resnet:10x128,pool_every=3,"
+        "heads=pooled with KataGo's global pooling, or transformer:8x256 (see "
+        "core.networks.spec.network_config)",
+    )
     sims = parser.add_mutually_exclusive_group()
     sims.add_argument(
         "--sims", type=int, default=64, help="MCTS iterations per self-play move"
@@ -304,7 +310,7 @@ def main():
         help="fork a new run from a saved state (state-<EPOCH>.npz, or a --ckpt-dir to take "
         "the newest from): it starts at epoch 0, with its own schedules, games and seed, "
         "from the saved network, optimizer state (the learning rate decaying anew from "
-        "--lr) and replay buffers. Needs the same --blocks and --channels; --buffer may "
+        "--lr) and replay buffers. Needs the same --net; --buffer may "
         "differ (each environment's newest entries are kept)",
     )
     parser.add_argument(
@@ -339,10 +345,9 @@ def main():
     # test games all start from XOT openings
     test_init_fn = make_xot_init_fn(load_xot(), standard_start_fraction=0)
 
-    # the residual network from the AlphaZero paper (see game.py), with its BatchNorm state
-    resnet, resnet_state = make_network(
-        args.blocks,
-        args.channels,
+    # the network (see game.py), with its state (BatchNorm's, if it has any)
+    network, network_state = make_network(
+        args.net,
         seed=args.seed,
         inference_dtype=args.inference_dtype,
         train_dtype=args.train_dtype,
@@ -353,7 +358,7 @@ def main():
     # samples moves in proportion to visit counts, for exploration during self-play.
     # With --sims-schedule, a search for each stage: each takes over at its epoch,
     # starting from empty trees sized for it (see core.training.schedule)
-    selfplay_eval_fn = make_nn_eval_fn(resnet, state_to_nn_input)
+    selfplay_eval_fn = make_nn_eval_fn(network, state_to_nn_input)
     evaluator = EvaluatorSchedule(
         [
             (
@@ -370,7 +375,7 @@ def main():
             for epoch, sims in args.sims_schedule or [(0, args.sims)]
         ]
     )
-    evaluator_test = make_test_evaluator(make_nn_eval_fn(resnet, state_to_nn_input))
+    evaluator_test = make_test_evaluator(make_nn_eval_fn(network, state_to_nn_input))
 
     # opponents: the greedy tile counter and pgx's pretrained model (others are listed
     # at https://sotets.uk/pgx/api/#pgx.BaselineModelId)
@@ -409,8 +414,8 @@ def main():
         collection_steps_per_epoch=128,
         train_steps_per_epoch=args.train_steps,
         grad_accum_steps=args.grad_accum,
-        nn=resnet,
-        nn_state=resnet_state,
+        nn=network,
+        nn_state=network_state,
         loss_fn=partial(az_default_loss_fn, value_target_q=args.value_target_q),
         # decays from --lr to --lr-final over the run
         optimizer=make_optimizer(

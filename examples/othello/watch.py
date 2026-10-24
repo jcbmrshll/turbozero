@@ -1,8 +1,8 @@
 """Evaluates a training run's checkpoints against Edax or Egaroucid as they're saved, so a
 long run's strength shows before it ends.
 
-    uv run examples/othello/train.py --blocks 10 --keep-every 25 --ckpt-dir runs/othello &
-    uv run examples/othello/watch.py runs/othello --blocks 10 --pid $!
+    uv run examples/othello/train.py --net resnet:10x128 --keep-every 25 --ckpt-dir runs/othello &
+    uv run examples/othello/watch.py runs/othello --net resnet:10x128 --pid $!
 
 Runs `vs_engine.py` on every checkpoint whose epoch is a multiple of --every (keep them
 with train.py's --keep-every, since it deletes all but the newest 2), and on the newest
@@ -77,8 +77,7 @@ def main():
         description="Evaluates a training run's checkpoints against an engine as they're saved."
     )
     parser.add_argument("ckpt_dir", type=Path, help="train.py's --ckpt-dir")
-    parser.add_argument("--blocks", type=int, default=6)
-    parser.add_argument("--channels", type=int, default=128)
+    parser.add_argument("--net", default="resnet:6x128", help="the run's --net")
     parser.add_argument("--engine", default="edax")
     parser.add_argument("--levels", type=int, nargs="+", default=[4, 6, 8])
     parser.add_argument("--sims", type=int, default=64)
@@ -132,8 +131,7 @@ def main():
         episodes = tempfile.TemporaryDirectory(prefix="watch-")
         subprocess.run(
             [sys.executable, str(VS_ENGINE), path]
-            + ["--engine", args.engine, "--blocks", str(args.blocks)]
-            + ["--channels", str(args.channels), "--sims", str(args.sims)]
+            + ["--engine", args.engine, "--net", args.net, "--sims", str(args.sims)]
             + ["--openings", str(args.openings), "--stop-below", "-1"]
             + ["--results", str(results), "--levels"]
             + [str(level) for level in args.levels]

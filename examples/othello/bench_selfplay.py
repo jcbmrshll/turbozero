@@ -42,12 +42,10 @@ from core.training.train import Trainer
 def make_trainer(args) -> tuple[Trainer, tuple]:
     """A trainer set up like train.py's, and the parameters to self-play with."""
     if args.ckpt:
-        resnet, params = load_checkpoint(
-            args.ckpt, args.blocks, args.channels, args.dtype
-        )
+        resnet, params = load_checkpoint(args.ckpt, args.net, args.dtype)
     else:
         resnet, resnet_state = make_network(
-            args.blocks, args.channels, seed=args.seed, inference_dtype=args.dtype
+            args.net, seed=args.seed, inference_dtype=args.dtype
         )
         params = (eqx.filter(resnet, eqx.is_inexact_array), resnet_state)
     evaluator = AlphaZero(MCTS)(
@@ -88,8 +86,7 @@ def main():
     parser = argparse.ArgumentParser(description="Time Othello self-play.")
     parser.add_argument("--envs", type=int, default=1024, help="parallel games")
     parser.add_argument("--sims", type=int, default=64, help="MCTS iterations a move")
-    parser.add_argument("--blocks", type=int, default=6)
-    parser.add_argument("--channels", type=int, default=128)
+    parser.add_argument("--net", default="resnet:6x128", help="as train.py's --net")
     parser.add_argument("--ckpt", default=None, help="checkpoint to play with")
     parser.add_argument(
         "--dtype", default="float32", help="the network's dtype in self-play"
@@ -151,7 +148,7 @@ def main():
         times.append(time.perf_counter() - t)
     per_step = np.array(times) / args.steps
     print(
-        f"{args.envs} envs, {args.sims} sims, {args.blocks}x{args.channels}: "
+        f"{args.envs} envs, {args.sims} sims, {args.net}: "
         f"{1e3 * np.median(per_step):.1f} ms/step (min {1e3 * per_step.min():.1f}), "
         f"{args.envs / np.median(per_step):,.0f} moves/s"
     )

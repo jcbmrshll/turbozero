@@ -32,20 +32,26 @@ def test_the_mask_selects_the_convolution_and_linear_weights():
         ".stem_conv.weight",
         ".blocks[0].conv1.weight",
         ".blocks[0].conv2.weight",
-        ".policy_conv.weight",
-        ".policy_linear.weight",
-        ".value_conv.weight",
-        ".value_hidden.weight",
-        ".value_linear.weight",
+        ".heads.policy_conv.weight",
+        ".heads.policy_linear.weight",
+        ".heads.value_conv.weight",
+        ".heads.value_hidden.weight",
+        ".heads.value_linear.weight",
     }
     # the rest: the linear layers' biases and the BatchNorms' scales and offsets
     assert {path for path, decayed in mask.items() if not decayed} == {
-        ".policy_linear.bias",
-        ".value_hidden.bias",
-        ".value_linear.bias",
+        ".heads.policy_linear.bias",
+        ".heads.value_hidden.bias",
+        ".heads.value_linear.bias",
     } | {
         f".{bn}.{param}"
-        for bn in ("stem_bn", "blocks[0].bn1", "blocks[0].bn2", "policy_bn", "value_bn")
+        for bn in (
+            "stem_bn",
+            "blocks[0].bn1",
+            "blocks[0].bn2",
+            "heads.policy_bn",
+            "heads.value_bn",
+        )
         for param in ("weight", "bias")
     }
 
