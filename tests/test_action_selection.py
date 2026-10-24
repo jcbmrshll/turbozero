@@ -6,7 +6,6 @@ import numpy as np
 import pytest
 
 from core.evaluators.mcts.action_selection import (
-    MuZeroPUCTSelector,
     PUCTSelector,
     bounded_q_values,
     normalize_q_values,
@@ -125,7 +124,9 @@ def visited_tree(prior, root_q, child_n, child_q):
     return tree
 
 
-@pytest.mark.parametrize("selector", [PUCTSelector(), MuZeroPUCTSelector()])
+@pytest.mark.parametrize(
+    "selector", [PUCTSelector(), PUCTSelector(q_transform=normalize_q_values)]
+)
 def test_selectors_never_choose_a_move_without_prior(selector):
     # illegal moves have no prior; however bad the legal moves' values are for the player to move
     # (they're the children's, from their side), their exploration bonus keeps them ahead
@@ -139,7 +140,9 @@ def test_selectors_never_choose_a_move_without_prior(selector):
     assert int(selector(KEY, tree, tree.ROOT_INDEX, -1.0)) in (0, 2)
 
 
-@pytest.mark.parametrize("selector", [PUCTSelector(), MuZeroPUCTSelector()])
+@pytest.mark.parametrize(
+    "selector", [PUCTSelector(), PUCTSelector(q_transform=normalize_q_values)]
+)
 def test_selectors_break_exact_ties_at_random(selector):
     # every child has the same prior, visits and value: only the key decides
     tree = visited_tree(
@@ -151,9 +154,11 @@ def test_selectors_break_exact_ties_at_random(selector):
     assert int(select(KEY)) == int(select(KEY))
 
 
-@pytest.mark.parametrize("selector", [PUCTSelector(), MuZeroPUCTSelector()])
+@pytest.mark.parametrize(
+    "selector", [PUCTSelector(), PUCTSelector(q_transform=normalize_q_values)]
+)
 def test_tie_breaking_never_overturns_a_strict_preference(selector):
-    # child 2 is ahead by 5e-5 of the value range: far more than the noise
+    # child 2 is ahead by 1e-5 in value: far more than the noise
     tree = visited_tree(
         prior=[0.25] * 4, root_q=0.0, child_n=[3] * 4, child_q=[0.2, 0.2, 0.19999, 0.2]
     )
@@ -165,8 +170,9 @@ def test_tie_breaking_never_overturns_a_strict_preference(selector):
 @pytest.mark.parametrize(
     "c1, c2, expected", [(1.25, 19652, 0), (1.25, 1.0, 3), (3.0, 19652, 3)]
 )
-def test_muzero_selector_matches_paper_ucb_score(c1, c2, expected):
-    """MuZero pseudocode `ucb_score`, with values min-max normalized over the parent and its children."""
+def test_puct_with_min_max_matches_muzero_ucb_score(c1, c2, expected):
+    """MuZero pseudocode `ucb_score` without known bounds (its Atari setting), with values min-max
+    normalized over the parent and its children."""
     prior = np.array([0.1, 0.5, 0.15, 0.25])
     child_n = np.array([4, 10, 1, 3])
     child_q = np.array([-0.5, 0.2, 0.3, -0.1])
@@ -182,12 +188,14 @@ def test_muzero_selector_matches_paper_ucb_score(c1, c2, expected):
     assert np.argmax(ucb) == expected
 
     assert (
-        MuZeroPUCTSelector(c1=c1, c2=c2)(KEY, tree, tree.ROOT_INDEX, discount)
+        PUCTSelector(c_init=c1, c_base=c2, q_transform=normalize_q_values)(
+            KEY, tree, tree.ROOT_INDEX, discount
+        )
         == expected
     )
 
 
-def test_muzero_selector_with_bounds_matches_paper_board_game_ucb_score():
+def test_puct_matches_alphazero_and_muzero_board_game_ucb_score():
     """MuZero pseudocode `ucb_score` for board games, whose values are normalized by
     `KnownBounds(-1, 1)`: here it picks a different action than min-max normalization."""
     prior = np.array([0.1, 0.5, 0.15, 0.25])
@@ -202,6 +210,6 @@ def test_muzero_selector_with_bounds_matches_paper_board_game_ucb_score():
     ucb = value_score + pb_c * prior
     assert np.argmax(ucb) == 3
 
-    selector = MuZeroPUCTSelector(q_transform=bounded_q_values)
-    assert selector(KEY, tree, tree.ROOT_INDEX, discount) == 3
-    assert MuZeroPUCTSelector()(KEY, tree, tree.ROOT_INDEX, discount) == 0
+    assert PUCTSelector()(KEY, tree, tree.ROOT_INDEX, discount) == 3
+    min_max = PUCTSelector(q_transform=normalize_q_values)
+    assert min_max(KEY, tree, tree.ROOT_INDEX, discount) == 0
