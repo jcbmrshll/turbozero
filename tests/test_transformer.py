@@ -36,10 +36,21 @@ def loss(net, state, x):
     return (policy**2).mean() + (value**2).mean(), state
 
 
+SMOLGEN = {
+    "smolgen": True,
+    "smolgen_compress": 2,
+    "smolgen_hidden": 6,
+    "smolgen_head": 4,
+}
+
+
 @pytest.mark.parametrize("norm", ["post", "pre"])
+@pytest.mark.parametrize("smolgen", [False, True])
 @pytest.mark.parametrize("dtype, tolerance", [("float32", 1e-6), ("bfloat16", 5e-2)])
-def test_inference_gives_the_outputs_training_does(norm, dtype, tolerance):
-    net, state = make_net(norm=norm, inference_dtype=dtype)
+def test_inference_gives_the_outputs_training_does(norm, smolgen, dtype, tolerance):
+    net, state = make_net(
+        norm=norm, inference_dtype=dtype, **(SMOLGEN if smolgen else {})
+    )
     x = observations(np.random.default_rng(0))
 
     @eqx.filter_jit
@@ -64,8 +75,12 @@ def test_static_options_do_not_change_training():
         grad_fn = eqx.filter_value_and_grad(loss, has_aux=True)
         return [jax.tree.leaves(grad_fn(net, state, x)) for net in nets]
 
-    plain, state = make_net()
-    nets = (plain, make_net(inference_dtype="bfloat16")[0], make_net(remat=True)[0])
+    plain, state = make_net(**SMOLGEN)
+    nets = (
+        plain,
+        make_net(inference_dtype="bfloat16", **SMOLGEN)[0],
+        make_net(remat=True, **SMOLGEN)[0],
+    )
     trained, trained16, trained_remat = run(
         nets, state, observations(np.random.default_rng(0))
     )
@@ -119,3 +134,26 @@ def test_the_policy_must_be_a_logit_per_square_and_a_pass():
             INPUT_SHAPE,
             key=jax.random.PRNGKey(0),
         )
+
+
+def test_smolgen_biases_attention_from_the_whole_board_with_one_shared_map():
+    net, state = make_net(**SMOLGEN)
+    x = observations(np.random.default_rng(0))
+    grads = eqx.filter_grad(lambda net: loss(net, state, x)[0])(net)
+
+    # one map from each head's features to its biases, (head features, squares^2), which every
+    # layer's smolgen trains
+    assert net.smolgen_generator is not None and grads.smolgen_generator is not None
+    assert net.smolgen_generator.weight.shape == (4, 81)
+    assert np.abs(grads.smolgen_generator.weight).sum() > 0
+    for layer in grads.layers:
+        assert layer.smolgen is not None
+        assert np.abs(layer.smolgen.compress.weight).sum() > 0
+    # the biases depend on the board: different positions, different biases
+    layer = net.layers[0]
+    assert layer.smolgen is not None
+    tokens = jax.random.normal(jax.random.PRNGKey(1), (2, 9, 8))
+    a, b = (
+        layer.smolgen(t, net.smolgen_generator, jnp.dtype("float32")) for t in tokens
+    )
+    assert a.shape == (2, 9, 9) and not np.allclose(a, b)
