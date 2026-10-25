@@ -335,7 +335,10 @@ class BoardTransformer(eqx.Module):
         f32 = jnp.dtype(jnp.float32)
         squares = self.policy(x, dtype).reshape(-1).astype(f32)
         passing = self.pass_logit(x.astype(f32).mean(axis=0), f32)
-        policy = jnp.concatenate([squares, passing])
+        # the square logits, then the pass logit: padded and summed rather than concatenated, which
+        # XLA (GPU, jax 0.11.2) fails to compile after a bfloat16 layer ("Reshape input and output
+        # shapes must be the same")
+        policy = jnp.pad(squares, (0, 1)) + jnp.pad(passing, (len(squares), 0))
 
         value = jax.nn.mish(self.value_proj(x, dtype)).reshape(-1)
         value = jax.nn.mish(self.value_hidden(value, f32))

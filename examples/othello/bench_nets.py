@@ -58,10 +58,19 @@ def random_batch(rng: np.random.Generator, size: int) -> BaseExperience:
 
 
 def forward_flops(network, network_state, x: jax.Array) -> float:
-    """XLA's count of the FLOPs of an inference-mode forward pass on `x`, per position."""
-    compiled = (
-        jax.jit(lambda x: apply_nn(network, network_state, x)[0]).lower(x).compile()
+    """XLA's count of the FLOPs of an inference-mode forward pass on `x`, per position. Counted
+    on the CPU: on the GPU, XLA doesn't count the convolutions it hands to cuDNN."""
+    cpu = jax.devices("cpu")[0]
+    network, network_state, x = jax.tree.map(
+        lambda a: jax.device_put(a, cpu) if eqx.is_array(a) else a,
+        (network, network_state, x),
     )
+    with jax.default_device(cpu):
+        compiled = (
+            jax.jit(lambda x: apply_nn(network, network_state, x)[0])
+            .lower(x)
+            .compile()
+        )
     cost: Any = compiled.cost_analysis()
     if isinstance(cost, list):
         cost = cost[0]
@@ -84,7 +93,9 @@ def bench(net: str, args) -> dict:
     # forward: inference mode, as self-play evaluates its search's leaves
     inference = eqx.nn.inference_mode(network)
     x = random_batch(rng, args.batch).observation_nn
-    result["gflop_per_position"] = forward_flops(inference, network_state, x) / 1e9
+    result["gflop_per_position"] = (
+        forward_flops(inference, network_state, x[:64]) / 1e9
+    )
 
     @jax.jit
     def forward(x, carry):
