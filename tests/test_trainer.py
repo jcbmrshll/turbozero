@@ -1541,6 +1541,8 @@ def test_a_real_run_trains_and_reports_its_metrics(real_run):
             "loss",
             "policy_loss",
             "value_loss",
+            "weight_norm",
+            "update_ratio",
             "TwoPlayerTester_avg_outcome",
             "episodes",
             "search_iterations",
