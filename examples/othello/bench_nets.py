@@ -67,9 +67,7 @@ def forward_flops(network, network_state, x: jax.Array) -> float:
     )
     with jax.default_device(cpu):
         compiled = (
-            jax.jit(lambda x: apply_nn(network, network_state, x)[0])
-            .lower(x)
-            .compile()
+            jax.jit(lambda x: apply_nn(network, network_state, x)[0]).lower(x).compile()
         )
     cost: Any = compiled.cost_analysis()
     if isinstance(cost, list):
@@ -93,9 +91,7 @@ def bench(net: str, args) -> dict:
     # forward: inference mode, as self-play evaluates its search's leaves
     inference = eqx.nn.inference_mode(network)
     x = random_batch(rng, args.batch).observation_nn
-    result["gflop_per_position"] = (
-        forward_flops(inference, network_state, x[:64]) / 1e9
-    )
+    result["gflop_per_position"] = forward_flops(inference, network_state, x[:64]) / 1e9
 
     @jax.jit
     def forward(x, carry):
@@ -138,8 +134,12 @@ def bench(net: str, args) -> dict:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Times networks' forward and training steps.")
-    parser.add_argument("nets", nargs="+", help="networks, as train.py's --net names them")
+    parser = argparse.ArgumentParser(
+        description="Times networks' forward and training steps."
+    )
+    parser.add_argument(
+        "nets", nargs="+", help="networks, as train.py's --net names them"
+    )
     parser.add_argument("--dtype", default="bfloat16", help="inference and train dtype")
     parser.add_argument("--remat", action="store_true", help="as train.py's --remat")
     parser.add_argument("--batch", type=int, default=1024, help="forward batch")
