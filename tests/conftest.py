@@ -24,6 +24,7 @@ import jax.numpy as jnp
 import optax
 import pgx
 import pytest
+from seaglass.server import make_server
 
 from core.evaluators.alphazero import AlphaZero
 from core.evaluators.evaluator import EvalOutput, Evaluator
@@ -33,8 +34,6 @@ from core.memory.replay_memory import EpisodeReplayBuffer
 from core.training.loss_fns import az_default_loss_fn
 from core.training.train import Trainer
 from core.types import StepMetadata
-from monitor import client
-from monitor.server import make_server
 
 # compiling dominates the suite's runtime, so compiled programs persist across runs (and
 # worktrees); JAX_COMPILATION_CACHE_DIR overrides where
@@ -330,18 +329,12 @@ def scripted():
     )
 
 
-@pytest.fixture(autouse=True)
-def no_monitor_heartbeat(monkeypatch):
-    """Monitors in tests don't send heartbeats (tests of the heartbeat set their own interval),
-    so the ones a test leaves running don't keep calling a server that has shut down."""
-    monkeypatch.setattr(client, "HEARTBEAT_S", 3600.0)
-
-
 @pytest.fixture
-def monitor_server(tmp_path):
-    """A monitor server on a free port, storing runs in a temporary directory.
+def seaglass_server(tmp_path):
+    """A seaglass server on a free port, storing runs in a temporary directory.
 
-    Returns a namespace with its `url`, `dir`, and `get(path)` to read its API as JSON.
+    Returns a namespace with its `url`, `dir`, `get(path)` to read its API as JSON, and
+    `file(path)` to read a file's bytes.
     """
     server = make_server("127.0.0.1", 0, str(tmp_path / "runs"))
     # polls for shutdown often, so that it takes no time
@@ -351,10 +344,13 @@ def monitor_server(tmp_path):
     thread.start()
     url = f"http://127.0.0.1:{server.server_address[1]}"
 
-    def get(path):
+    def file(path):
         with urllib.request.urlopen(url + path) as resp:
-            return json.loads(resp.read())
+            return resp.read()
 
-    yield SimpleNamespace(url=url, dir=tmp_path / "runs", get=get)
+    def get(path):
+        return json.loads(file(path))
+
+    yield SimpleNamespace(url=url, dir=tmp_path / "runs", get=get, file=file)
     server.shutdown()
     server.server_close()

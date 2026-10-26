@@ -13,9 +13,6 @@ dependencies = [
     "seaglass",
 ]
 
-[project.scripts]
-turbozero-monitor = "monitor.server:main"
-
 [project.optional-dependencies]
 # GPU build of jax; ./install.sh adds this when it finds an NVIDIA GPU
 cuda = ["jax[cuda13]"]
@@ -25,10 +22,10 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["core", "monitor"]
+packages = ["core"]
 
 [tool.pyright]
-include = ["core", "monitor", "tests", "examples"]
+include = ["core", "tests", "examples"]
 venvPath = "."
 venv = ".venv"
 # the Othello example's scripts import their sibling modules

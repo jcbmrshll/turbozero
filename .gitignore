@@ -1,7 +1,7 @@
 checkpoints/
 .vscode/
 
-# outputs of training runs (turbozero monitor)
+# outputs of training runs (and a seaglass server's runs, `seaglass serve --dir runs`)
 runs/
 # pgx baseline models, downloaded by pgx.make_baseline_model
 baselines/

@@ -35,10 +35,11 @@ from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
+from seaglass import Arrays
 
+from core.monitoring import DEFAULT_URL, Monitor
+from core.monitoring.episodes import episode_type
 from core.training.train import checkpoint_epochs, checkpoint_path
-from monitor import DEFAULT_URL, Monitor
-from monitor.client import Episode
 
 VS_ENGINE = Path(__file__).with_name("vs_engine.py")
 
@@ -99,14 +100,14 @@ def main():
         const=DEFAULT_URL,
         default=None,
         metavar="URL",
-        help=f"log results to a turbozero monitor (default {DEFAULT_URL})",
+        help=f"log results to a seaglass server (default {DEFAULT_URL})",
     )
     parser.add_argument(
-        "--run", default=None, help="the training run's id on the monitor"
+        "--run", default=None, help="the training run's id on the seaglass server"
     )
     args = parser.parse_args()
     if args.monitor and not args.run:
-        parser.error("--monitor needs --run, the id in train.py's monitor link")
+        parser.error("--monitor needs --run, the id in train.py's seaglass link")
 
     results = args.ckpt_dir / "vs_engine.jsonl"
     env = dict(os.environ, XLA_PYTHON_CLIENT_PREALLOCATE="false")
@@ -152,9 +153,9 @@ def main():
                 game = Path(episodes.name) / f"{key}.npz"
                 if game.exists():
                     with np.load(game) as arrays:
-                        logged[f"{key}_game"] = Episode(
-                            "othello",
-                            opponent=f"{args.engine} level {r['level']}",
+                        logged[f"{key}_game"] = Arrays(
+                            episode_type("othello"),
+                            attrs={"opponent": f"{args.engine} level {r['level']}"},
                             **arrays,
                         )
             monitor.log(epoch, logged)

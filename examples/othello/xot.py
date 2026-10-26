@@ -19,7 +19,7 @@ import jax.numpy as jnp
 import numpy as np
 from game import action, env, metadata
 
-from monitor.episodes import with_opening
+from core.monitoring.episodes import with_opening
 
 XOT_PATH = Path(__file__).parent / "xot-openings.txt"
 
@@ -67,8 +67,8 @@ def make_xot_init_fn(openings: np.ndarray, standard_start_fraction: float):
 def xot_episode_fn(episode_fn, openings: np.ndarray):
     """An `episode_fn` (see `BaseTester`) for games started from one of `openings` by an
     init fn from `make_xot_init_fn`, already played: packs the game with the opening's moves
-    before it, by `episode_fn` (`monitor.episodes.pgx_two_player_episode`'s), and the
-    dashboard showing it from the position the players started from.
+    before it, by `episode_fn` (`core.monitoring.episodes.pgx_two_player_episode`'s), and
+    the run's page showing it from the position the players started from.
 
     The game's first position names its opening: no two of the XOT openings end in the same
     position. A game from the standard start is packed as it is."""

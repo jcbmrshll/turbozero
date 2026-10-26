@@ -1,0 +1,212 @@
+/* turbozero's views: they run in frames of their own, so they bring their styles, in
+   the page's theme (its --sg-* variables, SPEC.md §7.5) */
+
+:root {
+  --mid: color-mix(in srgb, var(--sg-fg) 55%, var(--sg-dim));
+  --edge-soft: color-mix(in srgb, var(--sg-edge) 55%, var(--sg-panel));
+  --edge-hot: var(--sg-accent);
+  --hover: color-mix(in srgb, var(--sg-edge) 35%, var(--sg-panel));
+  --sunken: color-mix(in srgb, var(--sg-edge) 45%, var(--sg-panel));
+}
+
+* { box-sizing: border-box; }
+
+/* an episode, played on a canvas (episodes.js episodePlayer) */
+.player { width: 100%; display: flex; flex-direction: column; gap: 6px; }
+.player canvas { width: 100%; align-self: center; display: block; border: 1px solid var(--edge-soft); cursor: pointer; }
+.player-controls button { min-width: 30px; }
+.player-controls .play { min-width: 34px; }
+.player-controls .full { display: inline-flex; align-items: center; justify-content: center; }
+.player-controls .full svg { width: 10px; height: 10px; }
+.player input[type="range"] { flex: 1; appearance: none; -webkit-appearance: none; background: transparent; border: none; padding: 0; height: 16px; margin: 0 4px; cursor: pointer; width: auto; }
+.player input[type="range"]::-webkit-slider-runnable-track { height: 2px; background: var(--sg-edge); }
+.player input[type="range"]::-moz-range-track { height: 2px; background: var(--sg-edge); }
+.player input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 12px; height: 12px; margin-top: -5px; border-radius: 50%; background: var(--sg-panel); border: 1.5px solid var(--mid); }
+.player input[type="range"]::-moz-range-thumb { width: 10px; height: 10px; border-radius: 50%; background: var(--sg-panel); border: 1.5px solid var(--mid); }
+/* full screen: the episode as big as fits above its caption and controls, which
+   run as wide as it */
+.player:fullscreen {
+  justify-content: center;
+  align-items: center;
+  padding: 16px 24px;
+  background: var(--sg-bg);
+  --room: 120px;
+  /* the width that makes it as tall as the screen */
+  --tall: calc((100dvh - var(--room)) * var(--aspect));
+}
+.player:fullscreen canvas { max-width: none !important; }
+.player:fullscreen > * { width: min(100%, var(--tall)); }
+
+/* a two-player game's players, under its board */
+.seats { width: 100%; align-self: center; display: flex; flex-direction: column; gap: 2px; font: 11px var(--sg-mono); color: var(--mid); }
+.seat { display: flex; align-items: center; gap: 7px; padding: 1px 4px; border-left: 2px solid transparent; }
+.seat.to-move { border-left-color: var(--sg-accent); }
+.seat .who { color: var(--sg-fg); }
+.seat .spacer { flex: 1; }
+.seat .num { font-variant-numeric: tabular-nums; }
+.seat b.num { color: var(--sg-fg-strong); font-weight: 600; min-width: 48px; text-align: right; }
+.seat .dim { color: var(--sg-dim); }
+.seat .result { min-width: 30px; text-align: right; }
+.seat .result.won { color: var(--sg-good); font-weight: 600; }
+.seat .result.lost { color: var(--sg-bad); font-weight: 600; }
+/* a side of a two-player game: a disc of its colour, or its symbol */
+.swatch { width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex: none; background: var(--c); border: 1px solid var(--sg-fg-strong); }
+.swatch.ring { background: transparent; border: 2.5px solid var(--c); }
+.mark-sym { font: 700 11px var(--sg-mono); color: var(--c); flex: none; }
+/* a value as an advantage: its size, then the mark of the side it favours */
+.adv { display: inline-flex; align-items: center; justify-content: flex-end; gap: 4px; }
+.adv .swatch { width: 8px; height: 8px; }
+.adv .swatch.ring { border-width: 2px; }
+.adv .mark-sym { font-size: 10.5px; }
+
+/* an episode with its search explorer beside it (search.js) */
+.episode.exploring {
+  display: grid;
+  grid-template-columns: minmax(300px, 520px) minmax(320px, 1fr);
+  gap: 22px;
+  align-items: start;
+}
+/* a narrow card: the explorer under the board */
+@media (max-width: 760px) {
+  .episode.exploring { grid-template-columns: 1fr; }
+}
+.explore-heading { font: 600 15px var(--sg-font); color: var(--sg-fg-strong); }
+.explore-plot { display: flex; flex-direction: column; gap: 2px; max-width: 720px; }
+.explore-plot .plot { width: 100%; display: block; cursor: pointer; }
+.explore-plot .grid { stroke: var(--edge-soft); stroke-width: 1; }
+.explore-plot .axis { stroke: var(--sg-edge); stroke-width: 1; }
+.explore-plot .tick { fill: var(--sg-dim); font: 9px var(--sg-mono); }
+.explore-plot .cursor { stroke: var(--edge-hot); stroke-width: 1; stroke-dasharray: 2 2; }
+.explore-plot .line { fill: none; stroke-width: 1.75; stroke-linejoin: round; stroke-linecap: round; }
+.plot-legend { display: flex; gap: 12px; font: 10.5px var(--sg-mono); color: var(--sg-dim); }
+.plot-legend .legend-key { display: inline-flex; align-items: center; gap: 4px; }
+.plot-legend .key { width: 12px; height: 2px; display: inline-block; }
+.explore-evals { display: flex; flex-direction: column; gap: 2px; font: 11px var(--sg-mono); color: var(--mid); }
+.explore-eval {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr) auto 10px;
+  align-items: center;
+  column-gap: 7px;
+  padding: 3px 6px;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  background: transparent;
+  border: 1px solid transparent;
+  border-left: 2px solid transparent;
+}
+button.explore-eval { cursor: pointer; }
+button.explore-eval:hover { background: var(--hover); }
+.explore-eval.on { background: var(--sg-well); border-color: var(--edge-soft); border-left-color: var(--sg-accent); }
+.explore-eval > * { white-space: nowrap; }
+.explore-eval .who { color: var(--sg-fg); overflow: hidden; text-overflow: ellipsis; }
+.explore-eval .num { text-align: right; font-variant-numeric: tabular-nums; }
+.explore-eval .dim { color: var(--sg-dim); }
+.explore-eval b.num { color: var(--sg-fg-strong); font-weight: 600; }
+.explore-eval.over { grid-template-columns: 12px minmax(0, 1fr) auto 32px; }
+.explore-eval .result { font-weight: 600; text-align: right; }
+.unknown { color: var(--sg-faint); }
+.disagree { color: var(--sg-bad); font-weight: 700; text-align: center; }
+.explore-eval .result.won { color: var(--sg-good); }
+.explore-eval .result.lost { color: var(--sg-bad); }
+.explore-side { display: flex; flex-direction: column; gap: 8px; min-width: 0; font: 11.5px var(--sg-mono); color: var(--mid); }
+.explore-crumbs { min-height: 20px; display: flex; flex-wrap: wrap; align-items: center; gap: 3px; }
+.explore-crumbs .sep { color: var(--sg-faint); }
+.crumb {
+  font: 11.5px var(--sg-mono);
+  color: var(--sg-accent);
+  background: transparent;
+  border: 1px solid transparent;
+  padding: 0 4px;
+  cursor: pointer;
+}
+.crumb:hover { border-color: var(--sg-edge); }
+.crumb.on { color: var(--sg-fg-strong); font-weight: 600; border-color: var(--sg-edge); background: var(--sg-well); }
+.explore-summary { min-height: 17px; color: var(--sg-fg); }
+.explore-summary .dim { color: var(--sg-dim); }
+/* a player's tree at the position, side by side with the other's */
+.explore-sections { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 18px; align-items: start; }
+.explore-sec { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.explore-sec-hdr {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr) auto auto;
+  align-items: center;
+  column-gap: 8px;
+  padding: 3px 6px;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  background: transparent;
+  border: 1px solid transparent;
+  border-left: 2px solid transparent;
+  cursor: pointer;
+}
+.explore-sec-hdr:hover { background: var(--hover); }
+.explore-sec-hdr.on { background: var(--sg-well); border-color: var(--edge-soft); border-left-color: var(--sg-accent); }
+.explore-sec-hdr .who { color: var(--sg-fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.explore-sec-hdr .dim { color: var(--sg-dim); }
+.explore-sec-hdr b.num { color: var(--sg-fg-strong); }
+/* a move's row: the move, its visits (and share), value, a flag, its prior */
+.explore-lines { --line-cols: 44px 80px 84px 12px 44px; display: flex; flex-direction: column; height: 300px; overflow-y: auto; border-top: 1px solid var(--edge-soft); }
+.explore-line { border-bottom: 1px solid var(--edge-soft); padding: 4px 0 5px; }
+.explore-line .stats {
+  position: relative;
+  display: grid;
+  grid-template-columns: var(--line-cols);
+  align-items: baseline;
+  padding: 1px 6px;
+  cursor: pointer;
+  font-variant-numeric: tabular-nums;
+}
+.explore-line .stats:hover { background: var(--hover); }
+.explore-line .stats .prior { text-align: right; color: var(--sg-dim); }
+.explore-line .bar { position: absolute; left: 0; top: 0; bottom: 0; background: var(--sunken); z-index: 0; }
+.explore-line .stats > :not(.bar) { position: relative; }
+.explore-line .mv { color: var(--sg-fg-strong); font-weight: 600; }
+.explore-line .num { text-align: right; }
+.explore-line .num.dim, .explore-line .num .dim { color: var(--sg-dim); }
+.explore-line .val { color: var(--sg-fg); }
+.explore-cols {
+  /* stays in view as the moves scroll */
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--sg-panel);
+  display: grid;
+  grid-template-columns: var(--line-cols);
+  padding: 3px 6px 2px;
+  font-size: 10px;
+  color: var(--sg-dim);
+}
+.explore-cols .col { display: inline-flex; align-items: center; justify-content: flex-end; gap: 4px; }
+.explore-line.unexplored { padding: 2px 0; }
+.explore-line.unexplored .stats { cursor: default; }
+.explore-line.unexplored .stats:hover { background: none; }
+.explore-line.unexplored .stats > * { color: var(--sg-faint); font-weight: 400; }
+.explore-line .pv { display: flex; flex-wrap: wrap; gap: 1px 2px; padding: 2px 6px 0 44px; }
+.tok {
+  font: 11px var(--sg-mono);
+  color: var(--mid);
+  background: transparent;
+  border: 1px solid transparent;
+  padding: 0 3px;
+  cursor: pointer;
+}
+.tok.first { color: var(--sg-fg); }
+.tok:hover, .tok.hot { border-color: var(--edge-hot); color: var(--sg-fg-strong); background: var(--sg-well); }
+.explore-line .end { font-size: 10px; color: var(--sg-dim); padding: 0 3px; align-self: center; }
+
+.scrub { display: flex; align-items: center; gap: 4px; font: 11px var(--sg-mono); color: var(--sg-dim); }
+.scrub button {
+  font: 11px var(--sg-mono);
+  color: var(--mid);
+  background: transparent;
+  border: 1px solid var(--sg-edge);
+  padding: 0 6px;
+  height: 20px;
+  cursor: pointer;
+}
+.scrub button:hover:not(:disabled) { border-color: var(--edge-hot); color: var(--sg-fg); }
+.scrub button:disabled { color: var(--sg-faint); cursor: default; }
+.scrub button.on { border-color: var(--sg-accent); color: var(--sg-accent); }
+.scrub .pos { min-width: 70px; text-align: center; font-variant-numeric: tabular-nums; }

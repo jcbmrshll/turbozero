@@ -20,7 +20,7 @@ Othello model and against two strong open-source Othello engines,
 ## Training
 
 ```
-uv run turbozero-monitor                            # optional: a dashboard, in another shell
+uv run seaglass serve --dir runs                    # optional: the run's page, in another shell
 uv run examples/othello/train.py --monitor --ckpt-dir runs/othello
 ```
 
@@ -33,7 +33,7 @@ greedy tile counter, then pgx's pretrained model searching 1, 4, 16, 64 and 256
 iterations a move against our 64. It moves up past each rung it scores at least 0.55
 against (a draw counts half). A 10-block network passes every rung within about 60
 epochs; past that, play it against Edax instead (`--eval-every 0` turns the ladder
-off, and `watch.py`, below, plays an engine as it trains). The monitor also plots
+off, and `watch.py`, below, plays an engine as it trains). The run's page also plots
 `episode_draw`, the fraction of self-play games drawn, which `game.py`'s
 `episode_metrics` reports through the Trainer's `episode_metrics_fn`. See `--help` for
 the network size, search budget and number of epochs.
@@ -47,11 +47,11 @@ Cheap searches are enough while the network learns the basics, and deeper ones r
 its policy later. Each change compiles self-play again, as the first epoch does, so
 keep changes few; games in progress carry on, searching from new, empty trees. Test
 games, `eval_pgx.py`, `vs_engine.py` and `watch.py` keep their own budgets. The
-monitor plots the budget as `search_iterations`.
+run's page plots the budget as `search_iterations`.
 
 `--buffer` sets replay memory, the samples kept per environment, which training samples
 from. Self-play adds 1024 an epoch (128 moves, each with its 7 symmetric copies), so the
-default 3000 is about the last 3 epochs. The monitor plots the samples training can
+default 3000 is about the last 3 epochs. The run's page plots the samples training can
 sample as `buffer_samples`.
 
 The buffer's size sets how old the data training samples is, not how often each sample
@@ -172,7 +172,7 @@ K = 2 is that of `--buffer 9000`, which hasn't been tried. Keeping the buffer in
 memory would make every training step copy its minibatch over; for a larger K, give
 `--tree-buffer` less than K times `--buffer` instead.
 
-The monitor shows, each epoch, the tree positions stored (`tree_positions`, and
+The run's page shows, each epoch, the tree positions stored (`tree_positions`, and
 `tree_positions_per_move` out of K), their mean visit count (`tree_mean_visits`), how many
 training could sample (`tree_buffer_samples`), and the share of each training batch they
 made up (`tree_batch_fraction`).
@@ -190,7 +190,7 @@ environment, and K times that again with `--tree-positions K`.
 `--resume` continues the run in `--ckpt-dir` from its newest state; pass the run's own
 arguments. It carries on exactly as if it hadn't stopped (on the CPU the result is
 bit-identical; on a GPU, convolution autotuning may differ between processes). It logs
-to the same monitor run, which then holds the epochs between the state and the stop
+to the same seaglass run, which then holds the epochs between the state and the stop
 twice, and deletes the checkpoints saved after the state, which it saves again.
 
 ```
@@ -206,7 +206,7 @@ own `--ckpt-dir`. It starts from the saved network, Adam's moments, and the repl
 buffers, so its first epochs train on as much data as the run it was forked from did
 (the entries of the games in progress are dropped). `--init-without-buffers` starts with
 empty buffers instead. The network size must match. The replay memory may differ in
-size: each environment's newest samples are kept, as many as fit. The monitor's config
+size: each environment's newest samples are kept, as many as fit. The seaglass run's config
 records the parent state as `parent`, and so does every state the fork saves.
 
 This makes it cheap to compare settings late in training. Short runs from scratch only
@@ -268,7 +268,7 @@ uv run examples/othello/watch.py runs/othello --pid $! --levels 4 6 8
 ```
 
 Results go to `runs/othello/vs_engine.jsonl`, and with `--monitor URL --run ID` (the id
-in the run's monitor link) to the run's monitor page, as `edax_level4_sims64` and so on,
+in the run's seaglass link) to the run's page, as `edax_level4_sims64` and so on,
 each with a game at that level, `edax_level4_sims64_game`, to step through: our agent's search
 of each position, and the engine's scores (its predicted disc margin / 64): Edax's of every
 legal move of every position, each with the line it expects after it (from its own search

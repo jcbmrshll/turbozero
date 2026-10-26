@@ -20,6 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from seaglass import Monitor
 
 import core.training.train as train_module
 from core.evaluators.alphazero import AlphaZero
@@ -45,7 +46,6 @@ from core.training.train import (
     state_path,
 )
 from core.training.tree_positions import TreePositions, select_nodes
-from monitor import Monitor
 
 # self-play steps per epoch, and of warmup: more than a game of the test environment's 3 moves, so
 # warmup finishes episodes for the first epoch's training
@@ -312,12 +312,15 @@ class FakeMonitor(Monitor):
 
     def __init__(self, run_id: str | None = None):  # pylint: disable=super-init-not-called
         self.run_id = run_id
-        self.started, self.logged, self.activities, self.finished = [], [], [], []
+        self.started, self.totals, self.logged = [], [], []
+        self.activities, self.finished = [], []
 
-    def start(self, config=None):
+    def start(self, config=None, total=None):
         if self.run_id is None:
             self.run_id = f"run-{next(self.names)}"
         self.started.append(config)
+        self.totals.append(total)
+        return self
 
     def log(self, step, data):
         self.logged.append(
@@ -657,6 +660,8 @@ def test_train_loop_reports_to_the_monitor(env, tmp_path, fake_loop):
 
     (config,) = monitor.started
     assert config["run"] == {"seed": 3, "num_epochs": 2, "eval_every": 1}
+    # it ends at epoch 1
+    assert monitor.totals == [1]
     assert config["batch_size"] == 2 and config["note"] == "hello"
     assert "parent" not in config
     logged = monitor.by_epoch()

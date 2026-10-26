@@ -48,12 +48,12 @@ from game import (
     state_to_nn_input,
     step_fn,
 )
+from seaglass import Arrays
 from xot import XOT_PATH, load_xot
 
 from core.common import GameFrame
 from core.evaluators.evaluation_fns import make_nn_eval_fn
-from monitor.client import Episode
-from monitor.episodes import BOARDS, line_record, pgx_two_player_episode
+from core.monitoring.episodes import BOARDS, line_record, pgx_two_player_episode
 
 # the most discs a game can be won by: an engine's score, a disc margin, over this is a value
 MAX_MARGIN = 64
@@ -109,7 +109,7 @@ class GameRecorder:
         self.analyses.append(analysis)
         self.states.append(self.take(states))
 
-    def episode(self, analyst: EdaxAnalyst | None = None) -> Episode:
+    def episode(self, analyst: EdaxAnalyst | None = None) -> Arrays:
         """The game, for the monitor, with `analyst`'s analysis of the positions the engine
         didn't move from, if there is one."""
         num_actions = env.num_actions
@@ -447,7 +447,7 @@ def main():
                         analyst.close()
                 args.episodes.mkdir(parents=True, exist_ok=True)
                 name = f"{engine.name}_level{level}_sims{args.sims}.npz"
-                (args.episodes / name).write_bytes(episode.to_bytes())
+                (args.episodes / name).write_bytes(episode.encode())
             mean, se = score(results)
             seconds = time.perf_counter() - start
             if args.results is not None:

@@ -1,4 +1,4 @@
-// building DOM without a framework, shared by the dashboard's modules
+// building DOM without a framework (vendored: a bundle imports only its own files)
 
 // an element (SVG for SVG tags) with attributes, "on*" listeners and children;
 // "text" sets its text, so labels from a run never go in as markup

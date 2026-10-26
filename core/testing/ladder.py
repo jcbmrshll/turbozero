@@ -147,7 +147,7 @@ class LadderTester(BaseTester):
                   `{name}_{rung name}_{score, win_rate, loss_rate, seconds}` (unless already
                   logged with `log_fn`)
                 - the first episode against the last rung played, packed by `episode_fn` and named
-                  for the rung (`Episode.opponent`) (None without one)
+                  for the rung (its `attrs`' `opponent`) (None without one)
                 - on epochs that are not tested, returns `state` unchanged, empty metrics, and None
         """
         assert isinstance(state, LadderTestState)
@@ -196,7 +196,7 @@ class LadderTester(BaseTester):
             if self.episode_fn is not None:
                 frames, p_ids = jax.device_get((frames, p_ids))
                 episode = self.episode_fn(frames, p_ids, env_step_fn)
-                episode.opponent = baseline.name
+                episode.attrs = {**(episode.attrs or {}), "opponent": baseline.name}
             if score < self.promote_score:
                 break
             rung += 1

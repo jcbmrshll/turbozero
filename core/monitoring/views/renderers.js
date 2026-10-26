@@ -1,9 +1,9 @@
-// Episode renderers, one per environment, drawing on a canvas in the dashboard's
-// palette.
+// Episode views, one per environment, drawing on a canvas in the page's theme
+// (palette.js).
 //
-// A training run logs Episode(env, **arrays) (monitor/client.py); the dashboard
-// fetches the arrays (episodes.js loadArrays) and calls RENDERERS[env](arrays) for a
-// view of them:
+// A training run logs an episode as seaglass Arrays of type "turbozero/<env>-episode"
+// (core/monitoring/episodes.py); episode.js reads its arrays (episodes.js ndArrays)
+// and calls RENDERERS[env](arrays) for a view of them:
 //
 //   {
 //     width, height,       // its size, in the units draw() draws in
@@ -28,16 +28,16 @@
 //     at(r, c), cellSize,           // a cell's centre, and its size
 //   }
 //
-// Arrays are NdArrays (episodes.js), floats as float32. A view should do any
-// per-episode work when it's made, not every frame.
+// Arrays are NdArrays (episodes.js). A view should do any per-episode work when it's
+// made, not every frame; it reads the theme's colours when it draws.
 //
-// The board games' arrays are monitor/episodes.py's pgx_two_player_episode:
+// The board games' arrays are core/monitoring/episodes.py's pgx_two_player_episode:
 // board (frames, rows, cols) of 0 for empty, 1 and 2 for the two colours; to_move
 // (frames,), the colour to move; agent, the trained agent's colour; values (frames, 2),
 // the agent's and its opponent's value estimates; completed and outcome, the agent's
 // result once the game is over.
 
-import { BLUE, EDGE, GOLD, INK, INK_STRONG, MID, ORANGE, RED, SUNKEN, WELL } from "./palette.js";
+import { BLACK, C4_BLUE, GOLD, OTHELLO_GREEN, RED, WHITE, sunken, theme } from "./palette.js";
 
 export const RENDERERS = {
   othello,
@@ -143,8 +143,8 @@ function winningLine(cell, move, n, rows, cols) {
 
 // coordinates along the edges, as players write moves: files a-h, ranks 1-8
 function labels(ctx, game, at, size, pad) {
-  ctx.fillStyle = MID;
-  ctx.font = "10px ui-monospace, Menlo, monospace";
+  ctx.fillStyle = theme("dim");
+  ctx.font = `10px ${theme("mono") || "monospace"}`;
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   for (let c = 0; c < game.cols; c++) ctx.fillText(String.fromCharCode(97 + c), at(0, c)[0], pad / 2);
@@ -154,14 +154,13 @@ function labels(ctx, game, at, size, pad) {
 // ---------------------------------------------------------------- othello
 
 const OTHELLO_CELL = 40, OTHELLO_PAD = 18;
-const OTHELLO_BOARD = "#2f6f52";
 
 function othello(arrays) {
   const game = boardGame(arrays, { passes: true });
   const size = OTHELLO_CELL * 8;
   const W = OTHELLO_PAD + size + 6, H = OTHELLO_PAD + size + 6;
   const at = (r, c) => [OTHELLO_PAD + (c + 0.5) * OTHELLO_CELL, OTHELLO_PAD + (r + 0.5) * OTHELLO_CELL];
-  const fills = [INK_STRONG, WELL];
+  const fills = [BLACK, WHITE];
   return {
     ...game,
     width: W,
@@ -169,8 +168,8 @@ function othello(arrays) {
     at,
     cellSize: OTHELLO_CELL,
     players: [
-      { name: "Black", color: INK_STRONG },
-      { name: "White", color: WELL },
+      { name: "Black", color: BLACK },
+      { name: "White", color: WHITE },
     ],
     // the score
     pieces(t, color) {
@@ -190,25 +189,25 @@ function othello(arrays) {
       this.drawBoard(ctx, game.board(t), game.moves[t]);
     },
     drawBoard(ctx, cell, move) {
-      ctx.fillStyle = SUNKEN;
+      ctx.fillStyle = sunken();
       ctx.fillRect(0, 0, W, H);
       labels(ctx, game, at, size, OTHELLO_PAD);
-      ctx.fillStyle = OTHELLO_BOARD;
+      ctx.fillStyle = OTHELLO_GREEN;
       ctx.fillRect(OTHELLO_PAD, OTHELLO_PAD, size, size);
       for (let i = 0; i <= 8; i++) {
         const x = OTHELLO_PAD + i * OTHELLO_CELL;
-        line(ctx, [x, OTHELLO_PAD], [x, OTHELLO_PAD + size], INK_STRONG, 1);
-        line(ctx, [OTHELLO_PAD, x], [OTHELLO_PAD + size, x], INK_STRONG, 1);
+        line(ctx, [x, OTHELLO_PAD], [x, OTHELLO_PAD + size], BLACK, 1);
+        line(ctx, [OTHELLO_PAD, x], [OTHELLO_PAD + size, x], BLACK, 1);
       }
       // the four dots that mark out the centre
       for (const [r, c] of [[2, 2], [2, 6], [6, 2], [6, 6]]) {
-        disc(ctx, OTHELLO_PAD + c * OTHELLO_CELL, OTHELLO_PAD + r * OTHELLO_CELL, 3, INK_STRONG);
+        disc(ctx, OTHELLO_PAD + c * OTHELLO_CELL, OTHELLO_PAD + r * OTHELLO_CELL, 3, BLACK);
       }
       const r = OTHELLO_CELL * 0.4;
       for (let row = 0; row < 8; row++) {
         for (let col = 0; col < 8; col++) {
           const v = cell(row, col);
-          if (v) disc(ctx, ...at(row, col), r, fills[v - 1], INK_STRONG, 1);
+          if (v) disc(ctx, ...at(row, col), r, fills[v - 1], BLACK, 1);
         }
       }
       if (move) disc(ctx, ...at(...move), 4, RED);
@@ -250,19 +249,19 @@ function connectFour(arrays) {
       this.drawBoard(ctx, game.board(t), game.moves[t]);
     },
     drawBoard(ctx, cell, move) {
-      ctx.fillStyle = BLUE;
+      ctx.fillStyle = C4_BLUE;
       ctx.beginPath();
       ctx.roundRect(0, 0, W, H, 10);
       ctx.fill();
       for (let r = 0; r < 6; r++) {
         for (let c = 0; c < 7; c++) {
           const v = cell(r, c);
-          disc(ctx, ...at(r, c), R, v ? fills[v - 1] : WELL);
+          disc(ctx, ...at(r, c), R, v ? fills[v - 1] : WHITE);
         }
       }
-      if (move) disc(ctx, ...at(...move), 5, WELL);
+      if (move) disc(ctx, ...at(...move), 5, WHITE);
       const win = game.win(cell, move);
-      if (win) for (const rc of win) disc(ctx, ...at(...rc), R, null, INK, 4);
+      if (win) for (const rc of win) disc(ctx, ...at(...rc), R, null, BLACK, 4);
     },
   };
 }
@@ -284,8 +283,8 @@ function ticTacToe(arrays) {
     at,
     cellSize: TTT_CELL,
     players: [
-      { name: "X", color: BLUE, symbol: "X" },
-      { name: "O", color: ORANGE, ring: true, symbol: "O" },
+      { name: "X", color: "var(--sg-s1)", symbol: "X" },
+      { name: "O", color: "var(--sg-s2)", ring: true, symbol: "O" },
     ],
     // actions are the cells, row by row
     actionCell: (a) => [Math.floor(a / 3), a % 3],
@@ -298,29 +297,30 @@ function ticTacToe(arrays) {
       this.drawBoard(ctx, game.board(t), game.moves[t]);
     },
     drawBoard(ctx, cell, move) {
-      ctx.fillStyle = WELL;
+      ctx.fillStyle = theme("well");
       ctx.fillRect(0, 0, W, H);
       if (move) {
-        ctx.fillStyle = SUNKEN;
+        ctx.fillStyle = sunken();
         ctx.fillRect(TTT_PAD + move[1] * TTT_CELL, TTT_PAD + move[0] * TTT_CELL, TTT_CELL, TTT_CELL);
       }
       ctx.lineCap = "round";
       for (let i = 1; i < 3; i++) {
         const x = TTT_PAD + i * TTT_CELL;
-        line(ctx, [x, TTT_PAD + 4], [x, TTT_PAD + size - 4], EDGE, 3);
-        line(ctx, [TTT_PAD + 4, x], [TTT_PAD + size - 4, x], EDGE, 3);
+        line(ctx, [x, TTT_PAD + 4], [x, TTT_PAD + size - 4], theme("edge"), 3);
+        line(ctx, [TTT_PAD + 4, x], [TTT_PAD + size - 4, x], theme("edge"), 3);
       }
+      const [xColor, oColor] = [theme("s1"), theme("s2")];
       for (let r = 0; r < 3; r++) {
         for (let c = 0; c < 3; c++) {
           const v = cell(r, c);
           const [x, y] = at(r, c);
           if (v === 1) {
-            line(ctx, [x - mark, y - mark], [x + mark, y + mark], BLUE, 7);
-            line(ctx, [x - mark, y + mark], [x + mark, y - mark], BLUE, 7);
+            line(ctx, [x - mark, y - mark], [x + mark, y + mark], xColor, 7);
+            line(ctx, [x - mark, y + mark], [x + mark, y - mark], xColor, 7);
           } else if (v === 2) {
             ctx.beginPath();
             ctx.arc(x, y, mark, 0, 2 * Math.PI);
-            ctx.strokeStyle = ORANGE;
+            ctx.strokeStyle = oColor;
             ctx.lineWidth = 7;
             ctx.stroke();
           }
@@ -332,7 +332,7 @@ function ticTacToe(arrays) {
         // a little past the end cells' marks
         const dx = b[0] - a[0], dy = b[1] - a[1], k = (mark * 1.3) / Math.hypot(dx, dy);
         ctx.globalAlpha = 0.85;
-        line(ctx, [a[0] - dx * k, a[1] - dy * k], [b[0] + dx * k, b[1] + dy * k], INK, 5);
+        line(ctx, [a[0] - dx * k, a[1] - dy * k], [b[0] + dx * k, b[1] + dy * k], theme("fg"), 5);
         ctx.globalAlpha = 1;
       }
     },
