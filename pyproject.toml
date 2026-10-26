@@ -10,6 +10,7 @@ dependencies = [
     "equinox>=0.13.8",
     "jax>=0.11.2",
     "optax>=0.2.8",
+    "seaglass",
 ]
 
 [project.scripts]
@@ -58,3 +59,6 @@ testpaths = ["tests"]
 # to 8 processes (`-n0` runs them in this one, e.g. to debug with --pdb)
 addopts = "-ra -n auto --maxprocesses 8 --dist worksteal"
 xfail_strict = true
+
+[tool.uv.sources]
+seaglass = { git = "https://github.com/jcbmrshll/seaglass", rev = "v0.1.0" }
