@@ -58,4 +58,4 @@ addopts = "-ra -n auto --maxprocesses 8 --dist worksteal"
 xfail_strict = true
 
 [tool.uv.sources]
-seaglass = { git = "https://github.com/jcbmrshll/seaglass", rev = "v0.1.1" }
+seaglass = { git = "https://github.com/jcbmrshll/seaglass", rev = "v0.1.3" }
