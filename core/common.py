@@ -107,6 +107,44 @@ def search_and_step(
         params=params,
         env_step_fn=env_step_fn,
     )
+    return step_with_output(
+        key,
+        output,
+        env_state,
+        env_state_metadata,
+        evaluator,
+        env_step_fn,
+        env_init_fn,
+        max_steps,
+        reset,
+        choose_action,
+    )
+
+
+def step_with_output(
+    key: jax.Array,
+    output: EvalOutput,
+    env_state: Any,
+    env_state_metadata: StepMetadata,
+    evaluator: Evaluator,
+    env_step_fn: EnvStepFn,
+    env_init_fn: EnvInitFn,
+    max_steps: int,
+    reset: bool = True,
+    choose_action: ChooseActionFn | None = None,
+) -> tuple[EvalOutput, Any, StepMetadata, jax.Array, jax.Array, jax.Array, Any]:
+    """`search_and_step` after its evaluation: steps the environment and evaluator with the
+    evaluator's `output` for `env_state`.
+
+    Args:
+        key: rng, `search_and_step`'s after it splits off the evaluation's
+        output: the evaluator's output
+        others: see `step_env_and_evaluator`.
+
+    Returns:
+        Tuple[EvalOutput, Any, StepMetadata, jax.Array, jax.Array, jax.Array, Any]: see
+            `search_and_step`
+    """
     if choose_action is not None:
         choose_key, key = jax.random.split(key)
         output = replace(

@@ -10,7 +10,7 @@ import gc
 import itertools
 import os
 import warnings
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import cast
 
@@ -1151,6 +1151,114 @@ def test_collect_steps_runs_the_evaluator_it_is_given(env, tmp_path):
     )
 
 
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class BudgetState:
+    """`BudgetEvaluator`'s state: the cycles its search takes, and how many it has run."""
+
+    budget: jax.Array
+    searched: jax.Array
+
+
+class BudgetEvaluator(Evaluator):
+    """Plays the first legal move after a search of as many cycles as its state's budget (at most
+    3), each of which only counts itself. Its value is the cycles the search ran, so the experiences
+    it collects show how long each move searched."""
+
+    def __init__(self):
+        super().__init__(discount=-1.0)
+
+    def init(self, *args, **kwargs):
+        return BudgetState(budget=jnp.array(3), searched=jnp.array(0))
+
+    def reset(self, state):
+        return replace(state, searched=jnp.zeros_like(state.searched))
+
+    def step(self, state, action):
+        return self.reset(state)
+
+    def search_cycles(self):
+        return 3
+
+    def search_done(self, state, cycles):
+        return cycles >= state.budget
+
+    def search_cycle(self, key, state, cycle, active, *args, **kwargs):
+        return replace(state, searched=state.searched + active)
+
+    def evaluate(self, key, eval_state, env_state, root_metadata, **kwargs):
+        action = jnp.argmax(root_metadata.action_mask)
+        return EvalOutput(
+            eval_state=eval_state,
+            action=action,
+            policy_weights=jax.nn.one_hot(action, root_metadata.action_mask.shape[-1]),
+        )
+
+    def get_value(self, state):
+        return state.searched.astype(jnp.float32)
+
+
+def budget_collection(env, tmp_path, budgets, **kwargs):
+    """A trainer with a `BudgetEvaluator`, and a collection state whose environments' searches
+    take `budgets` cycles."""
+    trainer = make_trainer(env, tmp_path, evaluator=BudgetEvaluator(), **kwargs)
+    state = trainer.init_collection_state(jax.random.PRNGKey(0), trainer.batch_size)
+    eval_state = replace(state.eval_state, budget=jnp.array(budgets))
+    return trainer, replace(state, eval_state=eval_state)
+
+
+@pytest.mark.parametrize(
+    "advance_every, moves, searches, in_progress",
+    [
+        # moves after 1 cycle and after 3, as soon as their searches are done
+        (1, [6, 2], [[1] * 6, [3] * 2], [0, 0]),
+        # every 2 cycles: a 1-cycle search waits for a cycle, a 3-cycle one for one too, and the
+        # second's next search has run 2 cycles when the 6 are up
+        (2, [3, 1], [[1] * 3, [3]], [0, 2]),
+    ],
+)
+def test_each_environment_plays_its_move_when_its_search_is_done(
+    env, tmp_path, advance_every, moves, searches, in_progress
+):
+    trainer, state = budget_collection(
+        env, tmp_path, [1, 3], advance_every=advance_every
+    )
+    keys = jax.random.split(jax.random.PRNGKey(1), trainer.batch_size)
+
+    # 2 moves of the longest search: 6 cycles
+    state = trainer.collect_steps(keys, state, None, 2)
+
+    np.testing.assert_array_equal(state.moves, moves)
+    np.testing.assert_array_equal(state.search_cycles, in_progress)
+    # a move each 3-move game, and nothing else written
+    np.testing.assert_array_equal(state.buffer_state.next_idx, moves)
+    np.testing.assert_array_equal(state.episodes, np.array(moves) // 3)
+    for i, searched in enumerate(searches):
+        np.testing.assert_array_equal(
+            state.buffer_state.buffer.search_value[i, : len(searched)], searched
+        )
+
+
+def test_advance_leaves_an_environment_whose_search_is_not_done_as_it_is(env, tmp_path):
+    trainer, state = budget_collection(env, tmp_path, [2, 2])
+    state = replace(state, search_cycles=jnp.array([1, 1]))
+
+    advanced = jax.vmap(lambda s: trainer.advance(s, None))(state)
+
+    jax.tree.map(np.testing.assert_array_equal, advanced, state)
+
+
+def test_each_move_starting_in_a_call_takes_the_calls_next_key(env, tmp_path):
+    trainer, state = budget_collection(env, tmp_path, [1, 3])
+    keys = jax.random.split(jax.random.PRNGKey(1), trainer.batch_size)
+
+    state = trainer.collect_steps(keys, state, None, 2)
+
+    # of the 6 cycles' keys, the first's 6th move took the 6th, and the second's 2nd the 2nd
+    np.testing.assert_array_equal(state.move_key[0], jax.random.split(keys[0], 6)[5])
+    np.testing.assert_array_equal(state.move_key[1], jax.random.split(keys[1], 6)[1])
+
+
 def test_collect_stores_tree_positions_with_their_transformed_copies(env, tmp_path):
     trainer = tree_trainer(
         env,
@@ -1236,6 +1344,7 @@ def test_collection_metrics(env, tmp_path):
         state,
         buffer_state=buffer_state,
         episodes=state.episodes + jnp.array([1, 3]),
+        moves=state.moves + jnp.array([3, 5]),
         episode_metrics={"draw": jnp.array([1.0, 0.0])},
         tree_positions=state.tree_positions + jnp.array([2, 4]),
         tree_visits=state.tree_visits + jnp.array([10, 20]),
@@ -1243,6 +1352,7 @@ def test_collection_metrics(env, tmp_path):
 
     metrics = trainer.collection_metrics(before, after)
 
+    assert int(metrics["moves"]) == 8
     assert int(metrics["episodes"]) == 4
     assert float(metrics["episode_draw"]) == pytest.approx(0.25)
     assert int(metrics["buffer_samples"]) == 5
@@ -1250,7 +1360,7 @@ def test_collection_metrics(env, tmp_path):
     assert float(metrics["buffer_distinct_fraction"]) == pytest.approx(0.6)
     assert int(metrics["tree_positions"]) == 6
     # over the epoch's moves, in every environment
-    assert float(metrics["tree_positions_per_move"]) == pytest.approx(6 / (STEPS * 2))
+    assert float(metrics["tree_positions_per_move"]) == pytest.approx(6 / 8)
     assert float(metrics["tree_mean_visits"]) == pytest.approx(5.0)
     # without episodes, no episode means
     no_episodes = replace(after, episodes=state.episodes)
@@ -1681,8 +1791,9 @@ def test_loaded_states_are_donated_to_collection(real, real_run, tmp_path, monke
         real.train_loop(seed=0, num_epochs=1, fork_from=real_run.path)
 
     # the loaded states were donated to the first self-play, and nothing read them after; but
-    # for the search trees, which the schedule's switch at epoch 2 replaced
-    loaded = replace(resumed.collection_state, eval_state=None)
+    # for the search trees and their searches' cycles, which the schedule's switch at epoch 2
+    # replaced
+    loaded = replace(resumed.collection_state, eval_state=None, search_cycles=None)
     assert all(x.is_deleted() for x in jax.tree.leaves(loaded))
     assert given[0].buffer_state is resumed.collection_state.buffer_state
     assert all(x.is_deleted() for x in jax.tree.leaves(given[first_forked]))

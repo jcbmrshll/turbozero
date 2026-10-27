@@ -48,6 +48,18 @@ def test_add_experience_and_assign_rewards():
     np.testing.assert_array_equal(state.buffer.reward[3:], 0.0)
 
 
+def test_add_experience_that_is_not_valid_leaves_the_buffer_as_it_is():
+    buffer = EpisodeReplayBuffer(capacity=3)
+    # the next write wraps around, over a finished entry
+    state = buffer.assign_rewards(
+        add(buffer, init_single(buffer), [1, 2, 3]), jnp.ones(2)
+    )
+
+    after = buffer.add_experience(state, experience(4), valid=False)
+
+    jax.tree.map(np.testing.assert_array_equal, after, state)
+
+
 def test_assign_rewards_wraps_around_mid_episode():
     buffer = EpisodeReplayBuffer(capacity=5)
     state = add(buffer, init_single(buffer), [1, 2, 3])

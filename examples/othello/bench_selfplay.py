@@ -78,6 +78,7 @@ def make_trainer(args) -> tuple[Trainer, tuple]:
         state_to_nn_input_fn=state_to_nn_input,
         testers=[],
         data_transform_fns=SYMMETRY_TRANSFORM_FNS,
+        advance_every=args.advance_every,
         ckpt_dir="/tmp/turbozero-bench-selfplay",
     )
     return trainer, params
@@ -92,6 +93,12 @@ def main():
         default=DEFAULT_NET,
         help="as train.py's --net; with --ckpt, the checkpoint's"
         " (resnet:6x128 for a run trained with the old default)",
+    )
+    parser.add_argument(
+        "--advance-every",
+        type=int,
+        default=1,
+        help="cycles between plays of the moves whose searches are done",
     )
     parser.add_argument("--ckpt", default=None, help="checkpoint to play with")
     parser.add_argument(
@@ -145,18 +152,25 @@ def main():
     jax.block_until_ready(state)
     print(f"compile + first call ({args.steps} steps): {time.perf_counter() - t:.1f}s")
 
-    times = []
+    times, moves = [], 0
     for i in range(args.repeats):
         k = jax.random.fold_in(key, i + 1)
+        before = int(state.moves.sum())
         t = time.perf_counter()
         state = collect(keys(k), state, params, args.steps)
         jax.block_until_ready(state)
         times.append(time.perf_counter() - t)
+        moves += int(state.moves.sum()) - before
+    # a call runs the cycles of `steps` moves' searches; searches done between plays of the
+    # moves (see --advance-every) wait for the next, so fewer moves may be played
+    cycles = args.steps * trainer.collection_schedule.at(0).search_cycles()
     per_step = np.array(times) / args.steps
     print(
-        f"{args.envs} envs, {args.sims} sims, {args.net}: "
-        f"{1e3 * np.median(per_step):.1f} ms/step (min {1e3 * per_step.min():.1f}), "
-        f"{args.envs / np.median(per_step):,.0f} moves/s"
+        f"{args.envs} envs, {args.sims} sims, {args.net}, advance every "
+        f"{args.advance_every}: {1e3 * np.median(per_step):.1f} ms/step "
+        f"(min {1e3 * per_step.min():.1f}), "
+        f"{1e6 * np.median(times) / cycles:.0f} us/cycle, "
+        f"{moves / sum(times):,.0f} moves/s"
     )
     stats = jax.devices()[0].memory_stats() or {}
     if "peak_bytes_in_use" in stats:

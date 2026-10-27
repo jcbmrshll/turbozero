@@ -136,10 +136,12 @@ class Tree[NodeType]:
         edge_index: ArrayLike,
         data: NodeType,
         evict: ArrayLike = NULL_INDEX,
+        write: ArrayLike = True,
     ) -> Tree[NodeType]:
         """Stores `data` at the child of a node along an edge: updates the child if the edge exists,
         otherwise adds it as a new node, like `add_node`. If the tree is full, the new node takes the
         slot of the leaf `evict`, which is removed from the tree; a no-op if `evict` is NULL_INDEX.
+        A no-op too if not `write`.
 
         Equivalent to a `lax.cond` between `update_node` and `add_node`, but writes a single node either
         way. Under vmap, where whether the edge exists differs across trees, such a cond becomes a
@@ -152,6 +154,8 @@ class Tree[NodeType]:
             evict: (optional) a leaf, other than the root and `parent_index`, to remove to make room
                 for a new child when the tree is full. Its slot then holds a child of a node that can
                 come after it, so nodes are no longer in the order they were added.
+            write: (optional) whether to store it; if not, the tree is left as it is. Cheaper under
+                vmap than a lax.cond, for the same reason.
 
         Returns:
             Tree[NodeType]: tree with the child's data stored.
@@ -159,16 +163,20 @@ class Tree[NodeType]:
         self.check_data_type(data)
         exists = self.is_edge(parent_index, edge_index)
         in_bounds = self.next_free_idx < self.capacity
-        evicting = ~exists & ~in_bounds & (evict != self.NULL_INDEX)
+        evicting = write & ~exists & ~in_bounds & (evict != self.NULL_INDEX)
         # an existing child stays where it is; a new one goes at the next free index, or in the
-        # evicted leaf's slot when the tree is full. Without one to evict, the index is out of bounds,
-        # so the writes below are no-ops
+        # evicted leaf's slot when the tree is full. Without one to evict, or not writing, the index
+        # is out of bounds, so the writes below are no-ops
         index = jnp.where(
-            exists,
-            self.edge_map[parent_index, edge_index],
-            jnp.where(evicting, evict, self.next_free_idx),
+            write,
+            jnp.where(
+                exists,
+                self.edge_map[parent_index, edge_index],
+                jnp.where(evicting, evict, self.next_free_idx),
+            ),
+            self.capacity,
         )
-        adding = ~exists & in_bounds
+        adding = write & ~exists & in_bounds
         # cut the evicted leaf from its parent (out of bounds, dropped, when not evicting)
         evict_parent = self.parents[evict]
         edge_map = self.edge_map.at[
@@ -180,8 +188,9 @@ class Tree[NodeType]:
             next_free_idx=jnp.where(adding, self.next_free_idx + 1, self.next_free_idx),
             # an existing child's parent is already `parent_index`
             parents=self.parents.at[index].set(parent_index),
+            # an edge that doesn't exist is NULL_INDEX already
             edge_map=edge_map.at[parent_index, edge_index].set(
-                jnp.where(exists | adding | evicting, index, self.NULL_INDEX)
+                jnp.where(adding | evicting, index, edge_map[parent_index, edge_index])
             ),
             data=jax.tree.map(lambda x, y: x.at[index].set(y), self.data, data),
         )
@@ -200,23 +209,26 @@ class Tree[NodeType]:
         )
         return (jnp.arange(self.capacity) < self.next_free_idx) & ~has_child
 
-    def set_root(self, data: NodeType) -> Tree[NodeType]:
+    def set_root(self, data: NodeType, write: ArrayLike = True) -> Tree[NodeType]:
         """Sets node data at the root node.
 
         Args:
             data: the data to store at the root node.
+            write: (optional) whether to store it; if not, the tree is left as it is (see
+                `set_child`)
 
         Returns:
             Tree[NodeType]: tree with the root node data set.
         """
         self.check_data_type(data)
-
+        # out of bounds, so dropped, when not writing
+        index = jnp.where(write, self.ROOT_INDEX, self.capacity)
         return replace(
             self,
-            next_free_idx=jnp.maximum(self.next_free_idx, 1),
-            data=jax.tree.map(
-                lambda x, y: x.at[self.ROOT_INDEX].set(y), self.data, data
+            next_free_idx=jnp.where(
+                write, jnp.maximum(self.next_free_idx, 1), self.next_free_idx
             ),
+            data=jax.tree.map(lambda x, y: x.at[index].set(y), self.data, data),
         )
 
     def update_node(self, index: ArrayLike, data: NodeType) -> Tree[NodeType]:

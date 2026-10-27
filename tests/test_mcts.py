@@ -45,6 +45,13 @@ def varying_eval_fn(state, params, key):  # pylint: disable=unused-argument
     return jnp.array([0.5, 0.0, -0.5]), jnp.sin(state.step.astype(jnp.float32))
 
 
+def state_eval_fn(state, params, key):  # pylint: disable=unused-argument
+    """An evaluation function whose policy and value both differ from one move to the next (none
+    of its arithmetic is constant, for XLA to fold where it would compute it at runtime)."""
+    step = state.step.astype(jnp.float32)
+    return jnp.array([0.5, 0.0, -0.5]) * jnp.cos(step), jnp.sin(step)
+
+
 class FirstAction(MCTSActionSelector):
     """Always chooses action 0, so that a test decides where a traversal goes."""
 
@@ -60,6 +67,7 @@ def make_mcts(
     logits=None,
     value=0.0,
     selector=None,
+    num_iterations=1,
     **kwargs,
 ):
     """An MCTS evaluator (of class `cls`) whose evaluation function gives every state `logits`
@@ -73,7 +81,7 @@ def make_mcts(
         action_selector=selector if selector is not None else PUCTSelector(),
         branching_factor=num_actions,
         max_nodes=max_nodes,
-        num_iterations=1,
+        num_iterations=num_iterations,
         **kwargs,
     )
 
@@ -615,6 +623,115 @@ def test_iterations_do_not_depend_on_the_trees_capacity(env, cls):
             strict=True,
         ):
             np.testing.assert_array_equal(x, y[: a.capacity])
+
+
+# a search a cycle at a time, as self-play runs it
+
+
+def search_cycles(search, env, cycles, active=True):
+    """`search`'s cycles `cycles`, one after another, of the search for a move with key `key` of
+    the position in the tree's root. In a loop, as self-play runs them: unrolled, XLA could
+    compile each cycle for its number, and round differently."""
+    root_state, root_meta = env.init_fn(jax.random.PRNGKey(0))
+
+    def run(key, tree):
+        def cycle(tree, c):
+            tree = search.search_cycle(
+                key,
+                tree,
+                c,
+                jnp.array(active),
+                root_state,
+                root_meta,
+                None,
+                env.step_fn,
+            )
+            return tree, None
+
+        return jax.lax.scan(cycle, tree, jnp.asarray(cycles, dtype=jnp.int32))[0]
+
+    return run
+
+
+@pytest.mark.parametrize(
+    "cls",
+    [
+        pytest.param(AZ_MCTS, id="AlphaZero(MCTS)"),
+        pytest.param(AZ_WEIGHTED, id="AlphaZero(WeightedMCTS)"),
+    ],
+)
+@pytest.mark.parametrize("reused", [False, True], ids=["empty", "reused"])
+def test_a_search_a_cycle_at_a_time_is_evaluate(env, cls, reused):
+    # with the root's evaluation first, the same keys, and a tree too small for every iteration
+    search = make_mcts(cls, max_nodes=8, eval_fn=state_eval_fn, num_iterations=6)
+    root_state, root_meta = env.init_fn(jax.random.PRNGKey(0))
+    tree = (
+        build_tree(search, env, SHAPES[2])
+        if reused
+        else search.init(template_embedding=root_state)
+    )
+    key = jax.random.PRNGKey(3)
+    assert search.search_cycles() == 7
+
+    @jax.jit
+    def by_cycles(key, tree):
+        tree = search_cycles(search, env, list(range(search.search_cycles())))(
+            key, tree
+        )
+        return search.search_output(key, tree, root_state, root_meta, None, env.step_fn)
+
+    expected = jax.jit(search.evaluate, static_argnames="env_step_fn")(
+        key, tree, root_state, root_meta, None, env_step_fn=env.step_fn
+    )
+
+    assert_trees_equal(by_cycles(key, tree), expected)
+
+
+def test_a_search_is_done_after_the_roots_evaluation_and_its_iterations(env):
+    search = make_mcts(num_iterations=3)
+    tree = build_tree(search, env, SHAPES[2])
+
+    done = [bool(search.search_done(tree, jnp.array(c))) for c in range(6)]
+
+    assert done == [False, False, False, False, True, True]
+
+
+@pytest.mark.parametrize("cycle", [0, 2])
+def test_an_inactive_cycle_leaves_the_tree_as_it_is(env, cycle):
+    search = make_mcts(AZ_MCTS, max_nodes=8, eval_fn=state_eval_fn, num_iterations=4)
+    tree = build_tree(search, env, SHAPES[2])
+
+    run = jax.jit(search_cycles(search, env, [cycle], active=False))
+
+    assert_trees_equal(run(jax.random.PRNGKey(0), tree), tree)
+
+
+@pytest.mark.parametrize("cls", BACKUPS)
+def test_batched_cycles_match_each_trees_cycle_alone(env, cls):
+    # under vmap the root's evaluation and the iteration are both computed, and each tree must
+    # take only its own
+    search = make_mcts(cls, max_nodes=8, eval_fn=state_eval_fn, num_iterations=4)
+    trees = [build_tree(search, env, nodes) for nodes in SHAPES]
+    cycles = jnp.array([0, 1, 3])
+    active = jnp.array([True, True, False])
+    keys = jax.random.split(jax.random.PRNGKey(0), len(trees))
+    root_state, root_meta = env.init_fn(jax.random.PRNGKey(0))
+
+    def run(key, tree, cycle, active):
+        return search.search_cycle(
+            key, tree, cycle, active, root_state, root_meta, None, env.step_fn
+        )
+
+    batched = jax.jit(jax.vmap(run))(
+        keys, jax.tree.map(lambda *x: jnp.stack(x), *trees), cycles, active
+    )
+
+    alone = jax.jit(run)
+    for i, tree in enumerate(trees):
+        assert_trees_equal(
+            jax.tree.map(lambda x, i=i: x[i], batched),
+            alone(keys[i], tree, cycles[i], active[i]),
+        )
 
 
 # whole searches, on tic-tac-toe
