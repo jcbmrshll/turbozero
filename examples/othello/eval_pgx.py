@@ -16,6 +16,7 @@ import jax
 import numpy as np
 import pgx
 from game import (
+    DEFAULT_NET,
     load_checkpoint,
     make_test_evaluator,
     state_to_nn_input,
@@ -38,8 +39,9 @@ def main():
     parser.add_argument("checkpoint", help="a checkpoint saved by train.py")
     parser.add_argument(
         "--net",
-        default="resnet:6x128",
-        help="the checkpoint's network, as train.py's --net names it",
+        default=DEFAULT_NET,
+        help="the checkpoint's network, as train.py's --net names it"
+        " (resnet:6x128 for a run trained with the old default)",
     )
     parser.add_argument(
         "--sims", type=int, default=64, help="our MCTS iterations a move"

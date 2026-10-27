@@ -20,6 +20,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from game import (
+    DEFAULT_NET,
     SYMMETRY_TRANSFORM_FNS,
     env,
     load_checkpoint,
@@ -86,7 +87,12 @@ def main():
     parser = argparse.ArgumentParser(description="Time Othello self-play.")
     parser.add_argument("--envs", type=int, default=1024, help="parallel games")
     parser.add_argument("--sims", type=int, default=64, help="MCTS iterations a move")
-    parser.add_argument("--net", default="resnet:6x128", help="as train.py's --net")
+    parser.add_argument(
+        "--net",
+        default=DEFAULT_NET,
+        help="as train.py's --net; with --ckpt, the checkpoint's"
+        " (resnet:6x128 for a run trained with the old default)",
+    )
     parser.add_argument("--ckpt", default=None, help="checkpoint to play with")
     parser.add_argument(
         "--dtype", default="float32", help="the network's dtype in self-play"

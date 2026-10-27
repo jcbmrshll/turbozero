@@ -51,6 +51,7 @@ import pgx
 from engine_set import DEFAULT_PATH as DEFAULT_ENGINE_SET
 from engine_set import EngineSet
 from game import (
+    DEFAULT_NET,
     SYMMETRY_TRANSFORM_FNS,
     WEIGHT_DECAY,
     env,
@@ -137,7 +138,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument(
         "--net",
-        default="resnet:6x128",
+        default=DEFAULT_NET,
         help="the network: KIND:DEPTHxWIDTH[,FIELD=VALUE...], e.g. resnet:10x128 for "
         "AlphaZero's ResNet with 10 blocks of 128 channels, resnet:10x128,pool_every=3,"
         "heads=pooled with KataGo's global pooling, or transformer:8x256 (see "

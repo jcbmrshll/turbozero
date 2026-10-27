@@ -35,6 +35,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
+from game import DEFAULT_NET
 from seaglass import Arrays
 
 from core.monitoring import DEFAULT_URL, Monitor
@@ -78,7 +79,11 @@ def main():
         description="Evaluates a training run's checkpoints against an engine as they're saved."
     )
     parser.add_argument("ckpt_dir", type=Path, help="train.py's --ckpt-dir")
-    parser.add_argument("--net", default="resnet:6x128", help="the run's --net")
+    parser.add_argument(
+        "--net",
+        default=DEFAULT_NET,
+        help="the run's --net (resnet:6x128 for a run trained with the old default)",
+    )
     parser.add_argument("--engine", default="edax")
     parser.add_argument("--levels", type=int, nargs="+", default=[4, 6, 8])
     parser.add_argument("--sims", type=int, default=64)

@@ -62,8 +62,8 @@ it (or `--train-batch`).
 
 The network computes in bfloat16 by default: in self-play and test games
 (`--inference-dtype`), and its convolutions in training (`--train-dtype`, mixed precision:
-its parameters, BatchNorm and heads stay in float32). On one RTX 5080, with a 6-block,
-128-channel network computing in float32 throughout, an epoch takes about 63 seconds, and
+its parameters, BatchNorm and heads stay in float32). On one RTX 5080, with the plain
+`resnet:6x128` (below) computing in float32 throughout, an epoch takes about 63 seconds, and
 one 200-epoch run passed every rung of the ladder by epoch 65. bfloat16 in self-play and
 test games brings an epoch to about 36 seconds; searching with the same checkpoint,
 bfloat16 and float32 play evenly. bfloat16 training then takes each training step in less
@@ -73,8 +73,8 @@ well as float32 in a two-seed comparison.
 ### The network
 
 `--net` names the network as KIND:DEPTHxWIDTH, then any of its configuration's fields
-as ,FIELD=VALUE (see `core/networks/spec.py`). The default, `resnet:6x128`, is the
-residual network from the AlphaZero paper with 6 blocks of 128 channels. Its variants
+as ,FIELD=VALUE (see `core/networks/spec.py`). `resnet:6x128` is the residual network
+from the AlphaZero paper with 6 blocks of 128 channels. Its variants
 (`AZResnetConfig`):
 
 - `heads=pooled`: KataGo's policy and value heads, which pool features over the whole
@@ -85,6 +85,14 @@ residual network from the AlphaZero paper with 6 blocks of 128 channels. Its var
 - `block=bottleneck`: KataGo's nested bottleneck blocks, a 1x1 convolution down to
   half the width, a basic block (`bottleneck_inner` of them) and a 1x1 convolution
   back up, which cost under a third of a basic block.
+
+The default, `resnet:6x128,pool_every=2,heads=pooled` (`DEFAULT_NET` in `game.py`), has
+both kinds of global pooling. Trained for 50 epochs at 64 sims a move, then searching
+1000 iterations a move against Edax level 8 (512 games), `resnet:10x128` with the same
+pooling scored 0.73 in two seeds, where the plain `resnet:10x128` scored 0.57 to 0.61 in
+three, in the same training time (about 47 minutes). The pooled 6 × 128 scored 0.71, in
+64% of that time. On the engine-labelled set (below) the pooled networks' regret was
+1.85 to 1.93 discs, the plain ones' 2.07 to 2.12.
 
 `transformer:LAYERSxWIDTH` is a transformer with a token per square, after Leela Chess
 Zero's (`BoardTransformerConfig`): learned attention biases, optionally smolgen. On
@@ -226,7 +234,8 @@ uv run examples/othello/train.py --epochs 30 --init-from runs/trunk/state-150.np
 ## Evaluating a checkpoint
 
 Checkpoints from `train.py` are named after their epoch (`199.eqx` is the last of a
-200-epoch run). Pass the run's `--net` if it isn't the default.
+200-epoch run). Pass the run's `--net` if it isn't the default: `--net resnet:6x128` for
+a run trained before the pooled network became the default.
 
 ```
 uv run examples/othello/eval_pgx.py runs/othello/199.eqx --pgx-sims 64 256 1024
