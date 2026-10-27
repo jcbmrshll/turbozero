@@ -150,19 +150,26 @@ class EngineSet:
                 level=int(f["level"]),
             )
 
-    def groups(self) -> dict[str, np.ndarray]:
-        """The subsets metrics are reported for: each source, and each game phase."""
-        groups = {name: self.source == i for i, name in enumerate(self.source_names)}
+    def groups(self, by_source: bool = False) -> dict[str, np.ndarray]:
+        """The subsets metrics are reported for: each game phase, and with `by_source` each
+        source too (where positions came from matters for checking a set, not for reading a
+        network's metrics)."""
+        groups = (
+            {name: self.source == i for i, name in enumerate(self.source_names)}
+            if by_source
+            else {}
+        )
         for name, (lo, hi) in PHASES.items():
             groups[name] = (self.empties >= lo) & (self.empties <= hi)
         return groups
 
-    def scored_positions(self) -> ScoredPositions:
+    def scored_positions(self, by_source: bool = False) -> ScoredPositions:
+        """The positions and scores to measure networks on, with the groups of `groups`."""
         return ScoredPositions(
             observations=self.obs,
             legal=self.legal,
             scores=self.scores.astype(np.float32),
-            groups=self.groups(),
+            groups=self.groups(by_source),
         )
 
     def describe(self) -> dict:

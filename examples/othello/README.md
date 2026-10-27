@@ -347,13 +347,16 @@ move of which Edax has scored (the disc margin it expects at the end, searching 
 ahead and solving the last ~31 squares exactly).
 
 `train.py` scores the network on it every epoch and logs, for all positions and for each
-source and game phase (`opening`, 40-51 empty squares; `midgame`, 25-39; `endgame`, 1-24):
+game phase (`opening`, 40-51 empty squares; `midgame`, 25-39; `endgame`, 1-24):
 
 - `engine_top1`: how often the network's most likely move is one of Edax's best
 - `engine_regret`: discs its most likely move gives up against Edax's best
 - `engine_exp_regret`: the same, averaged over its policy: smoother, and about three times
   less noisy than `engine_regret` (a difference between two checkpoints on the same set is
-  good to about ±0.015 discs); the one to watch
+  good to about ±0.015 discs). But it also measures how sharp the policy is, which the
+  search and its policy target set (more sims, or `--policy-target completed-q`, train a
+  sharper or flatter one): compare it only between runs with the same search and target,
+  and across them, `engine_regret` and `engine_value_mse`
 - `engine_value_mse`: its value's squared error against the outcome Edax predicts (±1, 0 for a
   draw)
 - `engine_value_sign`: how often its value calls the winner Edax does
