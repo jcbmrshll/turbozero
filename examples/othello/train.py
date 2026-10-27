@@ -176,6 +176,13 @@ def main():
         "well-explored subtree (the tree is then sized for it, and --tree-factor is unused)",
     )
     parser.add_argument(
+        "--no-persist-tree",
+        action="store_true",
+        help="start every self-play search from an empty tree, rather than from the subtree "
+        "of the move played that the last search explored (by default kept, so a target is "
+        "built on its visits plus --sims more): an ablation of tree reuse",
+    )
+    parser.add_argument(
         "--min-iterations",
         type=int,
         default=0,
@@ -440,6 +447,11 @@ def main():
         parser.error("--resume needs the run's --ckpt-dir")
     if args.init_without_buffers and args.init_from is None:
         parser.error("--init-without-buffers needs --init-from")
+    if args.no_persist_tree and args.count_reused_visits:
+        parser.error(
+            "--count-reused-visits counts the visits of the subtree a search keeps, which "
+            "--no-persist-tree discards"
+        )
     if args.advance_every is None and args.count_reused_visits:
         # searches of varying lengths: see Trainer's advance_every
         args.advance_every = 5
@@ -483,6 +495,7 @@ def main():
                     branching_factor=env.num_actions,
                     action_selector=PUCTSelector(),
                     temperature=1.0,
+                    persist_tree=not args.no_persist_tree,
                     count_reused_visits=args.count_reused_visits,
                     min_iterations=args.min_iterations,
                     policy_target=CompletedQ(args.value_scale, args.maxvisit_init)
