@@ -37,8 +37,8 @@
     "*_win_rate": "The fraction of the test games against this opponent the network won.",
     "*_loss_rate": "The fraction of the test games against this opponent the network lost.",
     "*_seconds": "Seconds the ladder's games against this rung took, compiling included the first time it's played.",
-    "*_top1*": "How often the network's most likely action is one of the engine's best, on the engine-labelled positions (a suffix names a group of them: a source or a game phase). No search.",
-    "*_exp_regret*": "The score the network's policy gives up against the engine's best action, expected over its policy, on the engine-labelled positions (a suffix names a group). Less noisy than regret: the one to watch. No search.",
+    "*_top1*": "How often the network's most likely action is one of the engine's best, on the engine-labelled positions (a suffix names a game phase: opening, midgame or endgame). No search.",
+    "*_exp_regret*": "The score the network's policy gives up against the engine's best action, expected over its policy, on the engine-labelled positions (a suffix names a group). Less noisy than regret, but it also measures how sharp the policy is: compare it only between runs with the same search and policy target (across them, use regret and value_mse). No search.",
     "*_regret*": "The score the network's most likely action gives up against the engine's best, on the engine-labelled positions (a suffix names a group). No search.",
     "*_value_mse*": "(value - z)^2 of the network's value, z the outcome the engine predicts (+1, 0 or -1), on the engine-labelled positions (a suffix names a group). No search.",
     "*_value_sign*": "How often the network's value has the sign of the outcome the engine predicts, over the engine-labelled positions it doesn't call a draw (a suffix names a group). No search."

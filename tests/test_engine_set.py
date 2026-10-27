@@ -72,23 +72,27 @@ def test_a_set_saves_and_loads_unchanged(tmp_path):
     assert not list((tmp_path / "sets").glob("*.tmp*"))
 
 
-def test_a_set_reports_its_sources_and_phases():
+def test_a_set_reports_its_phases_and_on_request_its_sources():
     s = tiny_set(np.random.default_rng(0))
     s = EngineSet(**{**s.__dict__, "empties": np.array([45, 30, 10, 51], np.int8)})
 
     groups = s.groups()
+    by_source = s.groups(by_source=True)
 
-    assert list(groups) == ["held-out", "self_play", "opening", "midgame", "endgame"]
-    np.testing.assert_array_equal(groups["self_play"], [False, False, True, True])
+    # metrics by game phase; by source only when asked (for checking a set)
+    assert list(groups) == ["opening", "midgame", "endgame"]
+    assert list(by_source) == ["held-out", "self_play", "opening", "midgame", "endgame"]
+    np.testing.assert_array_equal(by_source["self_play"], [False, False, True, True])
     np.testing.assert_array_equal(groups["opening"], [True, False, False, True])
     np.testing.assert_array_equal(groups["endgame"], [False, False, True, False])
     positions = s.scored_positions()
-    assert positions.scores.dtype == np.float32 and positions.observations.shape == (
-        4,
-        8,
-        8,
-        2,
-    )
+    assert positions.scores.dtype == np.float32
+    assert positions.observations.shape == (4, 8, 8, 2)
+    assert list(positions.groups) == ["opening", "midgame", "endgame"]
+    assert list(s.scored_positions(by_source=True).groups)[:2] == [
+        "held-out",
+        "self_play",
+    ]
 
 
 @pytest.mark.parametrize(

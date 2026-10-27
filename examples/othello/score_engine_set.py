@@ -4,7 +4,8 @@ search, against Edax's scores of every legal move.
     uv run examples/othello/score_engine_set.py runs/othello/49.eqx runs/othello/99.eqx \\
         --net resnet:10x128,pool_every=3,heads=pooled
 
-Prints each checkpoint's metrics, for all positions and by source and game phase (see
+Prints each checkpoint's metrics, for all positions and by game phase (and with --by-source,
+by where the positions came from; see
 `core.testing.scored_positions.scored_position_metrics`); with --out, also appends them to a
 .jsonl file.
 """
@@ -36,6 +37,11 @@ def main():
     parser.add_argument(
         "--dtype", default="float32", help="dtype the network computes in"
     )
+    parser.add_argument(
+        "--by-source",
+        action="store_true",
+        help="also report each source of the set's positions",
+    )
     parser.add_argument("--out", default=None, help="append the results to this .jsonl")
     args = parser.parse_args()
 
@@ -48,7 +54,9 @@ def main():
     for path in args.checkpoints:
         network, params = load_checkpoint(path, args.net, args.dtype)
         if tester is None:
-            tester = ScoredPositionsTester(engine_set.scored_positions(), network)
+            tester = ScoredPositionsTester(
+                engine_set.scored_positions(args.by_source), network
+            )
         metrics = {k: float(v) for k, v in tester.evaluate(params).items()}
         print(
             f"{path} ({len(engine_set)} positions, {engine_set.engine} level {engine_set.level})"
