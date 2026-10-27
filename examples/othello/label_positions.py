@@ -27,7 +27,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
-from engine_set import DEFAULT_PATH, ILLEGAL, EngineSet, boards, selectable
+from engine_set import DEFAULT_PATH, ILLEGAL, EngineSet, SourceState, boards, selectable
 from engines import Analysis, Edax, EdaxAnalyst
 
 # what scores a position: Edax's analyst at a level, or a fake in tests
@@ -140,7 +140,7 @@ def label(
 
 
 def build(
-    sources: list[tuple[str, np.ndarray, np.ndarray]],
+    sources: list[tuple[str, SourceState, np.ndarray, np.ndarray]],
     per_source: int,
     level: int,
     workers: int,
@@ -152,7 +152,8 @@ def build(
     scoring (see `engine_set.selectable`) and distinct across sources.
 
     Args:
-        sources: each source's name, positions' obs (N, 8, 8, 2) and legal (N, 65)
+        sources: each source's name, where its positions came from, and their obs (N, 8, 8, 2)
+            and legal (N, 65)
         per_source: positions to sample from each
         level: the engine's level
         workers: analyst processes (see `label`)
@@ -163,7 +164,7 @@ def build(
     rng = np.random.default_rng(seed)
     obs, legal, source = [], [], []
     seen: set[bytes] = set()
-    for i, (name, o, m) in enumerate(sources):
+    for i, (name, _, o, m) in enumerate(sources):
         ok = selectable(o, m)
         # not already taken from an earlier source
         packed = np.packbits(o.reshape(len(o), -1), axis=1)
@@ -186,7 +187,8 @@ def build(
         scores=scores,
         depth=depth,
         source=source,
-        source_names=[name for name, _, _ in sources],
+        source_names=[name for name, _, _, _ in sources],
+        source_states=[state for _, state, _, _ in sources],
         empties=(64 - obs.sum(axis=(1, 2, 3))).astype(np.int8),
         engine="edax",
         level=level,
@@ -231,7 +233,7 @@ def main():
     for name, path, envs in args.source:
         obs, legal = buffer_positions(path, envs)
         print(f"{name}: {len(obs)} positions from {path}", flush=True)
-        sources.append((name, obs, legal))
+        sources.append((name, SourceState(str(Path(path).resolve()), envs), obs, legal))
     total = args.per_source * len(sources)
     start = time.perf_counter()
 

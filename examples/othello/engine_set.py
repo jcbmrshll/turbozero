@@ -13,12 +13,15 @@ A set is an .npz of numpy arrays:
   reaches the end of the game)
 - source: (N,) int8, which of `source_names` the position came from
 - source_names: (S,) the sources' names, e.g. the run whose games the positions are from
+- source_state_paths: (S,) each source's saved training state (state-<EPOCH>.npz), absolute
+- source_state_envs: (S, 2) the environments of it the positions are from, first to last
+  (exclusive); (-1, -1) for all
 - empties: (N,) int8, empty squares
 - engine, level: the engine and the level it searched at
 """
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -39,6 +42,22 @@ PHASES = {"opening": (40, 51), "midgame": (25, 39), "endgame": (1, 24)}
 
 
 @dataclass(frozen=True)
+class SourceState:
+    """Where a source's positions came from: a saved training state's replay buffer (see
+    `Trainer.save_state`), so that whoever trains on that run's games can leave these positions'
+    games out.
+
+    Attributes:
+        path: the state, state-<EPOCH>.npz, absolute
+        envs: (first, last), the environments the positions are from, last exclusive; None for
+            all of them
+    """
+
+    path: str
+    envs: tuple[int, int] | None = field(default=None)
+
+
+@dataclass(frozen=True)
 class EngineSet:
     """A set of positions with each legal action scored by an engine (see the module's
     docstring for the arrays).
@@ -50,6 +69,7 @@ class EngineSet:
         depth: (N, 65) int16
         source: (N,) int8
         source_names: the sources' names: letters, digits, "-" and "_" (they name metrics)
+        source_states: where each source's positions came from
         empties: (N,) int8
         engine: e.g. "edax"
         level: the engine's level
@@ -61,6 +81,7 @@ class EngineSet:
     depth: np.ndarray
     source: np.ndarray
     source_names: list[str]
+    source_states: list[SourceState]
     empties: np.ndarray
     engine: str
     level: int
@@ -71,6 +92,8 @@ class EngineSet:
                 raise ValueError(
                     f"source names name metrics: letters, digits, - and _, not {name!r}"
                 )
+        if len(self.source_states) != len(self.source_names):
+            raise ValueError("every source needs its state")
         if not ((self.scores != ILLEGAL) == self.legal).all():
             raise ValueError("every legal action needs a score, and only those")
 
@@ -91,6 +114,10 @@ class EngineSet:
             depth=self.depth.astype(np.int16),
             source=self.source.astype(np.int8),
             source_names=np.array(self.source_names),
+            source_state_paths=np.array([s.path for s in self.source_states]),
+            source_state_envs=np.array(
+                [s.envs or (-1, -1) for s in self.source_states], dtype=np.int64
+            ).reshape(-1, 2),
             empties=self.empties.astype(np.int8),
             engine=np.array(self.engine),
             level=np.array(self.level),
@@ -110,6 +137,14 @@ class EngineSet:
                 depth=f["depth"],
                 source=f["source"],
                 source_names=[str(s) for s in f["source_names"]],
+                source_states=[
+                    SourceState(
+                        str(path), None if first < 0 else (int(first), int(last))
+                    )
+                    for path, (first, last) in zip(
+                        f["source_state_paths"], f["source_state_envs"], strict=True
+                    )
+                ],
                 empties=f["empties"],
                 engine=str(f["engine"]),
                 level=int(f["level"]),
@@ -136,8 +171,14 @@ class EngineSet:
             "engine": self.engine,
             "level": self.level,
             "sources": {
-                name: int((self.source == i).sum())
-                for i, name in enumerate(self.source_names)
+                name: {
+                    "positions": int((self.source == i).sum()),
+                    "state": state.path,
+                    "envs": state.envs,
+                }
+                for i, (name, state) in enumerate(
+                    zip(self.source_names, self.source_states, strict=True)
+                )
             },
         }
 

@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "examples" / "othello"))
 
 import engine_set
 import label_positions
-from engine_set import ILLEGAL, EngineSet, boards, selectable
+from engine_set import ILLEGAL, EngineSet, SourceState, boards, selectable
 from engines import Analysis
 
 
@@ -39,6 +39,10 @@ def tiny_set(rng: np.random.Generator, n: int = 4) -> EngineSet:
         depth=np.where(legal, 24, 0).astype(np.int16),
         source=np.array([0, 0, 1, 1], np.int8)[:n],
         source_names=["held-out", "self_play"],
+        source_states=[
+            SourceState("/runs/a/state-150.npz", (896, 1024)),
+            SourceState("/runs/b/state-450.npz"),
+        ],
         empties=(64 - obs.sum(axis=(1, 2, 3))).astype(np.int8),
         engine="edax",
         level=24,
@@ -58,6 +62,13 @@ def test_a_set_saves_and_loads_unchanged(tmp_path):
         "edax",
         24,
     )
+    # where each source's positions came from, for training data to leave their games out
+    assert loaded.source_states == s.source_states
+    assert loaded.describe()["sources"]["held-out"] == {
+        "positions": 2,
+        "state": "/runs/a/state-150.npz",
+        "envs": (896, 1024),
+    }
     assert not list((tmp_path / "sets").glob("*.tmp*"))
 
 
@@ -85,6 +96,7 @@ def test_a_set_reports_its_sources_and_phases():
     [
         ({"source_names": ["a b", "c"]}, "letters, digits"),
         ({"scores": np.zeros((4, 65), np.int16)}, "every legal action needs a score"),
+        ({"source_states": [SourceState("/a.npz")]}, "every source needs its state"),
     ],
 )
 def test_a_set_refuses_bad_names_and_missing_scores(change, error):
@@ -151,11 +163,16 @@ def test_build_samples_each_source_and_scores_every_legal_move():
         obs.append(o.reshape(8, 8, 2))
         legal.append(legal_mask([0, 1, 2, 4, 5, 6, 7]))
     obs, legal = np.stack(obs), np.stack(legal)
-    sources = [("a", obs[:6], legal[:6]), ("b", obs[6:], legal[6:])]
+    states = [SourceState("/a.npz", (0, 6)), SourceState("/b.npz")]
+    sources = [
+        ("a", states[0], obs[:6], legal[:6]),
+        ("b", states[1], obs[6:], legal[6:]),
+    ]
 
     built = label_positions.build(sources, 4, level=10, workers=0, factory=fake_analyst)
 
     assert len(built) == 8 and built.source_names == ["a", "b"]
+    assert built.source_states == states
     np.testing.assert_array_equal(built.source, [0] * 4 + [1] * 4)
     expected = np.where(legal_mask([0, 1, 2, 4, 5, 6, 7]), np.arange(65) + 10, ILLEGAL)
     for scores in built.scores:
