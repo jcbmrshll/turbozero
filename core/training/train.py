@@ -2145,6 +2145,14 @@ class Trainer:
                 collection_metrics["search_iterations"] = jnp.asarray(
                     evaluator.num_iterations
                 )
+            # the cycles a move took, its search's and any it waited to be played
+            cycles = (
+                self.collection_steps_per_epoch
+                * evaluator.search_cycles()
+                * self.batch_size
+            )
+            moves = (collection_state.moves - before.moves).sum()
+            collection_metrics["cycles_per_move"] = cycles / jnp.maximum(moves, 1)
             # train
             self.set_activity(f"epoch {cur_epoch}: training")
             train_key, key = jax.random.split(key)

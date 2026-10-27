@@ -481,7 +481,7 @@ class KeyRecordingMCTS(MCTS):
         self.record("update_root", key)
         return tree
 
-    def iterate(self, key, tree, params, env_step_fn):
+    def iterate(self, key, tree, params, env_step_fn, write=True):
         self.record("iterate", key)
         return tree
 
@@ -628,19 +628,23 @@ def test_iterations_do_not_depend_on_the_trees_capacity(env, cls):
 # a search a cycle at a time, as self-play runs it
 
 
-def search_cycles(search, env, cycles, active=True):
+def search_cycles(search, env, cycles, active=None):
     """`search`'s cycles `cycles`, one after another, of the search for a move with key `key` of
-    the position in the tree's root. In a loop, as self-play runs them: unrolled, XLA could
-    compile each cycle for its number, and round differently."""
+    the position in the tree's root; each `active`, by default unless the search is done, as
+    self-play runs them. In a loop: unrolled, XLA could compile each cycle for its number, and
+    round differently."""
     root_state, root_meta = env.init_fn(jax.random.PRNGKey(0))
 
     def run(key, tree):
         def cycle(tree, c):
+            running = (
+                ~search.search_done(tree, c) if active is None else jnp.array(active)
+            )
             tree = search.search_cycle(
                 key,
                 tree,
                 c,
-                jnp.array(active),
+                running,
                 root_state,
                 root_meta,
                 None,
@@ -661,9 +665,21 @@ def search_cycles(search, env, cycles, active=True):
     ],
 )
 @pytest.mark.parametrize("reused", [False, True], ids=["empty", "reused"])
-def test_a_search_a_cycle_at_a_time_is_evaluate(env, cls, reused):
-    # with the root's evaluation first, the same keys, and a tree too small for every iteration
-    search = make_mcts(cls, max_nodes=8, eval_fn=state_eval_fn, num_iterations=6)
+@pytest.mark.parametrize(
+    "budget",
+    [
+        {},
+        {"count_reused_visits": True},
+        {"count_reused_visits": True, "min_iterations": 2},
+    ],
+    ids=["iterations", "visits", "visits-min-2"],
+)
+def test_a_search_a_cycle_at_a_time_is_evaluate(env, cls, reused, budget):
+    # with the root's evaluation first, the same keys, a tree too small for every iteration, and
+    # searches that stop early
+    search = make_mcts(
+        cls, max_nodes=8, eval_fn=state_eval_fn, num_iterations=6, **budget
+    )
     root_state, root_meta = env.init_fn(jax.random.PRNGKey(0))
     tree = (
         build_tree(search, env, SHAPES[2])
@@ -694,6 +710,62 @@ def test_a_search_is_done_after_the_roots_evaluation_and_its_iterations(env):
     done = [bool(search.search_done(tree, jnp.array(c))) for c in range(6)]
 
     assert done == [False, False, False, False, True, True]
+
+
+@pytest.mark.parametrize(
+    "nodes, min_iterations, done_from",
+    [
+        # the root has 1 visit: done after its evaluation and 4 iterations, as without
+        (SHAPES[0], 0, 5),
+        # 6 visits: done once evaluated
+        (SHAPES[2], 0, 1),
+        # but for 2 iterations more
+        (SHAPES[2], 2, 3),
+    ],
+)
+def test_a_search_counting_reused_visits_is_done_with_the_roots_visits(
+    env, nodes, min_iterations, done_from
+):
+    search = make_mcts(
+        num_iterations=4, count_reused_visits=True, min_iterations=min_iterations
+    )
+    tree = build_tree(search, env, nodes)
+
+    done = [bool(search.search_done(tree, jnp.array(c))) for c in range(7)]
+
+    assert done == [c >= done_from for c in range(7)]
+
+
+@pytest.mark.parametrize(
+    "nodes, min_iterations, visits",
+    [(SHAPES[0], 0, 9), (SHAPES[2], 0, 9), (SHAPES[2], 2, 9), (SHAPES[2], 5, 11)],
+)
+def test_a_search_counting_reused_visits_ends_with_as_many_root_visits(
+    env, nodes, min_iterations, visits
+):
+    # 8 iterations of a search from scratch: 9 visits, from the root's 1 or the reused 6; with
+    # 5 iterations at least, 11
+    search = make_mcts(
+        max_nodes=16,
+        eval_fn=state_eval_fn,
+        num_iterations=8,
+        count_reused_visits=True,
+        min_iterations=min_iterations,
+    )
+    tree = build_tree(search, env, nodes)
+    state, meta = env.init_fn(jax.random.PRNGKey(0))
+
+    searched = search.evaluate(
+        jax.random.PRNGKey(0), tree, state, meta, None, env_step_fn=env.step_fn
+    ).eval_state
+
+    assert int(root(searched).n) == visits
+    assert_consistent(searched)
+
+
+def test_min_iterations_is_at_most_num_iterations():
+    with pytest.raises(ValueError, match="min_iterations"):
+        make_mcts(num_iterations=2, count_reused_visits=True, min_iterations=3)
 
 
 @pytest.mark.parametrize("cycle", [0, 2])

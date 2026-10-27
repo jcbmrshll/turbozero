@@ -41,6 +41,8 @@ class MCTS(Evaluator):
         discount: float = -1.0,
         temperature: float = 1.0,
         persist_tree: bool = True,
+        count_reused_visits: bool = False,
+        min_iterations: int = 0,
     ):
         """Initializes an MCTS evaluator.
 
@@ -60,8 +62,24 @@ class MCTS(Evaluator):
             temperature: temperature for root action selection (default: 1.0); at 0, the most visited
                 action, ties broken at random
             persist_tree: whether to persist search tree state between calls to `evaluate` (default: True)
+            count_reused_visits: (optional) with `persist_tree`, stop a search once its root has
+                `num_iterations + 1` visits, those of the subtree it reused from the last search
+                counted, rather than after `num_iterations` iterations (default: False). A search from
+                a well-explored subtree then takes fewer iterations, and every root ends with the visits
+                of a search from scratch. The tree then never holds more than
+                `num_iterations + 1 + min_iterations` nodes, so `max_nodes` needs no more
+            min_iterations: (optional) with `count_reused_visits`, the fewest iterations a search
+                takes, however many visits it reused: the root's noise (e.g. AlphaZero's) only steers
+                the visits of its own search (default: 0). At most `num_iterations`
         """
+        if min_iterations < 0 or min_iterations > num_iterations:
+            raise ValueError(
+                f"min_iterations must be 0 to num_iterations ({num_iterations}), "
+                f"got {min_iterations}"
+            )
         super().__init__(discount=discount)
+        self.count_reused_visits = count_reused_visits
+        self.min_iterations = min_iterations
         self.eval_fn = eval_fn
         self.num_iterations = num_iterations
         self.branching_factor = branching_factor
@@ -81,6 +99,8 @@ class MCTS(Evaluator):
             "discount": self.discount,
             "temperature": self.temperature,
             "persist_tree": self.persist_tree,
+            "count_reused_visits": self.count_reused_visits,
+            "min_iterations": self.min_iterations,
         }
 
     def evaluate(
@@ -93,7 +113,8 @@ class MCTS(Evaluator):
         env_step_fn: EnvStepFn,
         **kwargs,
     ) -> MCTSOutput:
-        """Performs `self.num_iterations` MCTS iterations on an `MCTSTree`.
+        """Performs `self.num_iterations` MCTS iterations on an `MCTSTree` (fewer with
+        `count_reused_visits`, see `search_done`).
 
         Samples an action to take from the root node after search is completed.
 
@@ -117,8 +138,18 @@ class MCTS(Evaluator):
         iterate = partial(self.iterate, params=params, env_step_fn=env_step_fn)
 
         iterate_keys = jax.random.split(iterate_key, self.num_iterations)
+
+        def iteration(
+            state: MCTSTree, i_key: tuple[jax.Array, jax.Array]
+        ) -> tuple[MCTSTree, None]:
+            i, k = i_key
+            if not self.count_reused_visits:
+                return iterate(k, state), None
+            # after the root's evaluation and `i` iterations, as `search_cycle` counts them
+            return iterate(k, state, write=~self.search_done(state, i + 1)), None
+
         eval_state, _ = jax.lax.scan(
-            lambda state, k: (iterate(k, state), None), eval_state, iterate_keys
+            iteration, eval_state, (jnp.arange(self.num_iterations), iterate_keys)
         )
         # sample action based on root visit counts
         # (also get normalized policy weights for training purposes)
@@ -132,8 +163,13 @@ class MCTS(Evaluator):
         return self.num_iterations + 1
 
     def search_done(self, state: MCTSTree, cycles: jax.Array) -> jax.Array:
-        """Done after `search_cycles`."""
-        return cycles >= self.search_cycles()
+        """Done after `search_cycles`; with `count_reused_visits`, also once the root has
+        `num_iterations + 1` visits, after its evaluation and `min_iterations` iterations."""
+        done = cycles >= self.search_cycles()
+        if not self.count_reused_visits:
+            return done
+        visited = state.data.n[state.ROOT_INDEX] > self.num_iterations
+        return done | (visited & (cycles >= 1 + self.min_iterations))
 
     def search_cycle(
         self,
@@ -303,7 +339,12 @@ class MCTS(Evaluator):
         return policy
 
     def iterate(
-        self, key: jax.Array, tree: MCTSTree, params: Any, env_step_fn: EnvStepFn
+        self,
+        key: jax.Array,
+        tree: MCTSTree,
+        params: Any,
+        env_step_fn: EnvStepFn,
+        write: ArrayLike = True,
     ) -> MCTSTree:
         """Performs one iteration of MCTS.
 
@@ -317,6 +358,7 @@ class MCTS(Evaluator):
             tree: MCTSTree to evaluate
             params: parameters to pass to the the leaf evaluation function
             env_step_fn: env step fn: (env_state, action) -> (new_env_state, metadata)
+            write: (optional) whether to; if not, the tree is left as it is (see `expand`)
 
         Returns:
             MCTSTree: updated MCTSTree
@@ -324,7 +366,7 @@ class MCTS(Evaluator):
         traverse_key, eval_key, key = jax.random.split(key, 3)
         leaf = self.find_leaf(traverse_key, tree, env_step_fn)
         policy_logits, value = self.eval_fn(leaf.embedding, params, eval_key)
-        return self.expand(key, tree, leaf, policy_logits, value)
+        return self.expand(key, tree, leaf, policy_logits, value, write=write)
 
     def find_leaf(self, key: jax.Array, tree: MCTSTree, env_step_fn: EnvStepFn) -> Leaf:
         """Traverses from the root to the leaf an iteration evaluates, and steps to its state.

@@ -168,6 +168,20 @@ def main():
         "kept between moves, so it needs room for the reused subtree too)",
     )
     parser.add_argument(
+        "--count-reused-visits",
+        action="store_true",
+        help="a self-play search stops once its root has --sims + 1 visits, those of the "
+        "subtree it kept from the last move's search included, so it searches less from a "
+        "well-explored subtree (the tree then needs --sims + 1 + --min-iterations nodes, "
+        "and --tree-factor is unused)",
+    )
+    parser.add_argument(
+        "--min-iterations",
+        type=int,
+        default=0,
+        help="with --count-reused-visits, the fewest iterations a search takes",
+    )
+    parser.add_argument(
         "--sampling-moves",
         type=int,
         default=None,
@@ -417,10 +431,15 @@ def main():
                 AlphaZero(MCTS)(
                     eval_fn=selfplay_eval_fn,
                     num_iterations=sims,
-                    max_nodes=int(args.tree_factor * sims),
+                    # counting reused visits, a search's root never has more than this
+                    max_nodes=sims + 1 + args.min_iterations
+                    if args.count_reused_visits
+                    else int(args.tree_factor * sims),
                     branching_factor=env.num_actions,
                     action_selector=PUCTSelector(),
                     temperature=1.0,
+                    count_reused_visits=args.count_reused_visits,
+                    min_iterations=args.min_iterations,
                 ),
             )
             for epoch, sims in args.sims_schedule or [(0, args.sims)]

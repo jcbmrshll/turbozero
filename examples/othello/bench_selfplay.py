@@ -52,10 +52,14 @@ def make_trainer(args) -> tuple[Trainer, tuple]:
     evaluator = AlphaZero(MCTS)(
         eval_fn=make_nn_eval_fn(resnet, state_to_nn_input),
         num_iterations=args.sims,
-        max_nodes=2 * args.sims,
+        max_nodes=args.sims + 1 + args.min_iterations
+        if args.count_reused_visits
+        else 2 * args.sims,
         branching_factor=env.num_actions,
         action_selector=PUCTSelector(),
         temperature=1.0,
+        count_reused_visits=args.count_reused_visits,
+        min_iterations=args.min_iterations,
     )
     trainer = Trainer(
         batch_size=args.envs,
@@ -99,6 +103,17 @@ def main():
         type=int,
         default=1,
         help="cycles between plays of the moves whose searches are done",
+    )
+    parser.add_argument(
+        "--count-reused-visits",
+        action="store_true",
+        help="as train.py's: searches stop at --sims + 1 root visits, reused ones counted",
+    )
+    parser.add_argument(
+        "--min-iterations",
+        type=int,
+        default=0,
+        help="with --count-reused-visits, the fewest iterations a search takes",
     )
     parser.add_argument("--ckpt", default=None, help="checkpoint to play with")
     parser.add_argument(
@@ -170,7 +185,8 @@ def main():
         f"{args.advance_every}: {1e3 * np.median(per_step):.1f} ms/step "
         f"(min {1e3 * per_step.min():.1f}), "
         f"{1e6 * np.median(times) / cycles:.0f} us/cycle, "
-        f"{moves / sum(times):,.0f} moves/s"
+        f"{moves / sum(times):,.0f} moves/s, "
+        f"{cycles * args.repeats * args.envs / max(moves, 1):.1f} cycles/move"
     )
     stats = jax.devices()[0].memory_stats() or {}
     if "peak_bytes_in_use" in stats:
