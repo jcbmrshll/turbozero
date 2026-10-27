@@ -60,6 +60,17 @@ keep changes few; games in progress carry on, searching from new, empty trees. T
 games, `eval_pgx.py`, `vs_engine.py` and `watch.py` keep their own budgets. The
 run's page plots the budget as `search_iterations`.
 
+Each self-play environment searches at its own pace, a network evaluation a cycle, so a
+search needn't take a fixed number of iterations: with `--count-reused-visits` it stops
+once its root has `--sims` + 1 visits, those of the subtree it kept from the last move's
+search included. A move whose subtree the last search explored well then takes fewer
+iterations, about half of them with a trained network, and every root still ends with the
+visits of a full search. An epoch is still the compute of 128 full searches in each
+environment, so it plays more moves (logged as `moves` and `cycles_per_move`), and fills
+the replay buffer faster. `--min-iterations` sets the fewest a search takes, and
+`--advance-every` how often finished searches play their moves (5 cycles by default with
+`--count-reused-visits`; a search done in between goes on until then).
+
 `--buffer` sets replay memory, the samples kept per environment, which training samples
 from. Self-play adds 1024 an epoch (128 moves, each with its 7 symmetric copies), so the
 default 3000 is about the last 3 epochs. The run's page plots the samples training can
