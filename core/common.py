@@ -5,6 +5,7 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+from jax.typing import ArrayLike
 
 from core.evaluators.evaluator import EvalOutput, Evaluator
 from core.types import EnvInitFn, EnvStepFn, StepMetadata
@@ -107,6 +108,48 @@ def search_and_step(
         params=params,
         env_step_fn=env_step_fn,
     )
+    return step_with_output(
+        key,
+        output,
+        env_state,
+        env_state_metadata,
+        evaluator,
+        env_step_fn,
+        env_init_fn,
+        max_steps,
+        reset,
+        choose_action,
+    )
+
+
+def step_with_output(
+    key: jax.Array,
+    output: EvalOutput,
+    env_state: Any,
+    env_state_metadata: StepMetadata,
+    evaluator: Evaluator,
+    env_step_fn: EnvStepFn,
+    env_init_fn: EnvInitFn,
+    max_steps: int,
+    reset: bool = True,
+    choose_action: ChooseActionFn | None = None,
+    active: ArrayLike = True,
+) -> tuple[EvalOutput, Any, StepMetadata, jax.Array, jax.Array, jax.Array, Any]:
+    """`search_and_step` after its evaluation: steps the environment and evaluator with the
+    evaluator's `output` for `env_state`.
+
+    Args:
+        key: rng, `search_and_step`'s after it splits off the evaluation's
+        output: the evaluator's output
+        active: (optional) if not, the evaluator's state stays as `output` left it (see
+            `Evaluator.next_state`); the environment's is stepped all the same, for the caller
+            to keep or not
+        others: see `step_env_and_evaluator`.
+
+    Returns:
+        Tuple[EvalOutput, Any, StepMetadata, jax.Array, jax.Array, jax.Array, Any]: see
+            `search_and_step`
+    """
     if choose_action is not None:
         choose_key, key = jax.random.split(key)
         output = replace(
@@ -121,12 +164,17 @@ def search_and_step(
     # reset the environment and evaluator state if the episode is terminated or truncated
     # else, update the evaluator state
     rewards = env_state_metadata.rewards
-    eval_state = jax.lax.cond(
-        terminated | truncated,
-        evaluator.reset if reset else lambda s: s,
-        lambda s: evaluator.step(s, output.action),
-        output.eval_state,
-    )
+    if reset:
+        eval_state = evaluator.next_state(
+            output.eval_state, output.action, terminated | truncated, active=active
+        )
+    else:
+        eval_state = evaluator.next_state(
+            output.eval_state,
+            output.action,
+            False,
+            active=active & ~(terminated | truncated),
+        )
     # reset the environment if the episode is terminated or truncated
     env_state, env_state_metadata = jax.lax.cond(
         terminated | truncated,

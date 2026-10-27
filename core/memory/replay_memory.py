@@ -3,6 +3,7 @@ from dataclasses import dataclass, replace
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.typing import ArrayLike
 
 
 @jax.tree_util.register_dataclass
@@ -77,25 +78,34 @@ class EpisodeReplayBuffer:
         }
 
     def add_experience(
-        self, state: ReplayBufferState, experience: BaseExperience
+        self,
+        state: ReplayBufferState,
+        experience: BaseExperience,
+        valid: ArrayLike = True,
     ) -> ReplayBufferState:
         """Adds an experience to the replay buffer.
 
         Args:
             state: replay buffer state
             experience: experience to add
+            valid: (optional) whether to add it: if not, the buffer is left as it is. Cheaper under
+                vmap than a lax.cond, which would select between two whole buffers
 
         Returns:
             ReplayBufferState: updated replay buffer state
         """
+        # an out-of-bounds write is dropped
+        index = jnp.where(valid, state.next_idx, self.capacity)
         return replace(
             state,
             buffer=jax.tree_util.tree_map(
-                lambda x, y: x.at[state.next_idx].set(y), state.buffer, experience
+                lambda x, y: x.at[index].set(y, mode="drop"), state.buffer, experience
             ),
-            next_idx=(state.next_idx + 1) % self.capacity,
-            populated=state.populated.at[state.next_idx].set(True),
-            has_reward=state.has_reward.at[state.next_idx].set(False),
+            next_idx=jnp.where(
+                valid, (state.next_idx + 1) % self.capacity, state.next_idx
+            ),
+            populated=state.populated.at[index].set(True, mode="drop"),
+            has_reward=state.has_reward.at[index].set(False, mode="drop"),
         )
 
     def add_experiences(

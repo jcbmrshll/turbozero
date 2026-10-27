@@ -7,6 +7,7 @@ from jax.typing import ArrayLike
 
 from core.evaluators.evaluator import EvalOutput
 from core.trees.tree import Tree
+from core.types import StepMetadata
 
 
 @jax.tree_util.register_dataclass
@@ -50,6 +51,24 @@ class TraversalState:
 
     parent: ArrayLike
     action: jax.Array
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class Leaf:
+    """Where an iteration's traversal ended, and the state there it evaluates.
+
+    Attributes:
+        parent: index of the node the leaf is under
+        action: action from the parent to the leaf
+        embedding: the leaf's environment state
+        metadata: its metadata
+    """
+
+    parent: ArrayLike
+    action: jax.Array
+    embedding: Any
+    metadata: StepMetadata
 
 
 @jax.tree_util.register_dataclass

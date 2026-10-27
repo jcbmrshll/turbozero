@@ -168,6 +168,27 @@ def main():
         "kept between moves, so it needs room for the reused subtree too)",
     )
     parser.add_argument(
+        "--count-reused-visits",
+        action="store_true",
+        help="a self-play search stops once its root has --sims + 1 visits, those of the "
+        "subtree it kept from the last move's search included, so it searches less from a "
+        "well-explored subtree (the tree is then sized for it, and --tree-factor is unused)",
+    )
+    parser.add_argument(
+        "--min-iterations",
+        type=int,
+        default=0,
+        help="with --count-reused-visits, the fewest iterations a search takes",
+    )
+    parser.add_argument(
+        "--advance-every",
+        type=int,
+        default=None,
+        help="self-play cycles between plays of the moves whose searches are done (a search "
+        "done in between goes on until then): by default a whole search's, or 5 with "
+        "--count-reused-visits",
+    )
+    parser.add_argument(
         "--sampling-moves",
         type=int,
         default=None,
@@ -389,6 +410,9 @@ def main():
         parser.error("--resume needs the run's --ckpt-dir")
     if args.init_without_buffers and args.init_from is None:
         parser.error("--init-without-buffers needs --init-from")
+    if args.advance_every is None and args.count_reused_visits:
+        # searches of varying lengths: see Trainer's advance_every
+        args.advance_every = 5
 
     # self-play starts games from XOT openings (see xot.py) for varied, balanced
     # games
@@ -417,10 +441,16 @@ def main():
                 AlphaZero(MCTS)(
                     eval_fn=selfplay_eval_fn,
                     num_iterations=sims,
-                    max_nodes=int(args.tree_factor * sims),
+                    # counting reused visits, a search's root never has more visits than
+                    # this, those of the cycles it goes on for until its move is played included
+                    max_nodes=sims + args.min_iterations + args.advance_every
+                    if args.count_reused_visits
+                    else int(args.tree_factor * sims),
                     branching_factor=env.num_actions,
                     action_selector=PUCTSelector(),
                     temperature=1.0,
+                    count_reused_visits=args.count_reused_visits,
+                    min_iterations=args.min_iterations,
                 ),
             )
             for epoch, sims in args.sims_schedule or [(0, args.sims)]
@@ -486,6 +516,7 @@ def main():
         warmup_steps=0,
         collection_steps_per_epoch=128,
         train_steps_per_epoch=args.train_steps,
+        advance_every=args.advance_every,
         grad_accum_steps=args.grad_accum,
         nn=network,
         nn_state=network_state,

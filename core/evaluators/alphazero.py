@@ -1,11 +1,7 @@
-from typing import Any
-
 import jax
 import jax.numpy as jnp
 
 from core.evaluators.mcts.mcts import MCTS
-from core.evaluators.mcts.state import MCTSTree
-from core.types import StepMetadata
 
 
 class _AlphaZero(MCTS):
@@ -36,50 +32,29 @@ class _AlphaZero(MCTS):
             **super().get_config(),
         }
 
-    def update_root(
-        self,
-        key: jax.Array,
-        tree: MCTSTree,
-        root_embedding: Any,
-        params: Any,
-        root_metadata: StepMetadata,
-        **kwargs,
-    ) -> MCTSTree:  # pylint: disable=unused-argument
-        """Populates the root node of the search tree. Adds Dirichlet noise to the root policy.
+    def root_prior(
+        self, key: jax.Array, policy: jax.Array, action_mask: jax.Array
+    ) -> jax.Array:
+        """The root's prior: the network's policy, with Dirichlet noise mixed in.
 
         Args:
             key: rng
-            tree: The search tree.
-            root_embedding: root environment state.
-            params: nn parameters.
-            root_metadata: metadata of the root environment state
+            policy: the network's policy, 0 for illegal actions
+            action_mask: the legal actions
 
         Returns:
-            MCTSTree: The updated search tree.
+            jax.Array: the prior
         """
-        # evaluate the root state
-        root_key, dir_key = jax.random.split(key, 2)
-        root_policy_logits, root_value = self.eval_fn(root_embedding, params, root_key)
-        mask = root_metadata.action_mask
-        min_logit = jnp.finfo(root_policy_logits.dtype).min
-        root_policy = jax.nn.softmax(jnp.where(mask, root_policy_logits, min_logit))
-
+        min_logit = jnp.finfo(policy.dtype).min
         # Dirichlet noise over the legal actions only, as in AlphaZero (its root has a child per legal move,
         # and each gets a share of the noise): the softmax of independent log-Gamma(alpha) draws is a
         # Dirichlet(alpha) sample, computed in log space so small alphas don't underflow
-        log_gamma = jax.random.loggamma(dir_key, self.dirichlet_alpha, mask.shape)
-        dirichlet_noise = jax.nn.softmax(jnp.where(mask, log_gamma, min_logit))
+        log_gamma = jax.random.loggamma(key, self.dirichlet_alpha, action_mask.shape)
+        dirichlet_noise = jax.nn.softmax(jnp.where(action_mask, log_gamma, min_logit))
         # both are distributions over the legal actions, so their mix is too
-        noisy_policy = ((1 - self.dirichlet_epsilon) * root_policy) + (
+        return ((1 - self.dirichlet_epsilon) * policy) + (
             self.dirichlet_epsilon * dirichlet_noise
         )
-
-        # update the root node
-        root_node = tree.data_at(tree.ROOT_INDEX)
-        root_node = self.update_root_node(
-            root_node, noisy_policy, root_value, root_embedding
-        )
-        return tree.set_root(root_node)
 
 
 class AlphaZero(MCTS):

@@ -13,8 +13,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+from jax.typing import ArrayLike
 
-from core.common import search_and_step, step_env_and_evaluator
+from core.common import step_env_and_evaluator, step_with_output
 from core.evaluators.evaluator import Evaluator
 from core.evaluators.mcts.mcts import MCTS
 from core.memory.replay_memory import (
@@ -22,6 +23,7 @@ from core.memory.replay_memory import (
     EpisodeReplayBuffer,
     ReplayBufferState,
 )
+from core.pytree import where_tree
 from core.testing.tester import BaseTester, TestState
 from core.training.exploration import Exploration
 from core.training.schedule import EvaluatorSchedule, describe
@@ -63,6 +65,8 @@ class CollectionState:
         moves: number of self-play moves made so far
         episode_metrics: sums over the terminated episodes of each metric `Trainer`'s
             `episode_metrics_fn` returns (empty without it)
+        move_key: rng of the move in progress, its search's and the move's (see `Trainer.search`)
+        search_cycles: cycles the move's search has run so far (see `Evaluator.search_cycle`)
         tree_buffer_state: state of the replay buffer of search tree positions, None without them
         tree_written_at: for each entry of the tree position replay buffer, the number of moves made
             before it was written (see `Trainer.tree_sample_mask`), None without tree positions
@@ -77,6 +81,8 @@ class CollectionState:
     tree_visits: jax.Array
     moves: jax.Array
     episode_metrics: dict[str, jax.Array]
+    move_key: jax.Array
+    search_cycles: jax.Array
     tree_buffer_state: ReplayBufferState | None = None
     tree_written_at: jax.Array | None = None
 
@@ -88,12 +94,14 @@ class CollectionStats:
 
     Attributes:
         episodes: number of episodes that have terminated so far, per environment
+        moves: number of self-play moves made so far, per environment
         tree_positions: number of search tree positions stored so far
         tree_visits: their visit counts, summed
         episode_metrics: sums over the terminated episodes of each episode metric
     """
 
     episodes: jax.Array
+    moves: jax.Array
     tree_positions: jax.Array
     tree_visits: jax.Array
     episode_metrics: dict[str, jax.Array]
@@ -104,6 +112,7 @@ class CollectionStats:
         `Trainer.collect_steps`."""
         return cls(
             episodes=jnp.copy(state.episodes),
+            moves=jnp.copy(state.moves),
             tree_positions=jnp.copy(state.tree_positions),
             tree_visits=jnp.copy(state.tree_visits),
             episode_metrics={k: jnp.copy(v) for k, v in state.episode_metrics.items()},
@@ -403,6 +412,7 @@ class Trainer:
         episode_metrics_fn: Callable[[jax.Array], dict[str, jax.Array]] | None = None,
         data_transform_fns: Sequence[DataTransformFn] = (),
         tree_positions: TreePositions | None = None,
+        advance_every: int | None = None,
         extract_model_params_fn: ExtractModelParamsFn = extract_params,
         monitor: "Monitor | None" = None,
         ckpt_dir: str = "/tmp/turbozero_checkpoints",
@@ -465,6 +475,15 @@ class Trainer:
                 (see core.training.tree_positions). They're kept in a replay buffer of their own, and make up
                 a share of each training batch, sampled from those stored in the replay buffer's span of
                 self-play (see `tree_sample_mask`). Needs MCTS self-play evaluators.
+            advance_every: (optional) self-play plays the moves whose searches are done every this many
+                cycles (see `collect_steps`). Playing a move is computed for every environment,
+                whether its search is done or not (under vmap, a select), so checking less often
+                costs less; a search done in between goes on until the check, at most
+                `advance_every - 1` cycles more. By default, every evaluator's `search_cycles`: with
+                searches of a fixed length, a check as each is done, as if every environment searched
+                and played in step. With searches of varying lengths (e.g. MCTS's
+                `count_reused_visits`), a few cycles balance the two: about
+                sqrt(2 * mean search cycles * cost of a check / cost of a cycle).
             extract_model_params_fn: (optional) function to extract model parameters from TrainState
             monitor: (optional) `seaglass.Monitor` to log metrics and test episodes to (see a tester's `episode_fn`),
                 e.g. `core.monitoring.Monitor`, whose runs are drawn with turbozero's views
@@ -516,6 +535,9 @@ class Trainer:
             else EvaluatorSchedule([(0, evaluator)])
         )
         self.transform_fns = data_transform_fns
+        if advance_every is not None and advance_every < 1:
+            raise ValueError(f"advance_every must be positive, got {advance_every}")
+        self.advance_every = advance_every
         self.exploration = exploration
         self.episode_metrics_fn = episode_metrics_fn
         if tree_positions is not None and not all(
@@ -597,6 +619,7 @@ class Trainer:
             "train_batch_size": self.train_batch_size,
             "warmup_steps": self.warmup_steps,
             "collection_steps_per_epoch": self.collection_steps_per_epoch,
+            "advance_every": self.advance_every,
             "train_steps_per_epoch": self.train_steps_per_epoch,
             "max_episode_steps": self.max_episode_steps,
             "nn": self.nn.__class__.__name__,
@@ -635,21 +658,39 @@ class Trainer:
             "testers": [tester.get_config() for tester in self.testers],
         }
 
-    def collect(
+    def move_keys(
+        self, key: jax.Array
+    ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+        """Splits a move's key (see `CollectionState.move_key`).
+
+        Returns:
+            Tuple[jax.Array, jax.Array, jax.Array | None]: the search's key, the key for
+                choosing and playing the move (and starting a new game after it), and the key
+                for storing tree positions (None without them)
+        """
+        tree_key = None
+        if self.tree_positions is not None:
+            key, tree_key = jax.random.split(key)
+        key, evaluate_key = jax.random.split(key)
+        return evaluate_key, key, tree_key
+
+    def search(
         self,
         key: jax.Array,
         state: CollectionState,
         params: Any,
         evaluator: Evaluator | None = None,
     ) -> CollectionState:
-        """Collects self-play data for a single step.
+        """Runs a cycle of the search for the move in progress (see `Evaluator.search_cycle`). A
+        search that is done goes on until `advance` plays its move: under vmap, its cycle is
+        computed anyway.
 
-        - Stores experience in replay buffer.
-        - Resets environment/evaluator if episode is terminated.
+        A move starts with the first cycle after the last one's `advance`: `key` becomes its key
+        (see `CollectionState.move_key`). It's unused otherwise.
 
         Args:
-            key: rng
-            state: current collection state (environment, evaluator, replay buffer)
+            key: rng, for a move starting this cycle
+            state: current collection state
             params: model parameters
             evaluator: (optional) the self-play evaluator, whose states `state` holds. If not
                 provided, the first in the schedule.
@@ -659,9 +700,52 @@ class Trainer:
         """
         if evaluator is None:
             evaluator = self.collection_schedule.at(0)
-        tree_key = None
-        if self.tree_positions is not None:
-            key, tree_key = jax.random.split(key)
+        move_key = jnp.where(state.search_cycles == 0, key, state.move_key)
+        evaluate_key, _, _ = self.move_keys(move_key)
+        eval_state = evaluator.search_cycle(
+            evaluate_key,
+            state.eval_state,
+            state.search_cycles,
+            state.env_state,
+            state.metadata,
+            params,
+            self.env_step_fn,
+        )
+        return replace(
+            state,
+            eval_state=eval_state,
+            move_key=move_key,
+            search_cycles=state.search_cycles + 1,
+        )
+
+    def advance(
+        self,
+        state: CollectionState,
+        params: Any,
+        evaluator: Evaluator | None = None,
+    ) -> CollectionState:
+        """Plays the move whose search is done, if it is (see `Evaluator.search_done`).
+
+        - Stores experience in replay buffer.
+        - Resets environment/evaluator if episode is terminated.
+
+        If the search isn't done, the state is left as it is. Under vmap, where that differs
+        across environments, both are computed, but the replay buffers are only written where a
+        move is played, rather than selected between whole buffers.
+
+        Args:
+            state: current collection state
+            params: model parameters
+            evaluator: (optional) the self-play evaluator, whose states `state` holds. If not
+                provided, the first in the schedule.
+
+        Returns:
+            CollectionState: updated collection state
+        """
+        if evaluator is None:
+            evaluator = self.collection_schedule.at(0)
+        done = evaluator.search_done(state.eval_state, state.search_cycles)
+        evaluate_key, key, tree_key = self.move_keys(state.move_key)
         # step environment and evaluator
         (
             eval_output,
@@ -671,12 +755,18 @@ class Trainer:
             truncated,
             rewards,
             searched_eval_state,
-        ) = search_and_step(
+        ) = step_with_output(
             key=key,
+            output=evaluator.search_output(
+                evaluate_key,
+                state.eval_state,
+                state.env_state,
+                state.metadata,
+                params,
+                self.env_step_fn,
+            ),
             env_state=state.env_state,
             env_state_metadata=state.metadata,
-            eval_state=state.eval_state,
-            params=params,
             evaluator=evaluator,
             env_step_fn=self.env_step_fn,
             env_init_fn=self.env_init_fn,
@@ -684,8 +774,10 @@ class Trainer:
             choose_action=self.exploration.choose_action
             if self.exploration is not None
             else None,
+            active=done,
         )
         search_value = evaluator.get_value(searched_eval_state)
+        terminated, truncated = done & terminated, done & truncated
 
         # store experience in replay buffer
         buffer_state = self.memory_buffer.add_experience(
@@ -698,6 +790,7 @@ class Trainer:
                 cur_player_id=state.metadata.cur_player_id,
                 search_value=search_value,
             ),
+            valid=done,
         )
         # apply transforms
         for transform_fn in self.transform_fns:
@@ -714,18 +807,18 @@ class Trainer:
                     cur_player_id=state.metadata.cur_player_id,
                     search_value=search_value,
                 ),
+                valid=done,
             )
         # assign rewards to buffer if episode is terminated
-        buffer_state = jax.lax.cond(
+        buffer_state = where_tree(
             terminated,
-            lambda s: self.memory_buffer.assign_rewards(s, rewards),
-            lambda s: s,
+            self.memory_buffer.assign_rewards(buffer_state, rewards),
             buffer_state,
         )
         # discard the episode's experiences if it hit the step limit without terminating
         # (`truncated` is never set together with `terminated`)
-        buffer_state = jax.lax.cond(
-            truncated, self.memory_buffer.truncate, lambda s: s, buffer_state
+        buffer_state = where_tree(
+            truncated, self.memory_buffer.truncate(buffer_state), buffer_state
         )
         if tree_key is not None:
             # the tree the next search reuses: the played move's subtree, unless the episode ended
@@ -737,21 +830,43 @@ class Trainer:
                 ],
             )
             state = self.store_tree_positions(
-                tree_key, state, searched_eval_state, reused, evaluator
+                tree_key, state, searched_eval_state, reused, evaluator, valid=done
             )
         # return new collection state
         return replace(
             state,
+            # `step_with_output` moved it on only if done; if not, it's as `search_output` left
+            # it, which is as the search did (an evaluator whose `search_output` does the search,
+            # see `Evaluator.search_cycle`, is done every cycle)
             eval_state=eval_output.eval_state,
-            env_state=new_env_state,
+            env_state=where_tree(done, new_env_state, state.env_state),
             buffer_state=buffer_state,
-            metadata=new_metadata,
+            metadata=where_tree(done, new_metadata, state.metadata),
             episodes=state.episodes + terminated,
-            moves=state.moves + 1,
+            moves=state.moves + done,
             episode_metrics=self.add_episode_metrics(
                 state.episode_metrics, rewards, terminated
             ),
+            search_cycles=jnp.where(done, 0, state.search_cycles),
         )
+
+    def collect(
+        self,
+        key: jax.Array,
+        state: CollectionState,
+        params: Any,
+        evaluator: Evaluator | None = None,
+    ) -> CollectionState:
+        """A self-play cycle: `search`, then `advance`. With an evaluator that doesn't search a
+        cycle at a time (see `Evaluator.search_cycle`), a move.
+
+        Args: see `search`.
+
+        Returns:
+            CollectionState: updated collection state
+        """
+        state = self.search(key, state, params, evaluator)
+        return self.advance(state, params, evaluator)
 
     def store_tree_positions(
         self,
@@ -760,6 +875,7 @@ class Trainer:
         tree: Any,
         reused: jax.Array,
         evaluator: Evaluator,
+        valid: ArrayLike = True,
     ) -> CollectionState:
         """Stores positions from a self-play search tree in the tree position replay buffer
         (see `tree_positions`), with their transformed copies.
@@ -770,6 +886,7 @@ class Trainer:
             tree: the search tree, after the search
             reused: the root child whose subtree the next search reuses, NULL_INDEX for none
             evaluator: the self-play evaluator that searched the tree
+            valid: (optional) whether to store them: if not, the state is left as it is
 
         Returns:
             CollectionState: updated collection state
@@ -777,7 +894,7 @@ class Trainer:
         assert self.tree_positions is not None and self.tree_buffer is not None
         assert state.tree_buffer_state is not None and state.tree_written_at is not None
         assert isinstance(evaluator, MCTS)
-        indices, valid = select_nodes(
+        indices, selected = select_nodes(
             key,
             tree,
             self.tree_positions.per_move,
@@ -787,6 +904,7 @@ class Trainer:
             if self.tree_positions.discarded_only and evaluator.persist_tree
             else None,
         )
+        valid = jnp.logical_and(valid, selected)
         experiences, valid_experiences = tree_experiences(
             tree,
             indices,
@@ -831,7 +949,14 @@ class Trainer:
         *,
         evaluator: Evaluator | None = None,
     ) -> CollectionState:
-        """Collects self-play data for `num_steps` steps in every environment.
+        """Collects self-play data for the compute of `num_steps` moves in every environment: as
+        many cycles as `num_steps` moves' searches take at most (see `Evaluator.search_cycles`).
+
+        Each cycle, every environment runs a cycle of its move's search (`search`); every
+        `advance_every` cycles (see `Trainer`), those whose search is done play their moves
+        (`advance`). With searches that all take the same cycles, from environments that start
+        together, and the default `advance_every`, that's `num_steps` moves in each, as many
+        cycles apart.
 
         Compiled once for each evaluator.
 
@@ -840,26 +965,63 @@ class Trainer:
             state: current collection state, donated: its arrays are deleted, and can't be used
                 after the call
             params: model parameters
-            num_steps: number of self-play steps to collect
+            num_steps: number of moves' compute to collect for
             evaluator: (optional) the self-play evaluator, whose states `state` holds. If not
                 provided, the first in the schedule.
 
         Returns:
             CollectionState: updated collection state
         """
-        if num_steps > 0:
+        if evaluator is None:
+            evaluator = self.collection_schedule.at(0)
+        num_cycles = num_steps * evaluator.search_cycles()
+        if num_cycles == 0:
+            return state
+        advance_every = (
+            evaluator.search_cycles()
+            if self.advance_every is None
+            else self.advance_every
+        )
 
-            def collect_env(key: jax.Array, state: CollectionState) -> CollectionState:
-                keys = jax.random.split(key, num_steps)
-                return jax.lax.fori_loop(
-                    0,
-                    num_steps,
-                    lambda i, s: self.collect(keys[i], s, params, evaluator),
-                    state,
-                )
+        def collect_env(key: jax.Array, state: CollectionState) -> CollectionState:
+            # the i-th move to start in this call gets the i-th key
+            keys = jax.random.split(key, num_cycles)
 
-            return jax.vmap(collect_env)(key, state)
-        return state
+            def search(
+                carry: tuple[CollectionState, jax.Array], num: int
+            ) -> tuple[CollectionState, jax.Array]:
+                """`num` cycles of search, without playing any move: they only write the
+                trees, in place."""
+
+                def cycle(
+                    _: jax.Array, carry: tuple[CollectionState, jax.Array]
+                ) -> tuple[CollectionState, jax.Array]:
+                    state, started = carry
+                    starting = state.search_cycles == 0
+                    state = self.search(keys[started], state, params, evaluator)
+                    return state, started + starting
+
+                return jax.lax.fori_loop(0, num, cycle, carry)
+
+            def chunk(
+                _: jax.Array, carry: tuple[CollectionState, jax.Array]
+            ) -> tuple[CollectionState, jax.Array]:
+                state, started = search(carry, advance_every)
+                return self.advance(state, params, evaluator), started
+
+            # every `advance_every` cycles, the moves whose searches are done are played: loops
+            # within a loop rather than a lax.cond every cycle, through which XLA would copy the
+            # whole state (the trees and the replay buffers)
+            carry = jax.lax.fori_loop(
+                0,
+                num_cycles // advance_every,
+                chunk,
+                (state, jnp.array(0, dtype=jnp.int32)),
+            )
+            state, _ = search(carry, num_cycles % advance_every)
+            return state
+
+        return jax.vmap(collect_env)(key, state)
 
     def train_step(
         self, ts: TrainState, batch: BaseExperience
@@ -1156,6 +1318,7 @@ class Trainer:
 
         Returns:
             dict: metrics
+                - `moves`: self-play moves played in between, in all environments
                 - `episodes`: episodes that terminated in between
                 - with `episode_metrics_fn`: `episode_<name>`, each metric's mean over those
                   episodes, omitted if none terminated
@@ -1167,8 +1330,10 @@ class Trainer:
                   copies), `tree_positions_per_move`, and their `tree_mean_visits`
         """
         episodes = (after.episodes - before.episodes).sum()
+        moves = (after.moves - before.moves).sum()
         distinct, total = self.count_distinct_observations(after.buffer_state)
         metrics = {
+            "moves": moves,
             "episodes": episodes,
             "buffer_samples": total,
             "buffer_distinct_positions": distinct,
@@ -1181,9 +1346,8 @@ class Trainer:
         if self.tree_positions is not None:
             positions = (after.tree_positions - before.tree_positions).sum()
             visits = (after.tree_visits - before.tree_visits).sum()
-            moves = self.collection_steps_per_epoch * after.tree_positions.size
             metrics["tree_positions"] = positions
-            metrics["tree_positions_per_move"] = positions / max(moves, 1)
+            metrics["tree_positions_per_move"] = positions / jnp.maximum(moves, 1)
             metrics["tree_mean_visits"] = visits / jnp.maximum(positions, 1)
         return metrics
 
@@ -1525,6 +1689,7 @@ class Trainer:
             episode_metrics=self.init_episode_metrics(
                 self.batch_size, metadata.rewards[0]
             ),
+            **self.init_moves(key, self.batch_size),
             **stats,
         )
         return collection_state, train_state
@@ -1738,6 +1903,7 @@ class Trainer:
             tree_visits=jnp.zeros((batch_size,), dtype=jnp.int32),
             moves=jnp.zeros((batch_size,), dtype=jnp.int32),
             episode_metrics=self.init_episode_metrics(batch_size, metadata.rewards[0]),
+            **self.init_moves(key, batch_size),
             tree_buffer_state=tree_buffer_state,
             tree_written_at=jnp.zeros(
                 (batch_size, self.tree_buffer.capacity), dtype=jnp.int32
@@ -1745,6 +1911,16 @@ class Trainer:
             if self.tree_buffer is not None
             else None,
         )
+
+    @staticmethod
+    def init_moves(key: jax.Array, batch_size: int) -> dict[str, jax.Array]:
+        """`CollectionState`'s moves in progress, for `batch_size` environments: none, so each
+        environment's first cycle starts one."""
+        return {
+            # its first cycle sets it
+            "move_key": jnp.zeros_like(jax.random.split(key, batch_size)),
+            "search_cycles": jnp.zeros((batch_size,), dtype=jnp.int32),
+        }
 
     def init_games(
         self, key: jax.Array, batch_size: int, evaluator: Evaluator
@@ -1775,7 +1951,7 @@ class Trainer:
 
         The new evaluator's states replace the old one's, initialized from scratch: they may
         differ in shape (e.g. MCTS trees with a different `max_nodes`). Games in progress
-        carry on. Self-play is compiled again for the new evaluator, the first time it plays.
+        carry on, their moves in progress searched again from the start. Self-play is compiled again for the new evaluator, the first time it plays.
 
         Args:
             epoch: the epoch about to start
@@ -1793,8 +1969,14 @@ class Trainer:
             f"epoch {epoch}: self-play switches to {describe(scheduled)} (compiling)",
             echo=True,
         )
-        eval_state = self.init_eval_state(scheduled, collection_state.episodes.shape[0])
-        return scheduled, replace(collection_state, eval_state=eval_state)
+        num_envs = collection_state.episodes.shape[0]
+        eval_state = self.init_eval_state(scheduled, num_envs)
+        # the moves in progress start their searches again
+        return scheduled, replace(
+            collection_state,
+            eval_state=eval_state,
+            search_cycles=jnp.zeros((num_envs,), dtype=jnp.int32),
+        )
 
     def train_loop(
         self,
@@ -1978,6 +2160,14 @@ class Trainer:
                 collection_metrics["search_iterations"] = jnp.asarray(
                     evaluator.num_iterations
                 )
+            # the cycles a move took, its search's and any it waited to be played
+            cycles = (
+                self.collection_steps_per_epoch
+                * evaluator.search_cycles()
+                * self.batch_size
+            )
+            moves = (collection_state.moves - before.moves).sum()
+            collection_metrics["cycles_per_move"] = cycles / jnp.maximum(moves, 1)
             # train
             self.set_activity(f"epoch {cur_epoch}: training")
             train_key, key = jax.random.split(key)

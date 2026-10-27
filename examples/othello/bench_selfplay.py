@@ -52,10 +52,14 @@ def make_trainer(args) -> tuple[Trainer, tuple]:
     evaluator = AlphaZero(MCTS)(
         eval_fn=make_nn_eval_fn(resnet, state_to_nn_input),
         num_iterations=args.sims,
-        max_nodes=2 * args.sims,
+        max_nodes=args.sims + args.min_iterations + args.advance_every
+        if args.count_reused_visits
+        else 2 * args.sims,
         branching_factor=env.num_actions,
         action_selector=PUCTSelector(),
         temperature=1.0,
+        count_reused_visits=args.count_reused_visits,
+        min_iterations=args.min_iterations,
     )
     trainer = Trainer(
         batch_size=args.envs,
@@ -78,6 +82,7 @@ def make_trainer(args) -> tuple[Trainer, tuple]:
         state_to_nn_input_fn=state_to_nn_input,
         testers=[],
         data_transform_fns=SYMMETRY_TRANSFORM_FNS,
+        advance_every=args.advance_every,
         ckpt_dir="/tmp/turbozero-bench-selfplay",
     )
     return trainer, params
@@ -92,6 +97,24 @@ def main():
         default=DEFAULT_NET,
         help="as train.py's --net; with --ckpt, the checkpoint's"
         " (resnet:6x128 for a run trained with the old default)",
+    )
+    parser.add_argument(
+        "--advance-every",
+        type=int,
+        default=None,
+        help="as train.py's: cycles between plays of the moves whose searches are done, by "
+        "default a whole search's, or 5 with --count-reused-visits",
+    )
+    parser.add_argument(
+        "--count-reused-visits",
+        action="store_true",
+        help="as train.py's: searches stop at --sims + 1 root visits, reused ones counted",
+    )
+    parser.add_argument(
+        "--min-iterations",
+        type=int,
+        default=0,
+        help="with --count-reused-visits, the fewest iterations a search takes",
     )
     parser.add_argument("--ckpt", default=None, help="checkpoint to play with")
     parser.add_argument(
@@ -111,6 +134,8 @@ def main():
         "--compare", default=None, help="compare the warmup steps' results to a --save"
     )
     args = parser.parse_args()
+    if args.advance_every is None and args.count_reused_visits:
+        args.advance_every = 5
 
     trainer, params = make_trainer(args)
     collect = trainer.collect_steps
@@ -145,18 +170,26 @@ def main():
     jax.block_until_ready(state)
     print(f"compile + first call ({args.steps} steps): {time.perf_counter() - t:.1f}s")
 
-    times = []
+    times, moves = [], 0
     for i in range(args.repeats):
         k = jax.random.fold_in(key, i + 1)
+        before = int(state.moves.sum())
         t = time.perf_counter()
         state = collect(keys(k), state, params, args.steps)
         jax.block_until_ready(state)
         times.append(time.perf_counter() - t)
+        moves += int(state.moves.sum()) - before
+    # a call runs the cycles of `steps` moves' searches; searches done between plays of the
+    # moves (see --advance-every) go on until the next, so fewer moves may be played
+    cycles = args.steps * trainer.collection_schedule.at(0).search_cycles()
     per_step = np.array(times) / args.steps
     print(
-        f"{args.envs} envs, {args.sims} sims, {args.net}: "
-        f"{1e3 * np.median(per_step):.1f} ms/step (min {1e3 * per_step.min():.1f}), "
-        f"{args.envs / np.median(per_step):,.0f} moves/s"
+        f"{args.envs} envs, {args.sims} sims, {args.net}, advance every "
+        f"{args.advance_every}: {1e3 * np.median(per_step):.1f} ms/step "
+        f"(min {1e3 * per_step.min():.1f}), "
+        f"{1e6 * np.median(times) / cycles:.0f} us/cycle, "
+        f"{moves / sum(times):,.0f} moves/s, "
+        f"{cycles * args.repeats * args.envs / max(moves, 1):.1f} cycles/move"
     )
     stats = jax.devices()[0].memory_stats() or {}
     if "peak_bytes_in_use" in stats:

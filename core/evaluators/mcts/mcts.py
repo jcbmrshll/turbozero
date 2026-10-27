@@ -9,6 +9,7 @@ from jax.typing import ArrayLike
 from core.evaluators.evaluator import Evaluator
 from core.evaluators.mcts.action_selection import MCTSActionSelector
 from core.evaluators.mcts.state import (
+    Leaf,
     MCTSNode,
     MCTSOutput,
     MCTSTree,
@@ -40,6 +41,8 @@ class MCTS(Evaluator):
         discount: float = -1.0,
         temperature: float = 1.0,
         persist_tree: bool = True,
+        count_reused_visits: bool = False,
+        min_iterations: int = 0,
     ):
         """Initializes an MCTS evaluator.
 
@@ -59,8 +62,24 @@ class MCTS(Evaluator):
             temperature: temperature for root action selection (default: 1.0); at 0, the most visited
                 action, ties broken at random
             persist_tree: whether to persist search tree state between calls to `evaluate` (default: True)
+            count_reused_visits: (optional) with `persist_tree`, stop a search once its root has
+                `num_iterations + 1` visits, those of the subtree it reused from the last search
+                counted, rather than after `num_iterations` iterations (default: False). A search from
+                a well-explored subtree then takes fewer iterations, and every root ends with the visits
+                of a search from scratch. The tree then never holds more than
+                `num_iterations + 1 + min_iterations` nodes, so `max_nodes` needs no more
+            min_iterations: (optional) with `count_reused_visits`, the fewest iterations a search
+                takes, however many visits it reused: the root's noise (e.g. AlphaZero's) only steers
+                the visits of its own search (default: 0). At most `num_iterations`
         """
+        if min_iterations < 0 or min_iterations > num_iterations:
+            raise ValueError(
+                f"min_iterations must be 0 to num_iterations ({num_iterations}), "
+                f"got {min_iterations}"
+            )
         super().__init__(discount=discount)
+        self.count_reused_visits = count_reused_visits
+        self.min_iterations = min_iterations
         self.eval_fn = eval_fn
         self.num_iterations = num_iterations
         self.branching_factor = branching_factor
@@ -80,6 +99,8 @@ class MCTS(Evaluator):
             "discount": self.discount,
             "temperature": self.temperature,
             "persist_tree": self.persist_tree,
+            "count_reused_visits": self.count_reused_visits,
+            "min_iterations": self.min_iterations,
         }
 
     def evaluate(
@@ -92,7 +113,8 @@ class MCTS(Evaluator):
         env_step_fn: EnvStepFn,
         **kwargs,
     ) -> MCTSOutput:
-        """Performs `self.num_iterations` MCTS iterations on an `MCTSTree`.
+        """Performs `self.num_iterations` MCTS iterations on an `MCTSTree` (fewer with
+        `count_reused_visits`, see `search_done`).
 
         Samples an action to take from the root node after search is completed.
 
@@ -116,14 +138,117 @@ class MCTS(Evaluator):
         iterate = partial(self.iterate, params=params, env_step_fn=env_step_fn)
 
         iterate_keys = jax.random.split(iterate_key, self.num_iterations)
+
+        def iteration(
+            state: MCTSTree, i_key: tuple[jax.Array, jax.Array]
+        ) -> tuple[MCTSTree, None]:
+            i, k = i_key
+            if not self.count_reused_visits:
+                return iterate(k, state), None
+            # after the root's evaluation and `i` iterations, as `search_cycle` counts them
+            return iterate(k, state, write=~self.search_done(state, i + 1)), None
+
         eval_state, _ = jax.lax.scan(
-            lambda state, k: (iterate(k, state), None), eval_state, iterate_keys
+            iteration, eval_state, (jnp.arange(self.num_iterations), iterate_keys)
         )
         # sample action based on root visit counts
         # (also get normalized policy weights for training purposes)
         action, policy_weights = self.sample_root_action(sample_key, eval_state)
         return MCTSOutput(
             eval_state=eval_state, action=action, policy_weights=policy_weights
+        )
+
+    def search_cycles(self) -> int:
+        """The root's evaluation, then `num_iterations` iterations."""
+        return self.num_iterations + 1
+
+    def search_done(self, state: MCTSTree, cycles: jax.Array) -> jax.Array:
+        """Done after `search_cycles`; with `count_reused_visits`, also once the root has
+        `num_iterations + 1` visits, after its evaluation and `min_iterations` iterations."""
+        done = cycles >= self.search_cycles()
+        if not self.count_reused_visits:
+            return done
+        visited = state.data.n[state.ROOT_INDEX] > self.num_iterations
+        return done | (visited & (cycles >= 1 + self.min_iterations))
+
+    def search_cycle(
+        self,
+        key: jax.Array,
+        state: MCTSTree,
+        cycle: jax.Array,
+        env_state: Any,
+        root_metadata: StepMetadata,
+        params: Any,
+        env_step_fn: EnvStepFn,
+    ) -> MCTSTree:
+        """The root's evaluation (cycle 0), or an iteration: what `evaluate` does, a step at a
+        time, with the same keys. Either way, one network evaluation, so that a batch of searches
+        at different points evaluates the network once a cycle. Past `search_done`, more
+        iterations, each with a key of its own.
+
+        Args: see `Evaluator.search_cycle`.
+
+        Returns:
+            MCTSTree: updated MCTSTree
+        """
+        root_key, iterate_key, _ = jax.random.split(key, 3)
+        # the iteration's key, as `evaluate` splits it off (the split's i-th key doesn't depend on
+        # how many it makes); past `num_iterations`, folded in
+        iteration = jnp.maximum(cycle - 1, 0)
+        iteration_key = jnp.where(
+            iteration < self.num_iterations,
+            jax.random.split(iterate_key, self.num_iterations)[
+                jnp.minimum(iteration, self.num_iterations - 1)
+            ],
+            jax.random.fold_in(iterate_key, iteration),
+        )
+        traverse_key, leaf_eval_key, expand_key = jax.random.split(iteration_key, 3)
+        root_eval_key, _ = jax.random.split(root_key)
+        at_root = cycle == 0
+        # the network evaluates the root or the leaf; then the tree takes one of the two updates.
+        # Both are computed, as under vmap a lax.cond would, but they write only what they change,
+        # where a cond would select between two whole trees
+        leaf = self.find_leaf(traverse_key, state, env_step_fn)
+        policy_logits, value = self.eval_fn(
+            jax.tree.map(
+                lambda r, l: jnp.where(at_root, r, l), env_state, leaf.embedding
+            ),
+            params,
+            jnp.where(at_root, root_eval_key, leaf_eval_key),
+        )
+        state = self.expand_root(
+            root_key,
+            state,
+            env_state,
+            root_metadata,
+            policy_logits,
+            value,
+            write=at_root,
+        )
+        return self.expand(
+            expand_key, state, leaf, policy_logits, value, write=~at_root
+        )
+
+    def search_output(
+        self,
+        key: jax.Array,
+        state: MCTSTree,
+        env_state: Any,
+        root_metadata: StepMetadata,
+        params: Any,
+        env_step_fn: EnvStepFn,
+    ) -> MCTSOutput:
+        """Samples the action to take from the root, as `evaluate` does after its iterations.
+
+        Args: see `Evaluator.search_output`.
+
+        Returns:
+            MCTSOutput: as `evaluate`'s
+        """
+        _, _, sample_key = jax.random.split(key, 3)
+        action, policy_weights = self.sample_root_action(sample_key, state)
+        return MCTSOutput(
+            eval_state=state, action=action, policy_weights=policy_weights
         )
 
     def get_value(self, state: MCTSTree) -> jax.Array:
@@ -162,23 +287,70 @@ class MCTS(Evaluator):
         Returns:
             MCTSTree: updated MCTSTree
         """
-        # evaluate root state
-        root_policy_logits, root_value = self.eval_fn(root_embedding, params, key)
-        root_policy_logits = jnp.where(
-            root_metadata.action_mask,
-            root_policy_logits,
-            jnp.finfo(root_policy_logits).min,
+        eval_key, _ = jax.random.split(key)
+        policy_logits, value = self.eval_fn(root_embedding, params, eval_key)
+        return self.expand_root(
+            key, tree, root_embedding, root_metadata, policy_logits, value
         )
-        root_policy = jax.nn.softmax(root_policy_logits)
-        # update root node
-        root_node = tree.data_at(tree.ROOT_INDEX)
+
+    def expand_root(
+        self,
+        key: jax.Array,
+        tree: MCTSTree,
+        root_embedding: Any,
+        root_metadata: StepMetadata,
+        policy_logits: jax.Array,
+        value: ArrayLike,
+        write: ArrayLike = True,
+    ) -> MCTSTree:
+        """Populates the root node of an MCTSTree with the network's evaluation of it.
+
+        Args:
+            key: rng, `update_root`'s
+            tree: MCTSTree to update
+            root_embedding: root environment state
+            root_metadata: metadata of the root environment state
+            policy_logits: the root's policy logits
+            value: the root's value
+            write: (optional) whether to; if not, the tree is left as it is (see `Tree.set_root`)
+
+        Returns:
+            MCTSTree: updated MCTSTree
+        """
+        _, prior_key = jax.random.split(key)
+        policy_logits = jnp.where(
+            root_metadata.action_mask, policy_logits, jnp.finfo(policy_logits).min
+        )
+        policy = self.root_prior(
+            prior_key, jax.nn.softmax(policy_logits), root_metadata.action_mask
+        )
         root_node = self.update_root_node(
-            root_node, root_policy, root_value, root_embedding
+            tree.data_at(tree.ROOT_INDEX), policy, value, root_embedding
         )
-        return tree.set_root(root_node)
+        return tree.set_root(root_node, write=write)
+
+    def root_prior(
+        self, key: jax.Array, policy: jax.Array, action_mask: jax.Array
+    ) -> jax.Array:  # pylint: disable=unused-argument
+        """The root's prior, from the network's policy over the legal actions: the policy itself.
+
+        Args:
+            key: rng
+            policy: the network's policy, 0 for illegal actions
+            action_mask: the legal actions
+
+        Returns:
+            jax.Array: the prior
+        """
+        return policy
 
     def iterate(
-        self, key: jax.Array, tree: MCTSTree, params: Any, env_step_fn: EnvStepFn
+        self,
+        key: jax.Array,
+        tree: MCTSTree,
+        params: Any,
+        env_step_fn: EnvStepFn,
+        write: ArrayLike = True,
     ) -> MCTSTree:
         """Performs one iteration of MCTS.
 
@@ -192,20 +364,59 @@ class MCTS(Evaluator):
             tree: MCTSTree to evaluate
             params: parameters to pass to the the leaf evaluation function
             env_step_fn: env step fn: (env_state, action) -> (new_env_state, metadata)
+            write: (optional) whether to; if not, the tree is left as it is (see `expand`)
 
         Returns:
             MCTSTree: updated MCTSTree
         """
         traverse_key, eval_key, key = jax.random.split(key, 3)
-        # traverse from root -> leaf
-        traversal_state = self.traverse(traverse_key, tree)
+        leaf = self.find_leaf(traverse_key, tree, env_step_fn)
+        policy_logits, value = self.eval_fn(leaf.embedding, params, eval_key)
+        return self.expand(key, tree, leaf, policy_logits, value, write=write)
+
+    def find_leaf(self, key: jax.Array, tree: MCTSTree, env_step_fn: EnvStepFn) -> Leaf:
+        """Traverses from the root to the leaf an iteration evaluates, and steps to its state.
+
+        Args:
+            key: rng, for the traversal
+            tree: MCTSTree to search
+            env_step_fn: env step fn: (env_state, action) -> (new_env_state, metadata)
+
+        Returns:
+            Leaf: the leaf
+        """
+        traversal_state = self.traverse(key, tree)
         parent, action = traversal_state.parent, traversal_state.action
-        # get env state (embedding) for leaf node
-        embedding = tree.data_at(parent).embedding
-        new_embedding, metadata = env_step_fn(embedding, action)
+        embedding, metadata = env_step_fn(tree.data_at(parent).embedding, action)
+        return Leaf(
+            parent=parent, action=action, embedding=embedding, metadata=metadata
+        )
+
+    def expand(
+        self,
+        key: jax.Array,
+        tree: MCTSTree,
+        leaf: Leaf,
+        policy_logits: jax.Array,
+        value: ArrayLike,
+        write: ArrayLike = True,
+    ) -> MCTSTree:
+        """Adds a leaf with the network's evaluation of it to the tree, and backpropagates its value.
+
+        Args:
+            key: rng, for backpropagation
+            tree: MCTSTree to update
+            leaf: the leaf (see `find_leaf`)
+            policy_logits: the leaf's policy logits
+            value: the leaf's value
+            write: (optional) whether to; if not, the tree is left as it is (see `Tree.set_child`)
+
+        Returns:
+            MCTSTree: updated MCTSTree
+        """
+        parent, action = leaf.parent, leaf.action
+        new_embedding, metadata = leaf.embedding, leaf.metadata
         player_reward = metadata.rewards[metadata.cur_player_id]
-        # evaluate leaf node
-        policy_logits, value = self.eval_fn(new_embedding, params, eval_key)
         policy_logits = jnp.where(
             metadata.action_mask, policy_logits, jnp.finfo(policy_logits).min
         )
@@ -234,12 +445,16 @@ class MCTS(Evaluator):
         )
         # when the tree is full, a new leaf takes the slot of the least-visited leaf
         tree = tree.set_child(
-            parent, action, node_data, evict=self.eviction_candidate(tree, parent)
+            parent,
+            action,
+            node_data,
+            evict=self.eviction_candidate(tree, parent),
+            write=write,
         )
         # backpropagate, only if the leaf is in the tree: otherwise (a full tree with nothing to
         # evict) its value would reach the root but no child of it, and PUCT would choose the same
         # leaf again and again. Every later iteration then does nothing, and the search ends early
-        landed = tree.is_edge(parent, action)
+        landed = write & tree.is_edge(parent, action)
         return self.backpropagate(
             key, tree, jnp.where(landed, parent, tree.NULL_INDEX), value
         )
@@ -512,6 +727,24 @@ class MCTS(Evaluator):
             return state.get_subtree(action)
         # just reset to an empty tree if persist_tree is False
         return state.reset()
+
+    def next_state(
+        self,
+        state: MCTSTree,
+        action: jax.Array,
+        reset: ArrayLike,
+        active: ArrayLike = True,
+    ) -> MCTSTree:
+        """`step` or `reset`, in a single pass over the tree (see `Tree.get_subtree`).
+
+        Args: see `Evaluator.next_state`.
+
+        Returns:
+            MCTSTree: the tree for the next move
+        """
+        return state.get_subtree(
+            action, reset=jnp.logical_or(reset, not self.persist_tree), active=active
+        )
 
     def init(self, template_embedding: Any, *args, **kwargs) -> MCTSTree:  # pylint: disable=arguments-differ
         """Initializes the internal state of the MCTS evaluator.
