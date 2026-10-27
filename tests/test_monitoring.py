@@ -126,8 +126,8 @@ def test_pgx_episode_is_logged_for_the_views(seaglass_server, ttt):
         assert arrays["to_move"].tolist() == [0, 1, 0, 1, 0, 1, 0, 1]
         np.testing.assert_allclose(arrays["values"][:, 0], np.arange(8) / 10)
         np.testing.assert_allclose(arrays["values"][:, 1], -np.arange(8) / 10)
-        assert (arrays["agent"].item(), arrays["completed"].item()) == (1, True)
-        assert arrays["outcome"].item() == -1
+        assert (arrays["agent"][()], arrays["completed"][()]) == (1, True)
+        assert arrays["outcome"][()] == -1 and arrays["start"][()] == 0
         # the game didn't record its searches
         assert "search_offset" not in arrays
 

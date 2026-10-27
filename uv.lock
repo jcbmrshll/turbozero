@@ -810,8 +810,8 @@ wheels = [
 
 [[package]]
 name = "seaglass"
-version = "0.1.0"
-source = { git = "https://github.com/jcbmrshll/seaglass?rev=v0.1.0#c85d80c86dae98ede965091574a6a2505f16d1b7" }
+version = "0.1.1"
+source = { git = "https://github.com/jcbmrshll/seaglass?rev=v0.1.1#601469aca23fc47600ed60c1f3e820bf36453375" }
 dependencies = [
     { name = "numpy" },
 ]
@@ -867,7 +867,7 @@ requires-dist = [
     { name = "jax", specifier = ">=0.11.2" },
     { name = "jax", extras = ["cuda13"], marker = "extra == 'cuda'" },
     { name = "optax", specifier = ">=0.2.8" },
-    { name = "seaglass", git = "https://github.com/jcbmrshll/seaglass?rev=v0.1.0" },
+    { name = "seaglass", git = "https://github.com/jcbmrshll/seaglass?rev=v0.1.1" },
 ]
 provides-extras = ["cuda"]
 
