@@ -1,5 +1,5 @@
 // Episodes in the browser: the raw arrays a run logged, played frame by frame on a
-// canvas by the env's renderer (renderers.js).
+// canvas by the env's view (renderers.js).
 
 import { h } from "./dom.js";
 
@@ -31,22 +31,9 @@ export class NdArray {
   }
 }
 
-const DTYPES = { float32: Float32Array, int32: Int32Array, uint8: Uint8Array };
-
-// an episode's arrays, {name: NdArray}, as the server packs them (monitor/server.py
-// pack_arrays): a JSON header's length, the header, then each array's bytes
-export async function loadArrays(url) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`${res.status} ${url}`);
-  const buf = await res.arrayBuffer();
-  const length = new DataView(buf).getUint32(0, true);
-  const header = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 4, length)));
-  const arrays = {};
-  for (const [name, { dtype, shape, offset }] of Object.entries(header)) {
-    const size = shape.reduce((a, b) => a * b, 1);
-    arrays[name] = new NdArray(new DTYPES[dtype](buf, 4 + length + offset, size), shape);
-  }
-  return arrays;
+// an episode's arrays, {name: NdArray}, from host.arrays' {name: {dtype, shape, data}}
+export function ndArrays(arrays) {
+  return Object.fromEntries(Object.entries(arrays).map(([name, a]) => [name, new NdArray(a.data, a.shape)]));
 }
 
 // ---------------------------------------------------------------- player
@@ -72,8 +59,11 @@ document.addEventListener("keydown", (ev) => {
 // playing, after an opening played for them), and plays again from there.
 // player.onClick(event), if set, gets clicks on the canvas first, and returns true
 // for those it took; the rest play and pause. player.canvas is the canvas, and
-// player.redraw() draws the frame again, for a view that changed.
-export function episodePlayer(view, { maxHeight = MAX_HEIGHT, below = null, paused = false, start = 0 } = {}) {
+// player.redraw() draws the frame again, for a view that changed. `speed` is the speed it
+// plays at, if the view offers it; player.onSpeed(speed) is told when it's changed, and
+// player.onUser(frame, playing) when someone plays, pauses or moves it (not as it plays).
+// player.destroy() stops it.
+export function episodePlayer(view, { maxHeight = MAX_HEIGHT, below = null, paused = false, start = 0, speed = 1 } = {}) {
   const canvas = h("canvas");
   canvas.style.aspectRatio = `${view.width} / ${view.height}`;
   // no taller than maxHeight on screen
@@ -87,7 +77,7 @@ export function episodePlayer(view, { maxHeight = MAX_HEIGHT, below = null, paus
   const playBtn = h("button", { class: "play", title: "play/pause (space)" });
   const scrub = h("input", { type: "range", min: 0, max: Math.max(0, view.frames - 1), step: 1, value: 0 });
   const counter = h("span", { class: "pos" });
-  const speedBtns = speeds.map((s) => h("button", { text: `${s}×`, onclick: () => setSpeed(s) }));
+  const speedBtns = speeds.map((s) => h("button", { text: `${s}×`, onclick: () => (setSpeed(s), player.onSpeed?.(s)) }));
   const fullBtn = document.fullscreenEnabled && h("button", { class: "full", title: "full screen (f)", onclick: () => toggleFull() }, fullIcon());
   const controls = h("div", { class: "scrub player-controls" }, playBtn, scrub, counter, ...speedBtns, fullBtn);
   const el = h("div", { class: "player" }, canvas, below, !still && controls);
@@ -95,7 +85,7 @@ export function episodePlayer(view, { maxHeight = MAX_HEIGHT, below = null, paus
   el.style.setProperty("--aspect", view.width / view.height);
 
   start = Math.min(Math.max(start, 0), view.frames - 1);
-  const player = { el, canvas, frame: start, playing: !still && !paused, speed: 1, onFrame: null, onClick: null };
+  const player = { el, canvas, frame: start, playing: !still && !paused, speed: 1, onFrame: null, onClick: null, onSpeed: null, onUser: null };
   let scale = 1;
   // the frame's time at the last play or seek, so playback is real time whatever
   // the display's refresh rate
@@ -122,7 +112,10 @@ export function episodePlayer(view, { maxHeight = MAX_HEIGHT, below = null, paus
     playBtn.textContent = player.playing ? "❚❚" : "▶";
     if (player.playing) loop();
   }
+  // someone played, paused or moved it
+  const byUser = () => player.onUser?.(player.frame, player.playing);
   player.pause = () => setPlaying(false);
+  player.play = () => setPlaying(true);
   player.redraw = () => draw();
   function setSpeed(s) {
     player.speed = s;
@@ -164,12 +157,16 @@ export function episodePlayer(view, { maxHeight = MAX_HEIGHT, below = null, paus
     };
     requestAnimationFrame(tick);
   }
+  player.destroy = () => {
+    player.playing = false;
+    seen.disconnect();
+    sized.disconnect();
+    if (hovered === player) hovered = null;
+  };
   const seen = new IntersectionObserver(([entry]) => {
     // a player taken off the page (for another episode) is done with
     if (!canvas.isConnected) {
-      seen.disconnect();
-      sized.disconnect();
-      if (hovered === player) hovered = null;
+      player.destroy();
       return;
     }
     visible = entry.isIntersecting;
@@ -190,13 +187,19 @@ export function episodePlayer(view, { maxHeight = MAX_HEIGHT, below = null, paus
   });
   sized.observe(canvas);
 
-  playBtn.addEventListener("click", () => setPlaying(!player.playing));
+  playBtn.addEventListener("click", () => {
+    setPlaying(!player.playing);
+    byUser();
+  });
   scrub.addEventListener("input", () => {
     setPlaying(false);
     player.setFrame(Number(scrub.value));
+    byUser();
   });
   canvas.addEventListener("click", (ev) => {
-    if (!player.onClick?.(ev)) setPlaying(!player.playing);
+    if (player.onClick?.(ev)) return;
+    setPlaying(!player.playing);
+    byUser();
   });
   player.key = (key) => {
     if (still) return false;
@@ -206,14 +209,17 @@ export function episodePlayer(view, { maxHeight = MAX_HEIGHT, below = null, paus
       const frame = player.frame + (key === "ArrowRight" ? 1 : -1);
       // one that doesn't loop stops at either end
       player.setFrame(loops ? frame : Math.min(Math.max(frame, 0), view.frames - 1));
-    } else if (key === "f" && fullBtn) toggleFull();
-    else return false;
+    } else if (key === "f" && fullBtn) {
+      toggleFull();
+      return true;
+    } else return false;
+    byUser();
     return true;
   };
   el.addEventListener("pointerenter", () => (hovered = player));
   el.addEventListener("pointerleave", () => hovered === player && (hovered = null));
 
-  setSpeed(speeds.includes(1) ? 1 : speeds[0]);
+  setSpeed(speeds.includes(speed) ? speed : speeds.includes(1) ? 1 : speeds[0]);
   setPlaying(player.playing);
   return player;
 }

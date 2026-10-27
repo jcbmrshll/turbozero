@@ -42,8 +42,8 @@ class BaseTester:
                 time axis (`max_steps + 1` of them) and its player ids, both as numpy arrays, and the
                 environment step function. The frames record what each move's search explored (see
                 `two_player_game`'s `record_search`), which the packer can replay with `env_step_fn`.
-                - e.g. `monitor.episodes.pgx_two_player_episode()`: the dashboard draws the
-                  episode in the browser, so the training loop never renders anything
+                - e.g. `core.monitoring.episodes.pgx_two_player_episode()`: the run's views draw
+                  the episode in the browser, so the training loop never renders anything
             name: (optional) name of the tester (used for logging and differentiating between testers)
                 - defaults to the class name
         """

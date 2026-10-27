@@ -809,6 +809,14 @@ wheels = [
 ]
 
 [[package]]
+name = "seaglass"
+version = "0.1.1"
+source = { git = "https://github.com/jcbmrshll/seaglass?rev=v0.1.1#601469aca23fc47600ed60c1f3e820bf36453375" }
+dependencies = [
+    { name = "numpy" },
+]
+
+[[package]]
 name = "svgwrite"
 version = "1.4.3"
 source = { registry = "https://pypi.org/simple" }
@@ -834,6 +842,7 @@ dependencies = [
     { name = "equinox" },
     { name = "jax" },
     { name = "optax" },
+    { name = "seaglass" },
 ]
 
 [package.optional-dependencies]
@@ -858,6 +867,7 @@ requires-dist = [
     { name = "jax", specifier = ">=0.11.2" },
     { name = "jax", extras = ["cuda13"], marker = "extra == 'cuda'" },
     { name = "optax", specifier = ">=0.2.8" },
+    { name = "seaglass", git = "https://github.com/jcbmrshll/seaglass?rev=v0.1.1" },
 ]
 provides-extras = ["cuda"]
 

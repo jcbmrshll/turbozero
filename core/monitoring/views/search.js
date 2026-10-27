@@ -1,7 +1,7 @@
 // The search explorer: what each player's search explored from each position of a
 // test game, browsed node by node.
 //
-// The arrays are monitor/episodes.py's _searches: one search per (position, player)
+// The arrays are core/monitoring/episodes.py's _searches: one search per (position, player)
 // with a tree, search_frame (the frame of the position it's of), search_player (0 for
 // the trained agent, 1 for its opponent), search_offset (where its nodes start in the
 // node arrays, and one past the end), search_policy (its root's policy) and search_depth
@@ -17,7 +17,7 @@
 // search explored after it: hovering a move shows its position, clicking one goes there.
 
 import { h } from "./dom.js";
-import { BLUE, EDGE, INK_STRONG, ORANGE, WELL } from "./palette.js";
+import { mix, theme } from "./palette.js";
 
 export const hasSearches = (arrays) => "search_offset" in arrays;
 
@@ -123,13 +123,12 @@ export function advantage(v, players, bound = 0) {
 const DISAGREE = 0.2;
 const pct = (x) => `${Math.round(100 * x)}%`;
 
-// a value from -1 to 1 as a colour, orange (bad for the player choosing) to blue (good)
+// a value from -1 to 1 as a colour, the second series' (bad for the player choosing)
+// to the first's (good)
 function valueColor(v) {
-  const [a, b] = v >= 0 ? [WELL, BLUE] : [WELL, ORANGE];
   // most values are near 0; the square root tells them apart
   const t = Math.sqrt(Math.min(1, Math.abs(v)));
-  const mix = (i) => Math.round(parseInt(a.slice(i, i + 2), 16) * (1 - t) + parseInt(b.slice(i, i + 2), 16) * t);
-  return `rgb(${mix(1)}, ${mix(3)}, ${mix(5)})`;
+  return mix(theme(v >= 0 ? "s1" : "s2"), theme("well"), t);
 }
 
 // keys go to the explorer under the pointer, unless they're being typed somewhere
@@ -151,7 +150,8 @@ document.addEventListener("keydown", (ev) => {
 // player a view to play (explorer.view), which draws each frame as the explorer has
 // it: a new frame starts at its own position. explorer.attach(player) then lets the
 // explorer redraw the player's board, take clicks on it, and pause the episode when
-// it's used.
+// it's used. explorer.onUser(path) is told when someone goes to a position (the moves to it
+// from the frame's), and explorer.go(path) goes there.
 export function searchExplorer(view, arrays, { who }) {
   const tree = index(arrays);
   // the frame, the moves from its position to the one on the board, a position being
@@ -219,6 +219,7 @@ export function searchExplorer(view, arrays, { who }) {
     const kids = tree.children[n];
     const total = kids.reduce((k, c) => k + tree.visits(c), 0);
     const explored = new Set();
+    const [ink, edge] = [theme("fg-strong"), theme("edge")];
     for (const c of kids) {
       explored.add(tree.action(c));
       const cell = view.actionCell(tree.action(c), tree.board(n));
@@ -233,11 +234,11 @@ export function searchExplorer(view, arrays, { who }) {
       ctx.globalAlpha = 0.92;
       ctx.fill();
       ctx.globalAlpha = 1;
-      ctx.strokeStyle = c === kids[0] ? INK_STRONG : EDGE;
+      ctx.strokeStyle = c === kids[0] ? ink : edge;
       ctx.lineWidth = c === kids[0] ? 2 : 1;
       ctx.stroke();
-      ctx.fillStyle = INK_STRONG;
-      ctx.font = `600 ${Math.round(view.cellSize * 0.27)}px ui-monospace, Menlo, monospace`;
+      ctx.fillStyle = ink;
+      ctx.font = `600 ${Math.round(view.cellSize * 0.27)}px ${theme("mono") || "monospace"}`;
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
       if (!tree.inLine(c)) ctx.fillText(String(tree.visits(c)), x, y + 0.5);
@@ -249,7 +250,7 @@ export function searchExplorer(view, arrays, { who }) {
       const [x, y] = view.at(...cell);
       ctx.beginPath();
       ctx.arc(x, y, view.cellSize * 0.12, 0, 2 * Math.PI);
-      ctx.strokeStyle = EDGE;
+      ctx.strokeStyle = edge;
       ctx.lineWidth = 1.5;
       ctx.stroke();
     }
@@ -281,6 +282,7 @@ export function searchExplorer(view, arrays, { who }) {
     st.preview = null;
     renderPanels();
     redraw();
+    explorer.onUser?.(path);
   }
 
   function show(p) {
@@ -325,7 +327,7 @@ export function searchExplorer(view, arrays, { who }) {
   );
   const plotX = (t) => PAD_L + (t / Math.max(1, view.frames - 1)) * (PLOT_W - PAD_L - PAD_R);
   const plotY = (v) => PLOT_H / 2 - v * (PLOT_H / 2 - PAD_Y);
-  const SERIES = ["var(--s1)", "var(--s2)"];
+  const SERIES = ["var(--sg-s1)", "var(--sg-s2)"];
   function renderPlot() {
     const t = st.frame;
     const svg = h("svg", { viewBox: `0 0 ${PLOT_W} ${PLOT_H}`, class: "plot" });
@@ -358,6 +360,7 @@ export function searchExplorer(view, arrays, { who }) {
       const f = Math.round(((x - PAD_L) / (PLOT_W - PAD_L - PAD_R)) * (view.frames - 1));
       interact();
       player?.setFrame(Math.min(Math.max(f, 0), view.frames - 1));
+      explorer.onUser?.(st.path);
     });
     const legend = [0, 1]
       .filter((p) => tree.searched(p))
@@ -540,6 +543,20 @@ export function searchExplorer(view, arrays, { who }) {
   const explorer = {
     side,
     evals,
+    onUser: null,
+    // the position the moves `path` lead to from the frame's, as far as either search goes
+    go(path) {
+      let reached = [];
+      for (const a of path) {
+        if (anyNode([...reached, a]) < 0) break;
+        reached = [...reached, a];
+      }
+      st.path = reached;
+      st.preview = null;
+      renderPanels();
+      redraw();
+    },
+    path: () => st.path,
     // the episode's frames, each drawn as the explorer has it: a new frame starts at
     // its own position
     view: {

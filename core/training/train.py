@@ -42,9 +42,8 @@ from core.types import (
 )
 
 if TYPE_CHECKING:
-    # only a type: the trainer logs to whatever it's given, so core doesn't need the
-    # monitor package
-    from monitor import Monitor
+    # only a type: the trainer logs to whatever it's given
+    from seaglass import Monitor
 
 
 @jax.tree_util.register_dataclass
@@ -467,8 +466,9 @@ class Trainer:
                 a share of each training batch, sampled from those stored in the replay buffer's span of
                 self-play (see `tree_sample_mask`). Needs MCTS self-play evaluators.
             extract_model_params_fn: (optional) function to extract model parameters from TrainState
-            monitor: (optional) `monitor.Monitor` to log metrics and test episodes to (see a tester's `episode_fn`)
-                - start the server with `turbozero-monitor`; a run is created on the first `train_loop`,
+            monitor: (optional) `seaglass.Monitor` to log metrics and test episodes to (see a tester's `episode_fn`),
+                e.g. `core.monitoring.Monitor`, whose runs are drawn with turbozero's views
+                - start a server with `seaglass serve --dir runs`; a run is created on the first `train_loop`,
                   and later calls (e.g. continuing from `initial_state`) keep logging to it
             ckpt_dir: directory to save checkpoints
             max_checkpoints: maximum number of checkpoints to keep
@@ -1202,7 +1202,7 @@ class Trainer:
             self.monitor.log(epoch, metrics)
 
     def set_activity(self, text: str | None, echo: bool = False) -> None:
-        """Tells the monitor what the training loop is doing now, so the dashboard can show
+        """Tells the monitor what the training loop is doing now, so the run's page can show
         what a slow step is busy with.
 
         Args:
@@ -1865,7 +1865,9 @@ class Trainer:
                     },
                     **({"parent": self.parent} if self.parent is not None else {}),
                     **self.extra_config,
-                }
+                },
+                # the last epoch
+                total=num_epochs - 1,
             )
         try:
             output = self._train_loop(
@@ -2015,7 +2017,7 @@ class Trainer:
                     if metrics:
                         metrics = {k: v.mean() for k, v in metrics.items()}
                         self.log_metrics(metrics, cur_epoch)
-                    # the dashboard draws the episode, so the training loop never does
+                    # the run's views draw the episode, so the training loop never does
                     if episode is not None and self.monitor is not None:
                         self.monitor.log(
                             cur_epoch, {f"{self.testers[i].name}_game": episode}

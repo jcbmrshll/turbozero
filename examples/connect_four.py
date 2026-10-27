@@ -9,7 +9,8 @@ for comparison. See examples/othello.py for a walk-through of each component.
     uv run examples/connect_four.py
     uv run examples/connect_four.py --search mcts --monitor
 
-Start the monitor first, in another shell, with `uv run turbozero-monitor`.
+Start a seaglass server first, in another shell, with `uv run seaglass serve --dir runs`
+(or set $SEAGLASS_URL to one that's running).
 
 The hyperparameters here are only an example; tune them for your task and hardware.
 """
@@ -29,13 +30,13 @@ from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.mcts.mcts import MCTS
 from core.evaluators.mcts.weighted_mcts import WeightedMCTS
 from core.memory.replay_memory import EpisodeReplayBuffer
+from core.monitoring import DEFAULT_URL, Monitor
+from core.monitoring.episodes import pgx_two_player_episode
 from core.networks.azresnet import AZResnet, AZResnetConfig
 from core.testing.two_player_tester import TwoPlayerTester
 from core.training.loss_fns import az_default_loss_fn
 from core.training.train import Trainer, weight_decay_mask
 from core.types import StepMetadata
-from monitor import DEFAULT_URL, Monitor
-from monitor.episodes import pgx_two_player_episode
 
 env = pgx.make("connect_four")
 
@@ -86,7 +87,7 @@ def main():
         const=DEFAULT_URL,
         default=None,
         metavar="URL",
-        help=f"log to a turbozero monitor (default {DEFAULT_URL}); start it with `uv run turbozero-monitor`",
+        help=f"log to a seaglass server (default {DEFAULT_URL}); start one with `uv run seaglass serve --dir runs`",
     )
     args = parser.parse_args()
 
@@ -139,7 +140,7 @@ def main():
         env_step_fn=step_fn,
         env_init_fn=init_fn,
         state_to_nn_input_fn=state_to_nn_input,
-        # with a monitor, each test sends its first game for the dashboard to play
+        # with a monitor, each test sends its first game for the run's page to play
         testers=[
             TwoPlayerTester(
                 num_episodes=64,

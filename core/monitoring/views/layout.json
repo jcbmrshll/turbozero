@@ -1,0 +1,20 @@
+{
+  "contract": 1,
+  "renderers": {
+    "turbozero/othello-episode": "episode.js",
+    "turbozero/connect_four-episode": "episode.js",
+    "turbozero/tic_tac_toe-episode": "episode.js"
+  },
+  "summary": ["loss", "policy_loss", "value_loss", "*_avg_outcome"],
+  "tabs": [
+    {
+      "title": "Run",
+      "rows": [
+        [{"type": "tiles", "metrics": ["loss", "policy_loss", "value_loss", "*_avg_outcome"]}],
+        [{"type": "media", "title": "Test games", "keys": ["*"]}],
+        [{"type": "chart", "title": "Metrics", "metrics": ["*_avg_outcome", "loss", "policy_loss", "value_loss", "*"], "split": true}],
+        [{"type": "config"}]
+      ]
+    }
+  ]
+}

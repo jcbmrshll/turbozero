@@ -41,12 +41,14 @@ uv run examples/tic_tac_toe.py     # sanity check: trains in a minute or two on 
 Pass `--help` to see their options.
 
 ## Monitoring runs
-Training runs can push their metrics, config and test games to a small local dashboard. The training loop hands off raw test games (the board after each move, and each player's value estimates) and the dashboard plays them in the browser, so it never waits on drawing or the network:
+Training runs can log their metrics, config and test games to a [seaglass](https://github.com/jcbmrshll/seaglass) server. The training loop hands off raw test games (the board after each move, each player's value estimates, and what their searches explored) and the run's page plays them in the browser, so training never waits on drawing or the network:
 ```
-uv run turbozero-monitor               # http://localhost:8008, runs stored in ./runs
+uv run seaglass serve --dir runs             # http://localhost:8008, runs stored in ./runs
 uv run examples/othello/train.py --monitor   # in another shell
 ```
-In your own scripts, pass `monitor=Monitor(project="...")` (from `monitor`) to the `Trainer`, and `episode_fn=pgx_two_player_episode()` (from `monitor.episodes`) to testers of Othello, Connect Four or tic-tac-toe to see their games; another game needs a board in `monitor.episodes.BOARDS` and a renderer in `monitor/static/renderers.js`. Logging never interrupts training: if the server is down, the run keeps going and says so once.
+`--monitor URL` logs to another server; without a URL, the examples log to `$SEAGLASS_URL` if it's set.
+
+In your own scripts, pass `monitor=Monitor(project="...")` (from `core.monitoring`) to the `Trainer`, and `episode_fn=pgx_two_player_episode()` (from `core.monitoring.episodes`) to testers of Othello, Connect Four or tic-tac-toe to see their games. `core.monitoring.Monitor` is a `seaglass.Monitor` that ships turbozero's views (`core/monitoring/views/`, a seaglass bundle) with each run, so any seaglass server draws its games and search trees. Another game needs a board in `core.monitoring.episodes.BOARDS` and a view in `core/monitoring/views/renderers.js`. Logging never interrupts training: if the server is down, the run keeps going and says so once.
 
 ## Issues
 If you use this project and encounter an issue, error, or undesired behavior, please submit a [GitHub Issue](https://github.com/jcbmrshll/turbozero/issues) and I will do my best to resolve it as soon as I can. You may also contact me directly via `hello@jacob.land`.

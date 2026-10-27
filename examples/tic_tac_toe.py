@@ -17,8 +17,9 @@ opponent's blunders create, and the agent keeps losing some of its games.
     uv run examples/tic_tac_toe.py
     uv run examples/tic_tac_toe.py --monitor
 
-Start the monitor first, in another shell, with `uv run turbozero-monitor`. See
-examples/othello.py for a walk-through of each component.
+Start a seaglass server first, in another shell, with `uv run seaglass serve --dir runs`
+(or set $SEAGLASS_URL to one that's running). See examples/othello.py for a walk-through
+of each component.
 """
 
 import argparse
@@ -36,14 +37,14 @@ from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.mcts.mcts import MCTS
 from core.evaluators.random_evaluator import RandomEvaluator
 from core.memory.replay_memory import EpisodeReplayBuffer
+from core.monitoring import DEFAULT_URL, Monitor
+from core.monitoring.episodes import pgx_two_player_episode
 from core.networks.azresnet import AZResnet, AZResnetConfig
 from core.testing.two_player_baseline import TwoPlayerBaseline
 from core.training.exploration import Exploration
 from core.training.loss_fns import az_default_loss_fn
 from core.training.train import Trainer, weight_decay_mask
 from core.types import StepMetadata
-from monitor import DEFAULT_URL, Monitor
-from monitor.episodes import pgx_two_player_episode
 
 env = pgx.make("tic_tac_toe")
 
@@ -104,7 +105,7 @@ def main():
         const=DEFAULT_URL,
         default=None,
         metavar="URL",
-        help=f"log to a turbozero monitor (default {DEFAULT_URL}); start it with `uv run turbozero-monitor`",
+        help=f"log to a seaglass server (default {DEFAULT_URL}); start one with `uv run seaglass serve --dir runs`",
     )
     args = parser.parse_args()
 

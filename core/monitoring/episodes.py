@@ -1,15 +1,15 @@
-"""Packing test episodes for the monitor, which the dashboard draws in the browser.
+"""Packing test episodes for a seaglass server, whose run pages draw them in the browser.
 
-A training run packs an episode's raw arrays into an `Episode` (with a packer here,
-passed to a tester as its `episode_fn`); the server stores them as they are, and the
-dashboard plays them with its renderer for the episode's env (static/renderers.js), so
-neither the training run nor the server draws anything.
+A training run packs an episode's raw arrays into seaglass `Arrays` of type
+`episode_type(env)` (with a packer here, passed to a tester as its `episode_fn`); the server
+stores them as they are, and the run's page plays them with turbozero's views (`views/`, whose
+`episode.js` renders the type), so neither the training run nor the server draws anything.
 
 When the test recorded its searches (`two_player_game`'s `record_search`), the episode also
-carries what each player's search explored at each position, for the dashboard's search
-explorer: every node's statistics and, replayed through the environment here, its board. A
-player that only scores moves, each with the line it expects after it (an engine's analysis),
-records them as a `LineRecord`, a tree of those lines.
+carries what each player's search explored at each position, for the views' search explorer:
+every node's statistics and, replayed through the environment here, its board. A player that
+only scores moves, each with the line it expects after it (an engine's analysis), records them
+as a `LineRecord`, a tree of those lines.
 """
 
 from collections.abc import Callable, Sequence
@@ -20,12 +20,12 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import numpy as np
+from seaglass import Arrays
 
 from core.common import GameFrame
 from core.evaluators.mcts.state import SearchRecord
 from core.trees.tree import Tree
 from core.types import EnvStepFn
-from monitor.client import Episode
 
 
 @jax.tree_util.register_dataclass
@@ -115,6 +115,11 @@ def _connect_four(x: Any) -> tuple[np.ndarray, np.ndarray]:
     return (np.asarray(x.board) + 1).reshape(-1, 6, 7), np.asarray(x.color)
 
 
+def episode_type(env_id: str) -> str:
+    """The seaglass type of a pgx env's episodes, which picks the views' renderer for them."""
+    return f"turbozero/{env_id}-episode"
+
+
 # pgx env id -> the boards of a game's states, (frames, rows, cols) of 0 for empty, 1
 # for a piece of the colour that moves first in the game's usual opening (black, X)
 # and 2 for the other's, and the colour to move in each, 0 or 1
@@ -170,7 +175,7 @@ def _searches(
     env_step_fn: EnvStepFn,
 ) -> dict[str, np.ndarray]:
     """Each player's record of each position played from (see `GameFrame.p1_search`), as the
-    dashboard's search explorer reads them: one search per (position, player) with a tree, its
+    views' search explorer reads them: one search per (position, player) with a tree, its
     nodes in a flat list, each with its board replayed through `env_step_fn`.
 
     Args:
@@ -290,18 +295,19 @@ def with_opening(frames: GameFrame, states: Sequence[Any]) -> GameFrame:
     )
 
 
-def pgx_two_player_episode() -> Callable[..., Episode]:
+def pgx_two_player_episode() -> Callable[..., Arrays]:
     """An `episode_fn` for testers of two-player pgx board games (those in `BOARDS`):
-    packs the first test episode for the dashboard to play, its env named by the game.
+    packs the first test episode for the views to play, as `Arrays` of the game's
+    `episode_type`. Whoever packs it can name the trained agent's opponent in its attrs,
+    `{"opponent": "edax level 8"}`.
 
     Returns:
-        Callable: `episode_fn(frames, p_ids, env_step_fn, start=0) -> Episode`, see
+        Callable: `episode_fn(frames, p_ids, env_step_fn, start=0) -> Arrays`, see
         `BaseTester`; `start` is the frame the players started playing from, after an
-        opening played for them (see `with_opening`), where the dashboard shows the game
-        from
+        opening played for them (see `with_opening`), where the views show the game from
     """
 
-    def episode_fn(frames, p_ids, env_step_fn, start: int = 0) -> Episode:
+    def episode_fn(frames, p_ids, env_step_fn, start: int = 0) -> Arrays:
         env_state = frames.env_state
         env_id = str(env_state.env_id)
         if env_id not in BOARDS:
@@ -325,8 +331,8 @@ def pgx_two_player_episode() -> Callable[..., Episode]:
             num_frames - 1,
             env_step_fn,
         )
-        return Episode(
-            env_id,
+        return Arrays(
+            episode_type(env_id),
             board=board[:num_frames],
             to_move=to_move[:num_frames],
             agent=first if moves_first else 1 - first,

@@ -10,9 +10,10 @@ openings (see xot.py), which keeps them varied.
     uv run examples/othello/train.py --epochs 20 --monitor
     uv run examples/othello/train.py --sims-schedule 0:32,50:64,150:128
 
-Start the monitor first, in another shell, with `uv run turbozero-monitor`. It shows
-the metrics, which rung of the ladder the agent has reached, and a game against the
-last opponent it played, which it draws in the browser.
+Start a seaglass server first, in another shell, with `uv run seaglass serve --dir runs`
+(or set $SEAGLASS_URL to one that's running). The run's page shows the metrics, which
+rung of the ladder the agent has reached, and a game against the last opponent it
+played, which it draws in the browser.
 
 Every epoch it also scores the network on the engine-labelled set, if there is one (see
 engine_set.py and --engine-set): how close the raw network's moves and values come to
@@ -72,6 +73,8 @@ from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.mcts.mcts import MCTS
 from core.evaluators.random_evaluator import RandomEvaluator
 from core.memory.replay_memory import EpisodeReplayBuffer
+from core.monitoring import DEFAULT_URL, Monitor
+from core.monitoring.episodes import pgx_two_player_episode
 from core.testing.ladder import LadderTester, Rung
 from core.testing.scored_positions import ScoredPositionsTester
 from core.testing.tester import BaseTester
@@ -80,8 +83,6 @@ from core.training.loss_fns import az_default_loss_fn
 from core.training.schedule import EvaluatorSchedule, parse_schedule
 from core.training.train import Trainer
 from core.training.tree_positions import TreePositions
-from monitor import DEFAULT_URL, Monitor
-from monitor.episodes import pgx_two_player_episode
 
 
 def epoch_list(text: str) -> list[int]:
@@ -370,14 +371,14 @@ def main():
         help="continue the run in --ckpt-dir from its newest saved state, exactly as if it "
         "hadn't stopped; pass the run's own arguments",
     )
-    parser.add_argument("--name", default=None, help="the run's name on the monitor")
+    parser.add_argument("--name", default=None, help="the run's name on the server")
     parser.add_argument(
         "--monitor",
         nargs="?",
         const=DEFAULT_URL,
         default=None,
         metavar="URL",
-        help=f"log to a turbozero monitor (default {DEFAULT_URL}); start it with `uv run turbozero-monitor`",
+        help=f"log to a seaglass server (default {DEFAULT_URL}); start one with `uv run seaglass serve --dir runs`",
     )
     args = parser.parse_args()
     if args.resume and args.ckpt_dir is None:
@@ -430,7 +431,7 @@ def main():
     )
     greedy = make_nn_eval_fn_no_params_callable(greedy_eval, state_to_nn_input)
 
-    # with a monitor, each test sends a game for the dashboard to play, its XOT opening's
+    # with a monitor, each test sends a game for the run's page to play, its XOT opening's
     # moves before it
     episode_fn = (
         xot_episode_fn(pgx_two_player_episode(), load_xot()) if args.monitor else None
