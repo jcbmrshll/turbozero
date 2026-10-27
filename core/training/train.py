@@ -265,6 +265,34 @@ def weight_decay_mask(params: Any) -> Any:
     return jax.tree.map(lambda x: x.ndim >= 2, params)
 
 
+def update_size_metrics(params: Any, updates: Any) -> dict:
+    """How big an optimizer step is, relative to the weights it moves: over the weights weight
+    decay applies to (see `weight_decay_mask`),
+    - `weight_norm`: their norm, ||w||
+    - `update_ratio`: the step's norm relative to theirs, ||update|| / ||w||
+
+    Under BatchNorm a convolution's output doesn't depend on its weights' scale, so it's the
+    relative step, not the learning rate, that says how fast such a layer moves; with AdamW's
+    weight decay it settles at about sqrt(2 * learning rate * weight decay) per step. Comparable
+    across learning rates, weight decays and schedules.
+    """
+    mask = weight_decay_mask(params)
+
+    def squared_norm(tree: Any) -> jax.Array:
+        leaves = [
+            jnp.sum(jnp.square(x.astype(jnp.float32)))
+            for x, m in zip(jax.tree.leaves(tree), jax.tree.leaves(mask), strict=True)
+            if m
+        ]
+        return jnp.sum(jnp.stack(leaves)) if leaves else jnp.zeros(())
+
+    weight_norm = jnp.sqrt(squared_norm(params))
+    return {
+        "weight_norm": weight_norm,
+        "update_ratio": jnp.sqrt(squared_norm(updates)) / weight_norm,
+    }
+
+
 def restart_schedules(opt_state: Any) -> Any:
     """`opt_state` with its learning rate schedules' step counts back at 0, so that they start
     over: optax's `ScaleByScheduleState` (a schedule passed as an optimizer's learning rate), and
@@ -856,6 +884,7 @@ class Trainer:
             )
         # apply gradients
         updates, opt_state = self.optimizer.update(grads, ts.opt_state, ts.params)
+        update_size = update_size_metrics(ts.params, updates)
         ts = replace(
             ts,
             params=optax.apply_updates(ts.params, updates),
@@ -866,6 +895,7 @@ class Trainer:
         # return updated train state and metrics, with the hyperparameters this step used
         metrics = {
             **metrics,
+            **update_size,
             "loss": loss,
             **injected_hyperparams(opt_state, scheduled_only=True),
         }

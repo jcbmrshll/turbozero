@@ -5,7 +5,7 @@ import numpy as np
 import optax
 
 from core.networks.azresnet import AZResnet, AZResnetConfig
-from core.training.train import weight_decay_mask
+from core.training.train import update_size_metrics, weight_decay_mask
 
 
 def resnet_params():
@@ -32,20 +32,26 @@ def test_the_mask_selects_the_convolution_and_linear_weights():
         ".stem_conv.weight",
         ".blocks[0].conv1.weight",
         ".blocks[0].conv2.weight",
-        ".policy_conv.weight",
-        ".policy_linear.weight",
-        ".value_conv.weight",
-        ".value_hidden.weight",
-        ".value_linear.weight",
+        ".heads.policy_conv.weight",
+        ".heads.policy_linear.weight",
+        ".heads.value_conv.weight",
+        ".heads.value_hidden.weight",
+        ".heads.value_linear.weight",
     }
     # the rest: the linear layers' biases and the BatchNorms' scales and offsets
     assert {path for path, decayed in mask.items() if not decayed} == {
-        ".policy_linear.bias",
-        ".value_hidden.bias",
-        ".value_linear.bias",
+        ".heads.policy_linear.bias",
+        ".heads.value_hidden.bias",
+        ".heads.value_linear.bias",
     } | {
         f".{bn}.{param}"
-        for bn in ("stem_bn", "blocks[0].bn1", "blocks[0].bn2", "policy_bn", "value_bn")
+        for bn in (
+            "stem_bn",
+            "blocks[0].bn1",
+            "blocks[0].bn2",
+            "heads.policy_bn",
+            "heads.value_bn",
+        )
         for param in ("weight", "bias")
     }
 
@@ -67,3 +73,14 @@ def test_adamw_decays_the_masked_params_only():
     for path, before in by_path(params).items():
         expected = before * (1 - 0.1 * 0.5) if mask[path] else before
         np.testing.assert_allclose(by_path(stepped)[path], expected, rtol=1e-6)
+
+
+def test_update_size_is_the_step_relative_to_the_decayed_weights():
+    params = {"conv": jnp.full((2, 2), 3.0), "bias": jnp.full((4,), 100.0)}
+    updates = {"conv": jnp.full((2, 2), 0.3), "bias": jnp.full((4,), 50.0)}
+
+    metrics = update_size_metrics(params, updates)
+
+    # the bias isn't decayed, so it counts for neither: ||conv|| = 6, ||its update|| = 0.6
+    np.testing.assert_allclose(metrics["weight_norm"], 6.0, rtol=1e-6)
+    np.testing.assert_allclose(metrics["update_ratio"], 0.1, rtol=1e-6)

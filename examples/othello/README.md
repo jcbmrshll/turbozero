@@ -12,6 +12,7 @@ Othello model and against two strong open-source Othello engines,
 | `vs_engine.py` | Plays a checkpoint against Edax or Egaroucid at several levels, from XOT openings |
 | `engines.py` | Edax and Egaroucid, each driven over GTP, and what their searches made of each position, from their logs |
 | `setup_edax.sh`, `setup_egaroucid.sh` | Build the engines for `vs_engine.py` |
+| `bench_nets.py` | Times networks on their own: a forward pass at self-play's batch, a training step at training's |
 | `game.py` | What the scripts share: the environment, board symmetries, network, evaluators |
 | `xot.py`, `xot-openings.txt` | The XOT opening list |
 
@@ -64,6 +65,34 @@ every rung of the ladder by epoch 65. With `--inference-dtype bfloat16` the netw
 computes in bfloat16 in self-play and test games (it still trains in float32), and an
 epoch takes about 36 seconds; searching with the same checkpoint, bfloat16 and float32
 play evenly.
+
+### The network
+
+`--net` names the network as KIND:DEPTHxWIDTH, then any of its configuration's fields
+as ,FIELD=VALUE (see `core/networks/spec.py`). The default, `resnet:6x128`, is the
+residual network from the AlphaZero paper with 6 blocks of 128 channels. Its variants
+(`AZResnetConfig`):
+
+- `heads=pooled`: KataGo's policy and value heads, which pool features over the whole
+  board (their mean and maximum) instead of flattening a 1-channel map.
+- `pool_every=N`: KataGo's global pooling bias in every Nth block: some of the
+  block's channels, pooled over the board, bias the rest. Othello's flips run along
+  whole lines, and this gives every square board-wide context for almost no compute.
+- `block=bottleneck`: KataGo's nested bottleneck blocks, a 1x1 convolution down to
+  half the width, a basic block (`bottleneck_inner` of them) and a 1x1 convolution
+  back up, which cost under a third of a basic block.
+
+`transformer:LAYERSxWIDTH` is a transformer with a token per square, after Leela Chess
+Zero's (`BoardTransformerConfig`): learned attention biases, optionally smolgen. On
+the GPU it is much slower per FLOP than the convolutions: `transformer:8x256` takes
+1.4 times the FLOPs of `resnet:10x128` and 2.9 times the forward time, and needs
+`--remat` to train at the default batch.
+
+`bench_nets.py` times networks as named here:
+
+```
+uv run examples/othello/bench_nets.py resnet:10x128 resnet:10x128,pool_every=3,heads=pooled
+```
 
 ### Training memory
 
@@ -193,7 +222,7 @@ uv run examples/othello/train.py --epochs 30 --init-from runs/trunk/state-150.np
 ## Evaluating a checkpoint
 
 Checkpoints from `train.py` are named after their epoch (`199.eqx` is the last of a
-200-epoch run). Pass the network size if it isn't the default.
+200-epoch run). Pass the run's `--net` if it isn't the default.
 
 ```
 uv run examples/othello/eval_pgx.py runs/othello/199.eqx --pgx-sims 64 256 1024
