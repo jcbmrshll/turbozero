@@ -34,7 +34,7 @@ This creates a `.venv` with all dependencies. If an NVIDIA GPU is present it ins
 ## Examples
 Example training scripts live in `examples/`:
 ```
-uv run examples/othello/train.py   # AlphaZero, tested on a ladder of opponents up to pgx's pretrained Othello model
+uv run examples/othello/train.py   # AlphaZero, scored every epoch against Edax's scores of fixed positions
 uv run examples/connect_four.py    # AlphaZero with weighted MCTS on Connect Four
 uv run examples/tic_tac_toe.py     # sanity check: trains in a minute or two on CPU, tested against a random player
 ```
