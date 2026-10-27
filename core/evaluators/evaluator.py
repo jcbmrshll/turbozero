@@ -3,7 +3,9 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+from jax.typing import ArrayLike
 
+from core.pytree import where_tree
 from core.types import EnvStepFn, StepMetadata
 
 
@@ -164,6 +166,28 @@ class Evaluator:
             pytree: The updated internal state of the Evaluator.
         """
         return state
+
+    def next_state(
+        self,
+        state: Any,
+        action: jax.Array,
+        reset: ArrayLike,
+        active: ArrayLike = True,
+    ) -> Any:
+        """The internal state of the Evaluator for the next move: `step` with `action`, or `reset`
+        if `reset` (e.g. at the end of an episode); `state` as it is unless `active`.
+
+        Args:
+            state: The internal state of the Evaluator.
+            action: The action taken in the environment.
+            reset: whether to reset instead
+            active: (optional) whether to move on at all
+
+        Returns:
+            pytree: The internal state for the next move.
+        """
+        moved = jax.lax.cond(reset, self.reset, lambda s: self.step(s, action), state)
+        return where_tree(active, moved, state)
 
     def get_value(self, state: Any) -> jax.Array:
         """Extracts the state value estimate (for the current/root environment state) from the internal state of the Evaluator.

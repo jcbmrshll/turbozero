@@ -333,60 +333,62 @@ class Tree[NodeType]:
 
         return old_subtree_idxs, translation, erase_idxs
 
-    def get_subtree(self, subtree_index: ArrayLike) -> Tree[NodeType]:
+    def get_subtree(
+        self,
+        subtree_index: ArrayLike,
+        reset: ArrayLike = False,
+        active: ArrayLike = True,
+    ) -> Tree[NodeType]:
         """Extracts a subtree rooted at a specific node index.
 
         Collapses subtree into a new tree with the root node at index 0, and children in subsequent indices.
 
+        Every array is gathered from its new index's old one in a single pass, rather than scattered
+        to it (which needs a copy of the array first, to scatter from); `reset` and `active` fold
+        the other ways a tree moves on into the same pass, where under vmap a lax.cond or select
+        between them would read and write every tree again.
+
         Args:
             subtree_index: the edge index (from the root node) of the node to use as the new root.
+            reset: (optional) return an empty tree instead, as `reset` does.
+            active: (optional) if not, return the tree as it is.
 
         Returns:
             Tree[NodeType]: the subtree rooted at the specified node index.
         """
-        # get subtree translation
-        old_subtree_idxs, translation, erase_idxs = self._get_translation(subtree_index)
+        _, translation, erase = self._get_translation(subtree_index)
+        index = jnp.arange(self.capacity, dtype=translation.dtype)
+        # the old index of each new one (nodes past the subtree's are erased, whatever it is)
+        source = (
+            jnp.zeros_like(index)
+            .at[jnp.where(translation == self.NULL_INDEX, self.capacity, translation)]
+            .set(index, mode="drop")
+        )
+        num_nodes = jnp.where(reset, 0, translation.max() + 1)
+        # inactive, every node keeps its index
+        source = jnp.where(active, source, index)
+        translation = jnp.where(active, translation, index)
+        erase = jnp.where(active, erase | reset, False)
+        num_nodes = jnp.where(active, num_nodes, self.next_free_idx)
 
-        new_next_node_index = translation.max(axis=-1) + 1
+        def erased(x: jax.Array) -> jax.Array:
+            return erase.reshape((-1,) + (1,) * (x.ndim - 1))
 
-        def translate(x, null_value=self.NULL_VALUE):
-            return jnp.where(
-                erase_idxs.reshape((-1,) + (1,) * (x.ndim - 1)),
-                jnp.full_like(x, null_value, dtype=x.dtype),
-                # cases where translation == -1 will set last index
-                # but since we are at least removing the root node
-                # (and making one of its children the new root)
-                # the last index will always be freed
-                # and overwritten with zeros
-                x.at[translation].set(x[old_subtree_idxs]),
-            )
+        def translate(x: jax.Array) -> jax.Array:
+            return jnp.where(erased(x), jnp.zeros_like(x), x[source])
 
-        def translate_idx(x, null_value=self.NULL_INDEX):
-            return jnp.where(
-                erase_idxs.reshape((-1,) + (1,) * (x.ndim - 1)),
-                null_value,
-                # in this case we need to explicitly check for index
-                # mappings to UNVISITED, since otherwise thsese will
-                # map to the value of the last index of the translation
-                x.at[translation].set(
-                    jnp.where(
-                        x == null_value,
-                        jnp.full_like(x, null_value, dtype=x.dtype),
-                        translation[x],
-                    )
-                ),
-            )
+        def translate_idx(x: jax.Array) -> jax.Array:
+            # node indices point at their nodes' new indices
+            x = x[source]
+            moved = jnp.where(x == self.NULL_INDEX, self.NULL_INDEX, translation[x])
+            return jnp.where(erased(x), self.NULL_INDEX, moved)
 
-        def translate_pytree(x, null_value=self.NULL_VALUE):
-            return jax.tree.map(lambda t: translate(t, null_value=null_value), x)
-
-        # extract subtree using translation functions
         return replace(
             self,
-            next_free_idx=new_next_node_index,
+            next_free_idx=num_nodes,
             parents=translate_idx(self.parents),
             edge_map=translate_idx(self.edge_map),
-            data=translate_pytree(self.data),
+            data=jax.tree.map(translate, self.data),
         )
 
     def reset(self) -> Tree[NodeType]:

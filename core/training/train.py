@@ -23,6 +23,7 @@ from core.memory.replay_memory import (
     EpisodeReplayBuffer,
     ReplayBufferState,
 )
+from core.pytree import where_tree
 from core.testing.tester import BaseTester, TestState
 from core.training.exploration import Exploration
 from core.training.schedule import EvaluatorSchedule, describe
@@ -139,15 +140,6 @@ class TrainLoopOutput:
     test_states: list[TestState]
     cur_epoch: int
     key: jax.Array | None = None
-
-
-def where_tree(condition: ArrayLike, new: Any, old: Any) -> Any:
-    """`jnp.where(condition, new, old)`, leaf by leaf, for two pytrees of the same structure.
-    Leaves that are the same array in both (e.g. those `dataclasses.replace` left as they were)
-    are kept, without a select: under vmap, it would read and write the whole leaf."""
-    return jax.tree.map(
-        lambda n, o: o if n is o else jnp.where(condition, n, o), new, old
-    )
 
 
 def extract_params(state: TrainState) -> Any:
@@ -779,6 +771,7 @@ class Trainer:
             choose_action=self.exploration.choose_action
             if self.exploration is not None
             else None,
+            active=done,
         )
         search_value = evaluator.get_value(searched_eval_state)
         terminated, truncated = done & terminated, done & truncated
@@ -839,7 +832,10 @@ class Trainer:
         # return new collection state
         return replace(
             state,
-            eval_state=where_tree(done, eval_output.eval_state, state.eval_state),
+            # `step_with_output` moved it on only if done; if not, it's as `search_output` left
+            # it, which is as the search did (an evaluator whose `search_output` does the search,
+            # see `Evaluator.search_cycle`, is done every cycle)
+            eval_state=eval_output.eval_state,
             env_state=where_tree(done, new_env_state, state.env_state),
             buffer_state=buffer_state,
             metadata=where_tree(done, new_metadata, state.metadata),

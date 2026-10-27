@@ -114,6 +114,28 @@ def test_set_child_without_write_does_not_evict():
     assert_trees_equal(tree.set_child(0, 2, node(9.0), evict=2, write=False), tree)
 
 
+def test_get_subtree_can_reset_or_keep_the_tree_in_the_same_pass():
+    tree = full_tree()
+
+    assert_trees_equal(tree.get_subtree(0, reset=True), tree.reset())
+    assert_trees_equal(tree.get_subtree(0, active=False), tree)
+    assert_trees_equal(tree.get_subtree(0, reset=True, active=False), tree)
+
+
+def test_get_subtree_under_vmap_steps_resets_or_keeps_each_tree():
+    tree = full_tree()
+    trees = jax.tree.map(lambda x: jnp.stack([x] * 3), tree)
+    reset = jnp.array([False, True, False])
+    active = jnp.array([True, True, False])
+
+    out = jax.vmap(lambda t, r, a: t.get_subtree(0, reset=r, active=a))(
+        trees, reset, active
+    )
+
+    for i, expected in enumerate([tree.get_subtree(0), tree.reset(), tree]):
+        assert_trees_equal(jax.tree.map(lambda x, i=i: x[i], out), expected)
+
+
 def full_tree():
     """A full tree: the root with children on edges 0 and 1, and a grandchild under edge 0's."""
     tree = empty_tree(max_nodes=4).set_root(node(1.0))

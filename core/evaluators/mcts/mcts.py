@@ -722,6 +722,24 @@ class MCTS(Evaluator):
         # just reset to an empty tree if persist_tree is False
         return state.reset()
 
+    def next_state(
+        self,
+        state: MCTSTree,
+        action: jax.Array,
+        reset: ArrayLike,
+        active: ArrayLike = True,
+    ) -> MCTSTree:
+        """`step` or `reset`, in a single pass over the tree (see `Tree.get_subtree`).
+
+        Args: see `Evaluator.next_state`.
+
+        Returns:
+            MCTSTree: the tree for the next move
+        """
+        return state.get_subtree(
+            action, reset=jnp.logical_or(reset, not self.persist_tree), active=active
+        )
+
     def init(self, template_embedding: Any, *args, **kwargs) -> MCTSTree:  # pylint: disable=arguments-differ
         """Initializes the internal state of the MCTS evaluator.
 
