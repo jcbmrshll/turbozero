@@ -12,6 +12,7 @@ Othello model and against two strong open-source Othello engines,
 | `vs_engine.py` | Plays a checkpoint against Edax or Egaroucid at several levels, from XOT openings |
 | `engines.py` | Edax and Egaroucid, each driven over GTP, and what their searches made of each position, from their logs |
 | `setup_edax.sh`, `setup_egaroucid.sh` | Build the engines for `vs_engine.py` |
+| `engine_set.py`, `label_positions.py`, `score_engine_set.py` | The engine-labelled set: fixed positions with every legal move scored by Edax, to build, and to score checkpoints on (train.py scores the network on it every epoch) |
 | `bench_nets.py` | Times networks on their own: a forward pass at self-play's batch, a training step at training's |
 | `game.py` | What the scripts share: the environment, board symmetries, network, evaluators |
 | `xot.py`, `xot-openings.txt` | The XOT opening list |
@@ -274,6 +275,49 @@ Restarted, it evaluates only the levels a checkpoint has no result for yet, at t
 and `--openings`. Our agent searches on the GPU next to training, taking only the memory it
 needs: with a 10-block network, 256 games against each of 3 levels take about 2 minutes and
 slow training's epochs by about half while they run.
+
+### Against Edax's scores of fixed positions
+
+Games against engines measure strength, but coarsely: 512 games give a score within about
+±0.02, and a run's score moves by more than that from training randomness alone. The
+engine-labelled set measures the network more finely, without search or games: thousands of
+fixed positions from self-play, past the XOT opening and with a choice of move, each legal
+move of which Edax has scored (the disc margin it expects at the end, searching 24 moves
+ahead and solving the last ~31 squares exactly).
+
+`train.py` scores the network on it every epoch and logs, for all positions and for each
+source and game phase (`opening`, 40-51 empty squares; `midgame`, 25-39; `endgame`, 1-24):
+
+- `engine_top1`: how often the network's most likely move is one of Edax's best
+- `engine_regret`: discs its most likely move gives up against Edax's best
+- `engine_exp_regret`: the same, averaged over its policy: smoother, and about three times
+  less noisy than `engine_regret` (a difference between two checkpoints on the same set is
+  good to about ±0.015 discs); the one to watch
+- `engine_value_mse`: its value's squared error against the outcome Edax predicts (±1, 0 for a
+  draw)
+- `engine_value_sign`: how often its value calls the winner Edax does
+
+Scoring takes a forward pass over the positions, about 20 ms for 5000 on the GPU.
+`--engine-set PATH` scores on another set, and `--engine-eval-every N` sets the cadence (0
+for never). Without a set at the default path, `~/.cache/turbozero/othello/engine-sets/edax-l24.npz`,
+training warns and goes on unscored; a missing `--engine-set` is an error.
+
+To build a set, from the replay buffers of saved training states (`--save-state-at`); each
+`--source` is a state, optionally only some of its environments:
+
+```
+examples/othello/setup_edax.sh                       # once
+taskset -c 16-23 uv run examples/othello/label_positions.py \
+    --source az10x128=runs/trunk/state-150.npz:896-1024 \
+    --source pooled4x64=runs/p4x64/state-450.npz --per-source 2500 --level 24 --workers 8
+```
+
+At level 24 a position takes about 2 seconds on average (up to a minute), so 5000 took 84
+minutes on 8 Edax processes. To score saved checkpoints on a set:
+
+```
+uv run examples/othello/score_engine_set.py runs/othello/49.eqx runs/othello/99.eqx --net resnet:10x128
+```
 
 ## Credits
 

@@ -14,6 +14,10 @@ Start the monitor first, in another shell, with `uv run turbozero-monitor`. It s
 the metrics, which rung of the ladder the agent has reached, and a game against the
 last opponent it played, which it draws in the browser.
 
+Every epoch it also scores the network on the engine-labelled set, if there is one (see
+engine_set.py and --engine-set): how close the raw network's moves and values come to
+Edax's, logged as `engine_*`.
+
 The first epoch is slow: nearly all of the training loop is JIT-compiled the first
 time it runs. On one RTX 5080 the rest take about 63s each (36s with
 --inference-dtype bfloat16, see README.md). With these settings, one
@@ -38,9 +42,13 @@ with --resume, or to fork short runs from with --init-from (see README.md):
 
 import argparse
 import tempfile
+import warnings
 from functools import partial
+from pathlib import Path
 
 import pgx
+from engine_set import DEFAULT_PATH as DEFAULT_ENGINE_SET
+from engine_set import EngineSet
 from game import (
     SYMMETRY_TRANSFORM_FNS,
     WEIGHT_DECAY,
@@ -65,6 +73,8 @@ from core.evaluators.mcts.mcts import MCTS
 from core.evaluators.random_evaluator import RandomEvaluator
 from core.memory.replay_memory import EpisodeReplayBuffer
 from core.testing.ladder import LadderTester, Rung
+from core.testing.scored_positions import ScoredPositionsTester
+from core.testing.tester import BaseTester
 from core.training.exploration import Exploration
 from core.training.loss_fns import az_default_loss_fn
 from core.training.schedule import EvaluatorSchedule, parse_schedule
@@ -96,6 +106,28 @@ def positive_schedule(text: str) -> list[tuple[int, int]]:
     if any(value < 1 for _, value in schedule):
         raise argparse.ArgumentTypeError(f"values must be positive, got {text!r}")
     return schedule
+
+
+def load_engine_set(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> EngineSet | None:
+    """The engine-labelled set to score the network on, None if it isn't to be. A missing
+    default set is skipped with a warning (build one with label_positions.py); a missing
+    --engine-set is an error."""
+    if args.engine_eval_every <= 0:
+        return None
+    if args.engine_set is not None:
+        if not Path(args.engine_set).exists():
+            parser.error(f"--engine-set {args.engine_set}: no such file")
+        return EngineSet.load(args.engine_set)
+    if not DEFAULT_ENGINE_SET.exists():
+        warnings.warn(
+            f"no engine-labelled set at {DEFAULT_ENGINE_SET}, so the network won't be scored "
+            "against Edax: build one with label_positions.py, or pass --engine-set",
+            stacklevel=2,
+        )
+        return None
+    return EngineSet.load(DEFAULT_ENGINE_SET)
 
 
 def main():
@@ -274,6 +306,20 @@ def main():
         "watch.py plays checkpoints against an engine instead)",
     )
     parser.add_argument(
+        "--engine-set",
+        default=None,
+        metavar="PATH",
+        help="the engine-labelled set to score the network on (see engine_set.py; default "
+        f"{DEFAULT_ENGINE_SET}, skipped with a warning if it doesn't exist)",
+    )
+    parser.add_argument(
+        "--engine-eval-every",
+        type=int,
+        default=1,
+        help="epochs between scoring the network on the engine-labelled set (0 for never). "
+        "A forward pass over its positions: a fraction of a second",
+    )
+    parser.add_argument(
         "--ckpt-dir",
         default=None,
         help="where to save checkpoints (default: a new temporary directory)",
@@ -399,11 +445,32 @@ def main():
     ] + [
         Rung(f"pgx{n}", make_test_evaluator(pretrained, n)) for n in (1, 4, 16, 64, 256)
     ]
-    testers = (
-        [LadderTester(num_episodes=128, rungs=rungs, episode_fn=episode_fn)]
+    testers: list[BaseTester] = (
+        [
+            LadderTester(
+                num_episodes=128,
+                rungs=rungs,
+                episode_fn=episode_fn,
+                epochs_per_test=args.eval_every,
+            )
+        ]
         if args.eval_every > 0
         else []
     )
+    # the network's raw moves and values against Edax's, on the engine-labelled set
+    engine_set = load_engine_set(parser, args)
+    if engine_set is not None:
+        testers.append(
+            ScoredPositionsTester(
+                engine_set.scored_positions(),
+                network,
+                epochs_per_test=args.engine_eval_every,
+                config={
+                    "path": str(args.engine_set or DEFAULT_ENGINE_SET),
+                    **engine_set.describe(),
+                },
+            )
+        )
 
     # each epoch collects `collection_steps_per_epoch` self-play steps in each of
     # `batch_size` environments, then takes `train_steps_per_epoch` training steps
@@ -468,7 +535,8 @@ def main():
     trainer.train_loop(
         seed=args.seed,
         num_epochs=args.epochs,
-        eval_every=max(args.eval_every, 1),
+        # each tester keeps its own cadence (--eval-every, --engine-eval-every)
+        eval_every=1,
         initial_state=trainer.resume() if args.resume else None,
         fork_from=args.init_from,
         fork_replay_buffers=not args.init_without_buffers,
