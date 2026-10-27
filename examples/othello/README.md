@@ -207,6 +207,18 @@ The run's page shows, each epoch, the tree positions stored (`tree_positions`, a
 training could sample (`tree_buffer_samples`), and the share of each training batch they
 made up (`tree_batch_fraction`).
 
+### Policy target from the search
+
+By default the network learns each played position's policy from the search's visit
+distribution, as in AlphaZero. `--policy-target completed-q` trains it on Gumbel MuZero's
+improved policy instead (Danihelka et al., "Policy improvement by planning with Gumbel",
+ICLR 2022): `softmax(logits + σ(completed Q))`, with the network's logits at the root
+before the root's Dirichlet noise, and the children's values (unvisited children's
+estimated from the visited ones') rescaled to [0, 1] and scaled by
+`(--maxvisit-init + the most visited child's visits) · --value-scale`. The noise then
+steers only which moves the search explores, not the target. Tree positions keep the
+visit distribution, so the two options don't go together.
+
 ### Resuming and forking runs
 
 Checkpoints hold only the network and optimizer state. `--save-state-at 50,150` also

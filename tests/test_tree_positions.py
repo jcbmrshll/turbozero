@@ -9,13 +9,13 @@ import numpy as np
 import pytest
 
 from core.evaluators.mcts.mcts import MCTS
+from core.evaluators.mcts.state import init_mcts_tree
 from core.training.tree_positions import (
     TreePositions,
     child_visits,
     select_nodes,
     tree_experiences,
 )
-from core.trees.tree import init_tree
 
 
 def hand_built(nodes, capacity=16):
@@ -32,7 +32,7 @@ def hand_built(nodes, capacity=16):
         )
         return replace(new, n=jnp.array(n, dtype=jnp.int32))
 
-    tree = init_tree(capacity, 9, node(0, False))
+    tree = init_mcts_tree(capacity, 9, node(0, False))
     for parent, action, n, terminated in nodes:
         data = node(n, terminated)
         tree = (

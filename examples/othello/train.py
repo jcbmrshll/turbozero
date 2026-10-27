@@ -75,6 +75,7 @@ from core.evaluators.evaluation_fns import (
 )
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.mcts.mcts import MCTS
+from core.evaluators.mcts.policy_targets import CompletedQ, VisitCounts
 from core.evaluators.random_evaluator import RandomEvaluator
 from core.memory.replay_memory import EpisodeReplayBuffer
 from core.monitoring import DEFAULT_URL, Monitor
@@ -276,6 +277,30 @@ def main():
         "search's root value q: (1 - this) * z + this * q (0, the default, is z alone)",
     )
     parser.add_argument(
+        "--policy-target",
+        choices=["visits", "completed-q"],
+        default="visits",
+        help="train the policy of played positions on the search's visit distribution "
+        "(the default, as AlphaZero), or on Gumbel MuZero's improved policy: the "
+        "network's policy at the root, before the root's noise, shifted towards the "
+        "children the search found better (see core/evaluators/mcts/policy_targets.py)",
+    )
+    parser.add_argument(
+        "--value-scale",
+        type=float,
+        default=0.1,
+        help="with --policy-target completed-q, how far the children's values shift the "
+        "policy, per visit of the most visited child (mctx's default; Gumbel MuZero's "
+        "Go and chess agents used 1)",
+    )
+    parser.add_argument(
+        "--maxvisit-init",
+        type=float,
+        default=50.0,
+        help="with --policy-target completed-q, visits added to the most visited "
+        "child's in scaling the children's values",
+    )
+    parser.add_argument(
         "--tree-positions",
         type=int,
         default=0,
@@ -413,6 +438,10 @@ def main():
     if args.advance_every is None and args.count_reused_visits:
         # searches of varying lengths: see Trainer's advance_every
         args.advance_every = 5
+    if args.policy_target == "completed-q" and args.tree_positions > 0:
+        # a tree position's target is its visits: the network's policy before the
+        # search isn't kept below the root
+        parser.error("--policy-target completed-q can't go with --tree-positions")
 
     # self-play starts games from XOT openings (see xot.py) for varied, balanced
     # games
@@ -451,6 +480,9 @@ def main():
                     temperature=1.0,
                     count_reused_visits=args.count_reused_visits,
                     min_iterations=args.min_iterations,
+                    policy_target=CompletedQ(args.value_scale, args.maxvisit_init)
+                    if args.policy_target == "completed-q"
+                    else VisitCounts(),
                 ),
             )
             for epoch, sims in args.sims_schedule or [(0, args.sims)]

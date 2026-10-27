@@ -6,7 +6,7 @@ import jax.numpy as jnp
 from jax.typing import ArrayLike
 
 from core.evaluators.evaluator import EvalOutput
-from core.trees.tree import Tree
+from core.trees.tree import Tree, init_tree
 from core.types import StepMetadata
 
 
@@ -35,8 +35,38 @@ class MCTSNode:
         return self.q * self.n
 
 
-# an MCTSTree is a Tree containing MCTSNodes
-MCTSTree = Tree[MCTSNode]
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class MCTSTree(Tree[MCTSNode]):
+    """A Tree of MCTSNodes, with the network's evaluation of the root at the start of its search.
+
+    The root node's prior can include noise (e.g. AlphaZero's Dirichlet noise) and its value is the
+    search's running average, so the network's own evaluation is kept here, for the policy target
+    (see `CompletedQ`).
+
+    Attributes:
+        root_logits: (F) the network's policy logits at the root, illegal actions at the dtype's
+            minimum
+        root_value: () the network's value of the root
+    """
+
+    root_logits: jax.Array
+    root_value: jax.Array
+
+
+def init_mcts_tree(
+    max_nodes: int, branching_factor: int, template_data: MCTSNode
+) -> MCTSTree:
+    """An empty MCTSTree, see `init_tree`."""
+    tree = init_tree(max_nodes, branching_factor, template_data)
+    return MCTSTree(
+        next_free_idx=tree.next_free_idx,
+        parents=tree.parents,
+        edge_map=tree.edge_map,
+        data=tree.data,
+        root_logits=jnp.zeros((branching_factor,), dtype=jnp.float32),
+        root_value=jnp.array(0.0, dtype=jnp.float32),
+    )
 
 
 @jax.tree_util.register_dataclass

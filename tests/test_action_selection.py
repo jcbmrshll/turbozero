@@ -11,7 +11,7 @@ from core.evaluators.mcts.action_selection import (
     normalize_q_values,
 )
 from core.evaluators.mcts.mcts import MCTS
-from core.trees.tree import init_tree
+from core.evaluators.mcts.state import init_mcts_tree
 
 EPS = 1e-8
 KEY = jax.random.PRNGKey(0)
@@ -86,7 +86,7 @@ def root_only_tree(prior):
         embedding=jnp.zeros(()),
         terminated=False,
     )
-    return init_tree(8, len(prior), node).set_root(node)
+    return init_mcts_tree(8, len(prior), node).set_root(node)
 
 
 def test_puct_with_no_visits_picks_highest_prior():
@@ -108,7 +108,7 @@ def visited_tree(prior, root_q, child_n, child_q):
         n=jnp.array(1 + child_n.sum(), dtype=jnp.int32),
         q=jnp.float32(root_q),
     )
-    tree = init_tree(8, len(prior), root).set_root(root)
+    tree = init_mcts_tree(8, len(prior), root).set_root(root)
     for action, (n, q) in enumerate(zip(child_n, child_q)):
         child = replace(
             MCTS.new_node(

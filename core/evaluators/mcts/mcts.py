@@ -8,6 +8,7 @@ from jax.typing import ArrayLike
 
 from core.evaluators.evaluator import Evaluator
 from core.evaluators.mcts.action_selection import MCTSActionSelector
+from core.evaluators.mcts.policy_targets import PolicyTarget, VisitCounts
 from core.evaluators.mcts.state import (
     Leaf,
     MCTSNode,
@@ -16,10 +17,10 @@ from core.evaluators.mcts.state import (
     SearchRecord,
     TraversalState,
     backprop_stats,
+    init_mcts_tree,
     search_record,
     with_backprop_stats,
 )
-from core.trees.tree import init_tree
 from core.types import EnvStepFn, EvalFn, StepMetadata
 
 
@@ -43,6 +44,7 @@ class MCTS(Evaluator):
         persist_tree: bool = True,
         count_reused_visits: bool = False,
         min_iterations: int = 0,
+        policy_target: PolicyTarget | None = None,
     ):
         """Initializes an MCTS evaluator.
 
@@ -71,6 +73,8 @@ class MCTS(Evaluator):
             min_iterations: (optional) with `count_reused_visits`, the fewest iterations a search
                 takes, however many visits it reused: the root's noise (e.g. AlphaZero's) only steers
                 the visits of its own search (default: 0). At most `num_iterations`
+            policy_target: (optional) what the policy trains towards, from the root of a finished
+                search (default: `VisitCounts`, its visit distribution)
         """
         if min_iterations < 0 or min_iterations > num_iterations:
             raise ValueError(
@@ -87,6 +91,7 @@ class MCTS(Evaluator):
         self.action_selector = action_selector
         self.temperature = temperature
         self.persist_tree = persist_tree
+        self.policy_target = policy_target or VisitCounts()
 
     def get_config(self) -> dict:
         """Returns a config object for checkpoints."""
@@ -101,6 +106,7 @@ class MCTS(Evaluator):
             "persist_tree": self.persist_tree,
             "count_reused_visits": self.count_reused_visits,
             "min_iterations": self.min_iterations,
+            "policy_target_config": self.policy_target.get_config(),
         }
 
     def evaluate(
@@ -326,6 +332,12 @@ class MCTS(Evaluator):
         )
         root_node = self.update_root_node(
             tree.data_at(tree.ROOT_INDEX), policy, value, root_embedding
+        )
+        # the network's evaluation, before the prior's noise and the search's averaging
+        tree = replace(
+            tree,
+            root_logits=jnp.where(write, policy_logits, tree.root_logits),
+            root_value=jnp.where(write, value, tree.root_value),
         )
         return tree.set_root(root_node, write=write)
 
@@ -579,16 +591,10 @@ class MCTS(Evaluator):
             tree: MCTSTree to evaluate
 
         Returns:
-            Tuple[jax.Array, jax.Array]: sampled action, normalized policy weights
+            Tuple[jax.Array, jax.Array]: sampled action, the policy target (see `policy_target`)
         """
-        # get root visit counts
-        action_visits = tree.get_child_data("n", tree.ROOT_INDEX)
-        # normalize visit counts to get policy weights
-        total_visits = action_visits.sum(axis=-1)
-        policy_weights = action_visits / jnp.maximum(total_visits, 1)
-        policy_weights = jnp.where(
-            total_visits > 0, policy_weights, 1 / self.branching_factor
-        )
+        target = self.policy_target(tree, self.discount)
+        policy_weights = VisitCounts()(tree, self.discount)
 
         # zero temperature == argmax
         if self.temperature == 0:
@@ -597,7 +603,7 @@ class MCTS(Evaluator):
             action = jnp.argmax(
                 jnp.where(policy_weights == policy_weights.max(), noise, -1.0)
             )
-            return action, policy_weights
+            return action, target
 
         # apply temperature
         policy_weights_t = policy_weights ** (1 / self.temperature)
@@ -605,8 +611,7 @@ class MCTS(Evaluator):
         policy_weights_t /= policy_weights_t.sum()
         # sample action
         action = jax.random.choice(key, policy_weights_t.shape[-1], p=policy_weights_t)
-        # return original policy weights (we train on the policy before temperature is applied)
-        return action, policy_weights
+        return action, target
 
     @staticmethod
     def visit_node(
@@ -756,7 +761,7 @@ class MCTS(Evaluator):
         Returns:
             MCTSTree: initialized MCTSTree
         """
-        return init_tree(
+        return init_mcts_tree(
             self.max_nodes,
             self.branching_factor,
             self.new_node(
