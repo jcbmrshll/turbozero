@@ -1,27 +1,35 @@
-"""Evaluates a training run's checkpoints against Edax or Egaroucid as they're saved, so a
-long run's strength shows before it ends.
+"""Evaluates a training run against Edax or Egaroucid once it ends, or its checkpoints as
+they're saved.
 
-    uv run examples/othello/train.py --net resnet:10x128 --keep-every 25 --ckpt-dir runs/othello &
-    uv run examples/othello/watch.py runs/othello --net resnet:10x128 --pid $!
+    uv run examples/othello/train.py --ckpt-dir runs/othello &
+    uv run examples/othello/watch.py runs/othello --pid $!
 
-Runs `vs_engine.py` on every checkpoint whose epoch is a multiple of --every (keep them
-with train.py's --keep-every, since it deletes all but the newest 2), and on the newest
-one once the training process --pid has exited. `N.eqx` is the network after N + 1 epochs.
+train.py tracks a run by scoring the network every epoch on Edax's scores of fixed positions
+(`engine_*`, see README.md); games against the engine measure its strength at the end. By
+default this waits for the training process --pid to exit and runs `vs_engine.py` on its
+last checkpoint: 1000 MCTS iterations a move, 512 games (256 XOT openings, each with both
+colors) against each of Edax levels 4, 6 and 8, about 11 minutes a level alone on an RTX
+5080. --every N also evaluates every checkpoint whose epoch is a multiple of N as it's saved
+(keep them with train.py's --keep-every, since it deletes all but the newest 2), so a long
+run's strength shows before it ends; next to training, pass a smaller --sims and --openings,
+since a level at the defaults takes about an hour there. `N.eqx` is the network after N + 1
+epochs. Without --pid it evaluates the checkpoints already there (the newest, and with
+--every the multiples of it) and exits.
+
 Results are appended to `vs_engine.jsonl` in the checkpoint directory, a line per level,
-and with --monitor logged to the training run's page as `edax_level4_sims64` and so on
-(`{engine}_level{L}_sims{S}`), each with a game at that level, `edax_level4_sims64_game`, to
-explore move by move: our agent's searches, and the engine's scores: Edax's of every legal
+and with --monitor logged to the training run's page as `edax_level4_sims1000` and so on
+(`{engine}_level{L}_sims{S}`), each with a game at that level, `edax_level4_sims1000_game`,
+to explore move by move: our agent's searches, and the engine's scores: Edax's of every legal
 move of every position, each with the line it expects after it, Egaroucid's of the moves it
-played (see vs_engine.py). Without --pid it evaluates the checkpoints already there and
-exits.
+played (see vs_engine.py).
 
 A checkpoint is done once `vs_engine.jsonl` has a result for each of --levels at --sims
 and --openings. One evaluated at other levels or with other openings, or whose evaluation
 stopped partway, is evaluated at its missing levels (with the openings they'd have had in
 a full evaluation, see vs_engine.py's --skip-levels).
 
-Our agent's search runs on the accelerator next to training, but it only takes what it
-needs (XLA_PYTHON_CLIENT_PREALLOCATE=false); --cpu keeps it off the accelerator.
+Our agent's search runs on the accelerator, next to training with --every, but it only takes
+what it needs (XLA_PYTHON_CLIENT_PREALLOCATE=false); --cpu keeps it off the accelerator.
 """
 
 import argparse
@@ -74,9 +82,29 @@ def done_levels(
     return done
 
 
+def pending(
+    epochs: list[int], finished: set[int], every: int, training: bool
+) -> list[int]:
+    """The checkpoints, by epoch and oldest first, of `epochs` (ascending) still to evaluate,
+    of which `finished` are done: with `every` (0 for none), those whose epoch is a multiple
+    of it, and once training is over, the newest."""
+    todo = [
+        e
+        for e in epochs
+        # 0.eqx, after a single epoch, is too early to be worth evaluating
+        if every > 0 and e > 0 and e % every == 0 and e not in finished
+    ]
+    if not training and epochs:
+        last = epochs[-1]
+        if last not in finished and last not in todo:
+            todo.append(last)
+    return todo
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Evaluates a training run's checkpoints against an engine as they're saved."
+        description="Evaluates a training run against an engine once it ends, or its "
+        "checkpoints as they're saved."
     )
     parser.add_argument("ckpt_dir", type=Path, help="train.py's --ckpt-dir")
     parser.add_argument(
@@ -86,13 +114,21 @@ def main():
     )
     parser.add_argument("--engine", default="edax")
     parser.add_argument("--levels", type=int, nargs="+", default=[4, 6, 8])
-    parser.add_argument("--sims", type=int, default=64)
-    parser.add_argument("--openings", type=int, default=128)
+    parser.add_argument(
+        "--sims", type=int, default=1000, help="our MCTS iterations a move"
+    )
+    parser.add_argument(
+        "--openings",
+        type=int,
+        default=256,
+        help="XOT openings per level, each played with both colors",
+    )
     parser.add_argument(
         "--every",
         type=int,
-        default=25,
-        help="evaluate epochs that are multiples of this",
+        default=0,
+        help="also evaluate epochs that are multiples of this as they're saved (0 for "
+        "only the last checkpoint)",
     )
     parser.add_argument(
         "--pid", type=int, default=None, help="the training process to wait for"
@@ -182,16 +218,8 @@ def main():
             ]
             for e in epochs
         }
-        todo = [
-            e
-            for e in epochs
-            # 0.eqx, after a single epoch, is too early to be worth evaluating
-            if e > 0 and e % args.every == 0 and len(done_at[e]) < len(args.levels)
-        ]
-        if not training and epochs:
-            last = epochs[-1]
-            if len(done_at[last]) < len(args.levels) and last not in todo:
-                todo.append(last)
+        finished = {e for e in epochs if len(done_at[e]) == len(args.levels)}
+        todo = pending(epochs, finished, args.every, training)
         if todo:
             # the newest first: it says most about the run now
             evaluate(todo[-1], done_at[todo[-1]])

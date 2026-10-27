@@ -1,5 +1,5 @@
-"""AlphaZero on Othello, tested on a ladder of opponents: a random player, a greedy
-tile counter, then pgx's pretrained Othello model searching more and more.
+"""AlphaZero on Othello, tracked by how close the raw network's moves and values come to
+Edax's on fixed positions.
 
 Self-play games are collected in parallel across a batch of environments (and across
 every available GPU), with Monte Carlo Tree Search run on each of them; the network
@@ -10,20 +10,23 @@ openings (see xot.py), which keeps them varied.
     uv run examples/othello/train.py --epochs 20 --monitor
     uv run examples/othello/train.py --sims-schedule 0:32,50:64,150:128
 
-Start a seaglass server first, in another shell, with `uv run seaglass serve --dir runs`
-(or set $SEAGLASS_URL to one that's running). The run's page shows the metrics, which
-rung of the ladder the agent has reached, and a game against the last opponent it
-played, which it draws in the browser.
+Every epoch it scores the network on the engine-labelled set, if there is one (see
+engine_set.py and --engine-set), logged as `engine_*`: `engine_exp_regret`, the discs its
+policy gives up against Edax's best move, is the one to watch. Games against Edax measure
+the result at the end of the run (watch.py, see README.md). --eval-every N also plays test
+games every N epochs, on a ladder of opponents: a random player, a greedy tile counter, then
+pgx's pretrained Othello model searching more and more.
 
-Every epoch it also scores the network on the engine-labelled set, if there is one (see
-engine_set.py and --engine-set): how close the raw network's moves and values come to
-Edax's, logged as `engine_*`.
+Start a seaglass server first, in another shell, with `uv run seaglass serve --dir runs`
+(or set $SEAGLASS_URL to one that's running). The run's page shows the metrics, and with
+--eval-every which rung of the ladder the agent has reached, and a game against the last
+opponent it played, which it draws in the browser.
 
 The first epoch is slow: nearly all of the training loop is JIT-compiled the first
 time it runs. On one RTX 5080 the rest take about 63s each (36s with
---inference-dtype bfloat16, see README.md). With these settings, one
-200-epoch run passed every rung by epoch 65; at the end, in 512 games against pgx's
-model (our agent searching 64 iterations a move), it scored 0.82 against the model
+--inference-dtype bfloat16, see README.md). With these settings and the ladder every 5
+epochs, one 200-epoch run passed every rung by epoch 65; at the end, in 512 games against
+pgx's model (our agent searching 64 iterations a move), it scored 0.82 against the model
 searching 64, 0.74 against it searching 256, and 0.57 against it searching 1024
 (draws count half).
 
@@ -303,9 +306,9 @@ def main():
     parser.add_argument(
         "--eval-every",
         type=int,
-        default=5,
-        help="epochs between test games on the ladder (0 for none, e.g. when "
-        "watch.py plays checkpoints against an engine instead)",
+        default=0,
+        help="epochs between test games on the ladder (0 for none: the engine-labelled "
+        "set tracks the run, see --engine-set)",
     )
     parser.add_argument(
         "--engine-set",
@@ -425,40 +428,41 @@ def main():
     )
     evaluator_test = make_test_evaluator(make_nn_eval_fn(network, state_to_nn_input))
 
-    # opponents: the greedy tile counter and pgx's pretrained model (others are listed
-    # at https://sotets.uk/pgx/api/#pgx.BaselineModelId)
-    pretrained = make_nn_eval_fn_no_params_callable(
-        pgx.make_baseline_model("othello_v0"), state_to_nn_input
-    )
-    greedy = make_nn_eval_fn_no_params_callable(greedy_eval, state_to_nn_input)
+    testers: list[BaseTester] = []
+    if args.eval_every > 0:
+        # opponents: the greedy tile counter and pgx's pretrained model (others are listed
+        # at https://sotets.uk/pgx/api/#pgx.BaselineModelId)
+        pretrained = make_nn_eval_fn_no_params_callable(
+            pgx.make_baseline_model("othello_v0"), state_to_nn_input
+        )
+        greedy = make_nn_eval_fn_no_params_callable(greedy_eval, state_to_nn_input)
 
-    # with a monitor, each test sends a game for the run's page to play, its XOT opening's
-    # moves before it
-    episode_fn = (
-        xot_episode_fn(pgx_two_player_episode(), load_xot()) if args.monitor else None
-    )
+        # with a monitor, each test sends a game for the run's page to play, its XOT
+        # opening's moves before it
+        episode_fn = (
+            xot_episode_fn(pgx_two_player_episode(), load_xot())
+            if args.monitor
+            else None
+        )
 
-    # the ladder, easiest first: each test plays the lowest rung the agent hasn't
-    # beaten, and moves up past every rung it scores at least 55% against. Our agent
-    # searches 64 iterations a move throughout; pgx's model searches more and more
-    rungs = [
-        Rung("random", RandomEvaluator()),
-        Rung("greedy", make_test_evaluator(greedy)),
-    ] + [
-        Rung(f"pgx{n}", make_test_evaluator(pretrained, n)) for n in (1, 4, 16, 64, 256)
-    ]
-    testers: list[BaseTester] = (
-        [
+        # the ladder, easiest first: each test plays the lowest rung the agent hasn't
+        # beaten, and moves up past every rung it scores at least 55% against. Our agent
+        # searches 64 iterations a move throughout; pgx's model searches more and more
+        rungs = [
+            Rung("random", RandomEvaluator()),
+            Rung("greedy", make_test_evaluator(greedy)),
+        ] + [
+            Rung(f"pgx{n}", make_test_evaluator(pretrained, n))
+            for n in (1, 4, 16, 64, 256)
+        ]
+        testers.append(
             LadderTester(
                 num_episodes=128,
                 rungs=rungs,
                 episode_fn=episode_fn,
                 epochs_per_test=args.eval_every,
             )
-        ]
-        if args.eval_every > 0
-        else []
-    )
+        )
     # the network's raw moves and values against Edax's, on the engine-labelled set
     engine_set = load_engine_set(parser, args)
     if engine_set is not None:
