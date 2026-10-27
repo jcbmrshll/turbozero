@@ -974,32 +974,42 @@ class Trainer:
         if num_cycles == 0:
             return state
 
-        def advance(cycle: jax.Array, state: CollectionState) -> CollectionState:
-            if self.advance_every == 1:
-                return self.advance(state, params, evaluator)
-            # the cycle is the same in every environment, so this stays a cond under vmap
-            return jax.lax.cond(
-                (cycle + 1) % self.advance_every == 0,
-                lambda s: self.advance(s, params, evaluator),
-                lambda s: s,
-                state,
-            )
-
         def collect_env(key: jax.Array, state: CollectionState) -> CollectionState:
             # the i-th move to start in this call gets the i-th key
             keys = jax.random.split(key, num_cycles)
 
-            def cycle(
-                i: jax.Array, carry: tuple[CollectionState, jax.Array]
+            def search(
+                carry: tuple[CollectionState, jax.Array], num: int
             ) -> tuple[CollectionState, jax.Array]:
-                state, started = carry
-                starting = state.search_cycles == 0
-                state = self.search(keys[started], state, params, evaluator)
-                return advance(i, state), started + starting
+                """`num` cycles of search, without playing any move: they only write the
+                trees, in place."""
 
-            state, _ = jax.lax.fori_loop(
-                0, num_cycles, cycle, (state, jnp.array(0, dtype=jnp.int32))
+                def cycle(
+                    _: jax.Array, carry: tuple[CollectionState, jax.Array]
+                ) -> tuple[CollectionState, jax.Array]:
+                    state, started = carry
+                    starting = state.search_cycles == 0
+                    state = self.search(keys[started], state, params, evaluator)
+                    return state, started + starting
+
+                return jax.lax.fori_loop(0, num, cycle, carry)
+
+            def chunk(
+                _: jax.Array, carry: tuple[CollectionState, jax.Array]
+            ) -> tuple[CollectionState, jax.Array]:
+                state, started = search(carry, self.advance_every)
+                return self.advance(state, params, evaluator), started
+
+            # every `advance_every` cycles, the moves whose searches are done are played: loops
+            # within a loop rather than a lax.cond every cycle, through which XLA would copy the
+            # whole state (the trees and the replay buffers)
+            carry = jax.lax.fori_loop(
+                0,
+                num_cycles // self.advance_every,
+                chunk,
+                (state, jnp.array(0, dtype=jnp.int32)),
             )
+            state, _ = search(carry, num_cycles % self.advance_every)
             return state
 
         return jax.vmap(collect_env)(key, state)
