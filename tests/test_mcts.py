@@ -13,6 +13,7 @@ import pytest
 from core.evaluators.alphazero import AlphaZero
 from core.evaluators.mcts.action_selection import MCTSActionSelector, PUCTSelector
 from core.evaluators.mcts.mcts import MCTS
+from core.evaluators.mcts.policy_targets import CompletedQ
 from core.evaluators.mcts.weighted_mcts import WeightedMCTS, WeightedMCTSNode
 
 AZ_MCTS = AlphaZero(MCTS)
@@ -177,6 +178,11 @@ def test_update_root_evaluates_an_empty_root_with_a_masked_prior(fixed_length_en
     )
     assert int(node.n) == 1 and float(node.q) == pytest.approx(0.3)
     assert int(tree.next_free_idx) == 1
+    # the network's evaluation is kept for the policy target
+    np.testing.assert_allclose(
+        jax.nn.softmax(tree.root_logits), node.p, rtol=1e-6, atol=1e-30
+    )
+    assert float(tree.root_value) == pytest.approx(0.3)
 
 
 @pytest.mark.parametrize("cls", BACKUPS)
@@ -185,9 +191,12 @@ def test_update_root_keeps_a_reused_roots_visits_and_value(env, cls):
     tree = build_tree(search, env, [(None, None, 5, -0.2), (0, 1, 4, 0.1)])
     state, meta = env.init_fn(jax.random.PRNGKey(0))
 
-    node = root(search.update_root(jax.random.PRNGKey(0), tree, state, None, meta))
+    tree = search.update_root(jax.random.PRNGKey(0), tree, state, None, meta)
 
+    node = root(tree)
     assert int(node.n) == 5 and float(node.q) == pytest.approx(-0.2)
+    # while the network's value kept for the policy target is the new evaluation's
+    assert float(tree.root_value) == pytest.approx(0.9)
     if isinstance(node, WeightedMCTSNode):
         # the network's value too
         assert float(node.r) == pytest.approx(-0.2)
@@ -234,6 +243,23 @@ def test_dirichlet_noise_is_mixed_into_the_root_prior_over_legal_moves_only(
     np.testing.assert_allclose(noise[:, ~mask], 0.0, atol=1e-6)
     # a symmetric Dirichlet: each legal move gets an equal share on average
     np.testing.assert_allclose(noise[:, mask].mean(axis=0), 1 / mask.sum(), atol=0.06)
+
+
+def test_the_root_keeps_the_networks_policy_without_the_noise(fixed_length_env):
+    mask = np.array([True, False, True, True])
+    env = fixed_length_env(length=10, num_actions=4, action_mask=mask)
+    logits = jnp.array([2.0, 1.0, 0.5, -1.0])
+    search = make_mcts(AZ_MCTS, num_actions=4, logits=logits, dirichlet_epsilon=0.5)
+    state, meta = env.init_fn(jax.random.PRNGKey(0))
+
+    tree = search.update_root(
+        jax.random.PRNGKey(0), search.init(template_embedding=state), state, None, meta
+    )
+
+    assert not np.allclose(root(tree).p, masked_softmax(logits, mask))
+    np.testing.assert_allclose(
+        jax.nn.softmax(tree.root_logits), masked_softmax(logits, mask), rtol=1e-6
+    )
 
 
 # choosing the move to play
@@ -285,6 +311,21 @@ def test_moves_are_sampled_by_their_visits_to_the_power_of_one_over_the_temperat
     )
     # the policy target is the visits, without the temperature
     np.testing.assert_allclose(weights[0], np.array([3, 0, 5, 5]) / 13, rtol=1e-6)
+
+
+def test_the_move_is_chosen_by_visits_whatever_the_policy_target(fixed_length_env):
+    env = fixed_length_env(length=10, num_actions=3)
+    search = make_mcts(temperature=0.0, policy_target=CompletedQ())
+    # action 0 is the most visited, but action 1 is worth more to the root's player
+    tree = build_tree(
+        search, env, [(None, None, 9, 0.0), (0, 0, 5, 0.5), (0, 1, 3, -0.5)]
+    )
+
+    action, weights = search.sample_root_action(jax.random.PRNGKey(0), tree)
+
+    assert int(action) == 0
+    np.testing.assert_allclose(weights, CompletedQ()(tree, search.discount))
+    assert weights[1] > weights[0]
 
 
 def test_a_root_without_visited_children_has_a_uniform_policy(fixed_length_env):
@@ -833,6 +874,9 @@ BLOCK_MOVES, BLOCKING_ACTION = [0, 4, 8, 2], 6
 # a few moves in, so some actions are illegal
 MIDGAME_MOVES = [4, 0, 8, 2]
 
+# one instance, so that its searches share a compiled function
+COMPLETED_Q = CompletedQ()
+
 SEARCHES = [
     pytest.param(AZ_MCTS, id="AlphaZero(MCTS)"),
     pytest.param(AZ_WEIGHTED, id="AlphaZero(WeightedMCTS)"),
@@ -891,6 +935,21 @@ def test_finds_forced_win(make_search, ttt, cls, first_player):
     assert out.action == WINNING_ACTION
     # a won position is worth more than a draw to the player to move
     assert root(out.eval_state).q > 0
+
+
+@pytest.mark.parametrize("first_player", [0, 1])
+def test_the_completed_q_target_finds_forced_win(make_search, ttt, first_player):
+    out, meta = run_search(
+        make_search(AZ_MCTS, policy_target=COMPLETED_Q),
+        jax.random.PRNGKey(0),
+        WIN_MOVES,
+        ttt,
+        key_init=ttt.first_player_keys[first_player],
+    )
+
+    np.testing.assert_allclose(out.policy_weights.sum(), 1.0, rtol=1e-6)
+    np.testing.assert_array_equal(out.policy_weights[~meta.action_mask], 0.0)
+    assert int(out.policy_weights.argmax()) == WINNING_ACTION
 
 
 @pytest.mark.parametrize("first_player", [0, 1])

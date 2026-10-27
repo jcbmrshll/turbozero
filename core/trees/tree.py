@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import ClassVar
+from typing import ClassVar, Self
 
 import jax
 import jax.numpy as jnp
@@ -93,7 +93,7 @@ class Tree[NodeType]:
 
     def add_node(
         self, parent_index: ArrayLike, edge_index: ArrayLike, data: NodeType
-    ) -> Tree[NodeType]:
+    ) -> Self:
         """Adds a new node to the tree at the next free index, if the tree has capacity left.
 
         Is a no-op if the tree is full.
@@ -104,7 +104,7 @@ class Tree[NodeType]:
             data: the data to store at the new node.
 
         Returns:
-            Tree[NodeType]: tree with the new node added.
+            Self: tree with the new node added.
         """
         # check types
         self.check_data_type(data)
@@ -137,7 +137,7 @@ class Tree[NodeType]:
         data: NodeType,
         evict: ArrayLike = NULL_INDEX,
         write: ArrayLike = True,
-    ) -> Tree[NodeType]:
+    ) -> Self:
         """Stores `data` at the child of a node along an edge: updates the child if the edge exists,
         otherwise adds it as a new node, like `add_node`. If the tree is full, the new node takes the
         slot of the leaf `evict`, which is removed from the tree; a no-op if `evict` is NULL_INDEX.
@@ -158,7 +158,7 @@ class Tree[NodeType]:
                 vmap than a lax.cond, for the same reason.
 
         Returns:
-            Tree[NodeType]: tree with the child's data stored.
+            Self: tree with the child's data stored.
         """
         self.check_data_type(data)
         exists = self.is_edge(parent_index, edge_index)
@@ -209,7 +209,7 @@ class Tree[NodeType]:
         )
         return (jnp.arange(self.capacity) < self.next_free_idx) & ~has_child
 
-    def set_root(self, data: NodeType, write: ArrayLike = True) -> Tree[NodeType]:
+    def set_root(self, data: NodeType, write: ArrayLike = True) -> Self:
         """Sets node data at the root node.
 
         Args:
@@ -218,7 +218,7 @@ class Tree[NodeType]:
                 `set_child`)
 
         Returns:
-            Tree[NodeType]: tree with the root node data set.
+            Self: tree with the root node data set.
         """
         self.check_data_type(data)
         # out of bounds, so dropped, when not writing
@@ -231,7 +231,7 @@ class Tree[NodeType]:
             data=jax.tree.map(lambda x, y: x.at[index].set(y), self.data, data),
         )
 
-    def update_node(self, index: ArrayLike, data: NodeType) -> Tree[NodeType]:
+    def update_node(self, index: ArrayLike, data: NodeType) -> Self:
         """Updates the data of a node at a specific index.
 
         Args:
@@ -239,7 +239,7 @@ class Tree[NodeType]:
             data: the new data to store at the specified index.
 
         Returns:
-            Tree[NodeType]: tree with the node data updated.
+            Self: tree with the node data updated.
         """
         return replace(
             self,
@@ -338,7 +338,7 @@ class Tree[NodeType]:
         subtree_index: ArrayLike,
         reset: ArrayLike = False,
         active: ArrayLike = True,
-    ) -> Tree[NodeType]:
+    ) -> Self:
         """Extracts a subtree rooted at a specific node index.
 
         Collapses subtree into a new tree with the root node at index 0, and children in subsequent indices.
@@ -354,7 +354,7 @@ class Tree[NodeType]:
             active: (optional) if not, return the tree as it is.
 
         Returns:
-            Tree[NodeType]: the subtree rooted at the specified node index.
+            Self: the subtree rooted at the specified node index.
         """
         _, translation, erase = self._get_translation(subtree_index)
         index = jnp.arange(self.capacity, dtype=translation.dtype)
@@ -391,7 +391,7 @@ class Tree[NodeType]:
             data=jax.tree.map(translate, self.data),
         )
 
-    def reset(self) -> Tree[NodeType]:
+    def reset(self) -> Self:
         """Resets the tree to its initial state."""
         return replace(
             self,

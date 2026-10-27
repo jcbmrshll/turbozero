@@ -8,9 +8,8 @@ import jax.numpy as jnp
 import pytest
 
 from core.evaluators.mcts.action_selection import PUCTSelector
-from core.evaluators.mcts.state import MCTSTree
+from core.evaluators.mcts.state import MCTSTree, init_mcts_tree
 from core.evaluators.mcts.weighted_mcts import WeightedMCTS
-from core.trees.tree import init_tree
 
 
 def weighted_mcts(q_temperature):
@@ -39,7 +38,7 @@ def root_with_children(root_q, root_r, child_values):
             new, r=jnp.array(r, dtype=jnp.float32), n=jnp.array(n, dtype=jnp.int32)
         )
 
-    tree: MCTSTree = init_tree(8, 3, node(0.0, 0.0, 0))
+    tree: MCTSTree = init_mcts_tree(8, 3, node(0.0, 0.0, 0))
     tree = tree.set_root(node(root_q, root_r, 1 + len(child_values)))
     for action, value in enumerate(child_values):
         tree = tree.add_node(tree.ROOT_INDEX, action, node(-value, -value, 1))
