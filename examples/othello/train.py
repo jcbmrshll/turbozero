@@ -423,6 +423,11 @@ def main():
     )
     parser.add_argument("--name", default=None, help="the run's name on the server")
     parser.add_argument(
+        "--notes",
+        default=None,
+        help="what the run is testing and why, shown on its seaglass page (else $SEAGLASS_NOTES)",
+    )
+    parser.add_argument(
         "--monitor",
         nargs="?",
         const=DEFAULT_URL,
@@ -580,7 +585,9 @@ def main():
         )
         if args.tree_positions > 0
         else None,
-        monitor=Monitor(args.monitor, project="othello", name=args.name)
+        monitor=Monitor(
+            args.monitor, project="othello", name=args.name, notes=args.notes
+        )
         if args.monitor
         else None,
         ckpt_dir=args.ckpt_dir or tempfile.mkdtemp(prefix="turbozero-othello-"),
@@ -597,7 +604,7 @@ def main():
             "args": {
                 k: v
                 for k, v in vars(args).items()
-                if k not in ("resume", "init_from", "init_without_buffers")
+                if k not in ("resume", "init_from", "init_without_buffers", "notes")
             }
         },
     )

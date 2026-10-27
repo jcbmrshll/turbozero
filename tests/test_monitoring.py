@@ -1,6 +1,7 @@
 """Logging to a seaglass server: runs, with turbozero's views, and test episodes packed for
 them."""
 
+import fnmatch
 import functools
 import io
 import json
@@ -63,6 +64,42 @@ def test_views_draw_every_board_games_episodes():
     layout = json.loads(bundle["layout.json"])
     assert layout["contract"] == 1
     assert {episode_type(env) for env in BOARDS} <= set(layout["renderers"])
+
+
+def description(key):
+    """The views' description of a metric or media key: the first pattern's that matches it."""
+    descriptions = json.loads(read_bundle(VIEWS)["layout.json"])["descriptions"]
+    return next(
+        (text for p, text in descriptions.items() if fnmatch.fnmatchcase(key, p)), None
+    )
+
+
+@pytest.mark.parametrize(
+    "key, says",
+    [
+        ("loss", "The loss training minimizes"),
+        ("learning_rate", "The learning rate"),
+        ("episodes", "Self-play games that ended"),
+        ("episode_draw", "drawn"),
+        ("tree_positions_per_move", "per self-play move"),
+        ("random_avg_outcome", "mean outcome"),
+        ("ladder_rung", "rungs beaten"),
+        ("ladder_pgx16_score", "The ladder's score"),
+        ("ladder_greedy_win_rate", "won"),
+        ("random_loss_rate", "lost"),
+        ("ladder_pgx16_seconds", "Seconds"),
+        ("ladder_game", "A test game"),
+        ("engine_top1", "most likely action is one of the engine's best"),
+        ("engine_exp_regret_opening", "expected over its policy"),
+        ("engine_regret_midgame", "most likely action gives up"),
+        ("engine_value_mse_endgame", "(value - z)^2"),
+        ("engine_value_sign", "the sign of the outcome"),
+        ("edax_level4_sims1000", "score against the engine"),
+        ("edax_level4_sims1000_game", "A game the network"),
+    ],
+)
+def test_views_describe_the_metrics_turbozero_logs(key, says):
+    assert says in (description(key) or "")
 
 
 def stacked(states):

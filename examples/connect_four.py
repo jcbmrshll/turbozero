@@ -89,6 +89,11 @@ def main():
         metavar="URL",
         help=f"log to a seaglass server (default {DEFAULT_URL}); start one with `uv run seaglass serve --dir runs`",
     )
+    parser.add_argument(
+        "--notes",
+        default=None,
+        help="what the run is testing and why, shown on its seaglass page (else $SEAGLASS_NOTES)",
+    )
     args = parser.parse_args()
 
     resnet, resnet_state = eqx.nn.make_with_state(AZResnet)(
@@ -147,7 +152,9 @@ def main():
                 episode_fn=pgx_two_player_episode() if args.monitor else None,
             )
         ],
-        monitor=Monitor(args.monitor, project="connect_four") if args.monitor else None,
+        monitor=Monitor(args.monitor, project="connect_four", notes=args.notes)
+        if args.monitor
+        else None,
         extra_config={"args": vars(args)},
     )
     trainer.train_loop(seed=args.seed, num_epochs=args.epochs)

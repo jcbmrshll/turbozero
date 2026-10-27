@@ -22,9 +22,12 @@ Othello model and against two strong open-source Othello engines,
 
 ```
 uv run seaglass serve --dir runs                    # optional: the run's page, in another shell
-uv run examples/othello/train.py --monitor --ckpt-dir runs/othello &
+uv run examples/othello/train.py --monitor --ckpt-dir runs/othello --notes "the baseline" &
 uv run examples/othello/watch.py runs/othello --pid $!   # Edax games once it ends
 ```
+
+`--name` names the run on the server, and `--notes` says what it's testing and why, at the
+top of its page.
 
 Self-play runs in 1024 games at once, searching 64 MCTS iterations a move, and each
 position is stored with its 7 symmetric copies (rotations and reflections). Games start

@@ -6,8 +6,10 @@ that they compile nothing. A few compile the real thing on the smallest configur
 what they test: self-play following the evaluator it's given, tree positions, and (on one shared
 trainer, see `real`) a whole run, its exact resumption, and the donation of the replay buffers."""
 
+import fnmatch
 import gc
 import itertools
+import json
 import os
 import warnings
 from dataclasses import dataclass, replace
@@ -21,6 +23,7 @@ import numpy as np
 import optax
 import pytest
 from seaglass import Monitor
+from seaglass.bundle import read_bundle
 
 import core.training.train as train_module
 from core.evaluators.alphazero import AlphaZero
@@ -29,6 +32,7 @@ from core.evaluators.evaluator import EvalOutput, Evaluator
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.mcts.mcts import MCTS
 from core.memory.replay_memory import BaseExperience, EpisodeReplayBuffer
+from core.monitoring import VIEWS
 from core.networks.azresnet import batch_norm
 from core.networks.utils import apply_nn
 from core.testing.tester import BaseTester
@@ -1679,6 +1683,17 @@ def test_a_real_run_trains_and_reports_its_metrics(real_run):
         3,
     ]
     assert real_run.checkpoints == [2, 3] and real_run.states == [2]
+
+
+def test_the_views_describe_every_metric_a_real_run_logs(real_run):
+    layout = json.loads(read_bundle(VIEWS)["layout.json"])
+    logged = {name for metrics in real_run.logged.values() for name in metrics}
+    undescribed = {
+        name
+        for name in logged
+        if not any(fnmatch.fnmatchcase(name, p) for p in layout["descriptions"])
+    }
+    assert not undescribed
 
 
 def test_a_run_resumed_from_its_saved_state_is_bit_identical(

@@ -107,6 +107,11 @@ def main():
         metavar="URL",
         help=f"log to a seaglass server (default {DEFAULT_URL}); start one with `uv run seaglass serve --dir runs`",
     )
+    parser.add_argument(
+        "--notes",
+        default=None,
+        help="what the run is testing and why, shown on its seaglass page (else $SEAGLASS_NOTES)",
+    )
     args = parser.parse_args()
 
     resnet, resnet_state = eqx.nn.make_with_state(AZResnet)(
@@ -173,7 +178,9 @@ def main():
                 name="random",
             )
         ],
-        monitor=Monitor(args.monitor, project="tic_tac_toe") if args.monitor else None,
+        monitor=Monitor(args.monitor, project="tic_tac_toe", notes=args.notes)
+        if args.monitor
+        else None,
         # a fresh directory each run: the trainer won't overwrite another run's checkpoints
         ckpt_dir=tempfile.mkdtemp(prefix="turbozero-tic-tac-toe-"),
         extra_config={"args": vars(args)},
