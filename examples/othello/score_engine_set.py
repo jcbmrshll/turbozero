@@ -14,7 +14,7 @@ import json
 from pathlib import Path
 
 from engine_set import DEFAULT_PATH, EngineSet
-from game import load_checkpoint
+from game import DEFAULT_NET, load_checkpoint
 
 from core.testing.scored_positions import METRICS, ScoredPositionsTester
 
@@ -26,8 +26,9 @@ def main():
     parser.add_argument("checkpoints", nargs="+", help="checkpoints saved by train.py")
     parser.add_argument(
         "--net",
-        default="resnet:6x128",
-        help="the checkpoints' network, as train.py's --net",
+        default=DEFAULT_NET,
+        help="the checkpoints' network, as train.py's --net"
+        " (resnet:6x128 for a run trained with the old default)",
     )
     parser.add_argument(
         "--set", default=str(DEFAULT_PATH), help="the engine-labelled set"

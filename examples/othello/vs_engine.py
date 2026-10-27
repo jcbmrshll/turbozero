@@ -40,6 +40,7 @@ import jax.numpy as jnp
 import numpy as np
 from engines import ANALYSTS, ENGINES, Analysis, EdaxAnalyst, GTPEngine
 from game import (
+    DEFAULT_NET,
     PASS,
     env,
     load_checkpoint,
@@ -303,8 +304,9 @@ def main():
     parser.add_argument("--engine", choices=sorted(ENGINES), default="edax")
     parser.add_argument(
         "--net",
-        default="resnet:6x128",
-        help="the checkpoint's network, as train.py's --net names it",
+        default=DEFAULT_NET,
+        help="the checkpoint's network, as train.py's --net names it"
+        " (resnet:6x128 for a run trained with the old default)",
     )
     parser.add_argument(
         "--levels", type=int, nargs="+", default=[1, 2, 3, 4, 5, 6, 7, 8]

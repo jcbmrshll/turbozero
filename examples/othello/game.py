@@ -124,20 +124,26 @@ SYMMETRY_TRANSFORM_FNS = [
 # convolutions (from 0.3 to 0.8, Adam's normalization making it uneven between weights)
 WEIGHT_DECAY = 0.5
 
+# the network every script here defaults to: a ResNet of 6 blocks of 128 channels with
+# KataGo's global pooling, in every 2nd block and in the policy and value heads. Pooling
+# beat the AlphaZero paper's plain ResNet, resnet:6x128 before, against Edax and on the
+# engine-labelled set (see README.md)
+DEFAULT_NET = "resnet:6x128,pool_every=2,heads=pooled"
+
 
 def make_network(
-    net: str = "resnet:6x128",
+    net: str = DEFAULT_NET,
     seed: int = 0,
     inference_dtype: str = "float32",
     train_dtype: str = "float32",
     remat: bool = False,
 ):
     """The network a spec names (see core.networks.spec.network_config), e.g.
-    "resnet:10x128", the residual network from the AlphaZero paper with 10 blocks of 128
-    channels; any equinox module works (see core.networks.utils.apply_nn). It's created
-    along with its state (BatchNorm's, if it has any): returns (network, state). It
-    computes in `inference_dtype` when it isn't training, e.g. in self-play, and in
-    `train_dtype` in training (mixed precision, see AZResnetConfig). With `remat`,
+    DEFAULT_NET, or "resnet:10x128", the residual network from the AlphaZero paper with
+    10 blocks of 128 channels; any equinox module works (see core.networks.utils.apply_nn).
+    It's created along with its state (BatchNorm's, if it has any): returns (network,
+    state). It computes in `inference_dtype` when it isn't training, e.g. in self-play,
+    and in `train_dtype` in training (mixed precision, see AZResnetConfig). With `remat`,
     training computes each block's activations again in the backward pass instead of
     keeping them."""
     config = network_config(
@@ -173,7 +179,11 @@ def make_optimizer(
 
 
 def load_checkpoint(path: str, net: str, inference_dtype: str = "float32"):
-    """Loads the network saved in a training checkpoint (see `train.py`).
+    """Loads the network saved in a training checkpoint (see `train.py`). `net` must name
+    the network it was trained with, the run's --net.
+
+    Raises:
+        ValueError: if the checkpoint doesn't hold a `net` network
 
     Returns:
         (network, (params, network state)): the network, and the parameters and state
@@ -184,7 +194,17 @@ def load_checkpoint(path: str, net: str, inference_dtype: str = "float32"):
     # a checkpoint is a TrainState's arrays in order, params and network state first: read
     # just those, so that it loads whatever optimizer trained it
     with open(path, "rb") as f:
-        params, network_state = eqx.tree_deserialise_leaves(f, (params, network_state))
+        try:
+            params, network_state = eqx.tree_deserialise_leaves(
+                f, (params, network_state)
+            )
+        # a mismatch fails wherever the layouts first differ, as a shape error or worse
+        except Exception as e:
+            raise ValueError(
+                f"{path} doesn't hold a {net} network: pass the --net its run trained "
+                f"with (before {DEFAULT_NET} became the default, runs trained "
+                "resnet:6x128)"
+            ) from e
     return network, (params, network_state)
 
 
