@@ -176,7 +176,6 @@ class MCTS(Evaluator):
         key: jax.Array,
         state: MCTSTree,
         cycle: jax.Array,
-        active: jax.Array,
         env_state: Any,
         root_metadata: StepMetadata,
         params: Any,
@@ -184,7 +183,8 @@ class MCTS(Evaluator):
     ) -> MCTSTree:
         """The root's evaluation (cycle 0), or an iteration: what `evaluate` does, a step at a
         time, with the same keys. Either way, one network evaluation, so that a batch of searches
-        at different points evaluates the network once a cycle.
+        at different points evaluates the network once a cycle. Past `search_done`, more
+        iterations, each with a key of its own.
 
         Args: see `Evaluator.search_cycle`.
 
@@ -193,9 +193,15 @@ class MCTS(Evaluator):
         """
         root_key, iterate_key, _ = jax.random.split(key, 3)
         # the iteration's key, as `evaluate` splits it off (the split's i-th key doesn't depend on
-        # how many it makes)
-        iteration = jnp.clip(cycle - 1, 0, self.num_iterations - 1)
-        iteration_key = jax.random.split(iterate_key, self.num_iterations)[iteration]
+        # how many it makes); past `num_iterations`, folded in
+        iteration = jnp.maximum(cycle - 1, 0)
+        iteration_key = jnp.where(
+            iteration < self.num_iterations,
+            jax.random.split(iterate_key, self.num_iterations)[
+                jnp.minimum(iteration, self.num_iterations - 1)
+            ],
+            jax.random.fold_in(iterate_key, iteration),
+        )
         traverse_key, leaf_eval_key, expand_key = jax.random.split(iteration_key, 3)
         root_eval_key, _ = jax.random.split(root_key)
         at_root = cycle == 0
@@ -217,10 +223,10 @@ class MCTS(Evaluator):
             root_metadata,
             policy_logits,
             value,
-            write=active & at_root,
+            write=at_root,
         )
         return self.expand(
-            expand_key, state, leaf, policy_logits, value, write=active & ~at_root
+            expand_key, state, leaf, policy_logits, value, write=~at_root
         )
 
     def search_output(

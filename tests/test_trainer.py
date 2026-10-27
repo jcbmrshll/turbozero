@@ -1183,8 +1183,8 @@ class BudgetEvaluator(Evaluator):
     def search_done(self, state, cycles):
         return cycles >= state.budget
 
-    def search_cycle(self, key, state, cycle, active, *args, **kwargs):
-        return replace(state, searched=state.searched + active)
+    def search_cycle(self, key, state, cycle, *args, **kwargs):
+        return replace(state, searched=state.searched + 1)
 
     def evaluate(self, key, eval_state, env_state, root_metadata, **kwargs):
         action = jnp.argmax(root_metadata.action_mask)
@@ -1212,9 +1212,11 @@ def budget_collection(env, tmp_path, budgets, **kwargs):
     [
         # moves after 1 cycle and after 3, as soon as their searches are done
         (1, [6, 2], [[1] * 6, [3] * 2], [0, 0]),
-        # every 2 cycles: a 1-cycle search waits for a cycle, a 3-cycle one for one too, and the
-        # second's next search has run 2 cycles when the 6 are up
-        (2, [3, 1], [[1] * 3, [3]], [0, 2]),
+        # by default, every whole search's 3 cycles: in step, the shorter search going on
+        (None, [2, 2], [[3] * 2, [3] * 2], [0, 0]),
+        # every 2 cycles: a 1-cycle search goes on for a cycle until its move is played, a
+        # 3-cycle one for one too, and the second's next search has run 2 cycles when the 6 are up
+        (2, [3, 1], [[2] * 3, [4]], [0, 2]),
     ],
 )
 def test_each_environment_plays_its_move_when_its_search_is_done(
@@ -1249,7 +1251,7 @@ def test_advance_leaves_an_environment_whose_search_is_not_done_as_it_is(env, tm
 
 
 def test_each_move_starting_in_a_call_takes_the_calls_next_key(env, tmp_path):
-    trainer, state = budget_collection(env, tmp_path, [1, 3])
+    trainer, state = budget_collection(env, tmp_path, [1, 3], advance_every=1)
     keys = jax.random.split(jax.random.PRNGKey(1), trainer.batch_size)
 
     state = trainer.collect_steps(keys, state, None, 2)

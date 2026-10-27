@@ -412,7 +412,7 @@ class Trainer:
         episode_metrics_fn: Callable[[jax.Array], dict[str, jax.Array]] | None = None,
         data_transform_fns: Sequence[DataTransformFn] = (),
         tree_positions: TreePositions | None = None,
-        advance_every: int = 1,
+        advance_every: int | None = None,
         extract_model_params_fn: ExtractModelParamsFn = extract_params,
         monitor: "Monitor | None" = None,
         ckpt_dir: str = "/tmp/turbozero_checkpoints",
@@ -476,10 +476,14 @@ class Trainer:
                 a share of each training batch, sampled from those stored in the replay buffer's span of
                 self-play (see `tree_sample_mask`). Needs MCTS self-play evaluators.
             advance_every: (optional) self-play plays the moves whose searches are done every this many
-                cycles (see `collect_steps`), rather than every cycle (default 1). Playing a move is
-                computed for every environment, whether its search is done or not (under vmap, a
-                select), so checking less often costs less, but a search done in between waits
-                for the check: at most `advance_every - 1` cycles a move.
+                cycles (see `collect_steps`). Playing a move is computed for every environment,
+                whether its search is done or not (under vmap, a select), so checking less often
+                costs less; a search done in between goes on until the check, at most
+                `advance_every - 1` cycles more. By default, every evaluator's `search_cycles`: with
+                searches of a fixed length, a check as each is done, as if every environment searched
+                and played in step. With searches of varying lengths (e.g. MCTS's
+                `count_reused_visits`), a few cycles balance the two: about
+                sqrt(2 * mean search cycles * cost of a check / cost of a cycle).
             extract_model_params_fn: (optional) function to extract model parameters from TrainState
             monitor: (optional) `seaglass.Monitor` to log metrics and test episodes to (see a tester's `episode_fn`),
                 e.g. `core.monitoring.Monitor`, whose runs are drawn with turbozero's views
@@ -531,7 +535,7 @@ class Trainer:
             else EvaluatorSchedule([(0, evaluator)])
         )
         self.transform_fns = data_transform_fns
-        if advance_every < 1:
+        if advance_every is not None and advance_every < 1:
             raise ValueError(f"advance_every must be positive, got {advance_every}")
         self.advance_every = advance_every
         self.exploration = exploration
@@ -677,8 +681,9 @@ class Trainer:
         params: Any,
         evaluator: Evaluator | None = None,
     ) -> CollectionState:
-        """Runs a cycle of the search for the move in progress (see `Evaluator.search_cycle`),
-        unless the search is done, and waits for `advance` to play its move.
+        """Runs a cycle of the search for the move in progress (see `Evaluator.search_cycle`). A
+        search that is done goes on until `advance` plays its move: under vmap, its cycle is
+        computed anyway.
 
         A move starts with the first cycle after the last one's `advance`: `key` becomes its key
         (see `CollectionState.move_key`). It's unused otherwise.
@@ -697,12 +702,10 @@ class Trainer:
             evaluator = self.collection_schedule.at(0)
         move_key = jnp.where(state.search_cycles == 0, key, state.move_key)
         evaluate_key, _, _ = self.move_keys(move_key)
-        searching = ~evaluator.search_done(state.eval_state, state.search_cycles)
         eval_state = evaluator.search_cycle(
             evaluate_key,
             state.eval_state,
             state.search_cycles,
-            searching,
             state.env_state,
             state.metadata,
             params,
@@ -712,7 +715,7 @@ class Trainer:
             state,
             eval_state=eval_state,
             move_key=move_key,
-            search_cycles=state.search_cycles + searching,
+            search_cycles=state.search_cycles + 1,
         )
 
     def advance(
@@ -950,9 +953,10 @@ class Trainer:
         many cycles as `num_steps` moves' searches take at most (see `Evaluator.search_cycles`).
 
         Each cycle, every environment runs a cycle of its move's search (`search`); every
-        `advance_every` cycles, those whose search is done play their moves (`advance`). With
-        searches that all take the same cycles, from environments that start together, that's
-        `num_steps` moves in each, as many cycles apart.
+        `advance_every` cycles (see `Trainer`), those whose search is done play their moves
+        (`advance`). With searches that all take the same cycles, from environments that start
+        together, and the default `advance_every`, that's `num_steps` moves in each, as many
+        cycles apart.
 
         Compiled once for each evaluator.
 
@@ -973,6 +977,11 @@ class Trainer:
         num_cycles = num_steps * evaluator.search_cycles()
         if num_cycles == 0:
             return state
+        advance_every = (
+            evaluator.search_cycles()
+            if self.advance_every is None
+            else self.advance_every
+        )
 
         def collect_env(key: jax.Array, state: CollectionState) -> CollectionState:
             # the i-th move to start in this call gets the i-th key
@@ -997,7 +1006,7 @@ class Trainer:
             def chunk(
                 _: jax.Array, carry: tuple[CollectionState, jax.Array]
             ) -> tuple[CollectionState, jax.Array]:
-                state, started = search(carry, self.advance_every)
+                state, started = search(carry, advance_every)
                 return self.advance(state, params, evaluator), started
 
             # every `advance_every` cycles, the moves whose searches are done are played: loops
@@ -1005,11 +1014,11 @@ class Trainer:
             # whole state (the trees and the replay buffers)
             carry = jax.lax.fori_loop(
                 0,
-                num_cycles // self.advance_every,
+                num_cycles // advance_every,
                 chunk,
                 (state, jnp.array(0, dtype=jnp.int32)),
             )
-            state, _ = search(carry, num_cycles % self.advance_every)
+            state, _ = search(carry, num_cycles % advance_every)
             return state
 
         return jax.vmap(collect_env)(key, state)

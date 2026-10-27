@@ -76,8 +76,9 @@ class Evaluator:
     # A search can also run a cycle at a time, as self-play runs it (see
     # `core.training.train.Trainer.collect_steps`): environments at different points of their
     # searches then make their network evaluations together, a cycle at a time. A move's search is
-    # `search_cycle` until `search_done`, then `search_output`, all with the move's key. An
-    # evaluator that doesn't search does all of it in `search_output`, its `evaluate`.
+    # `search_cycle` until `search_done` and its move is played (self-play checks for those every
+    # few cycles, and a search done in between goes on), then `search_output`, all with the move's
+    # key. An evaluator that doesn't search does all of it in `search_output`.
 
     def search_cycles(self) -> int:
         """The most cycles a move's search takes: self-play's unit of compute."""
@@ -100,7 +101,6 @@ class Evaluator:
         key: jax.Array,
         state: Any,
         cycle: jax.Array,
-        active: jax.Array,
         env_state: Any,
         root_metadata: StepMetadata,
         params: Any,
@@ -111,9 +111,7 @@ class Evaluator:
         Args:
             key: rng, the move's (as `evaluate`'s)
             state: The internal state of the Evaluator.
-            cycle: the cycles the search has run so far
-            active: whether to run it: if not, `state` is left as it is (e.g. when the search is
-                done but its move not yet played). Cheaper under vmap than a select between states
+            cycle: the cycles the search has run so far, possibly past `search_done`
             env_state: the environment state to evaluate
             root_metadata: its metadata
             params: nn parameters

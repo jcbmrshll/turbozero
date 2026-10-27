@@ -52,7 +52,7 @@ def make_trainer(args) -> tuple[Trainer, tuple]:
     evaluator = AlphaZero(MCTS)(
         eval_fn=make_nn_eval_fn(resnet, state_to_nn_input),
         num_iterations=args.sims,
-        max_nodes=args.sims + 1 + args.min_iterations
+        max_nodes=args.sims + args.min_iterations + args.advance_every
         if args.count_reused_visits
         else 2 * args.sims,
         branching_factor=env.num_actions,
@@ -101,8 +101,9 @@ def main():
     parser.add_argument(
         "--advance-every",
         type=int,
-        default=1,
-        help="cycles between plays of the moves whose searches are done",
+        default=None,
+        help="as train.py's: cycles between plays of the moves whose searches are done, by "
+        "default a whole search's, or 5 with --count-reused-visits",
     )
     parser.add_argument(
         "--count-reused-visits",
@@ -133,6 +134,8 @@ def main():
         "--compare", default=None, help="compare the warmup steps' results to a --save"
     )
     args = parser.parse_args()
+    if args.advance_every is None and args.count_reused_visits:
+        args.advance_every = 5
 
     trainer, params = make_trainer(args)
     collect = trainer.collect_steps
@@ -177,7 +180,7 @@ def main():
         times.append(time.perf_counter() - t)
         moves += int(state.moves.sum()) - before
     # a call runs the cycles of `steps` moves' searches; searches done between plays of the
-    # moves (see --advance-every) wait for the next, so fewer moves may be played
+    # moves (see --advance-every) go on until the next, so fewer moves may be played
     cycles = args.steps * trainer.collection_schedule.at(0).search_cycles()
     per_step = np.array(times) / args.steps
     print(
