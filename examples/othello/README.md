@@ -60,12 +60,15 @@ self-play adds, whatever the size. With the defaults, 128 steps of 4096 samples
 against 1024 environments adding 1024 samples each, it's 0.5. `--train-steps` changes
 it (or `--train-batch`).
 
-On one RTX 5080, with the defaults (a 6-block, 128-channel network), an epoch takes
-about 63 seconds. One 200-epoch run (with epochs then taking about 70 seconds) passed
-every rung of the ladder by epoch 65. With `--inference-dtype bfloat16` the network
-computes in bfloat16 in self-play and test games (it still trains in float32), and an
-epoch takes about 36 seconds; searching with the same checkpoint, bfloat16 and float32
-play evenly.
+The network computes in bfloat16 by default: in self-play and test games
+(`--inference-dtype`), and its convolutions in training (`--train-dtype`, mixed precision:
+its parameters, BatchNorm and heads stay in float32). On one RTX 5080, with a 6-block,
+128-channel network computing in float32 throughout, an epoch takes about 63 seconds, and
+one 200-epoch run passed every rung of the ladder by epoch 65. bfloat16 in self-play and
+test games brings an epoch to about 36 seconds; searching with the same checkpoint,
+bfloat16 and float32 play evenly. bfloat16 training then takes each training step in less
+than half the time (a 10-block, 128-channel network's from 157 to 72 ms), and trained as
+well as float32 in a two-seed comparison.
 
 ### The network
 

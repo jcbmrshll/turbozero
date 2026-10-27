@@ -224,15 +224,15 @@ def main():
     )
     parser.add_argument(
         "--inference-dtype",
-        default="float32",
-        help="dtype the network computes in during self-play and test games, e.g. "
-        "bfloat16 (about twice as fast)",
+        default="bfloat16",
+        help="dtype the network computes in during self-play and test games (bfloat16 is "
+        "about twice as fast as float32, and plays as well)",
     )
     parser.add_argument(
         "--train-dtype",
-        default="float32",
-        help="dtype the network's convolutions compute in during training, e.g. bfloat16 "
-        "for mixed precision: its parameters, BatchNorm and heads stay in float32",
+        default="bfloat16",
+        help="dtype the network's convolutions compute in during training: bfloat16 is mixed "
+        "precision, its parameters, BatchNorm and heads staying in float32",
     )
     parser.add_argument(
         "--standard-starts",
