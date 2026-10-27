@@ -33,19 +33,21 @@ def normalize_q_values(
     return normalized
 
 
-def tie_break_noise(key: jax.Array, shape: tuple[int, ...]) -> jax.Array:
-    """Noise to add to selection scores so that exact ties go to a random action rather than the
-    lowest index (as in mctx): small enough to change nothing else, normalized Q-values being in
-    [0, 1].
+def random_argmax(key: jax.Array, scores: jax.Array) -> jax.Array:
+    """Index of the highest score, exact ties broken at random rather than to the lowest index
+    (as mctx does, though its tiny noise is only a few float32 ulps at scores near 1).
 
     Args:
         key: rng
-        shape: shape of the scores
+        scores: scores to maximize over the last axis
 
     Returns:
-        jax.Array: noise in [0, 1e-7)
+        jax.Array: index of a highest score
     """
-    return 1e-7 * jax.random.uniform(key, shape)
+    noise = jax.random.uniform(key, scores.shape)
+    return jnp.where(scores == scores.max(axis=-1, keepdims=True), noise, -1.0).argmax(
+        axis=-1
+    )
 
 
 def bounded_q_values(
@@ -99,29 +101,39 @@ class MCTSActionSelector:
 
 
 class PUCTSelector(MCTSActionSelector):
-    """PUCT (Polynomial Upper Confidence Trees) action selector.
+    """PUCT (Polynomial Upper Confidence Trees) action selector, as in AlphaZero.
 
-    This is the algorithm used for action selection within AlphaZero.
+    Picks the action maximizing `Q + c * P * sqrt(N) / (1 + n)`, with
+    `c = c_init + log((N + c_base + 1) / c_base)`: AlphaZero's (and MuZero's) rule. By default Q is
+    on the fixed range [-1, 1] (`bounded_q_values`), as in AlphaZero and MuZero's board games; use
+    `normalize_q_values` (mctx's default, MuZero's Atari setting) for values without known bounds.
     """
 
     def __init__(
-        self, c: float = 1.0, epsilon: float = 1e-8, q_transform=normalize_q_values
+        self,
+        c_init: float = 1.25,
+        c_base: float = 19652,
+        epsilon: float = 1e-8,
+        q_transform=bounded_q_values,
     ):
         """Initializes a PUCTSelector.
 
         Args:
-            c: exploration constant (larger values encourage exploration)
+            c_init: exploration constant (larger values encourage exploration)
+            c_base: visit count over which the exploration constant grows (by log(2) at N = c_base)
             epsilon: small value to avoid division by zero
-            q_transform: function applied to q-values before selection
+            q_transform: function mapping q-values to [0, 1] before selection
         """
         super().__init__(epsilon=epsilon)
-        self.c = c
+        self.c_init = c_init
+        self.c_base = c_base
         self.q_transform = q_transform
 
     def get_config(self) -> dict:
         """Returns the configuration of the PUCT action selector. Used for logging."""
         return {
-            "c": self.c,
+            "c_init": self.c_init,
+            "c_base": self.c_base,
             "q_transform": self.q_transform.__name__,
             **super().get_config(),
         }
@@ -150,73 +162,9 @@ class PUCTSelector(MCTSActionSelector):
         # normalize/transform q-values
         q_values = self.q_transform(discounted_q_values, n_values, node.q, self.epsilon)
         # calculate U-values
-        u_values = self.c * node.p * jnp.sqrt(node.n) / (n_values + 1)
+        c = self.c_init + jnp.log((node.n + self.c_base + 1) / self.c_base)
+        u_values = c * node.p * jnp.sqrt(node.n) / (n_values + 1)
         # PUCT = Q-value + U-value
         puct_values = q_values + u_values
         # select action with highest PUCT value, ties broken at random
-        return (puct_values + tie_break_noise(key, puct_values.shape)).argmax()
-
-
-class MuZeroPUCTSelector(MCTSActionSelector):
-    """Implements the variant of PUCT used in MuZero."""
-
-    def __init__(
-        self,
-        c1: float = 1.25,
-        c2: float = 19652,
-        epsilon: float = 1e-8,
-        q_transform=normalize_q_values,
-    ):
-        """Initializes a MuZeroPUCTSelector.
-
-        Args:
-            c1: 1st exploration constant
-            c2: 2nd exploration constant
-            epsilon: small value to avoid division by zero
-            q_transform: function applied to q-values before selection
-        """
-        super().__init__(epsilon=epsilon)
-        self.c1 = c1
-        self.c2 = c2
-        self.q_transform = q_transform
-
-    def get_config(self) -> dict:
-        """Returns the configuration of the MuZero PUCT action selector. Used for logging."""
-        return {
-            "c1": self.c1,
-            "c2": self.c2,
-            "q_transform": self.q_transform.__name__,
-            **super().get_config(),
-        }
-
-    def __call__(
-        self, key: jax.Array, tree: MCTSTree, index: ArrayLike, discount: float
-    ) -> jax.Array:
-        """Selects an action given a search tree state.
-
-        Args:
-            key: rng, to break ties
-            tree: search tree
-            index: index of the node in the search tree to select an action to take from
-            discount: discount factor
-
-        Returns:
-            jax.Array: id of action to take
-        """
-        # get child q-values
-        node = tree.data_at(index)
-        q_values = tree.get_child_data("q", index)
-        # apply discount to q-values
-        discounted_q_values = q_values * discount
-        # get child visit counts
-        n_values = tree.get_child_data("n", index)
-        # normalize/transform q-values
-        q_values = self.q_transform(discounted_q_values, n_values, node.q, self.epsilon)
-        # calculate U-values
-        base_term = node.p * jnp.sqrt(node.n) / (n_values + 1)
-        log_term = jnp.log((node.n + self.c2 + 1) / self.c2) + self.c1
-        u_values = base_term * log_term
-        # PUCT = Q-value + U-value
-        puct_values = q_values + u_values
-        # select action with highest PUCT value, ties broken at random
-        return (puct_values + tie_break_noise(key, puct_values.shape)).argmax()
+        return random_argmax(key, puct_values)

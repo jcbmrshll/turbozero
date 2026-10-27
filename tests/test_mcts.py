@@ -702,8 +702,8 @@ def test_blocks_forced_loss(make_search, ttt, cls, first_player):
 
 @pytest.mark.parametrize("cls", SEARCHES)
 def test_searches_in_a_tree_too_small_for_them(make_search, ttt, cls):
-    # 8 nodes for 32 iterations: room for the root's 5 children and deeper leaves to evict
-    search = make_search(cls, max_nodes=8)
+    # 10 nodes for 32 iterations: room for the root's 5 children and deeper leaves to evict
+    search = make_search(cls, max_nodes=10)
     k = search.evaluator.num_iterations
     state, meta = ttt.play(MIDGAME_MOVES)
 

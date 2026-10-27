@@ -13,7 +13,8 @@ import pgx
 from core.evaluators.alphazero import AlphaZero
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.mcts.mcts import MCTS
-from core.networks.azresnet import AZResnet, AZResnetConfig
+from core.networks.spec import make_network as build_network
+from core.networks.spec import network_config
 from core.training.train import weight_decay_mask
 from core.types import StepMetadata
 
@@ -125,29 +126,30 @@ WEIGHT_DECAY = 0.5
 
 
 def make_network(
-    num_blocks: int,
-    num_channels: int,
+    net: str = "resnet:6x128",
     seed: int = 0,
     inference_dtype: str = "float32",
+    train_dtype: str = "float32",
     remat: bool = False,
 ):
-    """The residual network from the AlphaZero paper; any equinox module works (see
-    core.networks.utils.apply_nn). It uses BatchNorm, so it's created along with its
-    state: returns (network, state). It computes in `inference_dtype` when it isn't
-    training, e.g. in self-play. With `remat`, training computes each residual block's
-    activations again in the backward pass instead of keeping them (see AZResnetConfig)."""
-    return eqx.nn.make_with_state(AZResnet)(
-        AZResnetConfig(
-            policy_head_out_size=env.num_actions,
-            num_blocks=num_blocks,
-            num_channels=num_channels,
-            inference_dtype=inference_dtype,
-            remat=remat,
-        ),
-        # pgx types observation_shape as Tuple[int, ...]; for board games it's (height, width, channels)
-        cast(tuple[int, int, int], env.observation_shape),
-        key=jax.random.PRNGKey(seed),
+    """The network a spec names (see core.networks.spec.network_config), e.g.
+    "resnet:10x128", the residual network from the AlphaZero paper with 10 blocks of 128
+    channels; any equinox module works (see core.networks.utils.apply_nn). It's created
+    along with its state (BatchNorm's, if it has any): returns (network, state). It
+    computes in `inference_dtype` when it isn't training, e.g. in self-play, and in
+    `train_dtype` in training (mixed precision, see AZResnetConfig). With `remat`,
+    training computes each block's activations again in the backward pass instead of
+    keeping them."""
+    config = network_config(
+        net,
+        env.num_actions,
+        inference_dtype=inference_dtype,
+        train_dtype=train_dtype,
+        remat=remat,
     )
+    # pgx types observation_shape as Tuple[int, ...]; for board games it's (height, width, channels)
+    shape = cast(tuple[int, int, int], env.observation_shape)
+    return build_network(config, shape, jax.random.PRNGKey(seed))
 
 
 def make_optimizer(
@@ -170,18 +172,14 @@ def make_optimizer(
     )
 
 
-def load_checkpoint(
-    path: str, num_blocks: int, num_channels: int, inference_dtype: str = "float32"
-):
+def load_checkpoint(path: str, net: str, inference_dtype: str = "float32"):
     """Loads the network saved in a training checkpoint (see `train.py`).
 
     Returns:
         (network, (params, network state)): the network, and the parameters and state
         to evaluate it with, as `core.evaluators.evaluation_fns.make_nn_eval_fn` takes them
     """
-    network, network_state = make_network(
-        num_blocks, num_channels, inference_dtype=inference_dtype
-    )
+    network, network_state = make_network(net, inference_dtype=inference_dtype)
     params = eqx.filter(network, eqx.is_inexact_array)
     # a checkpoint is a TrainState's arrays in order, params and network state first: read
     # just those, so that it loads whatever optimizer trained it

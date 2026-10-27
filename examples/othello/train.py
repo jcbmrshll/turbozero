@@ -14,6 +14,10 @@ Start the monitor first, in another shell, with `uv run turbozero-monitor`. It s
 the metrics, which rung of the ladder the agent has reached, and a game against the
 last opponent it played, which it draws in the browser.
 
+Every epoch it also scores the network on the engine-labelled set, if there is one (see
+engine_set.py and --engine-set): how close the raw network's moves and values come to
+Edax's, logged as `engine_*`.
+
 The first epoch is slow: nearly all of the training loop is JIT-compiled the first
 time it runs. On one RTX 5080 the rest take about 63s each (36s with
 --inference-dtype bfloat16, see README.md). With these settings, one
@@ -38,9 +42,13 @@ with --resume, or to fork short runs from with --init-from (see README.md):
 
 import argparse
 import tempfile
+import warnings
 from functools import partial
+from pathlib import Path
 
 import pgx
+from engine_set import DEFAULT_PATH as DEFAULT_ENGINE_SET
+from engine_set import EngineSet
 from game import (
     SYMMETRY_TRANSFORM_FNS,
     WEIGHT_DECAY,
@@ -60,15 +68,13 @@ from core.evaluators.evaluation_fns import (
     make_nn_eval_fn,
     make_nn_eval_fn_no_params_callable,
 )
-from core.evaluators.mcts.action_selection import (
-    MuZeroPUCTSelector,
-    PUCTSelector,
-    bounded_q_values,
-)
+from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.mcts.mcts import MCTS
 from core.evaluators.random_evaluator import RandomEvaluator
 from core.memory.replay_memory import EpisodeReplayBuffer
 from core.testing.ladder import LadderTester, Rung
+from core.testing.scored_positions import ScoredPositionsTester
+from core.testing.tester import BaseTester
 from core.training.exploration import Exploration
 from core.training.loss_fns import az_default_loss_fn
 from core.training.schedule import EvaluatorSchedule, parse_schedule
@@ -102,12 +108,40 @@ def positive_schedule(text: str) -> list[tuple[int, int]]:
     return schedule
 
 
+def load_engine_set(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> EngineSet | None:
+    """The engine-labelled set to score the network on, None if it isn't to be. A missing
+    default set is skipped with a warning (build one with label_positions.py); a missing
+    --engine-set is an error."""
+    if args.engine_eval_every <= 0:
+        return None
+    if args.engine_set is not None:
+        if not Path(args.engine_set).exists():
+            parser.error(f"--engine-set {args.engine_set}: no such file")
+        return EngineSet.load(args.engine_set)
+    if not DEFAULT_ENGINE_SET.exists():
+        warnings.warn(
+            f"no engine-labelled set at {DEFAULT_ENGINE_SET}, so the network won't be scored "
+            "against Edax: build one with label_positions.py, or pass --engine-set",
+            stacklevel=2,
+        )
+        return None
+    return EngineSet.load(DEFAULT_ENGINE_SET)
+
+
 def main():
     parser = argparse.ArgumentParser(description="AlphaZero on Othello.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=200)
-    parser.add_argument("--blocks", type=int, default=6, help="residual blocks")
-    parser.add_argument("--channels", type=int, default=128, help="channels per block")
+    parser.add_argument(
+        "--net",
+        default="resnet:6x128",
+        help="the network: KIND:DEPTHxWIDTH[,FIELD=VALUE...], e.g. resnet:10x128 for "
+        "AlphaZero's ResNet with 10 blocks of 128 channels, resnet:10x128,pool_every=3,"
+        "heads=pooled with KataGo's global pooling, or transformer:8x256 (see "
+        "core.networks.spec.network_config)",
+    )
     sims = parser.add_mutually_exclusive_group()
     sims.add_argument(
         "--sims", type=int, default=64, help="MCTS iterations per self-play move"
@@ -127,16 +161,6 @@ def main():
         default=2.0,
         help="self-play search tree capacity, in nodes per MCTS iteration (the tree is "
         "kept between moves, so it needs room for the reused subtree too)",
-    )
-    parser.add_argument(
-        "--puct",
-        choices=("min-max", "alphazero"),
-        default="min-max",
-        help="how self-play's search scores moves: min-max is PUCT with c=1 on the "
-        "children's values min-max normalized, as mctx does by default; alphazero is AlphaZero's "
-        "and MuZero's board-game PUCT, with c from 1.25 growing with visits and values on "
-        "the fixed range [-1, 1], which explores more where moves are close or the "
-        "position is lost. Test games always use min-max",
     )
     parser.add_argument(
         "--sampling-moves",
@@ -200,9 +224,15 @@ def main():
     )
     parser.add_argument(
         "--inference-dtype",
-        default="float32",
-        help="dtype the network computes in during self-play and test games, e.g. "
-        "bfloat16 (about twice as fast); it always trains in float32",
+        default="bfloat16",
+        help="dtype the network computes in during self-play and test games (bfloat16 is "
+        "about twice as fast as float32, and plays as well)",
+    )
+    parser.add_argument(
+        "--train-dtype",
+        default="bfloat16",
+        help="dtype the network's convolutions compute in during training: bfloat16 is mixed "
+        "precision, its parameters, BatchNorm and heads staying in float32",
     )
     parser.add_argument(
         "--standard-starts",
@@ -276,6 +306,20 @@ def main():
         "watch.py plays checkpoints against an engine instead)",
     )
     parser.add_argument(
+        "--engine-set",
+        default=None,
+        metavar="PATH",
+        help="the engine-labelled set to score the network on (see engine_set.py; default "
+        f"{DEFAULT_ENGINE_SET}, skipped with a warning if it doesn't exist)",
+    )
+    parser.add_argument(
+        "--engine-eval-every",
+        type=int,
+        default=1,
+        help="epochs between scoring the network on the engine-labelled set (0 for never). "
+        "A forward pass over its positions: a fraction of a second",
+    )
+    parser.add_argument(
         "--ckpt-dir",
         default=None,
         help="where to save checkpoints (default: a new temporary directory)",
@@ -312,7 +356,7 @@ def main():
         help="fork a new run from a saved state (state-<EPOCH>.npz, or a --ckpt-dir to take "
         "the newest from): it starts at epoch 0, with its own schedules, games and seed, "
         "from the saved network, optimizer state (the learning rate decaying anew from "
-        "--lr) and replay buffers. Needs the same --blocks and --channels; --buffer may "
+        "--lr) and replay buffers. Needs the same --net; --buffer may "
         "differ (each environment's newest entries are kept)",
     )
     parser.add_argument(
@@ -347,12 +391,12 @@ def main():
     # test games all start from XOT openings
     test_init_fn = make_xot_init_fn(load_xot(), standard_start_fraction=0)
 
-    # the residual network from the AlphaZero paper (see game.py), with its BatchNorm state
-    resnet, resnet_state = make_network(
-        args.blocks,
-        args.channels,
+    # the network (see game.py), with its state (BatchNorm's, if it has any)
+    network, network_state = make_network(
+        args.net,
         seed=args.seed,
         inference_dtype=args.inference_dtype,
+        train_dtype=args.train_dtype,
         remat=args.remat,
     )
 
@@ -360,12 +404,7 @@ def main():
     # samples moves in proportion to visit counts, for exploration during self-play.
     # With --sims-schedule, a search for each stage: each takes over at its epoch,
     # starting from empty trees sized for it (see core.training.schedule)
-    selfplay_eval_fn = make_nn_eval_fn(resnet, state_to_nn_input)
-    action_selector = (
-        MuZeroPUCTSelector(q_transform=bounded_q_values)
-        if args.puct == "alphazero"
-        else PUCTSelector()
-    )
+    selfplay_eval_fn = make_nn_eval_fn(network, state_to_nn_input)
     evaluator = EvaluatorSchedule(
         [
             (
@@ -375,14 +414,14 @@ def main():
                     num_iterations=sims,
                     max_nodes=int(args.tree_factor * sims),
                     branching_factor=env.num_actions,
-                    action_selector=action_selector,
+                    action_selector=PUCTSelector(),
                     temperature=1.0,
                 ),
             )
             for epoch, sims in args.sims_schedule or [(0, args.sims)]
         ]
     )
-    evaluator_test = make_test_evaluator(make_nn_eval_fn(resnet, state_to_nn_input))
+    evaluator_test = make_test_evaluator(make_nn_eval_fn(network, state_to_nn_input))
 
     # opponents: the greedy tile counter and pgx's pretrained model (others are listed
     # at https://sotets.uk/pgx/api/#pgx.BaselineModelId)
@@ -406,11 +445,32 @@ def main():
     ] + [
         Rung(f"pgx{n}", make_test_evaluator(pretrained, n)) for n in (1, 4, 16, 64, 256)
     ]
-    testers = (
-        [LadderTester(num_episodes=128, rungs=rungs, episode_fn=episode_fn)]
+    testers: list[BaseTester] = (
+        [
+            LadderTester(
+                num_episodes=128,
+                rungs=rungs,
+                episode_fn=episode_fn,
+                epochs_per_test=args.eval_every,
+            )
+        ]
         if args.eval_every > 0
         else []
     )
+    # the network's raw moves and values against Edax's, on the engine-labelled set
+    engine_set = load_engine_set(parser, args)
+    if engine_set is not None:
+        testers.append(
+            ScoredPositionsTester(
+                engine_set.scored_positions(),
+                network,
+                epochs_per_test=args.engine_eval_every,
+                config={
+                    "path": str(args.engine_set or DEFAULT_ENGINE_SET),
+                    **engine_set.describe(),
+                },
+            )
+        )
 
     # each epoch collects `collection_steps_per_epoch` self-play steps in each of
     # `batch_size` environments, then takes `train_steps_per_epoch` training steps
@@ -421,8 +481,8 @@ def main():
         collection_steps_per_epoch=128,
         train_steps_per_epoch=args.train_steps,
         grad_accum_steps=args.grad_accum,
-        nn=resnet,
-        nn_state=resnet_state,
+        nn=network,
+        nn_state=network_state,
         loss_fn=partial(az_default_loss_fn, value_target_q=args.value_target_q),
         # decays from --lr to --lr-final over the run
         optimizer=make_optimizer(
@@ -475,7 +535,8 @@ def main():
     trainer.train_loop(
         seed=args.seed,
         num_epochs=args.epochs,
-        eval_every=max(args.eval_every, 1),
+        # each tester keeps its own cadence (--eval-every, --engine-eval-every)
+        eval_every=1,
         initial_state=trainer.resume() if args.resume else None,
         fork_from=args.init_from,
         fork_replay_buffers=not args.init_without_buffers,

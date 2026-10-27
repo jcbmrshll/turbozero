@@ -5,8 +5,11 @@ import numpy as np
 import pytest
 
 from core.networks.azresnet import (
+    AlphaZeroHeads,
     AZResnet,
     AZResnetConfig,
+    BottleneckBlock,
+    ResidualBlock,
     batch_norm,
     conv,
     conv_bn,
@@ -69,13 +72,14 @@ def test_inference_folds_batch_norm_into_the_convolution(dtype, tolerance):
     )
 
 
-def make_net(inference_dtype="float32", remat=False):
+def make_net(inference_dtype="float32", remat=False, train_dtype="float32"):
     """A tiny AZResnet; the same parameters whatever its static options."""
     config = AZResnetConfig(
         policy_head_out_size=5,
         num_blocks=1,
         num_channels=4,
         inference_dtype=inference_dtype,
+        train_dtype=train_dtype,
         remat=remat,
     )
     return eqx.nn.make_with_state(AZResnet)(
@@ -84,8 +88,12 @@ def make_net(inference_dtype="float32", remat=False):
 
 
 def batch_norms(net: AZResnet) -> list[eqx.nn.BatchNorm]:
-    return [net.stem_bn, net.policy_bn, net.value_bn] + [
-        bn for block in net.blocks for bn in (block.bn1, block.bn2)
+    assert isinstance(net.heads, AlphaZeroHeads)
+    return [net.stem_bn, net.heads.policy_bn, net.heads.value_bn] + [
+        bn
+        for block in net.blocks
+        if isinstance(block, ResidualBlock)
+        for bn in (block.bn1, block.bn2)
     ]
 
 
@@ -102,12 +110,16 @@ def unfolded(net: AZResnet, state, x):
     x = jnp.moveaxis(x, -1, 0).astype(jnp.float32)
     x = jax.nn.relu(conv_bn(net.stem_conv, net.stem_bn, x))
     for block in net.blocks:
+        assert isinstance(block, ResidualBlock)
         y = jax.nn.relu(conv_bn(block.conv1, block.bn1, x))
         x = jax.nn.relu(x + conv_bn(block.conv2, block.bn2, y))
-    policy = jax.nn.relu(conv_bn(net.policy_conv, net.policy_bn, x))
-    value = jax.nn.relu(conv_bn(net.value_conv, net.value_bn, x))
-    policy = net.policy_linear(policy.reshape(-1))
-    value = jnp.tanh(net.value_linear(value.reshape(-1)))
+    heads = net.heads
+    assert isinstance(heads, AlphaZeroHeads)
+    policy = jax.nn.relu(conv_bn(heads.policy_conv, heads.policy_bn, x))
+    value = jax.nn.relu(conv_bn(heads.value_conv, heads.value_bn, x))
+    policy = heads.policy_linear(policy.reshape(-1))
+    value = jax.nn.relu(heads.value_hidden(value.reshape(-1)))
+    value = jnp.tanh(heads.value_linear(value))
     return policy, value
 
 
@@ -167,6 +179,40 @@ def test_static_options_do_not_change_training():
         np.testing.assert_array_equal(a, b)
 
 
+def test_mixed_precision_training_stays_close_to_float32():
+    # bfloat16 convolutions: the loss, the gradients (float32, as the parameters are) and the
+    # BatchNorm statistics (float32) within bfloat16's rounding of float32 training's
+    def loss(net, state, x):
+        (policy, value), state = apply_nn(net, state, x)
+        return (policy**2).mean() + (value**2).mean(), state
+
+    @eqx.filter_jit
+    def run(net, state, x):
+        (value, state), grads = eqx.filter_value_and_grad(loss, has_aux=True)(
+            net, state, x
+        )
+        return value, grads, state
+
+    net32, state = make_net()
+    net16, _ = make_net(train_dtype="bfloat16")
+    x = observations(np.random.default_rng(0), batch_size=16)
+    loss32, grads32, state32 = run(net32, state, x)
+    loss16, grads16, state16 = run(net16, state, x)
+
+    np.testing.assert_allclose(loss16, loss32, rtol=2e-2)
+    leaves16, leaves32 = jax.tree.leaves(grads16), jax.tree.leaves(grads32)
+    assert all(a.dtype == b.dtype == jnp.float32 for a, b in zip(leaves16, leaves32))
+    # bfloat16 rounding through the network: the whole gradient within about 10%, pointing the same way
+    a, b = (
+        np.concatenate([np.ravel(x) for x in leaves]) for leaves in (leaves16, leaves32)
+    )
+    assert np.linalg.norm(a - b) <= 0.15 * np.linalg.norm(b)
+    assert a @ b >= 0.99 * np.linalg.norm(a) * np.linalg.norm(b)
+    for a, b in zip(jax.tree.leaves(state16), jax.tree.leaves(state32), strict=True):
+        assert a.dtype == b.dtype
+        np.testing.assert_allclose(a, b, rtol=2e-2, atol=2e-2)
+
+
 @eqx.filter_jit
 def train_batch_norm(bn, state, x):
     """`bn` in training mode on the batch `x`: its outputs, normalized by the batch's statistics,
@@ -204,3 +250,97 @@ def test_inference_before_any_training_leaves_batch_norm_inputs_as_they_are():
 
     np.testing.assert_allclose(scale, np.full(3, 1 / np.sqrt(1 + bn.eps)), rtol=1e-6)
     np.testing.assert_array_equal(offset, np.zeros(3))
+
+
+VARIANTS = {
+    "global pooling": {
+        "num_blocks": 2,
+        "num_channels": 6,
+        "pool_every": 2,
+        "pool_channels": 2,
+    },
+    "bottleneck": {
+        "num_blocks": 2,
+        "num_channels": 8,
+        "block": "bottleneck",
+        "bottleneck_inner": 2,
+        "pool_every": 3,
+        "pool_channels": 2,
+    },
+    "pooled heads": {
+        "num_blocks": 1,
+        "num_channels": 4,
+        "heads": "pooled",
+        "head_channels": 3,
+    },
+}
+
+
+def make_variant(name: str, **options):
+    config = AZResnetConfig(policy_head_out_size=10, **VARIANTS[name], **options)
+    return eqx.nn.make_with_state(AZResnet)(
+        config, INPUT_SHAPE, key=jax.random.PRNGKey(0)
+    )
+
+
+@pytest.mark.parametrize("name", VARIANTS)
+@pytest.mark.parametrize("dtype, tolerance", [("float32", 1e-4), ("bfloat16", 5e-2)])
+def test_inference_matches_training_on_the_batch_a_variant_trained_on(
+    name, dtype, tolerance
+):
+    # after one training step, each BatchNorm's (debiased) running averages are the statistics of
+    # its inputs on that batch, so inference on it gives the outputs training gave: whatever the
+    # blocks and heads, their BatchNorms fold into the convolutions they follow
+    net, state = make_variant(name, inference_dtype=dtype)
+    x = observations(np.random.default_rng(0), batch_size=8)
+
+    @eqx.filter_jit
+    def run(net, state, x):
+        training, state = apply_nn(net, state, x)
+        inference, _ = apply_nn(eqx.nn.inference_mode(net), state, x)
+        return training, inference
+
+    (policy, value), inference = run(net, state, x)
+
+    assert policy.shape == (8, 10) and value.shape == (8, 1)
+    for a, b in zip(inference, (policy, value), strict=True):
+        assert a.dtype == jnp.float32
+        np.testing.assert_allclose(a, b, atol=tolerance, rtol=tolerance)
+
+
+def test_the_bottleneck_variant_has_the_blocks_it_is_configured_with():
+    net, _ = make_variant("bottleneck")
+
+    # four basic blocks inside two bottleneck blocks, of half the width; every third has a
+    # global pooling bias
+    inner = [
+        block
+        for outer in net.blocks
+        if isinstance(outer, BottleneckBlock)
+        for block in outer.inner
+    ]
+    assert [block.conv1.in_channels for block in inner] == [4, 4, 4, 4]
+    assert [block.pool_linear is not None for block in inner] == [
+        False,
+        False,
+        True,
+        False,
+    ]
+
+
+@pytest.mark.parametrize("pool_channels, reaches", [(0, False), (2, True)])
+def test_global_pooling_carries_information_across_the_board(pool_channels, reaches):
+    # a basic block's two 3x3 convolutions reach two squares away; with global pooling a change
+    # in one corner of a 7x7 board reaches the opposite corner
+    block, state = eqx.nn.make_with_state(ResidualBlock)(
+        6, pool_channels, key=jax.random.PRNGKey(0)
+    )
+    block = eqx.nn.inference_mode(block)
+    x = np.abs(np.random.default_rng(0).normal(size=(6, 7, 7))).astype(np.float32)
+    y = x.copy()
+    y[:, 0, 0] += 1
+
+    def far_corner(x):
+        return block(jnp.asarray(x), state, jnp.dtype("float32"))[0][:, 6, 6]
+
+    assert np.allclose(far_corner(x), far_corner(y)) != reaches

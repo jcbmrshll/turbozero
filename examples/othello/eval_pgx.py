@@ -37,10 +37,9 @@ def main():
     )
     parser.add_argument("checkpoint", help="a checkpoint saved by train.py")
     parser.add_argument(
-        "--blocks", type=int, default=6, help="the checkpoint's network size"
-    )
-    parser.add_argument(
-        "--channels", type=int, default=128, help="the checkpoint's network size"
+        "--net",
+        default="resnet:6x128",
+        help="the checkpoint's network, as train.py's --net names it",
     )
     parser.add_argument(
         "--sims", type=int, default=64, help="our MCTS iterations a move"
@@ -57,7 +56,7 @@ def main():
     args = parser.parse_args()
 
     init_fn = make_xot_init_fn(load_xot(), standard_start_fraction=0)
-    network, params = load_checkpoint(args.checkpoint, args.blocks, args.channels)
+    network, params = load_checkpoint(args.checkpoint, args.net)
     agent = make_test_evaluator(make_nn_eval_fn(network, state_to_nn_input), args.sims)
     pretrained = make_nn_eval_fn_no_params_callable(
         pgx.make_baseline_model("othello_v0"), state_to_nn_input

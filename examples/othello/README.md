@@ -12,6 +12,8 @@ Othello model and against two strong open-source Othello engines,
 | `vs_engine.py` | Plays a checkpoint against Edax or Egaroucid at several levels, from XOT openings |
 | `engines.py` | Edax and Egaroucid, each driven over GTP, and what their searches made of each position, from their logs |
 | `setup_edax.sh`, `setup_egaroucid.sh` | Build the engines for `vs_engine.py` |
+| `engine_set.py`, `label_positions.py`, `score_engine_set.py` | The engine-labelled set: fixed positions with every legal move scored by Edax, to build, and to score checkpoints on (train.py scores the network on it every epoch) |
+| `bench_nets.py` | Times networks on their own: a forward pass at self-play's batch, a training step at training's |
 | `game.py` | What the scripts share: the environment, board symmetries, network, evaluators |
 | `xot.py`, `xot-openings.txt` | The XOT opening list |
 
@@ -58,12 +60,43 @@ self-play adds, whatever the size. With the defaults, 128 steps of 4096 samples
 against 1024 environments adding 1024 samples each, it's 0.5. `--train-steps` changes
 it (or `--train-batch`).
 
-On one RTX 5080, with the defaults (a 6-block, 128-channel network), an epoch takes
-about 63 seconds. One 200-epoch run (with epochs then taking about 70 seconds) passed
-every rung of the ladder by epoch 65. With `--inference-dtype bfloat16` the network
-computes in bfloat16 in self-play and test games (it still trains in float32), and an
-epoch takes about 36 seconds; searching with the same checkpoint, bfloat16 and float32
-play evenly.
+The network computes in bfloat16 by default: in self-play and test games
+(`--inference-dtype`), and its convolutions in training (`--train-dtype`, mixed precision:
+its parameters, BatchNorm and heads stay in float32). On one RTX 5080, with a 6-block,
+128-channel network computing in float32 throughout, an epoch takes about 63 seconds, and
+one 200-epoch run passed every rung of the ladder by epoch 65. bfloat16 in self-play and
+test games brings an epoch to about 36 seconds; searching with the same checkpoint,
+bfloat16 and float32 play evenly. bfloat16 training then takes each training step in less
+than half the time (a 10-block, 128-channel network's from 157 to 72 ms), and trained as
+well as float32 in a two-seed comparison.
+
+### The network
+
+`--net` names the network as KIND:DEPTHxWIDTH, then any of its configuration's fields
+as ,FIELD=VALUE (see `core/networks/spec.py`). The default, `resnet:6x128`, is the
+residual network from the AlphaZero paper with 6 blocks of 128 channels. Its variants
+(`AZResnetConfig`):
+
+- `heads=pooled`: KataGo's policy and value heads, which pool features over the whole
+  board (their mean and maximum) instead of flattening a 1-channel map.
+- `pool_every=N`: KataGo's global pooling bias in every Nth block: some of the
+  block's channels, pooled over the board, bias the rest. Othello's flips run along
+  whole lines, and this gives every square board-wide context for almost no compute.
+- `block=bottleneck`: KataGo's nested bottleneck blocks, a 1x1 convolution down to
+  half the width, a basic block (`bottleneck_inner` of them) and a 1x1 convolution
+  back up, which cost under a third of a basic block.
+
+`transformer:LAYERSxWIDTH` is a transformer with a token per square, after Leela Chess
+Zero's (`BoardTransformerConfig`): learned attention biases, optionally smolgen. On
+the GPU it is much slower per FLOP than the convolutions: `transformer:8x256` takes
+1.4 times the FLOPs of `resnet:10x128` and 2.9 times the forward time, and needs
+`--remat` to train at the default batch.
+
+`bench_nets.py` times networks as named here:
+
+```
+uv run examples/othello/bench_nets.py resnet:10x128 resnet:10x128,pool_every=3,heads=pooled
+```
 
 ### Training memory
 
@@ -193,7 +226,7 @@ uv run examples/othello/train.py --epochs 30 --init-from runs/trunk/state-150.np
 ## Evaluating a checkpoint
 
 Checkpoints from `train.py` are named after their epoch (`199.eqx` is the last of a
-200-epoch run). Pass the network size if it isn't the default.
+200-epoch run). Pass the run's `--net` if it isn't the default.
 
 ```
 uv run examples/othello/eval_pgx.py runs/othello/199.eqx --pgx-sims 64 256 1024
@@ -245,6 +278,49 @@ Restarted, it evaluates only the levels a checkpoint has no result for yet, at t
 and `--openings`. Our agent searches on the GPU next to training, taking only the memory it
 needs: with a 10-block network, 256 games against each of 3 levels take about 2 minutes and
 slow training's epochs by about half while they run.
+
+### Against Edax's scores of fixed positions
+
+Games against engines measure strength, but coarsely: 512 games give a score within about
+±0.02, and a run's score moves by more than that from training randomness alone. The
+engine-labelled set measures the network more finely, without search or games: thousands of
+fixed positions from self-play, past the XOT opening and with a choice of move, each legal
+move of which Edax has scored (the disc margin it expects at the end, searching 24 moves
+ahead and solving the last ~31 squares exactly).
+
+`train.py` scores the network on it every epoch and logs, for all positions and for each
+source and game phase (`opening`, 40-51 empty squares; `midgame`, 25-39; `endgame`, 1-24):
+
+- `engine_top1`: how often the network's most likely move is one of Edax's best
+- `engine_regret`: discs its most likely move gives up against Edax's best
+- `engine_exp_regret`: the same, averaged over its policy: smoother, and about three times
+  less noisy than `engine_regret` (a difference between two checkpoints on the same set is
+  good to about ±0.015 discs); the one to watch
+- `engine_value_mse`: its value's squared error against the outcome Edax predicts (±1, 0 for a
+  draw)
+- `engine_value_sign`: how often its value calls the winner Edax does
+
+Scoring takes a forward pass over the positions, about 20 ms for 5000 on the GPU.
+`--engine-set PATH` scores on another set, and `--engine-eval-every N` sets the cadence (0
+for never). Without a set at the default path, `~/.cache/turbozero/othello/engine-sets/edax-l24.npz`,
+training warns and goes on unscored; a missing `--engine-set` is an error.
+
+To build a set, from the replay buffers of saved training states (`--save-state-at`); each
+`--source` is a state, optionally only some of its environments:
+
+```
+examples/othello/setup_edax.sh                       # once
+taskset -c 16-23 uv run examples/othello/label_positions.py \
+    --source az10x128=runs/trunk/state-150.npz:896-1024 \
+    --source pooled4x64=runs/p4x64/state-450.npz --per-source 2500 --level 24 --workers 8
+```
+
+At level 24 a position takes about 2 seconds on average (up to a minute), so 5000 took 84
+minutes on 8 Edax processes. To score saved checkpoints on a set:
+
+```
+uv run examples/othello/score_engine_set.py runs/othello/49.eqx runs/othello/99.eqx --net resnet:10x128
+```
 
 ## Credits
 

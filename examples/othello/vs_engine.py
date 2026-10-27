@@ -302,10 +302,9 @@ def main():
     parser.add_argument("checkpoint", help="a checkpoint saved by train.py")
     parser.add_argument("--engine", choices=sorted(ENGINES), default="edax")
     parser.add_argument(
-        "--blocks", type=int, default=6, help="the checkpoint's network size"
-    )
-    parser.add_argument(
-        "--channels", type=int, default=128, help="the checkpoint's network size"
+        "--net",
+        default="resnet:6x128",
+        help="the checkpoint's network, as train.py's --net names it",
     )
     parser.add_argument(
         "--levels", type=int, nargs="+", default=[1, 2, 3, 4, 5, 6, 7, 8]
@@ -365,7 +364,7 @@ def main():
         parser.error(
             f"no {engine.name} in {engine_dir}: run examples/othello/{engine.setup_script}"
         )
-    network, params = load_checkpoint(args.checkpoint, args.blocks, args.channels)
+    network, params = load_checkpoint(args.checkpoint, args.net)
     evaluator = make_test_evaluator(
         make_nn_eval_fn(network, state_to_nn_input), args.sims, noise=False
     )
