@@ -1661,6 +1661,8 @@ def test_a_real_run_trains_and_reports_its_metrics(real_run):
         assert {
             "loss",
             "policy_loss",
+            "policy_target_entropy",
+            "policy_kl",
             "value_loss",
             "weight_norm",
             "update_ratio",

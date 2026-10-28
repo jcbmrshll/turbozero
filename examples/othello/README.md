@@ -227,6 +227,13 @@ estimated from the visited ones') rescaled to [0, 1] and scaled by
 steers only which moves the search explores, not the target. Tree positions keep the
 visit distribution, so the two options don't go together.
 
+`policy_loss`, the cross-entropy against those targets, is their entropy (logged as
+`policy_target_entropy`), which no network can lower, plus the KL divergence from them to the
+network's policy (`policy_kl`). The search sets the first: a deeper search, a kept tree or
+the completed-Q target train toward sharper or flatter targets. So `policy_loss` doesn't
+compare across runs that differ in those; `policy_kl` says how well each network fits its own
+targets, and the engine-set metrics how good its policy is.
+
 ### Resuming and forking runs
 
 Checkpoints hold only the network and optimizer state. `--save-state-at 50,150` also
