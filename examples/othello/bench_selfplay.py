@@ -22,6 +22,7 @@ import numpy as np
 from game import (
     DEFAULT_NET,
     SYMMETRY_TRANSFORM_FNS,
+    TRAVERSAL_STEPS,
     env,
     load_checkpoint,
     make_network,
@@ -120,7 +121,7 @@ def main():
     parser.add_argument(
         "--traversal-steps",
         type=int,
-        default=1,
+        default=TRAVERSAL_STEPS,
         help="as train.py's: steps a traversal takes between checks for its leaf",
     )
     parser.add_argument("--ckpt", default=None, help="checkpoint to play with")

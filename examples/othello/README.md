@@ -79,6 +79,12 @@ explored, and adds `--sims` iterations to its visits. `--no-persist-tree` starts
 an empty tree instead: an ablation of that reuse (a target then comes from `--sims` visits
 alone, all of them fresh, and the root's noise steers a whole search).
 
+`--traversal-steps` sets how many steps down the tree a search's traversal takes between
+checks for having reached its leaf: the search is the same whatever the number, but on GPU
+each check waits on the host, and the batch's traversals go on until its deepest is done.
+The default, 8, was the fastest of 1, 2, 4, 8 and 16 on one RTX 5080 (1024 games, 64 to 256
+sims), self-play 1.2 to 1.25 times as fast as with 1.
+
 `--buffer` sets replay memory, the samples kept per environment, which training samples
 from. Self-play adds 1024 an epoch (128 moves, each with its 7 symmetric copies), so the
 default 3000 is about the last 3 epochs. The run's page plots the samples training can

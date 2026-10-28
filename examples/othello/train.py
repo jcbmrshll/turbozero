@@ -56,6 +56,7 @@ from engine_set import EngineSet
 from game import (
     DEFAULT_NET,
     SYMMETRY_TRANSFORM_FNS,
+    TRAVERSAL_STEPS,
     WEIGHT_DECAY,
     env,
     episode_metrics,
@@ -171,7 +172,7 @@ def main():
     parser.add_argument(
         "--traversal-steps",
         type=int,
-        default=1,
+        default=TRAVERSAL_STEPS,
         help="steps down the tree a self-play search's traversal takes between checks for "
         "having reached its leaf: the same search whatever the number, but on GPU each check "
         "waits on the host, and more steps a check compute more past the leaf",
