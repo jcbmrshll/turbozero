@@ -3,6 +3,7 @@ action choice, tree reuse) called on small hand-built trees of a fixed-length en
 few whole searches on tic-tac-toe for what only a search shows: tactics, and its bookkeeping over
 many iterations, in a tree with room to spare and in one too small for it."""
 
+import re
 from dataclasses import replace
 
 import jax
@@ -863,6 +864,46 @@ def test_batched_cycles_match_each_trees_cycle_alone(env, cls):
             jax.tree.map(lambda x, i=i: x[i], batched),
             alone(keys[i], tree, cycles[i]),
         )
+
+
+def copies_in_loop(hlo: str, shape: str) -> list[str]:
+    """The copies of arrays whose shape starts with `shape` (e.g. "5,24") in the bodies of the
+    outermost while loops of compiled `hlo` (not in loops within them)."""
+    computations = re.split(r"\n(?=\S)", hlo)
+    (entry,) = [c for c in computations if c.startswith("ENTRY")]
+    bodies = set(re.findall(r"body=%?([\w.-]+)", entry))
+    copies = []
+    for computation in computations:
+        if computation.split(" ", 1)[0].lstrip("%") in bodies:
+            copies += re.findall(rf"= \w+\[{shape}[,\]]\S* copy\(.*", computation)
+    return copies
+
+
+@pytest.mark.parametrize(
+    "cls",
+    [
+        pytest.param(AZ_MCTS, id="AlphaZero(MCTS)"),
+        pytest.param(AZ_WEIGHTED, id="AlphaZero(WeightedMCTS)"),
+    ],
+)
+def test_search_cycles_write_the_trees_in_place(env, cls):
+    # a copy of an array of the trees' nodes in a cycle makes each cycle's cost grow with the
+    # trees' capacity: e.g. where the root's update reads what the iteration writes (or the other
+    # way round) and XLA doesn't order the reads first, it copies the arrays to read from.
+    # (WeightedMCTS's backpropagation is a loop within the cycle's, which under vmap selects its
+    # statistics every step, see `backprop_stats`)
+    batch, capacity = 5, 24
+    search = make_mcts(cls, max_nodes=capacity, eval_fn=state_eval_fn, num_iterations=6)
+    trees = jax.vmap(lambda _: search.init(template_embedding=env.init_fn(None)[0]))(
+        jnp.arange(batch)
+    )
+    run = jax.vmap(search_cycles(search, env, jnp.arange(search.search_cycles())))
+    keys = jax.random.split(jax.random.PRNGKey(0), batch)
+
+    hlo = jax.jit(run).lower(keys, trees).compile().as_text()
+
+    assert hlo is not None
+    assert copies_in_loop(hlo, f"{batch},{capacity}") == []
 
 
 # whole searches, on tic-tac-toe

@@ -222,7 +222,14 @@ class MCTS(Evaluator):
             params,
             jnp.where(at_root, root_eval_key, leaf_eval_key),
         )
-        state = self.expand_root(
+        # the leaf's update first: the root's writes the root's state, which doesn't depend on
+        # the traversal's reads of the tree, so XLA would copy the arrays they read (whole trees
+        # of states, every cycle) rather than order them before it. Either way round, only one
+        # of the two writes anything
+        state = self.expand(
+            expand_key, state, leaf, policy_logits, value, write=~at_root
+        )
+        return self.expand_root(
             root_key,
             state,
             env_state,
@@ -230,9 +237,6 @@ class MCTS(Evaluator):
             policy_logits,
             value,
             write=at_root,
-        )
-        return self.expand(
-            expand_key, state, leaf, policy_logits, value, write=~at_root
         )
 
     def search_output(
