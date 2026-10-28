@@ -124,6 +124,11 @@ SYMMETRY_TRANSFORM_FNS = [
 # convolutions (from 0.3 to 0.8, Adam's normalization making it uneven between weights)
 WEIGHT_DECAY = 0.5
 
+# steps down the tree an MCTS traversal takes between checks for its leaf (see
+# MCTS.traversal_steps): the fastest on GPU of 1, 2, 4, 8 and 16, with 1024 games of 64 to 256
+# sims (1.2x to 1.25x faster self-play than 1; 16 was slower again)
+TRAVERSAL_STEPS = 8
+
 # the network every script here defaults to: a ResNet of 6 blocks of 128 channels with
 # KataGo's global pooling, in every 2nd block and in the policy and value heads. Pooling
 # beat the AlphaZero paper's plain ResNet, resnet:6x128 before, against Edax and on the
@@ -225,4 +230,5 @@ def make_test_evaluator(eval_fn, num_iterations: int = 64, noise: bool = True) -
         action_selector=PUCTSelector(),
         temperature=0.0,
         dirichlet_epsilon=0.25 if noise else 0.0,
+        traversal_steps=TRAVERSAL_STEPS,
     )

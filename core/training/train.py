@@ -65,7 +65,8 @@ class CollectionState:
         moves: number of self-play moves made so far
         episode_metrics: sums over the terminated episodes of each metric `Trainer`'s
             `episode_metrics_fn` returns (empty without it)
-        move_key: rng of the move in progress, its search's and the move's (see `Trainer.search`)
+        move_key: rng of the move in progress, its search's and the move's (see
+            `Trainer.start_searches`)
         search_cycles: cycles the move's search has run so far (see `Evaluator.search_cycle`)
         tree_buffer_state: state of the replay buffer of search tree positions, None without them
         tree_written_at: for each entry of the tree position replay buffer, the number of moves made
@@ -674,22 +675,50 @@ class Trainer:
         key, evaluate_key = jax.random.split(key)
         return evaluate_key, key, tree_key
 
-    def search(
+    def start_searches(
         self,
         key: jax.Array,
+        state: CollectionState,
+        evaluator: Evaluator | None = None,
+    ) -> CollectionState:
+        """Starts the search for a move, if one starts: if the last one's `advance` played its
+        move (or none was in progress). `key` becomes the move's key (see
+        `CollectionState.move_key`), and the evaluator starts its search (see
+        `Evaluator.start_search`). Otherwise, the state is left as it is.
+
+        Args:
+            key: rng, for a move starting
+            state: current collection state
+            evaluator: (optional) the self-play evaluator, whose states `state` holds. If not
+                provided, the first in the schedule.
+
+        Returns:
+            CollectionState: updated collection state
+        """
+        if evaluator is None:
+            evaluator = self.collection_schedule.at(0)
+        starting = state.search_cycles == 0
+        move_key = jnp.where(starting, key, state.move_key)
+        evaluate_key, _, _ = self.move_keys(move_key)
+        return replace(
+            state,
+            eval_state=evaluator.start_search(
+                evaluate_key, state.eval_state, active=starting
+            ),
+            move_key=move_key,
+        )
+
+    def search(
+        self,
         state: CollectionState,
         params: Any,
         evaluator: Evaluator | None = None,
     ) -> CollectionState:
-        """Runs a cycle of the search for the move in progress (see `Evaluator.search_cycle`). A
-        search that is done goes on until `advance` plays its move: under vmap, its cycle is
-        computed anyway.
-
-        A move starts with the first cycle after the last one's `advance`: `key` becomes its key
-        (see `CollectionState.move_key`). It's unused otherwise.
+        """Runs a cycle of the search for the move in progress (see `Evaluator.search_cycle`),
+        which `start_searches` started. A search that is done goes on until `advance` plays its
+        move: under vmap, its cycle is computed anyway.
 
         Args:
-            key: rng, for a move starting this cycle
             state: current collection state
             params: model parameters
             evaluator: (optional) the self-play evaluator, whose states `state` holds. If not
@@ -700,8 +729,7 @@ class Trainer:
         """
         if evaluator is None:
             evaluator = self.collection_schedule.at(0)
-        move_key = jnp.where(state.search_cycles == 0, key, state.move_key)
-        evaluate_key, _, _ = self.move_keys(move_key)
+        evaluate_key, _, _ = self.move_keys(state.move_key)
         eval_state = evaluator.search_cycle(
             evaluate_key,
             state.eval_state,
@@ -712,10 +740,7 @@ class Trainer:
             self.env_step_fn,
         )
         return replace(
-            state,
-            eval_state=eval_state,
-            move_key=move_key,
-            search_cycles=state.search_cycles + 1,
+            state, eval_state=eval_state, search_cycles=state.search_cycles + 1
         )
 
     def advance(
@@ -857,15 +882,16 @@ class Trainer:
         params: Any,
         evaluator: Evaluator | None = None,
     ) -> CollectionState:
-        """A self-play cycle: `search`, then `advance`. With an evaluator that doesn't search a
-        cycle at a time (see `Evaluator.search_cycle`), a move.
+        """A self-play cycle: `start_searches` (with `key`), `search`, then `advance`. With an
+        evaluator that doesn't search a cycle at a time (see `Evaluator.search_cycle`), a move.
 
-        Args: see `search`.
+        Args: see `start_searches` and `search`.
 
         Returns:
             CollectionState: updated collection state
         """
-        state = self.search(key, state, params, evaluator)
+        state = self.start_searches(key, state, evaluator)
+        state = self.search(state, params, evaluator)
         return self.advance(state, params, evaluator)
 
     def store_tree_positions(
@@ -991,17 +1017,15 @@ class Trainer:
                 carry: tuple[CollectionState, jax.Array], num: int
             ) -> tuple[CollectionState, jax.Array]:
                 """`num` cycles of search, without playing any move: they only write the
-                trees, in place."""
-
-                def cycle(
-                    _: jax.Array, carry: tuple[CollectionState, jax.Array]
-                ) -> tuple[CollectionState, jax.Array]:
-                    state, started = carry
-                    starting = state.search_cycles == 0
-                    state = self.search(keys[started], state, params, evaluator)
-                    return state, started + starting
-
-                return jax.lax.fori_loop(0, num, cycle, carry)
+                trees, in place. Moves start only in the first (after an `advance`, or at the
+                call's start), so their searches start before it, rather than in every cycle."""
+                state, started = carry
+                starting = state.search_cycles == 0
+                state = self.start_searches(keys[started], state, evaluator)
+                state = jax.lax.fori_loop(
+                    0, num, lambda _, s: self.search(s, params, evaluator), state
+                )
+                return state, started + starting
 
             def chunk(
                 _: jax.Array, carry: tuple[CollectionState, jax.Array]
@@ -1018,8 +1042,9 @@ class Trainer:
                 chunk,
                 (state, jnp.array(0, dtype=jnp.int32)),
             )
-            state, _ = search(carry, num_cycles % advance_every)
-            return state
+            if num_cycles % advance_every:
+                carry = search(carry, num_cycles % advance_every)
+            return carry[0]
 
         return jax.vmap(collect_env)(key, state)
 

@@ -161,7 +161,23 @@ class Tree[NodeType]:
             Self: tree with the child's data stored.
         """
         self.check_data_type(data)
-        exists = self.is_edge(parent_index, edge_index)
+        child = self.edge_map[parent_index, edge_index]
+        evict_parent = self.parents[evict]
+        evict_edge = jnp.argmax(self.edge_map[evict_parent] == evict)
+        # everything read from the tree (`data` and `evict` included, which the caller reads from
+        # it), then the writes: the barrier makes the writes depend on every read. XLA otherwise
+        # needn't order a read before a write it doesn't feed, and copies the whole array to read
+        # from instead (every iteration, in a search's loop)
+        (
+            (child, evict, evict_parent, evict_edge, data),
+            (parents, edge_map, tree_data),
+        ) = jax.lax.optimization_barrier(
+            (
+                (child, jnp.asarray(evict), evict_parent, evict_edge, data),
+                (self.parents, self.edge_map, self.data),
+            )
+        )
+        exists = child != self.NULL_INDEX
         in_bounds = self.next_free_idx < self.capacity
         evicting = write & ~exists & ~in_bounds & (evict != self.NULL_INDEX)
         # an existing child stays where it is; a new one goes at the next free index, or in the
@@ -169,30 +185,25 @@ class Tree[NodeType]:
         # is out of bounds, so the writes below are no-ops
         index = jnp.where(
             write,
-            jnp.where(
-                exists,
-                self.edge_map[parent_index, edge_index],
-                jnp.where(evicting, evict, self.next_free_idx),
-            ),
+            jnp.where(exists, child, jnp.where(evicting, evict, self.next_free_idx)),
             self.capacity,
         )
         adding = write & ~exists & in_bounds
         # cut the evicted leaf from its parent (out of bounds, dropped, when not evicting)
-        evict_parent = self.parents[evict]
-        edge_map = self.edge_map.at[
-            jnp.where(evicting, evict_parent, self.capacity),
-            jnp.argmax(self.edge_map[evict_parent] == evict),
+        edge_map = edge_map.at[
+            jnp.where(evicting, evict_parent, self.capacity), evict_edge
         ].set(self.NULL_INDEX, mode="drop")
         return replace(
             self,
             next_free_idx=jnp.where(adding, self.next_free_idx + 1, self.next_free_idx),
             # an existing child's parent is already `parent_index`
-            parents=self.parents.at[index].set(parent_index),
-            # an edge that doesn't exist is NULL_INDEX already
+            parents=parents.at[index].set(parent_index),
+            # an edge that doesn't exist is NULL_INDEX already (the evicted leaf's edge isn't
+            # this one: the edge exists, or it has no child)
             edge_map=edge_map.at[parent_index, edge_index].set(
-                jnp.where(adding | evicting, index, edge_map[parent_index, edge_index])
+                jnp.where(adding | evicting, index, child)
             ),
-            data=jax.tree.map(lambda x, y: x.at[index].set(y), self.data, data),
+            data=jax.tree.map(lambda x, y: x.at[index].set(y), tree_data, data),
         )
 
     def leaves(self) -> jax.Array:
@@ -221,6 +232,8 @@ class Tree[NodeType]:
             Self: tree with the root node data set.
         """
         self.check_data_type(data)
+        # `data` (which the caller can read from the tree), then the writes (see `set_child`)
+        data, tree_data = jax.lax.optimization_barrier((data, self.data))
         # out of bounds, so dropped, when not writing
         index = jnp.where(write, self.ROOT_INDEX, self.capacity)
         return replace(
@@ -228,7 +241,7 @@ class Tree[NodeType]:
             next_free_idx=jnp.where(
                 write, jnp.maximum(self.next_free_idx, 1), self.next_free_idx
             ),
-            data=jax.tree.map(lambda x, y: x.at[index].set(y), self.data, data),
+            data=jax.tree.map(lambda x, y: x.at[index].set(y), tree_data, data),
         )
 
     def update_node(self, index: ArrayLike, data: NodeType) -> Self:
