@@ -60,6 +60,7 @@ def make_trainer(args) -> tuple[Trainer, tuple]:
         temperature=1.0,
         count_reused_visits=args.count_reused_visits,
         min_iterations=args.min_iterations,
+        traversal_steps=args.traversal_steps,
     )
     trainer = Trainer(
         batch_size=args.envs,
@@ -115,6 +116,12 @@ def main():
         type=int,
         default=0,
         help="with --count-reused-visits, the fewest iterations a search takes",
+    )
+    parser.add_argument(
+        "--traversal-steps",
+        type=int,
+        default=1,
+        help="as train.py's: steps a traversal takes between checks for its leaf",
     )
     parser.add_argument("--ckpt", default=None, help="checkpoint to play with")
     parser.add_argument(

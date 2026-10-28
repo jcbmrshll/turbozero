@@ -76,9 +76,10 @@ class Evaluator:
     # A search can also run a cycle at a time, as self-play runs it (see
     # `core.training.train.Trainer.collect_steps`): environments at different points of their
     # searches then make their network evaluations together, a cycle at a time. A move's search is
-    # `search_cycle` until `search_done` and its move is played (self-play checks for those every
-    # few cycles, and a search done in between goes on), then `search_output`, all with the move's
-    # key. An evaluator that doesn't search does all of it in `search_output`.
+    # `start_search`, then `search_cycle` until `search_done` and its move is played (self-play
+    # checks for those every few cycles, and a search done in between goes on), then
+    # `search_output`, all with the move's key. An evaluator that doesn't search does all of it in
+    # `search_output`.
 
     def search_cycles(self) -> int:
         """The most cycles a move's search takes: self-play's unit of compute."""
@@ -95,6 +96,20 @@ class Evaluator:
             jax.Array: whether to stop searching and play a move
         """
         return jnp.array(True)
+
+    def start_search(self, key: jax.Array, state: Any, active: ArrayLike = True) -> Any:  # pylint: disable=unused-argument
+        """What a search does once before its cycles, rather than in each (under vmap, all of a
+        cycle is computed in every cycle): nothing.
+
+        Args:
+            key: rng, the move's (as `evaluate`'s)
+            state: The internal state of the Evaluator.
+            active: (optional) whether a search starts; if not, `state` as it is
+
+        Returns:
+            pytree: The updated internal state of the Evaluator.
+        """
+        return state
 
     def search_cycle(  # pylint: disable=unused-argument
         self,

@@ -169,6 +169,14 @@ def main():
         "kept between moves, so it needs room for the reused subtree too)",
     )
     parser.add_argument(
+        "--traversal-steps",
+        type=int,
+        default=1,
+        help="steps down the tree a self-play search's traversal takes between checks for "
+        "having reached its leaf: the same search whatever the number, but on GPU each check "
+        "waits on the host, and more steps a check compute more past the leaf",
+    )
+    parser.add_argument(
         "--count-reused-visits",
         action="store_true",
         help="a self-play search stops once its root has --sims + 1 visits, those of the "
@@ -498,6 +506,7 @@ def main():
                     persist_tree=not args.no_persist_tree,
                     count_reused_visits=args.count_reused_visits,
                     min_iterations=args.min_iterations,
+                    traversal_steps=args.traversal_steps,
                     policy_target=CompletedQ(args.value_scale, args.maxvisit_init)
                     if args.policy_target == "completed-q"
                     else VisitCounts(),

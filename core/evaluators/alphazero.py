@@ -32,13 +32,25 @@ class _AlphaZero(MCTS):
             **super().get_config(),
         }
 
+    def root_noise(self, key: jax.Array, shape: tuple[int, ...]) -> jax.Array:
+        """Independent log-Gamma(alpha) draws, one per action, for `root_prior`'s Dirichlet noise.
+
+        Args:
+            key: rng
+            shape: (F,)
+
+        Returns:
+            jax.Array: the draws
+        """
+        return jax.random.loggamma(key, self.dirichlet_alpha, shape)
+
     def root_prior(
-        self, key: jax.Array, policy: jax.Array, action_mask: jax.Array
+        self, noise: jax.Array, policy: jax.Array, action_mask: jax.Array
     ) -> jax.Array:
         """The root's prior: the network's policy, with Dirichlet noise mixed in.
 
         Args:
-            key: rng
+            noise: the search's `root_noise`
             policy: the network's policy, 0 for illegal actions
             action_mask: the legal actions
 
@@ -49,8 +61,7 @@ class _AlphaZero(MCTS):
         # Dirichlet noise over the legal actions only, as in AlphaZero (its root has a child per legal move,
         # and each gets a share of the noise): the softmax of independent log-Gamma(alpha) draws is a
         # Dirichlet(alpha) sample, computed in log space so small alphas don't underflow
-        log_gamma = jax.random.loggamma(key, self.dirichlet_alpha, action_mask.shape)
-        dirichlet_noise = jax.nn.softmax(jnp.where(action_mask, log_gamma, min_logit))
+        dirichlet_noise = jax.nn.softmax(jnp.where(action_mask, noise, min_logit))
         # both are distributions over the legal actions, so their mix is too
         return ((1 - self.dirichlet_epsilon) * policy) + (
             self.dirichlet_epsilon * dirichlet_noise

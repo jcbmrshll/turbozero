@@ -45,6 +45,7 @@ class MCTS(Evaluator):
         count_reused_visits: bool = False,
         min_iterations: int = 0,
         policy_target: PolicyTarget | None = None,
+        traversal_steps: int = 1,
     ):
         """Initializes an MCTS evaluator.
 
@@ -75,7 +76,16 @@ class MCTS(Evaluator):
                 the visits of its own search (default: 0). At most `num_iterations`
             policy_target: (optional) what the policy trains towards, from the root of a finished
                 search (default: `VisitCounts`, its visit distribution)
+            traversal_steps: (optional) steps down the tree a traversal takes between checks for
+                having reached its leaf (default: 1). Steps past it change nothing, so the search is
+                the same whatever the number; but on GPU each check waits on the host, and under
+                vmap a traversal goes on until the deepest in the batch is done: more steps a check
+                wait less and compute more, and which is fastest depends on the trees' depth
         """
+        if traversal_steps < 1:
+            raise ValueError(
+                f"traversal_steps must be at least 1, got {traversal_steps}"
+            )
         if min_iterations < 0 or min_iterations > num_iterations:
             raise ValueError(
                 f"min_iterations must be 0 to num_iterations ({num_iterations}), "
@@ -92,6 +102,7 @@ class MCTS(Evaluator):
         self.temperature = temperature
         self.persist_tree = persist_tree
         self.policy_target = policy_target or VisitCounts()
+        self.traversal_steps = traversal_steps
 
     def get_config(self) -> dict:
         """Returns a config object for checkpoints."""
@@ -107,6 +118,7 @@ class MCTS(Evaluator):
             "count_reused_visits": self.count_reused_visits,
             "min_iterations": self.min_iterations,
             "policy_target_config": self.policy_target.get_config(),
+            "traversal_steps": self.traversal_steps,
         }
 
     def evaluate(
@@ -135,6 +147,7 @@ class MCTS(Evaluator):
         Returns:
             MCTSOutput: contains new tree state, selected action, root value, and policy weights
         """
+        eval_state = self.start_search(key, eval_state)
         # store current state metadata in the root node
         root_key, iterate_key, sample_key = jax.random.split(key, 3)
         eval_state = self.update_root(
@@ -177,6 +190,35 @@ class MCTS(Evaluator):
         visited = state.data.n[state.ROOT_INDEX] > self.num_iterations
         return done | (visited & (cycles >= 1 + self.min_iterations))
 
+    def start_search(
+        self, key: jax.Array, state: MCTSTree, active: ArrayLike = True
+    ) -> MCTSTree:
+        """Draws the root's noise (see `root_noise`) for the search for a move with key `key`, as
+        `evaluate` does first: a search a cycle at a time draws it once, rather than in every
+        cycle (under vmap, the root's update is computed in every cycle, see `search_cycle`).
+
+        Args: see `Evaluator.start_search`.
+
+        Returns:
+            MCTSTree: the tree, with its `root_noise`
+        """
+        root_key, _, _ = jax.random.split(key, 3)
+        _, noise_key = jax.random.split(root_key)
+        noise = self.root_noise(noise_key, state.root_noise.shape)
+        return replace(state, root_noise=jnp.where(active, noise, state.root_noise))
+
+    def root_noise(self, key: jax.Array, shape: tuple[int, ...]) -> jax.Array:  # pylint: disable=unused-argument
+        """The noise the root's prior takes (see `root_prior`): none.
+
+        Args:
+            key: rng
+            shape: (F,)
+
+        Returns:
+            jax.Array: the noise, float32
+        """
+        return jnp.zeros(shape, dtype=jnp.float32)
+
     def search_cycle(
         self,
         key: jax.Array,
@@ -187,8 +229,8 @@ class MCTS(Evaluator):
         params: Any,
         env_step_fn: EnvStepFn,
     ) -> MCTSTree:
-        """The root's evaluation (cycle 0), or an iteration: what `evaluate` does, a step at a
-        time, with the same keys. Either way, one network evaluation, so that a batch of searches
+        """The root's evaluation (cycle 0), or an iteration: what `evaluate` does after
+        `start_search`, a step at a time, with the same keys. Either way, one network evaluation, so that a batch of searches
         at different points evaluates the network once a cycle. Past `search_done`, more
         iterations, each with a key of its own.
 
@@ -316,7 +358,7 @@ class MCTS(Evaluator):
         """Populates the root node of an MCTSTree with the network's evaluation of it.
 
         Args:
-            key: rng, `update_root`'s
+            key: rng, `update_root`'s (the root's noise is `start_search`'s)
             tree: MCTSTree to update
             root_embedding: root environment state
             root_metadata: metadata of the root environment state
@@ -327,12 +369,11 @@ class MCTS(Evaluator):
         Returns:
             MCTSTree: updated MCTSTree
         """
-        _, prior_key = jax.random.split(key)
         policy_logits = jnp.where(
             root_metadata.action_mask, policy_logits, jnp.finfo(policy_logits).min
         )
         policy = self.root_prior(
-            prior_key, jax.nn.softmax(policy_logits), root_metadata.action_mask
+            tree.root_noise, jax.nn.softmax(policy_logits), root_metadata.action_mask
         )
         root_node = self.update_root_node(
             tree.data_at(tree.ROOT_INDEX), policy, value, root_embedding
@@ -346,12 +387,12 @@ class MCTS(Evaluator):
         return tree.set_root(root_node, write=write)
 
     def root_prior(
-        self, key: jax.Array, policy: jax.Array, action_mask: jax.Array
+        self, noise: jax.Array, policy: jax.Array, action_mask: jax.Array
     ) -> jax.Array:  # pylint: disable=unused-argument
         """The root's prior, from the network's policy over the legal actions: the policy itself.
 
         Args:
-            key: rng
+            noise: the search's `root_noise`
             policy: the network's policy, 0 for illegal actions
             action_mask: the legal actions
 
@@ -530,13 +571,24 @@ class MCTS(Evaluator):
             node_key = jax.random.fold_in(key, node_idx)
             return self.action_selector(node_key, tree, node_idx, self.discount)
 
-        # each iterration:
+        # each step, unless the traversal is already at its leaf:
         # - get the index of the child node connected to the chosen action
         # - choose the action to take from the child node
-        def body_fn(state: TraversalState) -> TraversalState:
+        def step(state: TraversalState) -> TraversalState:
+            descend = cond_fn(state)
             node_idx = tree.edge_map[state.parent, state.action]
             action = select(node_idx)
-            return TraversalState(parent=node_idx, action=action)
+            return TraversalState(
+                parent=jnp.where(descend, node_idx, state.parent),
+                action=jnp.where(descend, action, state.action),
+            )
+
+        # `traversal_steps` steps between checks of the loop's condition: on GPU each check waits
+        # on the host, and under vmap the loop runs until the deepest traversal in the batch is done
+        def body_fn(state: TraversalState) -> TraversalState:
+            for _ in range(self.traversal_steps):
+                state = step(state)
+            return state
 
         # choose the action to take from the root
         root_action = select(tree.ROOT_INDEX)

@@ -229,7 +229,15 @@ def test_dirichlet_noise_is_mixed_into_the_root_prior_over_legal_moves_only(
     keys = jax.random.split(jax.random.PRNGKey(0), 1024)
 
     priors = jax.jit(
-        jax.vmap(lambda key: root(search.update_root(key, tree, state, None, meta)).p)
+        jax.vmap(
+            lambda key: (
+                root(
+                    search.update_root(
+                        key, search.start_search(key, tree), state, None, meta
+                    )
+                ).p
+            )
+        )
     )(keys)
 
     np.testing.assert_allclose(priors.sum(axis=-1), 1.0, rtol=1e-5)
@@ -253,9 +261,9 @@ def test_the_root_keeps_the_networks_policy_without_the_noise(fixed_length_env):
     search = make_mcts(AZ_MCTS, num_actions=4, logits=logits, dirichlet_epsilon=0.5)
     state, meta = env.init_fn(jax.random.PRNGKey(0))
 
-    tree = search.update_root(
-        jax.random.PRNGKey(0), search.init(template_embedding=state), state, None, meta
-    )
+    key = jax.random.PRNGKey(0)
+    tree = search.start_search(key, search.init(template_embedding=state))
+    tree = search.update_root(key, tree, state, None, meta)
 
     assert not np.allclose(root(tree).p, masked_softmax(logits, mask))
     np.testing.assert_allclose(
@@ -636,6 +644,34 @@ def test_batched_iterations_match_iterating_each_tree_alone(env, cls):
         )
 
 
+@pytest.mark.parametrize("traversal_steps", [2, 3])
+def test_iterations_do_not_depend_on_the_traversals_steps_between_checks(
+    env, traversal_steps
+):
+    # batched, the trees' traversals end at different depths, and steps past a traversal's leaf
+    # (to the next check, or until the deepest in the batch is done) must change nothing
+    trees = [build_tree(make_mcts(max_nodes=16), env, nodes) for nodes in SHAPES]
+    trees = jax.tree.map(lambda *x: jnp.stack(x), *trees)
+    keys = jax.random.split(jax.random.PRNGKey(0), len(SHAPES))
+
+    def run(search):
+        return jax.jit(jax.vmap(iterations(search, env, 6)))(keys, trees)
+
+    assert_trees_equal(
+        run(
+            make_mcts(
+                max_nodes=16, eval_fn=varying_eval_fn, traversal_steps=traversal_steps
+            )
+        ),
+        run(make_mcts(max_nodes=16, eval_fn=varying_eval_fn)),
+    )
+
+
+def test_traversal_steps_is_at_least_1():
+    with pytest.raises(ValueError, match="traversal_steps"):
+        make_mcts(traversal_steps=0)
+
+
 @pytest.mark.parametrize("cls", BACKUPS)
 def test_iterations_do_not_depend_on_the_trees_capacity(env, cls):
     # with room to spare, a larger tree changes nothing: arrays of the tree's capacity (e.g. the path
@@ -672,7 +708,7 @@ def test_iterations_do_not_depend_on_the_trees_capacity(env, cls):
 
 def search_cycles(search, env, cycles):
     """`search`'s cycles `cycles`, one after another, of the search for a move with key `key` of
-    the position in the tree's root. In a loop: unrolled, XLA could compile each cycle for its
+    the position in the tree's root, after its `start_search`. In a loop: unrolled, XLA could compile each cycle for its
     number, and round differently."""
     root_state, root_meta = env.init_fn(jax.random.PRNGKey(0))
 
@@ -683,14 +719,15 @@ def search_cycles(search, env, cycles):
             )
             return tree, None
 
+        tree = search.start_search(key, tree)
         return jax.lax.scan(cycle, tree, jnp.asarray(cycles, dtype=jnp.int32))[0]
 
     return run
 
 
 def search_until_done(search, env):
-    """The cycles of the search for a move with key `key` of the position in the tree's root,
-    until it's done."""
+    """The search for a move with key `key` of the position in the tree's root: `start_search`,
+    then its cycles until it's done."""
     root_state, root_meta = env.init_fn(jax.random.PRNGKey(0))
 
     def run(key, tree):
@@ -704,7 +741,7 @@ def search_until_done(search, env):
         return jax.lax.while_loop(
             lambda carry: ~search.search_done(*carry),
             cycle,
-            (tree, jnp.array(0, dtype=jnp.int32)),
+            (search.start_search(key, tree), jnp.array(0, dtype=jnp.int32)),
         )[0]
 
     return run
@@ -866,17 +903,38 @@ def test_batched_cycles_match_each_trees_cycle_alone(env, cls):
         )
 
 
-def copies_in_loop(hlo: str, shape: str) -> list[str]:
-    """The copies of arrays whose shape starts with `shape` (e.g. "5,24") in the bodies of the
-    outermost while loops of compiled `hlo` (not in loops within them)."""
+def outer_loop_bodies(hlo: str) -> list[str]:
+    """The bodies of the outermost while loops of compiled `hlo` with a known trip count (e.g. a
+    scan; not the loops within them)."""
     computations = re.split(r"\n(?=\S)", hlo)
     (entry,) = [c for c in computations if c.startswith("ENTRY")]
-    bodies = set(re.findall(r"body=%?([\w.-]+)", entry))
-    copies = []
-    for computation in computations:
-        if computation.split(" ", 1)[0].lstrip("%") in bodies:
-            copies += re.findall(rf"= \w+\[{shape}[,\]]\S* copy\(.*", computation)
-    return copies
+    bodies = {
+        body
+        for line in entry.splitlines()
+        if " while(" in line and "known_trip_count" in line
+        for body in re.findall(r"body=%?([\w.-]+)", line)
+    }
+    return [c for c in computations if c.split(" ", 1)[0].lstrip("%") in bodies]
+
+
+def copies_in_loop(hlo: str, shape: str) -> list[str]:
+    """The copies of arrays whose shape starts with `shape` (e.g. "5,24") in `outer_loop_bodies`."""
+    return [
+        copy
+        for body in outer_loop_bodies(hlo)
+        for copy in re.findall(rf"= \w+\[{shape}[,\]]\S* copy\(.*", body)
+    ]
+
+
+def open_loops_in_loop(hlo: str) -> int:
+    """The while loops in `outer_loop_bodies` whose trip count XLA doesn't know: on GPU, each of
+    their trips waits on the host for their condition."""
+    return sum(
+        "known_trip_count" not in line
+        for body in outer_loop_bodies(hlo)
+        for line in body.splitlines()
+        if " while(" in line
+    )
 
 
 @pytest.mark.parametrize(
@@ -904,6 +962,30 @@ def test_search_cycles_write_the_trees_in_place(env, cls):
 
     assert hlo is not None
     assert copies_in_loop(hlo, f"{batch},{capacity}") == []
+
+
+@pytest.mark.parametrize(
+    "cls, loops",
+    [
+        pytest.param(AZ_MCTS, 1, id="AlphaZero(MCTS)"),
+        # and its backpropagation
+        pytest.param(AZ_WEIGHTED, 2, id="AlphaZero(WeightedMCTS)"),
+    ],
+)
+def test_a_search_cycle_loops_only_to_traverse(env, cls, loops):
+    # the root's noise is drawn once, before the cycles (its Gamma draws are rejection sampling,
+    # a loop until every draw in the batch is accepted)
+    search = make_mcts(cls, max_nodes=24, eval_fn=state_eval_fn, num_iterations=6)
+    trees = jax.vmap(lambda _: search.init(template_embedding=env.init_fn(None)[0]))(
+        jnp.arange(5)
+    )
+    run = jax.vmap(search_cycles(search, env, jnp.arange(search.search_cycles())))
+    keys = jax.random.split(jax.random.PRNGKey(0), 5)
+
+    hlo = jax.jit(run).lower(keys, trees).compile().as_text()
+
+    assert hlo is not None
+    assert open_loops_in_loop(hlo) == loops
 
 
 # whole searches, on tic-tac-toe
