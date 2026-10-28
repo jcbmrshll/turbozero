@@ -77,6 +77,15 @@ def test_masked_policy_loss_is_finite_and_ignores_illegal_logits():
     log_probs = jax.nn.log_softmax(jnp.where(mask, logits, -jnp.inf))
     expected = -jnp.where(mask, batch.policy_weights * log_probs, 0.0).sum(-1).mean()
     np.testing.assert_allclose(metrics["policy_loss"], expected, rtol=1e-6)
+    # the loss splits into the targets' entropy and the KL divergence from them (zero targets
+    # count for nothing in the entropy)
+    w = np.asarray(batch.policy_weights, dtype=np.float64)
+    entropy = -np.where(w > 0, w * np.log(np.where(w > 0, w, 1)), 0).sum(-1).mean()
+    np.testing.assert_allclose(metrics["policy_target_entropy"], entropy, rtol=1e-6)
+    np.testing.assert_allclose(
+        metrics["policy_kl"], float(expected) - entropy, rtol=1e-5, atol=1e-6
+    )
+    assert metrics["policy_kl"] > 0
     assert all(jnp.isfinite(g).all() for g in jax.tree.leaves(grads))
     np.testing.assert_array_equal(grads.logits[~mask], 0.0)
 

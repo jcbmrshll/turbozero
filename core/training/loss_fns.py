@@ -67,7 +67,20 @@ def az_default_loss_fn(
     # compute MSE value loss
     value_loss = optax.l2_loss(pred_value.squeeze(), target_value).mean()
 
+    # the policy loss is the targets' entropy, which no network can lower, plus the KL divergence
+    # from the targets to the network's policy: of the two, only the KL says how well the network
+    # fits its targets whatever they are (a search that changes them changes the entropy)
+    targets = experience.policy_weights
+    target_entropy = (
+        -jnp.where(targets > 0, targets * jnp.log(targets), 0.0).sum(-1).mean()
+    )
+
     # total loss
     loss = policy_loss + value_loss
-    aux_metrics = {"policy_loss": policy_loss, "value_loss": value_loss}
+    aux_metrics = {
+        "policy_loss": policy_loss,
+        "value_loss": value_loss,
+        "policy_target_entropy": target_entropy,
+        "policy_kl": policy_loss - target_entropy,
+    }
     return loss, (aux_metrics, nn_state)

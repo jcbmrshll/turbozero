@@ -78,6 +78,8 @@ def description(key):
     "key, says",
     [
         ("loss", "The loss training minimizes"),
+        ("policy_target_entropy", "no network can lower"),
+        ("policy_kl", "KL divergence"),
         ("learning_rate", "The learning rate"),
         ("episodes", "Self-play games that ended"),
         ("episode_draw", "drawn"),
