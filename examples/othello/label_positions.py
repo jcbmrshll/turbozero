@@ -44,8 +44,7 @@ def buffer_positions(
     path: str | Path, envs: tuple[int, int] | None = None
 ) -> tuple[np.ndarray, np.ndarray]:
     """The positions of a saved state's replay buffer (see `Trainer.save_state`): those of
-    finished games, without the data transforms' copies (each move stores its position, then
-    the copies).
+    finished games.
 
     Args:
         path: the state, state-<EPOCH>.npz
@@ -63,18 +62,12 @@ def buffer_positions(
         def get(name: str) -> np.ndarray:
             return saved[f"collection_state.{leaves['.buffer_state.' + name]}"]
 
-        stride = 1 + meta["config"]["data_transforms"]
-        if (get("next_idx") % stride).any():
-            raise ValueError(
-                f"{path}: the buffer's positions aren't in groups of {stride} (a position and "
-                "its copies)"
-            )
-        keep = (get("has_reward") & get("populated"))[:, ::stride]
+        keep = get("has_reward") & get("populated")
         if envs is not None:
             keep[: envs[0]] = False
             keep[envs[1] :] = False
-        obs = get("buffer.observation_nn")[:, ::stride][keep]
-        legal = get("buffer.policy_mask")[:, ::stride][keep]
+        obs = get("buffer.observation_nn")[keep]
+        legal = get("buffer.policy_mask")[keep]
     return obs, legal
 
 

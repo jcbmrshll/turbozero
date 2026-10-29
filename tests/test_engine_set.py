@@ -189,7 +189,7 @@ def test_build_samples_each_source_and_scores_every_legal_move():
         label_positions.build(sources, 7, level=10, workers=0, factory=fake_analyst)
 
 
-def write_state(path, observation, mask, has_reward, next_idx, transforms=1):
+def write_state(path, observation, mask, has_reward, next_idx):
     """A saved state with just what `buffer_positions` reads (see `Trainer.save_state`)."""
     leaves = [
         (".buffer_state.next_idx", next_idx),
@@ -199,7 +199,6 @@ def write_state(path, observation, mask, has_reward, next_idx, transforms=1):
         (".buffer_state.buffer.policy_mask", mask),
     ]
     meta = {
-        "config": {"data_transforms": transforms},
         "leaves": {
             "collection_state": [
                 [name, list(x.shape), str(x.dtype)] for name, x in leaves
@@ -213,28 +212,25 @@ def write_state(path, observation, mask, has_reward, next_idx, transforms=1):
     )
 
 
-def test_buffer_positions_are_the_finished_games_originals(tmp_path):
-    # 3 environments, 4 entries each: 2 moves of a position and its copy
+def test_buffer_positions_are_the_finished_games(tmp_path):
+    # 3 environments, 4 positions each
     observation = np.arange(3 * 4 * 128).reshape(3, 4, 8, 8, 2) % 2 == 0
     observation[:, :, 0, 0, 0] = np.arange(12).reshape(3, 4) % 3 == 0
     mask = np.zeros((3, 4, 65), bool)
     mask[..., 1] = True
-    has_reward = np.array([[1, 1, 1, 1], [1, 1, 0, 0], [0, 0, 0, 0]], bool)
+    has_reward = np.array([[1, 1, 1, 1], [1, 0, 0, 1], [0, 0, 0, 0]], bool)
     path = tmp_path / "state-1.npz"
-    write_state(path, observation, mask, has_reward, next_idx=np.array([0, 2, 2]))
+    write_state(path, observation, mask, has_reward, next_idx=np.array([0, 1, 2]))
 
     obs, legal = label_positions.buffer_positions(path)
     some_obs, _ = label_positions.buffer_positions(path, envs=(1, 3))
 
     np.testing.assert_array_equal(
-        obs, np.stack([observation[0, 0], observation[0, 2], observation[1, 0]])
+        obs,
+        np.concatenate([observation[0], observation[1, [0, 3]]]),
     )
-    assert legal.shape == (3, 65) and legal[:, 1].all()
-    np.testing.assert_array_equal(some_obs, observation[1, :1])
-
-    write_state(path, observation, mask, has_reward, next_idx=np.array([0, 1, 2]))
-    with pytest.raises(ValueError, match="groups of 2"):
-        label_positions.buffer_positions(path)
+    assert legal.shape == (6, 65) and legal[:, 1].all()
+    np.testing.assert_array_equal(some_obs, observation[1, [0, 3]])
 
 
 @pytest.mark.parametrize(
