@@ -10,13 +10,15 @@ swapped, so that two deterministic players give varied, balanced games. The same
 at the given level with its opening book off: at level L (up to 10) it searches L moves ahead,
 and solves the game exactly once 2L or fewer squares are empty. Our agent runs
 `--sims` MCTS iterations a move at temperature 0, keeping its search tree between moves,
-without the root noise used in self-play. This is how OLIVAW was compared with Edax
+without the root noise used in self-play, its network computing in `--dtype` (bfloat16,
+as in self-play, unless told otherwise). This is how OLIVAW was compared with Edax
 (https://arxiv.org/abs/2103.17228).
 
-Games are played in batches: our agent's moves are searched together on the
-accelerator, and each game has its own engine process (see `engines.py`): as many at a
-time as fit in a quarter of the available memory, up to 128, since the machine may be
-shared. Each game's result is checked against the engine's own board.
+Games are played in batches of equal size, each game with its own engine process (see
+`engines.py`): as many at a time as fit in a quarter of the available memory, up to 128,
+since the machine may be shared. The games of a batch move in step: the engine moves in
+all of them, then our agent's moves are searched together on the accelerator. Each game's
+result is checked against the engine's own board.
 
 With --episodes, the first game at each level is also saved for the monitor (see `watch.py`),
 as `{engine}_level{L}_sims{S}.npz`: its positions, what our agent's search made of each, and
@@ -183,17 +185,17 @@ class GameRecorder:
 
 
 def play_games(
-    engines, openings, we_black, search, advance, evaluator, pool, key, recorder=None
+    engines, openings, we_black, search, advance, evaluator, pool, keys, recorder=None
 ):
     """Plays one game per engine process, from `openings` (one per game), with our agent
-    as black in the games marked `we_black`, recording one of them with `recorder`.
+    as black in the games marked `we_black`, recording one of them with `recorder`. Each
+    game has its own key, of `keys`, so that its moves don't depend on the other games.
 
     Returns:
         our result in each game: +1 win, 0 draw, -1 loss
     """
     num_games = len(engines)
-    init_key, key = jax.random.split(key)
-    states = jax.vmap(env.init)(jax.random.split(init_key, num_games))
+    states = jax.vmap(env.init)(keys)
     trees = jax.vmap(lambda s: evaluator.init(template_embedding=s))(states)
     # pgx picks which player id moves first (black) at random
     black_id = np.asarray(states.current_player)
@@ -210,55 +212,58 @@ def play_games(
         if recorder is not None:
             recorder.moved(states)
 
-    ply = openings.shape[1]
+    # the games step in turn: wherever it's the engine's move, the engine moves, and only once
+    # it has moved in every game is our agent's move searched, in all of them at once. The
+    # players alternate (a pass is a move), so after the engine's first move as black the
+    # games stay in step, every search a move of ours
     while not np.asarray(states.terminated).all():
         done = np.asarray(states.terminated)
         mask = np.asarray(states.legal_action_mask)
-        ours = we_black == (ply % 2 == 0)
-        # our moves: every game is searched in one batch, the ones where it's the
-        # engine's turn are thrown away
-        search_key, key = jax.random.split(key)
-        out = search(jax.random.split(search_key, num_games), trees, states)
-        moves = np.where(ours, np.asarray(out.action), PASS).astype(np.int32)
-        # the engine's moves, all games at once (a side with no move passes without asking)
-        asking = [
-            g
-            for g in range(num_games)
-            if not ours[g] and not done[g] and not mask[g, PASS]
-        ]
-        replies = pool.map(
-            GTPEngine.genmove, [engines[g] for g in asking], [color(ply)] * len(asking)
-        )
-        for g, move in zip(asking, replies):
-            moves[g] = move
-        live = [g for g in range(num_games) if not done[g]]
-        assert mask[live, moves[live]].all(), "an illegal move"
-        # tell the engines our moves
-        moved = [g for g in live if ours[g]]
-        list(
-            pool.map(
-                GTPEngine.play,
-                [engines[g] for g in moved],
-                [color(ply)] * len(moved),
-                moves[moved],
+        to_move = np.asarray(states.current_player)
+        colors = np.where(to_move == black_id, "b", "w")
+        theirs = (to_move != our_id) & ~done
+        moves = np.full(num_games, PASS, dtype=np.int32)
+        # our agent's tree of each position moved from: the one it kept, or its search
+        trees_before = trees
+        asking = []
+        if theirs.any():
+            # the engine's moves, all games at once (a side with no move passes without
+            # asking)
+            movers = theirs
+            asking = [g for g in np.flatnonzero(theirs) if not mask[g, PASS]]
+            replies = pool.map(
+                GTPEngine.genmove, [engines[g] for g in asking], colors[asking]
             )
-        )
-        # keep the search trees of the games we just moved in, then step everything
-        kept = trees
-        trees = select(ours, out.eval_state, trees)
+            for g, move in zip(asking, replies):
+                moves[g] = move
+        else:
+            # our moves, every game in one batch
+            movers = ~done
+            # a key for each game and ply
+            out = search(
+                jax.vmap(jax.random.fold_in)(keys, states._step_count), trees, states
+            )
+            moves[movers] = np.asarray(out.action)[movers]
+            moved = np.flatnonzero(movers)
+            list(
+                pool.map(
+                    GTPEngine.play,
+                    [engines[g] for g in moved],
+                    colors[moved],
+                    moves[moved],
+                )
+            )
+            trees = trees_before = select(movers, out.eval_state, trees)
+        assert mask[movers, moves[movers]].all(), "an illegal move"
+        # step the games that moved; the others stay as they are
         new_trees, new_states = advance(trees, states, jnp.asarray(moves))
-        # finished games stay as they are
-        trees = select(done, trees, new_trees)
-        states = select(done, states, new_states)
-        if recorder is not None and not done[recorder.game]:
+        trees = select(movers, new_trees, trees)
+        states = select(movers, new_states, states)
+        if recorder is not None and movers[recorder.game]:
             g = recorder.game
-            # our agent's tree of the position: its search, or the one it kept
             recorder.moved(
-                states,
-                out.eval_state if ours[g] else kept,
-                engines[g].analysis if g in asking else None,
+                states, trees_before, engines[g].analysis if g in asking else None
             )
-        ply += 1
 
     results = np.asarray(states.rewards)[np.arange(num_games), our_id]
     # check every result against the engine's own board
@@ -307,6 +312,12 @@ def main():
         default=DEFAULT_NET,
         help="the checkpoint's network, as train.py's --net names it"
         " (resnet:6x128 for a run trained with the old default)",
+    )
+    parser.add_argument(
+        "--dtype",
+        default="bfloat16",
+        help="dtype the network computes in (bfloat16 is about twice as fast as float32, "
+        "and self-play computes in it too, see train.py's --inference-dtype)",
     )
     parser.add_argument(
         "--levels", type=int, nargs="+", default=[1, 2, 3, 4, 5, 6, 7, 8]
@@ -366,7 +377,7 @@ def main():
         parser.error(
             f"no {engine.name} in {engine_dir}: run examples/othello/{engine.setup_script}"
         )
-    network, params = load_checkpoint(args.checkpoint, args.net)
+    network, params = load_checkpoint(args.checkpoint, args.net, args.dtype)
     evaluator = make_test_evaluator(
         make_nn_eval_fn(network, state_to_nn_input), args.sims, noise=False
     )
@@ -388,9 +399,12 @@ def main():
     xot = load_xot(args.xot)
     num_games = 2 * args.openings
     parallel = min(num_games, args.parallel or max_parallel_games(engine))
+    # batches of equal size: a smaller last one would take about as long as a full one
+    parallel = -(-num_games // -(-num_games // parallel))
     rng = np.random.default_rng(args.seed)
     print(
-        f"{args.checkpoint}: {args.sims} MCTS iterations a move, against {engine.name} at "
+        f"{args.checkpoint}: {args.sims} MCTS iterations a move in {args.dtype}, against "
+        f"{engine.name} at "
         f"levels {args.levels}; {args.openings} XOT openings x both colors per level, "
         f"{parallel} games at a time",
         flush=True,
@@ -407,6 +421,9 @@ def main():
                 continue
             we_black = np.arange(num_games) % 2 == 0
             results = np.zeros(num_games, dtype=np.int32)
+            keys = jax.random.split(
+                jax.random.PRNGKey(args.seed * 100_000 + level * 1000), num_games
+            )
             # the first game of the first batch, its engine analysing
             recorder = GameRecorder(0, evaluator) if args.episodes else None
             for begin in range(0, num_games, parallel):
@@ -433,7 +450,7 @@ def main():
                         advance,
                         evaluator,
                         pool,
-                        jax.random.PRNGKey(args.seed * 100_000 + level * 1000 + begin),
+                        keys[games],
                         recorder=recording,
                     )
                 finally:
@@ -459,6 +476,7 @@ def main():
                         "engine": engine.name,
                         "level": level,
                         "sims": args.sims,
+                        "dtype": args.dtype,
                         "games": num_games,
                         "score": float(mean),
                         "se": float(se),

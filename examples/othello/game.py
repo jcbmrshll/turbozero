@@ -229,7 +229,9 @@ def make_test_evaluator(eval_fn, num_iterations: int = 64, noise: bool = True) -
     return AlphaZero(MCTS)(
         eval_fn=eval_fn,
         num_iterations=num_iterations,
-        max_nodes=num_iterations + 16,
+        # the tree is kept between moves: room for the subtree a search reuses, and its own
+        # iterations on top (as self-play's, see train.py's --tree-factor)
+        max_nodes=2 * num_iterations,
         branching_factor=env.num_actions,
         action_selector=PUCTSelector(),
         temperature=0.0,
