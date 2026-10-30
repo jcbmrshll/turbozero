@@ -488,7 +488,7 @@ class Trainer:
             extract_model_params_fn: (optional) function to extract model parameters from TrainState
             monitor: (optional) `seaglass.Monitor` to log metrics and test episodes to (see a tester's `episode_fn`),
                 e.g. `core.monitoring.Monitor`, whose runs are drawn with turbozero's views
-                - start a server with `seaglass serve --dir runs`; a run is created on the first `train_loop`,
+                - it logs to $SEAGLASS_URL, else slick's; a run is created on the first `train_loop`,
                   and later calls (e.g. continuing from `initial_state`) keep logging to it
             ckpt_dir: directory to save checkpoints
             max_checkpoints: maximum number of checkpoints to keep

@@ -15,7 +15,7 @@ from seaglass.bundle import problems, read_bundle
 
 from core.common import GameFrame
 from core.evaluators.mcts.state import SearchRecord
-from core.monitoring import VIEWS, Monitor
+from core.monitoring import SLICK_URL, VIEWS, Monitor
 from core.monitoring.episodes import (
     BOARDS,
     episode_type,
@@ -55,6 +55,15 @@ def test_run_is_logged_with_its_config_metrics_and_views(seaglass_server):
     assert meta["bundle"] == monitor.bundle_hash
     files = seaglass_server.get(f"/api/bundles/{meta['bundle']}")["files"]
     assert {f["path"] for f in files} == set(read_bundle(VIEWS))
+
+
+def test_runs_log_to_slick_unless_the_environment_names_a_server(monkeypatch):
+    monkeypatch.delenv("SEAGLASS_URL", raising=False)
+    monkeypatch.setenv("SEAGLASS_TAGS", "slick:ws/repo/task")
+    monitor = Monitor()
+    assert (monitor.url, monitor.tags) == (SLICK_URL, ["slick:ws/repo/task"])
+    monkeypatch.setenv("SEAGLASS_URL", "http://elsewhere:8008")
+    assert Monitor().url == "http://elsewhere:8008"
 
 
 def test_views_draw_every_board_games_episodes():

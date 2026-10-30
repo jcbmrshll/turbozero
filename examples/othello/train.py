@@ -17,8 +17,9 @@ the result at the end of the run (watch.py, see README.md). --eval-every N also 
 games every N epochs, on a ladder of opponents: a random player, a greedy tile counter, then
 pgx's pretrained Othello model searching more and more.
 
-Start a seaglass server first, in another shell, with `uv run seaglass serve --dir runs`
-(or set $SEAGLASS_URL to one that's running). The run's page shows the metrics, and with
+With --monitor the run logs to slick's seaglass server ($SEAGLASS_URL, set in a slick task;
+--monitor URL for another, e.g. `uv run seaglass serve --dir runs` at http://localhost:8008).
+The run's page shows the metrics, and with
 --eval-every which rung of the ladder the agent has reached, and a game against the last
 opponent it played, which it draws in the browser.
 
@@ -449,7 +450,7 @@ def main():
         const=DEFAULT_URL,
         default=None,
         metavar="URL",
-        help=f"log to a seaglass server (default {DEFAULT_URL}); start one with `uv run seaglass serve --dir runs`",
+        help=f"log to a seaglass server (default {DEFAULT_URL}: $SEAGLASS_URL, else slick's)",
     )
     args = parser.parse_args()
     if args.resume and args.ckpt_dir is None:

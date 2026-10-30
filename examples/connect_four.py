@@ -9,8 +9,8 @@ for comparison. See examples/othello.py for a walk-through of each component.
     uv run examples/connect_four.py
     uv run examples/connect_four.py --search mcts --monitor
 
-Start a seaglass server first, in another shell, with `uv run seaglass serve --dir runs`
-(or set $SEAGLASS_URL to one that's running).
+With --monitor the run logs to slick's seaglass server ($SEAGLASS_URL, set in a slick task;
+--monitor URL for another).
 
 The hyperparameters here are only an example; tune them for your task and hardware.
 """
@@ -87,7 +87,7 @@ def main():
         const=DEFAULT_URL,
         default=None,
         metavar="URL",
-        help=f"log to a seaglass server (default {DEFAULT_URL}); start one with `uv run seaglass serve --dir runs`",
+        help=f"log to a seaglass server (default {DEFAULT_URL}: $SEAGLASS_URL, else slick's)",
     )
     parser.add_argument(
         "--notes",

@@ -21,7 +21,6 @@ Othello model and against two strong open-source Othello engines,
 ## Training
 
 ```
-uv run seaglass serve --dir runs                    # optional: the run's page, in another shell
 uv run examples/othello/train.py --monitor --ckpt-dir runs/othello --notes "the baseline" &
 uv run examples/othello/watch.py runs/othello --pid $!   # Edax games once it ends
 ```
