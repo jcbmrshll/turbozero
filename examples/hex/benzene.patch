@@ -1,0 +1,12 @@
+diff --git a/src/hex/HexBoard.cpp b/src/hex/HexBoard.cpp
+index ea8b198..1e51cdd 100644
+--- a/src/hex/HexBoard.cpp
++++ b/src/hex/HexBoard.cpp
+@@ -79,6 +79,7 @@ HexPoint HexBoard::ComputeInferiorCells(HexColor color_to_move,
+ 	IceUtil::Update(m_inf, inf);
+ 	return reverser;
+     }
++    return INVALID_POINT;
+ }
+ 
+ void HexBoard::BuildVCs()

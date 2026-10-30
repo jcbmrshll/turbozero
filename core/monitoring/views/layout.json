@@ -3,6 +3,7 @@
   "renderers": {
     "turbozero/othello-episode": "episode.js",
     "turbozero/connect_four-episode": "episode.js",
+    "turbozero/hex-episode": "episode.js",
     "turbozero/tic_tac_toe-episode": "episode.js"
   },
   "tabs": [
