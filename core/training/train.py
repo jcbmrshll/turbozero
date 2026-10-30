@@ -14,6 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from jax.typing import ArrayLike
+from seaglass.client import to_number
 
 from core.common import step_env_and_evaluator, step_with_output
 from core.evaluators.evaluator import Evaluator
@@ -1368,11 +1369,16 @@ class Trainer:
         """Logs metrics to console and the monitor.
 
         Args:
-            metrics: dictionary of metrics
+            metrics: dictionary of metrics, and media for the monitor (e.g. a tester's
+                games, logged with its `log_fn`), which the console skips
             epoch: current epoch
         """
         # log to console
-        metrics_str = {k: f"{v.item():.4f}" for k, v in metrics.items()}
+        metrics_str = {
+            k: f"{number:.4f}"
+            for k, v in metrics.items()
+            if (number := to_number(v)) is not None
+        }
         print(f"Epoch {epoch}: {metrics_str}")
         # log to monitor
         if self.monitor is not None:

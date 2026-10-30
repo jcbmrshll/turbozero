@@ -13,7 +13,16 @@ openings (see xot.py), which keeps them varied.
 Every epoch it scores the network on the engine-labelled set, if there is one (see
 engine_set.py and --engine-set), logged as `engine_*`: `engine_exp_regret`, the discs its
 policy gives up against Edax's best move, is the one to watch. Games against Edax measure
-the result at the end of the run (watch.py, see README.md). --eval-every N also plays test
+strength: --vs-engine-every N plays them after every N epochs, and --vs-engine-last K after
+each of the last K epochs, logging the mean of those too (by default 512 games at level 8,
+searching 1000 iterations a move; see vs_engine.py and README.md):
+
+    uv run examples/othello/train.py --epochs 50 --monitor --vs-engine-last 3
+
+Each level's score is logged at the epoch of the network that played, as
+`edax_level8_sims1000` (with `_se`, `_win`, `_draw` and `_loss`), the mean as
+`edax_level8_sims1000_last3`, and the time the games took as `edax_seconds`, to take out of
+the run's wall time. --eval-every N also plays test
 games every N epochs, on a ladder of opponents: a random player, a greedy tile counter, then
 pgx's pretrained Othello model searching more and more.
 
@@ -31,7 +40,8 @@ pgx's model (our agent searching 64 iterations a move), it scored 0.82 against t
 searching 64, 0.74 against it searching 256, and 0.57 against it searching 1024
 (draws count half).
 
-Checkpoints go to --ckpt-dir; `eval_pgx.py` and `vs_engine.py` evaluate them further (see
+Checkpoints go to --ckpt-dir, with the results of games against the engine in
+`vs_engine.jsonl`; `eval_pgx.py` and `vs_engine.py` evaluate checkpoints further (see
 README.md). The hyperparameters here are only an example; tune them for your task and
 hardware.
 
@@ -54,6 +64,7 @@ from pathlib import Path
 import pgx
 from engine_set import DEFAULT_PATH as DEFAULT_ENGINE_SET
 from engine_set import EngineSet
+from engines import ENGINES
 from game import (
     DEFAULT_NET,
     SYMMETRY_TRANSFORM_FNS,
@@ -68,6 +79,7 @@ from game import (
     state_to_nn_input,
     step_fn,
 )
+from vs_engine import EngineMatch, EngineMatchTester, describe_scores
 from xot import load_xot, make_xot_init_fn, xot_episode_fn
 
 from core.evaluators.alphazero import AlphaZero
@@ -388,6 +400,50 @@ def main():
         "A forward pass over its positions: a fraction of a second",
     )
     parser.add_argument(
+        "--vs-engine-every",
+        type=int,
+        default=0,
+        metavar="N",
+        help="play games against --vs-engine after every N epochs, between epochs (0, the "
+        "default, for never), and log them to the run at the epoch of the network that "
+        "played (see vs_engine.py). At the defaults, 512 games at level 8 take minutes",
+    )
+    parser.add_argument(
+        "--vs-engine-last",
+        type=int,
+        default=0,
+        metavar="K",
+        help="play the games after each of the run's last K epochs too, and log their mean "
+        "at the last, as <name>_last<K>: one network's score drifts from its neighbours' "
+        "by more than the games' own noise (0, the default, for none)",
+    )
+    parser.add_argument(
+        "--vs-engine",
+        choices=sorted(ENGINES),
+        default="edax",
+        help="the engine to play",
+    )
+    parser.add_argument(
+        "--vs-engine-levels",
+        type=int,
+        nargs="+",
+        default=[8],
+        help="the engine's levels to play at",
+    )
+    parser.add_argument(
+        "--vs-engine-sims",
+        type=int,
+        default=1000,
+        help="our MCTS iterations a move in games against the engine",
+    )
+    parser.add_argument(
+        "--vs-engine-openings",
+        type=int,
+        default=256,
+        help="XOT openings a level in games against the engine, each played with both "
+        "colors: the same ones every time, and in every run",
+    )
+    parser.add_argument(
         "--ckpt-dir",
         default=None,
         help="where to save checkpoints (default: a new temporary directory)",
@@ -465,6 +521,8 @@ def main():
     if args.advance_every is None and args.count_reused_visits:
         # searches of varying lengths: see Trainer's advance_every
         args.advance_every = 5
+    if args.vs_engine_last > args.epochs:
+        parser.error("--vs-engine-last can't be more than --epochs")
     if args.policy_target == "completed-q" and args.tree_positions > 0:
         # a tree position's target is its visits: the network's policy before the
         # search isn't kept below the root
@@ -568,6 +626,37 @@ def main():
                 },
             )
         )
+    ckpt_dir = args.ckpt_dir or tempfile.mkdtemp(prefix="turbozero-othello-")
+    monitor = (
+        Monitor(args.monitor, project="othello", name=args.name, notes=args.notes)
+        if args.monitor
+        else None
+    )
+    # games against Edax (or Egaroucid), between epochs, in this process (see vs_engine.py)
+    if args.vs_engine_every > 0 or args.vs_engine_last > 0:
+        try:
+            match = EngineMatch(
+                network,
+                ENGINES[args.vs_engine],
+                args.vs_engine_levels,
+                args.vs_engine_sims,
+                args.vs_engine_openings,
+            )
+        except ValueError as e:
+            parser.error(str(e))
+        match_tester = EngineMatchTester(
+            match,
+            args.epochs,
+            every=args.vs_engine_every,
+            last=args.vs_engine_last,
+            # with a monitor, a game at each level for the run's page
+            record=monitor is not None,
+            results=Path(ckpt_dir) / "vs_engine.jsonl",
+            config={"dtype": args.inference_dtype},
+        )
+        testers.append(match_tester)
+        if monitor is not None:
+            describe_scores(monitor, match_tester.score_names())
 
     # each epoch collects `collection_steps_per_epoch` self-play steps in each of
     # `batch_size` environments, then takes `train_steps_per_epoch` training steps
@@ -609,12 +698,8 @@ def main():
         )
         if args.tree_positions > 0
         else None,
-        monitor=Monitor(
-            args.monitor, project="othello", name=args.name, notes=args.notes
-        )
-        if args.monitor
-        else None,
-        ckpt_dir=args.ckpt_dir or tempfile.mkdtemp(prefix="turbozero-othello-"),
+        monitor=monitor,
+        ckpt_dir=ckpt_dir,
         keep_every=args.keep_every,
         # how often self-play games are drawn
         episode_metrics_fn=episode_metrics,
@@ -635,7 +720,8 @@ def main():
     trainer.train_loop(
         seed=args.seed,
         num_epochs=args.epochs,
-        # each tester keeps its own cadence (--eval-every, --engine-eval-every)
+        # each tester keeps its own cadence (--eval-every, --engine-eval-every,
+        # --vs-engine-every and --vs-engine-last)
         eval_every=1,
         initial_state=trainer.resume() if args.resume else None,
         fork_from=args.init_from,

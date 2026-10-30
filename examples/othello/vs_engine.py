@@ -18,10 +18,16 @@ Games are played in batches of equal size, each game with its own engine process
 `engines.py`): as many at a time as fit in a quarter of the available memory, up to 128,
 since the machine may be shared. The games of a batch move in step: the engine moves in
 all of them, then our agent's moves are searched together on the accelerator. Each game's
-result is checked against the engine's own board.
+result is checked against the engine's own board. The engine processes run on the cores
+this process may use (e.g. with `taskset`), as many searching at once as there are cores.
 
-With --episodes, the first game at each level is also saved for the monitor (see `watch.py`),
-as `{engine}_level{L}_sims{S}.npz`: its positions, what our agent's search made of each, and
+train.py plays these games as it trains (`EngineMatchTester`, see its --vs-engine-every and
+--vs-engine-last), logging them to the run. Here, with --monitor and --run, a checkpoint's
+results are logged to its training run afterwards, at the checkpoint's epoch, as
+`{engine}_level{L}_sims{S}` (the score, and `_se`, `_win`, `_draw` and `_loss`).
+
+Logged to a run, the first game at each level goes with them, as
+`{engine}_level{L}_sims{S}_game`: its positions, what our agent's search made of each, and
 what the engine's made of those it moved from (see `engines.GTPEngine.analysis`), read from
 its logs as it plays: Edax's scores of every legal move, each with the line it expects after
 it, Egaroucid's of the move it plays. Edax's analyst (`engines.EdaxAnalyst`), a process of
@@ -33,9 +39,12 @@ import argparse
 import json
 import os
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from operator import methodcaller
 from pathlib import Path
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -56,7 +65,9 @@ from xot import XOT_PATH, load_xot
 
 from core.common import GameFrame
 from core.evaluators.evaluation_fns import make_nn_eval_fn
+from core.monitoring import DEFAULT_URL, Monitor
 from core.monitoring.episodes import BOARDS, line_record, pgx_two_player_episode
+from core.testing.tester import BaseTester, TestState
 
 # the most discs a game can be won by: an engine's score, a disc margin, over this is a value
 MAX_MARGIN = 64
@@ -294,11 +305,430 @@ def available_memory() -> int:
     return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
 
 
+def available_cpus() -> int:
+    """The cores this process may run on (and the engine processes it starts, which inherit
+    them, e.g. from `taskset`), or all of them where that can't be told."""
+    if hasattr(os, "sched_getaffinity"):
+        return len(os.sched_getaffinity(0))
+    return os.cpu_count() or 1
+
+
 def max_parallel_games(engine: type[GTPEngine], limit: int = 128) -> int:
     """How many engine processes to run at once: as many as fit in a quarter of the
     memory available now (the machine may be shared), up to `limit`."""
     fit = int(0.25 * available_memory() / engine.memory_per_process)
     return max(2, min(fit, limit) // 2 * 2)
+
+
+@dataclass(frozen=True)
+class LevelResult:
+    """Our agent's games against the engine at one level.
+
+    Attributes:
+        level: the engine's level
+        results: our result in each game: +1 win, 0 draw, -1 loss
+        we_black: which games we played black in
+        seconds: how long the games took (and recording the first, if it was)
+        episode: the first game, for the monitor, if it was recorded
+    """
+
+    level: int
+    results: np.ndarray
+    we_black: np.ndarray
+    seconds: float
+    episode: Arrays | None = None
+
+    def metrics(self, name: str) -> dict[str, Any]:
+        """What the monitor logs of it, under `name` (`EngineMatch.name`): the score, its
+        standard error, the fractions of games won, drawn and lost, and the game."""
+        mean, se = score(self.results)
+        metrics: dict[str, Any] = {
+            name: float(mean),
+            f"{name}_se": float(se),
+            f"{name}_win": float((self.results > 0).mean()),
+            f"{name}_draw": float((self.results == 0).mean()),
+            f"{name}_loss": float((self.results < 0).mean()),
+        }
+        if self.episode is not None:
+            metrics[f"{name}_game"] = self.episode
+        return metrics
+
+    def record(self, **extra: Any) -> dict[str, Any]:
+        """The result as a line of a results file: `extra` (e.g. which checkpoint played),
+        then the games' score, standard error, outcomes and duration."""
+        mean, se = score(self.results)
+        return {
+            **extra,
+            "level": self.level,
+            "games": len(self.results),
+            "score": float(mean),
+            "se": float(se),
+            "win": float((self.results > 0).mean()),
+            "draw": float((self.results == 0).mean()),
+            "loss": float((self.results < 0).mean()),
+            "seconds": round(self.seconds, 1),
+        }
+
+    def summary(self) -> str:
+        """A line for the console."""
+        mean, se = score(self.results)
+        black = score(self.results[self.we_black])[0]
+        white = score(self.results[~self.we_black])[0]
+        return (
+            f"level {self.level:2d}: score {mean:.3f} ± {se:.3f}  "
+            f"(win {(self.results > 0).mean():.3f}, draw {(self.results == 0).mean():.3f}, "
+            f"loss {(self.results < 0).mean():.3f}; as black {black:.2f}, "
+            f"as white {white:.2f})  {self.seconds:.0f}s"
+        )
+
+
+class EngineMatch:
+    """Our agent, `network` searching `sims` MCTS iterations a move, against an engine at
+    each of `levels`: 2 * `openings` games a level, from XOT openings each played with both
+    colors. The openings are drawn level by level from `seed`, so every network it plays
+    plays the same games, and so does every match with the same levels and seed, here or in
+    train.py (see `EngineMatchTester`).
+
+    The search is compiled once, for whatever parameters it's given: train.py plays the
+    network as it trains, epoch after epoch, without compiling again.
+    """
+
+    def __init__(
+        self,
+        network,
+        engine: type[GTPEngine],
+        levels: list[int],
+        sims: int,
+        openings: int,
+        engine_dir: Path | None = None,
+        seed: int = 0,
+        xot: str | Path = XOT_PATH,
+        parallel: int | None = None,
+    ):
+        """
+        Args:
+            network: the network (see game.make_network), computing in the dtype to play in
+            engine: the engine, of `engines.ENGINES`
+            levels: the levels to play at
+            sims: our MCTS iterations a move
+            openings: XOT openings a level, each played with both colors
+            engine_dir: where the engine is installed (default: its own default)
+            seed: draws the openings, and seeds the games
+            xot: the XOT opening list
+            parallel: games at a time (default: as many as fit in a quarter of the memory
+                available now, up to 128), in batches of equal size: the search compiles
+                for each size
+
+        Raises:
+            ValueError: if the engine isn't installed
+        """
+        self.engine = engine
+        self.engine_dir = engine_dir or engine.default_dir()
+        if not engine.installed(self.engine_dir):
+            raise ValueError(
+                f"no {engine.name} in {self.engine_dir}: run "
+                f"examples/othello/{engine.setup_script}"
+            )
+        self.levels = list(levels)
+        self.sims = sims
+        self.num_openings = openings
+        self.num_games = 2 * openings
+        self.seed = seed
+        parallel = min(self.num_games, parallel or max_parallel_games(engine))
+        # batches of equal size: a smaller last one would take about as long as a full one
+        self.parallel = -(-self.num_games // -(-self.num_games // parallel))
+        self.evaluator = make_test_evaluator(
+            make_nn_eval_fn(network, state_to_nn_input), sims, noise=False
+        )
+        evaluator = self.evaluator
+        self.search = jax.jit(
+            jax.vmap(
+                lambda k, tree, state, params: evaluator.evaluate(
+                    key=k,
+                    eval_state=tree,
+                    env_state=state,
+                    root_metadata=metadata(state),
+                    params=params,
+                    env_step_fn=step_fn,
+                ),
+                in_axes=(0, 0, 0, None),
+            )
+        )
+        self.advance = jax.jit(
+            jax.vmap(
+                lambda tree, state, a: (evaluator.step(tree, a), env.step(state, a))
+            )
+        )
+        xot_openings = load_xot(xot)
+        rng = np.random.default_rng(seed)
+        # game 2i plays opening i with us as black, game 2i+1 with us as white
+        self.openings = {
+            level: np.repeat(
+                xot_openings[
+                    rng.choice(len(xot_openings), size=openings, replace=False)
+                ],
+                2,
+                axis=0,
+            )
+            for level in self.levels
+        }
+
+    def name(self, level: int) -> str:
+        """What a level's result is logged as: `edax_level8_sims1000` and so on."""
+        return f"{self.engine.name}_level{level}_sims{self.sims}"
+
+    def play(self, params: Any, level: int, record: bool = False) -> LevelResult:
+        """Plays the games at `level`, our agent's network with `params` (as
+        `make_nn_eval_fn` takes them); with `record`, records the first for the monitor,
+        and has the engine's analyst (if it has one) score the positions it didn't move
+        from."""
+        start = time.perf_counter()
+        num_games = self.num_games
+        openings = self.openings[level]
+        we_black = np.arange(num_games) % 2 == 0
+        results = np.zeros(num_games, dtype=np.int32)
+        keys = jax.random.split(
+            jax.random.PRNGKey(self.seed * 100_000 + level * 1000), num_games
+        )
+
+        def search(k, trees, states):
+            return self.search(k, trees, states, params)
+
+        parallel = self.parallel
+        # the first game of the first batch, its engine analysing
+        recorder = GameRecorder(0, self.evaluator) if record else None
+        with ThreadPoolExecutor(max_workers=available_cpus()) as pool:
+            for begin in range(0, num_games, parallel):
+                games = slice(begin, min(begin + parallel, num_games))
+                count = games.stop - games.start
+                recording = recorder if begin == 0 else None
+                engines = list(
+                    pool.map(
+                        self.engine,
+                        [self.engine_dir] * count,
+                        [level] * count,
+                        [
+                            recording is not None and g == recording.game
+                            for g in range(count)
+                        ],
+                    )
+                )
+                try:
+                    results[games] = play_games(
+                        engines,
+                        openings[games],
+                        we_black[games],
+                        search,
+                        self.advance,
+                        self.evaluator,
+                        pool,
+                        keys[games],
+                        recorder=recording,
+                    )
+                finally:
+                    for e in engines:
+                        e.close()
+        episode = None
+        if recorder is not None:
+            analyst = ANALYSTS.get(self.engine.name)
+            analyst = analyst and analyst(self.engine_dir, level)
+            try:
+                episode = recorder.episode(analyst)
+            finally:
+                if analyst is not None:
+                    analyst.close()
+            episode.attrs = {"opponent": f"{self.engine.name} level {level}"}
+        return LevelResult(
+            level, results, we_black, time.perf_counter() - start, episode
+        )
+
+    def describe(self) -> dict[str, Any]:
+        """The match's settings, for a run's configuration."""
+        return {
+            "engine": self.engine.name,
+            "levels": self.levels,
+            "sims": self.sims,
+            "openings": self.num_openings,
+            "seed": self.seed,
+        }
+
+
+def describe_scores(monitor: Monitor, names: list[str]) -> None:
+    """Tells `monitor` that the metrics `names`, scores against an engine, are better
+    higher and headline numbers. declared.json describes them, but can't say which way is
+    better: its patterns for them also match the standard errors and fractions of draws
+    logged beside them, which would take it up."""
+    for name in names:
+        monitor.describe(name, better="higher", headline=True)
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class EngineMatchState(TestState):
+    """What an `EngineMatchTester` keeps of the last networks of a run it's played, to log
+    their mean once it has played them all. Kept with the run's saved state, so a resumed
+    run has them too.
+
+    Attributes:
+        results: (last, levels, games) our result in each game (+1, 0, -1) of the network
+            after each of the run's last epochs, the oldest first
+        played: (last,) which of them it has played
+    """
+
+    results: jax.Array
+    played: jax.Array
+
+
+class EngineMatchTester(BaseTester):
+    """Plays an `EngineMatch` as a run trains: on the network after every `every` epochs
+    (epochs every - 1, 2 * every - 1, ... counting from 0, as the run logs them), and after
+    each of the last `last` epochs of a run of `num_epochs`, logging the mean of those too,
+    at the last epoch, as `<name>_last<last>`, with its standard error (`_last<last>_se`):
+    how much it would move with other openings, each game's results averaged over the
+    networks first, since they all play the same games.
+
+    Each level's result is logged as soon as it's played (see `LevelResult.metrics`), at the
+    epoch of the network that played, then the time all of them took, as
+    `<engine>_seconds`, so that a run's training time can be told from its time playing.
+    With `results`, each is also appended to that file, as a line of JSON.
+
+    It plays in the training process, on the same accelerator, between epochs: the search
+    takes its memory from what the run has, and the engine processes it starts run on the
+    cores the run may use (see `available_cpus`).
+    """
+
+    def __init__(
+        self,
+        match: EngineMatch,
+        num_epochs: int,
+        every: int = 0,
+        last: int = 0,
+        record: bool = False,
+        results: Path | None = None,
+        config: dict | None = None,
+    ):
+        """
+        Args:
+            match: the games to play
+            num_epochs: epochs in the run
+            every: play after every this many epochs (0 for never)
+            last: play after each of the run's last this many epochs (0 for none)
+            record: record a game at each level for the monitor
+            results: (optional) also append each level's result to this file
+            config: (optional) recorded with the tester's configuration, e.g. the dtype
+                the network plays in; added to each result in `results` too
+        """
+        super().__init__(num_keys=1, name=match.engine.name)
+        if not 0 <= last <= num_epochs:
+            raise ValueError(f"last must be between 0 and {num_epochs}, got {last}")
+        self.match = match
+        self.num_epochs = num_epochs
+        self.every = every
+        self.last = last
+        self.record = record
+        self.results = results
+        self.extra_config = config or {}
+
+    def plays_at(self, epoch: int) -> bool:
+        """Whether it plays the network after `epoch` (counting from 0)."""
+        return (self.every > 0 and (epoch + 1) % self.every == 0) or (
+            epoch >= self.num_epochs - self.last
+        )
+
+    def mean_name(self, level: int) -> str:
+        return f"{self.match.name(level)}_last{self.last}"
+
+    def score_names(self) -> list[str]:
+        """The scores it logs (see `describe_scores`)."""
+        names = [self.match.name(level) for level in self.match.levels]
+        if self.last > 0:
+            names += [self.mean_name(level) for level in self.match.levels]
+        return names
+
+    def get_config(self) -> dict:
+        return {
+            **super().get_config(),
+            **self.match.describe(),
+            "every": self.every,
+            "last": self.last,
+            **self.extra_config,
+        }
+
+    def init(self, *args, **kwargs) -> EngineMatchState:
+        shape = (self.last, len(self.match.levels), self.match.num_games)
+        return EngineMatchState(
+            results=jnp.zeros(shape, dtype=jnp.int8),
+            played=jnp.zeros((self.last,), dtype=bool),
+        )
+
+    def last_metrics(self, state: EngineMatchState) -> dict[str, float]:
+        """The mean of each level's scores over the last networks played, and its standard
+        error."""
+        played = np.asarray(state.played)
+        results = np.asarray(state.results)[played]
+        metrics = {}
+        for i, level in enumerate(self.match.levels):
+            # each game's points, averaged over the networks
+            points = ((1 + np.sign(results[:, i])) / 2).mean(axis=0)
+            name = self.mean_name(level)
+            metrics[name] = float(points.mean())
+            metrics[f"{name}_se"] = float(points.std() / np.sqrt(len(points)))
+        return metrics
+
+    def run(  # pyright: ignore[reportIncompatibleMethodOverride]
+        self,
+        key: jax.Array,
+        epoch_num: int,
+        max_steps: int,
+        env_step_fn: Any,
+        env_init_fn: Any,
+        evaluator: Any,
+        state: EngineMatchState,
+        params: Any,
+        *args,
+        log_fn: Callable[[dict], None] | None = None,
+        activity_fn: Callable[[str], None] | None = None,
+    ) -> tuple[EngineMatchState, dict, None]:
+        """Plays the match at the epochs it's set to (see `BaseTester.run`), logging its
+        results with `log_fn` as they come; returns no metrics or episode of its own."""
+        if not self.plays_at(epoch_num):
+            return state, {}, None
+        start = time.perf_counter()
+        results = []
+        for level in self.match.levels:
+            if activity_fn is not None:
+                activity_fn(
+                    f"{self.match.num_games} games against {self.match.engine.name} "
+                    f"level {level}, {self.match.sims} sims"
+                )
+            result = self.match.play(params, level, record=self.record)
+            print(f"epoch {epoch_num}: {self.match.engine.name} {result.summary()}")
+            if log_fn is not None:
+                log_fn(result.metrics(self.match.name(level)))
+            if self.results is not None:
+                with open(self.results, "a") as f:
+                    record = result.record(
+                        epoch=epoch_num,
+                        engine=self.match.engine.name,
+                        sims=self.match.sims,
+                        **self.extra_config,
+                    )
+                    f.write(json.dumps(record) + "\n")
+            results.append(result.results)
+        metrics: dict[str, Any] = {
+            f"{self.match.engine.name}_seconds": time.perf_counter() - start
+        }
+        slot = epoch_num - (self.num_epochs - self.last)
+        if 0 <= slot < self.last:
+            state = EngineMatchState(
+                results=state.results.at[slot].set(np.stack(results).astype(np.int8)),
+                played=state.played.at[slot].set(True),
+            )
+            if epoch_num == self.num_epochs - 1:
+                metrics.update(self.last_metrics(state))
+        if log_fn is not None:
+            log_fn(metrics)
+        return state, {}, None
 
 
 def main():
@@ -363,138 +793,77 @@ def main():
         help="also append each level's result to this file, as a line of JSON",
     )
     parser.add_argument(
-        "--episodes",
-        type=Path,
+        "--monitor",
+        nargs="?",
+        const=DEFAULT_URL,
         default=None,
-        help="also save the first game at each level here, for the monitor",
+        metavar="URL",
+        help="also log each level's result, and a game at it, to the checkpoint's training "
+        f"run on a seaglass server (default {DEFAULT_URL}), at the checkpoint's epoch",
+    )
+    parser.add_argument(
+        "--run",
+        default=None,
+        help="with --monitor, the training run's id on the server",
     )
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
-
-    engine = ENGINES[args.engine]
-    engine_dir = args.engine_dir or engine.default_dir()
-    if not engine.installed(engine_dir):
-        parser.error(
-            f"no {engine.name} in {engine_dir}: run examples/othello/{engine.setup_script}"
-        )
-    network, params = load_checkpoint(args.checkpoint, args.net, args.dtype)
-    evaluator = make_test_evaluator(
-        make_nn_eval_fn(network, state_to_nn_input), args.sims, noise=False
-    )
-    search = jax.jit(
-        jax.vmap(
-            lambda k, tree, state: evaluator.evaluate(
-                key=k,
-                eval_state=tree,
-                env_state=state,
-                root_metadata=metadata(state),
-                params=params,
-                env_step_fn=step_fn,
+    epoch = None
+    if args.monitor:
+        if not args.run:
+            parser.error("--monitor needs --run, the id in train.py's seaglass link")
+        if not Path(args.checkpoint).stem.isdigit():
+            parser.error(
+                f"{args.checkpoint} isn't named after its epoch (as train.py's N.eqx)"
             )
+        epoch = int(Path(args.checkpoint).stem)
+
+    network, params = load_checkpoint(args.checkpoint, args.net, args.dtype)
+    try:
+        match = EngineMatch(
+            network,
+            ENGINES[args.engine],
+            args.levels,
+            args.sims,
+            args.openings,
+            engine_dir=args.engine_dir,
+            seed=args.seed,
+            xot=args.xot,
+            parallel=args.parallel,
         )
-    )
-    advance = jax.jit(
-        jax.vmap(lambda tree, state, a: (evaluator.step(tree, a), env.step(state, a)))
-    )
-    xot = load_xot(args.xot)
-    num_games = 2 * args.openings
-    parallel = min(num_games, args.parallel or max_parallel_games(engine))
-    # batches of equal size: a smaller last one would take about as long as a full one
-    parallel = -(-num_games // -(-num_games // parallel))
-    rng = np.random.default_rng(args.seed)
+    except ValueError as e:
+        parser.error(str(e))
+    monitor = None
+    if args.monitor:
+        monitor = Monitor(args.monitor, project="othello")
+        monitor.run_id = args.run
+        describe_scores(monitor, [match.name(level) for level in args.levels])
     print(
         f"{args.checkpoint}: {args.sims} MCTS iterations a move in {args.dtype}, against "
-        f"{engine.name} at "
-        f"levels {args.levels}; {args.openings} XOT openings x both colors per level, "
-        f"{parallel} games at a time",
+        f"{args.engine} at levels {args.levels}; {args.openings} XOT openings x both "
+        f"colors per level, {match.parallel} games at a time",
         flush=True,
     )
-
-    with ThreadPoolExecutor(max_workers=os.cpu_count()) as pool:
-        for level in args.levels:
-            start = time.perf_counter()
-            # game 2i plays opening i with us as black, game 2i+1 with us as white
-            openings = np.repeat(
-                xot[rng.choice(len(xot), size=args.openings, replace=False)], 2, axis=0
-            )
-            if level in args.skip_levels:
-                continue
-            we_black = np.arange(num_games) % 2 == 0
-            results = np.zeros(num_games, dtype=np.int32)
-            keys = jax.random.split(
-                jax.random.PRNGKey(args.seed * 100_000 + level * 1000), num_games
-            )
-            # the first game of the first batch, its engine analysing
-            recorder = GameRecorder(0, evaluator) if args.episodes else None
-            for begin in range(0, num_games, parallel):
-                games = slice(begin, min(begin + parallel, num_games))
-                count = games.stop - games.start
-                recording = recorder if begin == 0 else None
-                engines = list(
-                    pool.map(
-                        engine,
-                        [engine_dir] * count,
-                        [level] * count,
-                        [
-                            recording is not None and g == recording.game
-                            for g in range(count)
-                        ],
-                    )
+    for level in args.levels:
+        if level in args.skip_levels:
+            continue
+        result = match.play(params, level, record=monitor is not None)
+        if args.results is not None:
+            with open(args.results, "a") as f:
+                record = result.record(
+                    checkpoint=args.checkpoint,
+                    engine=args.engine,
+                    sims=args.sims,
+                    dtype=args.dtype,
                 )
-                try:
-                    results[games] = play_games(
-                        engines,
-                        openings[games],
-                        we_black[games],
-                        search,
-                        advance,
-                        evaluator,
-                        pool,
-                        keys[games],
-                        recorder=recording,
-                    )
-                finally:
-                    for e in engines:
-                        e.close()
-            if recorder is not None:
-                analyst = ANALYSTS.get(engine.name)
-                analyst = analyst and analyst(engine_dir, level)
-                try:
-                    episode = recorder.episode(analyst)
-                finally:
-                    if analyst is not None:
-                        analyst.close()
-                args.episodes.mkdir(parents=True, exist_ok=True)
-                name = f"{engine.name}_level{level}_sims{args.sims}.npz"
-                (args.episodes / name).write_bytes(episode.encode())
-            mean, se = score(results)
-            seconds = time.perf_counter() - start
-            if args.results is not None:
-                with open(args.results, "a") as f:
-                    record = {
-                        "checkpoint": args.checkpoint,
-                        "engine": engine.name,
-                        "level": level,
-                        "sims": args.sims,
-                        "dtype": args.dtype,
-                        "games": num_games,
-                        "score": float(mean),
-                        "se": float(se),
-                        "win": float((results > 0).mean()),
-                        "draw": float((results == 0).mean()),
-                        "loss": float((results < 0).mean()),
-                        "seconds": round(seconds, 1),
-                    }
-                    f.write(json.dumps(record) + "\n")
-            print(
-                f"  {engine.name} level {level:2d}: score {mean:.3f} ± {se:.3f}  "
-                f"(win {(results > 0).mean():.3f}, draw {(results == 0).mean():.3f}, "
-                f"loss {(results < 0).mean():.3f}; as black {score(results[we_black])[0]:.2f}, "
-                f"as white {score(results[~we_black])[0]:.2f})  {seconds:.0f}s",
-                flush=True,
-            )
-            if mean < args.stop_below:
-                break
+                f.write(json.dumps(record) + "\n")
+        if monitor is not None and epoch is not None:
+            monitor.log(epoch, result.metrics(match.name(level)))
+        print(f"  {args.engine} {result.summary()}", flush=True)
+        if score(result.results)[0] < args.stop_below:
+            break
+    if monitor is not None:
+        monitor.flush()
 
 
 if __name__ == "__main__":
