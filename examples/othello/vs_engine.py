@@ -10,13 +10,15 @@ swapped, so that two deterministic players give varied, balanced games. The same
 at the given level with its opening book off: at level L (up to 10) it searches L moves ahead,
 and solves the game exactly once 2L or fewer squares are empty. Our agent runs
 `--sims` MCTS iterations a move at temperature 0, keeping its search tree between moves,
-without the root noise used in self-play. This is how OLIVAW was compared with Edax
+without the root noise used in self-play, its network computing in `--dtype` (bfloat16,
+as in self-play, unless told otherwise). This is how OLIVAW was compared with Edax
 (https://arxiv.org/abs/2103.17228).
 
-Games are played in batches: our agent's moves are searched together on the
-accelerator, and each game has its own engine process (see `engines.py`): as many at a
-time as fit in a quarter of the available memory, up to 128, since the machine may be
-shared. Each game's result is checked against the engine's own board.
+Games are played in batches of equal size, each game with its own engine process (see
+`engines.py`): as many at a time as fit in a quarter of the available memory, up to 128,
+since the machine may be shared. The games of a batch move in step: the engine moves in
+all of them, then our agent's moves are searched together on the accelerator. Each game's
+result is checked against the engine's own board.
 
 With --episodes, the first game at each level is also saved for the monitor (see `watch.py`),
 as `{engine}_level{L}_sims{S}.npz`: its positions, what our agent's search made of each, and
@@ -312,6 +314,12 @@ def main():
         " (resnet:6x128 for a run trained with the old default)",
     )
     parser.add_argument(
+        "--dtype",
+        default="bfloat16",
+        help="dtype the network computes in (bfloat16 is about twice as fast as float32, "
+        "and self-play computes in it too, see train.py's --inference-dtype)",
+    )
+    parser.add_argument(
         "--levels", type=int, nargs="+", default=[1, 2, 3, 4, 5, 6, 7, 8]
     )
     parser.add_argument(
@@ -369,7 +377,7 @@ def main():
         parser.error(
             f"no {engine.name} in {engine_dir}: run examples/othello/{engine.setup_script}"
         )
-    network, params = load_checkpoint(args.checkpoint, args.net)
+    network, params = load_checkpoint(args.checkpoint, args.net, args.dtype)
     evaluator = make_test_evaluator(
         make_nn_eval_fn(network, state_to_nn_input), args.sims, noise=False
     )
@@ -395,7 +403,8 @@ def main():
     parallel = -(-num_games // -(-num_games // parallel))
     rng = np.random.default_rng(args.seed)
     print(
-        f"{args.checkpoint}: {args.sims} MCTS iterations a move, against {engine.name} at "
+        f"{args.checkpoint}: {args.sims} MCTS iterations a move in {args.dtype}, against "
+        f"{engine.name} at "
         f"levels {args.levels}; {args.openings} XOT openings x both colors per level, "
         f"{parallel} games at a time",
         flush=True,
@@ -467,6 +476,7 @@ def main():
                         "engine": engine.name,
                         "level": level,
                         "sims": args.sims,
+                        "dtype": args.dtype,
                         "games": num_games,
                         "score": float(mean),
                         "se": float(se),
