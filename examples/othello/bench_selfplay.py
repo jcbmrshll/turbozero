@@ -74,10 +74,8 @@ def make_trainer(args) -> tuple[Trainer, tuple]:
         loss_fn=az_default_loss_fn,
         optimizer=make_optimizer(1),
         evaluator=evaluator,
-        # room for every step's sample and its symmetric copies, and no more
-        memory_buffer=EpisodeReplayBuffer(
-            capacity=(args.warmup + args.steps) * (1 + len(SYMMETRY_TRANSFORM_FNS))
-        ),
+        # room for every step's position, and no more
+        memory_buffer=EpisodeReplayBuffer(capacity=args.warmup + args.steps),
         max_episode_steps=80,
         env_step_fn=step_fn,
         env_init_fn=make_xot_init_fn(load_xot(), 0.0),

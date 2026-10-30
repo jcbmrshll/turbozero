@@ -17,8 +17,9 @@ the result at the end of the run (watch.py, see README.md). --eval-every N also 
 games every N epochs, on a ladder of opponents: a random player, a greedy tile counter, then
 pgx's pretrained Othello model searching more and more.
 
-Start a seaglass server first, in another shell, with `uv run seaglass serve --dir runs`
-(or set $SEAGLASS_URL to one that's running). The run's page shows the metrics, and with
+With --monitor the run logs to slick's seaglass server ($SEAGLASS_URL, set in a slick task;
+--monitor URL for another, e.g. `uv run seaglass serve --dir runs` at http://localhost:8008).
+The run's page shows the metrics, and with
 --eval-every which rung of the ladder the agent has reached, and a game against the last
 opponent it played, which it draws in the browser.
 
@@ -246,9 +247,9 @@ def main():
     parser.add_argument(
         "--buffer",
         type=int,
-        default=3000,
-        help="replay memory: samples kept per environment (with the 7 symmetric copies "
-        "of each, 3000 is about 3 epochs of self-play)",
+        default=375,
+        help="replay memory: positions kept per environment (375 is about 3 epochs of "
+        "self-play). Training maps each position it samples through a random symmetry",
     )
     parser.add_argument(
         "--lr", type=float, default=1e-3, help="the initial learning rate"
@@ -361,7 +362,7 @@ def main():
         "--tree-buffer",
         type=int,
         default=None,
-        help="tree positions (with their symmetric copies) kept per environment (default: "
+        help="tree positions kept per environment (default: "
         "K times --buffer). Training samples those stored in the replay memory's span "
         "of self-play",
     )
@@ -449,7 +450,7 @@ def main():
         const=DEFAULT_URL,
         default=None,
         metavar="URL",
-        help=f"log to a seaglass server (default {DEFAULT_URL}); start one with `uv run seaglass serve --dir runs`",
+        help=f"log to a seaglass server (default {DEFAULT_URL}: $SEAGLASS_URL, else slick's)",
     )
     args = parser.parse_args()
     if args.resume and args.ckpt_dir is None:
@@ -586,7 +587,7 @@ def main():
             args.epochs * args.train_steps, args.lr, args.lr_final, args.weight_decay
         ),
         evaluator=evaluator,
-        # stores `capacity` samples for each of the `batch_size` environments
+        # stores `capacity` positions for each of the `batch_size` environments
         memory_buffer=EpisodeReplayBuffer(capacity=args.buffer),
         max_episode_steps=80,
         env_step_fn=step_fn,
@@ -595,7 +596,7 @@ def main():
         state_to_nn_input_fn=state_to_nn_input,
         testers=testers,
         evaluator_test=evaluator_test,
-        # add each sample's 7 symmetric copies
+        # training maps each sample through one of the board's 8 symmetries, at random
         data_transform_fns=SYMMETRY_TRANSFORM_FNS,
         tree_positions=TreePositions(
             per_move=args.tree_positions,

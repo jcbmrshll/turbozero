@@ -2,17 +2,20 @@
 turbozero talks to it, board symmetries, the network and optimizer, evaluators for
 test games, square names, and loading checkpoints."""
 
+from dataclasses import replace
 from typing import cast
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 import pgx
 
 from core.evaluators.alphazero import AlphaZero
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.mcts.mcts import MCTS
+from core.memory.replay_memory import BaseExperience
 from core.networks.spec import make_network as build_network
 from core.networks.spec import network_config
 from core.training.train import weight_decay_mask
@@ -84,33 +87,34 @@ def episode_metrics(rewards):
 
 
 def make_symmetry_transform_fn(quarter_turns: int, transpose: bool):
-    """A DataTransformFn that maps the board through one of its symmetries (an optional
-    transpose, then `quarter_turns` quarter turns), to generate an extra training sample
-    from each self-play step. Othello's rules don't change under any of the board's 8
-    symmetries. The policy mask and weights are mapped to match: only the first 64
-    actions are board squares, the 65th (pass) stays where it is."""
+    """A DataTransformFn that maps a training sample through one of the board's symmetries
+    (an optional transpose, then `quarter_turns` quarter turns). Othello's rules don't
+    change under any of the board's 8 symmetries, so training draws one at random for each
+    sample it takes from the replay buffer. The policy mask and weights are mapped to match
+    the observation's board planes: only the first 64 actions are board squares, the 65th
+    (pass) stays where it is."""
+    # idxs[r, c] is the square that ends up at (r, c)
+    idxs = np.arange(64).reshape(8, 8)
+    if transpose:
+        idxs = idxs.T
+    idxs = np.rot90(idxs, quarter_turns, axes=(0, 1))
+    action_ids = np.append(idxs.flatten(), PASS)
 
-    def transform_fn(mask, policy, state):
-        # we only use state.observation, no need to update the rest of the state fields
-        new_obs = state.observation
-        # idxs[r, c] is the square that ends up at (r, c)
-        idxs = jnp.arange(64).reshape(8, 8)
+    def transform_fn(experience: BaseExperience) -> BaseExperience:
+        obs = experience.observation_nn
         if transpose:
-            new_obs = jnp.swapaxes(new_obs, -3, -2)
-            idxs = idxs.T
-        new_obs = jnp.rot90(new_obs, quarter_turns, axes=(-3, -2))
-        idxs = jnp.rot90(idxs, quarter_turns, axes=(0, 1))
-        action_ids = jnp.arange(65).at[:64].set(idxs.flatten())
-        return (
-            mask[..., action_ids],
-            policy[..., action_ids],
-            state.replace(observation=new_obs),
+            obs = jnp.swapaxes(obs, -3, -2)
+        return replace(
+            experience,
+            observation_nn=jnp.rot90(obs, quarter_turns, axes=(-3, -2)),
+            policy_mask=experience.policy_mask[..., action_ids],
+            policy_weights=experience.policy_weights[..., action_ids],
         )
 
     return transform_fn
 
 
-# every symmetry but the identity: 7 extra samples per self-play step
+# every symmetry but the identity, which training draws from along with it
 SYMMETRY_TRANSFORM_FNS = [
     make_symmetry_transform_fn(quarter_turns, transpose)
     for transpose in (False, True)

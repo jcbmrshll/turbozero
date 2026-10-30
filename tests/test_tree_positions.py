@@ -132,12 +132,11 @@ def test_tree_targets_take_the_perspective_of_the_player_to_move(ttt, lost_searc
     # O's winning moves after each of X's moves
     o_wins = {5: {6}, 6: {5}, 7: {5, 6}}
     indices, valid = select_nodes(jax.random.PRNGKey(0), tree, num=16, min_visits=2)
-    samples, sample_valid = jax.jit(
-        lambda tree, indices, valid: tree_experiences(
-            tree, indices, valid, ttt.step_fn, ttt.state_to_nn_input
+    samples = jax.jit(
+        lambda tree, indices: tree_experiences(
+            tree, indices, ttt.step_fn, ttt.state_to_nn_input
         )
-    )(tree, indices, valid)
-    np.testing.assert_array_equal(sample_valid, valid)
+    )(tree, indices)
 
     # the network's values are all 0, so only game outcomes move q away from 0: the root is lost for X
     assert float(tree.data.q[tree.ROOT_INDEX]) < -0.5
@@ -207,38 +206,6 @@ def test_select_nodes_can_leave_out_the_reused_subtree():
     assert chosen(4) == [1, 2]
     # nothing to leave out
     assert chosen(tree.NULL_INDEX) == [1, 2, 4]
-
-
-def test_tree_experiences_transformed_copies(ttt, lost_search):
-    _, tree = lost_search
-    indices, valid = select_nodes(jax.random.PRNGKey(0), tree, num=4, min_visits=2)
-
-    def transpose(mask, policy, state):
-        # the board's transpose: square (r, c) <-> (c, r)
-        perm = jnp.arange(9).reshape(3, 3).T.reshape(-1)
-        return (
-            mask[perm],
-            policy[perm],
-            state.replace(observation=jnp.swapaxes(state.observation, 0, 1)),
-        )
-
-    samples, sample_valid = jax.jit(
-        lambda tree, indices, valid: tree_experiences(
-            tree, indices, valid, ttt.step_fn, ttt.state_to_nn_input, [transpose]
-        )
-    )(tree, indices, valid)
-    perm = np.arange(9).reshape(3, 3).T.reshape(-1)
-    assert samples.policy_weights.shape[0] == 8
-    np.testing.assert_array_equal(sample_valid, np.tile(valid, 2))
-    original = jax.tree.map(lambda x: x[:4], samples)
-    copy = jax.tree.map(lambda x: x[4:], samples)
-    np.testing.assert_array_equal(copy.policy_weights, original.policy_weights[:, perm])
-    np.testing.assert_array_equal(copy.policy_mask, original.policy_mask[:, perm])
-    np.testing.assert_array_equal(
-        copy.observation_nn, np.swapaxes(original.observation_nn, 1, 2)
-    )
-    for field in ("reward", "search_value", "cur_player_id"):
-        np.testing.assert_array_equal(getattr(copy, field), getattr(original, field))
 
 
 def test_tree_positions_batch_count_and_decay():

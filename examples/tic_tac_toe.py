@@ -17,9 +17,8 @@ opponent's blunders create, and the agent keeps losing some of its games.
     uv run examples/tic_tac_toe.py
     uv run examples/tic_tac_toe.py --monitor
 
-Start a seaglass server first, in another shell, with `uv run seaglass serve --dir runs`
-(or set $SEAGLASS_URL to one that's running). See examples/othello.py for a walk-through
-of each component.
+With --monitor the run logs to slick's seaglass server ($SEAGLASS_URL, set in a slick task;
+--monitor URL for another). See examples/othello.py for a walk-through of each component.
 """
 
 import argparse
@@ -105,7 +104,7 @@ def main():
         const=DEFAULT_URL,
         default=None,
         metavar="URL",
-        help=f"log to a seaglass server (default {DEFAULT_URL}); start one with `uv run seaglass serve --dir runs`",
+        help=f"log to a seaglass server (default {DEFAULT_URL}: $SEAGLASS_URL, else slick's)",
     )
     parser.add_argument(
         "--notes",
