@@ -28,9 +28,10 @@ packages = ["core"]
 include = ["core", "tests", "examples"]
 venvPath = "."
 venv = ".venv"
-# the Othello example's scripts import their sibling modules
+# the examples' scripts import their sibling modules
 executionEnvironments = [
     { root = "examples/othello", extraPaths = ["examples/othello"] },
+    { root = "examples/connect_four", extraPaths = ["examples/connect_four"] },
     # tests of the Othello example's modules import them as its scripts do
     { root = "tests", extraPaths = ["examples/othello"] },
 ]

@@ -15,7 +15,7 @@ It contains:
 
 #### *`turbozero`* is *_extendable_*:
  * see an [idea on twitter](https://twitter.com/ptrschmdtnlsn/status/1748800529608888362) for a simple tweak to MCTS?
-      * [implement it](https://github.com/jcbmrshll/turbozero/blob/main/core/evaluators/mcts/weighted_mcts.py) then [test it](https://github.com/jcbmrshll/turbozero/blob/main/examples/connect_four.py) by extending core components
+      * [implement it](https://github.com/jcbmrshll/turbozero/blob/main/core/evaluators/mcts/weighted_mcts.py) then [test it](https://github.com/jcbmrshll/turbozero/blob/main/examples/connect_four/train.py) by extending core components (`--search weighted`)
   
 #### *`turbozero`* is *_flexible_*:
  * easy to integrate with you custom JAX environment or neural network architecture.
@@ -35,7 +35,7 @@ This creates a `.venv` with all dependencies. If an NVIDIA GPU is present it ins
 Example training scripts live in `examples/`:
 ```
 uv run examples/othello/train.py   # AlphaZero, scored every epoch against Edax's scores of fixed positions
-uv run examples/connect_four.py    # AlphaZero with weighted MCTS on Connect Four
+uv run examples/connect_four/train.py   # AlphaZero, measured against a perfect solver; --search weighted for weighted MCTS
 uv run examples/tic_tac_toe.py     # sanity check: trains in a minute or two on CPU, tested against a random player
 ```
 Pass `--help` to see their options.
