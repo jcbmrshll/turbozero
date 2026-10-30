@@ -13,8 +13,8 @@ never draw them. They're what shows the things the model can't see, such as rati
 along chains of near neighbours and inflation against engines, so `uniform_fraction` of the
 draw keeps them going, at the cost of that much of the GPU.
 
-Engines are players like any other, except that two of them never play each other, and that
-`engines` can leave them out of new games altogether.
+Engines are players like any other, except that `engines` can leave them out of new games
+altogether.
 
 Other trade-offs, in `SchedulerConfig`: `width` trades information per game (narrow) against
 ties across the scale (wide).
@@ -113,19 +113,13 @@ def opponent_weights(
 
 
 def _allowed(config: SchedulerConfig, players: list[Player]) -> np.ndarray:
-    """(n, n) which pairs may play: not a player itself, a retired one, two engines, whose
-    games are all CPU and say nothing about the networks, or any engine while they're
-    left out."""
+    """(n, n) which pairs may play: not a player itself, a retired one, or any engine while
+    they're left out."""
     external = np.array([p.is_external for p in players])
     active = np.array([not p.retired for p in players])
     if not config.engines:
         active = active & ~external
-    return (
-        active[:, None]
-        & active[None, :]
-        & ~np.eye(len(players), dtype=bool)
-        & ~(external[:, None] & external[None, :])
-    )
+    return active[:, None] & active[None, :] & ~np.eye(len(players), dtype=bool)
 
 
 def _normalized(weights: np.ndarray) -> np.ndarray:

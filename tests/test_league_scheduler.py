@@ -159,10 +159,10 @@ def test_engines_can_be_left_out():
         assert 3 not in (p.a, p.b)
 
 
-def test_engines_only_play_networks():
+def test_engines_play_each_other():
     players = [*nets(2), engine(2), engine(3)]
-    for p in draws(SchedulerConfig(), known([0, 0, 0, 0]), players, count=100):
-        assert p.a < 2 or p.b < 2
+    picks = draws(SchedulerConfig(), known([0, 0, 0, 0], [10, 10, 200, 10]), players)
+    assert {2, 3} in [{p.a, p.b} for p in picks]
 
 
 def test_retired_players_get_no_games():
