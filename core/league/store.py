@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS networks (
     sha256 TEXT NOT NULL,
     net TEXT NOT NULL,
     run TEXT NOT NULL,
+    url TEXT,
     source TEXT NOT NULL,
     added REAL NOT NULL
 );
@@ -84,6 +85,7 @@ class Player:
         network: its network's name
         path: its network's checkpoint, in the store
         net: its network's spec (see `core.networks.spec`)
+        url: where to read about it, e.g. its training run's page (an engine's is its settings')
         external: its engine's name, if it's an engine (see `game.LeagueGame.external_player`)
         settings: its engine's settings, e.g. its level
         retired: whether it no longer plays new games (it stays rated)
@@ -96,6 +98,7 @@ class Player:
     network: str | None = None
     path: str | None = None
     net: str | None = None
+    url: str | None = None
     external: str | None = None
     settings: dict[str, Any] = field(default_factory=dict)
     retired: bool = False
@@ -214,6 +217,19 @@ class Store:
         assert cursor.lastrowid is not None
         return cursor.lastrowid
 
+    def set_network_url(self, name: str, url: str) -> None:
+        """Links `name` to `url`.
+
+        Raises:
+            ValueError: if there's no such network
+        """
+        with self.transaction() as db:
+            cursor = db.execute(
+                "UPDATE networks SET url = ? WHERE name = ?", (url, name)
+            )
+        if cursor.rowcount == 0:
+            raise ValueError(f"no network {name} in the store")
+
     def add_net_player(self, network: str, sims: int) -> int:
         """The player that is `network` searching `sims` iterations a move."""
         row = self.db.execute(
@@ -260,24 +276,28 @@ class Store:
         """Every player, in the order they were added."""
         rows = self.db.execute(
             "SELECT p.id, p.name, p.sims, p.external, p.settings, p.retired, "
-            "n.name AS network, n.path, n.net, n.run "
+            "n.name AS network, n.path, n.net, n.run, n.url "
             "FROM players p LEFT JOIN networks n ON n.id = p.network_id ORDER BY p.id"
         )
-        return [
-            Player(
-                id=row["id"],
-                name=row["name"],
-                run=row["run"] or row["external"],
-                sims=row["sims"],
-                network=row["network"],
-                path=row["path"],
-                net=row["net"],
-                external=row["external"],
-                settings=json.loads(row["settings"]),
-                retired=bool(row["retired"]),
+        players = []
+        for row in rows:
+            settings = json.loads(row["settings"])
+            players.append(
+                Player(
+                    id=row["id"],
+                    name=row["name"],
+                    run=row["run"] or row["external"],
+                    sims=row["sims"],
+                    network=row["network"],
+                    path=row["path"],
+                    net=row["net"],
+                    url=row["url"] or settings.get("url"),
+                    external=row["external"],
+                    settings=settings,
+                    retired=bool(row["retired"]),
+                )
             )
-            for row in rows
-        ]
+        return players
 
     def record_batch(
         self,
@@ -334,10 +354,12 @@ class Store:
         return {row[0] for row in rows}
 
     def batch_costs(self) -> list[tuple[int, int, int, float]]:
-        """(a, b, games, seconds) of each batch, leaving out those that compiled something."""
+        """(a, b, games, seconds) of each batch, leaving out those that compiled something
+        and results recorded from elsewhere, which took no time here."""
         rows = self.db.execute(
             "SELECT b.a_id, b.b_id, COUNT(g.id), b.seconds FROM batches b "
-            "JOIN games g ON g.batch_id = b.id WHERE b.compiled = 0 GROUP BY b.id"
+            "JOIN games g ON g.batch_id = b.id WHERE b.compiled = 0 AND b.seconds > 0 "
+            "GROUP BY b.id"
         )
         return [(row[0], row[1], row[2], row[3]) for row in rows]
 

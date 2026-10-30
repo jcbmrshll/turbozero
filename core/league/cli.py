@@ -1,7 +1,9 @@
 """The league's command line: a game's script hands its `LeagueGame` to `main`.
 
-add-network NAME CHECKPOINT --net SPEC --run RUN --sims 128 1000
+add-network NAME CHECKPOINT --net SPEC --run RUN --sims 128 1000 [--url URL]
+link NAME URL
 add-external NAME ENGINE --settings '{"level": 8}'
+add-result A B WINS DRAWS LOSSES --source SOURCE
 anchor NAME; retire NAME
 ratings
 start; stop
@@ -20,7 +22,7 @@ import numpy as np
 
 from core.league.game import LeagueGame
 from core.league.ratings import Ratings
-from core.league.store import Player, Store
+from core.league.store import GameRecord, Player, Store
 
 
 def leaderboard(players: list[Player], ratings: Ratings) -> str:
@@ -63,11 +65,26 @@ def main(make_game: Callable[[], LeagueGame], default_root: Path, argv=None) -> 
     add.add_argument("--net", required=True, help="the network's spec")
     add.add_argument("--run", required=True, help="the training run it came from")
     add.add_argument("--sims", type=int, nargs="+", required=True)
+    add.add_argument("--url", help="where to read about it, e.g. its run's page")
+
+    link = commands.add_parser("link", help="link a network to any URL")
+    link.add_argument("name")
+    link.add_argument("url")
 
     external = commands.add_parser("add-external", help="register an engine")
     external.add_argument("name")
     external.add_argument("engine")
     external.add_argument("--settings", type=json.loads, default={})
+
+    result = commands.add_parser(
+        "add-result", help="record a series played elsewhere, without its games' moves"
+    )
+    result.add_argument("a")
+    result.add_argument("b")
+    result.add_argument("wins", type=int, help="A's")
+    result.add_argument("draws", type=int)
+    result.add_argument("losses", type=int, help="A's")
+    result.add_argument("--source", required=True, help="where it's reported")
 
     anchor = commands.add_parser("anchor", help="the player the scale's zero is at")
     anchor.add_argument("name")
@@ -96,8 +113,17 @@ def main(make_game: Callable[[], LeagueGame], default_root: Path, argv=None) -> 
         store.add_network(args.name, args.checkpoint, args.net, args.run)
         for sims in args.sims:
             store.add_net_player(args.name, sims)
+        if args.url:
+            store.set_network_url(args.name, args.url)
+    elif args.command == "link":
+        store.set_network_url(args.name, args.url)
     elif args.command == "add-external":
         store.add_external_player(args.name, args.engine, args.settings)
+    elif args.command == "add-result":
+        a, b = players[args.a].id, players[args.b].id
+        outcomes = [1] * args.wins + [0] * args.draws + [-1] * args.losses
+        games = [GameRecord(a, b, -1, outcome, []) for outcome in outcomes]
+        store.record_batch(a, b, 0.0, False, args.source, "", games)
     elif args.command == "anchor":
         store.set_meta("anchor", players[args.name].id)
     elif args.command == "retire":

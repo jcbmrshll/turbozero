@@ -69,6 +69,25 @@ def get(url, path):
         return json.load(response)
 
 
+def test_a_network_links_to_its_url(store, url, tmp_path):
+    checkpoint = tmp_path / "net.eqx"
+    checkpoint.write_bytes(b"weights")
+    store.add_network("net", checkpoint, "resnet:4x64", "run")
+    store.add_net_player("net", 128)
+    store.set_network_url("net", "https://example.com/run/1")
+    players = get(url, "/api/summary")["players"]
+    assert {p["name"]: p["url"] for p in players} == {
+        "x": None,
+        "y": None,
+        "net@128": "https://example.com/run/1",
+    }
+
+
+def test_linking_an_unknown_network_fails(store):
+    with pytest.raises(ValueError):
+        store.set_network_url("nobody", "https://example.com")
+
+
 def test_summary_rates_the_players(url):
     summary = get(url, "/api/summary")
     assert summary["games"] == 2

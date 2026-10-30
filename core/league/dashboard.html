@@ -24,10 +24,10 @@
   }
 }
 * { box-sizing: border-box; }
-body { margin: 0; background: var(--surface); color: var(--ink);
+body { margin: 0; background: var(--surface); color: var(--ink); height: 100vh; display: flex; flex-direction: column;
   font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
 header { display: flex; flex-wrap: wrap; gap: 8px 24px; align-items: center; padding: 12px 20px;
-  border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 2; }
+  border-bottom: 1px solid var(--line); background: var(--panel); }
 h1 { font-size: 15px; font-weight: 600; margin: 0; }
 nav { display: flex; gap: 2px; }
 nav a { color: var(--ink-2); text-decoration: none; padding: 4px 10px; border-radius: 6px; }
@@ -37,7 +37,16 @@ nav a.on { color: var(--ink); background: var(--line); }
 #worker .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--ink-3); }
 #worker.playing .dot { background: var(--win); }
 #worker.waiting .dot { background: var(--s4); }
-main { padding: 20px; max-width: 1240px; margin: 0 auto; }
+.layout { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(380px, 480px) minmax(0, 1fr); }
+#sidebar { overflow-y: auto; border-right: 1px solid var(--line); background: var(--panel); }
+#sidebar th { position: sticky; top: 0; background: var(--panel); z-index: 1; }
+#sidebar tr.on { background: var(--line-strong); }
+main { padding: 20px; overflow-y: auto; min-width: 0; }
+@media (max-width: 900px) {
+  body { height: auto; }
+  .layout { display: block; }
+  #sidebar { max-height: 45vh; border-right: 0; border-bottom: 1px solid var(--line); }
+}
 h2 { font-size: 13px; font-weight: 600; color: var(--ink-2); margin: 28px 0 10px; }
 h2:first-child { margin-top: 0; }
 .tiles { display: flex; flex-wrap: wrap; gap: 28px; margin-bottom: 20px; }
@@ -57,6 +66,7 @@ tbody tr.link:hover { background: var(--line); }
 td.dim, .dim { color: var(--ink-3); }
 a.name { color: inherit; text-decoration: none; }
 a.name:hover { text-decoration: underline; }
+a.run { color: var(--accent); }
 .tag { font-size: 11px; color: var(--ink-2); border: 1px solid var(--line-strong); border-radius: 4px; padding: 0 5px; margin-left: 6px; }
 .w { color: var(--win); } .l { color: var(--loss); } .d { color: var(--draw); }
 .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 14px; }
@@ -93,14 +103,13 @@ button:disabled { opacity: .4; cursor: default; }
 <header>
   <h1 id="title">Elo league</h1>
   <nav id="nav">
-    <a href="#leaderboard">Leaderboard</a>
+    <a href="#overview">Overview</a>
     <a href="#networks">Networks</a>
-    <a href="#pair">Head to head</a>
     <a href="#games">Games</a>
   </nav>
   <div id="worker"><span class="dot"></span><span id="worker-text"></span></div>
 </header>
-<main id="main"></main>
+<div class="layout"><aside id="sidebar"></aside><main id="main"></main></div>
 <div id="tip"></div>
 <script type="module">
 import board from "/game.js";
@@ -151,36 +160,47 @@ function drawWorker() {
   document.getElementById("worker-text").textContent = text;
 }
 
-function name(player) {
-  return el("a", { class: "name", href: `#pair/${player.id}` }, player.name);
+function runOf(player) {
+  if (!player.url) return player.run;
+  return el("a", { class: "name run", href: player.url, target: "_blank", rel: "noreferrer" }, player.run);
 }
 
-function drawLeaderboard() {
+function tagOf(player) {
+  // an external player that doesn't play here has only its reported results
+  const label = player.external ? (player.retired ? "external" : "engine") : player.retired ? "retired" : null;
+  return label && el("span", { class: "tag" }, label);
+}
+
+function selectedPlayer() {
+  const [page, a] = location.hash.slice(1).split("/");
+  return page === "player" && a ? Number(a) : null;
+}
+
+function drawSidebar() {
   const players = [...summary.players].sort((a, b) => {
     // whoever hasn't played has no rating to sort by
     if (!a.games !== !b.games) return a.games ? -1 : 1;
     const [x, y] = [a[sortKey] ?? "", b[sortKey] ?? ""];
     return (x < y ? -1 : x > y ? 1 : 0) * sortDir;
   });
-  const anchor = summary.anchor ? byId(summary.anchor) : null;
-  const columns = [
-    ["elo", "Rating", true], ["sd", "±", true], ["games", "Games", true],
-    ["sims", "Sims", true], ["name", "Player", false], ["run", "Run", false],
-  ];
+  const selected = selectedPlayer();
+  const columns = [["elo", "Rating", true], ["sd", "±", true], ["games", "Games", true], ["name", "Player", false]];
   const head = el("tr", {}, el("th", { class: "num" }, "#"), ...columns.map(([key, label, num]) =>
     el("th", {
       class: num ? "num" : "", "data-sort": key,
-      on: { click: () => { if (sortKey === key) sortDir = -sortDir; else { sortKey = key; sortDir = -1; } drawLeaderboard(); } },
+      on: { click: () => { if (sortKey === key) sortDir = -sortDir; else { sortKey = key; sortDir = -1; } drawSidebar(); } },
     }, label + (sortKey === key ? (sortDir < 0 ? " ↓" : " ↑") : ""))));
-  const rows = players.map((p, i) => el("tr", { class: "link", on: { click: () => { location.hash = `#pair/${p.id}`; } } },
+  const rows = players.map((p, i) => el("tr", { class: p.id === selected ? "link on" : "link", on: { click: () => { location.hash = `#player/${p.id}`; } } },
     el("td", { class: "num dim" }, String(i + 1)),
     el("td", { class: "num" }, p.games ? elo(p.elo) : "–"),
     el("td", { class: "num dim" }, p.games ? p.sd.toFixed(0) : "–"),
     el("td", { class: "num" }, String(p.games)),
-    el("td", { class: "num dim" }, p.sims === null ? "" : String(p.sims)),
-    el("td", {}, name(p), p.external ? el("span", { class: "tag" }, "engine") : null,
-      p.retired ? el("span", { class: "tag" }, "retired") : null),
-    el("td", { class: "dim" }, p.run)));
+    el("td", {}, p.name, tagOf(p))));
+  document.getElementById("sidebar").replaceChildren(el("table", {}, el("thead", {}, head), el("tbody", {}, ...rows)));
+}
+
+function drawOverview() {
+  const anchor = summary.anchor ? byId(summary.anchor) : null;
   main.replaceChildren(
     el("div", { class: "tiles" },
       tile(String(summary.players.length), "players"),
@@ -189,7 +209,6 @@ function drawLeaderboard() {
       tile(anchor ? anchor.name : "mean", "at 0"),
       tile(`±${Math.max(0, ...summary.players.filter((p) => !p.external && !p.retired).map((p) => p.sd)).toFixed(0)}`, "worst network"),
       tile(String(summary.parts), summary.parts === 1 ? "part" : "parts")),
-    el("div", { class: "card" }, el("table", {}, el("thead", {}, head), el("tbody", {}, ...rows))),
     el("h2", {}, "Recent batches"),
     el("div", { class: "card" }, el("table", {},
       el("thead", {}, el("tr", {}, el("th", {}, "Pair"),
@@ -223,10 +242,10 @@ function drawNetworks() {
       const any = [...entries.values()][0];
       return el("tr", {},
         el("td", {}, el("i", { style: `display:inline-block;width:14px;height:2px;margin-right:7px;vertical-align:middle;background:${color.get(network)}` }), network),
-        el("td", { class: "dim" }, any.run), el("td", { class: "dim" }, any.net),
+        el("td", { class: "dim" }, runOf(any)), el("td", { class: "dim" }, any.net),
         ...sims.map((s) => {
           const p = entries.get(s);
-          return el("td", { class: "num" }, p ? el("a", { class: "name", href: `#pair/${p.id}` }, `${elo(p.elo)} `, el("span", { class: "dim" }, `±${p.sd.toFixed(0)}`)) : "");
+          return el("td", { class: "num" }, p ? el("a", { class: "name", href: `#player/${p.id}` }, `${elo(p.elo)} `, el("span", { class: "dim" }, `±${p.sd.toFixed(0)}`)) : "");
         }));
     })));
 
@@ -312,16 +331,21 @@ function wdl(r) {
 }
 function points(r) { const n = r.w + r.d + r.l; return n ? (r.w + r.d / 2) / n : null; }
 
-async function drawPair(aId, bId) {
-  const players = [...summary.players].sort((p, q) => q.elo - p.elo);
-  aId = aId ?? players[0]?.id;
-  if (aId === undefined) { main.replaceChildren(); return; }
-  const options = (selected) => players.map((p) => { const o = el("option", { value: p.id }, p.name); if (p.id === selected) o.selected = true; return o; });
-  const onChange = () => { location.hash = `#pair/${selA.value}${selB.value ? `/${selB.value}` : ""}`; };
-  const selA = el("select", { on: { change: onChange } }, ...options(aId));
-  const selB = el("select", { on: { change: onChange } }, el("option", { value: "" }, "Every opponent"), ...options(bId));
+async function drawPlayer(aId, bId) {
   const a = byId(aId);
-  const content = [el("div", { class: "controls" }, selA, el("span", { class: "dim" }, "vs"), selB)];
+  if (!a) { drawOverview(); return; }
+  const players = [...summary.players].sort((p, q) => q.elo - p.elo).filter((p) => p.id !== aId);
+  const selB = el("select", { on: { change: () => { location.hash = `#player/${aId}${selB.value ? `/${selB.value}` : ""}`; } } },
+    el("option", { value: "" }, "Every opponent"),
+    ...players.map((p) => { const o = el("option", { value: p.id }, p.name); if (p.id === bId) o.selected = true; return o; }));
+  const content = [
+    el("h1", { style: "margin-bottom:4px" }, a.name),
+    el("div", { class: "dim", style: "margin-bottom:14px" }, runOf(a), a.net ? ` · ${a.net}` : ""),
+    el("div", { class: "tiles" },
+      tile(a.games ? `${elo(a.elo)} ±${a.sd.toFixed(0)}` : "–", "rating"),
+      tile(a.games.toLocaleString(), "games")),
+    el("div", { class: "controls" }, el("span", { class: "dim" }, "vs"), selB),
+  ];
   if (bId !== undefined && bId !== null) {
     const r = record(aId, bId);
     const fit = await api(`/api/pair?a=${aId}&b=${bId}`);
@@ -340,8 +364,8 @@ async function drawPair(aId, bId) {
       el("tbody", {}, ...opponents.map((p) => {
         const r = record(aId, p.id), score = points(r);
         const expected = 1 / (1 + 10 ** ((p.elo - a.elo) / 400));
-        return el("tr", { class: "link", on: { click: () => { location.hash = `#pair/${aId}/${p.id}`; } } },
-          el("td", {}, p.name, p.external ? el("span", { class: "tag" }, "engine") : null),
+        return el("tr", { class: "link", on: { click: () => { location.hash = `#player/${aId}/${p.id}`; } } },
+          el("td", {}, p.name, tagOf(p)),
           el("td", { class: "num" }, elo(p.elo)),
           el("td", { class: "num" }, elo(a.elo - p.elo)),
           el("td", { class: "num" }, wdl(r)),
@@ -372,7 +396,7 @@ async function drawGames(box, player, opponent, offset = 0) {
         el("td", { class: "num dim" }, String(g.id)),
         el("td", {}, g.first), el("td", {}, g.second), el("td", {}, resultText(g)),
         el("td", { class: "num dim" }, g.first_score === null ? "" : `${g.first_score} – ${g.second_score}`),
-        el("td", { class: "num dim" }, String(g.opening)),
+        el("td", { class: "num dim" }, g.opening < 0 ? "" : String(g.opening)),
         el("td", { class: "num dim" }, String(g.plies)),
         el("td", { class: "num dim" }, ago(g.finished)),
         el("td", { class: "dim" }, g.code_version)))))),
@@ -412,6 +436,7 @@ async function drawGame(id) {
   const result = game.result > 0 ? "1 – 0" : game.result < 0 ? "0 – 1" : "½ – ½";
   const discs = board?.sideColors ?? ["#111", "#eee"];
   main.replaceChildren(
+    el("div", { class: "controls" }, el("button", { on: { click: () => history.back() } }, "← Back")),
     el("div", { class: "game" },
       el("div", { class: "card" },
         el("div", { class: "side" }, el("span", { class: "disc", style: `background:${discs[0]}` }), game.first, firstCount),
@@ -419,7 +444,7 @@ async function drawGame(id) {
         el("div", { class: "side" }, el("span", { class: "disc", style: `background:${discs[1]}` }), game.second, secondCount),
         el("div", { class: "controls", style: "padding:8px 12px 12px;margin:0" }, toStart, prev, slider, next, toEnd)),
       el("div", {},
-        el("div", { class: "tiles" }, tile(result, "result"), tile(String(game.opening), "opening"), tile(game.code_version, "code")),
+        el("div", { class: "tiles" }, tile(result, "result"), game.opening < 0 ? null : tile(String(game.opening), "opening"), tile(game.code_version, "code")),
         el("div", { class: "card" }, el("div", { class: "moves" }, ...buttons)))));
   show(at);
   if (keyHandler) document.removeEventListener("keydown", keyHandler);
@@ -428,14 +453,15 @@ async function drawGame(id) {
 }
 
 async function route() {
-  const [page, a, b] = (location.hash.slice(1) || "leaderboard").split("/");
+  const [page, a, b] = (location.hash.slice(1) || "overview").split("/");
+  drawSidebar();
   for (const link of document.querySelectorAll("#nav a")) link.classList.toggle("on", link.getAttribute("href") === `#${page}`);
   if (page !== "game" && keyHandler) { document.removeEventListener("keydown", keyHandler); keyHandler = null; }
   if (page === "networks") drawNetworks();
-  else if (page === "pair") await drawPair(a ? Number(a) : undefined, b ? Number(b) : undefined);
+  else if (page === "player") await drawPlayer(Number(a), b ? Number(b) : undefined);
   else if (page === "games") { const box = el("div", {}); main.replaceChildren(box); await drawGames(box); }
   else if (page === "game") await drawGame(Number(a));
-  else drawLeaderboard();
+  else drawOverview();
 }
 
 async function refresh() {
@@ -444,7 +470,10 @@ async function refresh() {
   document.getElementById("title").textContent = `${summary.game} Elo league`;
   drawWorker();
   // the page in view is only redrawn when there's news, so reading it isn't disturbed
-  if (games !== summary.games && (location.hash.slice(1) || "leaderboard").startsWith("leaderboard")) drawLeaderboard();
+  if (games !== summary.games) {
+    drawSidebar();
+    if ((location.hash.slice(1) || "overview") === "overview") drawOverview();
+  }
 }
 
 await refresh();
