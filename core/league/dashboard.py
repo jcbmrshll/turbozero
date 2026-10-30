@@ -4,6 +4,7 @@ Ratings are fit from the games whenever there are new ones.
 """
 
 import json
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -94,8 +95,20 @@ class League:
                 ],
                 "recent": [dict(row) for row in rows],
                 "worker": self._worker(),
+                "playing": self._playing(),
                 "time": time.time(),
             }
+
+    def _playing(self) -> dict[str, Any] | None:
+        """The batch being played, if its player is still alive to be playing it."""
+        player = self.store.get_meta("player") or {}
+        if player.get("state") != "playing":
+            return None
+        try:
+            os.kill(player["pid"], 0)
+        except OSError:
+            return None
+        return player
 
     def _worker(self) -> dict[str, Any]:
         supervisor = self.store.get_meta("supervisor") or {}

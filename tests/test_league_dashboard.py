@@ -1,6 +1,8 @@
 """The league's web page: what its server answers, from a store of a few games."""
 
 import json
+import os
+import subprocess
 import threading
 import time
 import urllib.error
@@ -131,6 +133,20 @@ def test_summary_rates_the_players(url):
     assert by_name["x"]["external"] == "edax"
     assert summary["parts"] == 1
     assert summary["recent"][0]["a"] == "x"
+
+
+def test_summary_says_which_batch_is_playing(url, store):
+    assert get(url, "/api/summary")["playing"] is None
+    playing = {"state": "playing", "a": "x", "b": "y", "games": 64, "started": 1.0}
+    store.set_meta("player", {**playing, "pid": os.getpid()})
+    assert get(url, "/api/summary")["playing"]["a"] == "x"
+    # the player died without saying so
+    gone = subprocess.Popen(["true"])
+    gone.wait()
+    store.set_meta("player", {**playing, "pid": gone.pid})
+    assert get(url, "/api/summary")["playing"] is None
+    store.set_meta("player", {"state": "idle", "reason": "stopped"})
+    assert get(url, "/api/summary")["playing"] is None
 
 
 def test_summary_says_what_the_worker_is_doing(url, store):
