@@ -15,7 +15,7 @@ from seaglass.bundle import problems, read_bundle
 
 from core.common import GameFrame
 from core.evaluators.mcts.state import SearchRecord
-from core.monitoring import SLICK_URL, VIEWS, Monitor
+from core.monitoring import DECLARED, SLICK_URL, VIEWS, Monitor
 from core.monitoring.episodes import (
     BOARDS,
     episode_type,
@@ -55,6 +55,8 @@ def test_run_is_logged_with_its_config_metrics_and_views(seaglass_server):
     assert meta["bundle"] == monitor.bundle_hash
     files = seaglass_server.get(f"/api/bundles/{meta['bundle']}")["files"]
     assert {f["path"] for f in files} == set(read_bundle(VIEWS))
+    # and it declares what the metrics turbozero logs are, in order
+    assert list(meta["declared"].items()) == list(DECLARED.items())
 
 
 def test_runs_log_to_slick_unless_the_environment_names_a_server(monkeypatch):
@@ -75,11 +77,16 @@ def test_views_draw_every_board_games_episodes():
     assert {episode_type(env) for env in BOARDS} <= set(layout["renderers"])
 
 
-def description(key):
-    """The views' description of a metric or media key: the first pattern's that matches it."""
-    descriptions = json.loads(read_bundle(VIEWS)["layout.json"])["descriptions"]
+def declared(key, field):
+    """A field of a metric or media key's declaration: the first matching pattern's that has
+    it."""
     return next(
-        (text for p, text in descriptions.items() if fnmatch.fnmatchcase(key, p)), None
+        (
+            d[field]
+            for p, d in DECLARED.items()
+            if fnmatch.fnmatchcase(key, p) and field in d
+        ),
+        None,
     )
 
 
@@ -109,8 +116,43 @@ def description(key):
         ("edax_level4_sims1000_game", "A game the network"),
     ],
 )
-def test_views_describe_the_metrics_turbozero_logs(key, says):
-    assert says in (description(key) or "")
+def test_runs_describe_the_metrics_turbozero_logs(key, says):
+    assert says in (declared(key, "description") or "")
+
+
+@pytest.mark.parametrize(
+    "key, headline",
+    [
+        ("loss", True),
+        ("policy_loss", True),
+        ("value_loss", True),
+        ("random_avg_outcome", True),
+        ("policy_kl", None),
+        ("ladder_rung", None),
+    ],
+)
+def test_runs_headline_their_losses_and_test_outcomes(key, headline):
+    assert declared(key, "headline") is headline
+
+
+@pytest.mark.parametrize(
+    "key, better",
+    [
+        ("loss", "lower"),
+        ("policy_kl", "lower"),
+        ("engine_regret_midgame", "lower"),
+        ("engine_exp_regret", "lower"),
+        ("engine_value_mse", "lower"),
+        ("random_loss_rate", "lower"),
+        ("engine_top1_opening", "higher"),
+        ("engine_value_sign", "higher"),
+        ("random_avg_outcome", "higher"),
+        ("edax_level4_sims1000", "higher"),
+        ("policy_target_entropy", None),
+    ],
+)
+def test_runs_say_which_way_their_metrics_are_better(key, better):
+    assert declared(key, "better") == better
 
 
 def stacked(states):
