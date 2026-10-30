@@ -65,22 +65,13 @@ from xot import XOT_PATH, load_xot
 
 from core.common import GameFrame
 from core.evaluators.evaluation_fns import make_nn_eval_fn
+from core.league.match import select
 from core.monitoring import DEFAULT_URL, Monitor
 from core.monitoring.episodes import BOARDS, line_record, pgx_two_player_episode
 from core.testing.tester import BaseTester, TestState
 
 # the most discs a game can be won by: an engine's score, a disc margin, over this is a value
 MAX_MARGIN = 64
-
-
-def select(which, on_true, on_false):
-    """Game by game, `on_true` where `which` is set, else `on_false`."""
-    which = jnp.asarray(which)
-    return jax.tree.map(
-        lambda t, f: jnp.where(which.reshape((-1,) + (1,) * (t.ndim - 1)), t, f),
-        on_true,
-        on_false,
-    )
 
 
 def color(ply: int) -> str:

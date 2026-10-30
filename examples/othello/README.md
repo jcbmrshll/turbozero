@@ -422,3 +422,9 @@ uv run examples/othello/score_engine_set.py runs/othello/49.eqx runs/othello/99.
 Egaroucid, NBoard and othello-sensei. Edax (Richard Delorme) and Egaroucid (Takuto
 Yamana) are under the GPL; the setup scripts build them from their repositories, they
 aren't part of turbozero.
+
+## The Elo league
+
+`elo_league.py` keeps a rating for every network it's given, at each search budget, and for
+Edax and Egaroucid, from full games played whenever the GPU is free (see `core/league/`). Every
+game is stored; ratings are fit to all of them, with an uncertainty for each player.

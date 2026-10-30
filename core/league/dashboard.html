@@ -1,0 +1,458 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Elo league</title>
+<style>
+:root {
+  color-scheme: dark;
+  --surface: #141413; --panel: #1a1a19; --line: #2c2c2a; --line-strong: #3b3b38;
+  --ink: #f0efec; --ink-2: #c3c2b7; --ink-3: #8f8e85;
+  --accent: #3987e5; --other: #55544f;
+  --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500; --s5:#d55181; --s6:#008300; --s7:#9085e9; --s8:#e66767;
+  --win: #199e70; --loss: #e66767; --draw: #8f8e85;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+    --surface: #f5f5f3; --panel: #fcfcfb; --line: #e4e3df; --line-strong: #cfcec8;
+    --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #7c7b75;
+    --accent: #2a78d6; --other: #c5c4be;
+    --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; --s4:#eda100; --s5:#e87ba4; --s6:#008300; --s7:#6250d6; --s8:#e34948;
+    --win: #128a5f; --loss: #d13f3e; --draw: #7c7b75;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--surface); color: var(--ink);
+  font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { display: flex; flex-wrap: wrap; gap: 8px 24px; align-items: center; padding: 12px 20px;
+  border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 2; }
+h1 { font-size: 15px; font-weight: 600; margin: 0; }
+nav { display: flex; gap: 2px; }
+nav a { color: var(--ink-2); text-decoration: none; padding: 4px 10px; border-radius: 6px; }
+nav a:hover { color: var(--ink); }
+nav a.on { color: var(--ink); background: var(--line); }
+#worker { margin-left: auto; display: flex; align-items: center; gap: 8px; color: var(--ink-2); min-width: 0; }
+#worker .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--ink-3); }
+#worker.playing .dot { background: var(--win); }
+#worker.waiting .dot { background: var(--s4); }
+main { padding: 20px; max-width: 1240px; margin: 0 auto; }
+h2 { font-size: 13px; font-weight: 600; color: var(--ink-2); margin: 28px 0 10px; }
+h2:first-child { margin-top: 0; }
+.tiles { display: flex; flex-wrap: wrap; gap: 28px; margin-bottom: 20px; }
+.tile b { display: block; font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.tile > span { color: var(--ink-3); font-size: 12px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+th { text-align: left; font-weight: 500; color: var(--ink-3); font-size: 12px; padding: 8px 12px;
+  border-bottom: 1px solid var(--line); white-space: nowrap; }
+th[data-sort] { cursor: pointer; user-select: none; }
+th[data-sort]:hover { color: var(--ink); }
+th.num, td.num { text-align: right; }
+td { padding: 6px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+tr:last-child td { border-bottom: 0; }
+tbody tr.link { cursor: pointer; }
+tbody tr.link:hover { background: var(--line); }
+td.dim, .dim { color: var(--ink-3); }
+a.name { color: inherit; text-decoration: none; }
+a.name:hover { text-decoration: underline; }
+.tag { font-size: 11px; color: var(--ink-2); border: 1px solid var(--line-strong); border-radius: 4px; padding: 0 5px; margin-left: 6px; }
+.w { color: var(--win); } .l { color: var(--loss); } .d { color: var(--draw); }
+.controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 14px; }
+select, button { background: var(--panel); color: var(--ink); border: 1px solid var(--line-strong);
+  border-radius: 6px; padding: 5px 9px; font: inherit; }
+button { cursor: pointer; }
+button:hover { background: var(--line); }
+button:disabled { opacity: .4; cursor: default; }
+#chart { position: relative; padding: 12px; }
+#chart svg { display: block; width: 100%; height: auto; }
+#chart text { fill: var(--ink-3); font-size: 11px; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; padding: 0 12px 12px; color: var(--ink-2); font-size: 12px; }
+.legend i { display: inline-block; width: 14px; height: 2px; vertical-align: middle; margin-right: 5px; }
+#tip { position: absolute; pointer-events: none; background: var(--surface); border: 1px solid var(--line-strong);
+  border-radius: 6px; padding: 6px 9px; font-size: 12px; display: none; z-index: 3; white-space: nowrap; }
+#tip div { display: flex; gap: 8px; align-items: center; justify-content: space-between; }
+#tip b { font-weight: 600; font-variant-numeric: tabular-nums; }
+#tip i { display: inline-block; width: 10px; height: 2px; margin-right: 5px; vertical-align: middle; }
+#tip span { color: var(--ink-2); }
+.game { display: grid; grid-template-columns: minmax(280px, 480px) minmax(240px, 1fr); gap: 20px; align-items: start; }
+@media (max-width: 760px) { .game { grid-template-columns: 1fr; } }
+.board-wrap { padding: 12px; }
+.board-wrap svg { display: block; width: 100%; height: auto; }
+.moves { display: grid; grid-template-columns: repeat(auto-fill, minmax(68px, 1fr)); gap: 2px; padding: 10px; }
+.moves button { padding: 2px 4px; border: 0; background: none; color: var(--ink-2); text-align: left; font-variant-numeric: tabular-nums; border-radius: 4px; }
+.moves button.opening { color: var(--ink-3); }
+.moves button.on { background: var(--accent); color: #fff; }
+.side { display: flex; align-items: center; gap: 8px; padding: 6px 12px; }
+.side .disc { width: 14px; height: 14px; border-radius: 50%; border: 1px solid var(--line-strong); flex: none; }
+.side .count { margin-left: auto; font-weight: 600; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">Elo league</h1>
+  <nav id="nav">
+    <a href="#leaderboard">Leaderboard</a>
+    <a href="#networks">Networks</a>
+    <a href="#pair">Head to head</a>
+    <a href="#games">Games</a>
+  </nav>
+  <div id="worker"><span class="dot"></span><span id="worker-text"></span></div>
+</header>
+<main id="main"></main>
+<div id="tip"></div>
+<script type="module">
+import board from "/game.js";
+
+const main = document.getElementById("main");
+const SERIES = 8;
+let summary = null;
+let sortKey = "elo", sortDir = -1;
+
+function el(tag, attrs = {}, ...children) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(attrs)) {
+    if (key === "class") node.className = value;
+    else if (key === "on") for (const [e, f] of Object.entries(value)) node.addEventListener(e, f);
+    else if (value !== undefined && value !== null) node.setAttribute(key, value);
+  }
+  for (const child of children) if (child !== null && child !== undefined) node.append(child);
+  return node;
+}
+function svg(tag, attrs = {}, ...children) {
+  const node = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, value);
+  node.append(...children);
+  return node;
+}
+const api = (path) => fetch(path).then((r) => r.json());
+const elo = (x) => (x >= 0 ? "+" : "−") + Math.abs(x).toFixed(0);
+const byId = (id) => summary.players.find((p) => p.id === id);
+const ago = (t) => {
+  const s = Math.max(0, summary.time - t);
+  if (s < 90) return `${s.toFixed(0)}s`;
+  if (s < 5400) return `${(s / 60).toFixed(0)}m`;
+  if (s < 129600) return `${(s / 3600).toFixed(0)}h`;
+  return `${(s / 86400).toFixed(0)}d`;
+};
+const duration = (s) => (s < 5400 ? `${(s / 60).toFixed(0)}m` : `${(s / 3600).toFixed(1)}h`);
+
+function drawWorker() {
+  const worker = summary.worker, box = document.getElementById("worker");
+  let text = "Stopped";
+  if (worker.state === "playing") {
+    const p = worker.player;
+    text = p.state === "playing" ? `${p.a} vs ${p.b}, ${p.games} games, ${p.mode}, ${ago(p.started)}` : "Starting";
+  } else if (worker.state === "queued") text = `Queued #${worker.job}`;
+  else if (worker.state === "waiting") text = `Waiting: ${worker.reason ?? ""}`;
+  box.className = worker.state;
+  box.title = text;
+  document.getElementById("worker-text").textContent = text;
+}
+
+function name(player) {
+  return el("a", { class: "name", href: `#pair/${player.id}` }, player.name);
+}
+
+function drawLeaderboard() {
+  const players = [...summary.players].sort((a, b) => {
+    // whoever hasn't played has no rating to sort by
+    if (!a.games !== !b.games) return a.games ? -1 : 1;
+    const [x, y] = [a[sortKey] ?? "", b[sortKey] ?? ""];
+    return (x < y ? -1 : x > y ? 1 : 0) * sortDir;
+  });
+  const anchor = summary.anchor ? byId(summary.anchor) : null;
+  const columns = [
+    ["elo", "Rating", true], ["sd", "±", true], ["games", "Games", true], ["cross_run", "Between runs", true],
+    ["sims", "Sims", true], ["name", "Player", false], ["run", "Run", false],
+  ];
+  const head = el("tr", {}, el("th", { class: "num" }, "#"), ...columns.map(([key, label, num]) =>
+    el("th", {
+      class: num ? "num" : "", "data-sort": key,
+      on: { click: () => { if (sortKey === key) sortDir = -sortDir; else { sortKey = key; sortDir = -1; } drawLeaderboard(); } },
+    }, label + (sortKey === key ? (sortDir < 0 ? " ↓" : " ↑") : ""))));
+  const rows = players.map((p, i) => el("tr", { class: "link", on: { click: () => { location.hash = `#pair/${p.id}`; } } },
+    el("td", { class: "num dim" }, String(i + 1)),
+    el("td", { class: "num" }, p.games ? elo(p.elo) : "–"),
+    el("td", { class: "num dim" }, p.games ? p.sd.toFixed(0) : "–"),
+    el("td", { class: "num" }, String(p.games)),
+    el("td", { class: "num dim" }, p.games ? elo(p.cross_run) : "–"),
+    el("td", { class: "num dim" }, p.sims === null ? "" : String(p.sims)),
+    el("td", {}, name(p), p.external ? el("span", { class: "tag" }, "engine") : null,
+      p.retired ? el("span", { class: "tag" }, "retired") : null),
+    el("td", { class: "dim" }, p.run)));
+  main.replaceChildren(
+    el("div", { class: "tiles" },
+      tile(String(summary.players.length), "players"),
+      tile(summary.games.toLocaleString(), "games"),
+      tile(duration(summary.seconds), "playing"),
+      tile(anchor ? anchor.name : "mean", "at 0"),
+      tile(`±${Math.max(0, ...summary.players.filter((p) => !p.external && !p.retired).map((p) => p.sd)).toFixed(0)}`, "worst network"),
+      tile(String(summary.parts), summary.parts === 1 ? "part" : "parts")),
+    el("div", { class: "card" }, el("table", {}, el("thead", {}, head), el("tbody", {}, ...rows))),
+    el("h2", {}, "Recent batches"),
+    el("div", { class: "card" }, el("table", {},
+      el("thead", {}, el("tr", {}, ...["Pair", "Mode"].map((h) => el("th", {}, h)),
+        ...["Games", "Seconds", "Ago"].map((h) => el("th", { class: "num" }, h)), el("th", {}, "Code"))),
+      el("tbody", {}, ...summary.recent.map((b) => el("tr", {},
+        el("td", {}, `${b.a} vs ${b.b}`), el("td", { class: "dim" }, b.mode),
+        el("td", { class: "num" }, String(b.games)),
+        el("td", { class: "num" }, b.seconds.toFixed(0)),
+        el("td", { class: "num dim" }, ago(b.finished)),
+        el("td", { class: "dim" }, b.code_version)))))));
+}
+function tile(value, label) { return el("div", { class: "tile" }, el("b", {}, value), el("span", {}, label)); }
+
+function drawNetworks() {
+  const nets = new Map();
+  for (const p of summary.players) {
+    if (p.network === null) continue;
+    if (!nets.has(p.network)) nets.set(p.network, new Map());
+    nets.get(p.network).set(p.sims, p);
+  }
+  const sims = [...new Set(summary.players.filter((p) => p.sims !== null).map((p) => p.sims))].sort((a, b) => a - b);
+  const best = (entries) => Math.max(...[...entries.values()].map((p) => p.elo));
+  const order = [...nets.entries()].sort((a, b) => best(b[1]) - best(a[1]));
+  const color = new Map(order.map(([network], i) => [network, i < SERIES ? `var(--s${i + 1})` : "var(--other)"]));
+  const engines = summary.players.filter((p) => p.external);
+
+  const table = el("table", {},
+    el("thead", {}, el("tr", {}, el("th", {}, "Network"), el("th", {}, "Run"), el("th", {}, "Spec"),
+      ...sims.map((s) => el("th", { class: "num" }, `${s} sims`)))),
+    el("tbody", {}, ...order.map(([network, entries]) => {
+      const any = [...entries.values()][0];
+      return el("tr", {},
+        el("td", {}, el("i", { style: `display:inline-block;width:14px;height:2px;margin-right:7px;vertical-align:middle;background:${color.get(network)}` }), network),
+        el("td", { class: "dim" }, any.run), el("td", { class: "dim" }, any.net),
+        ...sims.map((s) => {
+          const p = entries.get(s);
+          return el("td", { class: "num" }, p ? el("a", { class: "name", href: `#pair/${p.id}` }, `${elo(p.elo)} `, el("span", { class: "dim" }, `±${p.sd.toFixed(0)}`)) : "");
+        }));
+    })));
+
+  const chartBox = el("div", { id: "chart" });
+  main.replaceChildren(
+    el("div", { class: "card" }, chartBox,
+      el("div", { class: "legend" }, ...order.slice(0, SERIES).map(([network]) =>
+        el("span", {}, el("i", { style: `background:${color.get(network)}` }), network)),
+        order.length > SERIES ? el("span", {}, el("i", { style: "background:var(--other)" }), "Other") : null)),
+    el("h2", {}, "Ratings"),
+    el("div", { class: "card" }, table));
+  drawChart(chartBox, order, sims, color, engines);
+}
+
+function drawChart(box, order, sims, color, engines) {
+  if (!sims.length) return;
+  const W = 1000, H = 400, L = 56, R = 110, T = 12, B = 30;
+  const shown = [...order.flatMap(([, e]) => [...e.values()]), ...engines];
+  const ys = shown.map((p) => p.elo);
+  const [lo, hi] = ys.length ? [Math.min(...ys), Math.max(...ys)] : [-100, 100];
+  const pad = Math.max(20, (hi - lo) * 0.08);
+  const y = (v) => T + (hi + pad - v) / (hi - lo + 2 * pad) * (H - T - B);
+  const logs = sims.map((s) => Math.log(s));
+  const [l0, l1] = [logs[0], logs[logs.length - 1]];
+  const x = (s) => (l1 === l0 ? (L + W - R) / 2 : L + (Math.log(s) - l0) / (l1 - l0) * (W - L - R));
+  const root = svg("svg", { viewBox: `0 0 ${W} ${H}` });
+  const step = niceStep((hi - lo + 2 * pad) / 6);
+  for (let v = Math.ceil((lo - pad) / step) * step; v <= hi + pad; v += step) {
+    root.append(svg("line", { x1: L, x2: W - R, y1: y(v), y2: y(v), stroke: "var(--line)" }));
+    const t = svg("text", { x: L - 8, y: y(v) + 4, "text-anchor": "end" }); t.textContent = elo(v); root.append(t);
+  }
+  for (const s of sims) {
+    const t = svg("text", { x: x(s), y: H - 8, "text-anchor": "middle" }); t.textContent = String(s); root.append(t);
+  }
+  for (const e of engines) {
+    root.append(svg("line", { x1: L, x2: W - R, y1: y(e.elo), y2: y(e.elo), stroke: "var(--ink-3)", "stroke-width": 1 }));
+    const t = svg("text", { x: W - R + 6, y: y(e.elo) + 4 }); t.textContent = e.name; root.append(t);
+  }
+  // the least important first, so the top networks are drawn over them
+  for (const [network, entries] of [...order].reverse()) {
+    const points = [...entries.values()].sort((a, b) => a.sims - b.sims);
+    if (points.length > 1) root.append(svg("polyline", {
+      points: points.map((p) => `${x(p.sims)},${y(p.elo)}`).join(" "), fill: "none",
+      stroke: color.get(network), "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round",
+    }));
+    for (const p of points) root.append(svg("circle", {
+      cx: x(p.sims), cy: y(p.elo), r: 4, fill: color.get(network), stroke: "var(--panel)", "stroke-width": 2,
+    }));
+  }
+  const cross = svg("line", { y1: T, y2: H - B, stroke: "var(--line-strong)", visibility: "hidden" });
+  root.append(cross);
+  box.append(root);
+  const tip = document.getElementById("tip");
+  root.addEventListener("pointermove", (event) => {
+    const rect = root.getBoundingClientRect();
+    const mx = (event.clientX - rect.left) / rect.width * W;
+    const s = sims.reduce((a, b) => (Math.abs(x(b) - mx) < Math.abs(x(a) - mx) ? b : a));
+    cross.setAttribute("x1", x(s)); cross.setAttribute("x2", x(s)); cross.setAttribute("visibility", "visible");
+    const rows = order.filter(([, e]) => e.has(s)).map(([n, e]) => [n, e.get(s)]).sort((a, b) => b[1].elo - a[1].elo);
+    tip.replaceChildren(el("div", {}, el("span", {}, `${s} sims`)), ...rows.map(([n, p]) =>
+      el("div", {}, el("span", {}, el("i", { style: `background:${color.get(n)}` }), n), el("b", {}, `${elo(p.elo)} ±${p.sd.toFixed(0)}`))));
+    tip.style.display = "block";
+    const left = event.pageX + 14;
+    tip.style.left = `${Math.min(left, window.innerWidth - tip.offsetWidth - 8)}px`;
+    tip.style.top = `${event.pageY + 14}px`;
+  });
+  root.addEventListener("pointerleave", () => { cross.setAttribute("visibility", "hidden"); tip.style.display = "none"; });
+}
+function niceStep(raw) {
+  const mag = 10 ** Math.floor(Math.log10(raw));
+  return [1, 2, 5, 10].map((m) => m * mag).find((m) => m >= raw);
+}
+
+function record(a, b) {
+  for (const [x, y, w, d, l] of summary.pairs) {
+    if (x === a && y === b) return { w, d, l };
+    if (x === b && y === a) return { w: l, d, l: w };
+  }
+  return { w: 0, d: 0, l: 0 };
+}
+function wdl(r) {
+  return el("span", {}, el("span", { class: "w" }, String(r.w)), " – ", el("span", { class: "d" }, String(r.d)), " – ", el("span", { class: "l" }, String(r.l)));
+}
+function points(r) { const n = r.w + r.d + r.l; return n ? (r.w + r.d / 2) / n : null; }
+
+async function drawPair(aId, bId) {
+  const players = [...summary.players].sort((p, q) => q.elo - p.elo);
+  aId = aId ?? players[0]?.id;
+  if (aId === undefined) { main.replaceChildren(); return; }
+  const options = (selected) => players.map((p) => { const o = el("option", { value: p.id }, p.name); if (p.id === selected) o.selected = true; return o; });
+  const onChange = () => { location.hash = `#pair/${selA.value}${selB.value ? `/${selB.value}` : ""}`; };
+  const selA = el("select", { on: { change: onChange } }, ...options(aId));
+  const selB = el("select", { on: { change: onChange } }, el("option", { value: "" }, "Every opponent"), ...options(bId));
+  const a = byId(aId);
+  const content = [el("div", { class: "controls" }, selA, el("span", { class: "dim" }, "vs"), selB)];
+  if (bId !== undefined && bId !== null) {
+    const r = record(aId, bId);
+    const fit = await api(`/api/pair?a=${aId}&b=${bId}`);
+    const score = points(r);
+    content.push(el("div", { class: "tiles" },
+      tile(`${elo(fit.difference)} ±${fit.sd.toFixed(0)}`, "rating difference"),
+      el("div", { class: "tile" }, el("b", {}, wdl(r)), el("span", {}, "wins, draws, losses")),
+      tile(score === null ? "–" : score.toFixed(3), "score"),
+      tile(fit.expected.toFixed(3), "expected")));
+  } else {
+    const opponents = summary.players.filter((p) => p.id !== aId && record(aId, p.id).w + record(aId, p.id).d + record(aId, p.id).l > 0)
+      .sort((p, q) => q.elo - p.elo);
+    content.push(el("div", { class: "card" }, el("table", {},
+      el("thead", {}, el("tr", {}, el("th", {}, "Opponent"), el("th", { class: "num" }, "Rating"), el("th", { class: "num" }, "Difference"),
+        el("th", { class: "num" }, "Wins – draws – losses"), el("th", { class: "num" }, "Score"), el("th", { class: "num" }, "Expected"))),
+      el("tbody", {}, ...opponents.map((p) => {
+        const r = record(aId, p.id), score = points(r);
+        const expected = 1 / (1 + 10 ** ((p.elo - a.elo) / 400));
+        return el("tr", { class: "link", on: { click: () => { location.hash = `#pair/${aId}/${p.id}`; } } },
+          el("td", {}, p.name, p.external ? el("span", { class: "tag" }, "engine") : null),
+          el("td", { class: "num" }, elo(p.elo)),
+          el("td", { class: "num" }, elo(a.elo - p.elo)),
+          el("td", { class: "num" }, wdl(r)),
+          el("td", { class: "num" }, score === null ? "" : score.toFixed(3)),
+          el("td", { class: "num dim" }, expected.toFixed(3)));
+      })))));
+  }
+  const list = el("div", {});
+  content.push(el("h2", {}, "Games"), list);
+  main.replaceChildren(...content);
+  await drawGames(list, aId, bId);
+}
+
+async function drawGames(box, player, opponent, offset = 0) {
+  const limit = 50;
+  const query = new URLSearchParams({ limit, offset });
+  if (player !== undefined && player !== null) query.set("player", player);
+  if (opponent !== undefined && opponent !== null) query.set("opponent", opponent);
+  const { games, total } = await api(`/api/games?${query}`);
+  const resultText = (g) => (g.result > 0 ? "1 – 0" : g.result < 0 ? "0 – 1" : "½ – ½");
+  box.replaceChildren(
+    el("div", { class: "card" }, el("table", {},
+      el("thead", {}, el("tr", {}, el("th", { class: "num" }, "#"),
+        el("th", {}, board?.sideNames?.[0] ?? "First"), el("th", {}, board?.sideNames?.[1] ?? "Second"),
+        el("th", {}, "Result"), el("th", { class: "num" }, "Score"), el("th", { class: "num" }, "Opening"),
+        el("th", { class: "num" }, "Moves"), el("th", {}, "Mode"), el("th", { class: "num" }, "Ago"), el("th", {}, "Code"))),
+      el("tbody", {}, ...games.map((g) => el("tr", { class: "link", on: { click: () => { location.hash = `#game/${g.id}`; } } },
+        el("td", { class: "num dim" }, String(g.id)),
+        el("td", {}, g.first), el("td", {}, g.second), el("td", {}, resultText(g)),
+        el("td", { class: "num dim" }, g.first_score === null ? "" : `${g.first_score} – ${g.second_score}`),
+        el("td", { class: "num dim" }, String(g.opening)),
+        el("td", { class: "num dim" }, String(g.plies)),
+        el("td", { class: "dim" }, g.mode),
+        el("td", { class: "num dim" }, ago(g.finished)),
+        el("td", { class: "dim" }, g.code_version)))))),
+    el("div", { class: "controls", style: "margin-top:10px" },
+      el("button", { ...(offset === 0 ? { disabled: "" } : {}), on: { click: () => drawGames(box, player, opponent, Math.max(0, offset - limit)) } }, "Newer"),
+      el("button", { ...(offset + limit >= total ? { disabled: "" } : {}), on: { click: () => drawGames(box, player, opponent, offset + limit) } }, "Older"),
+      el("span", { class: "dim" }, total ? `${offset + 1}–${Math.min(offset + limit, total)} of ${total.toLocaleString()}` : "0")));
+}
+
+let keyHandler = null;
+async function drawGame(id) {
+  const game = await api(`/api/game?id=${id}`);
+  if (game.error) { main.replaceChildren(el("p", { class: "dim" }, game.error)); return; }
+  const states = [board.start()];
+  for (const move of game.moves) states.push(board.play(states[states.length - 1], move));
+  let at = game.opening_plies;
+  const boardBox = el("div", { class: "board-wrap" });
+  const buttons = game.moves.map((move, i) => el("button", {
+    class: i < game.opening_plies ? "opening" : "", on: { click: () => show(i + 1) },
+  }, `${i + 1}. ${board.moveName(move)}`));
+  const slider = el("input", { type: "range", min: 0, max: game.moves.length, value: at, style: "flex:1;min-width:120px;accent-color:var(--accent)",
+    on: { input: (e) => show(Number(e.target.value)) } });
+  const firstCount = el("span", { class: "count" }), secondCount = el("span", { class: "count" });
+  const prev = el("button", { on: { click: () => show(at - 1) } }, "←");
+  const next = el("button", { on: { click: () => show(at + 1) } }, "→");
+  const toStart = el("button", { on: { click: () => show(0) } }, "⏮");
+  const toEnd = el("button", { on: { click: () => show(game.moves.length) } }, "⏭");
+  function show(i) {
+    at = Math.max(0, Math.min(game.moves.length, i));
+    board.draw(boardBox, states[at], at ? game.moves[at - 1] : null);
+    buttons.forEach((b, k) => b.classList.toggle("on", k === at - 1));
+    slider.value = at;
+    const counts = board.counts?.(states[at]) ?? ["", ""];
+    firstCount.textContent = counts[0]; secondCount.textContent = counts[1];
+    prev.disabled = at === 0; next.disabled = at === game.moves.length;
+  }
+  const result = game.result > 0 ? "1 – 0" : game.result < 0 ? "0 – 1" : "½ – ½";
+  const discs = board?.sideColors ?? ["#111", "#eee"];
+  main.replaceChildren(
+    el("div", { class: "game" },
+      el("div", { class: "card" },
+        el("div", { class: "side" }, el("span", { class: "disc", style: `background:${discs[0]}` }), game.first, firstCount),
+        boardBox,
+        el("div", { class: "side" }, el("span", { class: "disc", style: `background:${discs[1]}` }), game.second, secondCount),
+        el("div", { class: "controls", style: "padding:8px 12px 12px;margin:0" }, toStart, prev, slider, next, toEnd)),
+      el("div", {},
+        el("div", { class: "tiles" }, tile(result, "result"), tile(String(game.opening), "opening"), tile(game.code_version, "code")),
+        el("div", { class: "card" }, el("div", { class: "moves" }, ...buttons)))));
+  show(at);
+  if (keyHandler) document.removeEventListener("keydown", keyHandler);
+  keyHandler = (e) => { if (e.key === "ArrowLeft") show(at - 1); if (e.key === "ArrowRight") show(at + 1); };
+  document.addEventListener("keydown", keyHandler);
+}
+
+async function route() {
+  const [page, a, b] = (location.hash.slice(1) || "leaderboard").split("/");
+  for (const link of document.querySelectorAll("#nav a")) link.classList.toggle("on", link.getAttribute("href") === `#${page}`);
+  if (page !== "game" && keyHandler) { document.removeEventListener("keydown", keyHandler); keyHandler = null; }
+  if (page === "networks") drawNetworks();
+  else if (page === "pair") await drawPair(a ? Number(a) : undefined, b ? Number(b) : undefined);
+  else if (page === "games") { const box = el("div", {}); main.replaceChildren(box); await drawGames(box); }
+  else if (page === "game") await drawGame(Number(a));
+  else drawLeaderboard();
+}
+
+async function refresh() {
+  const games = summary?.games;
+  summary = await api("/api/summary");
+  document.getElementById("title").textContent = `${summary.game} Elo league`;
+  drawWorker();
+  // the page in view is only redrawn when there's news, so reading it isn't disturbed
+  if (games !== summary.games && (location.hash.slice(1) || "leaderboard").startsWith("leaderboard")) drawLeaderboard();
+}
+
+await refresh();
+window.addEventListener("hashchange", route);
+await route();
+setInterval(refresh, 10000);
+</script>
+</body>
+</html>
