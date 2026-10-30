@@ -9,7 +9,6 @@ trainer, see `real`) a whole run, its exact resumption, and the donation of the 
 import fnmatch
 import gc
 import itertools
-import json
 import os
 import warnings
 from dataclasses import dataclass, replace
@@ -23,7 +22,6 @@ import numpy as np
 import optax
 import pytest
 from seaglass import Monitor
-from seaglass.bundle import read_bundle
 
 import core.training.train as train_module
 from core.evaluators.alphazero import AlphaZero
@@ -32,7 +30,7 @@ from core.evaluators.evaluator import EvalOutput, Evaluator
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.mcts.mcts import MCTS
 from core.memory.replay_memory import BaseExperience, EpisodeReplayBuffer
-from core.monitoring import VIEWS
+from core.monitoring import DECLARED
 from core.networks.azresnet import batch_norm
 from core.networks.utils import apply_nn
 from core.testing.tester import BaseTester
@@ -1727,13 +1725,15 @@ def test_a_real_run_trains_and_reports_its_metrics(real_run):
     assert real_run.checkpoints == [2, 3] and real_run.states == [2]
 
 
-def test_the_views_describe_every_metric_a_real_run_logs(real_run):
-    layout = json.loads(read_bundle(VIEWS)["layout.json"])
+def test_runs_describe_every_metric_a_real_run_logs(real_run):
     logged = {name for metrics in real_run.logged.values() for name in metrics}
     undescribed = {
         name
         for name in logged
-        if not any(fnmatch.fnmatchcase(name, p) for p in layout["descriptions"])
+        if not any(
+            fnmatch.fnmatchcase(name, p) and "description" in d
+            for p, d in DECLARED.items()
+        )
     }
     assert not undescribed
 
