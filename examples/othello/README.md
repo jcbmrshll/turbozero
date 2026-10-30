@@ -7,10 +7,9 @@ Othello model and against two strong open-source Othello engines,
 
 | File | |
 |---|---|
-| `train.py` | Trains a network by self-play, scoring it against Edax's scores of fixed positions as it goes |
+| `train.py` | Trains a network by self-play, scoring it against Edax's scores of fixed positions as it goes, and in games against Edax if asked |
 | `eval_pgx.py` | Plays a checkpoint against pgx's pretrained model at several search budgets |
-| `vs_engine.py` | Plays a checkpoint against Edax or Egaroucid at several levels, from XOT openings |
-| `watch.py` | Plays a training run's last checkpoint against Edax once it ends (or checkpoints as they're saved) |
+| `vs_engine.py` | Plays a checkpoint against Edax or Egaroucid at several levels, from XOT openings (and train.py's network as it trains) |
 | `engines.py` | Edax and Egaroucid, each driven over GTP, and what their searches made of each position, from their logs |
 | `setup_edax.sh`, `setup_egaroucid.sh` | Build the engines for `vs_engine.py` |
 | `engine_set.py`, `label_positions.py`, `score_engine_set.py` | The engine-labelled set: fixed positions with every legal move scored by Edax, to build, and to score checkpoints on (train.py scores the network on it every epoch) |
@@ -21,8 +20,8 @@ Othello model and against two strong open-source Othello engines,
 ## Training
 
 ```
-uv run examples/othello/train.py --monitor --ckpt-dir runs/othello --notes "the baseline" &
-uv run examples/othello/watch.py runs/othello --pid $!   # Edax games once it ends
+uv run examples/othello/train.py --monitor --ckpt-dir runs/othello --notes "the baseline" \
+    --vs-engine-last 3   # Edax games after each of the last 3 epochs
 ```
 
 `--name` names the run on the server, and `--notes` says what it's testing and why, at the
@@ -38,8 +37,9 @@ A run is tracked by the engine-labelled set: every epoch, `train.py` scores the 
 on Edax's scores of 5000 fixed positions, in about 20 ms, and logs `engine_exp_regret` (the
 discs its policy gives up against Edax's best move) and the rest of the `engine_*` metrics
 (see [below](#against-edaxs-scores-of-fixed-positions)). They're much finer than games: a
-difference between two checkpoints is good to about ±0.015 discs. `watch.py` plays the last
-checkpoint against Edax once the run ends (see [During training](#during-training)).
+difference between two checkpoints is good to about ±0.015 discs. Games against Edax
+measure strength itself, with `--vs-engine-every` and `--vs-engine-last` (see
+[During training](#during-training)).
 
 `--eval-every N` also plays test games every N epochs, on a ladder of opponents, easiest
 first: a random player, a greedy tile counter, then pgx's pretrained model searching 1, 4,
@@ -60,7 +60,7 @@ of 20 (`0:100,4:200,11:400`, counting its generations as epochs).
 Cheap searches are enough while the network learns the basics, and deeper ones refine
 its policy later. Each change compiles self-play again, as the first epoch does, so
 keep changes few; games in progress carry on, searching from new, empty trees. Test
-games, `eval_pgx.py`, `vs_engine.py` and `watch.py` keep their own budgets. The
+games, `eval_pgx.py` and the games against engines keep their own budgets. The
 run's page plots the budget as `search_iterations`.
 
 Each self-play environment searches at its own pace, a network evaluation a cycle, so a
@@ -322,38 +322,52 @@ The run above scored, out of 256 games against each level (128 openings), search
 
 ### During training
 
-`train.py` tracks a run by the engine-labelled set every epoch (below), and `watch.py` plays
-the run against Edax once it ends: it waits for the training process to exit, then plays its
-last checkpoint, searching 1000 MCTS iterations a move, 512 games (256 openings) against each
-of levels 4, 6 and 8:
+`train.py` tracks a run by the engine-labelled set every epoch (below), and plays it against
+Edax when asked to: `--vs-engine-every N` after every N epochs, and `--vs-engine-last K` after
+each of the last K epochs. By default it plays 512 games (256 XOT openings) at level 8,
+searching 1000 MCTS iterations a move, the same games every time and in every run:
 
 ```
-uv run examples/othello/train.py --ckpt-dir runs/othello --monitor &
-uv run examples/othello/watch.py runs/othello --pid $!
+uv run examples/othello/train.py --epochs 50 --ckpt-dir runs/othello --monitor --vs-engine-last 3
+uv run examples/othello/train.py --ckpt-dir runs/othello --monitor --vs-engine-every 25 \
+    --vs-engine-levels 4 6 8 --vs-engine-sims 400
 ```
 
-Alone on one RTX 5080, with a 10-block network, each level takes about 11 minutes.
-`--every N` also plays every checkpoint whose epoch is a multiple of N as it's saved, so a
-long run's strength shows before it ends. `train.py` keeps only its 2 newest checkpoints,
-so pass it `--keep-every N` too; and since our agent then searches on the GPU next to
-training, pass a smaller budget: with `--sims 64 --openings 128`, 256 games against each of 3
-levels take about 2 minutes and slow training's epochs by about half while they run (at the
-defaults, a level takes about an hour there).
+`--vs-engine-levels`, `--vs-engine-sims` and `--vs-engine-openings` set the games, and
+`--vs-engine egaroucid` plays Egaroucid instead. Each level's result is logged to the run at
+the epoch of the network that played (counting from 0, so `--vs-engine-every 25` logs at
+epochs 24, 49, ...), as `edax_level8_sims1000`, the score, with its standard error
+`edax_level8_sims1000_se` and the fractions of games won, drawn and lost (`_win`, `_draw`,
+`_loss`), and a game at that level, `edax_level8_sims1000_game`, to step through: our agent's
+search of each position, and the engine's scores (its predicted disc margin / 64): Edax's of
+every legal move of every position, each with the line it expects after it (from its own
+search where it moved, and from a separate Edax process elsewhere, so as not to change its
+moves), Egaroucid's of the moves it played. Results also go to `runs/othello/vs_engine.jsonl`,
+a line per level and epoch.
+
+One network's score drifts from its neighbours' by about ±0.035, more than the ±0.02 of
+512 games' own noise, so `--vs-engine-last K` also logs the mean of the last K networks'
+scores at the last epoch, as `edax_level8_sims1000_last3` (for K = 3), with its standard
+error (`_last3_se`), each game's results averaged over the networks first, since they all
+play the same games.
+
+The games are played between epochs, in the training process: our agent's search shares
+the run's GPU memory and its compiled search, and the engine processes (single-threaded, one
+a game) run on the cores the run may use, so `taskset -c 0-7` keeps them on those 8, as many
+searching at once as there are cores. Training waits for them: each evaluation's time is
+logged as `edax_seconds`, to take out of the run's wall time. Alone on one RTX 5080, with a
+10-block network, a level at the defaults took about 11 minutes, before vs_engine.py's
+searches were made about twice as fast. A resumed run (`--resume`) goes on logging them to
+the same run, at the same epochs, and keeps the results of the last networks it played
+before it stopped for their mean.
+
+To evaluate a checkpoint after training, `vs_engine.py` logs to its run with `--monitor
+--run ID` (the id in the run's seaglass link), at the checkpoint's epoch:
 
 ```
-uv run examples/othello/train.py --keep-every 25 --ckpt-dir runs/othello --monitor &
-uv run examples/othello/watch.py runs/othello --pid $! --every 25 --sims 64 --openings 128
+uv run examples/othello/vs_engine.py runs/othello/49.eqx --levels 8 --sims 1000 --openings 256 \
+    --stop-below -1 --monitor --run ID
 ```
-
-Results go to `runs/othello/vs_engine.jsonl`, and with `--monitor URL --run ID` (the id
-in the run's seaglass link) to the run's page, as `edax_level4_sims1000` and so on,
-each with a game at that level, `edax_level4_sims1000_game`, to step through: our agent's search
-of each position, and the engine's scores (its predicted disc margin / 64): Edax's of every
-legal move of every position, each with the line it expects after it (from its own search
-where it moved, and from a separate Edax process elsewhere, so as not to change its moves),
-Egaroucid's of the moves it played.
-Restarted, it evaluates only the levels a checkpoint has no result for yet, at these `--sims`
-and `--openings`. Our agent's search takes only the GPU memory it needs.
 
 ### Against Edax's scores of fixed positions
 

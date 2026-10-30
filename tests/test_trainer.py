@@ -21,7 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from seaglass import Monitor
+from seaglass import Arrays, Monitor
 
 import core.training.train as train_module
 from core.evaluators.alphazero import AlphaZero
@@ -676,6 +676,29 @@ def test_train_loop_reports_to_the_monitor(env, tmp_path, fake_loop):
         # each test's first game, for the monitor server to render
         assert logged[epoch]["FakeTester_game"] == "episode"
     assert monitor.finished == ["finished"]
+
+
+class StagedTester(FakeTester):
+    """Logs its results with `log_fn` as it goes, a game among them, and returns none (as
+    examples/othello/vs_engine.py's EngineMatchTester does)."""
+
+    def run(self, *args, log_fn=None, **kwargs):  # pyright: ignore[reportIncompatibleMethodOverride]
+        assert log_fn is not None
+        log_fn({"score": 0.5, "a_game": Arrays("game", x=[1])})
+        return kwargs["state"], {}, None
+
+
+def test_testers_log_metrics_and_media_as_they_go(env, tmp_path, fake_loop, capsys):
+    monitor = FakeMonitor()
+    trainer = make_trainer(env, tmp_path, testers=[StagedTester()], monitor=monitor)
+    fake_loop(trainer)
+
+    trainer.train_loop(seed=0, num_epochs=1)
+
+    logged = monitor.by_epoch()[0]
+    assert logged["score"] == 0.5 and isinstance(logged["a_game"], Arrays)
+    # the console shows the numbers
+    assert "'score': '0.5000'" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(

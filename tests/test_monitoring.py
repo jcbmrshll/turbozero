@@ -113,7 +113,15 @@ def declared(key, field):
         ("engine_value_mse_endgame", "(value - z)^2"),
         ("engine_value_sign", "the sign of the outcome"),
         ("edax_level4_sims1000", "score against the engine"),
+        ("edax_level4_sims1000_se", "standard error of the score"),
+        ("edax_level4_sims1000_win", "won"),
+        ("edax_level4_sims1000_draw", "drawn"),
+        ("edax_level4_sims1000_loss", "lost"),
+        ("edax_level8_sims1000_last3", "the run's last epochs"),
+        ("edax_level8_sims1000_last3_se", "standard error of the mean score"),
         ("edax_level4_sims1000_game", "A game the network"),
+        ("edax_seconds", "games against Edax took"),
+        ("egaroucid_seconds", "games against Egaroucid took"),
     ],
 )
 def test_runs_describe_the_metrics_turbozero_logs(key, says):
@@ -147,7 +155,12 @@ def test_runs_headline_their_losses_and_test_outcomes(key, headline):
         ("engine_top1_opening", "higher"),
         ("engine_value_sign", "higher"),
         ("random_avg_outcome", "higher"),
-        ("edax_level4_sims1000", "higher"),
+        ("edax_level4_sims1000_win", "higher"),
+        ("edax_level4_sims1000_loss", "lower"),
+        # a score's direction is declared by its name (see vs_engine.describe_scores), as
+        # the patterns for it also match these
+        ("edax_level4_sims1000_draw", None),
+        ("edax_level4_sims1000_se", None),
         ("policy_target_entropy", None),
     ],
 )
@@ -223,7 +236,7 @@ def test_pgx_episode_is_logged_for_the_views(seaglass_server, ttt):
 
 
 def test_episode_names_its_opponent(seaglass_server):
-    # as a ladder names its rung, or watch.py its engine
+    # as a ladder names its rung, or vs_engine.py its engine
     monitor = Monitor(seaglass_server.url)
     monitor.start()
     episode = Arrays(episode_type("othello"), attrs={"opponent": "edax level 8"}, x=[1])
