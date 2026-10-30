@@ -51,7 +51,7 @@ class League:
             ratings = self._fit(players)
             anchor = store.get_meta("anchor")
             rows = store.db.execute(
-                "SELECT b.id, pa.name AS a, pb.name AS b, b.mode, b.seconds, b.compiled, "
+                "SELECT b.id, pa.name AS a, pb.name AS b, b.seconds, b.compiled, "
                 "b.code_version, b.finished, COUNT(g.id) AS games FROM batches b "
                 "JOIN players pa ON pa.id = b.a_id JOIN players pb ON pb.id = b.b_id "
                 "JOIN games g ON g.batch_id = b.id GROUP BY b.id "
@@ -134,7 +134,7 @@ class League:
             rows = self.store.db.execute(
                 "SELECT g.id, pf.name AS first, ps.name AS second, g.first_id, g.second_id, "
                 "g.opening, g.result, g.first_score, g.second_score, b.finished, "
-                "b.code_version, b.mode, length(g.moves) / 2 AS plies FROM games g "
+                "b.code_version, length(g.moves) / 2 AS plies FROM games g "
                 "JOIN players pf ON pf.id = g.first_id "
                 "JOIN players ps ON ps.id = g.second_id "
                 f"JOIN batches b ON b.id = g.batch_id {clause} "
@@ -151,7 +151,7 @@ class League:
             row = self.store.db.execute(
                 "SELECT g.id, pf.name AS first, ps.name AS second, g.opening, g.result, "
                 "g.first_score, g.second_score, g.moves, b.finished, b.code_version, "
-                "b.dtype, b.mode FROM games g JOIN players pf ON pf.id = g.first_id "
+                "b.dtype FROM games g JOIN players pf ON pf.id = g.first_id "
                 "JOIN players ps ON ps.id = g.second_id "
                 "JOIN batches b ON b.id = g.batch_id WHERE g.id = ?",
                 (game,),

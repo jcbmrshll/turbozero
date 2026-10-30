@@ -48,7 +48,6 @@ CREATE TABLE IF NOT EXISTS batches (
     id INTEGER PRIMARY KEY,
     a_id INTEGER NOT NULL REFERENCES players(id),
     b_id INTEGER NOT NULL REFERENCES players(id),
-    mode TEXT NOT NULL,
     seconds REAL NOT NULL,
     compiled INTEGER NOT NULL,
     code_version TEXT NOT NULL,
@@ -284,7 +283,6 @@ class Store:
         self,
         a: int,
         b: int,
-        mode: str,
         seconds: float,
         compiled: bool,
         code_version: str,
@@ -292,13 +290,12 @@ class Store:
         games: Iterable[GameRecord],
     ) -> int:
         """Records a batch of games between players `a` and `b`, all or none of it, and how
-        it was played: how the scheduler picked it (`mode`), how long it took, whether
-        that includes compiling, the code that played it and the dtype of its networks."""
+        it was played: how long it took, whether that includes compiling, the code that played it and the dtype of its networks."""
         with self.transaction() as db:
             cursor = db.execute(
-                "INSERT INTO batches (a_id, b_id, mode, seconds, compiled, code_version, "
-                "dtype, finished) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (a, b, mode, seconds, int(compiled), code_version, dtype, time.time()),
+                "INSERT INTO batches (a_id, b_id, seconds, compiled, code_version, "
+                "dtype, finished) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (a, b, seconds, int(compiled), code_version, dtype, time.time()),
             )
             batch = cursor.lastrowid
             db.executemany(

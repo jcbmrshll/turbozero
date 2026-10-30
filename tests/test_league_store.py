@@ -33,7 +33,7 @@ def game(first, second, result=1, opening=0):
 
 
 def batch(store, a, b, games):
-    return store.record_batch(a, b, "near", 1.0, False, "abc", "bfloat16", games)
+    return store.record_batch(a, b, 1.0, False, "abc", "bfloat16", games)
 
 
 def two_players(store):
@@ -115,8 +115,8 @@ def test_played_openings_cover_both_orders(store):
 
 def test_batch_costs_leave_out_compiling(store):
     x, y = two_players(store)
-    store.record_batch(x, y, "near", 90.0, True, "abc", "f", [game(x, y)])
-    store.record_batch(x, y, "near", 9.0, False, "abc", "f", [game(x, y), game(y, x)])
+    store.record_batch(x, y, 90.0, True, "abc", "f", [game(x, y)])
+    store.record_batch(x, y, 9.0, False, "abc", "f", [game(x, y), game(y, x)])
     assert store.batch_costs() == [(x, y, 2, 9.0)]
 
 
@@ -149,7 +149,7 @@ x = store.add_external_player("x", "edax")
 y = store.add_external_player("y", "edax")
 print("ready", flush=True)
 while True:
-    store.record_batch(x, y, "near", 1.0, False, "abc", "f",
+    store.record_batch(x, y, 1.0, False, "abc", "f",
                        [GameRecord(x, y, i, 1, [1, 2, 3]) for i in range(50)])
 """
 

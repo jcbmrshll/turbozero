@@ -1,34 +1,20 @@
-"""Picks the next batch of games: where they'd reduce the uncertainty of the ratings most,
-per second of the GPU.
+"""Picks the next batch of games, in two steps:
 
-What a batch is worth is known exactly, given the fit (`ratings`): `n` games between two
-players add `c = n K^2 p (1 - p)` to the precision of the difference `d` between their ratings
-(the near-even games, with p near 1/2, add the most), which removes
-
-    gain = c |Sigma d|^2 / (1 + c d' Sigma d)
-
-from the sum of all the ratings' variances, the Sherman-Morrison update of the covariance
-`Sigma`. It counts what the games tell about everyone else through these two as well.
-
-A batch is picked in two steps, once the game graph is connected:
-
-- The focal player is the one with the highest expected gain per second, given how its
-  opponent will be drawn.
+- The focal player is the most uncertain one. A player with no games is more uncertain than
+  anyone with some, whatever the prior says.
 - The opponent is drawn from a normal distribution of ratings centred on the focal player's,
   mixed with a uniform one. The normal's variance includes both players' uncertainty, so it
   widens to nearly uniform where little is known. It's weighted by the inverse of the pair's
   cost, and down for pairs from the same training run, whose descendants beat their ancestors
   out of proportion to real strength (`same_run_weight`).
 
-Far-apart games carry little information under the model, so the gain never asks for them, and
-the normal's tails almost never draw them. They're what shows the things the model can't see,
-such as ratings drifting along chains of near neighbours and inflation against engines, so
-`uniform_fraction` of the draw keeps them going, at the cost of that much of the GPU.
+Far-apart games say little about the ratings under the model, and the normal's tails almost
+never draw them. They're what shows the things the model can't see, such as ratings drifting
+along chains of near neighbours and inflation against engines, so `uniform_fraction` of the
+draw keeps them going, at the cost of that much of the GPU.
 
-While the game graph has separate parts, a small batch joins the smallest to another, chosen
-at random: before anyone has played, those are the initial random draws. Engines are players
-like any other, except that two of them never play each other, and that `engines` can leave
-them out of new games altogether.
+Engines are players like any other, except that two of them never play each other, and that
+`engines` can leave them out of new games altogether.
 
 Other trade-offs, in `SchedulerConfig`: `width` trades information per game (narrow) against
 ties across the scale (wide).
@@ -38,7 +24,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from core.league.ratings import K, Ratings, expected_score
+from core.league.ratings import Ratings
 from core.league.store import Player
 
 
@@ -75,14 +61,11 @@ class Pairing:
         a: the focal player's id
         b: its opponent's id
         games: how many games to play, half with each moving first
-        mode: "connect" if it joins separate parts of the game graph, otherwise "near" or
-            "far" for whether the two are within two widths of each other
     """
 
     a: int
     b: int
     games: int
-    mode: str
 
 
 def batch_size(
@@ -99,21 +82,6 @@ def batch_size(
         and size // 2 * nodes <= config.max_tree_nodes
     ]
     return fits[-1] if fits else min(config.batch_sizes)
-
-
-def gains(ratings: Ratings, games: np.ndarray) -> np.ndarray:
-    """(n, n) what `games[i, j]` games between each pair would remove from the sum of the
-    ratings' variances."""
-    cov = ratings.cov
-    squared = cov @ cov
-    diagonal = np.diag(cov)
-    diagonal_squared = np.diag(squared)
-    # d' Sigma d and |Sigma d|^2, for d the difference between each pair
-    var = diagonal[:, None] + diagonal[None, :] - 2 * cov
-    norm = diagonal_squared[:, None] + diagonal_squared[None, :] - 2 * squared
-    p = expected_score(ratings.elo[:, None] - ratings.elo[None, :])
-    c = games * K**2 * p * (1 - p)
-    return c * norm / (1 + c * var)
 
 
 def opponent_weights(
@@ -184,52 +152,15 @@ def next_pairing(
     Returns:
         the batch, or None if no two players can play
     """
-    n = len(players)
     allowed = _allowed(config, players)
     if not allowed.any():
         return None
-    ids = [p.id for p in players]
-
-    connect = _connect(ratings, allowed, rng)
-    if connect is not None:
-        # a few games are enough to join them, and to tell where to go from there
-        i, j = connect
-        return Pairing(ids[i], ids[j], min(config.batch_sizes), "connect")
-
-    games = np.array(
-        [
-            [batch_size(config, players[i], players[j], seconds_per_game[i, j])
-             for j in range(n)]
-            for i in range(n)
-        ],
-        dtype=float,
-    )  # fmt: skip
-    per_second = gains(ratings, games) / (games * seconds_per_game)
+    uncertainty = np.where(ratings.games == 0, np.inf, ratings.sd)
+    i = int(np.argmax(np.where(allowed.any(axis=1), uncertainty, -np.inf)))
     opponents = opponent_weights(config, ratings, players, seconds_per_game)
-    # what each player's next batch is worth on average, given how it'd be drawn
-    worth = (opponents * per_second).sum(axis=1)
-    i = int(np.argmax(np.where(allowed.any(axis=1), worth, -np.inf)))
-    j = int(rng.choice(n, p=opponents[i]))
-    far = abs(ratings.elo[i] - ratings.elo[j]) > 2 * config.width
-    return Pairing(ids[i], ids[j], int(games[i, j]), "far" if far else "near")
-
-
-def _connect(
-    ratings: Ratings, allowed: np.ndarray, rng: np.random.Generator
-) -> tuple[int, int] | None:
-    """A random allowed pair joining the smallest part of the game graph to another; None
-    if that isn't possible (everyone playing is connected already)."""
-    components = ratings.components
-    joining = allowed & (components[:, None] != components[None, :])
-    if not joining.any():
-        return None
-    sizes = np.bincount(components)[components]
-    can_join = joining.any(axis=1)
-    smallest = sizes[can_join].min()
-    choices = np.flatnonzero(can_join & (sizes == smallest))
-    i = int(rng.choice(choices))
-    j = int(rng.choice(np.flatnonzero(joining[i])))
-    return i, j
+    j = int(rng.choice(len(players), p=opponents[i]))
+    games = batch_size(config, players[i], players[j], seconds_per_game[i, j])
+    return Pairing(players[i].id, players[j].id, games)
 
 
 def choose_openings(

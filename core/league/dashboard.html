@@ -143,7 +143,7 @@ function drawWorker() {
   let text = "Stopped";
   if (worker.state === "playing") {
     const p = worker.player;
-    text = p.state === "playing" ? `${p.a} vs ${p.b}, ${p.games} games, ${p.mode}, ${ago(p.started)}` : "Starting";
+    text = p.state === "playing" ? `${p.a} vs ${p.b}, ${p.games} games, ${ago(p.started)}` : "Starting";
   } else if (worker.state === "queued") text = `Queued #${worker.job}`;
   else if (worker.state === "waiting") text = `Waiting: ${worker.reason ?? ""}`;
   box.className = worker.state;
@@ -192,10 +192,10 @@ function drawLeaderboard() {
     el("div", { class: "card" }, el("table", {}, el("thead", {}, head), el("tbody", {}, ...rows))),
     el("h2", {}, "Recent batches"),
     el("div", { class: "card" }, el("table", {},
-      el("thead", {}, el("tr", {}, ...["Pair", "Mode"].map((h) => el("th", {}, h)),
+      el("thead", {}, el("tr", {}, el("th", {}, "Pair"),
         ...["Games", "Seconds", "Ago"].map((h) => el("th", { class: "num" }, h)), el("th", {}, "Code"))),
       el("tbody", {}, ...summary.recent.map((b) => el("tr", {},
-        el("td", {}, `${b.a} vs ${b.b}`), el("td", { class: "dim" }, b.mode),
+        el("td", {}, `${b.a} vs ${b.b}`),
         el("td", { class: "num" }, String(b.games)),
         el("td", { class: "num" }, b.seconds.toFixed(0)),
         el("td", { class: "num dim" }, ago(b.finished)),
@@ -367,14 +367,13 @@ async function drawGames(box, player, opponent, offset = 0) {
       el("thead", {}, el("tr", {}, el("th", { class: "num" }, "#"),
         el("th", {}, board?.sideNames?.[0] ?? "First"), el("th", {}, board?.sideNames?.[1] ?? "Second"),
         el("th", {}, "Result"), el("th", { class: "num" }, "Score"), el("th", { class: "num" }, "Opening"),
-        el("th", { class: "num" }, "Moves"), el("th", {}, "Mode"), el("th", { class: "num" }, "Ago"), el("th", {}, "Code"))),
+        el("th", { class: "num" }, "Moves"), el("th", { class: "num" }, "Ago"), el("th", {}, "Code"))),
       el("tbody", {}, ...games.map((g) => el("tr", { class: "link", on: { click: () => { location.hash = `#game/${g.id}`; } } },
         el("td", { class: "num dim" }, String(g.id)),
         el("td", {}, g.first), el("td", {}, g.second), el("td", {}, resultText(g)),
         el("td", { class: "num dim" }, g.first_score === null ? "" : `${g.first_score} – ${g.second_score}`),
         el("td", { class: "num dim" }, String(g.opening)),
         el("td", { class: "num dim" }, String(g.plies)),
-        el("td", { class: "dim" }, g.mode),
         el("td", { class: "num dim" }, ago(g.finished)),
         el("td", { class: "dim" }, g.code_version)))))),
     el("div", { class: "controls", style: "margin-top:10px" },
