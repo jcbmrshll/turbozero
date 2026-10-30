@@ -115,6 +115,15 @@ def _connect_four(x: Any) -> tuple[np.ndarray, np.ndarray]:
     return (np.asarray(x.board) + 1).reshape(-1, 6, 7), np.asarray(x.color)
 
 
+def _hex(x: Any) -> tuple[np.ndarray, np.ndarray]:
+    # a cell of the board is > 0 for the player to move's stones and < 0 for the other's; colour 0
+    # moves first and connects the top and bottom, colour 1 the left and right
+    to_move = np.asarray(x.step_count) % 2
+    board = np.where(to_move[:, None] == 0, x.board, -x.board)
+    size = round(board.shape[1] ** 0.5)
+    return np.select([board > 0, board < 0], [1, 2], 0).reshape(-1, size, size), to_move
+
+
 def episode_type(env_id: str) -> str:
     """The seaglass type of a pgx env's episodes, which picks the views' renderer for them."""
     return f"turbozero/{env_id}-episode"
@@ -127,6 +136,7 @@ BOARDS: dict[str, Callable[[Any], tuple[np.ndarray, np.ndarray]]] = {
     "othello": _othello,
     "tic_tac_toe": _tic_tac_toe,
     "connect_four": _connect_four,
+    "hex": _hex,
 }
 
 

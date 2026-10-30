@@ -35,6 +35,7 @@ This creates a `.venv` with all dependencies. If an NVIDIA GPU is present it ins
 Example training scripts live in `examples/`:
 ```
 uv run examples/othello/train.py   # AlphaZero, scored every epoch against Edax's scores of fixed positions
+uv run examples/hex/train.py       # AlphaZero on Hex at 7 x 7, 9 x 9 or 11 x 11, measured against MoHex
 uv run examples/connect_four/train.py   # AlphaZero, measured against a perfect solver; --search weighted for weighted MCTS
 uv run examples/tic_tac_toe.py     # sanity check: trains in a minute or two on CPU, tested against a random player
 ```
@@ -47,7 +48,7 @@ uv run examples/othello/train.py --monitor   # logs to $SEAGLASS_URL, else slick
 ```
 Inside a slick task `$SEAGLASS_URL` and `$SEAGLASS_TAGS` are set, so the run lists under the task that started it. `--monitor URL` logs to another server, e.g. a standalone one: `uv run seaglass serve --dir runs` serves http://localhost:8008, storing runs in `./runs`. `--notes "..."` says what a run is testing and why, on its page (or set `$SEAGLASS_NOTES`, which any run reads).
 
-In your own scripts, pass `monitor=Monitor(project="...")` (from `core.monitoring`) to the `Trainer`, and `episode_fn=pgx_two_player_episode()` (from `core.monitoring.episodes`) to testers of Othello, Connect Four or tic-tac-toe to see their games. `core.monitoring.Monitor` is a `seaglass.Monitor` that ships turbozero's views (`core/monitoring/views/`, a seaglass bundle) with each run, so any seaglass server draws its games and search trees. Another game needs a board in `core.monitoring.episodes.BOARDS` and a view in `core/monitoring/views/renderers.js`. Each run declares what the metrics turbozero logs are, from `core/monitoring/declared.json`: a description the run's page shows by each, which way is better, and the headline metrics its tiles show. A new metric needs a description there. Logging never interrupts training: if the server is down, the run keeps going and says so once.
+In your own scripts, pass `monitor=Monitor(project="...")` (from `core.monitoring`) to the `Trainer`, and `episode_fn=pgx_two_player_episode()` (from `core.monitoring.episodes`) to testers of Othello, Hex, Connect Four or tic-tac-toe to see their games. `core.monitoring.Monitor` is a `seaglass.Monitor` that ships turbozero's views (`core/monitoring/views/`, a seaglass bundle) with each run, so any seaglass server draws its games and search trees. Another game needs a board in `core.monitoring.episodes.BOARDS`, and a view in `core/monitoring/views/renderers.js` with its episode type in `layout.json`. Each run declares what the metrics turbozero logs are, from `core/monitoring/declared.json`: a description the run's page shows by each, which way is better, and the headline metrics its tiles show. A new metric needs a description there. Logging never interrupts training: if the server is down, the run keeps going and says so once.
 
 ## Issues
 If you use this project and encounter an issue, error, or undesired behavior, please submit a [GitHub Issue](https://github.com/jcbmrshll/turbozero/issues) and I will do my best to resolve it as soon as I can. You may also contact me directly via `hello@jacob.land`.

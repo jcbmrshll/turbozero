@@ -42,6 +42,7 @@ import { BLACK, C4_BLUE, GOLD, OTHELLO_GREEN, RED, WHITE, sunken, theme } from "
 export const RENDERERS = {
   othello,
   connect_four: connectFour,
+  hex,
   tic_tac_toe: ticTacToe,
 };
 
@@ -335,6 +336,137 @@ function ticTacToe(arrays) {
         line(ctx, [a[0] - dx * k, a[1] - dy * k], [b[0] + dx * k, b[1] + dy * k], theme("fg"), 5);
         ctx.globalAlpha = 1;
       }
+    },
+  };
+}
+
+// ---------------------------------------------------------------- hex
+
+const HEX_CELL = 26;
+const HEX_NEIGHBOURS = [[0, -1], [0, 1], [-1, 0], [1, 0], [-1, 1], [1, -1]];
+
+// The board is a rhombus, each row half a cell to the right of the one above. Red (colour 0)
+// connects the top and bottom, Blue the left and right; each side's edge is drawn in its colour.
+// Actions are the cells, row by row, then the swap: the first stone taken, and the other player's
+// placed at its reflection, (r, c) -> (c, r), which boardGame's moves see as a filled cell unless
+// the stone is on the long diagonal.
+function hex(arrays) {
+  const game = boardGame(arrays);
+  const n = game.rows, swap = n * n;
+  const fills = [RED, C4_BLUE];
+  const dy = (HEX_CELL * Math.sqrt(3)) / 2;
+  const padX = HEX_CELL * 1.2, padY = HEX_CELL * 1.1;
+  const W = padX * 2 + HEX_CELL * (n - 1) * 1.5 + 8, H = padY * 2 + dy * (n - 1);
+  const at = (r, c) => [padX + HEX_CELL * (c + r / 2), padY + dy * r];
+  const hexagon = (ctx, x, y, s) => {
+    ctx.beginPath();
+    for (let i = 0; i < 6; i++) {
+      const a = Math.PI / 6 + (i * Math.PI) / 3;
+      ctx[i ? "lineTo" : "moveTo"](x + s * Math.cos(a), y + s * Math.sin(a));
+    }
+    ctx.closePath();
+  };
+  const radius = HEX_CELL / Math.sqrt(3);
+  // the stones connecting a side's two edges, if they do
+  function chain(cell) {
+    for (const colour of [1, 2]) {
+      const seen = new Map();
+      const starts = [];
+      for (let i = 0; i < n; i++) {
+        const [r, c] = colour === 1 ? [0, i] : [i, 0];
+        if (cell(r, c) === colour) starts.push([r, c, null]);
+      }
+      const reached = [];
+      while (starts.length) {
+        const [r, c, from] = starts.pop();
+        const key = r * n + c;
+        if (seen.has(key)) continue;
+        seen.set(key, from);
+        if ((colour === 1 ? r : c) === n - 1) reached.push(key);
+        for (const [dr, dc] of HEX_NEIGHBOURS) {
+          const i = r + dr, j = c + dc;
+          if (i >= 0 && i < n && j >= 0 && j < n && cell(i, j) === colour) starts.push([i, j, key]);
+        }
+      }
+      if (reached.length) {
+        const path = [];
+        for (let key = reached[0]; key !== null; key = seen.get(key)) path.push([Math.floor(key / n), key % n]);
+        return path;
+      }
+    }
+    return null;
+  }
+  return {
+    ...game,
+    width: W,
+    height: H,
+    at,
+    cellSize: HEX_CELL,
+    players: [
+      { name: "Red", color: RED },
+      { name: "Blue", color: C4_BLUE },
+    ],
+    pieces(t, color) {
+      let count = 0;
+      for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) count += game.cell(t, r, c) === color + 1;
+      return count;
+    },
+    actionCell: (a) => (a < swap ? [Math.floor(a / n), a % n] : null),
+    actionAt(x, y) {
+      const r = Math.round((y - padY) / dy);
+      const c = Math.round((x - padX) / HEX_CELL - r / 2);
+      return r >= 0 && r < n && c >= 0 && c < n ? r * n + c : null;
+    },
+    moveName: (a) => (a < swap ? cellName(Math.floor(a / n), a % n) : "swap"),
+    // the swap is the only move that adds no stone
+    counter(t) {
+      const swapped = t > 0 && this.pieces(t, 0) + this.pieces(t, 1) === this.pieces(t - 1, 0) + this.pieces(t - 1, 1);
+      return `move ${t}/${game.frames - 1}${swapped ? " swap" : ""}`;
+    },
+    draw(ctx, t) {
+      this.drawBoard(ctx, game.board(t), game.moves[t]);
+    },
+    drawBoard(ctx, cell, move) {
+      ctx.fillStyle = sunken();
+      ctx.fillRect(0, 0, W, H);
+      // each side's edges, under the cells along them
+      const edge = (from, to, colour) => {
+        const [x0, y0] = at(...from), [x1, y1] = at(...to);
+        line(ctx, [x0, y0], [x1, y1], colour, radius * 2.6);
+      };
+      ctx.lineCap = "round";
+      edge([0, 0], [0, n - 1], RED);
+      edge([n - 1, 0], [n - 1, n - 1], RED);
+      edge([0, 0], [n - 1, 0], C4_BLUE);
+      edge([0, n - 1], [n - 1, n - 1], C4_BLUE);
+      ctx.lineCap = "butt";
+      for (let r = 0; r < n; r++) {
+        for (let c = 0; c < n; c++) {
+          const [x, y] = at(r, c);
+          hexagon(ctx, x, y, radius);
+          ctx.fillStyle = theme("well") || WHITE;
+          ctx.fill();
+          ctx.strokeStyle = theme("edge") || BLACK;
+          ctx.lineWidth = 1;
+          ctx.stroke();
+          const v = cell(r, c);
+          if (v) disc(ctx, x, y, HEX_CELL * 0.38, fills[v - 1]);
+        }
+      }
+      // coordinates along the top and left, as players write moves
+      ctx.fillStyle = theme("dim");
+      ctx.font = `9px ${theme("mono") || "monospace"}`;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      for (let i = 0; i < n; i++) {
+        const [tx, ty] = at(0, i);
+        ctx.fillText(String.fromCharCode(97 + i), tx, ty - radius - 8);
+        const [lx, ly] = at(i, 0);
+        ctx.fillText(String(i + 1), lx - radius - 9, ly);
+      }
+      const won = chain(cell);
+      if (won) for (const rc of won) disc(ctx, ...at(...rc), HEX_CELL * 0.14, WHITE);
+      if (move) disc(ctx, ...at(...move), 4, won ? BLACK : WHITE);
     },
   };
 }
