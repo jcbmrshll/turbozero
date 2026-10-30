@@ -83,6 +83,39 @@ def test_a_network_links_to_its_url(store, url, tmp_path):
     }
 
 
+def post(url, path):
+    request = urllib.request.Request(url + path, method="POST")
+    with urllib.request.urlopen(request) as response:
+        return json.load(response)
+
+
+def test_a_player_can_be_paused_and_resumed(url):
+    x = get(url, "/api/summary")["players"][0]
+    assert not x["retired"] and x["can_play"]
+    post(url, f"/api/paused?player={x['id']}&paused=1")
+    assert get(url, "/api/summary")["players"][0]["retired"]
+    post(url, f"/api/paused?player={x['id']}&paused=0")
+    assert not get(url, "/api/summary")["players"][0]["retired"]
+
+
+def test_pausing_nobody_is_a_404(url):
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        post(url, "/api/paused?player=999&paused=1")
+    assert caught.value.code == 404
+
+
+def test_a_player_that_cant_play_here_cant_be_resumed(store):
+    class OnlySomePlay(FakeGame):
+        def can_play(self, player):
+            return player.name != "x"
+
+    league = League(store, OnlySomePlay())
+    x, y = store.players()
+    assert not league.set_paused(x.id, False)
+    assert league.set_paused(y.id, True)
+    assert store.players()[1].retired
+
+
 def test_linking_an_unknown_network_fails(store):
     with pytest.raises(ValueError):
         store.set_network_url("nobody", "https://example.com")

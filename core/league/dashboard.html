@@ -172,8 +172,7 @@ function perMove(player) {
 }
 
 function tagOf(player) {
-  // an external player that doesn't play here has only its reported results
-  const label = player.external ? (player.retired ? "external" : "engine") : player.retired ? "retired" : null;
+  const label = !player.can_play ? "external" : player.retired ? "paused" : player.external ? "engine" : null;
   return label && el("span", { class: "tag" }, label);
 }
 
@@ -346,7 +345,13 @@ async function drawPlayer(aId, bId) {
     el("option", { value: "" }, "Every opponent"),
     ...players.map((p) => { const o = el("option", { value: p.id }, p.name); if (p.id === bId) o.selected = true; return o; }));
   const content = [
-    el("h1", { style: "margin-bottom:4px" }, a.name),
+    el("div", { class: "controls", style: "margin-bottom:4px" }, el("h1", {}, a.name),
+      a.can_play ? el("button", { on: { click: async () => {
+        await fetch(`/api/paused?player=${aId}&paused=${a.retired ? 0 : 1}`, { method: "POST" });
+        await refresh();
+        drawSidebar();
+        await drawPlayer(aId, bId);
+      } } }, a.retired ? "Resume" : "Pause") : null),
     el("div", { class: "dim", style: "margin-bottom:14px" }, runOf(a), a.net ? ` · ${a.net}` : ""),
     el("div", { class: "tiles" },
       tile(a.games ? `${elo(a.elo)} ±${a.sd.toFixed(0)}` : "–", "rating"),

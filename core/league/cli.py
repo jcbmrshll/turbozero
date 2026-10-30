@@ -4,7 +4,7 @@ add-network NAME CHECKPOINT --net SPEC --run RUN --sims 128 1000 [--url URL]
 link NAME URL
 add-external NAME ENGINE --settings '{"level": 8}'
 add-result A B WINS DRAWS LOSSES --source SOURCE
-anchor NAME; retire NAME
+anchor NAME; retire NAME; resume NAME
 ratings
 start; stop
 dashboard
@@ -90,6 +90,8 @@ def main(make_game: Callable[[], LeagueGame], default_root: Path, argv=None) -> 
     anchor.add_argument("name")
     retire = commands.add_parser("retire", help="no more new games for a player")
     retire.add_argument("name")
+    resume = commands.add_parser("resume", help="new games for a retired player again")
+    resume.add_argument("name")
 
     engines = commands.add_parser("engines", help="whether engines play new games")
     engines.add_argument("state", choices=["on", "off"])
@@ -128,6 +130,8 @@ def main(make_game: Callable[[], LeagueGame], default_root: Path, argv=None) -> 
         store.set_meta("anchor", players[args.name].id)
     elif args.command == "retire":
         store.set_retired(args.name)
+    elif args.command == "resume":
+        store.set_retired(args.name, False)
     elif args.command == "engines":
         store.set_meta("engines", args.state == "on")
     elif args.command == "ratings":
