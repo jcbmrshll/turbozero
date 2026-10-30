@@ -8,6 +8,7 @@ from core.league import gate as gate_module
 from core.league.game import LeagueGame
 from core.league.gate import SlickGate, ThrottledGate
 from core.league.match import BatchResult, Stopped
+from core.league.match import Clock as MoveClock
 from core.league.store import GameRecord, Store
 from core.league.worker import play, supervise
 
@@ -74,6 +75,8 @@ def fake_playing(game, programs, a, b, openings, seed, should_stop):
         + [GameRecord(b.id, a.id, int(o), 1, [0, 1]) for o in openings],
         1.0,
         False,
+        MoveClock(0.5, 4),
+        MoveClock(0.25, 4),
     )
 
 

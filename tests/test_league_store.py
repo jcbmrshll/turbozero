@@ -200,3 +200,17 @@ def test_a_result_from_elsewhere_counts_but_has_no_cost(store):
     assert (record.wins, record.draws, record.losses) == (1, 1, 0)
     assert store.batch_costs() == []
     assert store.players()[0].url == "https://example.com/paper"
+
+
+def test_seconds_per_move_leaves_out_compiling_and_results_from_elsewhere(store):
+    x = store.add_external_player("x", "edax")
+    y = store.add_external_player("y", "edax")
+    games = [game(x, y)]
+    store.record_batch(x, y, 9.0, False, "abc", "f", games, (6.0, 20), (3.0, 10))
+    store.record_batch(y, x, 9.0, False, "abc", "f", games, (2.0, 10), (2.0, 20))
+    store.record_batch(x, y, 99.0, True, "abc", "f", games, (90.0, 10), (9.0, 10))
+    store.record_batch(x, y, 0.0, False, "a paper", "", games)
+    assert store.seconds_per_move() == {
+        x: pytest.approx(8.0 / 40),
+        y: pytest.approx(5.0 / 20),
+    }

@@ -147,7 +147,7 @@ def test_a_players_moves_depend_only_on_the_moves_it_sees(game, tmp_path):
         opponent = net_player(2, 8, seed=opponent_seed, tmp_path=tmp_path)
         first = side_of(game, programs, a, len(OPENINGS), key=1)
         second = side_of(game, programs, opponent, len(OPENINGS), key=2)
-        _, moves, _ = play_games(game, first, second, OPENINGS, key)
+        _, moves, *_ = play_games(game, first, second, OPENINGS, key)
         return moves
 
     # a plays first, so moves 2, 4, 6, 8 of the game are its opponent's after the opening
@@ -157,7 +157,7 @@ def test_a_players_moves_depend_only_on_the_moves_it_sees(game, tmp_path):
     # the same opponent's moves, from an engine with nothing else in common with it
     scripted = Scripted(theirs)
     first = side_of(game, programs, a, len(OPENINGS), key=1)
-    _, replayed, _ = play_games(game, first, scripted, OPENINGS, key)
+    _, replayed, *_ = play_games(game, first, scripted, OPENINGS, key)
     assert replayed == moves
 
 
@@ -191,6 +191,14 @@ def test_openings_are_played_with_each_moving_first(game, tmp_path):
     result = play_batch(game, programs, a, b, np.array([0, 4, 8, 2]), seed=3)
     assert len(result.games) == 8
     assert result.compiled
+    # each side moves in each game, beyond the moves of the openings
+    played = sum(
+        len(g.moves) - game.openings(np.array([g.opening])).shape[1]
+        for g in result.games
+    )
+    assert result.a_clock.moves + result.b_clock.moves <= played
+    assert result.a_clock.moves > 0 and result.a_clock.seconds > 0
+    assert result.b_clock.moves > 0 and result.b_clock.seconds > 0
     assert sorted((g.first, g.opening) for g in result.games) == sorted(
         [(p, o) for p in (1, 2) for o in (0, 4, 8, 2)]
     )
@@ -205,7 +213,7 @@ def test_results_are_the_first_players(game):
     # the top row, for the first player, with the opening its first move
     first = Scripted([[1, 2]])
     second = Scripted([[3, 4]])
-    results, moves, _ = play_games(
+    results, moves, *_ = play_games(
         game, first, second, np.array([[0]]), jax.random.PRNGKey(0)
     )
     assert results.tolist() == [1]

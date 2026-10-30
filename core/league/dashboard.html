@@ -165,6 +165,12 @@ function runOf(player) {
   return el("a", { class: "name run", href: player.url, target: "_blank", rel: "noreferrer" }, player.run);
 }
 
+function perMove(player) {
+  const s = player.seconds_per_move;
+  if (s === null || s === undefined) return "–";
+  return s < 1 ? `${(s * 1000).toFixed(s < 0.01 ? 1 : 0)} ms` : `${s.toFixed(1)} s`;
+}
+
 function tagOf(player) {
   // an external player that doesn't play here has only its reported results
   const label = player.external ? (player.retired ? "external" : "engine") : player.retired ? "retired" : null;
@@ -180,11 +186,11 @@ function drawSidebar() {
   const players = [...summary.players].sort((a, b) => {
     // whoever hasn't played has no rating to sort by
     if (!a.games !== !b.games) return a.games ? -1 : 1;
-    const [x, y] = [a[sortKey] ?? "", b[sortKey] ?? ""];
+    const [x, y] = [a[sortKey] ?? -Infinity, b[sortKey] ?? -Infinity];
     return (x < y ? -1 : x > y ? 1 : 0) * sortDir;
   });
   const selected = selectedPlayer();
-  const columns = [["elo", "Rating", true], ["sd", "±", true], ["games", "Games", true], ["name", "Player", false]];
+  const columns = [["elo", "Rating", true], ["sd", "±", true], ["games", "Games", true], ["seconds_per_move", "Per move", true], ["name", "Player", false]];
   const head = el("tr", {}, el("th", { class: "num" }, "#"), ...columns.map(([key, label, num]) =>
     el("th", {
       class: num ? "num" : "", "data-sort": key,
@@ -195,6 +201,7 @@ function drawSidebar() {
     el("td", { class: "num" }, p.games ? elo(p.elo) : "–"),
     el("td", { class: "num dim" }, p.games ? p.sd.toFixed(0) : "–"),
     el("td", { class: "num" }, String(p.games)),
+    el("td", { class: "num dim" }, perMove(p)),
     el("td", {}, p.name, tagOf(p))));
   document.getElementById("sidebar").replaceChildren(el("table", {}, el("thead", {}, head), el("tbody", {}, ...rows)));
 }
@@ -343,7 +350,8 @@ async function drawPlayer(aId, bId) {
     el("div", { class: "dim", style: "margin-bottom:14px" }, runOf(a), a.net ? ` · ${a.net}` : ""),
     el("div", { class: "tiles" },
       tile(a.games ? `${elo(a.elo)} ±${a.sd.toFixed(0)}` : "–", "rating"),
-      tile(a.games.toLocaleString(), "games")),
+      tile(a.games.toLocaleString(), "games"),
+      tile(perMove(a), "per move")),
     el("div", { class: "controls" }, el("span", { class: "dim" }, "vs"), selB),
   ];
   if (bId !== undefined && bId !== null) {
