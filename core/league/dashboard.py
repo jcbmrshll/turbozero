@@ -1,8 +1,6 @@
 """The league's web page: a server that only reads the store, and never touches the GPU.
 
-Ratings are fit from the games whenever there are new ones. Besides the fit to every game,
-it fits one leaving out the games within a training run: a player rated much higher by the
-first has been beating its own ancestors out of proportion to its real strength.
+Ratings are fit from the games whenever there are new ones.
 """
 
 import json
@@ -34,28 +32,23 @@ class League:
         self.lock = threading.Lock()
         self.fitted: tuple[int, int] | None = None
         self.ratings: Ratings | None = None
-        self.cross_run: Ratings | None = None
 
-    def _fit(self, players: list[Player]) -> tuple[Ratings, Ratings]:
-        """The fits to all the games and to those between runs, redone if there's more."""
+    def _fit(self, players: list[Player]) -> Ratings:
+        """The fit to all the games, redone if there's more."""
         version = (self.store.num_games(), len(players))
-        if self.fitted != version or self.ratings is None or self.cross_run is None:
+        if self.fitted != version or self.ratings is None:
             ids = [p.id for p in players]
-            runs = {p.id: p.run for p in players}
             records = self.store.pair_records()
             anchor = self.store.get_meta("anchor")
             self.ratings = fit_ratings(ids, records, anchor=anchor)
-            self.cross_run = fit_ratings(
-                ids, [r for r in records if runs[r.a] != runs[r.b]], anchor=anchor
-            )
             self.fitted = version
-        return self.ratings, self.cross_run
+        return self.ratings
 
     def summary(self) -> dict[str, Any]:
         with self.lock:
             store = self.store
             players = store.players()
-            ratings, cross_run = self._fit(players)
+            ratings = self._fit(players)
             anchor = store.get_meta("anchor")
             rows = store.db.execute(
                 "SELECT b.id, pa.name AS a, pb.name AS b, b.mode, b.seconds, b.compiled, "
@@ -80,7 +73,6 @@ class League:
                         "name": p.name,
                         "elo": float(ratings.elo[i]),
                         "sd": float(ratings.sd[i]),
-                        "cross_run": float(cross_run.elo[i]),
                         "games": int(ratings.games[i]),
                         "sims": p.sims,
                         "network": p.network,
@@ -118,7 +110,7 @@ class League:
     def pair(self, a: int, b: int) -> dict[str, Any]:
         with self.lock:
             players = self.store.players()
-            ratings, _ = self._fit(players)
+            ratings = self._fit(players)
             i, j = ratings.index(a), ratings.index(b)
             difference = float(ratings.elo[i] - ratings.elo[j])
             return {

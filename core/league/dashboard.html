@@ -164,7 +164,7 @@ function drawLeaderboard() {
   });
   const anchor = summary.anchor ? byId(summary.anchor) : null;
   const columns = [
-    ["elo", "Rating", true], ["sd", "±", true], ["games", "Games", true], ["cross_run", "Between runs", true],
+    ["elo", "Rating", true], ["sd", "±", true], ["games", "Games", true],
     ["sims", "Sims", true], ["name", "Player", false], ["run", "Run", false],
   ];
   const head = el("tr", {}, el("th", { class: "num" }, "#"), ...columns.map(([key, label, num]) =>
@@ -177,7 +177,6 @@ function drawLeaderboard() {
     el("td", { class: "num" }, p.games ? elo(p.elo) : "–"),
     el("td", { class: "num dim" }, p.games ? p.sd.toFixed(0) : "–"),
     el("td", { class: "num" }, String(p.games)),
-    el("td", { class: "num dim" }, p.games ? elo(p.cross_run) : "–"),
     el("td", { class: "num dim" }, p.sims === null ? "" : String(p.sims)),
     el("td", {}, name(p), p.external ? el("span", { class: "tag" }, "engine") : null,
       p.retired ? el("span", { class: "tag" }, "retired") : null),
