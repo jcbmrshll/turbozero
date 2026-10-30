@@ -416,7 +416,8 @@ class EngineMatch:
             seed: draws the openings, and seeds the games
             xot: the XOT opening list
             parallel: games at a time (default: as many as fit in a quarter of the memory
-                available when a level starts, up to 128)
+                available now, up to 128), in batches of equal size: the search compiles
+                for each size
 
         Raises:
             ValueError: if the engine isn't installed
@@ -433,7 +434,9 @@ class EngineMatch:
         self.num_openings = openings
         self.num_games = 2 * openings
         self.seed = seed
-        self.parallel = parallel
+        parallel = min(self.num_games, parallel or max_parallel_games(engine))
+        # batches of equal size: a smaller last one would take about as long as a full one
+        self.parallel = -(-self.num_games // -(-self.num_games // parallel))
         self.evaluator = make_test_evaluator(
             make_nn_eval_fn(network, state_to_nn_input), sims, noise=False
         )
@@ -474,12 +477,6 @@ class EngineMatch:
         """What a level's result is logged as: `edax_level8_sims1000` and so on."""
         return f"{self.engine.name}_level{level}_sims{self.sims}"
 
-    def games_at_a_time(self) -> int:
-        """Games played at once, in batches of equal size: a smaller last one would take
-        about as long as a full one."""
-        parallel = min(self.num_games, self.parallel or max_parallel_games(self.engine))
-        return -(-self.num_games // -(-self.num_games // parallel))
-
     def play(self, params: Any, level: int, record: bool = False) -> LevelResult:
         """Plays the games at `level`, our agent's network with `params` (as
         `make_nn_eval_fn` takes them); with `record`, records the first for the monitor,
@@ -497,7 +494,7 @@ class EngineMatch:
         def search(k, trees, states):
             return self.search(k, trees, states, params)
 
-        parallel = self.games_at_a_time()
+        parallel = self.parallel
         # the first game of the first batch, its engine analysing
         recorder = GameRecorder(0, self.evaluator) if record else None
         with ThreadPoolExecutor(max_workers=available_cpus()) as pool:
@@ -844,7 +841,7 @@ def main():
     print(
         f"{args.checkpoint}: {args.sims} MCTS iterations a move in {args.dtype}, against "
         f"{args.engine} at levels {args.levels}; {args.openings} XOT openings x both "
-        f"colors per level, {match.games_at_a_time()} games at a time",
+        f"colors per level, {match.parallel} games at a time",
         flush=True,
     )
     for level in args.levels:

@@ -355,9 +355,9 @@ The games are played between epochs, in the training process: our agent's search
 the run's GPU memory and its compiled search, and the engine processes (single-threaded, one
 a game) run on the cores the run may use, so `taskset -c 0-7` keeps them on those 8, as many
 searching at once as there are cores. Training waits for them: each evaluation's time is
-logged as `edax_seconds`, to take out of the run's wall time. Alone on one RTX 5080, with a
-10-block network, a level at the defaults took about 11 minutes, before vs_engine.py's
-searches were made about twice as fast. A resumed run (`--resume`) goes on logging them to
+logged as `edax_seconds`, to take out of the run's wall time. On one RTX 5080, with an
+8-block network, a level at the defaults took about 7.5 minutes before our agent's searches
+computed in bfloat16 and searched only on its own moves (each about twice as fast). A resumed run (`--resume`) goes on logging them to
 the same run, at the same epochs, and keeps the results of the last networks it played
 before it stopped for their mean.
 
