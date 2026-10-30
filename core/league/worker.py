@@ -21,7 +21,7 @@ import signal
 import subprocess
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
@@ -70,6 +70,7 @@ def pick_batch(
     rng: np.random.Generator,
 ) -> tuple[Pairing, Player, Player, np.ndarray] | None:
     """The next batch to play: the pairing, its players and the openings to play."""
+    config = replace(config, engines=store.get_meta("engines", True))
     players = store.players()
     ratings = current_ratings(store, players)
     external = {p.id: game.external_seconds(p) for p in players if p.is_external}

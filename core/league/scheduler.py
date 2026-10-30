@@ -10,24 +10,28 @@ players add `c = n K^2 p (1 - p)` to the precision of the difference `d` between
 from the sum of all the ratings' variances, the Sherman-Morrison update of the covariance
 `Sigma`. It counts what the games tell about everyone else through these two as well.
 
-Each batch is drawn by one of these modes:
+A batch is picked in two steps, once the game graph is connected:
 
-- connect: while the game graph has separate parts, a small batch joining the smallest to
-  another, chosen at random. Before anyone has played, that's the initial random draws.
-- near (most batches): the focal player is the one with the highest expected gain per second,
-  given how its opponent will be drawn; the opponent is drawn from a normal distribution of
-  ratings centred on the focal player's. Its variance includes both players' uncertainty, so
-  it widens to nearly uniform where little is known. It's weighted by the inverse of the
-  pair's cost, and down for pairs from the same training run, whose descendants beat their
-  ancestors out of proportion to real strength (`same_run_weight`).
-- far: as near, with the opponent drawn uniformly from the players further than two widths
-  away, so that ratings can't drift along chains of near neighbours.
-- external: as near, with an external engine as the focal player, so that engines keep tying
-  the scale to something outside the league, however few games they need by the gain alone.
+- The focal player is the one with the highest expected gain per second, given how its
+  opponent will be drawn.
+- The opponent is drawn from a normal distribution of ratings centred on the focal player's,
+  mixed with a uniform one. The normal's variance includes both players' uncertainty, so it
+  widens to nearly uniform where little is known. It's weighted by the inverse of the pair's
+  cost, and down for pairs from the same training run, whose descendants beat their ancestors
+  out of proportion to real strength (`same_run_weight`).
 
-Trade-offs, all in `SchedulerConfig`: `width` trades information per game (narrow) against
-ties across the scale (wide); `far_fraction` and `external_fraction` take that many batches
-from the best use of the GPU by the model, for what the model can't see (drift, inflation).
+Far-apart games carry little information under the model, so the gain never asks for them, and
+the normal's tails almost never draw them. They're what shows the things the model can't see,
+such as ratings drifting along chains of near neighbours and inflation against engines, so
+`uniform_fraction` of the draw keeps them going, at the cost of that much of the GPU.
+
+While the game graph has separate parts, a small batch joins the smallest to another, chosen
+at random: before anyone has played, those are the initial random draws. Engines are players
+like any other, except that two of them never play each other, and that `engines` can leave
+them out of new games altogether.
+
+Other trade-offs, in `SchedulerConfig`: `width` trades information per game (narrow) against
+ties across the scale (wide).
 """
 
 from dataclasses import dataclass
@@ -45,8 +49,8 @@ class SchedulerConfig:
     Attributes:
         width: the standard deviation of the ratings opponents are drawn from, in Elo
         same_run_weight: how much less likely an opponent from the same training run is
-        far_fraction: the fraction of batches with a far opponent
-        external_fraction: the fraction of batches with an external engine
+        uniform_fraction: how much of the opponent draw is uniform over all the players
+        engines: whether external engines play new games
         batch_seconds: how long a batch should take at most
         batch_sizes: the sizes of batch to choose from, in games, each even: the search
             compiles for each, so the fewer the better
@@ -56,8 +60,8 @@ class SchedulerConfig:
 
     width: float = 150.0
     same_run_weight: float = 0.5
-    far_fraction: float = 0.1
-    external_fraction: float = 0.1
+    uniform_fraction: float = 0.1
+    engines: bool = True
     batch_seconds: float = 180.0
     batch_sizes: tuple[int, ...] = (64, 128, 256, 512, 1024)
     max_tree_nodes: int = 6_000_000
@@ -71,7 +75,8 @@ class Pairing:
         a: the focal player's id
         b: its opponent's id
         games: how many games to play, half with each moving first
-        mode: how it was drawn: "connect", "near", "far" or "external"
+        mode: "connect" if it joins separate parts of the game graph, otherwise "near" or
+            "far" for whether the two are within two widths of each other
     """
 
     a: int
@@ -119,7 +124,8 @@ def opponent_weights(
 ) -> np.ndarray:
     """(n, n) how likely each column is as the opponent of each row (each row sums to 1,
     or to 0 if it has no opponent): the normal distribution centred on the row's rating,
-    weighted by the pair's cost and by whether it's within a training run."""
+    weighted by the pair's cost and by whether it's within a training run, mixed with a
+    uniform one."""
     sd = ratings.sd
     difference = ratings.elo[:, None] - ratings.elo[None, :]
     var = config.width**2 + sd[:, None] ** 2 + sd[None, :] ** 2
@@ -132,14 +138,20 @@ def opponent_weights(
     weights = np.where(
         same_run & ~same_network, weights * config.same_run_weight, weights
     )
-    return _normalized(weights / costs * _allowed(players))
+    allowed = _allowed(config, players)
+    normal = _normalized(weights / costs * allowed)
+    uniform = _normalized(allowed.astype(float))
+    return (1 - config.uniform_fraction) * normal + config.uniform_fraction * uniform
 
 
-def _allowed(players: list[Player]) -> np.ndarray:
-    """(n, n) which pairs may play: not a player itself, a retired one, or two engines,
-    whose games are all CPU and say nothing about the networks."""
+def _allowed(config: SchedulerConfig, players: list[Player]) -> np.ndarray:
+    """(n, n) which pairs may play: not a player itself, a retired one, two engines, whose
+    games are all CPU and say nothing about the networks, or any engine while they're
+    left out."""
     external = np.array([p.is_external for p in players])
     active = np.array([not p.retired for p in players])
+    if not config.engines:
+        active = active & ~external
     return (
         active[:, None]
         & active[None, :]
@@ -173,14 +185,10 @@ def next_pairing(
         the batch, or None if no two players can play
     """
     n = len(players)
-    allowed = _allowed(players)
+    allowed = _allowed(config, players)
     if not allowed.any():
         return None
     ids = [p.id for p in players]
-
-    def pairing(i: int, j: int, mode: str) -> Pairing:
-        games = batch_size(config, players[i], players[j], seconds_per_game[i, j])
-        return Pairing(ids[i], ids[j], games, mode)
 
     connect = _connect(ratings, allowed, rng)
     if connect is not None:
@@ -197,28 +205,13 @@ def next_pairing(
         dtype=float,
     )  # fmt: skip
     per_second = gains(ratings, games) / (games * seconds_per_game)
-    weights = opponent_weights(config, ratings, players, seconds_per_game)
-    is_far = np.abs(ratings.elo[:, None] - ratings.elo[None, :]) > 2 * config.width
-    far_weights = _normalized((is_far & allowed).astype(float))
-
-    external = np.array([p.is_external for p in players])
-    draw = rng.random()
-    if draw < config.external_fraction and (external & allowed.any(axis=1)).any():
-        mode, focal, opponents = "external", external, weights
-    elif draw < config.external_fraction + config.far_fraction and far_weights.any():
-        mode, focal, opponents = "far", ~external, far_weights
-    else:
-        mode, focal, opponents = "near", ~external, weights
-
-    # what the focal player's next batch is worth on average, given how it'd be drawn
+    opponents = opponent_weights(config, ratings, players, seconds_per_game)
+    # what each player's next batch is worth on average, given how it'd be drawn
     worth = (opponents * per_second).sum(axis=1)
-    can_play = opponents.sum(axis=1) > 0
-    eligible = can_play & focal if (can_play & focal).any() else can_play
-    if not eligible.any():
-        return None
-    i = int(np.argmax(np.where(eligible, worth, -np.inf)))
+    i = int(np.argmax(np.where(allowed.any(axis=1), worth, -np.inf)))
     j = int(rng.choice(n, p=opponents[i]))
-    return pairing(i, j, mode)
+    far = abs(ratings.elo[i] - ratings.elo[j]) > 2 * config.width
+    return Pairing(ids[i], ids[j], int(games[i, j]), "far" if far else "near")
 
 
 def _connect(
@@ -259,7 +252,8 @@ def choose_openings(
 
 @dataclass(frozen=True)
 class CostModel:
-    """How long a game takes, in seconds: a side's search costs `per_sim` per iteration, in
+    """How long a game takes, in seconds, from 8x128 and 6x96 nets on an RTX 5080 in bfloat16
+    (0.04 s at 128 sims a side, 0.4 s at 1000): a side's search costs `per_sim` per iteration, in
     proportion to its network's `size(net)`, on top of `per_game`; an external engine
     costs what the game says. Measured batches correct this, each player by the median of
     (seconds measured / seconds modelled) over its batches.
@@ -269,8 +263,8 @@ class CostModel:
         per_sim: seconds of a game per MCTS iteration a move, of a network of size 1
     """
 
-    per_game: float = 0.044
-    per_sim: float = 2.66e-4
+    per_game: float = 0.005
+    per_sim: float = 2.0e-4
 
 
 def network_size(net: str | None) -> float:

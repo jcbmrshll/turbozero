@@ -186,6 +186,7 @@ function drawLeaderboard() {
       tile(summary.games.toLocaleString(), "games"),
       tile(duration(summary.seconds), "playing"),
       tile(anchor ? anchor.name : "mean", "at 0"),
+      tile(`±${Math.max(0, ...summary.players.filter((p) => !p.external && !p.retired).map((p) => p.sd)).toFixed(0)}`, "worst network"),
       tile(String(summary.parts), summary.parts === 1 ? "part" : "parts")),
     el("div", { class: "card" }, el("table", {}, el("thead", {}, head), el("tbody", {}, ...rows))),
     el("h2", {}, "Recent batches"),

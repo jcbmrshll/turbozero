@@ -9,11 +9,13 @@ each played with both colors, and no pair repeats an opening until it's played t
     uv run examples/othello/elo_league.py ratings
     uv run examples/othello/elo_league.py dashboard
 
-The worker runs from a frozen copy of the code, from a slick task whose worktree it queues in:
+The worker runs from a frozen copy of the code, from a slick task whose worktree it queues in
+(SLICK_TASK names the task; a queue entry's end prompts that task's agent):
 
     git worktree add --detach ~/worktrees/turbozero/elo-frozen && cd ~/worktrees/turbozero/elo-frozen
     ./install.sh
-    uv run --extra cuda examples/othello/elo_league.py start --queue-cwd "$TASK_WORKTREE"
+    tmux new-session -d -s elo-league \
+        uv run --extra cuda examples/othello/elo_league.py start --queue-cwd "$TASK_WORKTREE"
     uv run --extra cuda examples/othello/elo_league.py stop
 
 The store is in ~/.cache/turbozero/othello/league (see --root).
@@ -160,9 +162,9 @@ class Othello(LeagueGame):
         )
 
     def external_seconds(self, player: Player) -> float:
-        # Edax at level 8 takes about 0.05 s of wall clock a game with 8 cores in parallel,
-        # and each level about 1.5x the one below; measured batches correct it
-        return 0.05 * 1.5 ** (player.settings.get("level", 8) - 8)
+        # Edax at level 8 takes about 0.1 s of wall clock a game with 8 cores in parallel;
+        # each level about 1.5x the one below is a guess, which measured batches correct
+        return 0.1 * 1.5 ** (player.settings.get("level", 8) - 8)
 
     def external_parallel(self, player: Player) -> int:
         assert player.external is not None

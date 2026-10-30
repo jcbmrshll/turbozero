@@ -108,6 +108,15 @@ def test_a_pair_doesnt_repeat_its_openings(store):
     assert all(row[3] == 2 for row in rows)
 
 
+def test_engines_can_be_turned_off_between_batches(store):
+    store.set_meta("engines", False)
+    run_play(store, max_batches=10)
+    engines = [p.id for p in store.players() if p.is_external]
+    rows = store.db.execute("SELECT DISTINCT a_id, b_id FROM batches").fetchall()
+    assert rows
+    assert not {pid for row in rows for pid in row} & set(engines)
+
+
 def test_stops_before_a_batch_when_the_gpu_is_wanted(store):
     assert run_play(store, FakeGate(["queue waiting #4"])) == "queue waiting #4"
     assert store.num_games() == 0

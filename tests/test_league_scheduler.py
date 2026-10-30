@@ -58,7 +58,7 @@ def draws(config, ratings, players, costs=None, count=400, seed=0):
     return [p for p in picks if p is not None]
 
 
-NEAR_ONLY = SchedulerConfig(far_fraction=0.0, external_fraction=0.0)
+NEAR_ONLY = SchedulerConfig(uniform_fraction=0.0)
 
 
 def test_gain_is_the_exact_drop_in_total_variance():
@@ -133,29 +133,53 @@ def test_a_network_at_another_budget_isnt_penalised_as_the_same_run():
     assert weights[0, 1] == pytest.approx(weights[0, 2])
 
 
-def test_some_batches_are_far_and_some_against_engines():
-    players = [*nets(4), engine(4)]
-    ratings = known([0, 50, 100, 900, 100])
-    config = SchedulerConfig(far_fraction=0.2, external_fraction=0.1)
-    modes = Counter(p.mode for p in draws(config, ratings, players, count=1000))
-    assert modes["far"] == pytest.approx(200, abs=50)
-    assert modes["external"] == pytest.approx(100, abs=40)
-    assert modes["near"] == pytest.approx(700, abs=60)
-
-
-def test_far_opponents_are_far():
+def test_the_uniform_part_draws_far_opponents():
     players = nets(4)
-    ratings = known([0, 50, 100, 900])
-    config = SchedulerConfig(far_fraction=1.0, external_fraction=0.0)
-    for p in draws(config, ratings, players, count=50):
-        assert p.mode == "far"
-        assert abs(ratings.elo[p.a] - ratings.elo[p.b]) > 2 * config.width
+    ratings = known([0, 50, 100, 900], 5.0)
+    costs = np.full((4, 4), 0.2)
+    config = SchedulerConfig(uniform_fraction=0.3)
+    weights = opponent_weights(config, ratings, players, costs)
+    assert weights.sum(axis=1) == pytest.approx(np.ones(4))
+    # next to nothing from the normal: its share of the uniform part
+    assert weights[0, 3] == pytest.approx(0.1, abs=0.001)
+    assert opponent_weights(NEAR_ONLY, ratings, players, costs)[0, 3] < 1e-6
+
+
+def test_far_batches_are_labelled_and_come_at_the_uniform_rate():
+    players = nets(4)
+    ratings = known([0, 50, 100, 900], 5.0)
+    picks = draws(SchedulerConfig(uniform_fraction=0.3), ratings, players, count=1000)
+    far = [p for p in picks if p.mode == "far"]
+    assert len(far) == pytest.approx(100, abs=40)
+    for p in far:
+        assert 3 in (p.a, p.b)
+
+
+def test_an_uncertain_engine_is_focal_like_anyone_else():
+    players = [*nets(3), engine(3)]
+    ratings = known([0, 0, 0, 0], [10, 10, 10, 200])
+    assert all(p.a == 3 for p in draws(NEAR_ONLY, ratings, players, count=20))
+
+
+def test_engines_can_be_left_out():
+    players = [*nets(3), engine(3)]
+    ratings = known([0, 0, 0, 0], [10, 10, 10, 200])
+    config = SchedulerConfig(engines=False)
+    for p in draws(config, ratings, players, count=100):
+        assert 3 not in (p.a, p.b)
+
+
+def test_engines_left_out_dont_hold_up_connecting():
+    players = [*nets(2), engine(2)]
+    fit = fit_ratings(range(3), [PairRecord(0, 1, 5, 0, 5)])
+    picks = draws(SchedulerConfig(engines=False), fit, players, count=20)
+    assert all({p.a, p.b} == {0, 1} for p in picks)
+    assert all(p.mode != "connect" for p in picks)
 
 
 def test_engines_only_play_networks():
     players = [*nets(2), engine(2), engine(3)]
-    config = SchedulerConfig(external_fraction=0.5)
-    for p in draws(config, known([0, 0, 0, 0]), players, count=100):
+    for p in draws(SchedulerConfig(), known([0, 0, 0, 0]), players, count=100):
         assert p.a < 2 or p.b < 2
 
 
@@ -244,7 +268,7 @@ def test_network_size():
 def test_costs_are_corrected_by_measured_batches():
     players = nets(3, sims=1000)
     before = seconds_per_game(players, {}, [])
-    assert before[0, 1] == pytest.approx(2 * 0.266 + 0.044, rel=0.01)
+    assert before[0, 1] == pytest.approx(0.405, rel=0.01)
     # players 0 and 1 measure three times slower; player 2 stays as modelled
     after = seconds_per_game(players, {}, [(0, 1, 100, 300 * before[0, 1])])
     assert after[0, 1] > 2.5 * before[0, 1]

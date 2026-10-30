@@ -74,6 +74,9 @@ def main(make_game: Callable[[], LeagueGame], default_root: Path, argv=None) -> 
     retire = commands.add_parser("retire", help="no more new games for a player")
     retire.add_argument("name")
 
+    engines = commands.add_parser("engines", help="whether engines play new games")
+    engines.add_argument("state", choices=["on", "off"])
+
     commands.add_parser("ratings", help="print the leaderboard")
     start = commands.add_parser("start", help="run the supervisor (stays running)")
     start.add_argument("--queue-cwd", required=True, help="the slick task's worktree")
@@ -99,6 +102,8 @@ def main(make_game: Callable[[], LeagueGame], default_root: Path, argv=None) -> 
         store.set_meta("anchor", players[args.name].id)
     elif args.command == "retire":
         store.set_retired(args.name)
+    elif args.command == "engines":
+        store.set_meta("engines", args.state == "on")
     elif args.command == "ratings":
         from core.league.worker import current_ratings
 
