@@ -157,6 +157,19 @@ def _env_step(env):
     return jax.jit(jax.vmap(env.step))
 
 
+@dataclass
+class Clock:
+    """How long a player took to choose its moves. Games move together, so a move's share of
+    a step's time is what it took: this is throughput rather than the time of one search."""
+
+    seconds: float = 0.0
+    moves: int = 0
+
+    def add(self, seconds: float, moves: int) -> None:
+        self.seconds += seconds
+        self.moves += moves
+
+
 def play_games(
     game: LeagueGame,
     first: Side,
@@ -164,7 +177,7 @@ def play_games(
     openings: np.ndarray,
     key: jax.Array,
     should_stop: Callable[[], bool] = lambda: False,
-) -> tuple[np.ndarray, list[list[int]], np.ndarray | None]:
+) -> tuple[np.ndarray, list[list[int]], np.ndarray | None, Clock, Clock]:
     """Plays a game per row of `openings` between two sides, the moves known to both.
 
     Args:
@@ -177,7 +190,8 @@ def play_games(
 
     Returns:
         the first player's result in each game (+1, 0, -1); each game's moves, from the
-        start; the game's scores of them (see `LeagueGame.scores`), if it has any
+        start; the game's scores of them (see `LeagueGame.scores`), if it has any; how long
+        the first and the second took to choose their moves
 
     Raises:
         Stopped: if `should_stop` said so
@@ -190,6 +204,7 @@ def play_games(
     moves: list[list[int]] = [[] for _ in range(num_games)]
     first.start(states, first_id)
     second.start(states, first_id)
+    clocks = {id(first): Clock(), id(second): Clock()}
 
     def played(actions: np.ndarray, movers: np.ndarray, told: tuple[Side, ...]) -> None:
         """Plays `actions` in the games marked `movers`, telling the sides `told`."""
@@ -223,21 +238,33 @@ def play_games(
             if movers.any():
                 # an external player has already played its own move on its board
                 own = (side,) if isinstance(side, NetworkSide) else ()
-                played(side.move(states, movers), movers, (*own, other))
+                start = time.perf_counter()
+                actions = side.move(states, movers)
+                clocks[id(side)].add(time.perf_counter() - start, int(movers.sum()))
+                played(actions, movers, (*own, other))
     results = np.sign(np.asarray(states.rewards)[np.arange(num_games), first_id])
     results = results.astype(int)
     first.finish(states, results)
     second.finish(states, results)
-    return results, moves, game.scores(states, first_id)
+    return (
+        results,
+        moves,
+        game.scores(states, first_id),
+        clocks[id(first)],
+        clocks[id(second)],
+    )
 
 
 @dataclass(frozen=True)
 class BatchResult:
-    """A batch played: its games, how long it took and whether that includes compiling."""
+    """A batch played: its games, how long it took and whether that includes compiling, and
+    how long each player took to choose its moves."""
 
     games: list[GameRecord]
     seconds: float
     compiled: bool
+    a_clock: Clock
+    b_clock: Clock
 
 
 def play_batch(
@@ -267,13 +294,14 @@ def play_batch(
         return NetworkSide(program, programs.network(player)[1], key)
 
     games: list[GameRecord] = []
+    clock_of = {a.id: Clock(), b.id: Clock()}
     for half, (one, other) in enumerate(((a, b), (b, a))):
         env_key, first_key, second_key = jax.random.split(
             jax.random.fold_in(jax.random.PRNGKey(seed), half), 3
         )
         first, second = side(one, first_key), side(other, second_key)
         try:
-            results, moves, scores = play_games(
+            results, moves, scores, first_clock, second_clock = play_games(
                 game,
                 first,
                 second,
@@ -284,6 +312,8 @@ def play_batch(
         finally:
             first.close()
             second.close()
+        clock_of[one.id].add(first_clock.seconds, first_clock.moves)
+        clock_of[other.id].add(second_clock.seconds, second_clock.moves)
         games += [
             GameRecord(
                 first=one.id,
@@ -296,4 +326,10 @@ def play_batch(
             )
             for g in range(len(openings))
         ]
-    return BatchResult(games, time.perf_counter() - start, programs.compiled)
+    return BatchResult(
+        games,
+        time.perf_counter() - start,
+        programs.compiled,
+        clock_of[a.id],
+        clock_of[b.id],
+    )

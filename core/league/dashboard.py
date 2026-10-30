@@ -57,6 +57,7 @@ class League:
                 "JOIN games g ON g.batch_id = b.id GROUP BY b.id "
                 "ORDER BY b.id DESC LIMIT 12"
             ).fetchall()
+            per_move = store.seconds_per_move()
             total = store.db.execute(
                 "SELECT COUNT(*), COALESCE(SUM(seconds), 0) FROM batches"
             ).fetchone()
@@ -78,6 +79,7 @@ class League:
                         "network": p.network,
                         "net": p.net,
                         "url": p.url,
+                        "seconds_per_move": per_move.get(p.id),
                         "run": p.run,
                         "external": p.external,
                         "settings": p.settings,

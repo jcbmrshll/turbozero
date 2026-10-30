@@ -53,7 +53,11 @@ CREATE TABLE IF NOT EXISTS batches (
     compiled INTEGER NOT NULL,
     code_version TEXT NOT NULL,
     dtype TEXT NOT NULL,
-    finished REAL NOT NULL
+    finished REAL NOT NULL,
+    a_seconds REAL NOT NULL DEFAULT 0,
+    a_moves INTEGER NOT NULL DEFAULT 0,
+    b_seconds REAL NOT NULL DEFAULT 0,
+    b_moves INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS games (
     id INTEGER PRIMARY KEY,
@@ -308,14 +312,20 @@ class Store:
         code_version: str,
         dtype: str,
         games: Iterable[GameRecord],
+        a_clock: tuple[float, int] = (0.0, 0),
+        b_clock: tuple[float, int] = (0.0, 0),
     ) -> int:
         """Records a batch of games between players `a` and `b`, all or none of it, and how
-        it was played: how long it took, whether that includes compiling, the code that played it and the dtype of its networks."""
+        it was played: how long it took, whether that includes compiling, the code that played it, the dtype of its networks and
+        how long each player took to choose its moves (seconds, moves)."""
         with self.transaction() as db:
             cursor = db.execute(
                 "INSERT INTO batches (a_id, b_id, seconds, compiled, code_version, "
-                "dtype, finished) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (a, b, seconds, int(compiled), code_version, dtype, time.time()),
+                "dtype, finished, a_seconds, a_moves, b_seconds, b_moves) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (a, b, seconds, int(compiled), code_version, dtype, time.time())
+                + a_clock
+                + b_clock,
             )
             batch = cursor.lastrowid
             db.executemany(
@@ -362,6 +372,18 @@ class Store:
             "GROUP BY b.id"
         )
         return [(row[0], row[1], row[2], row[3]) for row in rows]
+
+    def seconds_per_move(self) -> dict[int, float]:
+        """How long each player that has been timed takes to choose a move, leaving out
+        batches that compiled something."""
+        rows = self.db.execute(
+            "SELECT player, SUM(seconds) / SUM(moves) FROM ("
+            "SELECT a_id AS player, a_seconds AS seconds, a_moves AS moves FROM batches "
+            "WHERE compiled = 0 UNION ALL "
+            "SELECT b_id, b_seconds, b_moves FROM batches WHERE compiled = 0"
+            ") WHERE moves > 0 GROUP BY player"
+        )
+        return {row[0]: row[1] for row in rows}
 
     def num_games(self) -> int:
         return self.db.execute("SELECT COUNT(*) FROM games").fetchone()[0]

@@ -193,6 +193,8 @@ def play(
                 version,
                 dtype,
                 result.games,
+                (result.a_clock.seconds, result.a_clock.moves),
+                (result.b_clock.seconds, result.b_clock.moves),
             )
             batches += 1
     finally:
