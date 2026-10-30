@@ -50,6 +50,10 @@ class LeagueGame(ABC):
     # `examples/othello/league_board.js`
     board_js: Path | None = None
 
+    def can_play(self, player: Player) -> bool:
+        """Whether `player` can play here, rather than having only results from elsewhere."""
+        return True
+
     @abstractmethod
     def metadata(self, state: Any) -> StepMetadata:
         """The `StepMetadata` of a state."""

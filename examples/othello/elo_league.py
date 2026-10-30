@@ -154,6 +154,9 @@ class Othello(LeagueGame):
     def openings(self, indices: np.ndarray) -> np.ndarray:
         return self.xot[indices]
 
+    def can_play(self, player: Player) -> bool:
+        return player.external is None or player.external in ENGINES
+
     def external_player(self, player: Player) -> ExternalPlayer:
         assert player.external is not None
         settings = player.settings

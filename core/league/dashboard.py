@@ -84,6 +84,7 @@ class League:
                         "external": p.external,
                         "settings": p.settings,
                         "retired": p.retired,
+                        "can_play": self.game.can_play(p),
                         "part": int(ratings.components[i]),
                     }
                     for i, p in enumerate(players)
@@ -109,6 +110,16 @@ class League:
             "job": supervisor.get("job"),
             "player": player,
         }
+
+    def set_paused(self, player: int, paused: bool) -> bool:
+        """Takes `player` out of the draw for new games, or puts it back; False if there's no
+        such player or it can't play here."""
+        with self.lock:
+            for p in self.store.players():
+                if p.id == player and self.game.can_play(p):
+                    self.store.set_retired(p.name, paused)
+                    return True
+        return False
 
     def pair(self, a: int, b: int) -> dict[str, Any]:
         with self.lock:
@@ -184,6 +195,22 @@ def make_handler(league: League) -> type[BaseHTTPRequestHandler]:
 
         def _json(self, value: Any, status: int = 200) -> None:
             self._send(json.dumps(value).encode(), "application/json", status)
+
+        def do_POST(self) -> None:
+            url = urlparse(self.path)
+            query = parse_qs(url.query)
+            try:
+                player = int(query["player"][0])
+                paused = query["paused"][0] == "1"
+            except (KeyError, ValueError):
+                self._json({"error": "needs player and paused"}, 400)
+                return
+            if url.path != "/api/paused":
+                self._json({"error": "not found"}, 404)
+            elif league.set_paused(player, paused):
+                self._json({"player": player, "paused": paused})
+            else:
+                self._json({"error": "no such player can play"}, 404)
 
         def do_GET(self) -> None:
             url = urlparse(self.path)
