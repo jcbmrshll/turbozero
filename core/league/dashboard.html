@@ -80,7 +80,7 @@ button:disabled { opacity: .4; cursor: default; }
 @media (max-width: 760px) { .game { grid-template-columns: 1fr; } }
 .board-wrap { padding: 12px; }
 .board-wrap svg { display: block; width: 100%; height: auto; }
-.moves { display: grid; grid-template-columns: repeat(auto-fill, minmax(52px, 1fr)); gap: 2px; padding: 10px; }
+.moves { display: grid; grid-template-columns: repeat(auto-fill, minmax(68px, 1fr)); gap: 2px; padding: 10px; }
 .moves button { padding: 2px 4px; border: 0; background: none; color: var(--ink-2); text-align: left; font-variant-numeric: tabular-nums; border-radius: 4px; }
 .moves button.opening { color: var(--ink-3); }
 .moves button.on { background: var(--accent); color: #fff; }
@@ -157,6 +157,8 @@ function name(player) {
 
 function drawLeaderboard() {
   const players = [...summary.players].sort((a, b) => {
+    // whoever hasn't played has no rating to sort by
+    if (!a.games !== !b.games) return a.games ? -1 : 1;
     const [x, y] = [a[sortKey] ?? "", b[sortKey] ?? ""];
     return (x < y ? -1 : x > y ? 1 : 0) * sortDir;
   });
@@ -172,10 +174,10 @@ function drawLeaderboard() {
     }, label + (sortKey === key ? (sortDir < 0 ? " ↓" : " ↑") : ""))));
   const rows = players.map((p, i) => el("tr", { class: "link", on: { click: () => { location.hash = `#pair/${p.id}`; } } },
     el("td", { class: "num dim" }, String(i + 1)),
-    el("td", { class: "num" }, elo(p.elo)),
-    el("td", { class: "num dim" }, p.sd.toFixed(0)),
+    el("td", { class: "num" }, p.games ? elo(p.elo) : "–"),
+    el("td", { class: "num dim" }, p.games ? p.sd.toFixed(0) : "–"),
     el("td", { class: "num" }, String(p.games)),
-    el("td", { class: "num dim" }, elo(p.cross_run)),
+    el("td", { class: "num dim" }, p.games ? elo(p.cross_run) : "–"),
     el("td", { class: "num dim" }, p.sims === null ? "" : String(p.sims)),
     el("td", {}, name(p), p.external ? el("span", { class: "tag" }, "engine") : null,
       p.retired ? el("span", { class: "tag" }, "retired") : null),
@@ -447,8 +449,8 @@ async function refresh() {
   if (games !== summary.games && (location.hash.slice(1) || "leaderboard").startsWith("leaderboard")) drawLeaderboard();
 }
 
-window.addEventListener("hashchange", route);
 await refresh();
+window.addEventListener("hashchange", route);
 await route();
 setInterval(refresh, 10000);
 </script>
