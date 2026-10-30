@@ -49,9 +49,6 @@ class TrainState:
 
 EnvStepFn = Callable[[Any, jax.Array], tuple[Any, StepMetadata]]
 EnvInitFn = Callable[[jax.Array], tuple[Any, StepMetadata]]
-DataTransformFn = Callable[
-    [jax.Array, jax.Array, Any], tuple[jax.Array, jax.Array, Any]
-]
 Params = Any
 EvalFn = Callable[[Any, Params, jax.Array], tuple[jax.Array, jax.Array]]
 LossFn = Callable[

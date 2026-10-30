@@ -1,3 +1,4 @@
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 
 import jax
@@ -27,6 +28,37 @@ class BaseExperience:
     observation_nn: jax.Array
     cur_player_id: jax.Array
     search_value: jax.Array
+
+
+# a data transform (e.g. one of a board's symmetries): maps an experience, without batch
+# dimensions, to another as valid, e.g. the board rotated with its policy target and legal actions
+# to match. The value targets (`reward`, `search_value`) and `cur_player_id` stay as they are.
+DataTransformFn = Callable[[BaseExperience], BaseExperience]
+
+
+def transform_randomly(
+    key: jax.Array,
+    experiences: BaseExperience,
+    transform_fns: Sequence[DataTransformFn],
+) -> BaseExperience:
+    """Maps each of a batch of experiences through a transform drawn uniformly at random, and
+    independently for each, from the identity and `transform_fns`.
+
+    Args:
+        key: rng
+        experiences: experiences, with a leading batch dimension
+        transform_fns: the transforms besides the identity (e.g. a board's other symmetries)
+
+    Returns:
+        BaseExperience: the transformed experiences
+    """
+    if not transform_fns:
+        return experiences
+    branches = [lambda e: e, *transform_fns]
+    choice = jax.random.randint(
+        key, experiences.reward.shape[:1], 0, len(branches), dtype=jnp.int32
+    )
+    return jax.vmap(lambda c, e: jax.lax.switch(c, branches, e))(choice, experiences)
 
 
 @jax.tree_util.register_dataclass
@@ -348,38 +380,58 @@ class EpisodeReplayBuffer:
         return jax.tree_util.tree_map(lambda x: x[indices], state.buffer)
 
     def count_distinct_observations(
-        self, state: ReplayBufferState
+        self,
+        state: ReplayBufferState,
+        transform_fns: Sequence[DataTransformFn] = (),
     ) -> tuple[jax.Array, jax.Array]:
         """Counts the experiences that can be sampled, and how many distinct observations they hold.
 
         A measure of how varied the replay data is. Observations are compared by a 64-bit hash
         of their contents, so collisions are possible but vanishingly rare at buffer sizes.
-        Works with any number of batch dimensions in front of the capacity dimension.
+        With `transform_fns` (e.g. a board's symmetries, which training applies to sampled
+        experiences), observations that one maps to another count as one: each is compared by
+        the least hash of its images under the identity and the transforms, which must be a
+        group (as a board's symmetries are). Works with any number of batch dimensions in front
+        of the capacity dimension.
 
         Args:
             state: replay buffer state
+            transform_fns: (optional) the transforms besides the identity
 
         Returns:
             Tuple[jax.Array, jax.Array]: (number of distinct observations, number of experiences)
         """
         valid = self.sample_mask(state).reshape(-1)
-        obs = state.buffer.observation_nn.reshape(valid.shape[0], -1)
-        # compare raw bits: floats as float32, everything else as int32
-        if jnp.issubdtype(obs.dtype, jnp.floating):
-            bits = jax.lax.bitcast_convert_type(obs.astype(jnp.float32), jnp.uint32)
-        else:
-            bits = jax.lax.bitcast_convert_type(obs.astype(jnp.int32), jnp.uint32)
-        position = jnp.arange(1, bits.shape[1] + 1, dtype=jnp.uint32)
+        experiences = jax.tree.map(
+            lambda x: x.reshape(valid.shape[0], *x.shape[state.populated.ndim :]),
+            state.buffer,
+        )
 
-        def hash_rows(seed: int) -> jax.Array:
-            # mix each element with a constant for its position (murmur3's finalizer),
-            # then sum (mod 2^32), so the hash depends on every element and where it is
-            h = bits ^ (position * jnp.uint32(0x9E3779B9) + jnp.uint32(seed))
-            h = (h ^ (h >> 16)) * jnp.uint32(0x85EBCA6B)
-            h = (h ^ (h >> 13)) * jnp.uint32(0xC2B2AE35)
-            return (h ^ (h >> 16)).sum(axis=-1, dtype=jnp.uint32)
+        def hashes(obs: jax.Array) -> tuple[jax.Array, jax.Array]:
+            obs = obs.reshape(valid.shape[0], -1)
+            # compare raw bits: floats as float32, everything else as int32
+            if jnp.issubdtype(obs.dtype, jnp.floating):
+                bits = jax.lax.bitcast_convert_type(obs.astype(jnp.float32), jnp.uint32)
+            else:
+                bits = jax.lax.bitcast_convert_type(obs.astype(jnp.int32), jnp.uint32)
+            position = jnp.arange(1, bits.shape[1] + 1, dtype=jnp.uint32)
 
-        h1, h2 = hash_rows(0x2545F491), hash_rows(0x6C8E9CF5)
+            def hash_rows(seed: int) -> jax.Array:
+                # mix each element with a constant for its position (murmur3's finalizer),
+                # then sum (mod 2^32), so the hash depends on every element and where it is
+                h = bits ^ (position * jnp.uint32(0x9E3779B9) + jnp.uint32(seed))
+                h = (h ^ (h >> 16)) * jnp.uint32(0x85EBCA6B)
+                h = (h ^ (h >> 13)) * jnp.uint32(0xC2B2AE35)
+                return (h ^ (h >> 16)).sum(axis=-1, dtype=jnp.uint32)
+
+            return hash_rows(0x2545F491), hash_rows(0x6C8E9CF5)
+
+        h1, h2 = hashes(experiences.observation_nn)
+        for transform_fn in transform_fns:
+            t1, t2 = hashes(jax.vmap(transform_fn)(experiences).observation_nn)
+            # keep the least (h1, h2) pair
+            less = (t1 < h1) | ((t1 == h1) & (t2 < h2))
+            h1, h2 = jnp.where(less, t1, h1), jnp.where(less, t2, h2)
         # sort valid experiences first, then by hash, so equal observations end up adjacent
         order = jnp.lexsort((h2, h1, ~valid))
         valid, h1, h2 = valid[order], h1[order], h2[order]

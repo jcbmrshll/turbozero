@@ -8,7 +8,6 @@ in training, mostly the network's own estimates).
 """
 
 import math
-from collections.abc import Sequence
 from dataclasses import dataclass
 
 import jax
@@ -16,7 +15,7 @@ import jax.numpy as jnp
 
 from core.evaluators.mcts.state import MCTSTree
 from core.memory.replay_memory import BaseExperience
-from core.types import DataTransformFn, EnvStepFn, StateToNNInputFn
+from core.types import EnvStepFn, StateToNNInputFn
 
 
 @dataclass(frozen=True)
@@ -24,12 +23,10 @@ class TreePositions:
     """Which search tree positions self-play stores, and how many of them training batches hold.
 
     Attributes:
-        per_move: most tree positions stored from each self-play search (before data transforms add
-            their copies)
+        per_move: most tree positions stored from each self-play search
         min_visits: visits a node needs before it can be stored. Its policy target comes from the
             visits it passed on to its children, one fewer than its own.
-        capacity: tree positions (data transforms' copies included) the replay buffer keeps per
-            environment. Training samples those stored in the replay buffer's span of self-play (see
+        capacity: tree positions the replay buffer keeps per environment. Training samples those stored in the replay buffer's span of self-play (see
             `Trainer.tree_sample_mask`), so K times the replay buffer's capacity always holds it.
         ratio: tree positions per played position in training batches (1 for half of each batch)
         half_life: (optional) epochs over which `ratio` halves; by default it stays constant
@@ -147,12 +144,10 @@ def select_nodes(
 def tree_experiences(
     tree: MCTSTree,
     indices: jax.Array,
-    valid: jax.Array,
     env_step_fn: EnvStepFn,
     state_to_nn_input_fn: StateToNNInputFn,
-    transform_fns: Sequence[DataTransformFn] = (),
-) -> tuple[BaseExperience, jax.Array]:
-    """Training samples for nodes of a search tree (see `select_nodes`), with their transformed copies.
+) -> BaseExperience:
+    """Training samples for nodes of a search tree (see `select_nodes`).
 
     Each node's policy target is the visit distribution over its children, and its value target its
     value in the search, q, for the player to move there (MCTS keeps each node's value from the
@@ -165,15 +160,12 @@ def tree_experiences(
 
     Args:
         tree: search tree, after the search
-        indices: (K,) nodes to make samples of
-        valid: (K,) which of `indices` are nodes, rather than padding
+        indices: (K,) nodes to make samples of (padding's samples mean nothing, see `select_nodes`)
         env_step_fn: environment step function
         state_to_nn_input_fn: converts an environment state to the network's input
-        transform_fns: data transforms (e.g. board symmetries), each adding a copy of every sample
 
     Returns:
-        Tuple[BaseExperience, jax.Array]: K * (1 + len(transform_fns)) samples: the nodes', then each
-            transform's copies of them, and which of them are valid
+        BaseExperience: K samples, the nodes'
     """
     nodes = tree.data_at(indices)
     parents = tree.parents[indices]
@@ -190,22 +182,11 @@ def tree_experiences(
         players == metadata.cur_player_id[:, None], q[:, None], -q[:, None]
     ).astype(metadata.rewards.dtype)
 
-    def experiences(mask, policy, env_state):
-        return BaseExperience(
-            observation_nn=jax.vmap(state_to_nn_input_fn)(env_state),
-            policy_mask=mask,
-            policy_weights=policy,
-            reward=reward,
-            cur_player_id=metadata.cur_player_id,
-            search_value=q,
-        )
-
-    samples = [experiences(mask, policy, nodes.embedding)]
-    for transform_fn in transform_fns:
-        samples.append(
-            experiences(*jax.vmap(transform_fn)(mask, policy, nodes.embedding))
-        )
-    return (
-        jax.tree.map(lambda *x: jnp.concatenate(x), *samples),
-        jnp.tile(valid, len(samples)),
+    return BaseExperience(
+        observation_nn=jax.vmap(state_to_nn_input_fn)(nodes.embedding),
+        policy_mask=mask,
+        policy_weights=policy,
+        reward=reward,
+        cur_player_id=metadata.cur_player_id,
+        search_value=q,
     )

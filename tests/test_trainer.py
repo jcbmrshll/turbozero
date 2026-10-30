@@ -209,9 +209,13 @@ def tree_trainer(env, ckpt_dir, **kwargs):
     )
 
 
-def swap_actions(mask, policy, state):
+def swap_actions(experience):
     """A data transform for the test environment: its two actions swapped."""
-    return mask[::-1], policy[::-1], state
+    return replace(
+        experience,
+        policy_mask=experience.policy_mask[::-1],
+        policy_weights=experience.policy_weights[::-1],
+    )
 
 
 def leaves_equal(a, b):
@@ -1265,7 +1269,7 @@ def test_each_move_starting_in_a_call_takes_the_calls_next_key(env, tmp_path):
     np.testing.assert_array_equal(state.move_key[1], jax.random.split(keys[1], 6)[1])
 
 
-def test_collect_stores_tree_positions_with_their_transformed_copies(env, tmp_path):
+def test_collect_stores_each_position_once(env, tmp_path):
     trainer = tree_trainer(
         env,
         tmp_path,
@@ -1277,12 +1281,15 @@ def test_collect_stores_tree_positions_with_their_transformed_copies(env, tmp_pa
 
     state = trainer.collect_steps(keys, state, None, 6)
 
+    # the 6 moves' played positions, of two finished games of 3 moves, without transformed copies
+    np.testing.assert_array_equal(state.moves, [6, 6])
+    played = np.asarray(trainer.memory_buffer.sample_mask(state.buffer_state))
+    np.testing.assert_array_equal(played.sum(axis=-1), [6, 6])
     tree_buffer, tree_state = trainer.tree_buffer, state.tree_buffer_state
     assert tree_buffer is not None and tree_state is not None
     sampleable = np.asarray(tree_buffer.sample_mask(tree_state))
-    # each stored position, and its transformed copy
     assert int(state.tree_positions.sum()) > 0
-    assert sampleable.sum() == 2 * int(state.tree_positions.sum())
+    assert sampleable.sum() == int(state.tree_positions.sum())
     # each stored after one of the 6 moves
     written_at = np.asarray(state.tree_written_at)[sampleable]
     assert ((written_at >= 0) & (written_at < 6)).all()
@@ -1391,6 +1398,39 @@ def test_train_steps_needs_a_minibatch_of_finished_entries(
         trainer.train_steps(jax.random.PRNGKey(0), state, trainer.init_train_state(), 1)
 
 
+@pytest.mark.parametrize("transform_fns, swapped", [([], 0.0), ([swap_actions], 0.5)])
+def test_training_maps_each_sample_through_a_random_transform(
+    env, tmp_path, monkeypatch, transform_fns, swapped
+):
+    def spying_loss_fn(nn, nn_state, experience):
+        loss, (metrics, nn_state) = az_default_loss_fn(nn, nn_state, experience)
+        # the samples whose policy target was swapped
+        return loss, (
+            {**metrics, "swapped": experience.policy_weights[:, 1].mean()},
+            nn_state,
+        )
+
+    trainer = make_trainer(env, tmp_path, data_transform_fns=transform_fns)
+    monkeypatch.setattr(trainer, "loss_fn", spying_loss_fn)
+    state = trainer.init_collection_state(jax.random.PRNGKey(0), trainer.batch_size)
+    # stored with the first action's policy target
+    buffer_state = written(state.buffer_state, 8)
+    policy = jnp.zeros_like(buffer_state.buffer.policy_weights).at[..., 0].set(1.0)
+    buffer_state = replace(
+        buffer_state, buffer=replace(buffer_state.buffer, policy_weights=policy)
+    )
+
+    _, _, metrics = trainer.train_steps(
+        jax.random.PRNGKey(0),
+        replace(state, buffer_state=buffer_state),
+        trainer.init_train_state(),
+        50,
+    )
+
+    # 200 samples, each swapped with probability 1/2 (or never)
+    assert float(metrics["swapped"]) == pytest.approx(swapped, abs=0.12)
+
+
 def test_tree_position_sampler_fills_the_first_places(env, tmp_path):
     trainer = tree_trainer(env, tmp_path)
     template = trainer.make_template_experience()
@@ -1426,7 +1466,7 @@ def test_tree_position_sampler_fills_the_first_places(env, tmp_path):
 def test_tree_positions_follow_the_replay_buffers_span_of_collection(
     env, tmp_path, monkeypatch
 ):
-    trainer = tree_trainer(env, tmp_path, data_transform_fns=[swap_actions])
+    trainer = tree_trainer(env, tmp_path)
     state = trainer.init_collection_state(jax.random.PRNGKey(0), trainer.batch_size)
     tree_state, written_at = state.tree_buffer_state, state.tree_written_at
     assert tree_state is not None and written_at is not None
@@ -1439,8 +1479,8 @@ def test_tree_positions_follow_the_replay_buffers_span_of_collection(
         ),
         tree_written_at=written_at.at[:, :6].set(jnp.array([3, 4, 10, 15, 19, 0])),
     )
-    # one data transform: a buffer of 32 played entries spans 16 moves, one of 8 spans 4
-    for capacity, expected in [(32, [1, 2, 3, 4]), (8, [4])]:
+    # a buffer of 16 played positions spans 16 moves, one of 4 spans 4
+    for capacity, expected in [(16, [1, 2, 3, 4]), (4, [4])]:
         monkeypatch.setattr(
             trainer, "memory_buffer", EpisodeReplayBuffer(capacity=capacity)
         )

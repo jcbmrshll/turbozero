@@ -20,8 +20,10 @@ from core.evaluators.evaluator import Evaluator
 from core.evaluators.mcts.mcts import MCTS
 from core.memory.replay_memory import (
     BaseExperience,
+    DataTransformFn,
     EpisodeReplayBuffer,
     ReplayBufferState,
+    transform_randomly,
 )
 from core.pytree import where_tree
 from core.testing.tester import BaseTester, TestState
@@ -33,7 +35,6 @@ from core.training.tree_positions import (
     tree_experiences,
 )
 from core.types import (
-    DataTransformFn,
     EnvInitFn,
     EnvStepFn,
     ExtractModelParamsFn,
@@ -59,8 +60,8 @@ class CollectionState:
         buffer_state: state of the replay buffer
         metadata: metadata of the current environment state
         episodes: number of episodes that have terminated so far (not counting truncated ones)
-        tree_positions: number of search tree positions stored so far (not counting transformed copies,
-            see `Trainer`'s `tree_positions`)
+        tree_positions: number of search tree positions stored so far (see `Trainer`'s
+            `tree_positions`)
         tree_visits: their visit counts, summed
         moves: number of self-play moves made so far
         episode_metrics: sums over the terminated episodes of each metric `Trainer`'s
@@ -471,7 +472,11 @@ class Trainer:
                 player) to a dict of scalars, e.g. `lambda rewards: {"draw": (rewards == 0).all()}`. Each is logged
                 every epoch as `episode_<name>`, its mean over the episodes that terminated that epoch (truncated
                 ones aren't counted). Must be compatible with `jax.jit`.
-            data_transform_fns: (optional) list of data transform functions to apply to self-play experiences (e.g. rotation, reflection, etc.)
+            data_transform_fns: (optional) data transforms (e.g. a board's rotations and reflections, see
+                `core.memory.replay_memory.DataTransformFn`) besides the identity. The replay buffers store
+                each position once, and training maps each sample it draws through one of the identity and
+                these, drawn uniformly at random. Together they must be a group (as a board's symmetries are),
+                for `buffer_distinct_positions` (see `collection_metrics`) to count positions up to them.
             tree_positions: (optional) also train on positions from self-play's search trees
                 (see core.training.tree_positions). They're kept in a replay buffer of their own, and make up
                 a share of each training batch, sampled from those stored in the replay buffer's span of
@@ -552,7 +557,10 @@ class Trainer:
             else None
         )
         self.count_distinct_observations = jax.jit(
-            self.memory_buffer.count_distinct_observations
+            partial(
+                self.memory_buffer.count_distinct_observations,
+                transform_fns=tuple(self.transform_fns),
+            )
         )
         # training
         self.train_steps_per_epoch = train_steps_per_epoch
@@ -817,23 +825,6 @@ class Trainer:
             ),
             valid=done,
         )
-        # apply transforms
-        for transform_fn in self.transform_fns:
-            t_policy_mask, t_policy_weights, t_env_state = transform_fn(
-                state.metadata.action_mask, eval_output.policy_weights, state.env_state
-            )
-            buffer_state = self.memory_buffer.add_experience(
-                state=buffer_state,
-                experience=BaseExperience(
-                    observation_nn=self.state_to_nn_input_fn(t_env_state),
-                    policy_mask=t_policy_mask,
-                    policy_weights=t_policy_weights,
-                    reward=jnp.empty_like(state.metadata.rewards),
-                    cur_player_id=state.metadata.cur_player_id,
-                    search_value=search_value,
-                ),
-                valid=done,
-            )
         # assign rewards to buffer if episode is terminated
         buffer_state = where_tree(
             terminated,
@@ -904,7 +895,7 @@ class Trainer:
         valid: ArrayLike = True,
     ) -> CollectionState:
         """Stores positions from a self-play search tree in the tree position replay buffer
-        (see `tree_positions`), with their transformed copies.
+        (see `tree_positions`).
 
         Args:
             key: rng
@@ -931,21 +922,14 @@ class Trainer:
             else None,
         )
         valid = jnp.logical_and(valid, selected)
-        experiences, valid_experiences = tree_experiences(
-            tree,
-            indices,
-            valid,
-            self.env_step_fn,
-            self.state_to_nn_input_fn,
-            self.transform_fns,
+        experiences = tree_experiences(
+            tree, indices, self.env_step_fn, self.state_to_nn_input_fn
         )
-        written = self.tree_buffer.write_indices(
-            state.tree_buffer_state, valid_experiences
-        )
+        written = self.tree_buffer.write_indices(state.tree_buffer_state, valid)
         return replace(
             state,
             tree_buffer_state=self.tree_buffer.add_experiences(
-                state.tree_buffer_state, experiences, valid_experiences
+                state.tree_buffer_state, experiences, valid
             ),
             tree_written_at=state.tree_written_at.at[written].set(
                 state.moves, mode="drop"
@@ -1152,7 +1136,8 @@ class Trainer:
     ) -> tuple[TrainState, dict]:
         """Performs `num_steps` training steps, compiled into a single `jax.lax.scan`.
 
-        Each step samples a minibatch from the replay buffer and updates the parameters.
+        Each step samples a minibatch from the replay buffer, maps each sample through a random data
+        transform (see `data_transform_fns`), and updates the parameters.
 
         Does not check that the replay buffer holds enough entries to sample, see `train_steps`.
 
@@ -1196,6 +1181,8 @@ class Trainer:
             if add_tree_positions is not None:
                 tree_key, key = jax.random.split(key)
                 batch = add_tree_positions(tree_key, batch)
+            transform_key, key = jax.random.split(key)
+            batch = transform_randomly(transform_key, batch, self.transform_fns)
             # make training step
             ts, metrics = self.train_step(ts, batch)
             return (key, ts), metrics
@@ -1209,9 +1196,9 @@ class Trainer:
         """Marks the tree positions (see `tree_positions`) training can sample: those stored within
         the replay buffer's span of self-play.
 
-        The replay buffer holds each environment's newest C played positions (C its capacity), with
-        data transforms' copies: its last C / (1 + number of data transforms) moves. Tree positions
-        are sampled from the ones stored in as many moves, however many each move stored.
+        The replay buffer holds each environment's newest C played positions (C its capacity), its
+        last C moves. Tree positions are sampled from the ones stored in as many moves, however many
+        each move stored.
 
         Args:
             state: current collection state
@@ -1221,7 +1208,7 @@ class Trainer:
         """
         assert self.tree_buffer is not None
         assert state.tree_buffer_state is not None and state.tree_written_at is not None
-        moves = -(-self.memory_buffer.capacity // (1 + len(self.transform_fns)))
+        moves = self.memory_buffer.capacity
         # positions the last move stored are 1 move old
         age = state.moves[..., None] - state.tree_written_at
         return self.tree_buffer.sample_mask(state.tree_buffer_state) & (age <= moves)
@@ -1279,7 +1266,8 @@ class Trainer:
         """Performs `num_steps` training steps.
 
         Each step consists of sampling a minibatch from the replay buffer and updating the parameters.
-        The minibatch is sampled uniformly without replacement from the finished episodes in the buffer.
+        The minibatch is sampled uniformly without replacement from the finished episodes in the buffer,
+        and each sample mapped through a data transform drawn at random (see `data_transform_fns`).
         With `tree_positions`, a share of it is sampled (uniformly, with replacement) from the search tree
         positions stored in the same span of self-play instead (see `tree_sample_mask`).
 
@@ -1348,11 +1336,11 @@ class Trainer:
                 - with `episode_metrics_fn`: `episode_<name>`, each metric's mean over those
                   episodes, omitted if none terminated
                 - `buffer_samples`: experiences in the replay buffer training can sample
-                - `buffer_distinct_positions`: distinct observations among them (data
-                  transforms' outputs count as observations too)
+                - `buffer_distinct_positions`: distinct observations among them, those a data
+                  transform maps to one another counting as one (e.g. a board and its rotations)
                 - `buffer_distinct_fraction`: that as a fraction of those experiences
-                - with `tree_positions`: `tree_positions` stored in between (not counting transformed
-                  copies), `tree_positions_per_move`, and their `tree_mean_visits`
+                - with `tree_positions`: `tree_positions` stored in between,
+                  `tree_positions_per_move`, and their `tree_mean_visits`
         """
         episodes = (after.episodes - before.episodes).sum()
         moves = (after.moves - before.moves).sum()

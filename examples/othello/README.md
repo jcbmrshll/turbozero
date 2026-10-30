@@ -28,8 +28,9 @@ uv run examples/othello/watch.py runs/othello --pid $!   # Edax games once it en
 `--name` names the run on the server, and `--notes` says what it's testing and why, at the
 top of its page.
 
-Self-play runs in 1024 games at once, searching 64 MCTS iterations a move, and each
-position is stored with its 7 symmetric copies (rotations and reflections). Games start
+Self-play runs in 1024 games at once, searching 64 MCTS iterations a move. Replay memory
+stores each position once, and training maps each position it samples through one of the
+board's 8 symmetries (rotations and reflections), drawn at random. Games start
 from XOT openings rather than the standard start, which keeps self-play varied; every
 test game starts from one too (`--standard-starts` mixes in the standard start).
 
@@ -84,16 +85,17 @@ each check waits on the host, and the batch's traversals go on until its deepest
 The default, 8, was the fastest of 1, 2, 4, 8 and 16 on one RTX 5080 (1024 games, 64 to 256
 sims), self-play 1.2 to 1.25 times as fast as with 1.
 
-`--buffer` sets replay memory, the samples kept per environment, which training samples
-from. Self-play adds 1024 an epoch (128 moves, each with its 7 symmetric copies), so the
-default 3000 is about the last 3 epochs. The run's page plots the samples training can
-sample as `buffer_samples`.
+`--buffer` sets replay memory, the positions kept per environment, which training samples
+from. Self-play adds 128 an epoch (a position a move), so the default 375 is about the last
+3 epochs. The run's page plots the positions training can sample as `buffer_samples`, and
+how many of them are distinct, a position's symmetric images counting as one, as
+`buffer_distinct_positions`.
 
-The buffer's size sets how old the data training samples is, not how often each sample
-is trained on: on average, that's the samples training takes each epoch over the samples
+The buffer's size sets how old the data training samples is, not how often each position
+is trained on: on average, that's the samples training takes each epoch over the positions
 self-play adds, whatever the size. With the defaults, 128 steps of 4096 samples
-against 1024 environments adding 1024 samples each, it's 0.5. `--train-steps` changes
-it (or `--train-batch`).
+against 1024 environments adding 128 positions each, it's 4, each time in a symmetry drawn
+at random. `--train-steps` changes it (or `--train-batch`).
 
 The network computes in bfloat16 by default: in self-play and test games
 (`--inference-dtype`), and its convolutions in training (`--train-dtype`, mixed precision:
@@ -192,8 +194,8 @@ OLIVAW (Norelli & Panconesi, section IV-B) and "Lessons from implementing AlphaZ
 - `--tree-positions K` also trains on up to K positions from each self-play search tree:
   nodes visited at least `--tree-min-visits` times, sampled in proportion to their visits
   (`--tree-select most-visited` takes the most visited, as OLIVAW did). Each trains on
-  the visit distribution over its children and its q, and gets the 7 symmetric copies
-  too. They make up a share of each training batch: `--tree-ratio` tree positions per
+  the visit distribution over its children and its q, in a random symmetry each time
+  training samples it, as played positions are. They make up a share of each training batch: `--tree-ratio` tree positions per
   played position, 1 (half the batch) by default, halving every `--tree-half-life` epochs
   if given. Self-play reuses the played move's subtree in its next search, so a node along
   the expected line can be stored by several searches in a row, and is often played soon
@@ -201,19 +203,18 @@ OLIVAW (Norelli & Panconesi, section IV-B) and "Lessons from implementing AlphaZ
   is stored at most once, by the last search it's in.
 
 Tree positions follow replay memory (`--buffer`): training samples those stored in the
-moves its played positions come from (3000 samples is the last 375 moves, at 8 samples a
-move), however many positions each move stored. They're kept in a replay buffer of their
+moves its played positions come from (the last 375 at the default `--buffer`), however many positions each move stored. They're kept in a replay buffer of their
 own, by default K times `--buffer`, which holds that span even when every move stores K;
 `--tree-buffer` sets its size instead (a move stores fewer than K when too few nodes qualify, and about 1.3 of 2
 with `--tree-discarded-only`, so a smaller buffer can still hold the whole span).
 
-Each K adds to GPU memory what raising `--buffer` by as much again would: 1.45 GB per K at
-`--buffer 3000`. Training holds two copies of the replay memory (the epoch's, and the one
-before it, for the self-play metrics), and preallocates 75% of the GPU, 12 GB of a 16 GB
-card. At `--buffer 3000`, K = 1 fits (it's the memory of `--buffer 6000`, which runs);
-K = 2 is that of `--buffer 9000`, which hasn't been tried. Keeping the buffer in host
-memory would make every training step copy its minibatch over; for a larger K, give
-`--tree-buffer` less than K times `--buffer` instead.
+Each K adds to GPU memory what raising `--buffer` by as much again would: 0.18 GB per K at
+`--buffer 375` (about 480 bytes a position, in each of 1024 environments). Training holds
+two copies of the replay memory (the epoch's, and the one before it, for the self-play
+metrics), and preallocates 75% of the GPU, 12 GB of a 16 GB card. 6000 positions per
+environment, played and tree positions together (2.9 GB), are known to fit. Keeping the
+buffer in host memory would make every training step copy its minibatch over; for a much
+larger K, give `--tree-buffer` less than K times `--buffer` instead.
 
 The run's page shows, each epoch, the tree positions stored (`tree_positions`, and
 `tree_positions_per_move` out of K), their mean visit count (`tree_mean_visits`), how many
@@ -246,7 +247,7 @@ saves the whole training state once 50 and 150 epochs are done, as `state-50.npz
 `state-150.npz` in `--ckpt-dir`: the network, optimizer state, replay buffers, games in
 progress with their search trees, the ladder's rung (with `--eval-every`) and the rng.
 `--save-state-every 10` saves one every 10 epochs and keeps only the newest of these. A state takes about as much
-disk space as replay memory takes GPU memory, about 1.45 GB per 3000 samples per
+disk space as replay memory takes GPU memory, about 0.18 GB per 375 positions per
 environment, and K times that again with `--tree-positions K`.
 
 `--resume` continues the run in `--ckpt-dir` from its newest state; pass the run's own
