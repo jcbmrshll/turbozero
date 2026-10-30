@@ -19,6 +19,7 @@ import os
 import re
 import subprocess
 import tempfile
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -60,7 +61,13 @@ class GTPEngine:
     # roughly how much memory one process takes, to decide how many to run at once
     memory_per_process = 0
 
-    def __init__(self, engine_dir: Path, level: int, analyse: bool = False):
+    def __init__(
+        self,
+        engine_dir: Path,
+        level: int,
+        analyse: bool = False,
+        args: Sequence[str] = (),
+    ):
         self.analyse = analyse
         # what its search made of each move of the position it last moved from, best
         # first; None if it didn't say
@@ -69,7 +76,7 @@ class GTPEngine:
         # comes in line with its replies
         self.log: list[str] = []
         self.process = subprocess.Popen(
-            self.command_line(engine_dir, level),
+            [*self.command_line(engine_dir, level), *args],
             cwd=self.working_dir(engine_dir),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -168,7 +175,13 @@ class Edax(GTPEngine):
     # mostly its hash table (2^22 entries, about 130 MB); measured at about 165 MB
     memory_per_process = 170 << 20
 
-    def __init__(self, engine_dir: Path, level: int, analyse: bool = False):
+    def __init__(
+        self,
+        engine_dir: Path,
+        level: int,
+        analyse: bool = False,
+        args: Sequence[str] = (),
+    ):
         self.search_log = None
         if analyse:
             # it logs its searches in detail to a file
@@ -177,7 +190,7 @@ class Edax(GTPEngine):
             # there to be read from the start, before Edax opens it to write
             path.touch()
             self.search_log = open(path)  # noqa: SIM115 - read all its life, closed by close()
-        super().__init__(engine_dir, level, analyse)
+        super().__init__(engine_dir, level, analyse, args)
 
     @classmethod
     def installed(cls, engine_dir: Path) -> bool:
