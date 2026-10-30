@@ -45,7 +45,7 @@ def store(tmp_path):
     x = store.add_external_player("x", "edax", {"level": 8})
     y = store.add_external_player("y", "edax", {"level": 4})
     store.record_batch(
-        x, y, "near", 12.0, False, "abc", "bfloat16",
+        x, y, 12.0, False, "abc", "bfloat16",
         [GameRecord(x, y, 3, 1, [1, 2, 64], 40.0, 24.0), GameRecord(y, x, 3, -1, [5, 6])],
     )  # fmt: skip
     yield store
@@ -95,9 +95,7 @@ def test_summary_says_what_the_worker_is_doing(url, store):
 
 def test_ratings_follow_new_games(url, store):
     before = get(url, "/api/summary")["players"][0]["elo"]
-    store.record_batch(
-        1, 2, "near", 1.0, False, "abc", "f", [GameRecord(1, 2, 4, 1, [1])] * 5
-    )
+    store.record_batch(1, 2, 1.0, False, "abc", "f", [GameRecord(1, 2, 4, 1, [1])] * 5)
     assert get(url, "/api/summary")["players"][0]["elo"] > before
 
 

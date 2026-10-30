@@ -6,18 +6,17 @@ from typing import Any
 import numpy as np
 import pytest
 
-from core.league.ratings import K, Ratings, expected_score, fit_ratings
+from core.league.ratings import Ratings, fit_ratings
 from core.league.scheduler import (
     SchedulerConfig,
     batch_size,
     choose_openings,
-    gains,
     network_size,
     next_pairing,
     opponent_weights,
     seconds_per_game,
 )
-from core.league.store import PairRecord, Player
+from core.league.store import Player
 
 
 def nets(count, sims=128, run=None):
@@ -61,20 +60,6 @@ def draws(config, ratings, players, costs=None, count=400, seed=0):
 NEAR_ONLY = SchedulerConfig(uniform_fraction=0.0)
 
 
-def test_gain_is_the_exact_drop_in_total_variance():
-    fit = fit_ratings(
-        range(3), [PairRecord(0, 1, 20, 0, 20), PairRecord(1, 2, 8, 0, 4)]
-    )
-    games = np.full((3, 3), 64.0)
-    gain = gains(fit, games)
-    p = expected_score(fit.elo[0] - fit.elo[2])
-    d = np.array([1.0, 0.0, -1.0])
-    precision = np.linalg.pinv(fit.cov) + 64 * K**2 * p * (1 - p) * np.outer(d, d)
-    after = np.linalg.pinv(precision)
-    assert gain[0, 2] == pytest.approx(np.trace(fit.cov) - np.trace(after), rel=1e-4)
-    assert gain[0, 0] == 0
-
-
 def test_opponents_near_in_rating_are_drawn_most():
     players = nets(5)
     ratings = known([0, 50, 200, 400, 800])
@@ -100,12 +85,27 @@ def test_the_most_uncertain_player_is_focal():
     assert all(p.a == 2 for p in picks)
 
 
-def test_cost_shifts_the_focal_player_and_the_opponent():
+def test_a_player_without_games_comes_before_any_uncertainty():
     players = nets(3)
-    ratings = known([0, 0, 0], [100, 100, 100])
+    ratings = known([0, 0, 0], [500, 5, 500])
+    ratings.games[1] = 0
+    assert all(p.a == 1 for p in draws(NEAR_ONLY, ratings, players, count=20))
+
+
+def test_a_retired_player_isnt_focal():
+    players = nets(3)
+    players[0] = Player(id=0, name="p0", sims=128, network="n0", run="r0", retired=True)
+    ratings = known([0, 0, 0], [500, 10, 20])
+    assert all(
+        p.a == 2 and p.b == 1 for p in draws(NEAR_ONLY, ratings, players, count=20)
+    )
+
+
+def test_cost_shifts_the_opponent():
+    players = nets(3)
+    ratings = known([0, 0, 0], [200, 100, 100])
     costs = np.array([[1.0, 0.1, 1.0], [0.1, 1.0, 1.0], [1.0, 1.0, 1.0]])
     picks = draws(NEAR_ONLY, ratings, players, costs)
-    assert Counter(p.a for p in picks)[2] == 0
     assert Counter(p.b for p in picks)[1] > 3 * Counter(p.b for p in picks)[2]
 
 
@@ -145,16 +145,6 @@ def test_the_uniform_part_draws_far_opponents():
     assert opponent_weights(NEAR_ONLY, ratings, players, costs)[0, 3] < 1e-6
 
 
-def test_far_batches_are_labelled_and_come_at_the_uniform_rate():
-    players = nets(4)
-    ratings = known([0, 50, 100, 900], 5.0)
-    picks = draws(SchedulerConfig(uniform_fraction=0.3), ratings, players, count=1000)
-    far = [p for p in picks if p.mode == "far"]
-    assert len(far) == pytest.approx(100, abs=40)
-    for p in far:
-        assert 3 in (p.a, p.b)
-
-
 def test_an_uncertain_engine_is_focal_like_anyone_else():
     players = [*nets(3), engine(3)]
     ratings = known([0, 0, 0, 0], [10, 10, 10, 200])
@@ -169,14 +159,6 @@ def test_engines_can_be_left_out():
         assert 3 not in (p.a, p.b)
 
 
-def test_engines_left_out_dont_hold_up_connecting():
-    players = [*nets(2), engine(2)]
-    fit = fit_ratings(range(3), [PairRecord(0, 1, 5, 0, 5)])
-    picks = draws(SchedulerConfig(engines=False), fit, players, count=20)
-    assert all({p.a, p.b} == {0, 1} for p in picks)
-    assert all(p.mode != "connect" for p in picks)
-
-
 def test_engines_only_play_networks():
     players = [*nets(2), engine(2), engine(3)]
     for p in draws(SchedulerConfig(), known([0, 0, 0, 0]), players, count=100):
@@ -188,39 +170,6 @@ def test_retired_players_get_no_games():
     players[1] = Player(id=1, name="p1", sims=128, network="n1", run="r1", retired=True)
     for p in draws(NEAR_ONLY, known([0, 0, 0]), players, count=50):
         assert 1 not in (p.a, p.b)
-
-
-def test_initial_games_connect_everyone_at_random():
-    players = nets(6)
-    fit = fit_ratings(range(6), [])
-    picks = draws(NEAR_ONLY, fit, players, count=200)
-    assert {p.mode for p in picks} == {"connect"}
-    assert {p.a for p in picks} == set(range(6))
-    assert {p.b for p in picks} == set(range(6))
-    assert {p.games for p in picks} == {min(NEAR_ONLY.batch_sizes)}
-
-
-def test_a_separate_part_gets_joined_first():
-    players = nets(5)
-    fit = fit_ratings(
-        range(5),
-        [
-            PairRecord(0, 1, 5, 0, 5),
-            PairRecord(1, 2, 5, 0, 5),
-            PairRecord(3, 4, 5, 0, 5),
-        ],
-    )
-    for p in draws(NEAR_ONLY, fit, players, count=30):
-        assert p.mode == "connect"
-        assert {p.a < 3, p.b < 3} == {True, False}
-
-
-def test_a_retired_player_with_no_gain_isnt_focal():
-    players = nets(3)
-    players[0] = Player(id=0, name="p0", sims=128, network="n0", run="r0", retired=True)
-    # no uncertainty anywhere: every batch is worth nothing, and someone still plays
-    for p in draws(NEAR_ONLY, known([0, 0, 0], 0.0), players, count=20):
-        assert {p.a, p.b} == {1, 2}
 
 
 def test_nobody_to_play():

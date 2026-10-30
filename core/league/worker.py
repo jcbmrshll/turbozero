@@ -31,7 +31,6 @@ from core.league.gate import SLICK_URL, Gate, lane, queue_board
 from core.league.match import Programs, Stopped, play_batch
 from core.league.ratings import Ratings, fit_ratings
 from core.league.scheduler import (
-    Pairing,
     SchedulerConfig,
     choose_openings,
     next_pairing,
@@ -68,8 +67,8 @@ def pick_batch(
     game: LeagueGame,
     config: SchedulerConfig,
     rng: np.random.Generator,
-) -> tuple[Pairing, Player, Player, np.ndarray] | None:
-    """The next batch to play: the pairing, its players and the openings to play."""
+) -> tuple[Player, Player, np.ndarray] | None:
+    """The next batch to play: its players and the openings to play."""
     config = replace(config, engines=store.get_meta("engines", True))
     players = store.players()
     ratings = current_ratings(store, players)
@@ -87,7 +86,7 @@ def pick_batch(
     openings = choose_openings(
         game.num_openings(), store.played_openings(a.id, b.id), num_openings, rng
     )
-    return pairing, a, b, openings
+    return a, b, openings
 
 
 @dataclass
@@ -162,7 +161,7 @@ def play(
             if picked is None:
                 stop_reason = "no two players can play"
                 break
-            pairing, a, b, openings = picked
+            a, b, openings = picked
             store.set_meta(
                 "player",
                 {
@@ -170,7 +169,6 @@ def play(
                     "a": a.name,
                     "b": b.name,
                     "games": 2 * len(openings),
-                    "mode": pairing.mode,
                     "started": time.time(),
                     "pid": os.getpid(),
                 },
@@ -190,7 +188,6 @@ def play(
             store.record_batch(
                 a.id,
                 b.id,
-                pairing.mode,
                 result.seconds,
                 result.compiled,
                 version,
