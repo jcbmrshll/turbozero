@@ -77,6 +77,7 @@ class League:
                         "sims": p.sims,
                         "network": p.network,
                         "net": p.net,
+                        "url": p.url,
                         "run": p.run,
                         "external": p.external,
                         "settings": p.settings,

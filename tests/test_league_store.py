@@ -189,3 +189,14 @@ def test_meta_round_trips(store):
     assert store.get_meta("k", 3) == 3
     store.set_meta("k", {"a": 1})
     assert store.get_meta("k") == {"a": 1}
+
+
+def test_a_result_from_elsewhere_counts_but_has_no_cost(store):
+    x = store.add_external_player("x", "paper", {"url": "https://example.com/paper"})
+    y = store.add_external_player("y", "edax")
+    games = [GameRecord(x, y, -1, 1, []), GameRecord(x, y, -1, 0, [])]
+    store.record_batch(x, y, 0.0, False, "a paper", "", games)
+    record = store.pair_records()[0]
+    assert (record.wins, record.draws, record.losses) == (1, 1, 0)
+    assert store.batch_costs() == []
+    assert store.players()[0].url == "https://example.com/paper"
