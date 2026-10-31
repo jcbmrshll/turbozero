@@ -44,6 +44,9 @@ executionEnvironments = [
 dev = [
     # environments + pretrained baselines used by the examples (pgx's baseline models need haiku)
     "dm-haiku>=0.0.17",
+    "onnx>=1.23.2",
+    "onnxruntime>=1.31.1",
+    "openvino>=2026.4.1",
     "pgx>=2.6.0",
     "pre-commit>=4.6.2",
     "pyright>=1.1.414",
