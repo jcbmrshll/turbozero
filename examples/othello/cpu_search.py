@@ -55,7 +55,10 @@ def load_library() -> ctypes.CDLL:
     u64 = ctypes.POINTER(ctypes.c_uint64)
     c_int = ctypes.POINTER(ctypes.c_int)
     signatures = {
-        "search_new": (Search, [ctypes.c_int, ctypes.c_float, ctypes.c_float, ctypes.c_int]),
+        "search_new": (
+            Search,
+            [ctypes.c_int, ctypes.c_float, ctypes.c_float, ctypes.c_int],
+        ),
         "search_free": (None, [Search]),
         "search_reset": (None, [Search]),
         "search_begin": (None, [Search, ctypes.c_int]),
