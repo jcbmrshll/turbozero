@@ -5,7 +5,8 @@ Protocol, which both speak for Othello). One process plays one game.
 - Egaroucid (https://github.com/Nyanyan/Egaroucid): build it with `setup_egaroucid.sh`
 
 Both play at a "level" L, with their opening books off: up to level 10, they search L moves
-ahead, and solve the game exactly once 2L or fewer squares are empty.
+ahead, and solve the game exactly once 2L or fewer squares are empty. Or on a clock, books on,
+as `ClockedEngine`s (see `clock_match.py`).
 
 An engine started with `analyse` also says, after each move it makes, what its search made
 of the position (`GTPEngine.analysis`), read from the logs it writes as it searches; it plays
@@ -52,6 +53,13 @@ class Analysis:
     bound: int = 0
 
 
+# under CACHE_DIR, where the setup scripts build the engines; a new build goes in a new
+# directory, since a rating belongs to a build
+ENGINE_BUILDS = "engines-2026-10"
+# what Edax's `time_left` sets its level to: the clock decides how deep it goes
+CLOCKED_LEVEL = 60
+
+
 class GTPEngine:
     """An engine process. Subclasses say how to start it and how to read its board, and
     its logs."""
@@ -67,8 +75,10 @@ class GTPEngine:
         level: int,
         analyse: bool = False,
         args: Sequence[str] = (),
+        threads: int = 1,
     ):
         self.analyse = analyse
+        self.threads = threads
         # what its search made of each move of the position it last moved from, best
         # first; None if it didn't say
         self.analysis: list[Analysis] | None = None
@@ -89,7 +99,7 @@ class GTPEngine:
 
     @classmethod
     def default_dir(cls) -> Path:
-        return CACHE_DIR / cls.name
+        return CACHE_DIR / ENGINE_BUILDS / cls.name
 
     @classmethod
     def installed(cls, engine_dir: Path) -> bool:
@@ -181,6 +191,7 @@ class Edax(GTPEngine):
         level: int,
         analyse: bool = False,
         args: Sequence[str] = (),
+        threads: int = 1,
     ):
         self.search_log = None
         if analyse:
@@ -190,17 +201,16 @@ class Edax(GTPEngine):
             # there to be read from the start, before Edax opens it to write
             path.touch()
             self.search_log = open(path)  # noqa: SIM115 - read all its life, closed by close()
-        super().__init__(engine_dir, level, analyse, args)
+        super().__init__(engine_dir, level, analyse, args, threads)
 
     @classmethod
     def installed(cls, engine_dir: Path) -> bool:
         return (engine_dir / "bin" / "edax").exists()
 
     def command_line(self, engine_dir: Path, level: int) -> list[str]:
-        # one thread each: games run in parallel instead. It finds its weights in
-        # data/eval.dat, under its working directory
+        # It finds its weights in data/eval.dat, under its working directory
         command = [str(engine_dir / "bin" / "edax"), "-gtp", "-q", "-l", str(level),
-                   "-n", "1", "-book-usage", "off"]  # fmt: skip
+                   "-n", str(self.threads), "-book-usage", "off"]  # fmt: skip
         if self.search_log is not None:
             command += ["-search-log-file", self.search_log.name]
         return command
@@ -211,15 +221,15 @@ class Edax(GTPEngine):
         # c6:03@100%[-02,-02]; ...", the move's score for the player making it, then the
         # line it expects, the moves after the first each with what Edax knows of the
         # position it leads to: the depth searched and bounds on its value, for the player
-        # to move there. Each step of its search, a move deeper, ends with "=> BEST MOVE
-        # FOUND! level = 8@100% ...", at the depth searched
+        # to move there. Each step of its search, a move deeper, ends with "id = 1 ; level =
+        #  8@100% ; ab = [-64, +64]:", at the depth searched
         assert self.search_log is not None
         # each move's analysis in the latest step that searched it
         latest: dict[int, Analysis] = {}
         # the moves of the step being read: (line, score, bounds after the first move)
         step = []
         for text in self.search_log.read().splitlines():
-            if "BEST MOVE FOUND" in text:
+            if text.startswith("id = "):
                 depth = int(text.split("level =")[1].split("@")[0])
                 for line, score, after in step:
                     latest[line[0]] = Analysis(
@@ -366,7 +376,8 @@ class Egaroucid(GTPEngine):
 
     def command_line(self, engine_dir: Path, level: int) -> list[str]:
         command = [str(engine_dir / "bin" / "Egaroucid_for_Console.out"), "-gtp",
-                   "-quiet", "-nobook", "-level", str(level), "-threads", "1"]  # fmt: skip
+                   "-quiet", "-nobook", "-level", str(level),
+                   "-threads", str(self.threads)]  # fmt: skip
         # it logs its searches to stderr
         return command + (["-noise"] if self.analyse else [])
 
@@ -399,6 +410,112 @@ class Egaroucid(GTPEngine):
         return cells.count("X"), cells.count("O")
 
 
+class ClockedEngine:
+    """An engine playing one game on its own clock, the way its author's time management
+    expects: it's told what's left of the clock and plans the rest of the game itself, at
+    no fixed level, with its shipped opening book on. Only `move` takes its time."""
+
+    def play(self, color: str, move: int) -> None:
+        """Tells the engine about a move by `color` ("b" or "w")."""
+        raise NotImplementedError
+
+    def move(self, color: str, seconds_left: float) -> int:
+        """The engine's move for `color`, which it also plays."""
+        raise NotImplementedError
+
+    def close(self) -> None:
+        raise NotImplementedError
+
+
+class ClockedEdax(ClockedEngine):
+    """Edax over GTP, whose `time_left` is to the millisecond."""
+
+    def __init__(
+        self,
+        engine_dir: Path,
+        seconds: int,
+        threads: int,
+        args: Sequence[str] = (),
+    ):
+        # the author's benchmarks use hash size 25, 2^25 entries; later options win
+        self.engine = Edax(
+            engine_dir,
+            CLOCKED_LEVEL,
+            args=["-h", "25", "-book-usage", "on", *args],
+            threads=threads,
+        )
+        self.engine.command(f"time_settings {seconds} 0 0")
+
+    def play(self, color: str, move: int) -> None:
+        self.engine.play(color, move)
+
+    def move(self, color: str, seconds_left: float) -> int:
+        self.engine.command(f"time_left {color} {max(seconds_left, 0):.3f} 0")
+        return self.engine.genmove(color)
+
+    def close(self) -> None:
+        self.engine.close()
+
+
+class ClockedEgaroucid(ClockedEngine):
+    """Egaroucid over its own console protocol: its GTP has no clock. It keeps the clock
+    itself, in whole seconds to start with, and charges each search as it ends, so
+    `seconds_left` goes unused. Passes are its own: it plays them for whoever has no move."""
+
+    def __init__(
+        self,
+        engine_dir: Path,
+        seconds: int,
+        threads: int,
+        args: Sequence[str] = (),
+    ):
+        command = [str(engine_dir / "bin" / "Egaroucid_for_Console.out"), "-quiet",
+                   "-noboard", "-threads", str(threads), "-time", str(seconds), *args]  # fmt: skip
+        self.process = subprocess.Popen(
+            command,
+            cwd=engine_dir / "bin",
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+        # replies once it has loaded its weights, so that no move is charged for that
+        self.send("version")
+        self.reply()
+
+    def send(self, command: str) -> None:
+        assert self.process.stdin is not None
+        self.process.stdin.write(command + "\n")
+        self.process.stdin.flush()
+
+    def reply(self) -> str:
+        """A line of its output, without the prompts in front of it."""
+        assert self.process.stdout is not None
+        line = self.process.stdout.readline()
+        if line == "":
+            raise RuntimeError("egaroucid exited")
+        return line.replace(">", "").strip()
+
+    def play(self, color: str, move: int) -> None:
+        if move != PASS:
+            self.send(f"play {square(move)}")
+
+    def move(self, color: str, seconds_left: float) -> int:
+        self.send("go")
+        while not re.fullmatch(r"[a-h][1-8]", text := self.reply()):
+            pass
+        return action(text)
+
+    def close(self) -> None:
+        self.process.kill()
+        self.process.wait()
+
+
+CLOCKED: dict[str, type[ClockedEdax] | type[ClockedEgaroucid]] = {
+    Edax.name: ClockedEdax,
+    Egaroucid.name: ClockedEgaroucid,
+}
 ENGINES: dict[str, type[GTPEngine]] = {e.name: e for e in (Edax, Egaroucid)}
 # the engines with an analyst, by name
 ANALYSTS: dict[str, type[EdaxAnalyst]] = {Edax.name: EdaxAnalyst}
