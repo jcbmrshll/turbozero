@@ -286,6 +286,48 @@ uv run examples/othello/train.py --epochs 30 --init-from runs/trunk/state-150.np
     --sims 128 --ckpt-dir runs/trunk150-sims128
 ```
 
+### Training on Modal
+
+`modal_jobs.py` runs train.py on Modal's GPUs, several at once, and brings the results to the
+paths a local run would write them to, so analysis and the Elo league don't need to know:
+
+```sh
+# steps run in order on one GPU, from the commit named (it must be on GitHub)
+uv run examples/othello/modal_jobs.py launch --name trunk-a --gpu L40S --hours 4 --commit 7b52872 \
+    --step "examples/othello/train.py --epochs 93 --save-state-at 93 --monitor --name a --notes why --ckpt-dir $C/trunk > $L/trunk.log" \
+    --step "examples/othello/train.py --epochs 19 --lr 1e-4 --lr-final 1e-4 --init-from $C/trunk/state-93.npz --ckpt-dir $C/fork > $L/fork.log"
+uv run examples/othello/modal_jobs.py list [--billed today]
+uv run examples/othello/modal_jobs.py stop trunk-a       # or --all; --now doesn't wait for the run to end as stopped
+uv run examples/othello/modal_jobs.py resume trunk-a     # after it ended short; --hours for a new limit
+uv run examples/othello/modal_jobs.py sync               # `launch` keeps one running, in tmux session modal-sync
+```
+
+A step is the command as you'd write it here, with `> LOG`; paths must be under
+`~/.cache/turbozero`. `--init-from` names a `state-<EPOCH>.npz`, here, in the bucket, or from an
+earlier step. `--vs-engine-*` is refused, as the image has no Edax. A job runs without this machine.
+Files go to the bucket as they're written: the sync brings them here, and a `--monitor` run appears
+on slick's seaglass while it runs, tagged with `$SEAGLASS_TAGS` and `modal`, its chip in its
+provenance. `modal-job.json` beside the checkpoints records commit, chip, flags and wall time.
+Nothing leaves the bucket on its own. An interrupted job continues from its newest state, saved
+every `--resume-every` epochs (10) and kept in the bucket only; it repeats the epochs since, so its
+log and metrics hold those epochs twice, the later ones the ones that count, as with `--resume`.
+
+What each chip did on 8x128, 128 sims a move, 8 passes, window 1125 (72 s/epoch on the RTX 5080),
+with 2 cores and 16 GiB, at Modal's list prices of 2026-10-31:
+
+| `--gpu` | s/epoch | speed vs 5080 | $/h | $ per 5080-hour |
+|---|---|---|---|---|
+| L40S | 48 | 1.49 | 2.17 | 1.46 |
+| RTX-PRO-6000 | 34.5 | 2.09 | 3.25 | 1.56 |
+| H100! | 29 | 2.47 | 4.17 | 1.69 |
+| A100-40GB | 56 | 1.29 | 2.32 | 1.80 |
+| A10 | 129 | 0.56 | 1.32 | 2.37 |
+
+L40S costs least for the work done; H100! gives results soonest. Budgets stay in epochs, as chips
+differ in speed: 137 RTX 5080 minutes take about 92 minutes and $3.30 on an L40S. Saving and
+moving a state of about 0.8 GB costs next to nothing to the bucket; bringing it here costs about
+$0.10 (GCS egress), which is why states saved only to continue from stay there.
+
 ## Evaluating a checkpoint
 
 Checkpoints from `train.py` are named after their epoch (`199.eqx` is the last of a

@@ -44,6 +44,8 @@ executionEnvironments = [
 dev = [
     # environments + pretrained baselines used by the examples (pgx's baseline models need haiku)
     "dm-haiku>=0.0.17",
+    "google-cloud-storage>=3.17.1",
+    "modal>=1.6.3",
     "pgx>=2.6.0",
     "pre-commit>=4.6.2",
     "pyright>=1.1.414",
