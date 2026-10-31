@@ -7,6 +7,9 @@ so it can't be deleted from under the league.
 
 A batch of games is written in one transaction, so stopping at any moment, however abruptly,
 leaves whole batches. Ratings aren't stored: they're fit to the games whenever needed.
+
+A match request is a series someone asked for. Its progress is written in its batch's
+transaction, so a series can't lose count of its games however the worker stops.
 """
 
 import hashlib
@@ -74,6 +77,16 @@ CREATE INDEX IF NOT EXISTS games_by_pair ON games (first_id, second_id);
 CREATE INDEX IF NOT EXISTS games_by_second ON games (second_id);
 CREATE INDEX IF NOT EXISTS games_by_batch ON games (batch_id);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS match_requests (
+    id INTEGER PRIMARY KEY,
+    a_id INTEGER NOT NULL REFERENCES players(id),
+    b_id INTEGER NOT NULL REFERENCES players(id),
+    games INTEGER NOT NULL CHECK (games > 0),
+    played INTEGER NOT NULL DEFAULT 0,
+    state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'done', 'cancelled')),
+    added REAL NOT NULL,
+    ended REAL
+);
 """
 
 
@@ -144,6 +157,22 @@ class PairRecord:
     wins: int
     draws: int
     losses: int
+
+
+@dataclass(frozen=True)
+class MatchRequest:
+    """A series someone asked for, between players `a` and `b` (their ids): `played` of its
+    `games` so far."""
+
+    id: int
+    a: int
+    b: int
+    games: int
+    played: int
+
+    @property
+    def remaining(self) -> int:
+        return self.games - self.played
 
 
 def encode_moves(moves: Sequence[int]) -> bytes:
@@ -314,10 +343,13 @@ class Store:
         games: Iterable[GameRecord],
         a_clock: tuple[float, int] = (0.0, 0),
         b_clock: tuple[float, int] = (0.0, 0),
+        request: int | None = None,
     ) -> int:
         """Records a batch of games between players `a` and `b`, all or none of it, and how
         it was played: how long it took, whether that includes compiling, the code that played it, the dtype of its networks and
-        how long each player took to choose its moves (seconds, moves)."""
+        how long each player took to choose its moves (seconds, moves). If it's part of a
+        match `request`, that's brought up to date with it."""
+        games = list(games)
         with self.transaction() as db:
             cursor = db.execute(
                 "INSERT INTO batches (a_id, b_id, seconds, compiled, code_version, "
@@ -337,8 +369,52 @@ class Store:
                     for g in games
                 ],
             )
+            if request is not None:
+                db.execute(
+                    "UPDATE match_requests SET played = played + ? WHERE id = ?",
+                    (len(games), request),
+                )
+                db.execute(
+                    "UPDATE match_requests SET state = 'done', ended = ? "
+                    "WHERE id = ? AND state = 'pending' AND played >= games",
+                    (time.time(), request),
+                )
         assert batch is not None
         return batch
+
+    def request_match(self, a: int, b: int, games: int) -> int:
+        """Asks for `games` games between players `a` and `b`, after those already asked for."""
+        with self.transaction() as db:
+            cursor = db.execute(
+                "INSERT INTO match_requests (a_id, b_id, games, added) VALUES (?, ?, ?, ?)",
+                (a, b, games, time.time()),
+            )
+        assert cursor.lastrowid is not None
+        return cursor.lastrowid
+
+    def pending_matches(self) -> list[MatchRequest]:
+        """The series still to finish, oldest first."""
+        rows = self.db.execute(
+            "SELECT id, a_id, b_id, games, played FROM match_requests "
+            "WHERE state = 'pending' ORDER BY id"
+        )
+        return [MatchRequest(*row) for row in rows]
+
+    def cancel_match(self, request: int) -> None:
+        """Drops a pending series. Games already played stay, and a batch being played counts
+        when it finishes.
+
+        Raises:
+            ValueError: if there's no such series still pending
+        """
+        with self.transaction() as db:
+            changed = db.execute(
+                "UPDATE match_requests SET state = 'cancelled', ended = ? "
+                "WHERE id = ? AND state = 'pending'",
+                (time.time(), request),
+            ).rowcount
+        if not changed:
+            raise ValueError(f"no pending match #{request}")
 
     def pair_records(self) -> list[PairRecord]:
         """Each pair's games so far, the pair in order of id."""

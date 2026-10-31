@@ -155,6 +155,7 @@ function drawWorker() {
   else if (worker.state === "queued") text = `Queued #${worker.job}`;
   else if (worker.state === "waiting") text = `Waiting: ${worker.reason ?? ""}`;
   box.className = p ? "playing" : worker.state;
+  if (summary.requests.length) text += ` · ${summary.requests.map((r) => `${byId(r.a).name} vs ${byId(r.b).name} ${r.played}/${r.games}`).join(", ")}`;
   box.title = text;
   document.getElementById("worker-text").textContent = text;
 }

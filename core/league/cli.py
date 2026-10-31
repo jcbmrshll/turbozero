@@ -4,6 +4,7 @@ add-network NAME CHECKPOINT --net SPEC --run RUN --sims 128 1000 [--url URL]
 link NAME URL
 add-external NAME ENGINE --settings '{"level": 8}'
 add-result A B WINS DRAWS LOSSES --source SOURCE
+match A B --games N; matches; cancel-match ID
 anchor NAME; retire NAME; resume NAME
 ratings
 start; stop
@@ -36,6 +37,17 @@ def leaderboard(players: list[Player], ratings: Ratings) -> str:
     ]
     if not ratings.connected:
         lines.append(f"{len(set(ratings.components.tolist()))} separate parts")
+    return "\n".join(lines)
+
+
+def pending_matches(store: Store) -> str:
+    """The series still to finish as text, next first."""
+    by_id = {p.id: p for p in store.players()}
+    lines = []
+    for r in store.pending_matches():
+        a, b = by_id[r.a], by_id[r.b]
+        waiting = "  retired" if a.retired or b.retired else ""
+        lines.append(f"#{r.id}  {a.name} vs {b.name}  {r.played}/{r.games}{waiting}")
     return "\n".join(lines)
 
 
@@ -86,6 +98,16 @@ def main(make_game: Callable[[], LeagueGame], default_root: Path, argv=None) -> 
     result.add_argument("losses", type=int, help="A's")
     result.add_argument("--source", required=True, help="where it's reported")
 
+    match = commands.add_parser("match", help="ask the worker to play a series next")
+    match.add_argument("a")
+    match.add_argument("b")
+    match.add_argument(
+        "--games", type=int, required=True, help="even: half each colour"
+    )
+    commands.add_parser("matches", help="the series still to finish")
+    cancel = commands.add_parser("cancel-match", help="drop a series")
+    cancel.add_argument("id", type=int)
+
     anchor = commands.add_parser("anchor", help="the player the scale's zero is at")
     anchor.add_argument("name")
     retire = commands.add_parser("retire", help="no more new games for a player")
@@ -126,6 +148,28 @@ def main(make_game: Callable[[], LeagueGame], default_root: Path, argv=None) -> 
         outcomes = [1] * args.wins + [0] * args.draws + [-1] * args.losses
         games = [GameRecord(a, b, -1, outcome, []) for outcome in outcomes]
         store.record_batch(a, b, 0.0, False, args.source, "", games)
+    elif args.command == "match":
+        game = make_game()
+        for name in (args.a, args.b):
+            if name not in players:
+                parser.error(f"no player {name}")
+            if players[name].retired:
+                parser.error(f"{name} is retired")
+            if not game.can_play(players[name]):
+                parser.error(f"{name} can't play here")
+        if args.a == args.b:
+            parser.error("a player can't play itself")
+        if args.games <= 0 or args.games % 2:
+            parser.error("--games must be positive and even: half with each colour")
+        a, b = players[args.a].id, players[args.b].id
+        print(f"#{store.request_match(a, b, args.games)}")
+    elif args.command == "matches":
+        print(pending_matches(store))
+    elif args.command == "cancel-match":
+        try:
+            store.cancel_match(args.id)
+        except ValueError as e:
+            parser.error(str(e))
     elif args.command == "anchor":
         store.set_meta("anchor", players[args.name].id)
     elif args.command == "retire":

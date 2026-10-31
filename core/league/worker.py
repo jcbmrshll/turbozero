@@ -14,6 +14,9 @@ needs nothing but the store. An entry cancelled from the queue stops the supervi
 that's someone saying so.
 
 A batch is short (`SchedulerConfig.batch_seconds`) so that little is lost when one's abandoned.
+
+Series someone asked for (`Store.request_match`) are played first, oldest first, as batches like
+any others. One waits while either of its players is retired, and doesn't hold up the rest.
 """
 
 import os
@@ -34,9 +37,10 @@ from core.league.scheduler import (
     SchedulerConfig,
     choose_openings,
     next_pairing,
+    requested_games,
     seconds_per_game,
 )
-from core.league.store import Player, Store
+from core.league.store import MatchRequest, Player, Store
 
 
 def code_version() -> str:
@@ -62,31 +66,90 @@ def current_ratings(store: Store, players: list[Player] | None = None) -> Rating
     )
 
 
-def pick_batch(
+@dataclass(frozen=True)
+class Batch:
+    """The batch to play next: `request` is the series it's part of, if any."""
+
+    a: Player
+    b: Player
+    openings: np.ndarray
+    request: int | None = None
+
+
+def _choose_batch(
     store: Store,
     game: LeagueGame,
-    config: SchedulerConfig,
+    a: Player,
+    b: Player,
+    games: int,
     rng: np.random.Generator,
-) -> tuple[Player, Player, np.ndarray] | None:
-    """The next batch to play: its players and the openings to play."""
-    config = replace(config, engines=store.get_meta("engines", True))
-    players = store.players()
-    ratings = current_ratings(store, players)
-    external = {p.id: game.external_seconds(p) for p in players if p.is_external}
-    costs = seconds_per_game(players, external, store.batch_costs())
-    pairing = next_pairing(config, ratings, players, costs, rng)
-    if pairing is None:
-        return None
-    by_id = {p.id: p for p in players}
-    a, b = by_id[pairing.a], by_id[pairing.b]
-    num_openings = pairing.games // 2
+    request: int | None = None,
+) -> Batch:
+    """`games` games between `a` and `b`, or as many as their engines can play at once."""
+    num_openings = games // 2
     for player in (a, b):
         if player.is_external:
             num_openings = min(num_openings, game.external_parallel(player))
     openings = choose_openings(
         game.num_openings(), store.played_openings(a.id, b.id), num_openings, rng
     )
-    return a, b, openings
+    return Batch(a, b, openings, request)
+
+
+def _seconds_of_pair(
+    store: Store, game: LeagueGame, players: list[Player], a: Player, b: Player
+) -> float:
+    """How long a game of a pair takes: as measured, or else as modelled."""
+    costs = store.batch_costs()
+    measured = [
+        seconds / games
+        for x, y, games, seconds in costs
+        if {x, y} == {a.id, b.id} and games
+    ]
+    if measured:
+        return float(np.median(measured))
+    external = {p.id: game.external_seconds(p) for p in players if p.is_external}
+    return float(
+        seconds_per_game(players, external, costs)[players.index(a), players.index(b)]
+    )
+
+
+def _next_request(
+    game: LeagueGame, requests: list[MatchRequest], by_id: dict[int, Player]
+) -> MatchRequest | None:
+    """The oldest series that both of its players can play now."""
+    for request in requests:
+        players = by_id[request.a], by_id[request.b]
+        if all(not p.retired and game.can_play(p) for p in players):
+            return request
+    return None
+
+
+def pick_batch(
+    store: Store,
+    game: LeagueGame,
+    config: SchedulerConfig,
+    rng: np.random.Generator,
+) -> Batch | None:
+    """The next batch to play: of a requested series if there is one, else the scheduler's."""
+    players = store.players()
+    by_id = {p.id: p for p in players}
+    request = _next_request(game, store.pending_matches(), by_id)
+    if request is not None:
+        a, b = by_id[request.a], by_id[request.b]
+        seconds = _seconds_of_pair(store, game, players, a, b)
+        games = requested_games(config, a, b, seconds, request.remaining)
+        return _choose_batch(store, game, a, b, games, rng, request.id)
+    config = replace(config, engines=store.get_meta("engines", True))
+    ratings = current_ratings(store, players)
+    external = {p.id: game.external_seconds(p) for p in players if p.is_external}
+    costs = seconds_per_game(players, external, store.batch_costs())
+    pairing = next_pairing(config, ratings, players, costs, rng)
+    if pairing is None:
+        return None
+    return _choose_batch(
+        store, game, by_id[pairing.a], by_id[pairing.b], pairing.games, rng
+    )
 
 
 @dataclass
@@ -161,7 +224,7 @@ def play(
             if picked is None:
                 stop_reason = "no two players can play"
                 break
-            a, b, openings = picked
+            a, b, openings = picked.a, picked.b, picked.openings
             store.set_meta(
                 "player",
                 {
@@ -171,6 +234,7 @@ def play(
                     "games": 2 * len(openings),
                     "started": time.time(),
                     "pid": os.getpid(),
+                    "request": picked.request,
                 },
             )
             try:
@@ -195,6 +259,7 @@ def play(
                 result.games,
                 (result.a_clock.seconds, result.a_clock.moves),
                 (result.b_clock.seconds, result.b_clock.moves),
+                picked.request,
             )
             batches += 1
     finally:

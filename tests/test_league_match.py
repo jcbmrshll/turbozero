@@ -263,6 +263,8 @@ def test_a_tiny_league_plays_and_rates(game, tmp_path):
         store.add_network(f"n{seed}", path, "tiny", f"run{seed}")
         store.add_net_player(f"n{seed}", 2)
     store.add_net_player("n1", 4)
+    first, second = store.players()[:2]
+    store.request_match(first.id, second.id, 4)
     config = SchedulerConfig(batch_sizes=(4,))
     reason = play(
         store,
@@ -276,6 +278,7 @@ def test_a_tiny_league_plays_and_rates(game, tmp_path):
     )
     assert reason == "played its batches"
     assert store.num_games() == 12
+    assert store.pending_matches() == []
     ids = [p.id for p in store.players()]
     fit = fit_ratings(ids, store.pair_records())
     assert np.isfinite(fit.elo).all()

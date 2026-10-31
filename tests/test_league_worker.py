@@ -36,7 +36,7 @@ class FakeGame(LeagueGame):
     def external_seconds(self, player):
         return 0.1
 
-    def external_parallel(self, player):
+    def external_parallel(self, player) -> int:
         return 8
 
     def num_openings(self):
@@ -69,8 +69,8 @@ def _checkpoint(tmp_path):
     return path
 
 
-def fake_playing(game, programs, a, b, openings, seed, should_stop):
-    return BatchResult(
+def fake_result(game, programs, a, b, openings, seed, should_stop):
+    return (
         [GameRecord(a.id, b.id, int(o), 1, [0, 1]) for o in openings]
         + [GameRecord(b.id, a.id, int(o), 1, [0, 1]) for o in openings],
         1.0,
@@ -78,6 +78,10 @@ def fake_playing(game, programs, a, b, openings, seed, should_stop):
         MoveClock(0.5, 4),
         MoveClock(0.25, 4),
     )
+
+
+def fake_playing(*args):
+    return BatchResult(*fake_result(*args))
 
 
 def run_play(store, gate=None, **kwargs):
@@ -350,3 +354,178 @@ def test_throttled_gate_looks_at_most_so_often():
     assert gate.busy() == "first"
     assert gate.busy() == "first"
     assert len(fake.reasons) == 1
+
+
+def ids(store):
+    return {p.name: p.id for p in store.players()}
+
+
+def batches_of(store):
+    return store.db.execute(
+        "SELECT a_id, b_id, COUNT(g.id) FROM batches b "
+        "JOIN games g ON g.batch_id = b.id GROUP BY b.id ORDER BY b.id"
+    ).fetchall()
+
+
+def test_a_requested_series_comes_first_then_the_scheduler_takes_over(store):
+    x, y = ids(store)["n@8"], ids(store)["edax-1"]
+    request = store.request_match(x, y, 40)
+    run_play(store, max_batches=3)
+    rows = batches_of(store)
+    assert tuple(rows[0]) == (x, y, 16)
+    assert tuple(rows[1]) == (x, y, 16)
+    # the rest of the series
+    assert tuple(rows[2]) == (x, y, 8)
+    assert store.pending_matches() == []
+    state = store.db.execute(
+        "SELECT state, played FROM match_requests WHERE id = ?", (request,)
+    ).fetchone()
+    assert tuple(state) == ("done", 40)
+    run_play(store, max_batches=10)
+    assert {(row[0], row[1]) for row in batches_of(store)[3:]} != {(x, y)}
+
+
+def test_series_are_played_oldest_first(store):
+    p = ids(store)
+    store.request_match(p["n@8"], p["n@16"], 2)
+    store.request_match(p["edax-1"], p["edax-2"], 2)
+    run_play(store, max_batches=2)
+    assert [(r[0], r[1]) for r in batches_of(store)] == [
+        (p["n@8"], p["n@16"]),
+        (p["edax-1"], p["edax-2"]),
+    ]
+
+
+def test_a_series_resumes_where_it_left_off_after_a_restart(tmp_path):
+    root = tmp_path / "again"
+    store = Store(root)
+    x = store.add_external_player("x", "edax")
+    y = store.add_external_player("y", "edax")
+    store.request_match(x, y, 30)
+    run_play(store, max_batches=1)
+    assert store.pending_matches()[0].played == 16
+    store.close()
+    store = Store(root)
+    assert store.pending_matches()[0].remaining == 14
+    run_play(store, max_batches=1)
+    assert store.pending_matches() == []
+    assert store.num_games() == 30
+    openings = store.db.execute(
+        "SELECT opening, COUNT(*) FROM games GROUP BY opening"
+    ).fetchall()
+    # the new batch didn't repeat the old one's openings
+    assert all(row[1] == 2 for row in openings)
+    store.close()
+
+
+def test_a_series_gives_way_and_its_abandoned_batch_doesnt_count(store):
+    p = ids(store)
+    store.request_match(p["n@8"], p["edax-1"], 40)
+
+    def abandoned(game, programs, a, b, openings, seed, should_stop):
+        assert should_stop()
+        raise Stopped
+
+    reason = play(
+        store,
+        FakeGame(),
+        FakeGate([None, "queue waiting #4"]),
+        version="abc",
+        seed=0,
+        playing=abandoned,
+    )
+    assert reason == "queue waiting #4"
+    assert store.num_games() == 0
+    assert store.pending_matches()[0].played == 0
+    assert run_play(store, FakeGate(["on the GPU: 7"])) == "on the GPU: 7"
+
+
+def test_a_retired_players_series_waits_without_holding_up_the_others(store):
+    p = ids(store)
+    waiting = store.request_match(p["n@8"], p["edax-1"], 2)
+    store.request_match(p["n@16"], p["edax-2"], 2)
+    store.set_retired("edax-1")
+    run_play(store, max_batches=1)
+    assert [r.id for r in store.pending_matches()] == [waiting]
+    assert tuple(batches_of(store)[0])[:2] == (p["n@16"], p["edax-2"])
+    # with nothing else asked for, the scheduler goes on
+    run_play(store, max_batches=1)
+    assert store.pending_matches()[0].played == 0
+    store.set_retired("edax-1", False)
+    run_play(store, max_batches=1)
+    assert store.pending_matches() == []
+
+
+def test_a_requested_series_plays_with_engines_left_out_of_the_draw(store):
+    p = ids(store)
+    store.set_meta("engines", False)
+    store.request_match(p["n@8"], p["edax-1"], 2)
+    run_play(store, max_batches=1)
+    assert store.pending_matches() == []
+
+
+def test_a_cancelled_series_stops_being_played(store):
+    p = ids(store)
+    request = store.request_match(p["n@8"], p["edax-1"], 200)
+    run_play(store, max_batches=1)
+    store.cancel_match(request)
+    played = store.num_games()
+    assert played > 0
+    store.set_meta("engines", False)
+    run_play(store, max_batches=3)
+    rows = batches_of(store)[1:]
+    assert rows
+    assert p["edax-1"] not in {pid for row in rows for pid in row[:2]}
+
+
+def test_a_series_sizes_its_batches_by_how_long_its_pair_has_taken(store):
+    class ManyAtOnce(FakeGame):
+        def external_parallel(self, player):
+            return 128
+
+    p = ids(store)
+    x, y = p["n@8"], p["edax-1"]
+    store.request_match(x, y, 2000)
+    games = [GameRecord(x, y, 0, 1, [0])] * 10
+
+    def play_one():
+        play(
+            store,
+            ManyAtOnce(),
+            FakeGate(),
+            version="abc",
+            seed=0,
+            max_batches=1,
+            playing=fake_playing,
+        )
+
+    # 30 s a game: below the scheduler's smallest
+    store.record_batch(x, y, 300.0, False, "abc", "f", games)
+    play_one()
+    assert batches_of(store)[-1][2] == 16
+    store.db.execute("DELETE FROM games")
+    store.db.execute("DELETE FROM batches")
+    store.db.commit()
+    # 1 s a game
+    store.record_batch(x, y, 10.0, False, "abc", "f", games)
+    play_one()
+    assert batches_of(store)[-1][2] == 128
+
+
+def test_a_batch_of_a_series_keeps_to_what_its_engine_can_play_at_once(store):
+    class FewAtOnce(FakeGame):
+        def external_parallel(self, player):
+            return 2
+
+    p = ids(store)
+    store.request_match(p["n@8"], p["edax-1"], 40)
+    play(
+        store,
+        FewAtOnce(),
+        FakeGate(),
+        version="abc",
+        seed=0,
+        playing=fake_playing,
+        max_batches=1,
+    )
+    assert store.pending_matches()[0].played == 4

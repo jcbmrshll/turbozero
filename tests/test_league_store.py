@@ -214,3 +214,61 @@ def test_seconds_per_move_leaves_out_compiling_and_results_from_elsewhere(store)
         x: pytest.approx(8.0 / 40),
         y: pytest.approx(5.0 / 20),
     }
+
+
+def test_a_series_counts_its_batches_and_ends(store):
+    x, y = two_players(store)
+    request = store.request_match(x, y, 4)
+    store.record_batch(x, y, 1.0, False, "abc", "f", [game(x, y)] * 2, request=request)
+    assert store.pending_matches()[0].played == 2
+    assert store.pending_matches()[0].remaining == 2
+    store.record_batch(x, y, 1.0, False, "abc", "f", [game(y, x)] * 2, request=request)
+    assert store.pending_matches() == []
+
+
+def test_a_failed_batch_doesnt_count_towards_its_series(store):
+    x, y = two_players(store)
+    request = store.request_match(x, y, 4)
+    with pytest.raises(sqlite3.IntegrityError):
+        store.record_batch(
+            x, y, 1.0, False, "abc", "f", [GameRecord(x, y, 0, 2, [1])], request=request
+        )
+    assert store.pending_matches()[0].played == 0
+
+
+def test_cancelling_a_series_keeps_its_games(store):
+    x, y = two_players(store)
+    request = store.request_match(x, y, 4)
+    store.record_batch(x, y, 1.0, False, "abc", "f", [game(x, y)] * 2, request=request)
+    store.cancel_match(request)
+    assert store.pending_matches() == []
+    assert store.num_games() == 2
+    with pytest.raises(ValueError):
+        store.cancel_match(request)
+    with pytest.raises(ValueError):
+        store.cancel_match(999)
+
+
+def test_a_batch_finishing_after_its_series_was_cancelled_counts_without_reviving_it(
+    store,
+):
+    x, y = two_players(store)
+    request = store.request_match(x, y, 2)
+    store.cancel_match(request)
+    store.record_batch(x, y, 1.0, False, "abc", "f", [game(x, y)] * 2, request=request)
+    row = store.db.execute("SELECT state, played FROM match_requests").fetchone()
+    assert tuple(row) == ("cancelled", 2)
+
+
+def test_a_store_from_before_requests_opens_with_everything_in_it(tmp_path):
+    store = Store(tmp_path / "s")
+    x, y = two_players(store)
+    batch(store, x, y, [game(x, y)])
+    store.db.execute("DROP TABLE match_requests")
+    store.db.commit()
+    store.close()
+    store = Store(tmp_path / "s")
+    assert store.num_games() == 1
+    assert store.pending_matches() == []
+    assert store.request_match(x, y, 2) == 1
+    store.close()

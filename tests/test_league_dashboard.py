@@ -200,3 +200,12 @@ def test_the_pair_view_has_uncertainty(url):
 def test_the_page_is_served(url):
     with urllib.request.urlopen(url + "/") as response:
         assert b"Elo league" in response.read()
+
+
+def test_summary_lists_the_pending_series(url, store):
+    assert get(url, "/api/summary")["requests"] == []
+    store.request_match(1, 2, 40)
+    pending = get(url, "/api/summary")["requests"]
+    assert [(r["a"], r["b"], r["played"], r["games"]) for r in pending] == [
+        (1, 2, 0, 40)
+    ]
