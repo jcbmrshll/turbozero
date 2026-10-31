@@ -8,8 +8,7 @@ session. Many are played at once, their leaves evaluated in one call: at fixed v
 doesn't change the moves. A position with one legal move is played without a search.
 
 `speed` plays one game at a time, as in a contest, and reports evals a second including everything
-the search does. `clock` plays two players one game at a time on a real clock, `contest` one of
-them against an engine, on the same cores.
+the search does. `clock_match.py` plays on a clock, with a `NetPlayer` as "net:".
 """
 
 import argparse
@@ -30,7 +29,6 @@ from cpu_search import (
     ort_eval,
     ort_session,
 )
-from engines import ENGINES
 from export_onnx import export_checkpoint
 from xot import XOT_PATH, load_xot
 
@@ -289,21 +287,30 @@ def move_budget(seconds_left: float, empties: int) -> float:
 
 
 class NetPlayer:
-    """Our side of a game on a per-game clock: a `Search` with its own tree."""
+    """Our side of a game on a per-game clock (`clock_match.Player`): a `Search` with its own
+    tree."""
 
     def __init__(self, settings: SearchSettings, evaluate: Eval):
         self.search = Search(settings)
         self.evaluate = evaluate
         self.batch = np.empty((settings.batch, 2, 8, 8), np.float32)
+        self.to_move = "b"
+
+    def sync(self, color: str) -> None:
+        """Passes for the other color if `color` moves out of turn: the game passes for a player
+        with no move without saying so, and the tree has passes as moves."""
+        if color != self.to_move:
+            self.search.play(PASS)
+        self.to_move = "w" if color == "b" else "b"
 
     def play(self, color: str, move: int) -> None:
-        """A move by either side (a pass is a move, `PASS`); `color` isn't needed."""
-        del color
+        """A move by `color`."""
+        self.sync(color)
         self.search.play(move)
 
     def move(self, color: str, seconds_left: float) -> int:
         """Our move, which it also plays. A position with one legal move takes no time."""
-        del color
+        self.sync(color)
         if self.search.num_legal() == 1:
             action = self.search.first_legal()
         else:
@@ -317,147 +324,6 @@ class NetPlayer:
 
     def close(self) -> None:
         """Nothing outlives the player."""
-
-
-def parse_timed(spec: str, net: str, backend: str) -> tuple[Player, float]:
-    """A player of a real clock, its `Player.parse` spec with seconds= a move in place of visits."""
-    fields = dict(item.split("=") for item in spec.split(","))
-    seconds = float(fields.pop("seconds"))
-    rest = ",".join(f"{k}={v}" for k, v in fields.items())
-    return Player.parse(f"visits=0,{rest}", net, backend), seconds
-
-
-def clock(args: argparse.Namespace) -> None:
-    """One game at a time, on a real clock: each player searches for its seconds a move, alone on
-    the cores."""
-    a, a_seconds = parse_timed(args.a, args.net, args.backend)
-    b, b_seconds = parse_timed(args.b, args.net, args.backend)
-    cores = len(os.sched_getaffinity(0))
-    evals = {(p.net, p.backend): make_eval(p.net, p.backend, cores) for p in (a, b)}
-    pool = load_xot(XOT_PATH)
-    rng = np.random.default_rng(args.seed)
-    openings = pool[rng.choice(len(pool), size=args.openings, replace=False)]
-    results = np.zeros((len(openings), 2))
-    budgets = (a_seconds, b_seconds)
-    batches = [np.empty((p.settings.batch, 2, 8, 8), np.float32) for p in (a, b)]
-    leaves = [0, 0]
-    spent = [0.0, 0.0]
-    moves = [0, 0]
-    start = time.perf_counter()
-    for o, opening in enumerate(openings):
-        for side in range(2):
-            game = Game(a, b, opening, side == 0)
-            while not game.over():
-                m = game.mover
-                t0 = time.perf_counter()
-                count, _ = timed_move(
-                    game.searches[m], budgets[m], batches[m], evals[game.evaluator]
-                )
-                spent[m] += time.perf_counter() - t0
-                leaves[m] += count
-                moves[m] += 1
-                game.play(game.searches[m].best_action())
-                game.begin()
-                # `begin` starts a search of visits=0 at most: `timed_move` overrides it
-            results[o, side] = game.result()
-        if (o + 1) % 20 == 0:
-            print(f"  {o + 1} openings: {summarize(results[: o + 1])}", flush=True)
-    record = {
-        "a": args.a,
-        "b": args.b,
-        "net": args.net,
-        "seed": args.seed,
-        "seconds": round(time.perf_counter() - start),
-        "load": os.getloadavg()[0],
-        "a_evals_per_s": round(leaves[0] / spent[0]),
-        "b_evals_per_s": round(leaves[1] / spent[1]),
-        "a_s_per_move": round(spent[0] / moves[0], 4),
-        "b_s_per_move": round(spent[1] / moves[1], 4),
-        **summarize(results),
-    }
-    print(json.dumps(record), flush=True)
-    if args.results is not None:
-        with open(args.results, "a") as f:
-            f.write(json.dumps(record) + "\n")
-
-
-def contest(args: argparse.Namespace) -> None:
-    """Our player against an engine, one game at a time, each alone on the cores. Each opening is
-    played with both colors. Results are for our player, and checked against the engine's board."""
-    ours, seconds = parse_timed(args.a, args.net, args.backend)
-    cores = len(os.sched_getaffinity(0))
-    evaluate = make_eval(ours.net, ours.backend, cores)
-    engine_class = ENGINES[args.engine]
-    threads = ("-n", str(cores)) if args.engine == "edax" else ("-threads", str(cores))
-    engine_dir = engine_class.default_dir()
-    pool = load_xot(XOT_PATH)
-    rng = np.random.default_rng(args.seed)
-    openings = pool[rng.choice(len(pool), size=args.openings, replace=False)]
-    results = np.zeros((len(openings), 2))
-    batch = np.empty((ours.settings.batch, 2, 8, 8), np.float32)
-    ours_time = theirs_time = 0.0
-    ours_moves = theirs_moves = ours_leaves = 0
-    for o, opening in enumerate(openings):
-        for side in range(2):
-            we_black = side == 0
-            engine = engine_class(engine_dir, args.level, args=threads)
-            search = Search(ours.settings)
-            ply = 0
-
-            try:
-                for action in opening:
-                    action = int(action)
-                    engine.play("b" if ply % 2 == 0 else "w", action)
-                    search.play(action)
-                    ply += 1
-                while not search.terminated():
-                    color = "b" if ply % 2 == 0 else "w"
-                    if (ply % 2 == 0) == we_black:
-                        if search.num_legal() == 1:
-                            action = search.first_legal()
-                        else:
-                            t0 = time.perf_counter()
-                            count, _ = timed_move(search, seconds, batch, evaluate)
-                            ours_time += time.perf_counter() - t0
-                            ours_moves += 1
-                            ours_leaves += count
-                            action = search.best_action()
-                        engine.play(color, action)
-                    elif search.legal()[PASS]:
-                        action = PASS
-                    else:
-                        t0 = time.perf_counter()
-                        action = engine.genmove(color)
-                        theirs_time += time.perf_counter() - t0
-                        theirs_moves += 1
-                    search.play(action)
-                    ply += 1
-                # the mover at the end is whoever the next ply would be
-                reward = search.reward()
-                result = reward if (ply % 2 == 0) == we_black else -reward
-                black, white = engine.discs()
-                assert np.sign(black - white) * (1 if we_black else -1) == result
-                results[o, side] = result
-            finally:
-                engine.close()
-        if (o + 1) % 10 == 0:
-            print(f"  {o + 1} openings: {summarize(results[: o + 1])}", flush=True)
-    record = {
-        "a": args.a,
-        "net": args.net,
-        "engine": args.engine,
-        "level": args.level,
-        "seed": args.seed,
-        "our_s_per_move": round(ours_time / max(ours_moves, 1), 4),
-        "engine_s_per_move": round(theirs_time / max(theirs_moves, 1), 4),
-        "our_evals_per_s": round(ours_leaves / max(ours_time, 1e-9)),
-        "load": os.getloadavg()[0],
-        **summarize(results),
-    }
-    print(json.dumps(record), flush=True)
-    if args.results is not None:
-        with open(args.results, "a") as f:
-            f.write(json.dumps(record) + "\n")
 
 
 def speed(args: argparse.Namespace) -> None:
@@ -542,25 +408,6 @@ def main() -> None:
     s.add_argument("--seed", type=int, default=0)
     s.add_argument("--results", type=Path, default=None)
     s.set_defaults(fn=speed)
-    t = commands.add_parser("clock")
-    t.add_argument("--net", required=True)
-    t.add_argument("--backend", default="bf16")
-    t.add_argument("--a", required=True, help="e.g. seconds=0.1,batch=1,backend=bf16-1")
-    t.add_argument("--b", required=True)
-    t.add_argument("--openings", type=int, default=100)
-    t.add_argument("--seed", type=int, default=0)
-    t.add_argument("--results", type=Path, default=None)
-    t.set_defaults(fn=clock)
-    c = commands.add_parser("contest")
-    c.add_argument("--net", required=True)
-    c.add_argument("--backend", default="bf16")
-    c.add_argument("--a", required=True, help="our player: e.g. seconds=0.1,batch=8")
-    c.add_argument("--engine", choices=sorted(ENGINES), default="edax")
-    c.add_argument("--level", type=int, default=24)
-    c.add_argument("--openings", type=int, default=50)
-    c.add_argument("--seed", type=int, default=0)
-    c.add_argument("--results", type=Path, default=None)
-    c.set_defaults(fn=contest)
     args = parser.parse_args()
     args.fn(args)
 

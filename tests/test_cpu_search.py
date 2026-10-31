@@ -189,17 +189,49 @@ def test_move_budget_shares_the_clock():
     assert move_budget(10, 1) == pytest.approx(9.5)
 
 
-def test_net_player_plays_a_whole_game_on_a_clock():
+def test_net_players_play_a_game_through_the_clock_driver():
+    from clock_match import play_game
     from cpu_match import NetPlayer
     from cpu_search import SearchSettings
+    from xot import XOT_PATH, load_xot
 
-    players = (
-        NetPlayer(SearchSettings(batch=4), fake_eval),
-        NetPlayer(SearchSettings(batch=1), fake_eval),
-    )
-    turn = 0
-    while not players[0].search.terminated():
-        action = players[turn].move("b", 0.05)
-        players[1 - turn].play("w", action)
-        turn = 1 - turn
-    assert players[0].search.position() == players[1].search.position()
+    black = NetPlayer(SearchSettings(batch=4), fake_eval)
+    white = NetPlayer(SearchSettings(batch=1), fake_eval)
+    game = play_game(black, white, load_xot(XOT_PATH)[0], 1.0)
+    assert game.flagged is None
+    assert max(game.seconds) < 1.0
+
+
+def test_a_net_player_passes_when_the_game_does():
+    from cpu_match import NetPlayer
+    from cpu_search import PASS, Search, SearchSettings
+
+    # a random game up to its first pass that doesn't end it
+    rng = np.random.default_rng(0)
+    moves = []
+    passed = False
+    for _ in range(200):
+        replay = Search()
+        moves = []
+        while not replay.terminated():
+            action = int(rng.choice(np.flatnonzero(replay.legal())))
+            moves.append(action)
+            replay.play(action)
+            if action == PASS:
+                passed = not replay.terminated()
+                break
+        if passed:
+            break
+    assert passed
+    player = NetPlayer(SearchSettings(), fake_eval)
+    color = "b"
+    for action in moves:
+        if action != PASS:
+            # the driver says nothing of a pass: the next mover's color shows it
+            player.play(color, action)
+        color = "w" if color == "b" else "b"
+    # the side to move after the pass is the one that moved last
+    assert player.to_move != color
+    player.move(color, 0.01)
+    me, opp, _, _ = player.search.position()
+    assert (me | opp).bit_count() == 4 + sum(m != PASS for m in moves) + 1

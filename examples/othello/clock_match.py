@@ -5,7 +5,8 @@ sides on the same cores and nothing else on those cores or their SMT siblings.
     taskset -c 0-5,12-13 uv run examples/othello/clock_match.py \
         --a edax:threads=8 --b egaroucid:threads=8 --seconds 10 --openings 100
 
-A player is `name:key=value,...`: `edax` or `egaroucid`, with `threads`, `dir` (where the
+A player is `net:net=NAME,batch=16,...` (a network of the league's store, see `cpu_match.py`), or
+`name:key=value,...`: `edax` or `egaroucid`, with `threads`, `dir` (where the
 engine is built), `level` (play at this level, ignoring the clock, its book off) and `args`
 (more of the engine's own options, separated by spaces). Each opening is played with both
 colors, each game by fresh processes, so nothing carries over from one game to the next.
@@ -228,10 +229,24 @@ def summarize(games: list[Game], a_black: list[bool], seconds: float) -> dict:
     return result
 
 
+def net_player(options: dict[str, str]) -> Callable[[], Player]:
+    """What builds a network's player, which all games share a network for. Its `options` are
+    `cpu_match.Player.parse`'s, with `net`."""
+    from cpu_match import NetPlayer, make_eval
+    from cpu_match import Player as NetSpec
+
+    fields = ",".join(f"{k}={v}" for k, v in options.items())
+    spec = NetSpec.parse(f"visits=0,{fields}", options["net"], "bf16")
+    evaluate = make_eval(spec.net, spec.backend, len(os.sched_getaffinity(0)))
+    return lambda: NetPlayer(spec.settings, evaluate)
+
+
 def make_player(spec: str, seconds: int) -> Callable[[], Player]:
     """What builds a player from its `name:key=value,...`, for each game."""
     name, _, settings = spec.partition(":")
     options = dict(s.split("=", 1) for s in settings.split(",") if s)
+    if name == "net":
+        return net_player(options)
     engine_dir = (
         Path(options["dir"]) if "dir" in options else ENGINES[name].default_dir()
     )
