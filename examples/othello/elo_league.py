@@ -6,6 +6,7 @@ each played with both colors, and no pair repeats an opening until it's played t
         --net resnet:8x128,pool_every=2,heads=pooled,pool_channels=32 --run r2-A --sims 128 1000
     uv run examples/othello/elo_league.py add-external edax-L8 edax --settings '{"level": 8}'
     uv run examples/othello/elo_league.py anchor edax-L8
+    uv run examples/othello/elo_league.py match A-8x@1000 edax-L24 --games 400
     uv run examples/othello/elo_league.py ratings
     uv run examples/othello/elo_league.py dashboard
 

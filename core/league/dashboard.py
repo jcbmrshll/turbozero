@@ -8,6 +8,7 @@ import os
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -96,6 +97,7 @@ class League:
                 "recent": [dict(row) for row in rows],
                 "worker": self._worker(),
                 "playing": self._playing(),
+                "requests": [asdict(r) for r in store.pending_matches()],
                 "time": time.time(),
             }
 

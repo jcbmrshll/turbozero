@@ -16,11 +16,14 @@ draw keeps them going, at the cost of that much of the GPU.
 Engines are players like any other, except that `engines` can leave them out of new games
 altogether.
 
+Series someone asked for (`Store.request_match`) come before any of this, and go by
+`requested_games`.
+
 Other trade-offs, in `SchedulerConfig`: `width` trades information per game (narrow) against
 ties across the scale (wide).
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -42,6 +45,9 @@ class SchedulerConfig:
             compiles for each, so the fewer the better
         max_tree_nodes: the most tree nodes (of both sides' searches) a batch may hold at
             once, for the memory they take
+        request_batch_sizes: further sizes for requested series, whose games can be too slow
+            for the smallest of `batch_sizes`. Nothing smaller: a batch's games are played
+            at once, up to the cores engines get (8), so fewer take as long and just waste them
     """
 
     width: float = 150.0
@@ -51,6 +57,7 @@ class SchedulerConfig:
     batch_seconds: float = 180.0
     batch_sizes: tuple[int, ...] = (64, 128, 256, 512, 1024)
     max_tree_nodes: int = 6_000_000
+    request_batch_sizes: tuple[int, ...] = (16, 32)
 
 
 @dataclass(frozen=True)
@@ -82,6 +89,22 @@ def batch_size(
         and size // 2 * nodes <= config.max_tree_nodes
     ]
     return fits[-1] if fits else min(config.batch_sizes)
+
+
+def requested_games(
+    config: SchedulerConfig,
+    a: Player,
+    b: Player,
+    seconds_per_game: float,
+    remaining: int,
+) -> int:
+    """How many of a requested series' `remaining` games to play as the next batch: as for
+    `batch_size`, so that the worker can still give way, with `request_batch_sizes` too."""
+    sizes = (*config.request_batch_sizes, *config.batch_sizes)
+    return min(
+        remaining,
+        batch_size(replace(config, batch_sizes=sizes), a, b, seconds_per_game),
+    )
 
 
 def opponent_weights(
@@ -181,7 +204,8 @@ class CostModel:
     (0.04 s at 128 sims a side, 0.4 s at 1000): a side's search costs `per_sim` per iteration, in
     proportion to its network's `size(net)`, on top of `per_game`; an external engine
     costs what the game says. Measured batches correct this, each player by the median of
-    (seconds measured / seconds modelled) over its batches.
+    (seconds measured / seconds modelled) over its opponents, each pair counting once, by
+    the median of its batches, so that a long series can't speak for all a player's games.
 
     Attributes:
         per_game: the seconds of a game that don't depend on either player
@@ -234,13 +258,16 @@ def seconds_per_game(
         ]
     )
     predicted = side[:, None] + side[None, :] + model.per_game
-    ratios: list[list[float]] = [[] for _ in players]
+    measured: dict[tuple[int, int], list[float]] = {}
     for a, b, games, seconds in batches:
         if a in index and b in index and games:
-            i, j = index[a], index[b]
-            ratio = (seconds / games) / predicted[i, j]
-            ratios[i].append(ratio)
-            ratios[j].append(ratio)
+            pair = (min(index[a], index[b]), max(index[a], index[b]))
+            measured.setdefault(pair, []).append(seconds / games)
+    ratios: list[list[float]] = [[] for _ in players]
+    for (i, j), seconds in measured.items():
+        ratio = float(np.median(seconds)) / predicted[i, j]
+        ratios[i].append(ratio)
+        ratios[j].append(ratio)
     correction = np.array([float(np.median(r)) if r else 1.0 for r in ratios])
     # each side's correction goes with its share of the time
     corrected = side * correction

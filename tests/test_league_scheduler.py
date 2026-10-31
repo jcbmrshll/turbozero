@@ -14,6 +14,7 @@ from core.league.scheduler import (
     network_size,
     next_pairing,
     opponent_weights,
+    requested_games,
     seconds_per_game,
 )
 from core.league.store import Player
@@ -222,6 +223,32 @@ def test_costs_are_corrected_by_measured_batches():
     after = seconds_per_game(players, {}, [(0, 1, 100, 300 * before[0, 1])])
     assert after[0, 1] > 2.5 * before[0, 1]
     assert after[2, 2] == pytest.approx(before[2, 2])
+
+
+def test_a_long_series_doesnt_speak_for_all_a_players_costs():
+    players = nets(4)
+    before = seconds_per_game(players, {}, [])
+    slow = [(0, 1, 100, 1000 * before[0, 1])] * 50
+    usual = [(0, j, 100, 100 * before[0, j]) for j in (2, 3)]
+    after = seconds_per_game(players, {}, slow + usual)
+    assert after[0, 2] == pytest.approx(before[0, 2], rel=0.3)
+
+
+def test_a_series_splits_to_keep_a_batch_short():
+    a, b = nets(2)
+    config = SchedulerConfig(batch_seconds=180.0)
+    assert requested_games(config, a, b, 1.0, 10_000) == 128
+    assert requested_games(config, a, b, 4.0, 10_000) == 32
+    # nothing smaller, however slow: as many games still take as long
+    assert requested_games(config, a, b, 300.0, 10_000) == 16
+    assert requested_games(config, a, b, 300.0, 6) == 6
+    assert requested_games(config, a, b, 0.01, 40) == 40
+
+
+def test_a_series_keeps_to_the_memory_a_batch_may_hold():
+    a, b = nets(2, sims=10_000)
+    config = SchedulerConfig(max_tree_nodes=2_000_000)
+    assert requested_games(config, a, b, 0.01, 10_000) == 64
 
 
 def test_external_costs_come_from_the_game():
