@@ -323,10 +323,15 @@ with 2 cores and 16 GiB, at Modal's list prices of 2026-10-31:
 | A100-40GB | 56 | 1.29 | 2.32 | 1.80 |
 | A10 | 129 | 0.56 | 1.32 | 2.37 |
 
-L40S costs least for the work done; H100! gives results soonest. Budgets stay in epochs, as chips
-differ in speed: 137 RTX 5080 minutes take about 92 minutes and $3.30 on an L40S. Saving and
-moving a state of about 0.8 GB costs next to nothing to the bucket; bringing it here costs about
-$0.10 (GCS egress), which is why states saved only to continue from stay there.
+L40S costs least for the work done on this net; H100! gives results soonest. The advantage shrinks
+on smaller nets: 4x64 at the same settings took 18.9 s/epoch on an L40S against 17.8 on the RTX 5080
+(0.94x), so time a small net before budgeting it. Budgets stay in epochs, computed from RTX 5080
+timings, as chips differ in speed.
+
+Modal also bills what jobs upload, $0.04/GB: about $0.36/h with `--resume-every 25` on 4x64 at window
+1125, and `list` leaves it out (`list --billed` has it). Raise `--resume-every` to send fewer states,
+at the risk of more to redo after an interruption. Bringing a state of about 0.8 GB here costs about
+$0.10 in GCS egress, which is why states saved only to continue from stay in the bucket.
 
 ## Evaluating a checkpoint
 
