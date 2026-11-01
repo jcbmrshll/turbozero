@@ -9,7 +9,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "examples" / "othello"))
 
-from clock_match import Board, Game, flips, play_game, points, summarize
+from clock_match import GRACE, Board, Game, flips, play_game, points, summarize
 from engines import ClockedEdax, ClockedEgaroucid, Edax, Egaroucid
 from game import action
 
@@ -43,6 +43,11 @@ class FirstLegal:
 
     def close(self):
         pass
+
+
+def play_with(clock, seconds):
+    white = FirstLegal(clock, 1)
+    return play_game(FirstLegal(clock, 0), white, (), seconds), white
 
 
 @pytest.fixture
@@ -107,6 +112,13 @@ def test_who_runs_out_of_time_first_is_flagged_and_the_game_is_played_out(clock)
     game = play_game(FirstLegal(clock, 1), FirstLegal(clock, 3), (), seconds=4)
     assert game.flagged == "w"
     assert 64 - game.move_seconds[-1][0] >= 50
+
+
+def test_passing_the_clock_by_less_than_the_grace_is_no_loss(clock):
+    # a full game takes white some whole number of its one-second moves
+    moves_white = len(play_with(clock, seconds=1000)[1].seconds_left)
+    assert play_with(clock, seconds=moves_white - GRACE / 2)[0].flagged is None
+    assert play_with(clock, seconds=moves_white - 2 * GRACE)[0].flagged == "w"
 
 
 @pytest.mark.parametrize(
