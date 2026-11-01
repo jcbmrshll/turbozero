@@ -18,7 +18,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
-from functools import cache
+from functools import cache, partial
 from pathlib import Path
 from typing import Any
 
@@ -36,11 +36,29 @@ from core.league.store import (
     Player,
     Search,
     TopMove,
+    changed_settings,
 )
 
 
 class Stopped(Exception):
     """Someone else needs the GPU, or the league's being stopped: the batch is abandoned."""
+
+
+class SettingsRefused(Exception):
+    """A player would have played with other settings than its own: no longer the same player,
+    so the batch is abandoned before its first move.
+
+    Attributes:
+        player: who
+        settings: what it would have played with
+        changed: which of them differ
+    """
+
+    def __init__(self, player: Player, settings: dict[str, Any], changed: list[str]):
+        super().__init__(f"{player.name}: {', '.join(changed)}")
+        self.player = player
+        self.settings = settings
+        self.changed = changed
 
 
 def select(which, on_true, on_false):
@@ -262,6 +280,7 @@ def play_games(
     openings: np.ndarray,
     key: jax.Array,
     should_stop: Callable[[], bool] = lambda: False,
+    started: Callable[[], None] = lambda: None,
 ) -> tuple[
     np.ndarray,
     list[list[int]],
@@ -280,6 +299,7 @@ def play_games(
         openings: (games, plies) the moves played for them first
         key: the environment's rng
         should_stop: checked before each move; once it's true the games are abandoned
+        started: called once the sides have started, before the first move
 
     Returns:
         the first player's result in each game (+1, 0, -1); each game's moves, from the
@@ -300,6 +320,7 @@ def play_games(
     steps: list[tuple[int, float, int]] = []
     first.start(states, first_id)
     second.start(states, first_id)
+    started()
     clocks = {id(first): Clock(), id(second): Clock()}
 
     def played(actions: np.ndarray, movers: np.ndarray, told: tuple[Side, ...]) -> None:
@@ -359,6 +380,15 @@ def play_games(
     )
 
 
+def check_settings(sides: tuple[tuple[Player, Side], ...]) -> None:
+    """Raises `SettingsRefused` if a player, once started, has other settings than its own."""
+    for player, side in sides:
+        settings = side.settings()
+        changed = changed_settings(player.played_settings or settings, settings)
+        if changed:
+            raise SettingsRefused(player, settings, changed)
+
+
 @dataclass(frozen=True)
 class BatchResult:
     """A batch played: its games, how long it took and whether that includes compiling, how
@@ -387,6 +417,7 @@ def play_batch(
     Raises:
         Stopped: if `should_stop` said so: none of the batch's games are kept, since those
             finished by then would be the shorter ones
+        SettingsRefused: if either would play with other settings than its own
     """
     start = time.perf_counter()
     programs.compiled = False
@@ -413,7 +444,15 @@ def play_batch(
         first, second = side(one, first_key), side(other, second_key)
         try:
             results, moves, scores, first_clock, second_clock, searches, steps = (
-                play_games(game, first, second, moves_of, env_key, should_stop)
+                play_games(
+                    game,
+                    first,
+                    second,
+                    moves_of,
+                    env_key,
+                    should_stop,
+                    partial(check_settings, ((one, first), (other, second))),
+                )
             )
             settings_of[one.id] = first.settings()
             settings_of[other.id] = second.settings()

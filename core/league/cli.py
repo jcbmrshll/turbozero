@@ -10,7 +10,7 @@ fetch-ort
 build-browser-engines
 anchor NAME; retire NAME; resume NAME
 ratings
-settings-changes
+settings-changes; accept-settings NAME; variant SUFFIX [NAME ...]
 start; stop
 dashboard
 """
@@ -23,12 +23,13 @@ import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
 from core.league.game import LeagueGame, check_match
 from core.league.ratings import Ratings
-from core.league.store import GameRecord, Player, Store
+from core.league.store import GameRecord, Player, Store, changed_settings
 
 # seconds a player rides out slick being unreachable, as when it restarts
 PLAYER_QUEUE_OUTAGE = 300.0
@@ -59,23 +60,31 @@ def pending_matches(store: Store) -> str:
     return "\n".join(lines)
 
 
+def _differences(before: dict[str, Any], now: dict[str, Any]) -> str:
+    return ", ".join(
+        f"{key}: {before.get(key)!r} -> {now.get(key)!r}"
+        for key in changed_settings(before, now)
+    )
+
+
 def settings_changes(store: Store) -> str:
-    """As text, the players who've played under more than one set of settings, and what differs
-    between each set and the one before."""
-    by_id = {p.id: p for p in store.players()}
-    lines = []
+    """As text, the players refused for changed settings and what changed, then any who've played
+    under more than one set."""
+    players = store.players()
+    lines = [
+        f"{p.name} refused  {_differences(p.played_settings or {}, p.refused_settings)}"
+        for p in players
+        if p.refused_settings is not None
+    ]
+    by_id = {p.id: p for p in players}
     for player, periods in store.settings_changes().items():
         lines.append(by_id[player].name)
         for before, period in zip([None, *periods], periods):
-            changed = ""
-            if before is not None:
-                was, now = before.settings, period.settings
-                keys = sorted(
-                    k for k in was.keys() | now.keys() if was.get(k) != now.get(k)
-                )
-                changed = "  " + ", ".join(
-                    f"{k}: {was.get(k)!r} -> {now.get(k)!r}" for k in keys
-                )
+            changed = (
+                ""
+                if before is None
+                else "  " + _differences(before.settings, period.settings)
+            )
             started = time.strftime("%Y-%m-%d %H:%M", time.localtime(period.first))
             lines.append(f"  from {started}, {period.batches} batches{changed}")
     return "\n".join(lines)
@@ -182,6 +191,16 @@ def main(make_game: Callable[[], LeagueGame], default_root: Path, argv=None) -> 
     engines.add_argument("state", choices=["on", "off"])
 
     commands.add_parser("ratings", help="print the leaderboard")
+    accept = commands.add_parser(
+        "accept-settings",
+        help="a refused player's new settings don't affect play: it stays the same player",
+    )
+    accept.add_argument("name")
+    variant = commands.add_parser(
+        "variant", help="a new player of each one named, by default each one refused"
+    )
+    variant.add_argument("suffix", help="what sets it apart, e.g. c2")
+    variant.add_argument("names", nargs="*")
     commands.add_parser(
         "settings-changes",
         help="players who've played under more than one set of settings",
@@ -260,6 +279,14 @@ def main(make_game: Callable[[], LeagueGame], default_root: Path, argv=None) -> 
         print(leaderboard(store.players(), current_ratings(store)))
     elif args.command == "settings-changes":
         print(settings_changes(store))
+    elif args.command == "accept-settings":
+        store.accept_settings(args.name)
+    elif args.command == "variant":
+        chosen = [players[name] for name in args.names] or [
+            p for p in players.values() if p.refused_settings is not None
+        ]
+        for player in chosen:
+            print(store.add_variant(player, args.suffix))
     elif args.command == "stop":
         store.set_meta("stop", True)
     elif args.command == "start":

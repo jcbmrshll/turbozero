@@ -3,6 +3,7 @@ run through the whole league."""
 
 import inspect
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import jax
@@ -18,6 +19,7 @@ from core.league.game import ExternalPlayer, LeagueGame
 from core.league.match import (
     NetworkSide,
     Programs,
+    SettingsRefused,
     Stopped,
     play_batch,
     play_games,
@@ -319,6 +321,34 @@ def test_every_setting_of_a_search_is_in_its_config(made, kind):
             assert given <= configured, cls.__name__
 
 
+def test_a_player_with_other_settings_than_its_own_is_refused_before_a_move(
+    game, tmp_path
+):
+    programs = Programs(game, "float32")
+    a = net_player(1, 8, seed=1, tmp_path=tmp_path)
+    b = net_player(2, 8, seed=2, tmp_path=tmp_path)
+    own = programs.settings(a, 2)
+    # its own settings play on, whatever a traversal's checks
+    pinned = replace(a, played_settings={**own, "traversal_steps": 99})
+    assert play_batch(game, programs, pinned, b, np.array([0, 4]), seed=3).games
+    stale = replace(a, played_settings={**own, "dtype": "bfloat16"})
+    moved = []
+    with pytest.raises(SettingsRefused) as refused:
+        play_batch(
+            game,
+            programs,
+            stale,
+            b,
+            np.array([0, 4]),
+            seed=3,
+            should_stop=lambda: moved.append(True) or False,
+        )
+    assert refused.value.player is stale
+    assert refused.value.changed == ["dtype"]
+    assert refused.value.settings == own
+    assert not moved
+
+
 def test_each_network_keeps_its_own_tree_and_parameters(game, tmp_path):
     programs = Programs(game, "float32")
     a = net_player(1, 8, seed=1, tmp_path=tmp_path)
@@ -445,7 +475,9 @@ def test_a_tiny_league_plays_and_rates(game, tmp_path):
         == "v"
     )
     # what the games were played with, and what their searches made of them
-    assert store.settings_of(first.id) is not None
+    pinned = next(p for p in store.players() if p.id == first.id).played_settings
+    assert pinned is not None
+    assert pinned["num_iterations"] == 2
     assert store.settings_changes() == {}
     assert store.db.execute(
         "SELECT a_settings LIKE '%\"num_iterations\":2%' FROM batches LIMIT 1"

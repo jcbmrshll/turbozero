@@ -234,3 +234,39 @@ def test_settings_changes_says_who_and_what(root, capsys):
     assert out.splitlines()[0] == "x"
     assert "2 batches" in out
     assert "c_init: 1.25 -> 2.0" in out
+
+
+def test_a_refused_player_can_be_accepted_or_made_anew(root, capsys):
+    store = Store(root)
+    x, y = store.players()[:2]
+    store.record_batch(
+        x.id,
+        y.id,
+        1.0,
+        False,
+        "abc",
+        "f",
+        [GameRecord(x.id, y.id, 0, 1, [0])],
+        settings=BatchSettings({"c_init": 1.25}, {"level": 8}, 1, "cpu"),
+    )
+    store.refuse_settings(x.id, {"c_init": 2.0})
+    store.refuse_settings(y.id, {"level": 9})
+    store.close()
+    run(root, "settings-changes")
+    out = capsys.readouterr().out
+    assert "x refused  c_init: 1.25 -> 2.0" in out
+    assert "y refused  level: 8 -> 9" in out
+
+    run(root, "accept-settings", "y")
+    run(root, "variant", "c2")
+    assert capsys.readouterr().out.strip() == "x-c2"
+    run(root, "variant", "b2", "y")
+    assert capsys.readouterr().out.strip() == "y-b2"
+
+    store = Store(root)
+    by_name = {p.name: p for p in store.players()}
+    assert not by_name["y"].retired
+    assert by_name["y"].played_settings == {"level": 9}
+    assert by_name["x"].retired
+    assert not by_name["x-c2"].retired
+    store.close()
