@@ -34,6 +34,8 @@ from xot import XOT_PATH, load_xot
 
 # the most leaves one call of the network evaluates
 MAX_CALL = 64
+# traversals in a row that ended the game after which a search on a clock stops
+ENDED_VISITS = 64
 
 
 @dataclass(frozen=True)
@@ -268,15 +270,16 @@ def timed_move(
     evaluated and the visits."""
     start = time.perf_counter()
     before = search.total_visits()
-    leaves = 0
+    leaves = ended = 0
     search.begin(1 << 30)
     while time.perf_counter() - start < seconds:
         count = search.collect(batch)
         logits, values = evaluate(batch[:count])
         search.apply(logits, values)
         leaves += count
-        # every traversal ended the game: the tree has nothing left to evaluate
-        if count == 0:
+        # a run of traversals that all ended the game: the tree has little left to evaluate
+        ended = ended + len(batch) if count == 0 else 0
+        if ended >= ENDED_VISITS:
             break
     search.begin(0)
     return leaves, search.total_visits() - before
