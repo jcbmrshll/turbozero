@@ -39,6 +39,28 @@ class ExternalPlayer(ABC):
         """Ends its games, however they went."""
 
 
+def check_match(game: "LeagueGame", a: Player, b: Player, games: int) -> None:
+    """Checks that a series can be asked for: its games are split evenly between the colours.
+
+    Raises:
+        ValueError: if it can't, saying why
+    """
+    for player in (a, b):
+        if player.retired:
+            raise ValueError(f"{player.name} is retired")
+        if not game.can_play(player):
+            raise ValueError(f"{player.name} can't play here")
+    if a.id == b.id:
+        raise ValueError("a player can't play itself")
+    check_match_games(games)
+
+
+def check_match_games(games: int) -> None:
+    """Raises ValueError unless `games` can be split evenly between the colours."""
+    if games <= 0 or games % 2:
+        raise ValueError("games must be positive and even: half with each colour")
+
+
 class LeagueGame(ABC):
     """A two-player game's part in the league."""
 
@@ -49,6 +71,15 @@ class LeagueGame(ABC):
     # a module of the dashboard's: draws the game's boards and steps through its moves. See
     # `examples/othello/league_board.js`
     board_js: Path | None = None
+
+    def facts(self, player: Player) -> dict[str, str | int | bool]:
+        """What can be read from `player`'s name and settings, to filter by: label to value."""
+        return {}
+
+    def export_network(self, checkpoint: str, net: str, out: Path) -> None:
+        """Writes the `net` network in `checkpoint` to `out` as ONNX, whole or not at all, for
+        the dashboard to run in the browser. The dashboard's `board_js` says how to use it."""
+        raise NotImplementedError(f"{self.name} has no ONNX export")
 
     def can_play(self, player: Player) -> bool:
         """Whether `player` can play here, rather than having only results from elsewhere."""

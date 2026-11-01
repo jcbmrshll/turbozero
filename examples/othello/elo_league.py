@@ -9,6 +9,8 @@ each played with both colors, and no pair repeats an opening until it's played t
     uv run examples/othello/elo_league.py match A-8x@1000 edax-L24 --games 400
     uv run examples/othello/elo_league.py ratings
     uv run examples/othello/elo_league.py dashboard
+    uv run examples/othello/elo_league.py export-onnx    # networks registered without an export
+    uv run examples/othello/elo_league.py fetch-ort      # once, to run networks in the browser
 
 The worker runs from a frozen copy of the code, from a slick task whose worktree it queues in
 (SLICK_TASK names the task; a queue entry's end prompts that task's agent):
@@ -23,6 +25,7 @@ The store is in ~/.cache/turbozero/othello/league (see --root).
 """
 
 import os
+import re
 import sys
 
 # only the player needs the GPU: everything else stays off it, where it would take memory
@@ -52,6 +55,52 @@ from core.league.cli import main
 from core.league.game import ExternalPlayer, LeagueGame
 from core.league.store import Player
 from core.monitoring.episodes import BOARDS
+
+# a self-play network's name and a student's (see `distill.py`)
+SELF_PLAY = re.compile(
+    r"\d+x\d+-(?P<sims>\d+)s-(?P<passes>\d+)p-w(?P<window>\d+)(?P<vtq>-vtq)?"
+    r"-(?P<minutes>\d+)m(?P<planned>-planned)?"
+)
+STUDENT = re.compile(
+    r"\d+x\d+-distill-(?P<target>\w+)-(?P<minutes>\d+)m-(?P<passes>\d+)p"
+)
+
+
+def player_facts(player: Player) -> dict[str, str | int | bool]:
+    """What's in a player's settings and name, as in 8x128-128s-8p-w1125-274m@1000: its net, its
+    training sims, passes per position, window and GPU-minutes, and its sims in play."""
+    if player.external is not None:
+        facts: dict[str, str | int | bool] = {
+            "kind": "engine",
+            "engine": player.external,
+        }
+        for label, key in (("level", "level"), ("play sims", "sims")):
+            if key in player.settings:
+                facts[label] = player.settings[key]
+        return facts
+    facts = {"kind": "net"}
+    assert player.net is not None and player.network is not None
+    if shape := re.search(r"(\d+)x(\d+)", player.net):
+        facts["net"] = shape[0]
+        facts["blocks"], facts["channels"] = int(shape[1]), int(shape[2])
+    if player.sims is not None:
+        facts["play sims"] = player.sims
+    if name := SELF_PLAY.fullmatch(player.network):
+        facts |= {
+            "train sims": int(name["sims"]),
+            "passes": int(name["passes"]),
+            "window": int(name["window"]),
+            "minutes": int(name["minutes"]),
+            "vtq": name["vtq"] is not None,
+            "planned": name["planned"] is not None,
+        }
+    elif name := STUDENT.fullmatch(player.network):
+        facts |= {
+            "distill target": name["target"],
+            "teacher minutes": int(name["minutes"]),
+            "passes": int(name["passes"]),
+        }
+    return facts
 
 
 def color(first: bool) -> str:
@@ -133,6 +182,14 @@ class Othello(LeagueGame):
 
     def __init__(self, xot: Path = XOT_PATH):
         self.xot = load_xot(xot)
+
+    def facts(self, player: Player) -> dict[str, str | int | bool]:
+        return player_facts(player)
+
+    def export_network(self, checkpoint: str, net: str, out: Path) -> None:
+        from export_onnx import save_onnx
+
+        save_onnx(checkpoint, net, out)
 
     def metadata(self, state: Any):
         return metadata(state)

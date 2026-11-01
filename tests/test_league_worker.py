@@ -385,6 +385,18 @@ def test_a_requested_series_comes_first_then_the_scheduler_takes_over(store):
     assert {(row[0], row[1]) for row in batches_of(store)[3:]} != {(x, y)}
 
 
+def test_series_are_played_in_the_queues_order(store):
+    p = ids(store)
+    store.request_match(p["n@8"], p["n@16"], 2)
+    moved = store.request_match(p["edax-1"], p["edax-2"], 2)
+    store.move_match(moved, 0)
+    run_play(store, max_batches=2)
+    assert [(r[0], r[1]) for r in batches_of(store)] == [
+        (p["edax-1"], p["edax-2"]),
+        (p["n@8"], p["n@16"]),
+    ]
+
+
 def test_series_are_played_oldest_first(store):
     p = ids(store)
     store.request_match(p["n@8"], p["n@16"], 2)

@@ -9,7 +9,12 @@ A batch of games is written in one transaction, so stopping at any moment, howev
 leaves whole batches. Ratings aren't stored: they're fit to the games whenever needed.
 
 A match request is a series someone asked for. Its progress is written in its batch's
-transaction, so a series can't lose count of its games however the worker stops.
+transaction, so a series can't lose count of its games however the worker stops. The series
+still to finish are played in the order of their `position`.
+
+The file's `user_version` says which `SCHEMA_VERSION` it's at. Opening an older file backs it up
+beside itself and then migrates it, in one transaction. Migrations only add to the small tables,
+so they take no longer for having more games, and whatever is running can carry on.
 """
 
 import hashlib
@@ -25,6 +30,7 @@ from typing import Any
 
 import numpy as np
 
+SCHEMA_VERSION = 1
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS networks (
     id INTEGER PRIMARY KEY,
@@ -35,7 +41,9 @@ CREATE TABLE IF NOT EXISTS networks (
     run TEXT NOT NULL,
     url TEXT,
     source TEXT NOT NULL,
-    added REAL NOT NULL
+    added REAL NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    tags TEXT NOT NULL DEFAULT '[]'
 );
 CREATE TABLE IF NOT EXISTS players (
     id INTEGER PRIMARY KEY,
@@ -46,6 +54,8 @@ CREATE TABLE IF NOT EXISTS players (
     settings TEXT NOT NULL DEFAULT '{}',
     retired INTEGER NOT NULL DEFAULT 0,
     added REAL NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    tags TEXT NOT NULL DEFAULT '[]',
     CHECK ((network_id IS NULL) != (external IS NULL))
 );
 CREATE TABLE IF NOT EXISTS batches (
@@ -85,9 +95,21 @@ CREATE TABLE IF NOT EXISTS match_requests (
     played INTEGER NOT NULL DEFAULT 0,
     state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'done', 'cancelled')),
     added REAL NOT NULL,
-    ended REAL
+    ended REAL,
+    position INTEGER NOT NULL DEFAULT 0
 );
 """
+# what brings a file at each version to the next
+MIGRATIONS = {
+    0: (
+        "ALTER TABLE networks ADD COLUMN description TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE networks ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'",
+        "ALTER TABLE players ADD COLUMN description TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE players ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'",
+        "ALTER TABLE match_requests ADD COLUMN position INTEGER NOT NULL DEFAULT 0",
+        "UPDATE match_requests SET position = id",
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -106,6 +128,8 @@ class Player:
         external: its engine's name, if it's an engine (see `game.LeagueGame.external_player`)
         settings: its engine's settings, e.g. its level
         retired: whether it no longer plays new games (it stays rated)
+        description: what someone wrote about it: a network's is shared by its search budgets
+        tags: labels someone gave it, shared the same way
     """
 
     id: int
@@ -119,6 +143,8 @@ class Player:
     external: str | None = None
     settings: dict[str, Any] = field(default_factory=dict)
     retired: bool = False
+    description: str = ""
+    tags: tuple[str, ...] = ()
 
     @property
     def is_external(self) -> bool:
@@ -207,7 +233,40 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("PRAGMA foreign_keys=ON")
-        self.db.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Brings the file to `SCHEMA_VERSION`, backing it up first if it holds anything."""
+        version = self.db.execute("PRAGMA user_version").fetchone()[0]
+        if version == SCHEMA_VERSION:
+            return
+        filled = self.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'players'"
+        ).fetchone()
+        if filled is None:
+            self.db.executescript(SCHEMA)
+            self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            return
+        self._backup(self.root / f"league-backup-before-schema-{version + 1}.db")
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            # another process may have got here while this one waited
+            version = self.db.execute("PRAGMA user_version").fetchone()[0]
+            for step in range(version, SCHEMA_VERSION):
+                for statement in MIGRATIONS[step]:
+                    self.db.execute(statement)
+            self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+    def _backup(self, path: Path) -> None:
+        """A copy of the file as it is now, whole or not at all, with other processes using it."""
+        partial = path.with_suffix(".partial")
+        partial.unlink(missing_ok=True)
+        copy = sqlite3.connect(partial)
+        try:
+            self.db.backup(copy)
+        finally:
+            copy.close()
+        partial.rename(path)
 
     def close(self) -> None:
         self.db.close()
@@ -263,6 +322,48 @@ class Store:
         if cursor.rowcount == 0:
             raise ValueError(f"no network {name} in the store")
 
+    def onnx_path(self, player: Player) -> Path | None:
+        """Where the ONNX export of `player`'s network goes, beside its checkpoint in the store;
+        None if it has no network."""
+        if player.path is None:
+            return None
+        return self.root / "networks" / f"{Path(player.path).stem}.onnx"
+
+    def set_notes(
+        self,
+        player: int,
+        description: str | None = None,
+        tags: Sequence[str] | None = None,
+    ) -> None:
+        """Sets what's given of a player's description and tags. A network's search budgets
+        share theirs, so setting them for one sets them for all.
+
+        Raises:
+            ValueError: if there's no such player
+        """
+        row = self.db.execute(
+            "SELECT network_id FROM players WHERE id = ?", (player,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"no player #{player} in the store")
+        table, key = (
+            ("players", player)
+            if row["network_id"] is None
+            else ("networks", row["network_id"])
+        )
+        with self.transaction() as db:
+            if description is not None:
+                db.execute(
+                    f"UPDATE {table} SET description = ? WHERE id = ?",
+                    (description, key),
+                )
+            if tags is not None:
+                unique = sorted({tag.strip() for tag in tags} - {""})
+                db.execute(
+                    f"UPDATE {table} SET tags = ? WHERE id = ?",
+                    (json.dumps(unique), key),
+                )
+
     def add_net_player(self, network: str, sims: int) -> int:
         """The player that is `network` searching `sims` iterations a move."""
         row = self.db.execute(
@@ -309,7 +410,9 @@ class Store:
         """Every player, in the order they were added."""
         rows = self.db.execute(
             "SELECT p.id, p.name, p.sims, p.external, p.settings, p.retired, "
-            "n.name AS network, n.path, n.net, n.run, n.url "
+            "n.name AS network, n.path, n.net, n.run, n.url, "
+            "COALESCE(n.description, p.description) AS description, "
+            "COALESCE(n.tags, p.tags) AS tags "
             "FROM players p LEFT JOIN networks n ON n.id = p.network_id ORDER BY p.id"
         )
         players = []
@@ -328,6 +431,8 @@ class Store:
                     external=row["external"],
                     settings=settings,
                     retired=bool(row["retired"]),
+                    description=row["description"],
+                    tags=tuple(json.loads(row["tags"])),
                 )
             )
         return players
@@ -386,17 +491,19 @@ class Store:
         """Asks for `games` games between players `a` and `b`, after those already asked for."""
         with self.transaction() as db:
             cursor = db.execute(
-                "INSERT INTO match_requests (a_id, b_id, games, added) VALUES (?, ?, ?, ?)",
+                "INSERT INTO match_requests (a_id, b_id, games, added, position) "
+                "VALUES (?, ?, ?, ?, "
+                "(SELECT COALESCE(MAX(position), 0) + 1 FROM match_requests))",
                 (a, b, games, time.time()),
             )
         assert cursor.lastrowid is not None
         return cursor.lastrowid
 
     def pending_matches(self) -> list[MatchRequest]:
-        """The series still to finish, oldest first."""
+        """The series still to finish, the next first."""
         rows = self.db.execute(
             "SELECT id, a_id, b_id, games, played FROM match_requests "
-            "WHERE state = 'pending' ORDER BY id"
+            "WHERE state = 'pending' ORDER BY position, id"
         )
         return [MatchRequest(*row) for row in rows]
 
@@ -415,6 +522,58 @@ class Store:
             ).rowcount
         if not changed:
             raise ValueError(f"no pending match #{request}")
+
+    def move_match(self, request: int, index: int) -> None:
+        """Moves a pending series to place `index` among those still to finish, 0 being next,
+        or as near as there is. The batch being played, if any, finishes first.
+
+        Raises:
+            ValueError: if there's no such series still pending
+        """
+        with self.transaction() as db:
+            # taken before reading, so the order can't change between reading and writing it
+            db.execute("BEGIN IMMEDIATE")
+            order = [
+                row[0]
+                for row in db.execute(
+                    "SELECT id FROM match_requests WHERE state = 'pending' "
+                    "ORDER BY position, id"
+                )
+            ]
+            if request not in order:
+                raise ValueError(f"no pending match #{request}")
+            order.remove(request)
+            order.insert(max(0, index), request)
+            db.executemany(
+                "UPDATE match_requests SET position = ? WHERE id = ?",
+                [(i + 1, id) for i, id in enumerate(order)],
+            )
+
+    def set_match_games(self, request: int, games: int) -> None:
+        """Changes how many games a pending series is to have. Set to what's been played, it's
+        done; a batch being played counts when it finishes, even if that goes over.
+
+        Raises:
+            ValueError: if there's no such series still pending, or it's played more than that
+        """
+        with self.transaction() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT played FROM match_requests WHERE id = ? AND state = 'pending'",
+                (request,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"no pending match #{request}")
+            if games < row["played"]:
+                raise ValueError(f"match #{request} has played {row['played']} games")
+            db.execute(
+                "UPDATE match_requests SET games = ? WHERE id = ?", (games, request)
+            )
+            db.execute(
+                "UPDATE match_requests SET state = 'done', ended = ? "
+                "WHERE id = ? AND played >= games",
+                (time.time(), request),
+            )
 
     def pair_records(self) -> list[PairRecord]:
         """Each pair's games so far, the pair in order of id."""

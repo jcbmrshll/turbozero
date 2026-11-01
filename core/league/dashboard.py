@@ -1,10 +1,19 @@
-"""The league's web page: a server that only reads the store, and never touches the GPU.
+"""The league's web pages, and the server behind them, which never touches the GPU.
 
-Ratings are fit from the games whenever there are new ones.
+Ratings are fit from the games whenever there are new ones. The server writes to the store only
+for what's edited on the page: pauses, descriptions and tags, and the queue of series. The page
+runs networks itself, in the browser, on their ONNX exports (see `core.league.runtime`).
+
+It has no login. Anything that writes takes a JSON body, which another site's page can't send
+to it from a browser on the tailnet without the server agreeing to it first, which it doesn't.
+
+`timings.json`, beside the store, holds what players' moves cost on fixed hardware, for the
+runtime against rating plot. Each of its `runs` is one host: see `pareto`.
 """
 
 import json
 import os
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -16,13 +25,83 @@ from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 
-from core.league.game import LeagueGame
+from core.league.game import LeagueGame, check_match, check_match_games
 from core.league.ratings import Ratings, expected_score, fit_ratings
+from core.league.runtime import has_runtime, runtime_dir
 from core.league.store import Player, Store, decode_moves
 
 PAGE = Path(__file__).with_name("dashboard.html")
+WEB = Path(__file__).with_name("web")
+KINDS = {
+    ".css": "text/css",
+    ".js": "text/javascript",
+    ".mjs": "text/javascript",
+    ".wasm": "application/wasm",
+    ".onnx": "application/octet-stream",
+}
 # how long the supervisor can go without a word before it counts as not running
 SUPERVISOR_SILENCE = 300.0
+
+
+def _config_of(player: Player) -> tuple[str | int | None, ...]:
+    """What a timing is of, for `player`: every network of an architecture costs the same."""
+    if player.external is not None:
+        return ("engine", player.external, player.settings.get("level"))
+    return ("net", player.net, player.sims)
+
+
+def pareto(
+    timings: dict[str, Any], players: list[Player], ratings: Ratings
+) -> list[dict[str, Any]]:
+    """Each run in `timings`, with its players that have a rating and a measured time: their
+    seconds per game (one side's mean) against their rating. Those whose time assumes a batch
+    size that hasn't been shown to lose no strength aren't `solid`. `frontier` says who no solid
+    player beats on both, among the solid ones. Runs stay apart: each is its own hardware."""
+    runs = []
+    for run in timings.get("runs", []):
+        configs = {}
+        for config in run.get("configs", []):
+            if config.get("source") != "measured" or not config.get("plot"):
+                continue
+            key = (
+                ("net", config["net"], config.get("sims"))
+                if "net" in config
+                else ("engine", config.get("engine"), config.get("level"))
+            )
+            configs[key] = config
+        points = []
+        for i, player in enumerate(players):
+            config = configs.get(_config_of(player))
+            if config is None or not ratings.games[i]:
+                continue
+            points.append(
+                {
+                    "player": player.id,
+                    "name": player.name,
+                    "elo": float(ratings.elo[i]),
+                    "sd": float(ratings.sd[i]),
+                    "seconds": config["seconds_per_game"],
+                    "games": config.get("games"),
+                    "batch": config.get("batch"),
+                    "threads": config.get("threads"),
+                    "solid": config.get("batch_strength") != "unmeasured",
+                    "frontier": False,
+                }
+            )
+        best = -np.inf
+        for point in sorted(points, key=lambda p: (p["seconds"], -p["elo"])):
+            if point["solid"] and point["elo"] > best:
+                point["frontier"] = True
+                best = point["elo"]
+        runs.append(
+            {
+                "name": run.get("name", ""),
+                "hardware": run.get("hardware", {}),
+                "software": run.get("software", {}),
+                "points": points,
+            }
+        )
+    return runs
 
 
 class League:
@@ -34,6 +113,23 @@ class League:
         self.lock = threading.Lock()
         self.fitted: tuple[int, int] | None = None
         self.ratings: Ratings | None = None
+        self.timings_read: tuple[float, dict[str, Any]] = (0.0, {})
+
+    def _timings(self) -> dict[str, Any]:
+        """`timings.json`, read again if it's changed."""
+        path = self.store.root / "timings.json"
+        try:
+            changed = path.stat().st_mtime
+            if changed != self.timings_read[0]:
+                self.timings_read = (changed, json.loads(path.read_text()))
+        except (OSError, ValueError):
+            return {}
+        return self.timings_read[1]
+
+    def pareto(self) -> list[dict[str, Any]]:
+        with self.lock:
+            players = self.store.players()
+            return pareto(self._timings(), players, self._fit(players))
 
     def _fit(self, players: list[Player]) -> Ratings:
         """The fit to all the games, redone if there's more."""
@@ -86,6 +182,10 @@ class League:
                         "external": p.external,
                         "settings": p.settings,
                         "retired": p.retired,
+                        "description": p.description,
+                        "tags": list(p.tags),
+                        "facts": self.game.facts(p),
+                        "onnx": self._onnx(p),
                         "can_play": self.game.can_play(p),
                         "part": int(ratings.components[i]),
                     }
@@ -97,9 +197,69 @@ class League:
                 "recent": [dict(row) for row in rows],
                 "worker": self._worker(),
                 "playing": self._playing(),
-                "requests": [asdict(r) for r in store.pending_matches()],
+                "requests": self._queue(players),
+                "runtime": has_runtime(store.root),
                 "time": time.time(),
             }
+
+    def _onnx(self, player: Player) -> str | None:
+        """The name of `player`'s network's ONNX export, if it has one yet."""
+        path = self.store.onnx_path(player)
+        return path.name if path is not None and path.exists() else None
+
+    def _queue(self, players: list[Player]) -> list[dict[str, Any]]:
+        """The series still to finish, the next first, each with what's happening to it:
+        "playing", "next" (the first the worker can play after what's playing), "paused" or
+        "can't play" (skipped until that changes), or "" for its turn to come."""
+        by_id = {p.id: p for p in players}
+        playing = (self._playing() or {}).get("request")
+        queue, waiting = [], True
+        for request in self.store.pending_matches():
+            sides = by_id[request.a], by_id[request.b]
+            status = ""
+            if not all(self.game.can_play(p) for p in sides):
+                status = "can't play"
+            elif any(p.retired for p in sides):
+                status = "paused"
+            elif waiting:
+                status = "next"
+                waiting = False
+            if request.id == playing:
+                status = "playing"
+            queue.append({**asdict(request), "status": status})
+        return queue
+
+    def add_match(self, a: int, b: int, games: int) -> int:
+        """Asks for a series, after those already asked for.
+
+        Raises:
+            ValueError: if it can't be played
+        """
+        with self.lock:
+            by_id = {p.id: p for p in self.store.players()}
+            if a not in by_id or b not in by_id:
+                raise ValueError("no such player")
+            check_match(self.game, by_id[a], by_id[b], games)
+            return self.store.request_match(a, b, games)
+
+    def move_match(self, request: int, index: int) -> None:
+        with self.lock:
+            self.store.move_match(request, index)
+
+    def set_match_games(self, request: int, games: int) -> None:
+        with self.lock:
+            check_match_games(games)
+            self.store.set_match_games(request, games)
+
+    def cancel_match(self, request: int) -> None:
+        with self.lock:
+            self.store.cancel_match(request)
+
+    def set_notes(
+        self, player: int, description: str | None, tags: list[str] | None
+    ) -> None:
+        with self.lock:
+            self.store.set_notes(player, description, tags)
 
     def _playing(self) -> dict[str, Any] | None:
         """The batch being played, if its player is still alive to be playing it."""
@@ -178,8 +338,8 @@ class League:
     def game_record(self, game: int) -> dict[str, Any] | None:
         with self.lock:
             row = self.store.db.execute(
-                "SELECT g.id, pf.name AS first, ps.name AS second, g.opening, g.result, "
-                "g.first_score, g.second_score, g.moves, b.finished, b.code_version, "
+                "SELECT g.id, pf.name AS first, ps.name AS second, g.first_id, g.second_id, "
+                "g.opening, g.result, g.first_score, g.second_score, g.moves, b.finished, b.code_version, "
                 "b.dtype FROM games g JOIN players pf ON pf.id = g.first_id "
                 "JOIN players ps ON ps.id = g.second_id "
                 "JOIN batches b ON b.id = g.batch_id WHERE g.id = ?",
@@ -211,21 +371,69 @@ def make_handler(league: League) -> type[BaseHTTPRequestHandler]:
         def _json(self, value: Any, status: int = 200) -> None:
             self._send(json.dumps(value).encode(), "application/json", status)
 
-        def do_POST(self) -> None:
-            url = urlparse(self.path)
-            query = parse_qs(url.query)
+        def _file(self, path: Path, cached: bool) -> None:
+            """Sends a file, which `cached` says will never change."""
             try:
-                player = int(query["player"][0])
-                paused = query["paused"][0] == "1"
-            except (KeyError, ValueError):
-                self._json({"error": "needs player and paused"}, 400)
-                return
-            if url.path != "/api/paused":
+                body = path.read_bytes()
+            except OSError:
                 self._json({"error": "not found"}, 404)
-            elif league.set_paused(player, paused):
-                self._json({"player": player, "paused": paused})
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", KINDS[path.suffix])
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header(
+                "Cache-Control",
+                "public, max-age=31536000, immutable" if cached else "no-store",
+            )
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _post(self, path: str, body: dict[str, Any]) -> Any:
+            """Does what's asked: its answer, or None if there's no such thing to ask."""
+            if path == "/api/paused":
+                player, paused = int(body["player"]), bool(body["paused"])
+                if not league.set_paused(player, paused):
+                    raise LookupError("no such player can play")
+                return {"player": player, "paused": paused}
+            if path == "/api/notes":
+                league.set_notes(
+                    int(body["player"]), body.get("description"), body.get("tags")
+                )
+                return {}
+            if path == "/api/match/add":
+                request = league.add_match(
+                    int(body["a"]), int(body["b"]), int(body["games"])
+                )
+                return {"id": request}
+            if path == "/api/match/move":
+                league.move_match(int(body["id"]), int(body["index"]))
+                return {}
+            if path == "/api/match/games":
+                league.set_match_games(int(body["id"]), int(body["games"]))
+                return {}
+            if path == "/api/match/cancel":
+                league.cancel_match(int(body["id"]))
+                return {}
+            return None
+
+        def do_POST(self) -> None:
+            if self.headers.get("Content-Type") != "application/json":
+                self._json({"error": "needs a JSON body"}, 415)
+                return
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                answer = self._post(
+                    urlparse(self.path).path, json.loads(self.rfile.read(length))
+                )
+            except LookupError as e:
+                self._json({"error": str(e)}, 404)
+            except (TypeError, ValueError) as e:
+                self._json({"error": str(e)}, 400)
             else:
-                self._json({"error": "no such player can play"}, 404)
+                if answer is None:
+                    self._json({"error": "not found"}, 404)
+                else:
+                    self._json(answer)
 
         def do_GET(self) -> None:
             url = urlparse(self.path)
@@ -238,6 +446,12 @@ def make_handler(league: League) -> type[BaseHTTPRequestHandler]:
             try:
                 if url.path == "/":
                     self._send(PAGE.read_bytes(), "text/html; charset=utf-8")
+                elif match := re.fullmatch(r"/web/(\w+\.(?:js|css))", url.path):
+                    self._file(WEB / match[1], cached=False)
+                elif match := re.fullmatch(r"/ort/([\w.-]+\.(?:mjs|wasm))", url.path):
+                    self._file(runtime_dir(league.store.root) / match[1], cached=True)
+                elif match := re.fullmatch(r"/onnx/([0-9a-f]{64}\.onnx)", url.path):
+                    self._file(league.store.root / "networks" / match[1], cached=True)
                 elif url.path == "/game.js":
                     board = league.game.board_js
                     if board is None:
@@ -246,6 +460,8 @@ def make_handler(league: League) -> type[BaseHTTPRequestHandler]:
                         self._send(board.read_bytes(), "text/javascript")
                 elif url.path == "/api/summary":
                     self._json(league.summary())
+                elif url.path == "/api/pareto":
+                    self._json(league.pareto())
                 elif url.path == "/api/pair":
                     a, b = number("a"), number("b")
                     if a is None or b is None:

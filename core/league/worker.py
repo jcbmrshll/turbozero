@@ -15,7 +15,7 @@ that's someone saying so.
 
 A batch is short (`SchedulerConfig.batch_seconds`) so that little is lost when one's abandoned.
 
-Series someone asked for (`Store.request_match`) are played first, oldest first, as batches like
+Series someone asked for (`Store.request_match`) are played first, in their queue's order, as batches like
 any others. One waits while either of its players is retired, and doesn't hold up the rest.
 """
 
@@ -117,7 +117,7 @@ def _seconds_of_pair(
 def _next_request(
     game: LeagueGame, requests: list[MatchRequest], by_id: dict[int, Player]
 ) -> MatchRequest | None:
-    """The oldest series that both of its players can play now."""
+    """The first series in the queue that both of its players can play now."""
     for request in requests:
         players = by_id[request.a], by_id[request.b]
         if all(not p.retired and game.can_play(p) for p in players):

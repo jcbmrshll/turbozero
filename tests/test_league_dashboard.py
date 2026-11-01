@@ -12,8 +12,10 @@ from http.server import ThreadingHTTPServer
 import numpy as np
 import pytest
 
-from core.league.dashboard import League, make_handler
+from core.league.dashboard import League, make_handler, pareto
 from core.league.game import LeagueGame
+from core.league.ratings import fit_ratings
+from core.league.runtime import FILES, runtime_dir
 from core.league.store import GameRecord, Store
 
 
@@ -85,8 +87,13 @@ def test_a_network_links_to_its_url(store, url, tmp_path):
     }
 
 
-def post(url, path):
-    request = urllib.request.Request(url + path, method="POST")
+def post(url, path, body):
+    request = urllib.request.Request(
+        url + path,
+        method="POST",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+    )
     with urllib.request.urlopen(request) as response:
         return json.load(response)
 
@@ -94,15 +101,15 @@ def post(url, path):
 def test_a_player_can_be_paused_and_resumed(url):
     x = get(url, "/api/summary")["players"][0]
     assert not x["retired"] and x["can_play"]
-    post(url, f"/api/paused?player={x['id']}&paused=1")
+    post(url, "/api/paused", {"player": x["id"], "paused": True})
     assert get(url, "/api/summary")["players"][0]["retired"]
-    post(url, f"/api/paused?player={x['id']}&paused=0")
+    post(url, "/api/paused", {"player": x["id"], "paused": False})
     assert not get(url, "/api/summary")["players"][0]["retired"]
 
 
 def test_pausing_nobody_is_a_404(url):
     with pytest.raises(urllib.error.HTTPError) as caught:
-        post(url, "/api/paused?player=999&paused=1")
+        post(url, "/api/paused", {"player": 999, "paused": True})
     assert caught.value.code == 404
 
 
@@ -209,3 +216,272 @@ def test_summary_lists_the_pending_series(url, store):
     assert [(r["a"], r["b"], r["played"], r["games"]) for r in pending] == [
         (1, 2, 0, 40)
     ]
+
+
+def refused(url, path, body):
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        post(url, path, body)
+    return caught.value.code
+
+
+def test_writing_needs_a_json_body(url):
+    request = urllib.request.Request(
+        url + "/api/paused", method="POST", data=b"player=1&paused=1"
+    )
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        urllib.request.urlopen(request)
+    assert caught.value.code == 415
+    assert not get(url, "/api/summary")["players"][0]["retired"]
+
+
+def test_notes_are_edited_and_shown(url):
+    post(url, "/api/notes", {"player": 1, "description": "deep", "tags": ["t"]})
+    x = get(url, "/api/summary")["players"][0]
+    assert (x["description"], x["tags"]) == ("deep", ["t"])
+
+
+def test_a_series_is_added_moved_edited_and_cancelled(url):
+    first = post(url, "/api/match/add", {"a": 1, "b": 2, "games": 4})["id"]
+    second = post(url, "/api/match/add", {"a": 2, "b": 1, "games": 4})["id"]
+    post(url, "/api/match/move", {"id": second, "index": 0})
+    post(url, "/api/match/games", {"id": first, "games": 8})
+    requests = get(url, "/api/summary")["requests"]
+    assert [(r["id"], r["games"]) for r in requests] == [(second, 4), (first, 8)]
+    post(url, "/api/match/cancel", {"id": second})
+    assert [r["id"] for r in get(url, "/api/summary")["requests"]] == [first]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"a": 1, "b": 2, "games": 3},
+        {"a": 1, "b": 2, "games": 0},
+        {"a": 1, "b": 1, "games": 2},
+        {"a": 1, "b": 99, "games": 2},
+    ],
+)
+def test_a_series_that_cant_be_played_is_refused(url, body):
+    assert refused(url, "/api/match/add", body) == 400
+
+
+def test_a_paused_player_cant_be_asked_to_play(url):
+    post(url, "/api/paused", {"player": 1, "paused": True})
+    assert refused(url, "/api/match/add", {"a": 1, "b": 2, "games": 2}) == 400
+
+
+def test_a_series_cant_be_given_an_odd_number_of_games(url, store):
+    request = store.request_match(1, 2, 4)
+    assert refused(url, "/api/match/games", {"id": request, "games": 3}) == 400
+    assert refused(url, "/api/match/move", {"id": 99, "index": 0}) == 400
+
+
+def test_the_queue_says_whats_happening_to_each_series(url, store):
+    playing = store.request_match(1, 2, 4)
+    next_up = store.request_match(1, 2, 4)
+    waiting = store.request_match(1, 2, 4)
+    statuses = lambda: {
+        r["id"]: r["status"] for r in get(url, "/api/summary")["requests"]
+    }
+    assert statuses() == {playing: "next", next_up: "", waiting: ""}
+    store.set_meta(
+        "player",
+        {"state": "playing", "a": "x", "b": "y", "games": 4, "started": 0.0,
+         "pid": os.getpid(), "request": next_up},
+    )  # fmt: skip
+    assert statuses() == {playing: "next", next_up: "playing", waiting: ""}
+    store.move_match(next_up, 0)
+    assert statuses() == {next_up: "playing", playing: "", waiting: ""}
+    store.set_retired("x")
+    assert statuses() == {next_up: "playing", playing: "paused", waiting: "paused"}
+
+
+def test_a_series_a_player_cant_play_is_marked(store):
+    class OnlyYPlays(FakeGame):
+        def can_play(self, player):
+            return player.name == "y"
+
+    request = store.request_match(1, 2, 2)
+    league = League(store, OnlyYPlays())
+    assert league.summary()["requests"][0] == {
+        "id": request, "a": 1, "b": 2, "games": 2, "played": 0, "status": "can't play",
+    }  # fmt: skip
+
+
+def status_of(url, path):
+    try:
+        with urllib.request.urlopen(url + path) as response:
+            return response.status, response.headers, response.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers, b""
+
+
+def test_the_pages_scripts_are_served(url):
+    status, headers, body = status_of(url, "/web/app.js")
+    assert status == 200 and headers["Content-Type"] == "text/javascript" and body
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/web/../store.py",
+        "/web/%2e%2e/store.py",
+        "/onnx/../league.db",
+        "/onnx/nothex.onnx",
+        "/onnx/" + "a" * 64 + ".onnx",
+        "/ort/../../league.db",
+        "/ort/missing.wasm",
+    ],
+)
+def test_only_the_files_for_the_page_are_served(url, path):
+    assert status_of(url, path)[0] == 404
+
+
+def test_a_networks_export_and_the_runtime_are_served_once_they_exist(
+    url, store, tmp_path
+):
+    checkpoint = tmp_path / "net.eqx"
+    checkpoint.write_bytes(b"weights")
+    store.add_network("net", checkpoint, "resnet:4x64", "run")
+    store.add_net_player("net", 128)
+    summary = get(url, "/api/summary")
+    assert not summary["runtime"] and summary["players"][-1]["onnx"] is None
+    player = store.players()[-1]
+    exported = store.onnx_path(player)
+    exported.write_bytes(b"graph")
+    name = get(url, "/api/summary")["players"][-1]["onnx"]
+    assert name == exported.name
+    status, headers, body = status_of(url, f"/onnx/{name}")
+    assert (status, body) == (200, b"graph")
+    assert "immutable" in headers["Cache-Control"]
+    out = runtime_dir(store.root)
+    out.mkdir(parents=True)
+    for file in FILES:
+        (out / file).write_bytes(b"x")
+    assert get(url, "/api/summary")["runtime"]
+    assert (
+        status_of(url, "/ort/ort-wasm-simd-threaded.wasm")[1]["Content-Type"]
+        == "application/wasm"
+    )
+
+
+def test_a_game_says_who_played_it(url):
+    assert get(url, "/api/game?id=1")["first_id"] == 1
+
+
+NET = "resnet:4x64"
+
+
+@pytest.fixture
+def timed(tmp_path):
+    """Four players, of whom a is weakest and fastest, c strongest, and d beaten by both of them."""
+    store = Store(tmp_path / "timed")
+    checkpoint = tmp_path / "net.eqx"
+    checkpoint.write_bytes(b"weights")
+    store.add_network("net", checkpoint, NET, "run")
+    a, b = store.add_net_player("net", 128), store.add_net_player("net", 1000)
+    c = store.add_external_player("c", "edax", {"level": 20})
+    d = store.add_external_player("d", "edax", {"level": 4})
+    games = []
+    for winner, loser, count in ((b, a, 30), (c, b, 30), (a, d, 30)):
+        games += [GameRecord(winner, loser, 0, 1, [])] * count + [
+            GameRecord(loser, winner, 0, -1, [])
+        ] * 10
+        games += [GameRecord(loser, winner, 0, 1, [])] * 5
+    store.record_batch(a, b, 1.0, False, "abc", "", games)
+    yield store, (a, b, c, d)
+    store.close()
+
+
+def run_of(*configs, **fields):
+    return {
+        "name": "r",
+        "hardware": {"cpu": "fake"},
+        "configs": list(configs),
+        **fields,
+    }
+
+
+def measured(**fields):
+    return {"source": "measured", "plot": True, "seconds_per_game": 1.0, **fields}
+
+
+def by_name(store, timings):
+    players = store.players()
+    ratings = fit_ratings([p.id for p in players], store.pair_records())
+    return [
+        {p["name"]: p for p in run["points"]}
+        for run in pareto(timings, players, ratings)
+    ]
+
+
+def test_timings_join_networks_by_architecture_and_sims_and_engines_by_level(timed):
+    store, _ = timed
+    [points] = by_name(store, {"runs": [run_of(
+        measured(net=NET, sims=1000, seconds_per_game=2.0),
+        measured(engine="edax", level=20, seconds_per_game=9.0),
+        measured(net="other", sims=128),
+        measured(engine="other", level=4),
+    )]})  # fmt: skip
+    assert {name: p["seconds"] for name, p in points.items()} == {
+        "net@1000": 2.0,
+        "c": 9.0,
+    }
+
+
+def test_only_whats_measured_and_marked_for_plotting_is_plotted(timed):
+    store, _ = timed
+    [points] = by_name(store, {"runs": [run_of(
+        {**measured(net=NET, sims=128), "source": "fit"},
+        {**measured(net=NET, sims=1000), "plot": False},
+    )]})  # fmt: skip
+    assert points == {}
+
+
+def test_runs_stay_apart(timed):
+    store, _ = timed
+    runs = by_name(store, {"runs": [
+        run_of(measured(net=NET, sims=128)),
+        run_of(measured(net=NET, sims=1000)),
+    ]})  # fmt: skip
+    assert [set(points) for points in runs] == [{"net@128"}, {"net@1000"}]
+
+
+def test_the_frontier_is_who_nothing_is_both_faster_and_stronger_than(timed):
+    store, _ = timed
+    [points] = by_name(store, {"runs": [run_of(
+        measured(net=NET, sims=128, seconds_per_game=1.0),
+        measured(net=NET, sims=1000, seconds_per_game=4.0),
+        measured(engine="edax", level=20, seconds_per_game=8.0),
+        measured(engine="edax", level=4, seconds_per_game=2.0),
+    )]})  # fmt: skip
+    assert {name for name, p in points.items() if p["frontier"]} == {
+        "net@128",
+        "net@1000",
+        "c",
+    }
+    assert "d" in points
+
+
+def test_an_unverified_batch_is_shown_but_isnt_the_frontier(timed):
+    store, _ = timed
+    [points] = by_name(store, {"runs": [run_of(
+        measured(net=NET, sims=128, seconds_per_game=4.0),
+        measured(net=NET, sims=1000, seconds_per_game=1.0, batch_strength="unmeasured"),
+    )]})  # fmt: skip
+    assert not points["net@1000"]["solid"] and not points["net@1000"]["frontier"]
+    assert points["net@128"]["frontier"]
+
+
+def test_there_are_no_points_without_timings(url):
+    assert get(url, "/api/pareto") == []
+
+
+def test_a_timings_file_is_read_again_when_it_changes(url, store):
+    path = store.root / "timings.json"
+    path.write_text(json.dumps({"runs": [run_of(measured(engine="edax", level=8))]}))
+    assert [p["name"] for p in get(url, "/api/pareto")[0]["points"]] == ["x"]
+    path.write_text("{ half written")
+    assert get(url, "/api/pareto") == []
+    path.write_text(json.dumps({"runs": []}))
+    os.utime(path, (1, 1))
+    assert get(url, "/api/pareto") == []
