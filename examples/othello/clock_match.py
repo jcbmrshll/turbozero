@@ -25,6 +25,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
+# a CPU script: JAX would otherwise take the GPU's memory, and the league would give way
+if __name__ == "__main__":
+    os.environ.setdefault("JAX_PLATFORMS", "cpu")
+
 import numpy as np
 from engines import CLOCKED, ENGINES, GTPEngine
 from game import square
