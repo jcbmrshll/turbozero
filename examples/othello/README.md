@@ -11,7 +11,8 @@ Othello model and against two strong open-source Othello engines,
 | `eval_pgx.py` | Plays a checkpoint against pgx's pretrained model at several search budgets |
 | `vs_engine.py` | Plays a checkpoint against Edax or Egaroucid at several levels, from XOT openings (and train.py's network as it trains) |
 | `engines.py` | Edax and Egaroucid, each driven over GTP, and what their searches made of each position, from their logs |
-| `setup_edax.sh`, `setup_egaroucid.sh` | Build the engines for `vs_engine.py` |
+| `setup_edax.sh`, `setup_egaroucid.sh` | Build the engines for `vs_engine.py` and `clock_match.py` |
+| `clock_match.py` | Games on a real clock, one at a time on the same cores, each side at its best settings |
 | `engine_set.py`, `label_positions.py`, `score_engine_set.py` | The engine-labelled set: fixed positions with every legal move scored by Edax, to build, and to score checkpoints on (train.py scores the network on it every epoch) |
 | `bench_nets.py` | Times networks on their own: a forward pass at self-play's batch, a training step at training's |
 | `game.py` | What the scripts share: the environment, board symmetries, network, evaluators |
@@ -319,6 +320,55 @@ The run above scored, out of 256 games against each level (128 openings), search
 | Edax level | 4 | 6 | 8 | 10 |
 |---|---|---|---|---|
 | Score | 0.79 | 0.49 | 0.23 | 0.07 |
+
+### On a clock
+
+`clock_match.py` plays games the way a contest would: one at a time, the same seconds for each
+side for the whole game, on the same cores. Each engine runs its own time management at its
+strongest settings: Edax over GTP (`time_settings`, then `time_left` before each move), and
+Egaroucid over its console protocol (`-time`, `play`, `go`), since its GTP has no clock.
+
+```
+taskset -c 16-23 uv run examples/othello/clock_match.py --a edax:threads=8 --b egaroucid:threads=8 \
+    --seconds 10 --openings 100
+```
+
+which amounts to these engine processes, each with a fresh process for every game:
+
+```
+edax/bin/edax -gtp -q -l 60 -n 8 -book-usage on -h 25    # in edax/
+egaroucid/bin/Egaroucid_for_Console.out -quiet -noboard -threads 8 -time 10    # in egaroucid/bin/
+```
+
+- **Run them with the machine quiet.** Eight busy cores on the other core complex slowed the
+  engines' 8-thread searches by 30-45%, more than any choice of cores or build. Which cores
+  matters less: on an idle Ryzen 9 9900X3D, 16-23 (eight physical cores across both complexes)
+  and 0-5,12,13 (the V-cache complex, two cores doubled) were within 7% for the engines, though
+  16-23 ran a network's batched search 1.45 times faster. An idle sibling is part of the core:
+  16-23 needs 4-11 idle.
+- **Clocks of 2 to 10 seconds a game suit them.** Edax used about 85% of each, and Egaroucid
+  95-100%, passing it by at most 14 ms (hence `GRACE`, 50 ms). At 30 seconds Egaroucid used only 59%:
+  its time management keeps a large margin. Clocks are whole seconds: Egaroucid's `-time` is.
+- **Opening books are on**, as they ship. From XOT openings they hardly matter: of 300 openings,
+  4 start in Egaroucid's book, and Edax ships an empty one.
+- **Neither engine ponders** over these protocols, and between moves neither uses any CPU.
+
+A level is no stand-in for a clock. On real positions, from XOT openings, with 8 threads on 16-23:
+
+| | Seconds a move: mean | 99th percentile | Worst | Seconds a game: mean | Worst |
+|---|---|---|---|---|---|
+| Edax level 16 | 0.018 | 0.31 | 0.67 | 0.47 | 1.0 |
+| Edax level 20 | 0.046 | 0.75 | 1.35 | 1.2 | 2.0 |
+| Edax level 24 | 0.11 | 1.3 | 2.2 | 2.9 | 6.1 |
+| Edax level 28 | 0.64 | 8.0 | 17 | 16.7 | 34 |
+| Egaroucid level 16 | 0.020 | 0.31 | 0.49 | 0.53 | 0.75 |
+| Egaroucid level 20 | 0.048 | 0.40 | 0.73 | 1.3 | 3.1 |
+| Egaroucid level 24 | 0.16 | 1.5 | 7.9 | 4.3 | 11.4 |
+| Egaroucid level 28 | 0.76 | 7.9 | 20 | 19.9 | 56 |
+
+More threads make a level no stronger, only faster (at level 16, 150 games each: 8 threads
+against 1 scored 0.49 for Edax and 0.50 for Egaroucid, each about 0.04 either way), and one
+search took 3.5 times less time on 8 threads than on 1 at level 20.
 
 ### During training
 
