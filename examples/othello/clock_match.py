@@ -16,6 +16,7 @@ show what clock losses changed.
 """
 
 import argparse
+import itertools
 import json
 import math
 import os
@@ -247,7 +248,9 @@ def net_player(options: dict[str, str]) -> Callable[[], Player]:
     spec = NetSpec.parse(f"visits=0,{fields}", options["net"], "bf16")
     evaluate = make_eval(spec.net, spec.backend, len(os.sched_getaffinity(0)))
     taper = int(options.get("taper", 0))
-    return lambda: NetPlayer(spec.settings, evaluate, taper)
+    # a seed to a game, for its draws of symmetries
+    seeds = itertools.count()
+    return lambda: NetPlayer(spec.settings, evaluate, taper, next(seeds))
 
 
 def make_player(spec: str, seconds: int) -> Callable[[], Player]:

@@ -526,12 +526,15 @@ another or an engine on a per-game clock.
 
 ```
 taskset -c 16-23 uv run examples/othello/clock_match.py --seconds 10 --openings 20 \
-    --a net:net=8x128-128s-8p-w1125-274m,batch=16,virtual_loss=visit,taper=24 --b edax:threads=8
+    --a net:net=8x128-128s-8p-w1125-274m,batch=16,virtual_loss=visit,random_symmetry=1,taper=24 \
+    --b edax:threads=8
 ```
 
 The network is named as in the league's store. Its search collects 16 traversals at a time, each
 steered off the others by virtual visits, and evaluates their leaves together, split over a stream
-per core of OpenVINO, in bfloat16. On eight physical cores of a Ryzen 9 9900X3D, one game at a time:
+per core of OpenVINO, in bfloat16. With `random_symmetry=1` it shows the network each leaf in a
+random one of the board's 8 symmetries, which costs nothing measurable and gained about 30 Elo at
+4000 visits a move, in self-play and against Edax, though nothing shown at 1000. On eight physical cores of a Ryzen 9 9900X3D, one game at a time:
 
 | 8x128, evals a second | batch 1 | 8 | 16 | 32 |
 |---|---|---|---|---|

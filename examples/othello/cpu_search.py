@@ -4,6 +4,10 @@ compiled on first use), the network in ONNX Runtime (see `export_onnx.py`).
 A search visits the tree a batch of traversals at a time, each steered away from those still in
 flight by virtual loss, and evaluates their leaves together: a batch of 1 is the sequential search
 of `core/evaluators/mcts`. Only for play: self-play and training use `core`'s batched search.
+
+With `random_symmetry`, the network sees each leaf in a random one of the board's 8 symmetries, and
+its policy is mapped back to the real squares: whatever it gets wrong about one orientation doesn't
+repeat across the tree.
 """
 
 import ctypes
@@ -57,7 +61,14 @@ def load_library() -> ctypes.CDLL:
     signatures = {
         "search_new": (
             Search,
-            [ctypes.c_int, ctypes.c_float, ctypes.c_float, ctypes.c_int],
+            [
+                ctypes.c_int,
+                ctypes.c_float,
+                ctypes.c_float,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_uint64,
+            ],
         ),
         "search_free": (None, [Search]),
         "search_reset": (None, [Search]),
@@ -77,6 +88,8 @@ def load_library() -> ctypes.CDLL:
         "search_collisions": (ctypes.c_long, [Search]),
         "search_total_visits": (ctypes.c_long, [Search]),
         "search_num_nodes": (ctypes.c_long, [Search]),
+        "search_symmetric_bits": (ctypes.c_uint64, [ctypes.c_uint64, ctypes.c_int]),
+        "search_symmetric_action": (ctypes.c_int, [ctypes.c_int, ctypes.c_int]),
     }
     for name, (restype, argtypes) in signatures.items():
         fn = getattr(lib, name)
@@ -100,6 +113,8 @@ class SearchSettings:
         c_init: PUCT's exploration constant (see `core`'s `PUCTSelector`)
         max_collisions: traversals of a batch allowed to find a leaf already in flight before it
             stops short; None for the batch's size
+        random_symmetry: show the network each leaf in a random one of the board's 8 symmetries,
+            drawn from the search's seed
     """
 
     batch: int = 1
@@ -107,12 +122,14 @@ class SearchSettings:
     weight: float = 1.0
     c_init: float = 1.25
     max_collisions: int | None = None
+    random_symmetry: bool = False
 
 
 class Search:
-    """A game's tree, from its start: the root follows the game (`play`), keeping what it searched."""
+    """A game's tree, from its start: the root follows the game (`play`), keeping what it searched.
+    `seed` starts its draws of symmetries, the only randomness it has."""
 
-    def __init__(self, settings: SearchSettings | None = None):
+    def __init__(self, settings: SearchSettings | None = None, seed: int = 0):
         settings = settings or SearchSettings()
         self.settings = settings
         collisions = settings.max_collisions
@@ -121,6 +138,8 @@ class Search:
             settings.weight,
             settings.c_init,
             settings.batch if collisions is None else collisions,
+            settings.random_symmetry,
+            seed,
         )
         LIB.search_reset(self.handle)
 
