@@ -12,6 +12,12 @@ A match request is a series someone asked for. Its progress is written in its ba
 transaction, so a series can't lose count of its games however the worker stops. The series
 still to finish are played in the order of their `position`.
 
+A batch keeps the settings each player played it with, exactly as the search or the engine was
+given them, so that a default changing later can be told apart from the player's games before.
+A game's searches (`NetSearch`, `EngineSearch`) are in a table of their own, a compressed blob a
+game: fitting ratings reads every row of `games`, and shouldn't read those too. Games from before
+schema 2 have neither.
+
 The file's `user_version` says which `SCHEMA_VERSION` it's at. Opening an older file backs it up
 beside itself and then migrates it, in one transaction. Migrations only add to the small tables,
 so they take no longer for having more games, and whatever is running can carry on.
@@ -22,7 +28,9 @@ import json
 import os
 import shutil
 import sqlite3
+import struct
 import time
+import zlib
 from collections.abc import Generator, Iterable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -31,7 +39,7 @@ from typing import Any
 
 import numpy as np
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS networks (
     id INTEGER PRIMARY KEY,
@@ -71,7 +79,12 @@ CREATE TABLE IF NOT EXISTS batches (
     a_seconds REAL NOT NULL DEFAULT 0,
     a_moves INTEGER NOT NULL DEFAULT 0,
     b_seconds REAL NOT NULL DEFAULT 0,
-    b_moves INTEGER NOT NULL DEFAULT 0
+    b_moves INTEGER NOT NULL DEFAULT 0,
+    a_settings TEXT,
+    b_settings TEXT,
+    games_at_once INTEGER,
+    device TEXT,
+    steps TEXT
 );
 CREATE TABLE IF NOT EXISTS games (
     id INTEGER PRIMARY KEY,
@@ -87,6 +100,10 @@ CREATE TABLE IF NOT EXISTS games (
 CREATE INDEX IF NOT EXISTS games_by_pair ON games (first_id, second_id);
 CREATE INDEX IF NOT EXISTS games_by_second ON games (second_id);
 CREATE INDEX IF NOT EXISTS games_by_batch ON games (batch_id);
+CREATE TABLE IF NOT EXISTS game_searches (
+    game_id INTEGER PRIMARY KEY REFERENCES games(id) ON DELETE CASCADE,
+    searches BLOB NOT NULL
+);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS match_requests (
     id INTEGER PRIMARY KEY,
@@ -110,7 +127,21 @@ MIGRATIONS = {
         "ALTER TABLE match_requests ADD COLUMN position INTEGER NOT NULL DEFAULT 0",
         "UPDATE match_requests SET position = id",
     ),
+    1: (
+        "ALTER TABLE batches ADD COLUMN a_settings TEXT",
+        "ALTER TABLE batches ADD COLUMN b_settings TEXT",
+        "ALTER TABLE batches ADD COLUMN games_at_once INTEGER",
+        "ALTER TABLE batches ADD COLUMN device TEXT",
+        "ALTER TABLE batches ADD COLUMN steps TEXT",
+        (
+            "CREATE TABLE game_searches ("
+            "game_id INTEGER PRIMARY KEY REFERENCES games(id) ON DELETE CASCADE, "
+            "searches BLOB NOT NULL)"
+        ),
+    ),
 }
+# how many of a search's moves are kept, the most visited first
+TOP_MOVES = 4
 
 
 @dataclass(frozen=True)
@@ -153,6 +184,86 @@ class Player:
 
 
 @dataclass(frozen=True)
+class TopMove:
+    """A move of a network's search, for the player making it: `visits`, and `value` in -1 to 1."""
+
+    action: int
+    visits: int
+    value: float
+
+
+@dataclass(frozen=True)
+class NetSearch:
+    """What a network's search made of a position it moved from. Its values are for the player
+    to move, to the nearest thousandth.
+
+    Attributes:
+        value: the search's value of the position
+        net_value: the network's own value of it
+        visits: the root's visits once searched, those of the tree it reused included
+        evals: the network evaluations it took
+        tree: nodes in the tree once searched, where it had room for them
+        top: its most visited moves, at most `TOP_MOVES`, the most visited first (moves with equal
+            visits in no particular order, so the move played needn't be the first)
+    """
+
+    value: float
+    net_value: float
+    visits: int
+    evals: int
+    tree: int
+    top: tuple[TopMove, ...]
+
+
+@dataclass(frozen=True)
+class EngineSearch:
+    """What an engine's search made of a position it moved from, as it reported it.
+
+    Attributes:
+        score: the disc margin it expects at the end, for the player making the move
+        depth: how many moves ahead it searched
+        nodes: the nodes it searched, if it says
+    """
+
+    score: int
+    depth: int
+    nodes: int | None = None
+
+
+Search = NetSearch | EngineSearch
+
+
+@dataclass(frozen=True)
+class BatchSettings:
+    """How a batch was played.
+
+    Attributes:
+        a: player `a`'s settings: everything its search or engine was given
+        b: player `b`'s
+        games_at_once: games moving in step, half the batch's games
+        device: what networks computed on
+        steps: each half's steps: (ply, seconds, games moving). Seconds are wall-clock for all
+            those games together, on a shared machine: they say what a step cost then and there
+    """
+
+    a: dict[str, Any]
+    b: dict[str, Any]
+    games_at_once: int
+    device: str
+    steps: tuple[tuple[tuple[int, float, int], ...], ...] = ()
+
+
+@dataclass(frozen=True)
+class SettingsPeriod:
+    """A player's settings over the batches it played with them, first to last `finished`."""
+
+    settings: dict[str, Any]
+    batches: int
+    first: float
+    last: float
+
+
+@dataclass(frozen=True)
 class GameRecord:
     """A game to record.
 
@@ -164,6 +275,8 @@ class GameRecord:
         moves: every action from the standard start, the opening's first
         first_score: the first player's score at the end, if the game has one (e.g. discs)
         second_score: the second player's
+        searches: what the players' searches made of the moves that had one, by ply (the index
+            in `moves` of the move each chose)
     """
 
     first: int
@@ -173,6 +286,7 @@ class GameRecord:
     moves: Sequence[int]
     first_score: float | None = None
     second_score: float | None = None
+    searches: dict[int, Search] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -208,6 +322,123 @@ def encode_moves(moves: Sequence[int]) -> bytes:
 
 def decode_moves(moves: bytes) -> list[int]:
     return np.frombuffer(moves, dtype=np.uint16).tolist()
+
+
+# a blob's columns, each search's a row: compressed well, since a column's values are alike
+NET_COLUMNS = (
+    ("ply", "<u2", ()),
+    ("value", "<i2", ()),
+    ("net_value", "<i2", ()),
+    ("visits", "<u4", ()),
+    ("evals", "<u4", ()),
+    ("tree", "<u4", ()),
+    ("actions", "<u2", (TOP_MOVES,)),
+    ("top_visits", "<u4", (TOP_MOVES,)),
+    ("top_values", "<i2", (TOP_MOVES,)),
+)
+ENGINE_COLUMNS = (
+    ("ply", "<u2", ()),
+    ("score", "<i2", ()),
+    ("depth", "<u2", ()),
+    ("nodes", "<i8", ()),
+)
+
+
+def _thousandths(value: float) -> int:
+    return round(value * 1000)
+
+
+def encode_searches(searches: dict[int, Search]) -> bytes:
+    """A game's searches, by ply, as a blob."""
+    nets = {p: s for p, s in searches.items() if isinstance(s, NetSearch)}
+    engines = {p: s for p, s in searches.items() if isinstance(s, EngineSearch)}
+    plies = sorted(nets)
+
+    def padded(field_of) -> list[list]:
+        return [
+            [field_of(top) for top in nets[p].top]
+            + [0] * (TOP_MOVES - len(nets[p].top))
+            for p in plies
+        ]
+
+    columns = {
+        "ply": plies,
+        "value": [_thousandths(nets[p].value) for p in plies],
+        "net_value": [_thousandths(nets[p].net_value) for p in plies],
+        "visits": [nets[p].visits for p in plies],
+        "evals": [nets[p].evals for p in plies],
+        "tree": [nets[p].tree for p in plies],
+        "actions": padded(lambda t: t.action),
+        "top_visits": padded(lambda t: t.visits),
+        "top_values": padded(lambda t: _thousandths(t.value)),
+    }
+    parts = [struct.pack("<HH", len(plies), len(engines))]
+    for name, kind, shape in NET_COLUMNS:
+        values = np.asarray(columns[name], dtype=kind).reshape((len(plies), *shape))
+        parts.append(values.tobytes())
+    ordered = sorted(engines)
+    columns = {
+        "ply": ordered,
+        "score": [engines[p].score for p in ordered],
+        "depth": [engines[p].depth for p in ordered],
+        "nodes": [
+            -1 if engines[p].nodes is None else engines[p].nodes for p in ordered
+        ],
+    }
+    parts += [
+        np.asarray(columns[name], dtype=kind).tobytes()
+        for name, kind, _ in ENGINE_COLUMNS
+    ]
+    return zlib.compress(b"".join(parts))
+
+
+def _read_columns(
+    data: bytes, start: int, rows: int, spec: tuple
+) -> tuple[dict[str, np.ndarray], int]:
+    columns = {}
+    for name, kind, shape in spec:
+        count = rows * int(np.prod(shape, dtype=int))
+        column = np.frombuffer(data, dtype=kind, count=count, offset=start)
+        columns[name] = column.reshape((rows, *shape))
+        start += column.nbytes
+    return columns, start
+
+
+def decode_searches(blob: bytes) -> dict[int, Search]:
+    """What `encode_searches` was given, its values to the nearest thousandth, by ply."""
+    data = zlib.decompress(blob)
+    num_nets, num_engines = struct.unpack_from("<HH", data)
+    net, start = _read_columns(data, 4, num_nets, NET_COLUMNS)
+    engine, _ = _read_columns(data, start, num_engines, ENGINE_COLUMNS)
+    searches: dict[int, Search] = {}
+    for i, ply in enumerate(net["ply"].tolist()):
+        searches[ply] = NetSearch(
+            value=int(net["value"][i]) / 1000,
+            net_value=int(net["net_value"][i]) / 1000,
+            visits=int(net["visits"][i]),
+            evals=int(net["evals"][i]),
+            tree=int(net["tree"][i]),
+            top=tuple(
+                TopMove(int(a), int(v), int(q) / 1000)
+                for a, v, q in zip(
+                    net["actions"][i], net["top_visits"][i], net["top_values"][i]
+                )
+                if v > 0
+            ),
+        )
+    for i, ply in enumerate(engine["ply"].tolist()):
+        nodes = int(engine["nodes"][i])
+        searches[ply] = EngineSearch(
+            score=int(engine["score"][i]),
+            depth=int(engine["depth"][i]),
+            nodes=None if nodes < 0 else nodes,
+        )
+    return dict(sorted(searches.items()))
+
+
+def canonical_settings(settings: dict[str, Any]) -> str:
+    """Settings as text, the same text for the same settings."""
+    return json.dumps(settings, sort_keys=True, separators=(",", ":"))
 
 
 def sha256(path: Path) -> str:
@@ -461,31 +692,50 @@ class Store:
         a_clock: tuple[float, int] = (0.0, 0),
         b_clock: tuple[float, int] = (0.0, 0),
         request: int | None = None,
+        settings: BatchSettings | None = None,
     ) -> int:
         """Records a batch of games between players `a` and `b`, all or none of it, and how
         it was played: how long it took, whether that includes compiling, the code that played it, the dtype of its networks and
         how long each player took to choose its moves (seconds, moves). If it's part of a
-        match `request`, that's brought up to date with it."""
+        match `request`, that's brought up to date with it. `settings` are what it was played
+        with, if it was played here."""
         games = list(games)
+        # before taking the file, which others may be waiting for
+        blobs = [encode_searches(g.searches) if g.searches else None for g in games]
         with self.transaction() as db:
             cursor = db.execute(
                 "INSERT INTO batches (a_id, b_id, seconds, compiled, code_version, "
-                "dtype, finished, a_seconds, a_moves, b_seconds, b_moves) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "dtype, finished, a_seconds, a_moves, b_seconds, b_moves, a_settings, "
+                "b_settings, games_at_once, device, steps) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (a, b, seconds, int(compiled), code_version, dtype, time.time())
                 + a_clock
-                + b_clock,
+                + b_clock
+                + (
+                    (None,) * 5
+                    if settings is None
+                    else (
+                        canonical_settings(settings.a),
+                        canonical_settings(settings.b),
+                        settings.games_at_once,
+                        settings.device,
+                        json.dumps(settings.steps, separators=(",", ":")),
+                    )
+                ),
             )
             batch = cursor.lastrowid
-            db.executemany(
-                "INSERT INTO games (batch_id, first_id, second_id, opening, result, "
-                "first_score, second_score, moves) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                [
+            for g, searches in zip(games, blobs):
+                game = db.execute(
+                    "INSERT INTO games (batch_id, first_id, second_id, opening, result, "
+                    "first_score, second_score, moves) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (batch, g.first, g.second, g.opening, g.result, g.first_score)
-                    + (g.second_score, encode_moves(g.moves))
-                    for g in games
-                ],
-            )
+                    + (g.second_score, encode_moves(g.moves)),
+                ).lastrowid
+                if searches is not None:
+                    db.execute(
+                        "INSERT INTO game_searches (game_id, searches) VALUES (?, ?)",
+                        (game, searches),
+                    )
             if request is not None:
                 db.execute(
                     "UPDATE match_requests SET played = played + ? WHERE id = ?",
@@ -498,6 +748,40 @@ class Store:
                 )
         assert batch is not None
         return batch
+
+    def game_searches(self, game: int) -> dict[int, Search]:
+        """What the players' searches made of a game's moves, by ply; nothing for a game from
+        before these were kept."""
+        row = self.db.execute(
+            "SELECT searches FROM game_searches WHERE game_id = ?", (game,)
+        ).fetchone()
+        return {} if row is None else decode_searches(row[0])
+
+    def settings_of(self, player: int) -> dict[str, Any] | None:
+        """The settings `player` played its latest batch with, if any were kept."""
+        row = self.db.execute(
+            "SELECT CASE WHEN a_id = ? THEN a_settings ELSE b_settings END FROM batches "
+            "WHERE (a_id = ? OR b_id = ?) AND a_settings IS NOT NULL "
+            "ORDER BY id DESC LIMIT 1",
+            (player, player, player),
+        ).fetchone()
+        return None if row is None else json.loads(row[0])
+
+    def settings_changes(self) -> dict[int, list[SettingsPeriod]]:
+        """The players who've played under more than one set of settings, by id, each set in
+        the order it first appeared. Batches from before settings were kept aren't counted."""
+        rows = self.db.execute(
+            "SELECT player, settings, COUNT(*), MIN(finished), MAX(finished) FROM ("
+            "SELECT a_id AS player, a_settings AS settings, finished FROM batches "
+            "UNION ALL SELECT b_id, b_settings, finished FROM batches"
+            ") WHERE settings IS NOT NULL GROUP BY player, settings ORDER BY player, 4"
+        )
+        periods: dict[int, list[SettingsPeriod]] = {}
+        for player, settings, batches, first, last in rows:
+            periods.setdefault(player, []).append(
+                SettingsPeriod(json.loads(settings), batches, first, last)
+            )
+        return {p: found for p, found in periods.items() if len(found) > 1}
 
     def request_match(self, a: int, b: int, games: int) -> int:
         """Asks for `games` games between players `a` and `b`, after those already asked for."""

@@ -40,7 +40,7 @@ from core.league.scheduler import (
     requested_games,
     seconds_per_game,
 )
-from core.league.store import MatchRequest, Player, Store
+from core.league.store import BatchSettings, MatchRequest, Player, Store
 
 
 def code_version() -> str:
@@ -56,6 +56,24 @@ def code_version() -> str:
     except (OSError, subprocess.SubprocessError):
         return "unknown"
     return commit + ("-dirty" if dirty else "")
+
+
+def settings_changed(
+    store: Store, a: Player, b: Player, settings: BatchSettings | None
+) -> list[str]:
+    """A line for each player who has just played with settings other than its last batch's. Its
+    games still count as the same player's, as `Store.settings_changes` keeps reporting."""
+    if settings is None:
+        return []
+    lines = []
+    for player, now in ((a, settings.a), (b, settings.b)):
+        before = store.settings_of(player.id)
+        if before is not None and before != now:
+            keys = sorted(
+                k for k in before.keys() | now.keys() if before.get(k) != now.get(k)
+            )
+            lines.append(f"settings changed: {player.name}: {', '.join(keys)}")
+    return lines
 
 
 def current_ratings(store: Store, players: list[Player] | None = None) -> Ratings:
@@ -249,6 +267,8 @@ def play(
                 )
             except Stopped:
                 break
+            for line in settings_changed(store, a, b, result.settings):
+                print(line, flush=True)
             store.record_batch(
                 a.id,
                 b.id,
@@ -260,6 +280,7 @@ def play(
                 (result.a_clock.seconds, result.a_clock.moves),
                 (result.b_clock.seconds, result.b_clock.moves),
                 picked.request,
+                result.settings,
             )
             batches += 1
     finally:

@@ -352,7 +352,8 @@ def test_a_failing_step_ends_the_job_without_retrying(scene):
 
 
 def test_the_time_limit_stops_a_job_across_attempts(scene):
-    scene.job(step("t", "--epochs 4 --hang-at 1"), name="l", hours=0.5 / 3600)
+    # long enough for its first epoch to log, however slowly the machine starts it
+    scene.job(step("t", "--epochs 4 --hang-at 1"), name="l", hours=5 / 3600)
     assert scene.runner("l").run() == "timeout"
     scene.wipe_container()
     scene.sync().run()

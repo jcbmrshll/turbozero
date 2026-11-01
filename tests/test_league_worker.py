@@ -9,7 +9,7 @@ from core.league.game import LeagueGame
 from core.league.gate import SlickGate, ThrottledGate
 from core.league.match import BatchResult, Stopped
 from core.league.match import Clock as MoveClock
-from core.league.store import GameRecord, Store
+from core.league.store import BatchSettings, GameRecord, Store
 from core.league.worker import play, supervise
 
 
@@ -94,6 +94,34 @@ def run_play(store, gate=None, **kwargs):
         playing=fake_playing,
         **kwargs,
     )
+
+
+def test_a_player_whose_settings_change_is_reported_and_plays_on(store, capsys):
+    x, y = store.players()[:2]
+    store.request_match(x.id, y.id, 400)
+
+    def run(c_init):
+        def playing(*args):
+            settings = BatchSettings({"c_init": c_init}, {"level": 8}, 2, "cpu")
+            return BatchResult(*fake_result(*args), settings=settings)
+
+        return play(
+            store,
+            FakeGame(),
+            FakeGate(),
+            version="abc",
+            seed=0,
+            playing=playing,
+            max_batches=1,
+        )
+
+    run(1.25)
+    assert "settings changed" not in capsys.readouterr().out
+    games = store.num_games()
+    assert run(2.0) == "played its batches"
+    assert store.num_games() > games
+    assert capsys.readouterr().out == f"settings changed: {x.name}: c_init\n"
+    assert list(store.settings_changes()) == [x.id]
 
 
 def test_plays_batches_and_records_them_with_their_code_version(store):

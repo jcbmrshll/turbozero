@@ -1,6 +1,7 @@
 // A game's page: its positions on the board, with a trained network's view of each worked out in
-// the browser. Nothing of a game's search was kept, so the tree shown is searched again here, by
-// default by the player to move's network at the sims it played at.
+// the browser. Of a game's searches only a summary was kept (`game.searches`, none for older games),
+// so the tree shown is searched again here, by default by the player to move's network at the sims
+// it played at.
 
 import board from "/game.js";
 import { api, backButton, byId, el, state, svg, tile } from "./dom.js";
@@ -86,6 +87,15 @@ export async function drawGamePage(main, id) {
   const treeBox = el("div", { class: "tree-body", on: { pointerleave: () => setPreview(null) } });
   const thinking = el("div", { class: "thinking" });
   const readouts = el("div", { class: "readouts dim" });
+  const signed = (v, digits) => `${v > 0 ? "+" : v < 0 ? "−" : ""}${Math.abs(v).toFixed(digits)}`;
+  const rootValue = el("span", {});
+  const rootLabel = el("span", {});
+
+  function drawRootValue() {
+    const search = game.searches[at];
+    rootLabel.textContent = search?.score !== undefined ? "score" : "root value";
+    rootValue.textContent = !search ? "–" : search.score !== undefined ? signed(search.score, 0) : signed(search.value, 3);
+  }
 
   const shownPath = () => (preview ?? path);
 
@@ -281,7 +291,7 @@ export async function drawGamePage(main, id) {
     slider.value = at;
     prev.disabled = at === 0; next.disabled = at === game.moves.length;
     analyse();
-    drawBoard(); drawEval(); drawTimeline();
+    drawBoard(); drawEval(); drawTimeline(); drawRootValue();
     drawSimsControl();
   }
 
@@ -336,7 +346,7 @@ export async function drawGamePage(main, id) {
         canAnalyse ? el("div", { class: "eval" }, el("i", { class: "swatch", style: `background:${discs[0]}` }), evalShares[0], el("div", { class: "eval-bar" }, evalFill), evalShares[1], el("i", { class: "swatch", style: `background:${discs[1]}` })) : null,
         canAnalyse ? timelineBox : null),
       el("div", { class: "game-right" },
-        el("div", { class: "tiles" }, tile(resultText(game.result), "result"), game.opening < 0 ? null : tile(String(game.opening), "opening"), tile(game.code_version, "code")),
+        el("div", { class: "tiles" }, tile(resultText(game.result), "result"), game.opening < 0 ? null : tile(String(game.opening), "opening"), tile(game.code_version, "code"), Object.keys(game.searches).length ? tile(rootValue, rootLabel) : null),
         canAnalyse ? panel : null,
         el("div", { class: "card" }, el("div", { class: "moves" }, ...buttons))))));
 
