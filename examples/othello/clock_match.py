@@ -218,6 +218,11 @@ def summarize(games: list[Game], a_black: list[bool], seconds: float) -> dict:
         "stderr": round(float(np.std(final) / math.sqrt(max(len(final), 1))), 4),
         "elo": round(elo(score), 1),
         "board_score": round(float(np.mean(board)), 4),
+        "board_wins": sum(p == 1 for p in board),
+        "board_draws": sum(p == 0.5 for p in board),
+        "board_losses": sum(p == 0 for p in board),
+        # a's discs less b's, game by game
+        "margins": [g.margin if b else -g.margin for g, b in zip(games, a_black)],
         "flags": flags,
     }
     for side in ("a", "b"):
