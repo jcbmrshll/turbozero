@@ -56,6 +56,7 @@ a.run { color: var(--accent); }
 .tag.own { color: var(--accent); border-color: var(--accent); }
 .tag.live { color: var(--win); border-color: var(--win); }
 .w { color: var(--win); } .l { color: var(--loss); } .d { color: var(--draw); }
+[hidden] { display: none !important; }
 .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 14px; }
 select, button, input, textarea { background: var(--panel); color: var(--ink); border: 1px solid var(--line-strong);
   border-radius: 6px; padding: 5px 9px; font: inherit; }
@@ -188,6 +189,7 @@ input.games { width: 72px; padding: 2px 6px; flex: none; text-align: right; }
 .thinking i.shimmer::after { content: ""; position: absolute; inset: 0; background: linear-gradient(90deg, transparent, var(--accent), transparent); animation: shimmer 1.4s linear infinite; }
 @keyframes shimmer { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
 .readouts { font-size: 12px; min-height: 18px; }
+.engine-line { display: flex; gap: 12px; font-size: 14px; }
 
 .tree-body { display: flex; flex-direction: column; gap: 8px; min-width: 0; font: 12.5px ui-monospace, Menlo, monospace; color: var(--ink-2); }
 .tree-body button { font: inherit; border: 1px solid transparent; border-radius: 4px; padding: 0 4px; background: none; color: inherit; }

@@ -1,9 +1,10 @@
 // A game's page: its positions on the board, with a trained network's view of each worked out in
 // the browser. Of a game's searches only a summary was kept (`game.searches`, none for older games),
 // so the tree shown is searched again here, by default by the player to move's network at the sims
-// it played at.
+// it played at. An engine compiled to WebAssembly can look instead, if the store has them.
 
 import board from "/game.js";
+import { BrowserEngine } from "./browser_engine.js";
 import { api, backButton, byId, el, state, svg, tile } from "./dom.js";
 import { drawTree, forFirst, indexTree, nodeAt, positionAt, valueColor } from "./tree.js";
 
@@ -13,6 +14,11 @@ const DEFAULT_SIMS = 128;
 const PONDER_LIMIT = 50000;
 // the most finished searches to keep, for coming back to a position
 const CACHED = 200;
+// how long (ms) a position stays before an engine searches it: stepping past positions shouldn't
+// cost a search each, which takes seconds to end and, for Egaroucid, a second to start again
+const ENGINE_SETTLE = 200;
+// the most an engine's score can be, in discs
+const MAX_SCORE = 64;
 
 let leave = null;
 export function leaveGame() {
@@ -44,9 +50,15 @@ export async function drawGamePage(main, id) {
   const nets = loadableNets();
   const canAnalyse = state.summary.runtime && nets.length > 0 && !!board.observe;
   const worker = canAnalyse ? new Worker(`/web/engine_worker.js?ort=${encodeURIComponent(state.summary.runtime)}`, { type: "module" }) : null;
-  leave = () => { worker?.terminate(); document.removeEventListener("keydown", onKey); };
+  const engines = state.summary.browser_engines && board.engines ? board.engines : null;
+  const browserEngine = engines ? new BrowserEngine(state.summary.browser_engines, onEngineMessage) : null;
+  leave = () => { worker?.terminate(); browserEngine?.close(); clearTimeout(settling); document.removeEventListener("keydown", onKey); };
 
   let at = game.opening_plies;
+  let engine = null; // the engine looking, if any: none until it's picked, as each takes memory
+  const levels = new Map(); // each engine's level set here
+  let engineLook = null; // what it's made of the position: { key, id, running, position, step }
+  let settling = null;
   let mode = "mover"; // or the name of a network's export
   let override = null; // the sims set here, rather than the game's
   let ponder = false;
@@ -102,6 +114,11 @@ export async function drawGamePage(main, id) {
   function drawBoard() {
     const shown = shownPath();
     const ix = current?.ix;
+    if (engine) {
+      board.draw(boardBox, states[at], at ? game.moves[at - 1] : null, { marks: engineMarks(), played: game.moves[at] ?? null });
+      drawCounts(states[at]);
+      return;
+    }
     if (shown && ix) {
       const position = positionAt(board, ix.tree.position, shown);
       board.draw(boardBox, position, shown.length ? shown[shown.length - 1] : (at ? game.moves[at - 1] : null), { marks: preview ? new Map() : marksFor(ix, path ?? []), on: boardEvents() });
@@ -148,7 +165,24 @@ export async function drawGamePage(main, id) {
     return marks;
   }
 
+  const engineStep = () => engineLook?.step ?? null;
+  const levelOf = (name) => levels.get(name) ?? engines[name].level;
+  function engineMarks() {
+    const step = engineStep();
+    const marks = new Map();
+    if (step) marks.set(step.move, { size: 1, color: valueColor(step.score / MAX_SCORE), label: signed(step.score, 0), ink: Math.abs(step.score) > 6 ? "#fff" : undefined });
+    return marks;
+  }
+
   function drawEval() {
+    if (engine) {
+      const step = engineStep();
+      const score = step ? (states[at].turn === 1 ? step.score : -step.score) : null;
+      evalFill.style.width = `${score === null ? 50 : (score + MAX_SCORE) / (2 * MAX_SCORE) * 100}%`;
+      evalShares[0].textContent = score === null ? "" : signed(score, 0);
+      evalShares[1].textContent = score === null ? "" : signed(-score, 0);
+      return;
+    }
     const ix = current?.ix;
     const shown = shownPath() ?? [];
     let value = timeline[at];
@@ -184,6 +218,13 @@ export async function drawGamePage(main, id) {
 
   function drawThinking() {
     thinking.replaceChildren();
+    if (engine) {
+      if (engineLook?.running) {
+        const step = engineStep();
+        thinking.append(el("i", { class: "shimmer" }), el("span", {}, step ? `depth ${step.depth} at ${step.percent}%` : "loading"));
+      }
+      return;
+    }
     if (current?.running) {
       const fill = ponder ? null : current.done / Math.max(1, current.of);
       thinking.append(el("i", { class: fill === null ? "shimmer" : "" }, fill === null ? null : el("b", { style: `width:${fill * 100}%` })),
@@ -191,7 +232,18 @@ export async function drawGamePage(main, id) {
     }
   }
 
+  function drawEngineAnalysis() {
+    drawThinking();
+    const step = engineStep();
+    const parts = [`${engines[engine].label} level ${levelOf(engine)}`];
+    if (step) parts.push(`depth ${step.depth} at ${step.percent}%`, `${step.nodes.toLocaleString()} nodes`, `${(step.ms / 1000).toFixed(1)} s`);
+    if (failure) parts.push(failure);
+    readouts.textContent = parts.join(" · ");
+    treeBox.replaceChildren(...(step ? [el("div", { class: "engine-line" }, el("b", {}, board.moveName(step.move)), el("span", {}, `${signed(step.score, 0)} discs for ${board.sideNames[states[at].turn - 1]}`))] : []));
+  }
+
   function drawAnalysis() {
+    if (engine) { drawEngineAnalysis(); return; }
     const ix = current?.ix;
     const look = canAnalyse ? looker(at) : null;
     drawThinking();
@@ -221,8 +273,43 @@ export async function drawGamePage(main, id) {
     worker?.postMessage({ type: "stop", count: stops });
   }
 
+  function analyseWithEngine() {
+    clearTimeout(settling);
+    browserEngine.stop();
+    failure = null;
+    const position = states[at];
+    const level = levelOf(engine);
+    const key = `${engine}|${level}|${at}`;
+    if (position.terminated) engineLook = null;
+    else if (finished.has(key)) engineLook = finished.get(key);
+    else {
+      const look = engineLook = { key, id: null, running: true, step: null };
+      const name = engine;
+      settling = setTimeout(() => { look.id = browserEngine.search(name, position, level); }, ENGINE_SETTLE);
+    }
+    drawAnalysis();
+  }
+
+  function onEngineMessage(data) {
+    const look = engineLook;
+    if (data.id !== look?.id) return;
+    if (data.type === "error") {
+      failure = data.message;
+      look.running = false;
+    } else {
+      look.step = data;
+      look.running = data.type === "progress";
+      if (data.type === "result") {
+        finished.set(look.key, look);
+        if (finished.size > CACHED) finished.delete(finished.keys().next().value);
+      }
+    }
+    drawBoard(); drawEval(); drawAnalysis();
+  }
+
   function analyse() {
-    if (!worker) return;
+    if (engine) { analyseWithEngine(); return; }
+    if (!worker) { drawAnalysis(); return; }
     stopSearch();
     searchId = 0;
     path = null; preview = null;
@@ -298,7 +385,15 @@ export async function drawGamePage(main, id) {
   const options = [...new Set([...SIMS, ...players.map((p) => p?.sims).filter((s) => s !== null && s !== undefined)])].sort((a, b) => a - b);
   const simsBox = el("span", { class: "sims-control" });
   function drawSimsControl() {
-    if (!canAnalyse) return;
+    if (engine) {
+      const level = levelOf(engine);
+      simsBox.className = "sims-control";
+      simsBox.replaceChildren(
+        el("input", { type: "range", min: 1, max: engines[engine].maxLevel, value: level, on: { change: (e) => { levels.set(engine, Number(e.target.value)); drawSimsControl(); analyse(); drawBoard(); drawEval(); } } }),
+        el("span", {}, `level ${level}`));
+      return;
+    }
+    if (!canAnalyse) { simsBox.replaceChildren(); return; }
     const sims = looker(at).sims;
     const nearest = options.reduce((best, s, i) => (Math.abs(s - sims) < Math.abs(options[best] - sims) ? i : best), 0);
     simsBox.className = ponder ? "sims-control off" : "sims-control";
@@ -308,9 +403,17 @@ export async function drawGamePage(main, id) {
       ...(override !== null && !ponder ? [el("button", { on: { click: () => { override = null; drawSimsControl(); analyse(); drawBoard(); drawEval(); } } }, "Game")] : []));
   }
 
-  const netSelect = canAnalyse ? el("select", { on: { change: (e) => { mode = e.target.value; finished.clear(); drawSimsControl(); analyse(); startTimeline(); drawBoard(); drawEval(); } } },
-    el("option", { value: "mover" }, "Player to move"),
-    ...nets.map((p) => el("option", { value: p.onnx }, p.network))) : null;
+  const netSelect = canAnalyse || engines ? el("select", { on: { change: (e) => {
+    const [, picked] = /^engine:(.*)$/.exec(e.target.value) ?? [];
+    if (engine && !picked) { engineLook = null; browserEngine.close(); clearTimeout(settling); current = null; failure = null; }
+    if (picked) { stopSearch(); current = null; searchId = 0; }
+    engine = picked ?? null;
+    netOnly.forEach((part) => { part.hidden = !canAnalyse || !!engine; });
+    if (canAnalyse && !picked && e.target.value !== mode) { mode = e.target.value; finished.clear(); startTimeline(); }
+    drawSimsControl(); analyse(); drawBoard(); drawEval();
+  } } },
+    ...(canAnalyse ? [el("option", { value: "mover" }, "Player to move"), ...nets.map((p) => el("option", { value: p.onnx }, p.network))] : [el("option", { value: "" }, "None")]),
+    ...Object.entries(engines ?? {}).map(([name, spec]) => el("option", { value: `engine:${name}` }, spec.label))) : null;
   const overlayGroup = el("span", { class: "segment" }, ...["visits", "policy"].map((name) => el("button", {
     class: overlay === name ? "on" : "", "data-name": name,
     on: { click: () => {
@@ -325,11 +428,12 @@ export async function drawGamePage(main, id) {
     panel.classList.toggle("frosted", hidden);
     eye.textContent = hidden ? "Show" : "Hide";
   } } }, "Hide");
+  const ponderBox = el("label", { class: "check" }, el("input", { type: "checkbox", on: { change: (e) => { ponder = e.target.checked; drawSimsControl(); analyse(); drawBoard(); drawEval(); } } }), "Ponder");
+  const netOnly = [ponderBox, overlayGroup];
+  netOnly.forEach((part) => { part.hidden = !canAnalyse; });
   panel.append(
     el("div", { class: "analysis-head" }, el("h2", {}, "Analysis"), thinking, eye),
-    canAnalyse ? el("div", { class: "controls compact" }, netSelect, simsBox,
-      el("label", { class: "check" }, el("input", { type: "checkbox", on: { change: (e) => { ponder = e.target.checked; drawSimsControl(); analyse(); drawBoard(); drawEval(); } } }), "Ponder"),
-      overlayGroup) : null,
+    el("div", { class: "controls compact" }, netSelect, simsBox, ponderBox, overlayGroup),
     treeBox, readouts);
 
   const playerName = (p, name) => (p ? el("a", { class: "name", href: `#player/${p.id}` }, name) : name);
@@ -343,11 +447,11 @@ export async function drawGamePage(main, id) {
           boardBox,
           el("div", { class: "side" }, el("span", { class: "disc", style: `background:${discs[1]}` }), playerName(players[1], game.second), secondCount),
           el("div", { class: "controls scrubber" }, toStart, prev, slider, next, toEnd)),
-        canAnalyse ? el("div", { class: "eval" }, el("i", { class: "swatch", style: `background:${discs[0]}` }), evalShares[0], el("div", { class: "eval-bar" }, evalFill), evalShares[1], el("i", { class: "swatch", style: `background:${discs[1]}` })) : null,
+        canAnalyse || engines ? el("div", { class: "eval" }, el("i", { class: "swatch", style: `background:${discs[0]}` }), evalShares[0], el("div", { class: "eval-bar" }, evalFill), evalShares[1], el("i", { class: "swatch", style: `background:${discs[1]}` })) : null,
         canAnalyse ? timelineBox : null),
       el("div", { class: "game-right" },
         el("div", { class: "tiles" }, tile(resultText(game.result), "result"), game.opening < 0 ? null : tile(String(game.opening), "opening"), tile(game.code_version, "code"), Object.keys(game.searches).length ? tile(rootValue, rootLabel) : null),
-        canAnalyse ? panel : null,
+        canAnalyse || engines ? panel : null,
         el("div", { class: "card" }, el("div", { class: "moves" }, ...buttons))))));
 
   function onKey(e) {

@@ -151,6 +151,51 @@ function draw(container, position, lastMove, { marks = new Map(), played = null,
   });
 }
 
+// what a browser engine is asked about `position`: its player to move's and opponent's discs, a1
+// the lowest bit. An engine's search needs a move to make, so with none it's asked about the position
+// after the pass, `passed`.
+function engineProblem(position) {
+  const passed = legal(position)[0] === PASS;
+  const me = passed ? 3 - position.turn : position.turn;
+  let player = 0n, opponent = 0n;
+  position.squares.forEach((square, i) => {
+    if (square === me) player |= 1n << BigInt(i);
+    else if (square) opponent |= 1n << BigInt(i);
+  });
+  return { player, opponent, passed };
+}
+
+// The engines compiled to WebAssembly (`setup_wasm_engines.sh`): their files, by the path each reads
+// it from, and what each says as it searches. Edax reports each step itself; Egaroucid logs it,
+// "main mid depth 6@100% value 1 (raw 1) policy f6 n_nodes 123 ...". Their levels stop where the
+// slowest search of a dozen midgame positions took about a minute, on one thread here.
+const engines = {
+  edax: {
+    label: "Edax",
+    module: "edax.mjs",
+    files: { "/data/eval.dat": "edax-eval.dat" },
+    level: 20,
+    maxLevel: 28,
+  },
+  egaroucid: {
+    label: "Egaroucid",
+    module: "egaroucid.mjs",
+    files: {
+      "/resources/eval.egev2": "egaroucid-eval.egev2",
+      "/resources/eval_move_ordering_end.egev": "egaroucid-eval_move_ordering_end.egev",
+      "/resources/hash/hash25.eghs": "egaroucid-hash25.eghs",
+    },
+    level: 20,
+    maxLevel: 28,
+    logged(line) {
+      const found = /depth (\d+)@(\d+)%.*? value (-?\d+).*? policy ([a-h][1-8]).*? n_nodes (\d+)/.exec(line);
+      if (!found) return null;
+      const move = found[4].charCodeAt(0) - 97 + (Number(found[4][1]) - 1) * 8;
+      return { depth: Number(found[1]), percent: Number(found[2]), score: Number(found[3]), move, nodes: Number(found[5]) };
+    },
+  },
+};
+
 export default {
   start,
   play,
@@ -159,6 +204,8 @@ export default {
   draw,
   moveName,
   counts,
+  engines,
+  engineProblem,
   numActions: 65,
   inputShape: [2, 8, 8],
   sideNames: ["Black", "White"],

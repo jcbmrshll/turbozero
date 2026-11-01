@@ -573,7 +573,17 @@ A game's page runs trained networks in the browser, on their ONNX exports, throu
 served from the store (`elo_league.py fetch-ort`, once). No game's search was kept, so its tree is
 searched again from each position, by default by the player to move's network at the sims it played
 at, with the same PUCT as core's MCTS. Games kept their tree between moves, and this doesn't, so a
-position's tree isn't the one the game had. Edax and Egaroucid don't run there.
+position's tree isn't the one the game had.
+
+The same page can run Edax and Egaroucid in the browser, compiled to WebAssembly from the commits the
+setup scripts pin (`elo_league.py build-browser-engines`, once; `setup_wasm_engines.sh`), with no book.
+It shows each one's best move and its score in discs for the player to move. They run on one thread:
+threads need cross-origin isolation headers and HTTPS, which the tailnet's plain HTTP address doesn't
+have. A search can't be interrupted, so stopping one ends its worker: Edax is back in about 0.1 s, and
+Egaroucid in about 1 s, as it builds its tables again. Edax takes about 130 MB. Egaroucid takes about
+565 MB, with a hash table of 2^23 entries for native's 2^25; its keys are native's, cut to size.
+`wasm/check_against_native.py` compares them with the native engines on the league's own positions.
+These numbers are for exploring a game: they aren't ratings, and they stay off the Pareto plot.
 
 Every run and every network registered with the league is exported to ONNX, which is cheap (about
 0.3 s and 9 MB for an 8x128 once the process is up). A failed export only says so, and

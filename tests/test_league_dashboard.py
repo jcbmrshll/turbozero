@@ -377,6 +377,77 @@ def test_only_the_files_for_the_page_are_served(url, path):
     assert status_of(url, path)[0] == 404
 
 
+@pytest.fixture
+def engines_game():
+    class WithEngines(FakeGame):
+        browser_engines = "build-1"
+
+    return WithEngines()
+
+
+@pytest.fixture
+def engines_url(store, engines_game):
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0), make_handler(League(store, engines_game))
+    )
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{server.server_address[1]}"
+    server.shutdown()
+    server.server_close()
+
+
+def test_browser_engines_are_offered_only_once_their_build_is_whole(engines_url, store):
+    out = store.root / "wasm-engines" / "build-1"
+    assert get(engines_url, "/api/summary")["browser_engines"] is None
+    out.mkdir(parents=True)
+    (out / "edax.wasm").write_bytes(b"code")
+    assert get(engines_url, "/api/summary")["browser_engines"] is None
+    (out / "complete").touch()
+    assert get(engines_url, "/api/summary")["browser_engines"] == "build-1"
+
+
+@pytest.mark.parametrize(
+    ("name", "kind"),
+    [
+        ("edax.wasm", "application/wasm"),
+        ("edax.mjs", "text/javascript"),
+        ("edax-eval.dat", "application/octet-stream"),
+        ("egaroucid-eval.egev2", "application/octet-stream"),
+        ("egaroucid-eval_move_ordering_end.egev", "application/octet-stream"),
+        ("egaroucid-hash25.eghs", "application/octet-stream"),
+    ],
+)
+def test_a_browser_engines_files_are_served_to_keep(engines_url, store, name, kind):
+    out = store.root / "wasm-engines" / "build-1"
+    out.mkdir(parents=True)
+    (out / name).write_bytes(b"contents")
+    status, headers, body = status_of(engines_url, f"/wasm-engines/build-1/{name}")
+    assert (status, body) == (200, b"contents")
+    assert headers["Content-Type"] == kind
+    assert "immutable" in headers["Cache-Control"]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/wasm-engines/build-1/missing.wasm",
+        "/wasm-engines/build-1/complete",
+        "/wasm-engines/build-1/../../league.db",
+        "/wasm-engines/build-2/edax.wasm",
+    ],
+)
+def test_only_a_browser_engines_files_are_served(engines_url, store, path):
+    out = store.root / "wasm-engines" / "build-1"
+    out.mkdir(parents=True)
+    (out / "complete").touch()
+    assert status_of(engines_url, path)[0] == 404
+
+
+def test_a_game_without_browser_engines_offers_none(url):
+    assert get(url, "/api/summary")["browser_engines"] is None
+    assert status_of(url, "/wasm-engines/build-1/edax.wasm")[0] == 404
+
+
 def test_a_networks_export_and_the_runtime_are_served_once_they_exist(
     url, store, tmp_path
 ):

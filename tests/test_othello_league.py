@@ -458,3 +458,85 @@ console.log("ok");
         check=False,
     )
     assert out.stdout.strip() == "ok", out.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+def test_browser_engines_are_asked_about_the_player_to_move_and_past_a_pass():
+    root = Path(__file__).parent.parent
+    script = f"""
+import board from {json.dumps(str(root / "examples/othello/league_board.js"))};
+const start = board.start();
+const first = board.engineProblem(start);
+// black: e4, d5; white: d4, e5
+if (first.player !== (1n << 28n | 1n << 35n) || first.opponent !== (1n << 27n | 1n << 36n) || first.passed) throw new Error("start");
+const second = board.engineProblem(board.play(start, 19));
+if (second.player !== 1n << 36n || second.passed) throw new Error("white");
+// black to move has nothing: it's asked for white, whose position it then is
+const squares = new Array(64).fill(0);
+squares[0] = 1; squares[63] = 2;
+const stuck = board.engineProblem({{ squares, turn: 1, passed: false, terminated: false, reward: 0 }});
+if (!stuck.passed || stuck.player !== 1n << 63n || stuck.opponent !== 1n) throw new Error("pass");
+// Egaroucid's log says each step of its search, its a1 as ours
+const step = board.engines.egaroucid.logged("main mid depth 6@93% value -4 (raw -5) policy c2 n_nodes 123 time 1 NPS 2");
+if (step.depth !== 6 || step.percent !== 93 || step.score !== -4 || step.move !== 10 || step.nodes !== 123) throw new Error("log");
+if (board.engines.egaroucid.logged("thread pool size 0 n_idle 0") !== null) throw new Error("not a step");
+console.log("ok");
+"""
+    out = subprocess.run(
+        ["node", "--input-type=module", "-e", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert out.stdout.strip() == "ok", out.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+def test_a_browser_engine_keeps_an_idle_worker_and_ends_one_to_stop_a_search():
+    root = Path(__file__).parent.parent
+    script = f"""
+const workers = [];
+globalThis.Worker = class {{
+  constructor(url) {{ this.url = url; this.sent = []; this.ended = false; workers.push(this); }}
+  postMessage(message) {{ this.sent.push(message); }}
+  terminate() {{ this.ended = true; }}
+}};
+const {{ BrowserEngine }} = await import({json.dumps(str(root / "core/league/web/browser_engine.js"))});
+const got = [];
+const runner = new BrowserEngine("build", (data) => got.push(data));
+const first = runner.search("edax", "p1", 8);
+if (!workers[0].url.includes("build=build&engine=edax")) throw new Error("url");
+workers[0].onmessage({{ data: {{ type: "progress", id: first, score: 1 }} }});
+workers[0].onmessage({{ data: {{ type: "result", id: first, score: 2 }} }});
+if (got.length !== 2) throw new Error("messages");
+// idle: the same worker takes the next one
+const second = runner.search("edax", "p2", 8);
+if (workers.length !== 1 || workers[0].sent.length !== 2) throw new Error("reuse");
+// running: it's ended, and nothing more is heard from it
+const third = runner.search("edax", "p3", 8);
+if (workers.length !== 2 || !workers[0].ended || second === third) throw new Error("stop");
+workers[0].onmessage({{ data: {{ type: "result", id: second, score: 3 }} }});
+if (got.length !== 2) throw new Error("heard an old search");
+runner.stop();
+if (!workers[1].ended) throw new Error("stop running");
+// another engine needs its own worker, idle or not
+runner.search("edax", "p4", 8);
+workers[2].onmessage({{ data: {{ type: "result", id: runner.running, score: 4 }} }});
+runner.search("egaroucid", "p5", 8);
+if (!workers[2].ended || !workers[3].url.includes("engine=egaroucid")) throw new Error("switch");
+// a worker that fails says so, and the next search gets a new one
+const fifth = runner.running;
+workers[3].onerror({{ message: "out of memory" }});
+const last = got[got.length - 1];
+if (last.type !== "error" || last.id !== fifth || last.message !== "out of memory") throw new Error("error");
+runner.search("egaroucid", "p6", 8);
+if (workers.length !== 5) throw new Error("after an error");
+console.log("ok");
+"""
+    out = subprocess.run(
+        ["node", "--input-type=module", "-e", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert out.stdout.strip() == "ok", out.stderr

@@ -11,6 +11,7 @@ each played with both colors, and no pair repeats an opening until it's played t
     uv run examples/othello/elo_league.py dashboard
     uv run examples/othello/elo_league.py export-onnx    # networks registered without an export
     uv run examples/othello/elo_league.py fetch-ort      # once, to run networks in the browser
+    uv run examples/othello/elo_league.py build-browser-engines  # once, for Edax and Egaroucid there
 
 The worker runs from a frozen copy of the code, from a slick task whose worktree it queues in
 (SLICK_TASK names the task; a queue entry's end prompts that task's agent):
@@ -26,6 +27,7 @@ The store is in ~/.cache/turbozero/othello/league (see --root).
 
 import os
 import re
+import subprocess
 import sys
 
 # only the player needs the GPU: everything else stays off it, where it would take memory
@@ -197,6 +199,8 @@ class Othello(LeagueGame):
     name = "Othello"
     env = env
     board_js = Path(__file__).with_name("league_board.js")
+    # a new build needs a new name: browsers keep its files for good
+    browser_engines = "edax-8a2b3ea-egaroucid-3b1c6ad-1"
 
     def __init__(self, xot: Path = XOT_PATH):
         self.xot = load_xot(xot)
@@ -208,6 +212,10 @@ class Othello(LeagueGame):
         from export_onnx import save_onnx
 
         save_onnx(checkpoint, net, out)
+
+    def build_browser_engines(self, out: Path) -> None:
+        script = Path(__file__).with_name("setup_wasm_engines.sh")
+        subprocess.run([str(script), str(out)], check=True)
 
     def metadata(self, state: Any):
         return metadata(state)
