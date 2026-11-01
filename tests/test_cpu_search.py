@@ -2,6 +2,7 @@
 
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 import jax
@@ -180,6 +181,64 @@ def test_export_matches_the_network():
         got_logits, got_values = evaluate(channels_first)
         np.testing.assert_allclose(got_logits, np.asarray(logits), atol=1e-5)
         np.testing.assert_allclose(got_values, np.asarray(values)[:, 0], atol=1e-5)
+
+
+def test_an_arm_names_a_quantized_model_and_a_precision():
+    from cpu_match import model_and_precision
+
+    path, precision = model_and_precision("net", "int8-a_b")
+    assert isinstance(path, str) and path.endswith("net-a_b.xml")
+    assert precision == "f32"
+    assert model_and_precision("net", "int8-a_b-bf16")[1] == "bf16"
+
+
+def test_float_heads_stay_unquantized_and_follow_the_network():
+    import equinox as eqx
+    import openvino as ov
+    from cpu_search import openvino_eval
+    from export_onnx import to_onnx
+    from game import make_network
+    from quantize import BEST, quantize_graph
+
+    network, state = make_network(
+        "resnet:2x8,pool_every=2,heads=pooled,pool_channels=4,head_channels=4"
+    )
+    graph = to_onnx(eqx.nn.inference_mode(network), state).SerializeToString()
+    x = (np.random.default_rng(0).random((64, 2, 8, 8)) < 0.3).astype(np.float32)
+    quantized = quantize_graph(graph, BEST, x)
+
+    def fake_quantizes(model) -> int:
+        return sum(op.get_type_name() == "FakeQuantize" for op in model.get_ops())
+
+    trunk_only = fake_quantizes(quantized)
+    assert (
+        0
+        < trunk_only
+        < fake_quantizes(quantize_graph(graph, "performance_leaves_minmax", x))
+    )
+    with tempfile.TemporaryDirectory() as d:
+        ov.save_model(quantized, f"{d}/q.xml", compress_to_fp16=False)
+        logits, values = openvino_eval(f"{d}/q.xml", 1, "f32")(x)
+    reference_logits, reference_values = openvino_eval(graph, 1, "f32")(x)
+    assert logits.shape == reference_logits.shape
+    np.testing.assert_allclose(values, reference_values, atol=0.2)
+
+
+def test_legal_squares_match_the_search():
+    from cpu_search import Search
+    from fidelity import legal_squares
+
+    rng = np.random.default_rng(0)
+    search = Search()
+    batch = np.empty((1, 2, 8, 8), np.float32)
+    while not search.terminated():
+        search.begin(1)
+        search.collect(batch)
+        search.apply(*fake_eval(batch))
+        legal = search.legal()
+        if not legal[64]:
+            assert np.array_equal(legal_squares(batch)[0], legal[:64])
+        search.play(int(rng.choice(np.flatnonzero(legal))))
 
 
 def test_move_budget_shares_the_clock():

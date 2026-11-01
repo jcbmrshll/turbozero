@@ -16,13 +16,16 @@ positions it didn't move from, Edax has an analyst (`EdaxAnalyst`), a process of
 that searching them can't change the moves the one playing makes.
 """
 
+import hashlib
 import os
 import re
 import subprocess
 import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from game import PASS, action, square
@@ -60,6 +63,17 @@ ENGINE_BUILDS = "engines-2026-10"
 CLOCKED_LEVEL = 60
 
 
+@cache
+def _file_sha256(path: Path, size: int, modified: int) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def file_sha256(path: Path) -> str:
+    """A file's hash, worked out once a process unless the file changes."""
+    stat = path.stat()
+    return _file_sha256(path, stat.st_size, stat.st_mtime_ns)
+
+
 class GTPEngine:
     """An engine process. Subclasses say how to start it and how to read its board, and
     its logs."""
@@ -82,9 +96,13 @@ class GTPEngine:
         # what its search made of each move of the position it last moved from, best
         # first; None if it didn't say
         self.analysis: list[Analysis] | None = None
+        # how many nodes the search of its last move took, if it said
+        self.nodes: int | None = None
         # what it wrote before its last reply: when analysing, its stderr (its logs)
         # comes in line with its replies
         self.log: list[str] = []
+        self.engine_dir = engine_dir
+        self.level = level
         self.process = subprocess.Popen(
             [*self.command_line(engine_dir, level), *args],
             cwd=self.working_dir(engine_dir),
@@ -152,6 +170,34 @@ class GTPEngine:
         """What the search that chose `move` made of the position, from its logs."""
         raise NotImplementedError
 
+    def weights(self) -> list[Path]:
+        """The files it evaluates positions with."""
+        raise NotImplementedError
+
+    def book_and_hash(self, arguments: list[str]) -> tuple[bool, int]:
+        """Whether a process started with `arguments` plays from its book, and its hash table's
+        size (bits or level, the engine's own unit)."""
+        raise NotImplementedError
+
+    def settings(self) -> dict[str, Any]:
+        """Everything that decides how it plays: what it was started with, what it is."""
+        # a log's name changes with each process, and has no part in how it plays
+        arguments = [str(a) for a in self.process.args]  # pyright: ignore[reportGeneralTypeIssues]
+        if "-search-log-file" in arguments:
+            at = arguments.index("-search-log-file")
+            del arguments[at : at + 2]
+        book, hash_size = self.book_and_hash(arguments)
+        return {
+            "engine": self.name,
+            "level": self.level,
+            "threads": self.threads,
+            "book": book,
+            "hash": hash_size,
+            "command": arguments[1:],
+            "binary_sha256": file_sha256(Path(arguments[0])),
+            "weights_sha256": {p.name: file_sha256(p) for p in self.weights()},
+        }
+
     def discs(self) -> tuple[int, int]:
         """(black, white) discs on the engine's board."""
         raise NotImplementedError
@@ -166,6 +212,15 @@ EDAX_MOVE = r"[a-hA-H][1-8]|[pP][aA]"
 # Edax searches every move with a full window up to this depth (its MULTIPV_DEPTH); deeper,
 # it stops on a move once it knows it's no better than the best so far
 EDAX_FULL_WINDOW_DEPTH = 10
+EDAX_NODES = re.compile(r"; nodes = (\d+) N;")
+# the size of its hash table unless it's told otherwise (its `options.hash_table_size`)
+EDAX_HASH_BITS = 21
+
+
+def _last_value(arguments: list[str], option: str, default: str) -> str:
+    """The value given to `option`, the last if there's more than one, as engines read them."""
+    found = [i for i, a in enumerate(arguments[:-1]) if a == option]
+    return arguments[found[-1] + 1] if found else default
 
 
 def edax_bound(score: int, after: tuple[int, int] | None, depth: int) -> int:
@@ -224,11 +279,12 @@ class Edax(GTPEngine):
         # to move there. Each step of its search, a move deeper, ends with "id = 1 ; level =
         #  8@100% ; ab = [-64, +64]:", at the depth searched
         assert self.search_log is not None
+        log = self.search_log.read()
         # each move's analysis in the latest step that searched it
         latest: dict[int, Analysis] = {}
         # the moves of the step being read: (line, score, bounds after the first move)
         step = []
-        for text in self.search_log.read().splitlines():
+        for text in log.splitlines():
             if text.startswith("id = "):
                 depth = int(text.split("level =")[1].split("@")[0])
                 for line, score, after in step:
@@ -255,8 +311,19 @@ class Edax(GTPEngine):
         if not latest:
             # a move it played without searching
             return None
+        # each step's total so far: "+00 < score = +00 < +00; time = 0:00.001; nodes = 6632 N; ..."
+        self.nodes = int(nodes[-1]) if (nodes := EDAX_NODES.findall(log)) else None
         # best first: exact scores before bounds of the same score
         return sorted(latest.values(), key=lambda a: (-a.score, a.bound != 0))
+
+    def weights(self) -> list[Path]:
+        return [self.engine_dir / "data" / "eval.dat"]
+
+    def book_and_hash(self, arguments: list[str]) -> tuple[bool, int]:
+        return (
+            _last_value(arguments, "-book-usage", "off") == "on",
+            int(_last_value(arguments, "-h", str(EDAX_HASH_BITS))),
+        )
 
     def discs(self) -> tuple[int, int]:
         counts = {}
@@ -395,7 +462,17 @@ class Egaroucid(GTPEngine):
         ]
         if not found:
             return None
+        nodes = re.search(r"n_nodes (\d+)", found[-1].string)
+        self.nodes = int(nodes[1]) if nodes else None
         return [Analysis([move], int(found[-1][2]), int(found[-1][1]))]
+
+    def weights(self) -> list[Path]:
+        resources = self.engine_dir / "bin" / "resources"
+        return [resources / "eval.egev2", resources / "eval_move_ordering_end.egev"]
+
+    def book_and_hash(self, arguments: list[str]) -> tuple[bool, int]:
+        # its `DEFAULT_HASH_LEVEL`
+        return "-nobook" not in arguments, int(_last_value(arguments, "-hash", "25"))
 
     def discs(self) -> tuple[int, int]:
         # its final_score counts for the side to move, not black; count the board

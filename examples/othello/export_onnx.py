@@ -9,8 +9,15 @@ value, (batch, 1). BatchNorm is folded into the convolutions, as in the network'
 """
 
 import argparse
+import os
+from pathlib import Path
+
+# a CPU script: JAX would otherwise take the GPU's memory, and the league would give way
+if __name__ == "__main__":
+    os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import equinox as eqx
+import jax
 import numpy as np
 import onnx
 from game import load_checkpoint
@@ -185,13 +192,24 @@ def export_checkpoint(path: str, net: str) -> onnx.ModelProto:
     return to_onnx(eqx.nn.inference_mode(eqx.combine(params, static)), state)
 
 
+def save_onnx(path: str, net: str, out: Path) -> None:
+    """Writes the ONNX graph of the checkpoint at `path` to `out`, whole or not at all, on the
+    CPU, so that it can't get in the way of anything on the GPU."""
+    with jax.default_device(jax.devices("cpu")[0]):
+        model = export_checkpoint(path, net)
+    partial = out.with_name(f"{out.name}.partial")
+    onnx.save(model, partial)
+    os.chmod(partial, 0o444)
+    partial.rename(out)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("checkpoint")
     parser.add_argument("--net", required=True, help="the checkpoint's train.py --net")
     parser.add_argument("out", help="the .onnx file to write")
     args = parser.parse_args()
-    onnx.save(export_checkpoint(args.checkpoint, args.net), args.out)
+    save_onnx(args.checkpoint, args.net, Path(args.out))
 
 
 if __name__ == "__main__":

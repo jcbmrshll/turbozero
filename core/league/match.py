@@ -8,25 +8,57 @@ nothing between calls, so this shares compile time and no information.
 The batch's games move in step, and only the side to move searches, so that a batch's cost is
 one search per position. Half the games are played with each moving first, opening by opening
 (each opening played with both colours), one half after the other.
+
+What a side's search made of each move is read from its finished tree by a program of its own
+(`summarise_searches`), rather than added to the search's outputs: the search is the same program
+whatever is recorded, so the moves can't depend on it.
 """
 
 import time
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
-from functools import cache
+from functools import cache, partial
+from pathlib import Path
 from typing import Any
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
+from core.evaluators.mcts.state import MCTSTree
 from core.league.game import ExternalPlayer, LeagueGame
-from core.league.store import GameRecord, Player
+from core.league.store import (
+    TOP_MOVES,
+    BatchSettings,
+    GameRecord,
+    NetSearch,
+    Player,
+    Search,
+    TopMove,
+    changed_settings,
+)
 
 
 class Stopped(Exception):
     """Someone else needs the GPU, or the league's being stopped: the batch is abandoned."""
+
+
+class SettingsRefused(Exception):
+    """A player would have played with other settings than its own: no longer the same player,
+    so the batch is abandoned before its first move.
+
+    Attributes:
+        player: who
+        settings: what it would have played with
+        changed: which of them differ
+    """
+
+    def __init__(self, player: Player, settings: dict[str, Any], changed: list[str]):
+        super().__init__(f"{player.name}: {', '.join(changed)}")
+        self.player = player
+        self.settings = settings
+        self.changed = changed
 
 
 def select(which, on_true, on_false):
@@ -46,6 +78,8 @@ class Program:
     init: Callable
     search: Callable
     advance: Callable
+    # everything the evaluator was given, as `Evaluator.get_config` says
+    config: dict[str, Any]
 
 
 class Programs:
@@ -110,18 +144,60 @@ class Programs:
                 )
             ),
             advance=jax.jit(jax.vmap(evaluator.step)),
+            config=evaluator.get_config(),
         )
+
+    def settings(self, player: Player, games: int) -> dict[str, Any]:
+        """Everything `player` plays with here, but for what it's playing on."""
+        assert player.path is not None
+        return {
+            **self.program(player, games).config,
+            "dtype": self.dtype,
+            "net": player.net,
+            "checkpoint_sha256": Path(player.path).stem,
+        }
+
+
+def _summarise_search(before: MCTSTree, tree: MCTSTree) -> dict[str, jax.Array]:
+    """What a `NetSearch` keeps of a finished tree, and of the one it started from. Values are as
+    they're stored at their nodes: a child's is for the player to move there."""
+    children = tree.edge_map[tree.ROOT_INDEX]
+    visits = jnp.where(children != tree.NULL_INDEX, tree.data.n[children], 0)
+    top_visits, actions = jax.lax.top_k(visits, TOP_MOVES)
+    return {
+        "value": tree.data.q[tree.ROOT_INDEX],
+        "net_value": tree.root_value,
+        "visits": tree.data.n[tree.ROOT_INDEX],
+        "reused": before.data.n[before.ROOT_INDEX],
+        "tree": tree.next_free_idx,
+        "actions": actions,
+        "top_visits": top_visits,
+        "top_q": tree.data.q[children[actions]],
+    }
+
+
+# one program for all of a tree's shape, reading a few numbers a game however big the trees: what
+# it doesn't read of them stays on the device
+summarise_searches = jax.jit(jax.vmap(_summarise_search))
 
 
 class NetworkSide:
     """A network's side of a batch's games: its parameters, and its own tree of each game,
     kept between its moves."""
 
-    def __init__(self, program: Program, params: Any, key: jax.Array):
+    def __init__(
+        self,
+        program: Program,
+        params: Any,
+        key: jax.Array,
+        settings: dict[str, Any] | None = None,
+    ):
         self.program = program
         self.params = params
         self.key = key
+        self.played_settings = settings or {}
         self.trees: Any = None
+        self.summary: dict[str, np.ndarray] = {}
 
     def start(self, states: Any, first: np.ndarray) -> None:
         self.trees = self.program.init(states)
@@ -130,8 +206,35 @@ class NetworkSide:
     def move(self, states: Any, movers: np.ndarray) -> np.ndarray:
         keys = jax.vmap(jax.random.fold_in)(self.keys, states._step_count)
         out = self.program.search(keys, self.trees, states, self.params)
+        summary = summarise_searches(self.trees, out.eval_state)
         self.trees = select(movers, out.eval_state, self.trees)
+        self.summary = jax.device_get(summary)
         return np.asarray(out.action)
+
+    def searches(self, movers: np.ndarray) -> dict[int, Search]:
+        """What the search of the last `move` made of the games marked `movers`, by game."""
+        s, discount = self.summary, self.program.config["discount"]
+        return {
+            g: NetSearch(
+                value=float(s["value"][g]),
+                net_value=float(s["net_value"][g]),
+                visits=int(s["visits"][g]),
+                # a root with visits to reuse is still evaluated, without counting as a visit
+                evals=int(s["visits"][g] - s["reused"][g] + (s["reused"][g] > 0)),
+                tree=int(s["tree"][g]),
+                top=tuple(
+                    TopMove(int(a), int(v), discount * float(q))
+                    for a, v, q in zip(
+                        s["actions"][g], s["top_visits"][g], s["top_q"][g]
+                    )
+                    if v > 0
+                ),
+            )
+            for g in np.flatnonzero(movers).tolist()
+        }
+
+    def settings(self) -> dict[str, Any]:
+        return self.played_settings
 
     def observe(self, actions: np.ndarray, movers: np.ndarray) -> None:
         trees = self.program.advance(self.trees, jnp.asarray(actions))
@@ -177,7 +280,16 @@ def play_games(
     openings: np.ndarray,
     key: jax.Array,
     should_stop: Callable[[], bool] = lambda: False,
-) -> tuple[np.ndarray, list[list[int]], np.ndarray | None, Clock, Clock]:
+    started: Callable[[], None] = lambda: None,
+) -> tuple[
+    np.ndarray,
+    list[list[int]],
+    np.ndarray | None,
+    Clock,
+    Clock,
+    list[dict[int, Search]],
+    list[tuple[int, float, int]],
+]:
     """Plays a game per row of `openings` between two sides, the moves known to both.
 
     Args:
@@ -187,11 +299,13 @@ def play_games(
         openings: (games, plies) the moves played for them first
         key: the environment's rng
         should_stop: checked before each move; once it's true the games are abandoned
+        started: called once the sides have started, before the first move
 
     Returns:
         the first player's result in each game (+1, 0, -1); each game's moves, from the
         start; the game's scores of them (see `LeagueGame.scores`), if it has any; how long
-        the first and the second took to choose their moves
+        the first and the second took to choose their moves; what each game's searches made of
+        its moves, by ply; each step of the games: (ply, seconds, games moving)
 
     Raises:
         Stopped: if `should_stop` said so
@@ -202,8 +316,11 @@ def play_games(
     states = _env_init(env)(jax.random.split(key, num_games))
     first_id = np.asarray(states.current_player)
     moves: list[list[int]] = [[] for _ in range(num_games)]
+    searches: list[dict[int, Search]] = [{} for _ in range(num_games)]
+    steps: list[tuple[int, float, int]] = []
     first.start(states, first_id)
     second.start(states, first_id)
+    started()
     clocks = {id(first): Clock(), id(second): Clock()}
 
     def played(actions: np.ndarray, movers: np.ndarray, told: tuple[Side, ...]) -> None:
@@ -240,7 +357,13 @@ def play_games(
                 own = (side,) if isinstance(side, NetworkSide) else ()
                 start = time.perf_counter()
                 actions = side.move(states, movers)
-                clocks[id(side)].add(time.perf_counter() - start, int(movers.sum()))
+                seconds = time.perf_counter() - start
+                clocks[id(side)].add(seconds, int(movers.sum()))
+                # every game's at the same ply: passes count, and the openings are one length
+                ply = len(moves[int(np.argmax(movers))])
+                steps.append((ply, round(seconds, 4), int(movers.sum())))
+                for g, search in side.searches(movers).items():
+                    searches[g][len(moves[g])] = search
                 played(actions, movers, (*own, other))
     results = np.sign(np.asarray(states.rewards)[np.arange(num_games), first_id])
     results = results.astype(int)
@@ -252,19 +375,31 @@ def play_games(
         game.scores(states, first_id),
         clocks[id(first)],
         clocks[id(second)],
+        searches,
+        steps,
     )
+
+
+def check_settings(sides: tuple[tuple[Player, Side], ...]) -> None:
+    """Raises `SettingsRefused` if a player, once started, has other settings than its own."""
+    for player, side in sides:
+        settings = side.settings()
+        changed = changed_settings(player.played_settings or settings, settings)
+        if changed:
+            raise SettingsRefused(player, settings, changed)
 
 
 @dataclass(frozen=True)
 class BatchResult:
-    """A batch played: its games, how long it took and whether that includes compiling, and
-    how long each player took to choose its moves."""
+    """A batch played: its games, how long it took and whether that includes compiling, how
+    long each player took to choose its moves, and what it was played with."""
 
     games: list[GameRecord]
     seconds: float
     compiled: bool
     a_clock: Clock
     b_clock: Clock
+    settings: BatchSettings | None = None
 
 
 def play_batch(
@@ -282,6 +417,7 @@ def play_batch(
     Raises:
         Stopped: if `should_stop` said so: none of the batch's games are kept, since those
             finished by then would be the shorter ones
+        SettingsRefused: if either would play with other settings than its own
     """
     start = time.perf_counter()
     programs.compiled = False
@@ -290,30 +426,42 @@ def play_batch(
     def side(player: Player, key: jax.Array) -> Side:
         if player.is_external:
             return game.external_player(player)
-        program = programs.program(player, len(openings))
-        return NetworkSide(program, programs.network(player)[1], key)
+        return NetworkSide(
+            programs.program(player, len(openings)),
+            programs.network(player)[1],
+            key,
+            programs.settings(player, len(openings)),
+        )
 
     games: list[GameRecord] = []
     clock_of = {a.id: Clock(), b.id: Clock()}
+    settings_of: dict[int, dict[str, Any]] = {}
+    steps_of_halves = []
     for half, (one, other) in enumerate(((a, b), (b, a))):
         env_key, first_key, second_key = jax.random.split(
             jax.random.fold_in(jax.random.PRNGKey(seed), half), 3
         )
         first, second = side(one, first_key), side(other, second_key)
         try:
-            results, moves, scores, first_clock, second_clock = play_games(
-                game,
-                first,
-                second,
-                moves_of,
-                env_key,
-                should_stop,
+            results, moves, scores, first_clock, second_clock, searches, steps = (
+                play_games(
+                    game,
+                    first,
+                    second,
+                    moves_of,
+                    env_key,
+                    should_stop,
+                    partial(check_settings, ((one, first), (other, second))),
+                )
             )
+            settings_of[one.id] = first.settings()
+            settings_of[other.id] = second.settings()
         finally:
             first.close()
             second.close()
         clock_of[one.id].add(first_clock.seconds, first_clock.moves)
         clock_of[other.id].add(second_clock.seconds, second_clock.moves)
+        steps_of_halves.append(tuple(steps))
         games += [
             GameRecord(
                 first=one.id,
@@ -323,6 +471,7 @@ def play_batch(
                 moves=moves[g],
                 first_score=None if scores is None else float(scores[g, 0]),
                 second_score=None if scores is None else float(scores[g, 1]),
+                searches=searches[g],
             )
             for g in range(len(openings))
         ]
@@ -332,4 +481,11 @@ def play_batch(
         programs.compiled,
         clock_of[a.id],
         clock_of[b.id],
+        BatchSettings(
+            settings_of[a.id],
+            settings_of[b.id],
+            len(openings),
+            jax.devices()[0].device_kind,
+            tuple(steps_of_halves),
+        ),
     )

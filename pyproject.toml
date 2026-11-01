@@ -46,6 +46,7 @@ dev = [
     "dm-haiku>=0.0.17",
     "google-cloud-storage>=3.17.1",
     "modal>=1.6.3",
+    "nncf>=3.4.0",
     "onnx>=1.23.2",
     "onnxruntime>=1.31.1",
     "openvino>=2026.4.1",

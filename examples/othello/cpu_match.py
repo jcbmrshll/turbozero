@@ -18,6 +18,10 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+# a CPU script: JAX would otherwise take the GPU's memory, and the league would give way
+if __name__ == "__main__":
+    os.environ.setdefault("JAX_PLATFORMS", "cpu")
+
 import numpy as np
 from bench_cpu_backends import network_path
 from cpu_search import (
@@ -30,6 +34,7 @@ from cpu_search import (
     ort_session,
 )
 from export_onnx import export_checkpoint
+from quantize import quantized_path
 from xot import XOT_PATH, load_xot
 
 # the most leaves one call of the network evaluates
@@ -227,14 +232,27 @@ def summarize(results: np.ndarray) -> dict[str, float]:
     }
 
 
-def make_eval(name: str, backend: str, cores: int) -> Eval:
-    """The network `name` on `backend`: "ort", ONNX Runtime; "bf16" or "f32", OpenVINO's, a stream
-    to a core, or e.g. "bf16-1", on that many streams."""
+def model_and_precision(name: str, arm: str) -> tuple[bytes | str, str]:
+    """The model of the network `name` for an OpenVINO `arm`: "bf16" or "f32", or a quantized one,
+    "int8-<variant>" (see `quantize.py`), computing what isn't quantized in f32, or
+    "int8-<variant>-bf16"."""
+    if arm.startswith("int8-"):
+        _, variant, *rest = arm.split("-")
+        path = quantized_path(name, variant)
+        return str(path), rest[0] if rest else "f32"
     path, net = network_path(name)
-    model = export_checkpoint(path, net).SerializeToString()
+    return export_checkpoint(path, net).SerializeToString(), arm
+
+
+def make_eval(name: str, backend: str, cores: int) -> Eval:
+    """The network `name` on `backend`: "ort", ONNX Runtime; else an arm of `model_and_precision`,
+    a stream to a core, or e.g. "bf16-s1", on that many streams."""
     if backend == "ort":
+        path, net = network_path(name)
+        model = export_checkpoint(path, net).SerializeToString()
         return ort_eval(ort_session(model, cores))
-    precision, _, streams = backend.partition("-")
+    arm, _, streams = backend.partition("-s")
+    model, precision = model_and_precision(name, arm)
     return openvino_eval(model, cores, precision, int(streams) if streams else None)
 
 

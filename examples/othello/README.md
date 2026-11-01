@@ -17,6 +17,7 @@ Othello model and against two strong open-source Othello engines,
 | `cpu_match.py` | Games between two such players at fixed visits a move, and their speed in evals a second |
 | `export_onnx.py` | Exports a checkpoint's network to ONNX |
 | `bench_cpu_backends.py` | Evals a second by CPU backend and batch, each checked against JAX's outputs |
+| `quantize.py`, `fidelity.py`, `bench_quantized.py` | Quantizes a network to int8 for playing on CPU, and measures its outputs and speed against bf16 |
 | `engine_set.py`, `label_positions.py`, `score_engine_set.py` | The engine-labelled set: fixed positions with every legal move scored by Edax, to build, and to score checkpoints on (train.py scores the network on it every epoch) |
 | `distill.py` | Trains a network on a saved training state's replay buffer, with no self-play, on a teacher network's values or the games' outcomes |
 | `bench_nets.py` | Times networks on their own: a forward pass at self-play's batch, a training step at training's |
@@ -583,6 +584,32 @@ bf16 networks, on 2026-11-01:
 A line through 128, 1000 and 4000 sims predicted seconds a move at 16000 to within 9.1%. An engine's
 slowest move at L20 and up took 33-97 times its mean.
 
+### Int8
+
+Quantized after training, a network plays stronger on a clock than in bf16, where its leaves come in
+batches. Build the model, calibrated on the leaves of its own searches, and play it as a `backend`:
+
+```
+uv run examples/othello/fidelity.py leaves --net 8x128-128s-8p-w1125-274m --out LEAVES
+uv run examples/othello/quantize.py --net 8x128-128s-8p-w1125-274m --positions LEAVES/calibration.npy
+taskset -c 16-23 uv run examples/othello/clock_match.py --seconds 4 --openings 100 --b edax:threads=8 \
+    --a net:net=8x128-128s-8p-w1125-274m,batch=16,virtual_loss=visit,taper=24,backend=int8-performance_leaves_heads_minmax
+```
+
+Int8 against bf16, on the same eight cores with nothing else running, batch 16 with the search; games
+from XOT openings, 1000 visits a move, or 4 s a side:
+
+| Network | Evals a second | Elo, equal visits | Elo, equal clock |
+|---|---|---|---|
+| 4x64 | 52827 vs 41778, 1.26x | | |
+| 6x96 | 28019 vs 20302, 1.38x | -3 ± 19 (200 games) | +63 ± 19 (200) |
+| 8x128 | 17298 vs 10429, 1.66x | -9 ± 12 (400) | +83 ± 21 (200) |
+| 10x128 | 14146 vs 8876, 1.59x | | |
+
+At a batch of 1 it's no faster (0.94-0.99x). The gain is OpenVINO's int8 kernels on AVX512_VNNI: on
+ONNX Runtime int8 only matched bf16, and a CPU without VNNI will differ. The 4x64 net's outputs follow
+bf16's least closely, and it hasn't played.
+
 ## Credits
 
 `xot-openings.txt` is Matthias Berg's large XOT list
@@ -596,3 +623,42 @@ aren't part of turbozero.
 `elo_league.py` keeps a rating for every network it's given, at each search budget, and for
 Edax and Egaroucid, from full games played whenever the GPU is free (see `core/league/`). Every
 game is stored; ratings are fit to all of them, with an uncertainty for each player.
+
+The dashboard (`elo_league.py dashboard`) lists the players, with filters read from their names and
+settings, beside the queue of series and a plot of runtime against rating. A player's page holds
+its description and tags. A network's budgets share theirs.
+
+A game's page runs trained networks in the browser, on their ONNX exports, through onnxruntime-web
+served from the store (`elo_league.py fetch-ort`, once). No game's search was kept, so its tree is
+searched again from each position, by default by the player to move's network at the sims it played
+at, with the same PUCT as core's MCTS. Games kept their tree between moves, and this doesn't, so a
+position's tree isn't the one the game had.
+
+The same page can run Edax and Egaroucid in the browser, compiled to WebAssembly from the commits the
+setup scripts pin (`elo_league.py build-browser-engines`, once; `setup_wasm_engines.sh`), with no book.
+It shows each one's best move and its score in discs for the player to move. They run on one thread:
+threads need cross-origin isolation headers and HTTPS, which the tailnet's plain HTTP address doesn't
+have. A search can't be interrupted, so stopping one ends its worker: Edax is back in about 0.1 s, and
+Egaroucid in about 1 s, as it builds its tables again. Edax takes about 130 MB. Egaroucid takes about
+565 MB, with a hash table of 2^23 entries for native's 2^25; its keys are native's, cut to size.
+`wasm/check_against_native.py` compares them with the native engines on the league's own positions.
+These numbers are for exploring a game: they aren't ratings, and they stay off the Pareto plot.
+
+Every run and every network registered with the league is exported to ONNX, which is cheap (about
+0.3 s and 9 MB for an 8x128 once the process is up). A failed export only says so, and
+`elo_league.py export-onnx` tries the store's missing ones again.
+
+The plot reads `timings.json` beside the store, which a benchmark writes atomically:
+
+```json
+{"runs": [{"name": "...", "hardware": {"cpu": "...", "cores": 8, "threads": 8}, "software": {},
+  "configs": [
+    {"net": "resnet:8x128,...", "sims": 1000, "batch": 16, "batch_strength": "measured_no_loss",
+     "source": "measured", "plot": true, "games": 24, "seconds_per_game": 2.1},
+    {"engine": "edax", "level": 20,
+     "source": "measured", "plot": true, "games": 24, "seconds_per_game": 1.4}]}]}
+```
+
+A run is one host, and the plot shows one at a time. `seconds_per_game` is one side's mean. Only
+configs that are `measured` and marked `plot` appear, joined to players by architecture and sims or
+engine and level. A `batch_strength` of `unmeasured` draws a point hollow and off the frontier.
