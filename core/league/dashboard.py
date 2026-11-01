@@ -27,7 +27,7 @@ import numpy as np
 
 from core.league.game import LeagueGame, check_match, check_match_games
 from core.league.ratings import Ratings, expected_score, fit_ratings
-from core.league.runtime import has_runtime, runtime_dir
+from core.league.runtime import VERSION, has_runtime, runtime_dir
 from core.league.store import Player, Store, decode_moves
 
 PAGE = Path(__file__).with_name("dashboard.html")
@@ -41,6 +41,10 @@ KINDS = {
 }
 # how long the supervisor can go without a word before it counts as not running
 SUPERVISOR_SILENCE = 300.0
+
+
+class NoSuchPlayer(Exception):
+    pass
 
 
 def _config_of(player: Player) -> tuple[str | int | None, ...]:
@@ -198,7 +202,7 @@ class League:
                 "worker": self._worker(),
                 "playing": self._playing(),
                 "requests": self._queue(players),
-                "runtime": has_runtime(store.root),
+                "runtime": VERSION if has_runtime(store.root) else None,
                 "time": time.time(),
             }
 
@@ -217,15 +221,15 @@ class League:
         for request in self.store.pending_matches():
             sides = by_id[request.a], by_id[request.b]
             status = ""
-            if not all(self.game.can_play(p) for p in sides):
+            if request.id == playing:
+                status = "playing"
+            elif not all(self.game.can_play(p) for p in sides):
                 status = "can't play"
             elif any(p.retired for p in sides):
                 status = "paused"
             elif waiting:
                 status = "next"
                 waiting = False
-            if request.id == playing:
-                status = "playing"
             queue.append({**asdict(request), "status": status})
         return queue
 
@@ -390,15 +394,24 @@ def make_handler(league: League) -> type[BaseHTTPRequestHandler]:
 
         def _post(self, path: str, body: dict[str, Any]) -> Any:
             """Does what's asked: its answer, or None if there's no such thing to ask."""
+            if not isinstance(body, dict):
+                raise TypeError("needs a JSON object")
             if path == "/api/paused":
-                player, paused = int(body["player"]), bool(body["paused"])
+                player, paused = int(body["player"]), body["paused"]
+                if not isinstance(paused, bool):
+                    raise TypeError("paused is true or false")
                 if not league.set_paused(player, paused):
-                    raise LookupError("no such player can play")
+                    raise NoSuchPlayer("no such player can play")
                 return {"player": player, "paused": paused}
             if path == "/api/notes":
-                league.set_notes(
-                    int(body["player"]), body.get("description"), body.get("tags")
-                )
+                description, tags = body.get("description"), body.get("tags")
+                if not isinstance(description, str | None):
+                    raise TypeError("a description is text")
+                if tags is not None and not (
+                    isinstance(tags, list) and all(isinstance(t, str) for t in tags)
+                ):
+                    raise TypeError("tags are a list of text")
+                league.set_notes(int(body["player"]), description, tags)
                 return {}
             if path == "/api/match/add":
                 request = league.add_match(
@@ -425,10 +438,12 @@ def make_handler(league: League) -> type[BaseHTTPRequestHandler]:
                 answer = self._post(
                     urlparse(self.path).path, json.loads(self.rfile.read(length))
                 )
-            except LookupError as e:
+            except NoSuchPlayer as e:
                 self._json({"error": str(e)}, 404)
-            except (TypeError, ValueError) as e:
-                self._json({"error": str(e)}, 400)
+            except (KeyError, TypeError, ValueError) as e:
+                self._json(
+                    {"error": repr(e) if isinstance(e, KeyError) else str(e)}, 400
+                )
             else:
                 if answer is None:
                     self._json({"error": "not found"}, 404)
@@ -448,7 +463,9 @@ def make_handler(league: League) -> type[BaseHTTPRequestHandler]:
                     self._send(PAGE.read_bytes(), "text/html; charset=utf-8")
                 elif match := re.fullmatch(r"/web/(\w+\.(?:js|css))", url.path):
                     self._file(WEB / match[1], cached=False)
-                elif match := re.fullmatch(r"/ort/([\w.-]+\.(?:mjs|wasm))", url.path):
+                elif match := re.fullmatch(
+                    rf"/ort/{re.escape(VERSION)}/([\w.-]+\.(?:mjs|wasm))", url.path
+                ):
                     self._file(runtime_dir(league.store.root) / match[1], cached=True)
                 elif match := re.fullmatch(r"/onnx/([0-9a-f]{64}\.onnx)", url.path):
                     self._file(league.store.root / "networks" / match[1], cached=True)

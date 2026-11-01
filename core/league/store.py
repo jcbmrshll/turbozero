@@ -19,6 +19,7 @@ so they take no longer for having more games, and whatever is running can carry 
 
 import hashlib
 import json
+import os
 import shutil
 import sqlite3
 import time
@@ -236,10 +237,16 @@ class Store:
         self._migrate()
 
     def _migrate(self) -> None:
-        """Brings the file to `SCHEMA_VERSION`, backing it up first if it holds anything."""
+        """Brings the file to `SCHEMA_VERSION`, backing it up first if it holds anything.
+
+        Raises:
+            ValueError: if the file is newer than this code
+        """
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
         if version == SCHEMA_VERSION:
             return
+        if version > SCHEMA_VERSION:
+            raise ValueError(f"the store is at schema {version}, newer than this code")
         filled = self.db.execute(
             "SELECT 1 FROM sqlite_master WHERE name = 'players'"
         ).fetchone()
@@ -247,7 +254,7 @@ class Store:
             self.db.executescript(SCHEMA)
             self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             return
-        self._backup(self.root / f"league-backup-before-schema-{version + 1}.db")
+        self._backup(version)
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
             # another process may have got here while this one waited
@@ -257,16 +264,21 @@ class Store:
                     self.db.execute(statement)
             self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
-    def _backup(self, path: Path) -> None:
-        """A copy of the file as it is now, whole or not at all, with other processes using it."""
-        partial = path.with_suffix(".partial")
-        partial.unlink(missing_ok=True)
+    def _backup(self, version: int) -> None:
+        """Copies the file as it is at `version`, whole or not at all, with other processes using
+        it. If one of them has migrated it meanwhile, it made the backup, and this doesn't."""
+        path = self.root / f"league-backup-before-schema-{version + 1}.db"
+        partial = path.with_name(f"{path.name}.{os.getpid()}.partial")
         copy = sqlite3.connect(partial)
         try:
             self.db.backup(copy)
+            current = copy.execute("PRAGMA user_version").fetchone()[0] == version
         finally:
             copy.close()
-        partial.rename(path)
+        if current:
+            partial.rename(path)
+        else:
+            partial.unlink()
 
     def close(self) -> None:
         self.db.close()

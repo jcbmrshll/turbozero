@@ -75,7 +75,7 @@ function drawRow(request, i, all) {
     el("td", { class: "num dim" }, `${request.played} /`),
     el("td", { class: "num" }, el("input", {
       type: "number", class: "games", min: 2, step: 2, value: request.games,
-      on: { change: (e) => act("/api/match/games", { id: request.id, games: Number(e.target.value) }) },
+      on: { change: (e) => { e.target.blur(); act("/api/match/games", { id: request.id, games: Number(e.target.value) }); } },
     })),
     el("td", { class: "actions" },
       el("button", { ...(i === 0 ? { disabled: "" } : {}), on: { click: () => act("/api/match/move", { id: request.id, index: i - 1 }) } }, "↑"),

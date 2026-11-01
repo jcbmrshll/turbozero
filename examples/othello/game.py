@@ -20,7 +20,7 @@ from core.evaluators.mcts.mcts import MCTS
 from core.memory.replay_memory import BaseExperience
 from core.networks.spec import make_network as build_network
 from core.networks.spec import network_config
-from core.training.train import weight_decay_mask
+from core.training.train import checkpoint_epochs, checkpoint_path, weight_decay_mask
 from core.types import StepMetadata
 
 # vectorized environments pair well with batched AlphaZero; pgx has many more:
@@ -193,10 +193,10 @@ def export_last(ckpt_dir: str, net: str) -> None:
     """Exports a finished run's last checkpoint to ONNX beside it. A failure only says so: the
     run's results are safe by now, and the checkpoint can be exported later (`export_onnx.py`)."""
     try:
-        last = max(Path(ckpt_dir).glob("*.eqx"), key=lambda p: int(p.stem))
         from export_onnx import save_onnx
 
-        save_onnx(str(last), net, last.with_suffix(".onnx"))
+        last = checkpoint_path(ckpt_dir, max(checkpoint_epochs(ckpt_dir)))
+        save_onnx(last, net, Path(last).with_suffix(".onnx"))
     except Exception as e:  # noqa: BLE001
         print(f"no ONNX export: {e!r}", file=sys.stderr)
 

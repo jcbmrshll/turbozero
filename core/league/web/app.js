@@ -41,14 +41,14 @@ async function route() {
 }
 
 async function refresh() {
-  const games = state.summary?.games;
+  const before = state.summary && JSON.stringify([state.summary.games, state.summary.players]);
   state.summary = await api("/api/summary");
   document.getElementById("title").textContent = `${state.summary.game} Elo league`;
   drawWorker();
   if (page()[0] === "main") {
     drawQueue();
     // reading the leaderboard isn't disturbed unless there's news
-    if (games !== state.summary.games) {
+    if (before !== JSON.stringify([state.summary.games, state.summary.players])) {
       drawLeaderboard();
       await drawPareto();
     }

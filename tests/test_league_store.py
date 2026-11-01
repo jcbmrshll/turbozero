@@ -316,6 +316,29 @@ def test_opening_a_migrated_file_again_changes_nothing(old_file):
     assert not backup.exists()
 
 
+def test_a_file_newer_than_the_code_isnt_touched(old_file):
+    Store(old_file).close()
+    db = sqlite3.connect(old_file / "league.db")
+    db.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
+    db.close()
+    with pytest.raises(ValueError):
+        Store(old_file)
+    db = sqlite3.connect(old_file / "league.db")
+    assert db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION + 1
+    db.close()
+
+
+def test_a_backup_of_a_file_migrated_meanwhile_isnt_kept(old_file):
+    store = Store(old_file)
+    backup = old_file / "league-backup-before-schema-1.db"
+    made = backup.read_bytes()
+    # a process that read version 0 before this one migrated it
+    store._backup(0)
+    assert backup.read_bytes() == made
+    assert not list(old_file.glob("*.partial"))
+    store.close()
+
+
 def test_a_new_file_needs_no_backup(tmp_path):
     store = Store(tmp_path / "new")
     assert store.db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION

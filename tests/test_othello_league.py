@@ -275,6 +275,7 @@ def test_an_engines_facts_come_from_its_settings():
 
 def test_a_failed_export_at_the_end_of_a_run_only_says_so(tmp_path, capsys):
     (tmp_path / "7.eqx").write_bytes(b"not a network")
+    (tmp_path / "best.eqx").write_bytes(b"not a checkpoint of the run")
     export_last(str(tmp_path), "resnet:2x8,heads=pooled,pool_channels=2")
     assert "no ONNX export" in capsys.readouterr().err
     assert (tmp_path / "7.eqx").read_bytes() == b"not a network"

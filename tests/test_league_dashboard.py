@@ -15,7 +15,7 @@ import pytest
 from core.league.dashboard import League, make_handler, pareto
 from core.league.game import LeagueGame
 from core.league.ratings import fit_ratings
-from core.league.runtime import FILES, runtime_dir
+from core.league.runtime import FILES, VERSION, runtime_dir
 from core.league.store import GameRecord, Store
 
 
@@ -234,6 +234,23 @@ def test_writing_needs_a_json_body(url):
     assert not get(url, "/api/summary")["players"][0]["retired"]
 
 
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        ("/api/match/add", {"a": 1, "b": 2}),
+        ("/api/paused", {"player": 1, "paused": "0"}),
+        ("/api/notes", {"player": 1, "tags": "abc"}),
+        ("/api/notes", {"player": 1, "tags": [1]}),
+        ("/api/notes", {"player": 1, "description": 3}),
+        ("/api/notes", [1]),
+    ],
+)
+def test_a_malformed_request_is_refused_and_changes_nothing(url, path, body):
+    before = get(url, "/api/summary")["players"]
+    assert refused(url, path, body) == 400
+    assert get(url, "/api/summary")["players"] == before
+
+
 def test_notes_are_edited_and_shown(url):
     post(url, "/api/notes", {"player": 1, "description": "deep", "tags": ["t"]})
     x = get(url, "/api/summary")["players"][0]
@@ -290,7 +307,7 @@ def test_the_queue_says_whats_happening_to_each_series(url, store):
     )  # fmt: skip
     assert statuses() == {playing: "next", next_up: "playing", waiting: ""}
     store.move_match(next_up, 0)
-    assert statuses() == {next_up: "playing", playing: "", waiting: ""}
+    assert statuses() == {next_up: "playing", playing: "next", waiting: ""}
     store.set_retired("x")
     assert statuses() == {next_up: "playing", playing: "paused", waiting: "paused"}
 
@@ -329,7 +346,8 @@ def test_the_pages_scripts_are_served(url):
         "/onnx/nothex.onnx",
         "/onnx/" + "a" * 64 + ".onnx",
         "/ort/../../league.db",
-        "/ort/missing.wasm",
+        f"/ort/{VERSION}/missing.wasm",
+        "/ort/0.0.0/ort.wasm.min.mjs",
     ],
 )
 def test_only_the_files_for_the_page_are_served(url, path):
@@ -344,7 +362,7 @@ def test_a_networks_export_and_the_runtime_are_served_once_they_exist(
     store.add_network("net", checkpoint, "resnet:4x64", "run")
     store.add_net_player("net", 128)
     summary = get(url, "/api/summary")
-    assert not summary["runtime"] and summary["players"][-1]["onnx"] is None
+    assert summary["runtime"] is None and summary["players"][-1]["onnx"] is None
     player = store.players()[-1]
     exported = store.onnx_path(player)
     exported.write_bytes(b"graph")
@@ -357,9 +375,9 @@ def test_a_networks_export_and_the_runtime_are_served_once_they_exist(
     out.mkdir(parents=True)
     for file in FILES:
         (out / file).write_bytes(b"x")
-    assert get(url, "/api/summary")["runtime"]
+    assert get(url, "/api/summary")["runtime"] == VERSION
     assert (
-        status_of(url, "/ort/ort-wasm-simd-threaded.wasm")[1]["Content-Type"]
+        status_of(url, f"/ort/{VERSION}/ort-wasm-simd-threaded.wasm")[1]["Content-Type"]
         == "application/wasm"
     )
 

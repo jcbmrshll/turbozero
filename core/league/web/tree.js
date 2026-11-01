@@ -3,6 +3,9 @@
 
 import { el } from "./dom.js";
 
+// Rows are replaced as a search goes on, so they act on the press: a click needs its row to last
+// until the button comes up.
+
 // a tree from the worker, indexed: each node's children, best first
 export function indexTree(tree) {
   const children = Array.from({ length: tree.n.length }, () => []);
@@ -61,7 +64,7 @@ export function drawTree(box, { board, ix, path, preview, played, go, setPreview
   const position = positionAt(board, tree.position, at);
   const depth = at.length;
 
-  const crumb = (label, on, to) => el("button", { class: on ? "crumb on" : "crumb", on: { click: () => go(to) } }, label);
+  const crumb = (label, on, to) => el("button", { class: on ? "crumb on" : "crumb", on: { pointerdown: () => go(to) } }, label);
   const crumbs = el("div", { class: "tree-crumbs" }, crumb("game", !path, null), el("span", { class: "sep" }, "·"), crumb("root", path?.length === 0, []),
     ...at.flatMap((a, i) => [el("span", { class: "sep" }, "›"), crumb(board.moveName(a), i === at.length - 1, at.slice(0, i + 1))]));
   // a position the search never reached: only the way back
@@ -75,7 +78,7 @@ export function drawTree(box, { board, ix, path, preview, played, go, setPreview
     const to = (i) => [...at, ...line.slice(0, i + 1).map((m) => tree.action[m])];
     const isPlayed = !path && tree.action[c] === played;
     return el("div", { class: isPlayed ? "tree-line played" : "tree-line", on: { pointerleave: () => setPreview(null) } },
-      el("div", { class: "stats", on: { pointerenter: () => setPreview(to(0)), click: () => go(to(0)) } },
+      el("div", { class: "stats", on: { pointerenter: () => setPreview(to(0)), pointerdown: () => go(to(0)) } },
         el("i", { class: "bar", style: `width:${pct(share)}` }),
         el("b", { class: "mv" }, board.moveName(tree.action[c])),
         el("span", { class: "num" }, `${tree.n[c]} `, el("span", { class: "dim" }, `(${pct(share)})`)),
@@ -83,7 +86,7 @@ export function drawTree(box, { board, ix, path, preview, played, go, setPreview
         el("span", { class: "num dim" }, tree.prior[c].toFixed(2))),
       el("div", { class: "pv" }, ...line.map((m, i) => el("button", {
         class: `tok${i === 0 ? " first" : ""}${key(preview) === key(to(i)) ? " hot" : ""}`,
-        on: { pointerenter: () => setPreview(to(i)), click: () => go(to(i)) },
+        on: { pointerenter: () => setPreview(to(i)), pointerdown: () => go(to(i)) },
       }, board.moveName(tree.action[m]))),
       tree.terminal[line[line.length - 1]] === 1 ? el("span", { class: "end" }, "end") : null));
   });

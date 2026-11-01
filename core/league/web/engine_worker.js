@@ -2,11 +2,10 @@
 // the tailnet's address is, browsers allow neither threads nor WebGPU, so it's one wasm thread.
 
 import board from "/game.js";
-import * as ort from "/ort/ort.wasm.min.mjs";
 import { Search, snapshot } from "./search.js";
 
-ort.env.wasm.wasmPaths = { wasm: "/ort/ort-wasm-simd-threaded.wasm", mjs: "/ort/ort-wasm-simd-threaded.mjs" };
-ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 1) : 1;
+const ORT = `/ort/${new URL(self.location.href).searchParams.get("ort")}`;
+let ort = null;
 
 // the networks loaded, the latest last: few, as each holds its weights
 const MAX_SESSIONS = 3;
@@ -15,20 +14,32 @@ const sessions = new Map();
 const TREE_EVERY = 250;
 // bumped by a stop, which takes effect at once on the search running then
 let stopped = 0;
-// requests run one at a time, in the order they came
-let queue = Promise.resolve();
+// requests run one at a time, in the order they came, once the runtime has loaded. It isn't awaited
+// at the top of this module, as messages sent meanwhile would come before there's anyone to hear.
+let queue = import(`${ORT}/ort.wasm.min.mjs`).then((module) => {
+  ort = module;
+  ort.env.wasm.wasmPaths = { wasm: `${ORT}/ort-wasm-simd-threaded.wasm`, mjs: `${ORT}/ort-wasm-simd-threaded.mjs` };
+  ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 1) : 1;
+});
 
 async function session(net) {
-  if (!sessions.has(net)) {
-    sessions.set(net, ort.InferenceSession.create(`/onnx/${net}`, { executionProviders: ["wasm"] }));
-    if (sessions.size > MAX_SESSIONS) {
-      const [oldest] = sessions.keys();
-      const old = await sessions.get(oldest);
-      sessions.delete(oldest);
-      await old.release();
-    }
+  const loaded = sessions.get(net);
+  if (loaded) {
+    sessions.delete(net);
+    sessions.set(net, loaded);
+    return loaded;
   }
-  return sessions.get(net);
+  const loading = ort.InferenceSession.create(`/onnx/${net}`, { executionProviders: ["wasm"] });
+  sessions.set(net, loading);
+  // one that failed can be tried again
+  loading.catch(() => sessions.delete(net));
+  if (sessions.size > MAX_SESSIONS) {
+    const [oldest] = sessions.keys();
+    const old = sessions.get(oldest);
+    sessions.delete(oldest);
+    old.then((model) => model.release()).catch(() => {});
+  }
+  return loading;
 }
 
 async function evaluateMany(model, positions) {
@@ -97,4 +108,3 @@ self.onmessage = (event) => {
     self.postMessage({ type: "error", id: request.id, message: e instanceof Error ? e.message : String(e) });
   });
 };
-self.postMessage({ type: "ready" });

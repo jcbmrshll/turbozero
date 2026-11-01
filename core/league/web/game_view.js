@@ -42,7 +42,7 @@ export async function drawGamePage(main, id) {
 
   const nets = loadableNets();
   const canAnalyse = state.summary.runtime && nets.length > 0 && !!board.observe;
-  const worker = canAnalyse ? new Worker("/web/engine_worker.js", { type: "module" }) : null;
+  const worker = canAnalyse ? new Worker(`/web/engine_worker.js?ort=${encodeURIComponent(state.summary.runtime)}`, { type: "module" }) : null;
   leave = () => { worker?.terminate(); document.removeEventListener("keydown", onKey); };
 
   let at = game.opening_plies;
@@ -82,7 +82,8 @@ export async function drawGamePage(main, id) {
   const evalShares = [el("span", { class: "share" }), el("span", { class: "share" })];
   const evalFill = el("div", {});
   const timelineBox = el("div", { class: "timeline" });
-  const treeBox = el("div", { class: "tree-body" });
+  // rows are replaced as a search goes on, so one that's left may never say so
+  const treeBox = el("div", { class: "tree-body", on: { pointerleave: () => setPreview(null) } });
   const thinking = el("div", { class: "thinking" });
   const readouts = el("div", { class: "readouts dim" });
 
@@ -171,15 +172,19 @@ export async function drawGamePage(main, id) {
     timelineBox.replaceChildren(root);
   }
 
-  function drawAnalysis() {
-    const ix = current?.ix;
-    const look = canAnalyse ? looker(at) : null;
+  function drawThinking() {
     thinking.replaceChildren();
     if (current?.running) {
       const fill = ponder ? null : current.done / Math.max(1, current.of);
       thinking.append(el("i", { class: fill === null ? "shimmer" : "" }, fill === null ? null : el("b", { style: `width:${fill * 100}%` })),
         el("span", {}, `${current.done.toLocaleString()} sims`));
     }
+  }
+
+  function drawAnalysis() {
+    const ix = current?.ix;
+    const look = canAnalyse ? looker(at) : null;
+    drawThinking();
     const parts = [];
     if (look) parts.push(look.name);
     if (current?.value !== undefined && current?.value !== null) parts.push(`net ${current.value >= 0 ? "+" : "−"}${Math.abs(current.value).toFixed(3)}`);
@@ -264,7 +269,8 @@ export async function drawGamePage(main, id) {
           finished.set(current.key, current);
           if (finished.size > CACHED) finished.delete(finished.keys().next().value);
         }
-        drawBoard(); drawEval(); drawAnalysis();
+        // the tree comes a few times a second, and the count far more often
+        if (data.tree) { drawBoard(); drawEval(); drawAnalysis(); } else drawThinking();
       }
     };
   }
