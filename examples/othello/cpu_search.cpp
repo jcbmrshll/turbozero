@@ -1,6 +1,7 @@
 // A single game's MCTS on CPU: the tree and Othello's rules, with leaves collected a batch at a time
 // for the caller to evaluate (see cpu_search.py). AlphaZero's PUCT and rules as core/evaluators/mcts
-// and pgx's Othello have them, with virtual loss steering a batch's traversals apart.
+// and pgx's Othello have them, with virtual loss steering a batch's traversals apart. A search can show
+// the network each leaf in a random one of the board's 8 symmetries.
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -65,6 +66,57 @@ inline uint64_t flips(uint64_t pos, uint64_t me, uint64_t opp) {
            flips_along<9>(pos, me, opp) | flips_along<-9>(pos, me, opp);
 }
 
+// The board's 8 symmetries, numbered by what they do in order: 1, swap rows and columns; 2, reverse the
+// rows; 4, reverse the columns. 0 is the identity.
+inline uint64_t transpose(uint64_t x) {
+    uint64_t t = (x ^ (x << 28)) & 0x0f0f0f0f00000000ULL;
+    x ^= t ^ (t >> 28);
+    t = (x ^ (x << 14)) & 0x3333000033330000ULL;
+    x ^= t ^ (t >> 14);
+    t = (x ^ (x << 7)) & 0x5500550055005500ULL;
+    x ^= t ^ (t >> 7);
+    return x;
+}
+
+inline uint64_t reverse_columns(uint64_t x) {
+    x = ((x >> 1) & 0x5555555555555555ULL) | ((x & 0x5555555555555555ULL) << 1);
+    x = ((x >> 2) & 0x3333333333333333ULL) | ((x & 0x3333333333333333ULL) << 2);
+    return ((x >> 4) & 0x0f0f0f0f0f0f0f0fULL) | ((x & 0x0f0f0f0f0f0f0f0fULL) << 4);
+}
+
+inline uint64_t symmetric_bits(uint64_t x, int symmetry) {
+    if (symmetry & 1) x = transpose(x);
+    if (symmetry & 2) x = __builtin_bswap64(x);
+    if (symmetry & 4) x = reverse_columns(x);
+    return x;
+}
+
+// where each action's square goes under each symmetry; a pass stays a pass
+struct SymmetricActions {
+    uint8_t to[8][PASS + 1];
+};
+
+constexpr SymmetricActions make_symmetric_actions() {
+    SymmetricActions actions{};
+    for (int symmetry = 0; symmetry < 8; symmetry++) {
+        for (int action = 0; action < PASS; action++) {
+            int row = action / 8, column = action % 8;
+            if (symmetry & 1) {
+                int swapped = row;
+                row = column;
+                column = swapped;
+            }
+            if (symmetry & 2) row = 7 - row;
+            if (symmetry & 4) column = 7 - column;
+            actions.to[symmetry][action] = (uint8_t)(row * 8 + column);
+        }
+        actions.to[symmetry][PASS] = PASS;
+    }
+    return actions;
+}
+
+constexpr SymmetricActions SYMMETRIC_ACTIONS = make_symmetric_actions();
+
 struct Position {
     uint64_t me, opp;
     bool passed;
@@ -123,6 +175,8 @@ struct Search {
     float weight;
     float c_init;
     int max_collisions;
+    bool random_symmetry;
+    uint64_t rng;  // splitmix64's state
     int32_t root;
     int remaining;
     std::vector<Node> nodes;
@@ -132,6 +186,7 @@ struct Search {
     std::vector<PathStep> paths;
     std::vector<int32_t> leaf_ends;       // where each leaf's path ends in `paths`
     std::vector<int32_t> collision_ends;  // and each collision's, after the leaves'
+    std::vector<uint8_t> leaf_symmetries;  // the symmetry each leaf was shown in
     int collisions_total;
     int visits_total;
 };
@@ -197,23 +252,33 @@ void fly(Search& s, int delta) {
     }
 }
 
-void write_observation(const Position& p, float* out) {
+void write_observation(uint64_t me, uint64_t opp, float* out) {
     for (int i = 0; i < 64; i++) {
-        out[i] = (float)((p.me >> i) & 1);
-        out[64 + i] = (float)((p.opp >> i) & 1);
+        out[i] = (float)((me >> i) & 1);
+        out[64 + i] = (float)((opp >> i) & 1);
     }
+}
+
+// a random one of the 8, the top bits of splitmix64
+inline int draw_symmetry(Search& s) {
+    uint64_t z = (s.rng += 0x9e3779b97f4a7c15ULL);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return (int)((z ^ (z >> 31)) >> 61);
 }
 
 }  // namespace
 
 extern "C" {
 
-Search* search_new(int mode, float weight, float c_init, int max_collisions) {
+Search* search_new(int mode, float weight, float c_init, int max_collisions, int random_symmetry, uint64_t seed) {
     Search* s = new Search();
     s->mode = mode;
     s->weight = weight;
     s->c_init = c_init;
     s->max_collisions = max_collisions;
+    s->random_symmetry = random_symmetry != 0;
+    s->rng = seed;
     s->root = -1;
     s->remaining = 0;
     s->collisions_total = 0;
@@ -239,7 +304,8 @@ void search_begin(Search* s, int visits) { s->remaining = visits; }
 int search_remaining(const Search* s) { return s->remaining; }
 
 // Up to `batch` traversals, as many as are left, each ending in a leaf to evaluate (whose observation
-// is written to `out`, (batch, 2, 8, 8), and which `search_apply` takes the evaluation of), or a game's
+// is written to `out`, (batch, 2, 8, 8), in the symmetry drawn for it if the search draws them, and which
+// `search_apply` takes the evaluation of, in that same symmetry), or a game's
 // end, which counts as a visit without one. A traversal ending in a leaf already in flight is a
 // collision: it visits nothing, but counts against the edges it took until `search_apply`. After
 // `max_collisions` of them the batch stops short. Returns the leaves.
@@ -247,6 +313,7 @@ int search_collect(Search* s, int batch, float* out) {
     s->paths.clear();
     s->leaf_ends.clear();
     s->collision_ends.clear();
+    s->leaf_symmetries.clear();
     std::vector<PathStep> collisions;
     int leaves = 0, visits = 0, collided = 0;
     int want = std::min(batch, s->remaining);
@@ -283,7 +350,11 @@ int search_collect(Search* s, int batch, float* out) {
             fly(*s, 1);
             s->paths.insert(s->paths.end(), s->path.begin(), s->path.end());
             s->leaf_ends.push_back((int32_t)s->paths.size());
-            write_observation(s->nodes[index].position, out + (size_t)leaves * 128);
+            int symmetry = s->random_symmetry ? draw_symmetry(*s) : 0;
+            s->leaf_symmetries.push_back((uint8_t)symmetry);
+            const Position& p = s->nodes[index].position;
+            write_observation(symmetric_bits(p.me, symmetry), symmetric_bits(p.opp, symmetry),
+                              out + (size_t)leaves * 128);
             leaves++;
             visits++;
         } else {
@@ -310,17 +381,18 @@ void search_apply(Search* s, const float* logits, const float* values) {
         int32_t index = s->paths[end - 1].node;
         const Position p = s->nodes[index].position;
         const float* l = logits + (size_t)i * 65;
+        const uint8_t* shown_at = SYMMETRIC_ACTIONS.to[s->leaf_symmetries[i]];
         uint64_t legal = legal_moves(p.me, p.opp);
         int first = (int)s->edges.size();
         float top = -1e30f;
         if (legal) {
-            for (uint64_t m = legal; m; m &= m - 1) top = std::max(top, l[__builtin_ctzll(m)]);
+            for (uint64_t m = legal; m; m &= m - 1) top = std::max(top, l[shown_at[__builtin_ctzll(m)]]);
         } else {
             top = l[PASS];
         }
         float total = 0;
         auto add = [&](int action) {
-            float prior = std::exp(l[action] - top);
+            float prior = std::exp(l[shown_at[action]] - top);
             total += prior;
             s->edges.push_back(Edge{prior, 0, 0, 0, -1, action});
         };
@@ -428,4 +500,8 @@ void search_legal(const Search* s, int32_t* out) {
     if (!legal) out[PASS] = 1;
     for (uint64_t m = legal; m; m &= m - 1) out[__builtin_ctzll(m)] = 1;
 }
+
+uint64_t search_symmetric_bits(uint64_t x, int symmetry) { return symmetric_bits(x, symmetry); }
+
+int search_symmetric_action(int action, int symmetry) { return SYMMETRIC_ACTIONS.to[symmetry][action]; }
 }

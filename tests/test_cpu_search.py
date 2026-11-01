@@ -157,6 +157,252 @@ def test_a_short_batch_still_finishes():
     assert search.collisions() > 0
 
 
+def symmetry_tables() -> dict[int, np.ndarray]:
+    """For each of the search's symmetries, (65) where each action goes, worked out by hand from
+    what it does: 1 swaps rows and columns, 2 reverses the rows, 4 the columns."""
+    tables = {}
+    for symmetry in range(8):
+        table = np.arange(65)
+        for action in range(64):
+            row, column = action // 8, action % 8
+            if symmetry & 1:
+                row, column = column, row
+            if symmetry & 2:
+                row = 7 - row
+            if symmetry & 4:
+                column = 7 - column
+            table[action] = row * 8 + column
+        tables[symmetry] = table
+    return tables
+
+
+def test_each_symmetry_maps_squares_and_undoes_with_its_inverse():
+    from cpu_search import LIB, PASS
+
+    tables = symmetry_tables()
+    rng = np.random.default_rng(0)
+    boards = [int(x) for x in rng.integers(0, 2**63, 50, dtype=np.uint64)]
+    for symmetry, table in tables.items():
+        for action in range(65):
+            assert LIB.search_symmetric_action(action, symmetry) == table[action]
+        assert LIB.search_symmetric_action(PASS, symmetry) == PASS
+        # discs go where their squares do
+        for action in range(64):
+            assert LIB.search_symmetric_bits(1 << action, symmetry) == (
+                1 << int(table[action])
+            )
+        # some symmetry undoes it, on whole boards too
+        inverses = [
+            other
+            for other, back in tables.items()
+            if np.array_equal(back[table], np.arange(65))
+        ]
+        assert len(inverses) == 1
+        for board in boards:
+            shown = LIB.search_symmetric_bits(board, symmetry)
+            assert LIB.search_symmetric_bits(shown, inverses[0]) == board
+
+
+def test_the_symmetries_are_those_training_uses():
+    from game import make_symmetry_transform_fn
+
+    from core.memory.replay_memory import BaseExperience
+
+    actions = jnp.arange(65)
+    experience = BaseExperience(
+        reward=jnp.zeros(2),
+        policy_weights=actions,
+        policy_mask=actions,
+        observation_nn=jnp.zeros((8, 8, 2)),
+        cur_player_id=jnp.zeros(1),
+        search_value=jnp.zeros(1),
+    )
+    training = set()
+    for transpose in (False, True):
+        for quarter_turns in range(4):
+            transform = make_symmetry_transform_fn(quarter_turns, transpose)
+            training.add(np.asarray(transform(experience).policy_weights).tobytes())
+    assert training == {
+        table.astype(np.asarray(actions).dtype).tobytes()
+        for table in symmetry_tables().values()
+    }
+
+
+def board_planes(me: int, opp: int) -> np.ndarray:
+    bits = 1 << np.arange(64, dtype=np.uint64)
+    planes = [(int(x) & bits) > 0 for x in (me, opp)]
+    return np.stack(planes).reshape(2, 8, 8).astype(np.float32)
+
+
+def shown_symmetry(view: np.ndarray, me: int, opp: int) -> int:
+    """Which symmetry an observation is of a position with no symmetry of its own."""
+    from cpu_search import LIB
+
+    found = [
+        symmetry
+        for symmetry in range(8)
+        if np.array_equal(
+            view,
+            board_planes(
+                LIB.search_symmetric_bits(me, symmetry),
+                LIB.search_symmetric_bits(opp, symmetry),
+            ),
+        )
+    ]
+    assert len(found) == 1
+    return found[0]
+
+
+# a position with no symmetry of its own and several legal moves
+UNSYMMETRIC = [19, 18, 26, 34]
+
+
+def unsymmetric_search(seed: int, batch: int = 1):
+    from cpu_search import Search, SearchSettings
+
+    search = Search(SearchSettings(batch=batch, random_symmetry=True), seed)
+    for action in UNSYMMETRIC:
+        search.play(action)
+    return search
+
+
+def test_the_policy_reaches_the_edges_of_the_real_squares():
+    tables = symmetry_tables()
+    probe = unsymmetric_search(0)
+    me, opp, _, _ = probe.position()
+    targets = np.flatnonzero(probe.legal())
+    assert len(targets) > 1
+    seen = set()
+
+    def favouring(target: int):
+        def favour_target(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            # a network that sees through the symmetry: a high logit where the target is shown
+            symmetry = shown_symmetry(x[0], me, opp)
+            seen.add(symmetry)
+            logits = np.zeros((1, 65), np.float32)
+            logits[0, tables[symmetry][target]] = 10
+            return logits, np.zeros(1, np.float32)
+
+        return favour_target
+
+    for seed, target in enumerate(np.tile(targets, 16)):
+        search = unsymmetric_search(seed)
+        # the root's evaluation, then one traversal, down the edge of highest prior
+        search.run(1, favouring(int(target)))
+        search.run(1, fake_eval)
+        visits = search.visits()
+        assert visits[target] == 1 and visits.sum() == 1
+    assert seen == set(range(8))
+
+
+def test_a_position_with_only_a_pass_searches_under_any_symmetry():
+    from cpu_search import PASS, Search, SearchSettings
+
+    # a random game up to a position with only a pass to play
+    rng = np.random.default_rng(1)
+    moves: list[int] = []
+    for _ in range(200):
+        replay = Search()
+        moves = []
+        while not replay.terminated() and not replay.legal()[PASS]:
+            action = int(rng.choice(np.flatnonzero(replay.legal())))
+            moves.append(action)
+            replay.play(action)
+        if not replay.terminated():
+            break
+    for seed in range(16):
+        search = Search(SearchSettings(random_symmetry=True), seed)
+        for action in moves:
+            search.play(action)
+        assert search.legal()[PASS]
+        search.run(2, fake_eval)
+        assert search.visits()[PASS] == 1
+
+
+def equivariant_eval(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """A network no symmetry changes: logits depend on each square's distance from the board's
+    centre and the discs around it, the value on the lead in discs."""
+    me, opp = x[:, 0], x[:, 1]
+    padded = np.pad(me - 0.7 * opp, ((0, 0), (1, 1), (1, 1)))
+    around = sum(
+        padded[:, 1 + dr : (9 + dr), 1 + dc : (9 + dc)]
+        for dr in (-1, 0, 1)
+        for dc in (-1, 0, 1)
+    )
+    centre = np.abs(np.arange(8) - 3.5)
+    distance = centre[None, :] ** 2 + centre[:, None] ** 2
+    logits = 0.7 * around + 0.13 * distance[None] * (1 + me.sum((1, 2), keepdims=True))
+    logits = np.concatenate([logits.reshape(len(x), 64), np.zeros((len(x), 1))], 1)
+    values = np.tanh((me.sum((1, 2)) - opp.sum((1, 2))) * 0.1 + 0.02)
+    return logits.astype(np.float32), values.astype(np.float32)
+
+
+@pytest.mark.parametrize("batch", [1, 8])
+def test_a_network_no_symmetry_changes_searches_the_same_tree(batch):
+    from cpu_search import Search, SearchSettings
+
+    plain = Search(SearchSettings(batch=batch))
+    shown = Search(SearchSettings(batch=batch, random_symmetry=True), seed=3)
+    for search in (plain, shown):
+        for action in UNSYMMETRIC:
+            search.play(action)
+        search.run(400, equivariant_eval)
+    assert np.array_equal(plain.visits(), shown.visits())
+    assert plain.root_q() == pytest.approx(shown.root_q(), abs=1e-5)
+
+
+def test_a_seed_replays_a_search_and_another_changes_it():
+    def visits(seed: int) -> np.ndarray:
+        search = unsymmetric_search(seed, batch=4)
+        search.run(300, fake_eval)
+        return search.visits()
+
+    assert np.array_equal(visits(5), visits(5))
+    assert any(not np.array_equal(visits(5), visits(seed)) for seed in (6, 7, 8))
+
+
+def test_symmetries_are_drawn_evenly():
+    from collections import Counter
+
+    probe = unsymmetric_search(0)
+    me, opp, _, _ = probe.position()
+    counts: Counter[int] = Counter()
+    batch = np.empty((1, 2, 8, 8), np.float32)
+    for seed in range(800):
+        search = unsymmetric_search(seed)
+        search.begin(1)
+        assert search.collect(batch) == 1
+        counts[shown_symmetry(batch[0], me, opp)] += 1
+    assert set(counts) == set(range(8))
+    assert all(60 <= count <= 140 for count in counts.values())
+
+
+def test_a_player_parses_random_symmetry():
+    from cpu_match import Player
+
+    def settings(spec: str):
+        return Player.parse(spec, "net", "bf16").settings
+
+    assert not settings("visits=10").random_symmetry
+    assert settings("visits=10,random_symmetry=1").random_symmetry
+
+
+def test_a_match_replays_from_its_seed_however_many_play_at_once():
+    from cpu_match import Player, play_match
+    from cpu_search import SearchSettings
+    from xot import XOT_PATH, load_xot
+
+    key = ("fake", "fake")
+
+    def results(parallel: int, seed: int) -> np.ndarray:
+        a = Player(*key, 12, SearchSettings(batch=4, random_symmetry=True))
+        b = Player(*key, 12, SearchSettings(batch=4))
+        openings = load_xot(XOT_PATH)[:4]
+        return play_match(a, b, openings, {key: fake_eval}, parallel, seed)
+
+    assert np.array_equal(results(8, 0), results(3, 0))
+
+
 def test_export_matches_the_network():
     import equinox as eqx
     from cpu_search import openvino_eval, ort_eval, ort_session
@@ -259,7 +505,7 @@ def test_net_players_play_a_game_through_the_clock_driver():
     from cpu_search import SearchSettings
     from xot import XOT_PATH, load_xot
 
-    black = NetPlayer(SearchSettings(batch=4), fake_eval)
+    black = NetPlayer(SearchSettings(batch=4, random_symmetry=True), fake_eval, seed=1)
     white = NetPlayer(SearchSettings(batch=1), fake_eval)
     game = play_game(black, white, load_xot(XOT_PATH)[0], 1.0)
     assert game.flagged is None

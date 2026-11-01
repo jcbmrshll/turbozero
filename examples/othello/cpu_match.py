@@ -68,6 +68,7 @@ class Player:
             max_collisions=int(fields["max_collisions"])
             if "max_collisions" in fields
             else None,
+            random_symmetry=bool(int(fields.pop("random_symmetry", 0))),
         )
         return cls(net, backend, visits, settings)
 
@@ -88,11 +89,13 @@ def chunked(evaluate: Eval) -> Eval:
 
 
 class Game:
-    """A game between players a and b, from an opening. Each keeps its own tree."""
+    """A game between players a and b, from an opening. Each keeps its own tree, seeded apart."""
 
-    def __init__(self, a: Player, b: Player, opening: np.ndarray, a_black: bool):
+    def __init__(
+        self, a: Player, b: Player, opening: np.ndarray, a_black: bool, seed: int = 0
+    ):
         self.players = (a, b)
-        self.searches = (Search(a.settings), Search(b.settings))
+        self.searches = (Search(a.settings, 2 * seed), Search(b.settings, 2 * seed + 1))
         self.a_black = a_black
         self.ply = 0
         for action in opening:
@@ -155,8 +158,10 @@ def play_match(
     openings: np.ndarray,
     evals: dict[tuple[str, str], Eval],
     parallel: int,
+    seed: int = 0,
 ) -> np.ndarray:
-    """Plays each opening twice, a black in the first, `parallel` games at once.
+    """Plays each opening twice, a black in the first, `parallel` games at once. Each game has a
+    seed of its own, from `seed`: how many are played at once doesn't change them.
 
     Returns:
         (openings, 2) a's result in each game.
@@ -174,7 +179,8 @@ def play_match(
     while queue or active:
         while queue and len(active) < parallel:
             o, side = queue.pop()
-            active.append((Game(a, b, openings[o], side == 0), o, side))
+            game_seed = (seed << 20) + 2 * o + side
+            active.append((Game(a, b, openings[o], side == 0, game_seed), o, side))
         filled = dict.fromkeys(evals, 0)
         pending = []
         still = []
@@ -265,7 +271,7 @@ def match(args: argparse.Namespace) -> None:
     rng = np.random.default_rng(args.seed)
     openings = pool[rng.choice(len(pool), size=args.openings, replace=False)]
     start = time.perf_counter()
-    results = play_match(a, b, openings, evals, args.parallel)
+    results = play_match(a, b, openings, evals, args.parallel, args.seed)
     record = {
         "a": args.a,
         "b": args.b,
@@ -320,8 +326,10 @@ class NetPlayer:
     """Our side of a game on a per-game clock (`clock_match.Player`): a `Search` with its own
     tree."""
 
-    def __init__(self, settings: SearchSettings, evaluate: Eval, taper: int = 0):
-        self.search = Search(settings)
+    def __init__(
+        self, settings: SearchSettings, evaluate: Eval, taper: int = 0, seed: int = 0
+    ):
+        self.search = Search(settings, seed)
         self.evaluate = evaluate
         self.taper = taper
         self.batch = np.empty((settings.batch, 2, 8, 8), np.float32)
@@ -365,7 +373,11 @@ def speed(args: argparse.Namespace) -> None:
     rng = np.random.default_rng(args.seed)
     openings = pool[rng.choice(len(pool), size=args.openings, replace=False)]
     for batch in args.batch:
-        settings = SearchSettings(batch=batch, virtual_loss=args.virtual_loss)
+        settings = SearchSettings(
+            batch=batch,
+            virtual_loss=args.virtual_loss,
+            random_symmetry=args.random_symmetry,
+        )
         buffer = np.empty((batch, 2, 8, 8), np.float32)
         visits = leaves = calls = 0
         collect = call = apply = 0.0
@@ -400,6 +412,7 @@ def speed(args: argparse.Namespace) -> None:
             "backend": args.backend,
             "batch": batch,
             "virtual_loss": args.virtual_loss,
+            "random_symmetry": args.random_symmetry,
             "visits_per_move": args.visits,
             "evals_per_s": round(leaves / seconds),
             "visits_per_s": round(visits / seconds),
@@ -435,6 +448,7 @@ def main() -> None:
     s.add_argument("--batch", type=int, nargs="+", default=[1, 4, 8, 16, 32, 64])
     s.add_argument("--visits", type=int, default=1000)
     s.add_argument("--virtual-loss", default="loss")
+    s.add_argument("--random-symmetry", action="store_true")
     s.add_argument("--openings", type=int, default=2)
     s.add_argument("--seed", type=int, default=0)
     s.add_argument("--results", type=Path, default=None)
