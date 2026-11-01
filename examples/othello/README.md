@@ -13,6 +13,10 @@ Othello model and against two strong open-source Othello engines,
 | `engines.py` | Edax and Egaroucid, each driven over GTP, and what their searches made of each position, from their logs |
 | `setup_edax.sh`, `setup_egaroucid.sh` | Build the engines for `vs_engine.py` and `clock_match.py` |
 | `clock_match.py` | Games on a real clock, one at a time on the same cores, each side at its best settings |
+| `cpu_search.py`, `cpu_search.cpp` | A single game's MCTS for playing on CPU: a tree in C++, leaves evaluated in batches by OpenVINO or ONNX Runtime |
+| `cpu_match.py` | Games between two such players at fixed visits a move, and their speed in evals a second |
+| `export_onnx.py` | Exports a checkpoint's network to ONNX |
+| `bench_cpu_backends.py` | Evals a second by CPU backend and batch, each checked against JAX's outputs |
 | `engine_set.py`, `label_positions.py`, `score_engine_set.py` | The engine-labelled set: fixed positions with every legal move scored by Edax, to build, and to score checkpoints on (train.py scores the network on it every epoch) |
 | `bench_nets.py` | Times networks on their own: a forward pass at self-play's batch, a training step at training's |
 | `game.py` | What the scripts share: the environment, board symmetries, network, evaluators |
@@ -415,6 +419,40 @@ minutes on 8 Edax processes. To score saved checkpoints on a set:
 ```
 uv run examples/othello/score_engine_set.py runs/othello/49.eqx runs/othello/99.eqx --net resnet:10x128
 ```
+
+## Playing on CPU
+
+Self-play's search is built for thousands of games at once on a GPU. Alone on CPU it spends about
+12 times what the network costs: 86 evals a second for an 8x128 net whose forward pass alone does
+1056. `cpu_search.py` plays one game on CPU instead: `clock_match.py` plays it, as `net:`, against
+another or an engine on a per-game clock.
+
+```
+taskset -c 16-23 uv run examples/othello/clock_match.py --seconds 10 --openings 20 \
+    --a net:net=8x128-128s-8p-w1125-274m,batch=16,virtual_loss=visit,taper=24 --b edax:threads=8
+```
+
+The network is named as in the league's store. Its search collects 16 traversals at a time, each
+steered off the others by virtual visits, and evaluates their leaves together, split over a stream
+per core of OpenVINO, in bfloat16. On eight physical cores of a Ryzen 9 9900X3D, one game at a time:
+
+| 8x128, evals a second | batch 1 | 8 | 16 | 32 |
+|---|---|---|---|---|
+| With the search, OpenVINO bf16 | 2796 | 9906 | 11002 | 12358 |
+
+| Network only, batch 1 / 8 / 64 | 4x64 | 6x96 | 8x128 | 10x128 |
+|---|---|---|---|---|
+| JAX | 5077 / 15133 / 29386 | 2051 / 5936 / 10819 | 1056 / 3158 / 5191 | 703 / 2462 / 3940 |
+| ONNX Runtime, f32 | 6552 / 12253 / 16418 | 5088 / 9902 / 13898 | 2266 / 4775 / 6839 | 1600 / 3335 / 3658 |
+| OpenVINO bf16 | 6289 / 43221 / 97480 | 4296 / 22975 / 34898 | 3210 / 12192 / 16458 | 2777 / 11204 / 13189 |
+
+Each of these is one run, on a machine with other work on it. Batch 1 is on one stream, the others
+on a stream per core. Physical cores matter more than the CPU's cache: the same net at batch 32 does
+12358 on eight cores and 8556 on six with two of them doubled up, V-cache or not.
+
+At 1000 visits a move, batches of 8 and 16 lost nothing against sequential search in 200 games each
+(+17 and +19, standard errors 16 and 18), batch 32 lost 28 and batch 64 lost 60. On a 4 s clock
+batch 16 took 86.5% of 100 games from the same net searching sequentially.
 
 ## Credits
 
