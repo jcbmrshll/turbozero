@@ -10,8 +10,8 @@ engine is built), `level` (play at this level, ignoring the clock, its book off)
 (more of the engine's own options, separated by spaces). Each opening is played with both
 colors, each game by fresh processes, so nothing carries over from one game to the next.
 
-Who runs out of time loses. A game's `board` result ignores that, to show what clock losses
-changed.
+Who runs out of time, by more than `GRACE`, loses. A game's `board` result ignores that, to
+show what clock losses changed.
 """
 
 import argparse
@@ -29,6 +29,9 @@ from engines import CLOCKED, ENGINES, GTPEngine
 from game import square
 from xot import XOT_PATH, load_xot
 
+# seconds past the clock that don't lose a game: an engine that plans its whole clock can pass
+# it by milliseconds, the pipes and the operating system's doing as much as its own
+GRACE = 0.05
 DIRECTIONS = (1, -1, 8, -8, 9, -9, 7, -7)
 
 
@@ -155,7 +158,7 @@ def play_game(
         spent = time.perf_counter() - start
         game.seconds[side] += spent
         game.move_seconds.append((empties, not side, spent))
-        if game.flagged is None and game.seconds[side] > seconds:
+        if game.flagged is None and game.seconds[side] > seconds + GRACE:
             game.flagged = color
         board.play(move)
         players[not side].play(color, move)
@@ -296,8 +299,8 @@ def main() -> None:
         report,
     )
     record = {
-        "a": args.a,
-        "b": args.b,
+        "player_a": args.a,
+        "player_b": args.b,
         "seed": args.seed,
         "cores": sorted(os.sched_getaffinity(0)),
         "load": os.getloadavg()[0],
