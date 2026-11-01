@@ -18,6 +18,10 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+# a CPU script: JAX would otherwise take the GPU's memory, and the league would give way
+if __name__ == "__main__":
+    os.environ.setdefault("JAX_PLATFORMS", "cpu")
+
 import numpy as np
 from bench_cpu_backends import network_path
 from cpu_search import (

@@ -4,6 +4,7 @@ every few seconds while it does.
 Two things count, since neither knows about the other: slick's run queue, which only knows
 its own entries, and the GPU's own list of processes, which shows work started outside it.
 Anything that can't be told counts as busy: the league's games are never the urgent thing.
+The exception is a player mid-session riding out `queue_outage` of slick restarting.
 """
 
 import json
@@ -64,6 +65,8 @@ class SlickGate:
         url: slick's server
         own_job: the queue entry that's allowed to be running
         own_pid: the process that's allowed to be on the GPU
+        queue_outage: seconds the queue may go unread before that counts as busy, since slick
+            restarting shouldn't end a session and lose its batch
     """
 
     def __init__(
@@ -72,11 +75,14 @@ class SlickGate:
         url: str = SLICK_URL,
         own_job: int | None = None,
         own_pid: int | None = None,
+        queue_outage: float = 0.0,
     ):
         self.resource = resource
         self.url = url
         self.own_job = own_job
         self.own_pid = own_pid
+        self.queue_outage = queue_outage
+        self.unread_since: float | None = None
 
     def busy(self) -> str | None:
         processes = gpu_processes()
@@ -87,7 +93,13 @@ class SlickGate:
             return f"on the GPU: {' '.join(str(p) for p in sorted(others))}"
         board = queue_board(self.url)
         if board is None:
+            now = time.monotonic()
+            if self.unread_since is None:
+                self.unread_since = now
+            if now - self.unread_since < self.queue_outage:
+                return None
             return "can't read the queue"
+        self.unread_since = None
         found = lane(board, self.resource)
         running = found.get("running")
         if running and running.get("id") != self.own_job:

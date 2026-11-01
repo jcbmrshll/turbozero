@@ -12,6 +12,10 @@ import argparse
 import os
 from pathlib import Path
 
+# a CPU script: JAX would otherwise take the GPU's memory, and the league would give way
+if __name__ == "__main__":
+    os.environ.setdefault("JAX_PLATFORMS", "cpu")
+
 import equinox as eqx
 import jax
 import numpy as np

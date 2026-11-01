@@ -27,6 +27,9 @@ from core.league.game import LeagueGame, check_match
 from core.league.ratings import Ratings
 from core.league.store import GameRecord, Player, Store
 
+# seconds a player rides out slick being unreachable, as when it restarts
+PLAYER_QUEUE_OUTAGE = 300.0
+
 
 def leaderboard(players: list[Player], ratings: Ratings) -> str:
     """The ratings as text, best first."""
@@ -232,7 +235,11 @@ def main(make_game: Callable[[], LeagueGame], default_root: Path, argv=None) -> 
         from core.league.worker import play
 
         own_job = os.environ.get("SLICK_RUN")
-        gate = SlickGate(own_job=int(own_job) if own_job else None, own_pid=os.getpid())
+        gate = SlickGate(
+            own_job=int(own_job) if own_job else None,
+            own_pid=os.getpid(),
+            queue_outage=PLAYER_QUEUE_OUTAGE,
+        )
         reason = play(
             store, make_game(), ThrottledGate(gate), max_batches=args.max_batches
         )

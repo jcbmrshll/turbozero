@@ -348,6 +348,38 @@ def test_gate_counts_what_it_cant_read_as_busy(gpu):
     assert SlickGate().busy() is not None
 
 
+def test_gate_rides_out_a_short_queue_outage(gpu, monkeypatch):
+    now = {"t": 0.0}
+    monkeypatch.setattr(gate_module.time, "monotonic", lambda: now["t"])
+    gate = SlickGate(queue_outage=60.0)
+    gpu["board"] = None
+    assert gate.busy() is None
+    now["t"] = 59.0
+    assert gate.busy() is None
+    now["t"] = 60.0
+    assert gate.busy() == "can't read the queue"
+
+
+def test_gate_forgets_an_outage_once_it_reads_the_queue(gpu, monkeypatch):
+    now = {"t": 0.0}
+    monkeypatch.setattr(gate_module.time, "monotonic", lambda: now["t"])
+    gate = SlickGate(queue_outage=60.0)
+    gpu["board"] = None
+    gate.busy()
+    gpu["board"] = {"resources": []}
+    now["t"] = 59.0
+    assert gate.busy() is None
+    gpu["board"] = None
+    now["t"] = 100.0
+    assert gate.busy() is None
+
+
+def test_gate_still_sees_the_gpu_during_an_outage(gpu):
+    gpu["board"] = None
+    gpu["processes"] = {7}
+    assert "7" in str(SlickGate(queue_outage=60.0).busy())
+
+
 def test_throttled_gate_looks_at_most_so_often():
     fake = FakeGate(["first", "second"])
     gate = ThrottledGate(fake, every=1000)

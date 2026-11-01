@@ -44,7 +44,8 @@ class SchedulerConfig:
         batch_sizes: the sizes of batch to choose from, in games, each even: the search
             compiles for each, so the fewer the better
         max_tree_nodes: the most tree nodes (of both sides' searches) a batch may hold at
-            once, for the memory they take
+            once, for the memory they take: 6M ran a 16 GB GPU out of memory, at 4x64 with
+            4000 sims against 128 in a batch of 1024
         request_batch_sizes: further sizes for requested series, whose games can be too slow
             for the smallest of `batch_sizes`. Nothing smaller: a batch's games are played
             at once, up to the cores engines get (8), so fewer take as long and just waste them
@@ -56,7 +57,7 @@ class SchedulerConfig:
     engines: bool = True
     batch_seconds: float = 180.0
     batch_sizes: tuple[int, ...] = (64, 128, 256, 512, 1024)
-    max_tree_nodes: int = 6_000_000
+    max_tree_nodes: int = 3_000_000
     request_batch_sizes: tuple[int, ...] = (16, 32)
 
 
