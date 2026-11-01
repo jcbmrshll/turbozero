@@ -1,6 +1,7 @@
 """clock_match.py's referee and clock, with fake players in place of the engines."""
 
 import io
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -228,3 +229,15 @@ def test_clocked_egaroucid_reads_its_move_past_prompts_and_noise():
     engine.play("b", action("c4"))
     assert engine.move("w", 3.0) == action("f5")
     assert script.sent == ["play c4", "go"]
+
+
+def test_a_summary_counts_results_and_writes_as_json():
+    games = [Game(margin=4), Game(margin=-2), Game(margin=0), Game(margin=6)]
+    for game in games:
+        game.move_seconds.append((40, True, 0.1))
+        game.move_seconds.append((39, False, 0.1))
+    summary = summarize(games, [True, True, False, False], 10)
+    assert (summary["board_wins"], summary["board_draws"]) == (1, 1)
+    assert summary["board_losses"] == 2
+    assert summary["margins"] == [4, -2, 0, -6]
+    json.dumps(summary)
