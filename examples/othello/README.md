@@ -564,3 +564,32 @@ aren't part of turbozero.
 `elo_league.py` keeps a rating for every network it's given, at each search budget, and for
 Edax and Egaroucid, from full games played whenever the GPU is free (see `core/league/`). Every
 game is stored; ratings are fit to all of them, with an uncertainty for each player.
+
+The dashboard (`elo_league.py dashboard`) lists the players, with filters read from their names and
+settings, beside the queue of series and a plot of runtime against rating. A player's page holds
+its description and tags. A network's budgets share theirs.
+
+A game's page runs trained networks in the browser, on their ONNX exports, through onnxruntime-web
+served from the store (`elo_league.py fetch-ort`, once). No game's search was kept, so its tree is
+searched again from each position, by default by the player to move's network at the sims it played
+at, with the same PUCT as core's MCTS. Games kept their tree between moves, and this doesn't, so a
+position's tree isn't the one the game had. Edax and Egaroucid don't run there.
+
+Every run and every network registered with the league is exported to ONNX, which is cheap (about
+0.3 s and 9 MB for an 8x128 once the process is up). A failed export only says so, and
+`elo_league.py export-onnx` tries the store's missing ones again.
+
+The plot reads `timings.json` beside the store, which a benchmark writes atomically:
+
+```json
+{"runs": [{"name": "...", "hardware": {"cpu": "...", "cores": 8, "threads": 8}, "software": {},
+  "configs": [
+    {"net": "resnet:8x128,...", "sims": 1000, "batch": 16, "batch_strength": "measured_no_loss",
+     "source": "measured", "plot": true, "games": 24, "seconds_per_game": 2.1},
+    {"engine": "edax", "level": 20,
+     "source": "measured", "plot": true, "games": 24, "seconds_per_game": 1.4}]}]}
+```
+
+A run is one host, and the plot shows one at a time. `seconds_per_game` is one side's mean. Only
+configs that are `measured` and marked `plot` appear, joined to players by architecture and sims or
+engine and level. A `batch_strength` of `unmeasured` draws a point hollow and off the frontier.

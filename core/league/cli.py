@@ -5,6 +5,8 @@ link NAME URL
 add-external NAME ENGINE --settings '{"level": 8}'
 add-result A B WINS DRAWS LOSSES --source SOURCE
 match A B --games N; matches; cancel-match ID
+export-onnx
+fetch-ort
 anchor NAME; retire NAME; resume NAME
 ratings
 start; stop
@@ -21,7 +23,7 @@ from pathlib import Path
 
 import numpy as np
 
-from core.league.game import LeagueGame
+from core.league.game import LeagueGame, check_match
 from core.league.ratings import Ratings
 from core.league.store import GameRecord, Player, Store
 
@@ -49,6 +51,28 @@ def pending_matches(store: Store) -> str:
         waiting = "  retired" if a.retired or b.retired else ""
         lines.append(f"#{r.id}  {a.name} vs {b.name}  {r.played}/{r.games}{waiting}")
     return "\n".join(lines)
+
+
+def export_network(store: Store, game: LeagueGame, player: Player) -> bool:
+    """Exports `player`'s network to the store unless that's been done; False if it fails,
+    which leaves everything else as it was: the network plays on, and can be tried again."""
+    out = store.onnx_path(player)
+    assert out is not None and player.path is not None and player.net is not None
+    if out.exists():
+        return True
+    try:
+        game.export_network(player.path, player.net, out)
+    except Exception as e:  # noqa: BLE001
+        print(f"{player.network}: no ONNX export: {e!r}", file=sys.stderr)
+        return False
+    return True
+
+
+def export_networks(store: Store, game: LeagueGame) -> bool:
+    """Exports every network in the store that hasn't been; False if any failed."""
+    networks = {p.network: p for p in store.players() if p.network is not None}
+    done = [export_network(store, game, p) for p in networks.values()]
+    return all(done)
 
 
 def queue_command(root: Path, script: str) -> str:
@@ -104,6 +128,13 @@ def main(make_game: Callable[[], LeagueGame], default_root: Path, argv=None) -> 
     match.add_argument(
         "--games", type=int, required=True, help="even: half each colour"
     )
+    commands.add_parser(
+        "export-onnx", help="export the store's networks that haven't been"
+    )
+    commands.add_parser(
+        "fetch-ort",
+        help="download what the dashboard runs networks with in the browser",
+    )
     commands.add_parser("matches", help="the series still to finish")
     cancel = commands.add_parser("cancel-match", help="drop a series")
     cancel.add_argument("id", type=int)
@@ -139,6 +170,8 @@ def main(make_game: Callable[[], LeagueGame], default_root: Path, argv=None) -> 
             store.add_net_player(args.name, sims)
         if args.url:
             store.set_network_url(args.name, args.url)
+        added = next(p for p in store.players() if p.network == args.name)
+        export_network(store, make_game(), added)
     elif args.command == "link":
         store.set_network_url(args.name, args.url)
     elif args.command == "add-external":
@@ -149,20 +182,22 @@ def main(make_game: Callable[[], LeagueGame], default_root: Path, argv=None) -> 
         games = [GameRecord(a, b, -1, outcome, []) for outcome in outcomes]
         store.record_batch(a, b, 0.0, False, args.source, "", games)
     elif args.command == "match":
-        game = make_game()
         for name in (args.a, args.b):
             if name not in players:
                 parser.error(f"no player {name}")
-            if players[name].retired:
-                parser.error(f"{name} is retired")
-            if not game.can_play(players[name]):
-                parser.error(f"{name} can't play here")
-        if args.a == args.b:
-            parser.error("a player can't play itself")
-        if args.games <= 0 or args.games % 2:
-            parser.error("--games must be positive and even: half with each colour")
-        a, b = players[args.a].id, players[args.b].id
-        print(f"#{store.request_match(a, b, args.games)}")
+        a, b = players[args.a], players[args.b]
+        try:
+            check_match(make_game(), a, b, args.games)
+        except ValueError as e:
+            parser.error(str(e))
+        print(f"#{store.request_match(a.id, b.id, args.games)}")
+    elif args.command == "export-onnx":
+        if not export_networks(store, make_game()):
+            sys.exit(1)
+    elif args.command == "fetch-ort":
+        from core.league.runtime import fetch_runtime
+
+        fetch_runtime(store.root)
     elif args.command == "matches":
         print(pending_matches(store))
     elif args.command == "cancel-match":
