@@ -555,6 +555,38 @@ At 1000 visits a move, batches of 8 and 16 lost nothing against sequential searc
 (+17 and +19, standard errors 16 and 18), batch 32 lost 28 and batch 64 lost 60. On a 4 s clock
 batch 16 took 86.5% of 100 games from the same net searching sequentially.
 
+### What a player costs
+
+`timing_benchmark.py` times every player alone: each game is a player against itself from XOT
+openings, and only the side to move is charged, move by move. Stop everything else on the machine
+first (other load costs engines 30-45%); it won't start if any CPU is doing real work.
+
+```
+uv run examples/othello/timing_benchmark.py prepare     # the nets, as ONNX, once
+taskset -c 16-23 uv run examples/othello/timing_benchmark.py work run-1 --hours 3.5
+uv run examples/othello/timing_benchmark.py summarize run-1 --publish
+```
+
+`--publish` writes the league's `timings.json`; each move's record stays under
+`~/.cache/turbozero/othello/timing/`. One side's seconds a game on 8 threads of those cores, with
+bf16 networks, on 2026-11-01:
+
+| Sims | 4x64 | 6x96 | 8x128 | 10x128 |
+|---|---|---|---|---|
+| 128, sequential | 0.52 | 0.73 | 0.92 | 1.11 |
+| 1000, sequential | 3.58 | 4.98 | 6.50 | 7.73 |
+| 1000, batch 16 | 0.46 | 0.90 | 1.67 | 2.05 |
+| 4000, batch 32 | 1.35 | 3.02 | 5.26 | 6.53 |
+| 16000, batch 32 | 4.91 | 11.4 | 22.8 | 26.4 |
+
+| Level | 8 | 12 | 16 | 20 | 24 | 28 |
+|---|---|---|---|---|---|---|
+| Edax | 0.087 | 0.240 | 0.268 | 1.07 | 2.54 | 14.0 |
+| Egaroucid | 0.021 | 0.188 | 0.392 | 1.25 | 4.15 | 18.4 |
+
+A line through 128, 1000 and 4000 sims predicted seconds a move at 16000 to within 9.1%. An engine's
+slowest move at L20 and up took 33-97 times its mean.
+
 ### Int8
 
 Quantized after training, a network plays stronger on a clock than in bf16, where its leaves come in
