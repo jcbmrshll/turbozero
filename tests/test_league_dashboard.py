@@ -16,7 +16,7 @@ from core.league.dashboard import League, make_handler, pareto
 from core.league.game import LeagueGame
 from core.league.ratings import fit_ratings
 from core.league.runtime import FILES, VERSION, runtime_dir
-from core.league.store import GameRecord, Store
+from core.league.store import EngineSearch, GameRecord, NetSearch, Store, TopMove
 
 
 class FakeGame(LeagueGame):
@@ -189,6 +189,29 @@ def test_a_game_comes_with_its_moves(url):
     assert game["first"] == "x"
     assert game["opening_plies"] == 2
     assert game["first_score"] == 40.0
+
+
+def test_a_game_comes_with_what_its_searches_made_of_its_moves(url, store):
+    x, y = (p.id for p in store.players()[:2])
+    top = (TopMove(19, 90, 0.5),)
+    searches = {2: NetSearch(0.25, 0.125, 129, 129, 200, top), 3: EngineSearch(-4, 12)}
+    batch = store.record_batch(
+        x,
+        y,
+        1.0,
+        False,
+        "abc",
+        "f",
+        [GameRecord(x, y, 0, 1, [1, 2], searches=searches)],
+    )
+    game = store.db.execute(
+        "SELECT id FROM games WHERE batch_id = ?", (batch,)
+    ).fetchone()[0]
+    recorded = get(url, f"/api/game?id={game}")["searches"]
+    assert recorded["2"]["value"] == 0.25
+    assert recorded["3"]["score"] == -4
+    # a game from before they were kept
+    assert get(url, "/api/game?id=1")["searches"] == {}
 
 
 def test_a_missing_game_is_a_404(url):

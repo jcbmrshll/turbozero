@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 
 from core.evaluators.evaluator import Evaluator
-from core.league.store import Player
+from core.league.store import Player, Search
 from core.types import EnvStepFn, StepMetadata
 
 
@@ -37,6 +37,15 @@ class ExternalPlayer(ABC):
     @abstractmethod
     def close(self) -> None:
         """Ends its games, however they went."""
+
+    def searches(self, movers: np.ndarray) -> dict[int, Search]:
+        """What its search made of the last `move` in the games marked `movers`, by game, where
+        it says."""
+        return {}
+
+    def settings(self) -> dict[str, Any]:
+        """Everything that decides how it plays, once it's `start`ed."""
+        return {}
 
 
 def check_match(game: "LeagueGame", a: Player, b: Player, games: int) -> None:

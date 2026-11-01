@@ -353,6 +353,9 @@ class League:
             return None
         record = dict(row)
         record["moves"] = decode_moves(row["moves"])
+        with self.lock:
+            searches = self.store.game_searches(game)
+        record["searches"] = {ply: asdict(s) for ply, s in searches.items()}
         record["opening_plies"] = self.game.openings(
             np.array([row["opening"]], dtype=int)
         ).shape[1]

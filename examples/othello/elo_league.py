@@ -53,7 +53,7 @@ from xot import XOT_PATH, load_xot
 from core.evaluators.evaluation_fns import make_nn_eval_fn
 from core.league.cli import main
 from core.league.game import ExternalPlayer, LeagueGame
-from core.league.store import Player
+from core.league.store import EngineSearch, Player, Search
 from core.monitoring.episodes import BOARDS
 
 # a self-play network's name and a student's (see `distill.py`)
@@ -118,6 +118,8 @@ class EnginePlayer(ExternalPlayer):
         self.pool = ThreadPoolExecutor(max_workers=available_cpus())
         self.processes: list[GTPEngine] = []
         self.first: np.ndarray = np.zeros(0, dtype=int)
+        self.started: dict[str, Any] = {}
+        self.asked: dict[int, int] = {}
 
     def start(self, states: Any, first: np.ndarray) -> None:
         self.first = first
@@ -125,11 +127,12 @@ class EnginePlayer(ExternalPlayer):
         self.processes = list(
             self.pool.map(
                 lambda _: self.engine(
-                    self.engine.default_dir(), self.level, args=self.args
+                    self.engine.default_dir(), self.level, analyse=True, args=self.args
                 ),
                 range(count),
             )
         )
+        self.started = self.processes[0].settings()
         self.plies = np.zeros(count, dtype=int)
 
     def move(self, states: Any, movers: np.ndarray) -> np.ndarray:
@@ -144,8 +147,23 @@ class EnginePlayer(ExternalPlayer):
         )
         for g, move in zip(asking, replies):
             moves[g] = move
+        self.asked = {int(g): int(moves[g]) for g in asking}
         self.plies[movers] += 1
         return moves
+
+    def searches(self, movers: np.ndarray) -> dict[int, Search]:
+        found: dict[int, Search] = {}
+        for g, move in self.asked.items():
+            process = self.processes[g]
+            analysis = next(
+                (a for a in process.analysis or [] if a.line[0] == move), None
+            )
+            if analysis is not None:
+                found[g] = EngineSearch(analysis.score, analysis.depth, process.nodes)
+        return found
+
+    def settings(self) -> dict[str, Any]:
+        return self.started
 
     def observe(self, actions: np.ndarray, movers: np.ndarray) -> None:
         # players alternate, a pass being a move: black moves at even plies

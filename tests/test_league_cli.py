@@ -11,7 +11,7 @@ import pytest
 from core.league.cli import main
 from core.league.game import LeagueGame
 from core.league.runtime import FILES, fetch_runtime, has_runtime, runtime_dir
-from core.league.store import Store
+from core.league.store import BatchSettings, GameRecord, Store
 
 
 class FakeGame(LeagueGame):
@@ -187,3 +187,32 @@ def test_the_runtime_is_fetched_once_and_checked(tmp_path):
     assert sorted(p.name for p in runtime_dir(root).iterdir()) == sorted(FILES)
     path.unlink()
     fetch_runtime(root, path.as_uri(), sha512)
+
+
+def test_settings_changes_says_who_and_what(root, capsys):
+    store = Store(root)
+    x, y = (p.id for p in store.players()[:2])
+
+    def played(c_init):
+        store.record_batch(
+            x,
+            y,
+            1.0,
+            False,
+            "abc",
+            "f",
+            [GameRecord(x, y, 0, 1, [0])],
+            settings=BatchSettings({"c_init": c_init}, {"level": 8}, 1, "cpu"),
+        )
+
+    played(1.25)
+    played(1.25)
+    run(root, "settings-changes")
+    assert capsys.readouterr().out.strip() == ""
+    played(2.0)
+    store.close()
+    run(root, "settings-changes")
+    out = capsys.readouterr().out
+    assert out.splitlines()[0] == "x"
+    assert "2 batches" in out
+    assert "c_init: 1.25 -> 2.0" in out

@@ -9,6 +9,7 @@ export-onnx
 fetch-ort
 anchor NAME; retire NAME; resume NAME
 ratings
+settings-changes
 start; stop
 dashboard
 """
@@ -18,6 +19,7 @@ import json
 import os
 import shlex
 import sys
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -53,6 +55,28 @@ def pending_matches(store: Store) -> str:
         a, b = by_id[r.a], by_id[r.b]
         waiting = "  retired" if a.retired or b.retired else ""
         lines.append(f"#{r.id}  {a.name} vs {b.name}  {r.played}/{r.games}{waiting}")
+    return "\n".join(lines)
+
+
+def settings_changes(store: Store) -> str:
+    """As text, the players who've played under more than one set of settings, and what differs
+    between each set and the one before."""
+    by_id = {p.id: p for p in store.players()}
+    lines = []
+    for player, periods in store.settings_changes().items():
+        lines.append(by_id[player].name)
+        for before, period in zip([None, *periods], periods):
+            changed = ""
+            if before is not None:
+                was, now = before.settings, period.settings
+                keys = sorted(
+                    k for k in was.keys() | now.keys() if was.get(k) != now.get(k)
+                )
+                changed = "  " + ", ".join(
+                    f"{k}: {was.get(k)!r} -> {now.get(k)!r}" for k in keys
+                )
+            started = time.strftime("%Y-%m-%d %H:%M", time.localtime(period.first))
+            lines.append(f"  from {started}, {period.batches} batches{changed}")
     return "\n".join(lines)
 
 
@@ -153,6 +177,10 @@ def main(make_game: Callable[[], LeagueGame], default_root: Path, argv=None) -> 
     engines.add_argument("state", choices=["on", "off"])
 
     commands.add_parser("ratings", help="print the leaderboard")
+    commands.add_parser(
+        "settings-changes",
+        help="players who've played under more than one set of settings",
+    )
     start = commands.add_parser("start", help="run the supervisor (stays running)")
     start.add_argument("--queue-cwd", required=True, help="the slick task's worktree")
     start.add_argument("--resource", default="5080")
@@ -220,6 +248,8 @@ def main(make_game: Callable[[], LeagueGame], default_root: Path, argv=None) -> 
         from core.league.worker import current_ratings
 
         print(leaderboard(store.players(), current_ratings(store)))
+    elif args.command == "settings-changes":
+        print(settings_changes(store))
     elif args.command == "stop":
         store.set_meta("stop", True)
     elif args.command == "start":
