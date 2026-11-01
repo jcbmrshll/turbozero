@@ -1,11 +1,14 @@
 """The Othello side of the league: its engines' colors, and the dashboard's board rules."""
 
+import hashlib
+import io
 import json
 import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import ClassVar
+from types import SimpleNamespace
+from typing import Any, ClassVar
 
 import jax
 import numpy as np
@@ -13,11 +16,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "examples" / "othello"))
 
-from elo_league import EnginePlayer, Othello
-from game import env
+from elo_league import EnginePlayer, Othello, player_facts
+from engines import Analysis, Edax, Egaroucid
+from game import action, env, export_last
 from xot import XOT_PATH, load_xot
 
-from core.league.store import Player
+from core.league.store import EngineSearch, Player
 
 
 class FakeEngine:
@@ -26,8 +30,11 @@ class FakeEngine:
     name = "fake"
     instances: ClassVar[list] = []
 
-    def __init__(self, engine_dir, level, args=()):
+    def __init__(self, engine_dir, level, analyse=False, args=()):
         self.level, self.args = level, args
+        self.analyse = analyse
+        self.analysis = None
+        self.nodes = None
         self.played = []
         self.asked = []
         self.replies = [44, 19]
@@ -46,6 +53,9 @@ class FakeEngine:
 
     def discs(self):
         return 40, 24
+
+    def settings(self):
+        return {"level": self.level, "args": self.args}
 
     def close(self):
         pass
@@ -98,6 +108,123 @@ def test_engine_passes_without_being_asked(fake):
     player.close()
 
 
+def test_an_engine_is_started_to_say_what_its_searches_made_of_its_moves(fake):
+    player = EnginePlayer(fake, 8, ["-x"])
+    legal = [[True] * 64 + [False], [False] * 64 + [True]]
+    player.start(states_of(legal, [0, 0]), np.array([0, 0]))
+    assert fake.instances[0].analyse
+    assert player.settings() == {"level": 8, "args": ["-x"]}
+    fake.instances[0].analysis = [Analysis([19], 2, 10), Analysis([44], 6, 10)]
+    fake.instances[0].nodes = 1234
+    moves = player.move(states_of(legal, [0, 0]), np.array([True, True]))
+    assert moves.tolist() == [44, 64]
+    # the move it played's, and none for the game it passed in without being asked
+    assert player.searches(np.array([True, True])) == {0: EngineSearch(6, 10, 1234)}
+    player.close()
+
+
+def test_an_engine_that_says_nothing_of_a_search_has_no_record_of_it(fake):
+    player = EnginePlayer(fake, 8, [])
+    legal = [[True] * 64 + [False]]
+    player.start(states_of(legal, [0]), np.array([0]))
+    player.move(states_of(legal, [0]), np.array([True]))
+    assert player.searches(np.array([True])) == {}
+    player.close()
+
+
+EDAX_LOG = """initial bound = [-64, +64]
+direct root_PVS [-64, 64]:
+current move:  --  [-64, +64], D6 => -01; pv = D6 :06@73%[+00,+00]; c3:07@73%[+01,+01];
+id = 1 ; level =  8@73% ; ab = [-64, +64]:
+stability bounds = [-64, +64]:
+-01 < score = -01 < -01; time =  0:00.001; nodes = 4729 N; speed =   4729000 Nps
+pv = D6 c3
+direct root_PVS [-64, 64]:
+current move:  --  [-64, +64], D6 => -01; pv = D6 :08@73%[-01,-01]; c3:07@73%[+01,+01];
+id = 1 ; level =  8@73% ; ab = [-64, +64]:
+-01 < score = -01 < -01; time =  0:00.001; nodes = 6632 N; speed =   6632000 Nps
+"""
+
+
+def edax_reading(log) -> Any:
+    engine: Any = Edax.__new__(Edax)
+    engine.search_log = io.StringIO(log)
+    engine.nodes = None
+    return engine
+
+
+def test_edax_says_how_many_nodes_its_whole_search_took():
+    engine = edax_reading(EDAX_LOG)
+    analysis = engine.read_analysis(action("d6"))
+    assert analysis[0].line[0] == action("d6")
+    assert (analysis[0].score, analysis[0].depth) == (-1, 8)
+    assert engine.nodes == 6632
+
+
+def test_egaroucid_says_how_many_nodes_its_whole_search_took():
+    engine: Any = Egaroucid.__new__(Egaroucid)
+    engine.nodes = None
+    engine.log = [
+        "level status 8 1 discs depth 8@100%",
+        "pre mid depth 7@100% value 0 (raw 0) policy d6 n_worker 0 n_nodes 1442 time 0",
+        "main mid depth 8@100% value 1 (raw 2) policy f6 n_worker 0 n_nodes 5293 time 2",
+    ]
+    analysis = engine.read_analysis(action("f6"))
+    assert [(a.score, a.depth) for a in analysis] == [(1, 8)]
+    assert engine.nodes == 5293
+
+
+@pytest.mark.parametrize(
+    ("kind", "arguments", "book", "hash_size"),
+    [
+        (Edax, ["edax", "-book-usage", "off"], False, 21),
+        (
+            Edax,
+            ["edax", "-book-usage", "off", "-h", "25", "-book-usage", "on"],
+            True,
+            25,
+        ),
+        (Egaroucid, ["egaroucid", "-nobook"], False, 25),
+        (Egaroucid, ["egaroucid", "-hash", "20"], True, 20),
+    ],
+)
+def test_an_engines_book_and_hash_are_read_from_how_its_started(
+    kind, arguments, book, hash_size
+):
+    assert kind.__new__(kind).book_and_hash(arguments) == (book, hash_size)
+
+
+def test_an_engines_settings_say_what_it_is_and_not_where_it_logs(tmp_path):
+    binary, weights = tmp_path / "bin" / "edax", tmp_path / "data" / "eval.dat"
+    binary.parent.mkdir()
+    weights.parent.mkdir()
+    binary.write_bytes(b"binary")
+    weights.write_bytes(b"weights")
+    engine: Any = Edax.__new__(Edax)
+    engine.engine_dir, engine.level, engine.threads = tmp_path, 8, 1
+    engine.process = SimpleNamespace(
+        args=[
+            str(binary),
+            "-l",
+            "8",
+            "-book-usage",
+            "off",
+            "-search-log-file",
+            "/tmp/a",
+        ]
+    )
+    assert engine.settings() == {
+        "engine": "edax",
+        "level": 8,
+        "threads": 1,
+        "book": False,
+        "hash": 21,
+        "command": ["-l", "8", "-book-usage", "off"],
+        "binary_sha256": hashlib.sha256(b"binary").hexdigest(),
+        "weights_sha256": {"eval.dat": hashlib.sha256(b"weights").hexdigest()},
+    }
+
+
 def test_engine_checks_the_result_against_its_board(fake):
     player = EnginePlayer(fake, 8, [])
     player.start(states_of([[True] * 65], [0]), np.array([0]))
@@ -139,7 +266,8 @@ def test_the_external_settings_reach_the_engine(monkeypatch, fake):
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
 def test_the_boards_rules_match_the_environment(tmp_path):
-    """Random games through pgx and through the dashboard's board: the same boards."""
+    """Random games through pgx and through the dashboard's board: the same boards, moves, ends,
+    results and network inputs."""
     key = jax.random.PRNGKey(0)
     games = []
     step = jax.jit(env.step)
@@ -147,7 +275,7 @@ def test_the_boards_rules_match_the_environment(tmp_path):
         key, init = jax.random.split(key)
         state = env.init(init)
         black = int(state.current_player)
-        moves, boards = [], []
+        moves, boards, legal, over, seen, rewards = [], [], [], [], [], []
         while not bool(state.terminated):
             key, pick = jax.random.split(key)
             move = int(
@@ -161,7 +289,27 @@ def test_the_boards_rules_match_the_environment(tmp_path):
             flip = 1 if int(state.current_player) == black else -1
             board = np.asarray(state._x.board) * flip
             boards.append(np.select([board > 0, board < 0], [1, 2], 0).tolist())
-        games.append({"moves": moves, "boards": boards})
+            legal.append(np.flatnonzero(state.legal_action_mask).tolist())
+            over.append(bool(state.terminated))
+            # (8, 8, 2) to the network's channels first
+            seen.append(
+                np.moveaxis(np.asarray(state.observation), -1, 0)
+                .astype(int)
+                .ravel()
+                .tolist()
+            )
+            to_move = int(state.current_player)
+            rewards.append(float(state.rewards[to_move]))
+        games.append(
+            {
+                "moves": moves,
+                "boards": boards,
+                "legal": legal,
+                "over": over,
+                "seen": seen,
+                "rewards": rewards,
+            }
+        )
     module = tmp_path / "board.mjs"
     module.write_text(
         Path(__file__)
@@ -178,6 +326,16 @@ for (const game of games) {{
     position = board.play(position, move);
     if (JSON.stringify(position.squares) !== JSON.stringify(game.boards[i]))
       throw new Error(`differs at ply ${{i}}`);
+    if (position.terminated !== game.over[i]) throw new Error(`end differs at ply ${{i}}`);
+    if (position.terminated && position.reward !== game.rewards[i]) throw new Error("result differs");
+    if (!position.terminated) {{
+      if (JSON.stringify(board.legal(position)) !== JSON.stringify(game.legal[i]))
+        throw new Error(`moves differ at ply ${{i}}`);
+      const seen = new Float32Array(128);
+      board.observe(position, seen);
+      if (JSON.stringify([...seen]) !== JSON.stringify(game.seen[i]))
+        throw new Error(`observation differs at ply ${{i}}`);
+    }}
   }});
 }}
 console.log("same");
@@ -190,3 +348,195 @@ console.log("same");
         check=False,
     )
     assert out.stdout.strip() == "same", out.stderr
+
+
+NET = "resnet:8x128,pool_every=2,heads=pooled,pool_channels=32"
+
+
+def net_player(network, sims=1000, net=NET):
+    return Player(id=1, name=f"{network}@{sims}", network=network, net=net, sims=sims)
+
+
+def test_a_self_play_networks_facts_come_from_its_name():
+    assert player_facts(net_player("8x128-128s-8p-w1125-274m")) == {
+        "kind": "net", "net": "8x128", "blocks": 8, "channels": 128, "play sims": 1000,
+        "train sims": 128, "passes": 8, "window": 1125, "minutes": 274,
+        "vtq": False, "planned": False,
+    }  # fmt: skip
+
+
+def test_a_names_optional_parts_are_facts_too():
+    facts = player_facts(net_player("8x128-128s-8p-w375-vtq-68m"))
+    assert (facts["vtq"], facts["planned"], facts["minutes"]) == (True, False, 68)
+    assert player_facts(net_player("8x128-128s-8p-w1125-68m-planned"))["planned"]
+
+
+def test_a_students_facts_come_from_its_name():
+    facts = player_facts(
+        net_player("4x64-distill-teacherv-274m-32p", 128, "resnet:4x64")
+    )
+    assert (facts["net"], facts["distill target"], facts["teacher minutes"]) == (
+        "4x64",
+        "teacherv",
+        274,
+    )
+    assert facts["passes"] == 32 and "minutes" not in facts
+
+
+def test_a_name_that_doesnt_fit_still_has_its_nets_facts():
+    assert player_facts(net_player("something-else")) == {
+        "kind": "net", "net": "8x128", "blocks": 8, "channels": 128, "play sims": 1000,
+    }  # fmt: skip
+
+
+def test_an_engines_facts_come_from_its_settings():
+    engine = Player(id=1, name="e", external="edax-okuhara", settings={"level": 20})
+    assert player_facts(engine) == {
+        "kind": "engine",
+        "engine": "edax-okuhara",
+        "level": 20,
+    }
+    paper = Player(id=2, name="OLIVAW@400", external="olivaw", settings={"sims": 400})
+    assert player_facts(paper)["play sims"] == 400
+
+
+def test_a_failed_export_at_the_end_of_a_run_only_says_so(tmp_path, capsys):
+    (tmp_path / "7.eqx").write_bytes(b"not a network")
+    (tmp_path / "best.eqx").write_bytes(b"not a checkpoint of the run")
+    export_last(str(tmp_path), "resnet:2x8,heads=pooled,pool_channels=2")
+    assert "no ONNX export" in capsys.readouterr().err
+    assert (tmp_path / "7.eqx").read_bytes() == b"not a network"
+    assert not list(tmp_path.glob("*.onnx*"))
+
+
+def test_a_run_with_no_checkpoints_has_nothing_to_export(tmp_path, capsys):
+    export_last(str(tmp_path), "resnet:2x8")
+    assert "no ONNX export" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+def test_the_browser_search_counts_and_signs_its_values():
+    """A fake network and game: the search visits what it's told to, each level up the tree negates
+    a value, and it stops when told to."""
+    root = Path(__file__).parent.parent
+    script = f"""
+import {{ Search, snapshot, policy }} from {json.dumps(str(root / "core/league/web/search.js"))};
+const p = policy(new Float32Array([0, Math.log(3), 99]), 0, [0, 1], 3);
+if (Math.abs(p[0] - 0.25) > 1e-6 || Math.abs(p[1] - 0.75) > 1e-6 || p[2] !== 0) throw new Error("policy");
+// a game of two moves: each of two actions leads on, and the second move ends it with a win
+const board = {{
+  numActions: 2,
+  legal: (position) => (position.terminated ? [] : [0, 1]),
+  play: (position, action) => ({{ depth: position.depth + 1, terminated: position.depth === 1, reward: -1 }}),
+}};
+const start = {{ depth: 0, terminated: false, reward: 0 }};
+const search = new Search(board, async () => ({{ logits: new Float32Array([1, 0]), value: -0.5 }}));
+const root = await search.run(start, 8);
+if (root.n !== 9) throw new Error(`root visits ${{root.n}}`);
+const counts = [...root.children.values()].reduce((sum, child) => sum + child.n, 0);
+if (counts !== 8) throw new Error(`child visits ${{counts}}`);
+const tree = snapshot(root);
+if (tree.parent[0] !== -1 || tree.n[0] !== 9) throw new Error("snapshot");
+const small = snapshot(root, 2);
+if (small.n.length !== 2 || small.parent[1] !== 0) throw new Error("limit");
+let stopped = 0;
+const partial = await new Search(board, async () => ({{ logits: new Float32Array([1, 0]), value: 0 }})).run(start, 100, async () => (++stopped < 2), 4);
+if (partial.n !== 9) throw new Error(`stopping: ${{partial.n}}`);
+// by hand: the root and first child evaluate to -0.5 for whoever moves, so the root's q averages
+// -0.5 with +0.5; then the second move ends the game at -1 for the player to move at the root
+const two = await new Search(board, async () => ({{ logits: new Float32Array([1, 0]), value: -0.5 }})).run(start, 1);
+if (two.q !== 0 || two.children.get(0).q !== -0.5) throw new Error(`one: ${{two.q}}`);
+const three = await new Search(board, async () => ({{ logits: new Float32Array([1, 0]), value: -0.5 }})).run(start, 2);
+const child = three.children.get(0);
+if (child.q !== 0.25 || Math.abs(three.q + 1 / 3) > 1e-12) throw new Error(`two: ${{three.q}} ${{child.q}}`);
+console.log("ok");
+"""
+    out = subprocess.run(
+        ["node", "--input-type=module", "-e", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert out.stdout.strip() == "ok", out.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+def test_browser_engines_are_asked_about_the_player_to_move_and_past_a_pass():
+    root = Path(__file__).parent.parent
+    script = f"""
+import board from {json.dumps(str(root / "examples/othello/league_board.js"))};
+const start = board.start();
+const first = board.engineProblem(start);
+// black: e4, d5; white: d4, e5
+if (first.player !== (1n << 28n | 1n << 35n) || first.opponent !== (1n << 27n | 1n << 36n) || first.passed) throw new Error("start");
+const second = board.engineProblem(board.play(start, 19));
+if (second.player !== 1n << 36n || second.passed) throw new Error("white");
+// black to move has nothing: it's asked for white, whose position it then is
+const squares = new Array(64).fill(0);
+squares[0] = 1; squares[63] = 2;
+const stuck = board.engineProblem({{ squares, turn: 1, passed: false, terminated: false, reward: 0 }});
+if (!stuck.passed || stuck.player !== 1n << 63n || stuck.opponent !== 1n) throw new Error("pass");
+// Egaroucid's log says each step of its search, its a1 as ours
+const step = board.engines.egaroucid.logged("main mid depth 6@93% value -4 (raw -5) policy c2 n_nodes 123 time 1 NPS 2");
+if (step.depth !== 6 || step.percent !== 93 || step.score !== -4 || step.move !== 10 || step.nodes !== 123) throw new Error("log");
+if (board.engines.egaroucid.logged("thread pool size 0 n_idle 0") !== null) throw new Error("not a step");
+console.log("ok");
+"""
+    out = subprocess.run(
+        ["node", "--input-type=module", "-e", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert out.stdout.strip() == "ok", out.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+def test_a_browser_engine_keeps_an_idle_worker_and_ends_one_to_stop_a_search():
+    root = Path(__file__).parent.parent
+    script = f"""
+const workers = [];
+globalThis.Worker = class {{
+  constructor(url) {{ this.url = url; this.sent = []; this.ended = false; workers.push(this); }}
+  postMessage(message) {{ this.sent.push(message); }}
+  terminate() {{ this.ended = true; }}
+}};
+const {{ BrowserEngine }} = await import({json.dumps(str(root / "core/league/web/browser_engine.js"))});
+const got = [];
+const runner = new BrowserEngine("build", (data) => got.push(data));
+const first = runner.search("edax", "p1", 8);
+if (!workers[0].url.includes("build=build&engine=edax")) throw new Error("url");
+workers[0].onmessage({{ data: {{ type: "progress", id: first, score: 1 }} }});
+workers[0].onmessage({{ data: {{ type: "result", id: first, score: 2 }} }});
+if (got.length !== 2) throw new Error("messages");
+// idle: the same worker takes the next one
+const second = runner.search("edax", "p2", 8);
+if (workers.length !== 1 || workers[0].sent.length !== 2) throw new Error("reuse");
+// running: it's ended, and nothing more is heard from it
+const third = runner.search("edax", "p3", 8);
+if (workers.length !== 2 || !workers[0].ended || second === third) throw new Error("stop");
+workers[0].onmessage({{ data: {{ type: "result", id: second, score: 3 }} }});
+if (got.length !== 2) throw new Error("heard an old search");
+runner.stop();
+if (!workers[1].ended) throw new Error("stop running");
+// another engine needs its own worker, idle or not
+runner.search("edax", "p4", 8);
+workers[2].onmessage({{ data: {{ type: "result", id: runner.running, score: 4 }} }});
+runner.search("egaroucid", "p5", 8);
+if (!workers[2].ended || !workers[3].url.includes("engine=egaroucid")) throw new Error("switch");
+// a worker that fails says so, and the next search gets a new one
+const fifth = runner.running;
+workers[3].onerror({{ message: "out of memory" }});
+const last = got[got.length - 1];
+if (last.type !== "error" || last.id !== fifth || last.message !== "out of memory") throw new Error("error");
+runner.search("egaroucid", "p6", 8);
+if (workers.length !== 5) throw new Error("after an error");
+console.log("ok");
+"""
+    out = subprocess.run(
+        ["node", "--input-type=module", "-e", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert out.stdout.strip() == "ok", out.stderr

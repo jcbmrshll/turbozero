@@ -238,16 +238,9 @@ class Search:
         return LIB.search_num_nodes(self.handle)
 
 
-def openvino_eval(
-    model: bytes | str, cores: int, precision: str = "bf16", streams: int | None = None
-) -> Eval:
-    """The network of an ONNX graph in OpenVINO, computing in `precision`: a batch is split over
-    up to `streams` requests in flight at once, sharing `cores`. One to a core (the default) is the
-    fastest way found at batches of 8 and up, one in all at a batch of 1. bf16 runs on AVX512_BF16
-    where the CPU has it."""
-    import openvino as ov
-
-    core = ov.Core()
+def compile_model(model: bytes | str, precision: str, cores: int, streams: int, core):
+    """An ONNX graph or a saved model, compiled by OpenVINO to compute in `precision` over `streams`
+    requests in flight at once, sharing `cores`."""
     if isinstance(model, bytes):
         with tempfile.NamedTemporaryFile(suffix=".onnx") as f:
             f.write(model)
@@ -256,8 +249,7 @@ def openvino_eval(
     else:
         network = core.read_model(model)
     network.reshape({"input": [-1, 2, 8, 8]})
-    streams = streams or cores
-    compiled = core.compile_model(
+    return core.compile_model(
         network,
         "CPU",
         {
@@ -266,6 +258,19 @@ def openvino_eval(
             "INFERENCE_PRECISION_HINT": precision,
         },
     )
+
+
+def openvino_eval(
+    model: bytes | str, cores: int, precision: str = "bf16", streams: int | None = None
+) -> Eval:
+    """The network of an ONNX graph or a saved model in OpenVINO, computing in `precision`: a batch
+    is split over up to `streams` requests in flight at once, sharing `cores`. One to a core (the
+    default) is the fastest way found at batches of 8 and up, one in all at a batch of 1. bf16 runs
+    on AVX512_BF16 where the CPU has it."""
+    import openvino as ov
+
+    streams = streams or cores
+    compiled = compile_model(model, precision, cores, streams, ov.Core())
     requests = [compiled.create_infer_request() for _ in range(streams)]
 
     def evaluate(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

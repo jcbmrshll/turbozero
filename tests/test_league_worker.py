@@ -7,7 +7,7 @@ import pytest
 from core.league import gate as gate_module
 from core.league.game import LeagueGame
 from core.league.gate import SlickGate, ThrottledGate
-from core.league.match import BatchResult, Stopped
+from core.league.match import BatchResult, SettingsRefused, Stopped
 from core.league.match import Clock as MoveClock
 from core.league.store import GameRecord, Store
 from core.league.worker import play, supervise
@@ -94,6 +94,50 @@ def run_play(store, gate=None, **kwargs):
         playing=fake_playing,
         **kwargs,
     )
+
+
+def test_a_refused_player_is_paused_and_the_league_goes_on_without_it(store, capsys):
+    x, y = store.players()[:2]
+    store.request_match(x.id, y.id, 400)
+    calls = []
+
+    def once_then_playing(game, programs, a, b, *rest):
+        calls.append({a.id, b.id})
+        if len(calls) == 1:
+            raise SettingsRefused(a, {"c_init": 2.0}, ["c_init"])
+        return fake_playing(game, programs, a, b, *rest)
+
+    assert (
+        play(
+            store,
+            FakeGame(),
+            FakeGate(),
+            version="abc",
+            seed=0,
+            playing=once_then_playing,
+            max_batches=1,
+        )
+        == "played its batches"
+    )
+    assert capsys.readouterr().out == f"settings changed, paused: {x.name}: c_init\n"
+    paused = next(p for p in store.players() if p.id == x.id)
+    assert paused.retired
+    assert paused.refused_settings == {"c_init": 2.0}
+    assert calls[0] == {x.id, y.id}
+    # its series waits, and nothing it was refused for was recorded
+    assert x.id not in calls[1]
+    assert store.pending_matches()[0].played == 0
+
+
+def test_with_everyone_refused_the_player_says_so(store):
+    def refusing(game, programs, a, b, *rest):
+        raise SettingsRefused(a, {"c_init": 2.0}, ["c_init"])
+
+    reason = play(
+        store, FakeGame(), FakeGate(), version="abc", seed=0, playing=refusing
+    )
+    assert reason == "no two players can play"
+    assert store.num_games() == 0
 
 
 def test_plays_batches_and_records_them_with_their_code_version(store):
@@ -348,6 +392,38 @@ def test_gate_counts_what_it_cant_read_as_busy(gpu):
     assert SlickGate().busy() is not None
 
 
+def test_gate_rides_out_a_short_queue_outage(gpu, monkeypatch):
+    now = {"t": 0.0}
+    monkeypatch.setattr(gate_module.time, "monotonic", lambda: now["t"])
+    gate = SlickGate(queue_outage=60.0)
+    gpu["board"] = None
+    assert gate.busy() is None
+    now["t"] = 59.0
+    assert gate.busy() is None
+    now["t"] = 60.0
+    assert gate.busy() == "can't read the queue"
+
+
+def test_gate_forgets_an_outage_once_it_reads_the_queue(gpu, monkeypatch):
+    now = {"t": 0.0}
+    monkeypatch.setattr(gate_module.time, "monotonic", lambda: now["t"])
+    gate = SlickGate(queue_outage=60.0)
+    gpu["board"] = None
+    gate.busy()
+    gpu["board"] = {"resources": []}
+    now["t"] = 59.0
+    assert gate.busy() is None
+    gpu["board"] = None
+    now["t"] = 100.0
+    assert gate.busy() is None
+
+
+def test_gate_still_sees_the_gpu_during_an_outage(gpu):
+    gpu["board"] = None
+    gpu["processes"] = {7}
+    assert "7" in str(SlickGate(queue_outage=60.0).busy())
+
+
 def test_throttled_gate_looks_at_most_so_often():
     fake = FakeGate(["first", "second"])
     gate = ThrottledGate(fake, every=1000)
@@ -383,6 +459,18 @@ def test_a_requested_series_comes_first_then_the_scheduler_takes_over(store):
     assert tuple(state) == ("done", 40)
     run_play(store, max_batches=10)
     assert {(row[0], row[1]) for row in batches_of(store)[3:]} != {(x, y)}
+
+
+def test_series_are_played_in_the_queues_order(store):
+    p = ids(store)
+    store.request_match(p["n@8"], p["n@16"], 2)
+    moved = store.request_match(p["edax-1"], p["edax-2"], 2)
+    store.move_match(moved, 0)
+    run_play(store, max_batches=2)
+    assert [(r[0], r[1]) for r in batches_of(store)] == [
+        (p["edax-1"], p["edax-2"]),
+        (p["n@8"], p["n@16"]),
+    ]
 
 
 def test_series_are_played_oldest_first(store):

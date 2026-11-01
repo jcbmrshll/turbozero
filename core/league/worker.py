@@ -15,7 +15,10 @@ that's someone saying so.
 
 A batch is short (`SchedulerConfig.batch_seconds`) so that little is lost when one's abandoned.
 
-Series someone asked for (`Store.request_match`) are played first, oldest first, as batches like
+A player whose settings have changed is refused before its batch's first move, and paused: see
+`core.league.store`. If none can play for that, the player exits saying so.
+
+Series someone asked for (`Store.request_match`) are played first, in their queue's order, as batches like
 any others. One waits while either of its players is retired, and doesn't hold up the rest.
 """
 
@@ -31,7 +34,7 @@ import numpy as np
 
 from core.league.game import LeagueGame
 from core.league.gate import SLICK_URL, Gate, lane, queue_board
-from core.league.match import Programs, Stopped, play_batch
+from core.league.match import Programs, SettingsRefused, Stopped, play_batch
 from core.league.ratings import Ratings, fit_ratings
 from core.league.scheduler import (
     SchedulerConfig,
@@ -117,7 +120,7 @@ def _seconds_of_pair(
 def _next_request(
     game: LeagueGame, requests: list[MatchRequest], by_id: dict[int, Player]
 ) -> MatchRequest | None:
-    """The oldest series that both of its players can play now."""
+    """The first series in the queue that both of its players can play now."""
     for request in requests:
         players = by_id[request.a], by_id[request.b]
         if all(not p.retired and game.can_play(p) for p in players):
@@ -249,6 +252,10 @@ def play(
                 )
             except Stopped:
                 break
+            except SettingsRefused as refused:
+                store.refuse_settings(refused.player.id, refused.settings)
+                print(f"settings changed, paused: {refused}", flush=True)
+                continue
             store.record_batch(
                 a.id,
                 b.id,
@@ -260,6 +267,7 @@ def play(
                 (result.a_clock.seconds, result.a_clock.moves),
                 (result.b_clock.seconds, result.b_clock.moves),
                 picked.request,
+                result.settings,
             )
             batches += 1
     finally:

@@ -1,6 +1,9 @@
 """Games between two players, on tic-tac-toe: whether each sees only the moves, and one tiny
 run through the whole league."""
 
+import inspect
+import json
+from dataclasses import replace
 from pathlib import Path
 
 import jax
@@ -16,13 +19,15 @@ from core.league.game import ExternalPlayer, LeagueGame
 from core.league.match import (
     NetworkSide,
     Programs,
+    SettingsRefused,
     Stopped,
     play_batch,
     play_games,
+    select,
 )
 from core.league.ratings import fit_ratings
 from core.league.scheduler import SchedulerConfig
-from core.league.store import Player, Store
+from core.league.store import NetSearch, Player, Store
 from core.league.worker import play
 from core.types import StepMetadata
 
@@ -161,6 +166,189 @@ def test_a_players_moves_depend_only_on_the_moves_it_sees(game, tmp_path):
     assert replayed == moves
 
 
+class UnrecordedSide(NetworkSide):
+    """A network's side as it played before searches were recorded."""
+
+    def move(self, states, movers):
+        keys = jax.vmap(jax.random.fold_in)(self.keys, states._step_count)
+        out = self.program.search(keys, self.trees, states, self.params)
+        self.trees = select(movers, out.eval_state, self.trees)
+        return np.asarray(out.action)
+
+    def searches(self, movers):
+        return {}
+
+
+def test_recording_a_search_doesnt_change_the_moves_or_the_trees(game, tmp_path):
+    programs = Programs(game, "float32")
+    a = net_player(1, 16, seed=1, tmp_path=tmp_path)
+    b = net_player(2, 16, seed=2, tmp_path=tmp_path)
+
+    def played(kind):
+        first, second = (
+            kind(
+                programs.program(p, len(OPENINGS)),
+                programs.network(p)[1],
+                jax.random.PRNGKey(key),
+            )
+            for p, key in ((a, 1), (b, 2))
+        )
+        results, moves, *_ = play_games(
+            game, first, second, OPENINGS, jax.random.PRNGKey(5)
+        )
+        return results, moves, first.trees, second.trees
+
+    (recorded, moves, *trees), (unrecorded, same_moves, *same_trees) = (
+        played(NetworkSide),
+        played(UnrecordedSide),
+    )
+    assert moves == same_moves
+    np.testing.assert_array_equal(recorded, unrecorded)
+    jax.tree.map(np.testing.assert_array_equal, trees, same_trees)
+
+
+def test_what_a_search_made_of_a_move_is_recorded(game, tmp_path):
+    programs = Programs(game, "float32")
+    a = net_player(1, 16, seed=1, tmp_path=tmp_path)
+    b = net_player(2, 16, seed=2, tmp_path=tmp_path)
+    first = side_of(game, programs, a, len(OPENINGS), key=1)
+    second = side_of(game, programs, b, len(OPENINGS), key=2)
+    _, moves, _, _, _, searches, steps = play_games(
+        game, first, second, OPENINGS, jax.random.PRNGKey(5)
+    )
+    for game_moves, by_ply in zip(moves, searches):
+        # each move past the opening's, and nothing else
+        assert sorted(by_ply) == list(range(1, len(game_moves)))
+        for ply, search in by_ply.items():
+            assert isinstance(search, NetSearch)
+            # the fake network's value is 0
+            assert search.net_value == 0.0
+            assert search.evals == 17
+            assert search.tree <= 32
+            visits = [top.visits for top in search.top]
+            assert visits == sorted(visits, reverse=True)
+            assert visits[0] > 0
+            assert game_moves[ply] in {
+                top.action for top in search.top if top.visits == visits[0]
+            }
+            assert all(-1.0 <= top.value <= 1.0 for top in search.top)
+    # a search's first has nothing to reuse; the root and its iterations. A later one keeps the
+    # visits of the moves played since, where it had made them
+    nets = [{p: s for p, s in g.items() if isinstance(s, NetSearch)} for g in searches]
+    assert all(g[1].visits == 17 for g in nets)
+    later = [s.visits for g in nets for ply, s in g.items() if ply > 2]
+    assert min(later) >= 17 and max(later) > 17
+    assert [s[0] for s in steps] == list(range(1, len(steps) + 1))
+    assert steps[0][2] == len(OPENINGS)
+    assert all(s[1] > 0 for s in steps)
+
+
+def test_a_moves_values_are_for_the_player_making_it(game, tmp_path):
+    """The root's value is the average of its first evaluation and its children's values, for
+    whoever moves, so their signs have to be the root's."""
+    programs = Programs(game, "float32")
+    a = net_player(1, 32, seed=1, tmp_path=tmp_path)
+    first = side_of(game, programs, a, 1, key=1)
+    # nothing to reuse, and few enough moves that they all get kept
+    plan = np.array([[0, 3, 1, 4]])
+    second = Scripted([[5, 6, 7, 8]])
+    _, _, _, _, _, searches, _ = play_games(
+        game, first, second, plan, jax.random.PRNGKey(0)
+    )
+    search = searches[0][4]
+    assert isinstance(search, NetSearch)
+    assert sum(top.visits for top in search.top) == search.visits - 1
+    total = search.net_value + sum(top.visits * top.value for top in search.top)
+    assert search.value == pytest.approx(total / search.visits, abs=1e-6)
+    assert search.value != 0.0
+
+
+def test_a_batch_records_everything_each_player_was_given(game, tmp_path):
+    programs = Programs(game, "float32")
+    a = net_player(1, 8, seed=1, tmp_path=tmp_path)
+    b = net_player(2, 16, seed=2, tmp_path=tmp_path)
+    settings = play_batch(game, programs, a, b, np.array([0, 4]), seed=3).settings
+    assert settings is not None
+    assert settings.games_at_once == 2
+    assert settings.device
+    assert [len(half) > 0 for half in settings.steps] == [True, True]
+    for played, sims in ((settings.a, 8), (settings.b, 16)):
+        json.dumps(played)  # it's stored as text
+        assert played["num_iterations"] == sims
+        assert played["max_nodes"] == 2 * sims
+        assert played["temperature"] == 0.0
+        assert played["dirichlet_epsilon"] == 0.0
+        assert played["action_selection_config"]["c_init"] == 1.25
+        assert played["dtype"] == "float32"
+        assert played["net"] == "tiny"
+    assert settings.a["checkpoint_sha256"] == "1"
+    assert settings.b["checkpoint_sha256"] == "2"
+
+
+def search_of(kind):
+    return kind(
+        eval_fn=eval_fn,
+        action_selector=PUCTSelector(),
+        branching_factor=9,
+        max_nodes=4,
+        num_iterations=2,
+    )
+
+
+@pytest.mark.parametrize(
+    ("made", "kind"),
+    [
+        (search_of(MCTS), MCTS),
+        (search_of(AlphaZero(MCTS)), AlphaZero(MCTS)),
+        (PUCTSelector(), PUCTSelector),
+    ],
+    ids=["mcts", "alphazero", "puct"],
+)
+def test_every_setting_of_a_search_is_in_its_config(made, kind):
+    """A setting left out of `get_config` would go unrecorded, and a change to it unnoticed."""
+    aliases = {
+        "action_selection_config": "action_selector",
+        "policy_target_config": "policy_target",
+    }
+    configured = {aliases.get(name, name) for name in made.get_config()}
+    for cls in kind.__mro__:
+        if "__init__" in vars(cls) and cls is not object:
+            given = set(inspect.signature(cls.__init__).parameters) - {
+                "self",
+                "args",
+                "kwargs",
+            }
+            assert given <= configured, cls.__name__
+
+
+def test_a_player_with_other_settings_than_its_own_is_refused_before_a_move(
+    game, tmp_path
+):
+    programs = Programs(game, "float32")
+    a = net_player(1, 8, seed=1, tmp_path=tmp_path)
+    b = net_player(2, 8, seed=2, tmp_path=tmp_path)
+    own = programs.settings(a, 2)
+    # its own settings play on, whatever a traversal's checks
+    pinned = replace(a, played_settings={**own, "traversal_steps": 99})
+    assert play_batch(game, programs, pinned, b, np.array([0, 4]), seed=3).games
+    stale = replace(a, played_settings={**own, "dtype": "bfloat16"})
+    moved = []
+    with pytest.raises(SettingsRefused) as refused:
+        play_batch(
+            game,
+            programs,
+            stale,
+            b,
+            np.array([0, 4]),
+            seed=3,
+            should_stop=lambda: moved.append(True) or False,
+        )
+    assert refused.value.player is stale
+    assert refused.value.changed == ["dtype"]
+    assert refused.value.settings == own
+    assert not moved
+
+
 def test_each_network_keeps_its_own_tree_and_parameters(game, tmp_path):
     programs = Programs(game, "float32")
     a = net_player(1, 8, seed=1, tmp_path=tmp_path)
@@ -286,4 +474,13 @@ def test_a_tiny_league_plays_and_rates(game, tmp_path):
         store.db.execute("SELECT DISTINCT code_version FROM batches").fetchall()[0][0]
         == "v"
     )
+    # what the games were played with, and what their searches made of them
+    pinned = next(p for p in store.players() if p.id == first.id).played_settings
+    assert pinned is not None
+    assert pinned["num_iterations"] == 2
+    assert store.settings_changes() == {}
+    assert store.db.execute(
+        "SELECT a_settings LIKE '%\"num_iterations\":2%' FROM batches LIMIT 1"
+    ).fetchone()[0]
+    assert store.game_searches(1)
     store.close()
