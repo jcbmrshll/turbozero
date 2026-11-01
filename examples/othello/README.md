@@ -18,6 +18,7 @@ Othello model and against two strong open-source Othello engines,
 | `export_onnx.py` | Exports a checkpoint's network to ONNX |
 | `bench_cpu_backends.py` | Evals a second by CPU backend and batch, each checked against JAX's outputs |
 | `engine_set.py`, `label_positions.py`, `score_engine_set.py` | The engine-labelled set: fixed positions with every legal move scored by Edax, to build, and to score checkpoints on (train.py scores the network on it every epoch) |
+| `distill.py` | Trains a network on a saved training state's replay buffer, with no self-play, on a teacher network's values or the games' outcomes |
 | `bench_nets.py` | Times networks on their own: a forward pass at self-play's batch, a training step at training's |
 | `game.py` | What the scripts share: the environment, board symmetries, network, evaluators |
 | `xot.py`, `xot-openings.txt` | The XOT opening list |
@@ -290,6 +291,53 @@ uv run examples/othello/train.py --epochs 30 --init-from runs/trunk/state-150.np
 uv run examples/othello/train.py --epochs 30 --init-from runs/trunk/state-150.npz \
     --sims 128 --ckpt-dir runs/trunk150-sims128
 ```
+
+### Training on Modal
+
+`modal_jobs.py` runs train.py on Modal's GPUs, several at once, and brings the results to the
+paths a local run would write them to, so analysis and the Elo league don't need to know:
+
+```sh
+# steps run in order on one GPU, from the commit named (it must be on GitHub)
+uv run examples/othello/modal_jobs.py launch --name trunk-a --gpu L40S --hours 4 --commit 7b52872 \
+    --step "examples/othello/train.py --epochs 93 --save-state-at 93 --monitor --name a --notes why --ckpt-dir $C/trunk > $L/trunk.log" \
+    --step "examples/othello/train.py --epochs 19 --lr 1e-4 --lr-final 1e-4 --init-from $C/trunk/state-93.npz --ckpt-dir $C/fork > $L/fork.log"
+uv run examples/othello/modal_jobs.py list [--billed today]
+uv run examples/othello/modal_jobs.py stop trunk-a       # or --all; --now doesn't wait for the run to end as stopped
+uv run examples/othello/modal_jobs.py resume trunk-a     # after it ended short; --hours for a new limit
+uv run examples/othello/modal_jobs.py sync               # `launch` keeps one running, in tmux session modal-sync
+```
+
+A step is the command as you'd write it here, with `> LOG`; paths must be under
+`~/.cache/turbozero`. `--init-from` names a `state-<EPOCH>.npz`, here, in the bucket, or from an
+earlier step. `--vs-engine-*` is refused, as the image has no Edax. A job runs without this machine.
+Files go to the bucket as they're written: the sync brings them here, and a `--monitor` run appears
+on slick's seaglass while it runs, tagged with `$SEAGLASS_TAGS` and `modal`, its chip in its
+provenance. `modal-job.json` beside the checkpoints records commit, chip, flags and wall time.
+Nothing leaves the bucket on its own. An interrupted job continues from its newest state, saved
+every `--resume-every` epochs (10) and kept in the bucket only; it repeats the epochs since, so its
+log and metrics hold those epochs twice, the later ones the ones that count, as with `--resume`.
+
+What each chip did on 8x128, 128 sims a move, 8 passes, window 1125 (72 s/epoch on the RTX 5080),
+with 2 cores and 16 GiB, at Modal's list prices of 2026-10-31:
+
+| `--gpu` | s/epoch | speed vs 5080 | $/h | $ per 5080-hour |
+|---|---|---|---|---|
+| L40S | 48 | 1.49 | 2.17 | 1.46 |
+| RTX-PRO-6000 | 34.5 | 2.09 | 3.25 | 1.56 |
+| H100! | 29 | 2.47 | 4.17 | 1.69 |
+| A100-40GB | 56 | 1.29 | 2.32 | 1.80 |
+| A10 | 129 | 0.56 | 1.32 | 2.37 |
+
+L40S costs least for the work done on this net; H100! gives results soonest. The advantage shrinks
+on smaller nets: 4x64 at the same settings took 18.9 s/epoch on an L40S against 17.8 on the RTX 5080
+(0.94x), so time a small net before budgeting it. Budgets stay in epochs, computed from RTX 5080
+timings, as chips differ in speed.
+
+Modal also bills what jobs upload, $0.04/GB: about $0.36/h with `--resume-every 25` on 4x64 at window
+1125, and `list` leaves it out (`list --billed` has it). Raise `--resume-every` to send fewer states,
+at the risk of more to redo after an interruption. Bringing a state of about 0.8 GB here costs about
+$0.10 in GCS egress, which is why states saved only to continue from stay in the bucket.
 
 ## Evaluating a checkpoint
 
