@@ -231,14 +231,15 @@ def summarize(games: list[Game], a_black: list[bool], seconds: float) -> dict:
 
 def net_player(options: dict[str, str]) -> Callable[[], Player]:
     """What builds a network's player, which all games share a network for. Its `options` are
-    `cpu_match.Player.parse`'s, with `net`."""
+    `cpu_match.Player.parse`'s, with `net`, and `taper` (see `cpu_match.move_budget`)."""
     from cpu_match import NetPlayer, make_eval
     from cpu_match import Player as NetSpec
 
     fields = ",".join(f"{k}={v}" for k, v in options.items())
     spec = NetSpec.parse(f"visits=0,{fields}", options["net"], "bf16")
     evaluate = make_eval(spec.net, spec.backend, len(os.sched_getaffinity(0)))
-    return lambda: NetPlayer(spec.settings, evaluate)
+    taper = int(options.get("taper", 0))
+    return lambda: NetPlayer(spec.settings, evaluate, taper)
 
 
 def make_player(spec: str, seconds: int) -> Callable[[], Player]:

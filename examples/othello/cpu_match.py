@@ -275,24 +275,34 @@ def timed_move(
         logits, values = evaluate(batch[:count])
         search.apply(logits, values)
         leaves += count
+        # every traversal ended the game: the tree has nothing left to evaluate
+        if count == 0:
+            break
     search.begin(0)
     return leaves, search.total_visits() - before
 
 
-def move_budget(seconds_left: float, empties: int) -> float:
-    """Seconds to search a move on a game's clock: an even share of what's left over the moves still
-    to play, each side playing about half of the empty squares, with 5% held back for what isn't
-    searching."""
-    return 0.95 * seconds_left / max((empties + 1) // 2, 1)
+def move_budget(seconds_left: float, empties: int, taper: int = 0) -> float:
+    """Seconds to search a move on a game's clock: its share of what's left over the moves still to
+    play, each side playing every other empty square, with 5% held back for what isn't searching.
+    Moves count alike, or with `taper`, those with fewer empties than that less and less, by the
+    square of the fraction of it left: positions near the end are small, and their values good."""
+
+    def weight(e: int) -> float:
+        return min(1.0, e / taper) ** 2 if taper else 1.0
+
+    total = sum(weight(e) for e in range(empties, 0, -2))
+    return 0.95 * seconds_left * weight(empties) / max(total, 1e-9)
 
 
 class NetPlayer:
     """Our side of a game on a per-game clock (`clock_match.Player`): a `Search` with its own
     tree."""
 
-    def __init__(self, settings: SearchSettings, evaluate: Eval):
+    def __init__(self, settings: SearchSettings, evaluate: Eval, taper: int = 0):
         self.search = Search(settings)
         self.evaluate = evaluate
+        self.taper = taper
         self.batch = np.empty((settings.batch, 2, 8, 8), np.float32)
         self.to_move = "b"
 
@@ -316,7 +326,7 @@ class NetPlayer:
         else:
             me, opp, _, _ = self.search.position()
             empties = 64 - (me | opp).bit_count()
-            seconds = move_budget(seconds_left, empties)
+            seconds = move_budget(seconds_left, empties, self.taper)
             timed_move(self.search, seconds, self.batch, self.evaluate)
             action = self.search.best_action()
         self.search.play(action)

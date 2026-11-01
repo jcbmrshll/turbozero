@@ -187,6 +187,11 @@ def test_move_budget_shares_the_clock():
 
     assert move_budget(10, 40) == pytest.approx(0.95 * 10 / 20)
     assert move_budget(10, 1) == pytest.approx(9.5)
+    # a taper moves time to the moves before it
+    assert move_budget(10, 40, taper=24) > move_budget(10, 40)
+    assert move_budget(10, 10, taper=24) == pytest.approx(
+        0.95 * 10 * 100 / (100 + 64 + 36 + 16 + 4)
+    )
 
 
 def test_net_players_play_a_game_through_the_clock_driver():
