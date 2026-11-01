@@ -13,7 +13,10 @@ transaction, so a series can't lose count of its games however the worker stops.
 still to finish are played in the order of their `position`.
 
 A batch keeps the settings each player played it with, exactly as the search or the engine was
-given them, so that a default changing later can be told apart from the player's games before.
+given them. A player is who it is with its settings: its first batch pins them, and a player whose
+settings have changed since is refused (see `match.SettingsRefused`) and paused, its games and rating
+as they were. A new player can then be made of it (`add_variant`), or the change accepted if it doesn't
+affect play (`accept_settings`).
 A game's searches (`NetSearch`, `EngineSearch`) are in a table of their own, a compressed blob a
 game: fitting ratings reads every row of `games`, and shouldn't read those too. Games from before
 schema 2 have neither.
@@ -39,7 +42,7 @@ from typing import Any
 
 import numpy as np
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS networks (
     id INTEGER PRIMARY KEY,
@@ -65,6 +68,8 @@ CREATE TABLE IF NOT EXISTS players (
     added REAL NOT NULL,
     description TEXT NOT NULL DEFAULT '',
     tags TEXT NOT NULL DEFAULT '[]',
+    played_settings TEXT,
+    refused_settings TEXT,
     CHECK ((network_id IS NULL) != (external IS NULL))
 );
 CREATE TABLE IF NOT EXISTS batches (
@@ -139,9 +144,22 @@ MIGRATIONS = {
             "searches BLOB NOT NULL)"
         ),
     ),
+    2: (
+        "ALTER TABLE players ADD COLUMN played_settings TEXT",
+        "ALTER TABLE players ADD COLUMN refused_settings TEXT",
+        (
+            "UPDATE players SET played_settings = ("
+            "SELECT CASE WHEN b.a_id = players.id THEN b.a_settings ELSE b.b_settings END "
+            "FROM batches b WHERE (b.a_id = players.id OR b.b_id = players.id) "
+            "AND b.a_settings IS NOT NULL ORDER BY b.id DESC LIMIT 1)"
+        ),
+    ),
 }
 # how many of a search's moves are kept, the most visited first
 TOP_MOVES = 4
+# settings recorded that can't change a move: a traversal's checks only say when to stop looking
+# (see `MCTS`), and a policy target is for training
+NOT_PLAY_SETTINGS = frozenset({"traversal_steps", "policy_target_config"})
 
 
 @dataclass(frozen=True)
@@ -162,6 +180,8 @@ class Player:
         retired: whether it no longer plays new games (it stays rated)
         description: what someone wrote about it: a network's is shared by its search budgets
         tags: labels someone gave it, shared the same way
+        played_settings: the settings its games are played with, once it has any
+        refused_settings: the settings it was last refused for playing with, if it's still refused
     """
 
     id: int
@@ -177,6 +197,8 @@ class Player:
     retired: bool = False
     description: str = ""
     tags: tuple[str, ...] = ()
+    played_settings: dict[str, Any] | None = None
+    refused_settings: dict[str, Any] | None = None
 
     @property
     def is_external(self) -> bool:
@@ -441,6 +463,19 @@ def canonical_settings(settings: dict[str, Any]) -> str:
     return json.dumps(settings, sort_keys=True, separators=(",", ":"))
 
 
+def changed_settings(before: dict[str, Any], now: dict[str, Any]) -> list[str]:
+    """The settings that differ between two sets, of those that can change a move."""
+    return sorted(
+        key
+        for key in (before.keys() | now.keys()) - NOT_PLAY_SETTINGS
+        if key not in before or key not in now or before[key] != now[key]
+    )
+
+
+def _settings_or_none(text: str | None) -> dict[str, Any] | None:
+    return None if text is None else json.loads(text)
+
+
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as f:
@@ -607,15 +642,16 @@ class Store:
                     (json.dumps(unique), key),
                 )
 
-    def add_net_player(self, network: str, sims: int) -> int:
-        """The player that is `network` searching `sims` iterations a move."""
+    def add_net_player(self, network: str, sims: int, variant: str = "") -> int:
+        """The player that is `network` searching `sims` iterations a move; with `variant`, a
+        player of its own, for settings other than the first's."""
         row = self.db.execute(
             "SELECT id FROM networks WHERE name = ?", (network,)
         ).fetchone()
         if row is None:
             raise ValueError(f"no network {network} in the store")
         return self._add_player(
-            f"{network}@{sims}",
+            f"{network}@{sims}" + (f"-{variant}" if variant else ""),
             "INSERT INTO players (name, network_id, sims, added) VALUES (?, ?, ?, ?)",
             (row["id"], sims),
         )
@@ -641,6 +677,43 @@ class Store:
         assert cursor.lastrowid is not None
         return cursor.lastrowid
 
+    def add_variant(self, player: Player, variant: str) -> str:
+        """A new player that's the same network or engine as `player`, to play with whatever
+        settings it's given from now on; returns its name. `player` stays as it is."""
+        if player.network is not None:
+            assert player.sims is not None
+            self.add_net_player(player.network, player.sims, variant)
+            return f"{player.network}@{player.sims}-{variant}"
+        assert player.external is not None
+        name = f"{player.name}-{variant}"
+        self.add_external_player(name, player.external, player.settings)
+        return name
+
+    def refuse_settings(self, player: int, settings: dict[str, Any]) -> None:
+        """Pauses a player that would have played with other settings than its own."""
+        with self.transaction() as db:
+            db.execute(
+                "UPDATE players SET retired = 1, refused_settings = ? WHERE id = ?",
+                (canonical_settings(settings), player),
+            )
+
+    def accept_settings(self, name: str) -> None:
+        """Takes the settings a player was refused for as its own, and lets it play again: for a
+        change that doesn't affect play, as its games then count as one player's.
+
+        Raises:
+            ValueError: if it isn't refused
+        """
+        with self.transaction() as db:
+            changed = db.execute(
+                "UPDATE players SET played_settings = refused_settings, "
+                "refused_settings = NULL, retired = 0 "
+                "WHERE name = ? AND refused_settings IS NOT NULL",
+                (name,),
+            ).rowcount
+        if not changed:
+            raise ValueError(f"{name} hasn't been refused")
+
     def set_retired(self, name: str, retired: bool = True) -> None:
         with self.transaction() as db:
             changed = db.execute(
@@ -653,6 +726,7 @@ class Store:
         """Every player, in the order they were added."""
         rows = self.db.execute(
             "SELECT p.id, p.name, p.sims, p.external, p.settings, p.retired, "
+            "p.played_settings, p.refused_settings, "
             "n.name AS network, n.path, n.net, n.run, n.url, "
             "COALESCE(n.description, p.description) AS description, "
             "COALESCE(n.tags, p.tags) AS tags "
@@ -676,6 +750,8 @@ class Store:
                     retired=bool(row["retired"]),
                     description=row["description"],
                     tags=tuple(json.loads(row["tags"])),
+                    played_settings=_settings_or_none(row["played_settings"]),
+                    refused_settings=_settings_or_none(row["refused_settings"]),
                 )
             )
         return players
@@ -724,6 +800,16 @@ class Store:
                 ),
             )
             batch = cursor.lastrowid
+            if settings is not None:
+                # a player's first settings are its own; playing clears any refusal
+                db.executemany(
+                    "UPDATE players SET played_settings = COALESCE(played_settings, ?), "
+                    "refused_settings = NULL WHERE id = ?",
+                    [
+                        (canonical_settings(settings.a), a),
+                        (canonical_settings(settings.b), b),
+                    ],
+                )
             for g, searches in zip(games, blobs):
                 game = db.execute(
                     "INSERT INTO games (batch_id, first_id, second_id, opening, result, "
@@ -756,16 +842,6 @@ class Store:
             "SELECT searches FROM game_searches WHERE game_id = ?", (game,)
         ).fetchone()
         return {} if row is None else decode_searches(row[0])
-
-    def settings_of(self, player: int) -> dict[str, Any] | None:
-        """The settings `player` played its latest batch with, if any were kept."""
-        row = self.db.execute(
-            "SELECT CASE WHEN a_id = ? THEN a_settings ELSE b_settings END FROM batches "
-            "WHERE (a_id = ? OR b_id = ?) AND a_settings IS NOT NULL "
-            "ORDER BY id DESC LIMIT 1",
-            (player, player, player),
-        ).fetchone()
-        return None if row is None else json.loads(row[0])
 
     def settings_changes(self) -> dict[int, list[SettingsPeriod]]:
         """The players who've played under more than one set of settings, by id, each set in

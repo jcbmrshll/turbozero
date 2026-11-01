@@ -22,6 +22,7 @@ from core.league.store import (
     NetSearch,
     Store,
     TopMove,
+    changed_settings,
     decode_moves,
     decode_searches,
     encode_moves,
@@ -337,8 +338,27 @@ def test_old_games_are_left_alone_and_have_nothing_new(old_file):
     ).fetchone()
     assert tuple(row) == (b"\x01\x00", 1, "old", None, None, None, None, None)
     assert store.game_searches(1) == {}
-    assert store.settings_of(1) is None
+    assert store.players()[0].played_settings is None
     assert store.settings_changes() == {}
+    store.close()
+
+
+def test_a_file_at_schema_2_pins_each_players_settings_from_its_latest_batch(old_file):
+    db = sqlite3.connect(old_file / "league.db")
+    for step in (0, 1):
+        for statement in MIGRATIONS[step]:
+            db.execute(statement)
+    db.executemany(
+        "INSERT INTO batches (id, a_id, b_id, seconds, compiled, code_version, dtype, finished, "
+        "a_settings, b_settings) VALUES (?, ?, ?, 1, 0, 'v', 'f', 0, ?, ?)",
+        [(2, 1, 2, '{"c": 1}', '{"l": 8}'), (3, 2, 1, '{"l": 9}', '{"c": 2}')],
+    )
+    db.execute("PRAGMA user_version = 2")
+    db.commit()
+    db.close()
+    store = Store(old_file)
+    assert [p.played_settings for p in store.players()] == [{"c": 2}, {"l": 9}]
+    assert store.num_games() == 1
     store.close()
 
 
@@ -502,30 +522,33 @@ def test_a_games_searches_are_kept_with_it(store):
     assert store.db.execute("SELECT COUNT(*) FROM game_searches").fetchone()[0] == 0
 
 
-def test_a_batchs_settings_are_kept_and_changes_reported(store):
+def played_with(store, a, b, a_settings, b_settings):
+    store.record_batch(
+        a,
+        b,
+        1.0,
+        False,
+        "abc",
+        "f",
+        [game(a, b)],
+        settings=BatchSettings(a_settings, b_settings, 8, "cpu", (((8, 0.5, 8),),)),
+    )
+
+
+def player_named(store, name):
+    return next(p for p in store.players() if p.name == name)
+
+
+def test_a_batchs_settings_are_kept_and_the_first_are_the_players_own(store):
     x, y = store.add_external_player("x", "e"), store.add_external_player("y", "e")
-
-    def played(a, b, x_settings, y_settings):
-        settings = (x_settings, y_settings) if a == x else (y_settings, x_settings)
-        store.record_batch(
-            a,
-            b,
-            1.0,
-            False,
-            "abc",
-            "f",
-            [game(a, b)],
-            settings=BatchSettings(*settings, 8, "cpu", (((8, 0.5, 8),),)),
-        )
-
-    played(x, y, {"c_init": 1.25, "max_nodes": 8}, {"level": 8})
-    played(
-        y, x, {"max_nodes": 8, "c_init": 1.25}, {"level": 8}
-    )  # the same, in another order
+    played_with(store, x, y, {"c_init": 1.25, "max_nodes": 8}, {"level": 8})
+    # the same, in another order
+    played_with(store, y, x, {"level": 8}, {"max_nodes": 8, "c_init": 1.25})
     assert store.settings_changes() == {}
-    played(x, y, {"c_init": 2.0, "max_nodes": 8}, {"level": 8})
-    assert store.settings_of(x) == {"c_init": 2.0, "max_nodes": 8}
-    assert store.settings_of(y) == {"level": 8}
+    # however it came to play with others, they aren't its own
+    played_with(store, x, y, {"c_init": 2.0, "max_nodes": 8}, {"level": 8})
+    assert player_named(store, "x").played_settings == {"c_init": 1.25, "max_nodes": 8}
+    assert player_named(store, "y").played_settings == {"level": 8}
     changes = store.settings_changes()
     assert list(changes) == [x]
     assert [(p.settings["c_init"], p.batches) for p in changes[x]] == [
@@ -538,8 +561,57 @@ def test_a_batchs_settings_are_kept_and_changes_reported(store):
     assert tuple(row) == (8, "cpu", "[[[8,0.5,8]]]")
 
 
+def test_only_settings_that_can_change_a_move_count_as_changed():
+    before = {"c_init": 1.25, "traversal_steps": 8, "dtype": "f"}
+    assert changed_settings(before, {**before, "traversal_steps": 1}) == []
+    assert changed_settings(before, {**before, "c_init": 2.0}) == ["c_init"]
+    assert changed_settings(before, {**before, "fpu": 0.0}) == ["fpu"]
+    assert changed_settings(before, {"c_init": 1.25, "traversal_steps": 8}) == ["dtype"]
+
+
+def test_a_refused_player_is_paused_and_keeps_its_own_settings(store):
+    x, y = store.add_external_player("x", "e"), store.add_external_player("y", "e")
+    played_with(store, x, y, {"c": 1}, {"l": 8})
+    records = store.pair_records()
+    store.refuse_settings(x, {"c": 2})
+    refused = player_named(store, "x")
+    assert refused.retired
+    assert refused.played_settings == {"c": 1}
+    assert refused.refused_settings == {"c": 2}
+    assert store.pair_records() == records
+
+
+def test_accepting_new_settings_keeps_the_same_player(store):
+    x, y = store.add_external_player("x", "e"), store.add_external_player("y", "e")
+    played_with(store, x, y, {"c": 1}, {"l": 8})
+    store.refuse_settings(x, {"c": 2})
+    store.accept_settings("x")
+    accepted = player_named(store, "x")
+    assert not accepted.retired
+    assert accepted.played_settings == {"c": 2}
+    assert accepted.refused_settings is None
+    with pytest.raises(ValueError):
+        store.accept_settings("x")
+
+
+def test_a_variant_is_a_new_player_of_the_same_network_or_engine(store, checkpoint):
+    store.add_network("n", checkpoint, "resnet:2x8", "r")
+    x = store.add_net_player("n", 128)
+    store.add_external_player("edax-L8", "edax", {"level": 8})
+    store.refuse_settings(x, {"c": 2})
+    assert store.add_variant(player_named(store, "n@128"), "c2") == "n@128-c2"
+    assert store.add_variant(player_named(store, "edax-L8"), "b2") == "edax-L8-b2"
+    new = player_named(store, "n@128-c2")
+    assert (new.network, new.sims, new.retired) == ("n", 128, False)
+    assert new.played_settings is None
+    engine = player_named(store, "edax-L8-b2")
+    assert (engine.external, engine.settings) == ("edax", {"level": 8})
+    # the old one stays as it was
+    assert player_named(store, "n@128").retired
+
+
 def test_results_from_elsewhere_have_no_settings(store):
     x, y = store.add_external_player("x", "e"), store.add_external_player("y", "e")
     store.record_batch(x, y, 0.0, False, "a paper", "", [game(x, y)])
-    assert store.settings_of(x) is None
+    assert player_named(store, "x").played_settings is None
     assert store.settings_changes() == {}

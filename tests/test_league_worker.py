@@ -7,9 +7,9 @@ import pytest
 from core.league import gate as gate_module
 from core.league.game import LeagueGame
 from core.league.gate import SlickGate, ThrottledGate
-from core.league.match import BatchResult, Stopped
+from core.league.match import BatchResult, SettingsRefused, Stopped
 from core.league.match import Clock as MoveClock
-from core.league.store import BatchSettings, GameRecord, Store
+from core.league.store import GameRecord, Store
 from core.league.worker import play, supervise
 
 
@@ -96,32 +96,48 @@ def run_play(store, gate=None, **kwargs):
     )
 
 
-def test_a_player_whose_settings_change_is_reported_and_plays_on(store, capsys):
+def test_a_refused_player_is_paused_and_the_league_goes_on_without_it(store, capsys):
     x, y = store.players()[:2]
     store.request_match(x.id, y.id, 400)
+    calls = []
 
-    def run(c_init):
-        def playing(*args):
-            settings = BatchSettings({"c_init": c_init}, {"level": 8}, 2, "cpu")
-            return BatchResult(*fake_result(*args), settings=settings)
+    def once_then_playing(game, programs, a, b, *rest):
+        calls.append({a.id, b.id})
+        if len(calls) == 1:
+            raise SettingsRefused(a, {"c_init": 2.0}, ["c_init"])
+        return fake_playing(game, programs, a, b, *rest)
 
-        return play(
+    assert (
+        play(
             store,
             FakeGame(),
             FakeGate(),
             version="abc",
             seed=0,
-            playing=playing,
+            playing=once_then_playing,
             max_batches=1,
         )
+        == "played its batches"
+    )
+    assert capsys.readouterr().out == f"settings changed, paused: {x.name}: c_init\n"
+    paused = next(p for p in store.players() if p.id == x.id)
+    assert paused.retired
+    assert paused.refused_settings == {"c_init": 2.0}
+    assert calls[0] == {x.id, y.id}
+    # its series waits, and nothing it was refused for was recorded
+    assert x.id not in calls[1]
+    assert store.pending_matches()[0].played == 0
 
-    run(1.25)
-    assert "settings changed" not in capsys.readouterr().out
-    games = store.num_games()
-    assert run(2.0) == "played its batches"
-    assert store.num_games() > games
-    assert capsys.readouterr().out == f"settings changed: {x.name}: c_init\n"
-    assert list(store.settings_changes()) == [x.id]
+
+def test_with_everyone_refused_the_player_says_so(store):
+    def refusing(game, programs, a, b, *rest):
+        raise SettingsRefused(a, {"c_init": 2.0}, ["c_init"])
+
+    reason = play(
+        store, FakeGame(), FakeGate(), version="abc", seed=0, playing=refusing
+    )
+    assert reason == "no two players can play"
+    assert store.num_games() == 0
 
 
 def test_plays_batches_and_records_them_with_their_code_version(store):
