@@ -1,7 +1,7 @@
 """Othello engines to test against, each driven as a subprocess over GTP (the Go Text
 Protocol, which both speak for Othello). One process plays one game.
 
-- Edax (https://github.com/abulmo/edax-reversi): build it with `setup_edax.sh`
+- Edax (https://github.com/okuhara/edax-reversi-AVX): build it with `setup_edax.sh`
 - Egaroucid (https://github.com/Nyanyan/Egaroucid): build it with `setup_egaroucid.sh`
 
 Both play at a "level" L, with their opening books off: up to level 10, they search L moves
