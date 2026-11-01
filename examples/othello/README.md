@@ -17,6 +17,7 @@ Othello model and against two strong open-source Othello engines,
 | `cpu_match.py` | Games between two such players at fixed visits a move, and their speed in evals a second |
 | `export_onnx.py` | Exports a checkpoint's network to ONNX |
 | `bench_cpu_backends.py` | Evals a second by CPU backend and batch, each checked against JAX's outputs |
+| `quantize.py`, `fidelity.py`, `bench_quantized.py` | Quantizes a network to int8 for playing on CPU, and measures its outputs and speed against bf16 |
 | `engine_set.py`, `label_positions.py`, `score_engine_set.py` | The engine-labelled set: fixed positions with every legal move scored by Edax, to build, and to score checkpoints on (train.py scores the network on it every epoch) |
 | `distill.py` | Trains a network on a saved training state's replay buffer, with no self-play, on a teacher network's values or the games' outcomes |
 | `bench_nets.py` | Times networks on their own: a forward pass at self-play's batch, a training step at training's |
@@ -550,6 +551,32 @@ on a stream per core. Physical cores matter more than the CPU's cache: the same 
 At 1000 visits a move, batches of 8 and 16 lost nothing against sequential search in 200 games each
 (+17 and +19, standard errors 16 and 18), batch 32 lost 28 and batch 64 lost 60. On a 4 s clock
 batch 16 took 86.5% of 100 games from the same net searching sequentially.
+
+### Int8
+
+Quantized after training, a network plays stronger on a clock than in bf16, where its leaves come in
+batches. Build the model, calibrated on the leaves of its own searches, and play it as a `backend`:
+
+```
+uv run examples/othello/fidelity.py leaves --net 8x128-128s-8p-w1125-274m --out LEAVES
+uv run examples/othello/quantize.py --net 8x128-128s-8p-w1125-274m --positions LEAVES/calibration.npy
+taskset -c 16-23 uv run examples/othello/clock_match.py --seconds 4 --openings 100 --b edax:threads=8 \
+    --a net:net=8x128-128s-8p-w1125-274m,batch=16,virtual_loss=visit,taper=24,backend=int8-performance_leaves_heads_minmax
+```
+
+Int8 against bf16, on the same eight cores with nothing else running, batch 16 with the search; games
+from XOT openings, 1000 visits a move, or 4 s a side:
+
+| Network | Evals a second | Elo, equal visits | Elo, equal clock |
+|---|---|---|---|
+| 4x64 | 52827 vs 41778, 1.26x | | |
+| 6x96 | 28019 vs 20302, 1.38x | -3 ± 19 (200 games) | +63 ± 19 (200) |
+| 8x128 | 17298 vs 10429, 1.66x | -9 ± 12 (400) | +83 ± 21 (200) |
+| 10x128 | 14146 vs 8876, 1.59x | | |
+
+At a batch of 1 it's no faster (0.94-0.99x). The gain is OpenVINO's int8 kernels on AVX512_VNNI: on
+ONNX Runtime int8 only matched bf16, and a CPU without VNNI will differ. The 4x64 net's outputs follow
+bf16's least closely, and it hasn't played.
 
 ## Credits
 
