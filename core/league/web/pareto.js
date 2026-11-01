@@ -48,8 +48,8 @@ function plot(points) {
   }
   const frontier = points.filter((p) => p.frontier).sort((a, b) => a.seconds - b.seconds);
   if (frontier.length > 1) {
-    const corners = frontier.flatMap((p, i) => (i ? [[x(p.seconds), y(frontier[i - 1].elo)], [x(p.seconds), y(p.elo)]] : [[x(p.seconds), y(p.elo)]]));
-    root.append(svg("polyline", { points: corners.map((c) => c.join(",")).join(" "), fill: "none", stroke: "var(--accent)", "stroke-width": 2, "stroke-linejoin": "round" }));
+    const line = frontier.map((p) => `${x(p.seconds)},${y(p.elo)}`).join(" ");
+    root.append(svg("polyline", { points: line, fill: "none", stroke: "var(--accent)", "stroke-width": 2, "stroke-linejoin": "round" }));
   }
   const tip = document.getElementById("tip");
   // the frontier's last, so that it's drawn over the rest
