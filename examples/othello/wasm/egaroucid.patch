@@ -1,0 +1,31 @@
+diff --git a/src/engine/hash.hpp b/src/engine/hash.hpp
+index 39340c0..5bd13f2 100755
+--- a/src/engine/hash.hpp
++++ b/src/engine/hash.hpp
+@@ -15,12 +15,15 @@
+ /*
+     @brief definition of maximum hash level
+ */
+-#ifdef HAS_32_BIT_OS
++#if defined(HAS_32_BIT_OS) || defined(__EMSCRIPTEN__)
+ constexpr int N_HASH_LEVEL = 32; // level 32 is maximim because hash is 32 bit
+ #else
+ constexpr int N_HASH_LEVEL = 33;
+ #endif
+-constexpr int DEFAULT_HASH_LEVEL = 25;
++#ifndef EGAROUCID_HASH_LEVEL
++#define EGAROUCID_HASH_LEVEL 25
++#endif
++constexpr int DEFAULT_HASH_LEVEL = EGAROUCID_HASH_LEVEL;
+ 
+ #if USE_CHANGEABLE_HASH_LEVEL
+ int global_hash_level = DEFAULT_HASH_LEVEL;
+@@ -40,7 +43,7 @@ uint32_t hash_rand_opponent[4][65536];
+     2 ^ hash_level will be tha size of hash
+ */
+ 
+-#ifdef HAS_32_BIT_OS
++#if defined(HAS_32_BIT_OS) || defined(__EMSCRIPTEN__)
+ constexpr size_t hash_sizes[N_HASH_LEVEL] = {
+     1,
+     2,

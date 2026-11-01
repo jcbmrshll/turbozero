@@ -189,6 +189,24 @@ def test_the_runtime_is_fetched_once_and_checked(tmp_path):
     fetch_runtime(root, path.as_uri(), sha512)
 
 
+def test_building_browser_engines_fills_the_stores_directory_for_them(root):
+    built = []
+
+    class WithEngines(FakeGame):
+        browser_engines = "build-1"
+
+        def build_browser_engines(self, out):
+            built.append(out)
+
+    main(WithEngines, root, ["--root", str(root), "build-browser-engines"])
+    assert built == [root / "wasm-engines" / "build-1"]
+
+
+def test_a_game_without_browser_engines_cant_build_them(root):
+    with pytest.raises(SystemExit, match="no browser engines"):
+        run(root, "build-browser-engines")
+
+
 def test_settings_changes_says_who_and_what(root, capsys):
     store = Store(root)
     x, y = (p.id for p in store.players()[:2])

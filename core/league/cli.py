@@ -7,6 +7,7 @@ add-result A B WINS DRAWS LOSSES --source SOURCE
 match A B --games N; matches; cancel-match ID
 export-onnx
 fetch-ort
+build-browser-engines
 anchor NAME; retire NAME; resume NAME
 ratings
 settings-changes
@@ -162,6 +163,10 @@ def main(make_game: Callable[[], LeagueGame], default_root: Path, argv=None) -> 
         "fetch-ort",
         help="download what the dashboard runs networks with in the browser",
     )
+    commands.add_parser(
+        "build-browser-engines",
+        help="build the engines the dashboard can run in the browser",
+    )
     commands.add_parser("matches", help="the series still to finish")
     cancel = commands.add_parser("cancel-match", help="drop a series")
     cancel.add_argument("id", type=int)
@@ -229,6 +234,11 @@ def main(make_game: Callable[[], LeagueGame], default_root: Path, argv=None) -> 
         from core.league.runtime import fetch_runtime
 
         fetch_runtime(store.root)
+    elif args.command == "build-browser-engines":
+        game = make_game()
+        if game.browser_engines is None:
+            sys.exit(f"{game.name} has no browser engines")
+        game.build_browser_engines(store.root / "wasm-engines" / game.browser_engines)
     elif args.command == "matches":
         print(pending_matches(store))
     elif args.command == "cancel-match":

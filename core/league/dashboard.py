@@ -2,7 +2,8 @@
 
 Ratings are fit from the games whenever there are new ones. The server writes to the store only
 for what's edited on the page: pauses, descriptions and tags, and the queue of series. The page
-runs networks itself, in the browser, on their ONNX exports (see `core.league.runtime`).
+runs networks itself, in the browser, on their ONNX exports (see `core.league.runtime`), and can
+run a game's engines there too, compiled to WebAssembly, from the store's `wasm-engines`.
 
 It has no login. Anything that writes takes a JSON body, which another site's page can't send
 to it from a browser on the tailnet without the server agreeing to it first, which it doesn't.
@@ -38,6 +39,10 @@ KINDS = {
     ".mjs": "text/javascript",
     ".wasm": "application/wasm",
     ".onnx": "application/octet-stream",
+    ".dat": "application/octet-stream",
+    ".egev": "application/octet-stream",
+    ".egev2": "application/octet-stream",
+    ".eghs": "application/octet-stream",
 }
 # how long the supervisor can go without a word before it counts as not running
 SUPERVISOR_SILENCE = 300.0
@@ -203,8 +208,20 @@ class League:
                 "playing": self._playing(),
                 "requests": self._queue(players),
                 "runtime": VERSION if has_runtime(store.root) else None,
+                "browser_engines": self._browser_engines(),
                 "time": time.time(),
             }
+
+    def _browser_engines(self) -> str | None:
+        """The build of the game's browser engines, if it's been made."""
+        build = self.game.browser_engines
+        if build is None:
+            return None
+        return build if (self.browser_engines_dir() / "complete").exists() else None
+
+    def browser_engines_dir(self) -> Path:
+        assert self.game.browser_engines is not None
+        return self.store.root / "wasm-engines" / self.game.browser_engines
 
     def _onnx(self, player: Player) -> str | None:
         """The name of `player`'s network's ONNX export, if it has one yet."""
@@ -470,6 +487,14 @@ def make_handler(league: League) -> type[BaseHTTPRequestHandler]:
                     rf"/ort/{re.escape(VERSION)}/([\w.-]+\.(?:mjs|wasm))", url.path
                 ):
                     self._file(runtime_dir(league.store.root) / match[1], cached=True)
+                elif league.game.browser_engines is not None and (
+                    match := re.fullmatch(
+                        rf"/wasm-engines/{re.escape(league.game.browser_engines)}"
+                        r"/([\w.-]+\.(?:mjs|wasm|dat|egev|egev2|eghs))",
+                        url.path,
+                    )
+                ):
+                    self._file(league.browser_engines_dir() / match[1], cached=True)
                 elif match := re.fullmatch(r"/onnx/([0-9a-f]{64}\.onnx)", url.path):
                     self._file(league.store.root / "networks" / match[1], cached=True)
                 elif url.path == "/game.js":
