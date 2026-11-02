@@ -250,6 +250,19 @@ def main():
         "opening's 8 moves. By default every move is sampled",
     )
     parser.add_argument(
+        "--dirichlet-alpha",
+        type=float,
+        default=0.3,
+        help="concentration of the Dirichlet noise mixed into each self-play root's prior: "
+        "lower puts it on fewer moves (AlphaZero: 0.3 chess, 0.15 shogi, 0.03 Go)",
+    )
+    parser.add_argument(
+        "--dirichlet-epsilon",
+        type=float,
+        default=0.25,
+        help="share of each self-play root's prior that is Dirichlet noise (0 for none)",
+    )
+    parser.add_argument(
         "--train-batch",
         type=int,
         default=4096,
@@ -552,6 +565,10 @@ def main():
     if args.advance_every is None and args.count_reused_visits:
         # searches of varying lengths: see Trainer's advance_every
         args.advance_every = 5
+    if args.dirichlet_alpha <= 0:
+        parser.error("--dirichlet-alpha must be positive")
+    if not 0 <= args.dirichlet_epsilon <= 1:
+        parser.error("--dirichlet-epsilon must be between 0 and 1")
     if args.vs_engine_last > args.epochs:
         parser.error("--vs-engine-last can't be more than --epochs")
     if args.policy_target == "completed-q" and args.tree_positions > 0:
@@ -594,6 +611,8 @@ def main():
                     branching_factor=env.num_actions,
                     action_selector=PUCTSelector(),
                     temperature=1.0,
+                    dirichlet_alpha=args.dirichlet_alpha,
+                    dirichlet_epsilon=args.dirichlet_epsilon,
                     persist_tree=not args.no_persist_tree,
                     count_reused_visits=args.count_reused_visits,
                     min_iterations=args.min_iterations,
