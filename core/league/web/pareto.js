@@ -4,6 +4,10 @@
 import { api, el, elo, showTip, svg } from "./dom.js";
 
 let run = 0;
+let int8 = localStorage.getItem("pareto-int8") === "1";
+// measured int8 speedups with the search at batch 16, by the network's size; unmeasured sizes
+// take the largest nets'. Batch 1 gains nothing. Ratings stay as they are, from bf16
+const INT8_SPEEDUP = { "4x64": 1.26, "6x96": 1.38, "8x128": 1.66, "10x128": 1.59 };
 const body = el("div", { class: "pareto-body" });
 export const pareto = el("section", { class: "panel" }, el("h2", {}, "Runtime against rating"), body);
 
@@ -24,6 +28,19 @@ function decades(lo, hi) {
     for (const m of [1, 10 ** 0.5]) ticks.push(m * 10 ** e);
   }
   return ticks.filter((t) => t >= lo && t <= hi);
+}
+
+function withInt8(points) {
+  const shown = points.map((p) => {
+    const size = p.name.match(/^\d+x\d+/)?.[0];
+    const speedup = size && p.batch > 1 ? INT8_SPEEDUP[size] ?? 1.6 : 1;
+    return { ...p, seconds: p.seconds / speedup, frontier: false };
+  });
+  let best = -Infinity;
+  for (const p of [...shown].sort((a, b) => a.seconds - b.seconds || b.elo - a.elo)) {
+    if (p.solid && p.elo > best) { p.frontier = true; best = p.elo; }
+  }
+  return shown;
 }
 
 function plot(points) {
@@ -78,8 +95,15 @@ export async function drawPareto() {
   const found = shown[run];
   const choose = shown.length > 1 ? el("select", { on: { change: (e) => { run = Number(e.target.value); drawPareto(); } } },
     ...shown.map((r, i) => { const o = el("option", { value: i }, r.name); if (i === run) o.selected = true; return o; })) : null;
-  body.replaceChildren(plot(found.points),
+  const toggle = el("input", { type: "checkbox", on: { change: (e) => {
+    int8 = e.target.checked;
+    localStorage.setItem("pareto-int8", int8 ? "1" : "0");
+    drawPareto();
+  } } });
+  toggle.checked = int8;
+  body.replaceChildren(plot(int8 ? withInt8(found.points) : found.points),
     el("div", { class: "under dim" }, choose,
+      el("label", {}, toggle, "int8"),
       el("span", {}, hardware(found)),
       el("span", { class: "keys" },
         el("i", { class: "key on" }), "Frontier", el("i", { class: "key" }), "Below", el("i", { class: "key open" }), "Batch unverified")));
