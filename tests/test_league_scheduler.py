@@ -1,6 +1,7 @@
 """How the league picks its next batch."""
 
 from collections import Counter
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -196,6 +197,15 @@ def test_batch_size_fits_the_time_and_memory():
     assert batch_size(config, low, low, 100.0) == 64
     # 128 games at a time, of 2 * (1000 + 1000) nodes each, is too many
     assert batch_size(config, high, high, 0.1) == 128
+
+
+def test_batch_size_counts_a_players_tree_factor():
+    config = SchedulerConfig(batch_sizes=(64, 128, 256), max_tree_nodes=300_000)
+    plain = nets(1, sims=1000)[0]
+    wide = replace(plain, settings={"tree_factor": 4})
+    assert batch_size(config, plain, plain, 0.1) == 128
+    # 2 * 1000 + 4 * 1000 nodes a game
+    assert batch_size(config, plain, wide, 0.1) == 64
 
 
 def test_openings_arent_repeated_until_theyre_all_played():

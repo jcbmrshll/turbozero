@@ -631,6 +631,10 @@ aren't part of turbozero.
 Edax and Egaroucid, from full games played whenever the GPU is free (see `core/league/`). Every
 game is stored; ratings are fit to all of them, with an uncertainty for each player.
 
+A network's players keep a tree of 2 x sims nodes unless they're added with a bigger one
+(`add-player NET --sims 4000 --tree-factor 4`, a player of its own, `NET@4000-t4`). For a session
+of requested series only, with the GPU to itself: `play --requests-only --batch-seconds 900`.
+
 The dashboard (`elo_league.py dashboard`) lists the players, with filters read from their names and
 settings, beside the queue of series and a plot of runtime against rating. A player's page holds
 its description and tags. A network's budgets share theirs.

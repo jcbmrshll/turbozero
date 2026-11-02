@@ -70,11 +70,11 @@ class TicTacToe(LeagueGame):
         logits = jax.random.normal(jax.random.PRNGKey(seed), (9,))
         return None, {"logits": logits, "value": jnp.array(0.0)}
 
-    def make_evaluator(self, network, sims):
+    def make_evaluator(self, network, sims, tree_factor=2):
         return AlphaZero(MCTS)(
             eval_fn=eval_fn,
             num_iterations=sims,
-            max_nodes=2 * sims,
+            max_nodes=tree_factor * sims,
             branching_factor=9,
             action_selector=PUCTSelector(),
             temperature=0.0,
@@ -440,6 +440,16 @@ def test_an_illegal_move_is_refused(game):
 class NoGate:
     def busy(self):
         return None
+
+
+def test_a_tree_factor_is_a_program_of_its_own(game, tmp_path):
+    path = tmp_path / "1.ckpt"
+    path.write_text("1")
+    plain = Player(id=1, name="n@8", network="n", net="tiny", sims=8, path=str(path))
+    wide = replace(plain, id=2, name="n@8-t4", settings={"tree_factor": 4})
+    programs = Programs(game, "float32")
+    assert programs.program(plain, 2).config["max_nodes"] == 16
+    assert programs.program(wide, 2).config["max_nodes"] == 32
 
 
 def test_a_tiny_league_plays_and_rates(game, tmp_path):

@@ -600,6 +600,11 @@ def test_a_variant_is_a_new_player_of_the_same_network_or_engine(store, checkpoi
     store.add_external_player("edax-L8", "edax", {"level": 8})
     store.refuse_settings(x, {"c": 2})
     assert store.add_variant(player_named(store, "n@128"), "c2") == "n@128-c2"
+    store.add_net_player("n", 128, "t4", {"tree_factor": 4})
+    assert player_named(store, "n@128-t4").tree_nodes == 512
+    assert player_named(store, "n@128").tree_nodes == 256
+    assert store.add_variant(player_named(store, "n@128-t4"), "c2") == "n@128-t4-c2"
+    assert player_named(store, "n@128-t4-c2").tree_factor == 4
     assert store.add_variant(player_named(store, "edax-L8"), "b2") == "edax-L8-b2"
     new = player_named(store, "n@128-c2")
     assert (new.network, new.sims, new.retired) == ("n", 128, False)

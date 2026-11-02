@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 
 from core.evaluators.evaluator import Evaluator
-from core.league.store import Player, Search
+from core.league.store import DEFAULT_TREE_FACTOR, Player, Search
 from core.types import EnvStepFn, StepMetadata
 
 
@@ -116,9 +116,12 @@ class LeagueGame(ABC):
         with, computing in `dtype`."""
 
     @abstractmethod
-    def make_evaluator(self, network: Any, sims: int) -> Evaluator:
+    def make_evaluator(
+        self, network: Any, sims: int, tree_factor: int = DEFAULT_TREE_FACTOR
+    ) -> Evaluator:
         """The evaluator of `network`, as it plays at full strength: `sims` iterations a
-        move, temperature 0, no root noise. Called once per player in a batch."""
+        move, temperature 0, no root noise, with a tree of `tree_factor` * `sims` nodes.
+        Called once per player in a batch."""
 
     @abstractmethod
     def num_openings(self) -> int:

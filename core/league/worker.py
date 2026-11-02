@@ -19,7 +19,8 @@ A player whose settings have changed is refused before its batch's first move, a
 `core.league.store`. If none can play for that, the player exits saying so.
 
 Series someone asked for (`Store.request_match`) are played first, in their queue's order, as batches like
-any others. One waits while either of its players is retired, and doesn't hold up the rest.
+any others. One waits while either of its players is retired, and doesn't hold up the rest. A player told
+`requests_only` stops when none is left, rather than handing their players to the scheduler.
 """
 
 import os
@@ -133,8 +134,10 @@ def pick_batch(
     game: LeagueGame,
     config: SchedulerConfig,
     rng: np.random.Generator,
+    requests_only: bool = False,
 ) -> Batch | None:
-    """The next batch to play: of a requested series if there is one, else the scheduler's."""
+    """The next batch to play: of a requested series if there is one, else the scheduler's,
+    unless `requests_only`."""
     players = store.players()
     by_id = {p.id: p for p in players}
     request = _next_request(game, store.pending_matches(), by_id)
@@ -143,6 +146,8 @@ def pick_batch(
         seconds = _seconds_of_pair(store, game, players, a, b)
         games = requested_games(config, a, b, seconds, request.remaining)
         return _choose_batch(store, game, a, b, games, rng, request.id)
+    if requests_only:
+        return None
     config = replace(config, engines=store.get_meta("engines", True))
     ratings = current_ratings(store, players)
     external = {p.id: game.external_seconds(p) for p in players if p.is_external}
@@ -175,6 +180,7 @@ def play(
     max_batches: int | None = None,
     playing: Callable = play_batch,
     version: str | None = None,
+    requests_only: bool = False,
 ) -> str:
     """Plays batches until the GPU is wanted, or the league's stopped, whichever's first.
 
@@ -188,6 +194,7 @@ def play(
         max_batches: stop after this many
         playing: plays a batch (`play_batch`)
         version: the code's version (default: `code_version`)
+        requests_only: stop when no requested series can be played
 
     Returns:
         why it stopped
@@ -223,9 +230,13 @@ def play(
                 break
             if should_stop():
                 break
-            picked = pick_batch(store, game, config, rng)
+            picked = pick_batch(store, game, config, rng, requests_only)
             if picked is None:
-                stop_reason = "no two players can play"
+                stop_reason = (
+                    "no requested series left"
+                    if requests_only
+                    else "no two players can play"
+                )
                 break
             a, b, openings = picked.a, picked.b, picked.openings
             store.set_meta(

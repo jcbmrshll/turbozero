@@ -6,6 +6,7 @@ each played with both colors, and no pair repeats an opening until it's played t
         --net resnet:8x128,pool_every=2,heads=pooled,pool_channels=32 --run r2-A --sims 128 1000
     uv run examples/othello/elo_league.py add-external edax-L8 edax --settings '{"level": 8}'
     uv run examples/othello/elo_league.py anchor edax-L8
+    uv run examples/othello/elo_league.py add-player A-8x --sims 4000 --tree-factor 4
     uv run examples/othello/elo_league.py match A-8x@1000 edax-L24 --games 400
     uv run examples/othello/elo_league.py ratings
     uv run examples/othello/elo_league.py dashboard
@@ -55,7 +56,7 @@ from xot import XOT_PATH, load_xot
 from core.evaluators.evaluation_fns import make_nn_eval_fn
 from core.league.cli import main
 from core.league.game import ExternalPlayer, LeagueGame
-from core.league.store import EngineSearch, Player, Search
+from core.league.store import DEFAULT_TREE_FACTOR, EngineSearch, Player, Search
 from core.monitoring.episodes import BOARDS
 
 # a self-play network's name and a student's (see `distill.py`)
@@ -87,6 +88,7 @@ def player_facts(player: Player) -> dict[str, str | int | bool]:
         facts["blocks"], facts["channels"] = int(shape[1]), int(shape[2])
     if player.sims is not None:
         facts["play sims"] = player.sims
+    facts["tree factor"] = player.tree_factor
     if name := SELF_PLAY.fullmatch(player.network):
         facts |= {
             "train sims": int(name["sims"]),
@@ -227,9 +229,14 @@ class Othello(LeagueGame):
     def load_network(self, path: str, net: str, dtype: str):
         return load_checkpoint(path, net, dtype)
 
-    def make_evaluator(self, network: Any, sims: int):
+    def make_evaluator(
+        self, network: Any, sims: int, tree_factor: int = DEFAULT_TREE_FACTOR
+    ):
         return make_test_evaluator(
-            make_nn_eval_fn(network, state_to_nn_input), sims, noise=False
+            make_nn_eval_fn(network, state_to_nn_input),
+            sims,
+            noise=False,
+            tree_factor=tree_factor,
         )
 
     def num_openings(self) -> int:
