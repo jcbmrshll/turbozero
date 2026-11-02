@@ -118,6 +118,26 @@ def epoch_list(text: str) -> list[int]:
     return epochs
 
 
+# training holds --lr, then drops 10x late in the run and again near its end: AlphaGo Zero's three
+# levels, and about where Lc0's example configuration and KataGo drop. At 110 epochs of 4x64 it
+# played within noise of one drop at 83%, and far above a constant learning rate
+DEFAULT_LR_DROPS = [(0.7, 1e-4), (0.9, 1e-5)]
+
+
+def lr_drops(text: str) -> list[tuple[float, float]]:
+    """Parses --lr-drops."""
+    try:
+        drops = [
+            (float(a), float(b)) for a, b in (d.split(":") for d in text.split(","))
+        ]
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"{text!r} isn't FRACTION:LR,...") from e
+    fractions = [fraction for fraction, _ in drops]
+    if fractions != sorted(set(fractions)) or not 0 < fractions[0] <= fractions[-1] < 1:
+        raise argparse.ArgumentTypeError(f"{text!r}: fractions rise, between 0 and 1")
+    return drops
+
+
 def positive_schedule(text: str) -> list[tuple[int, int]]:
     """Parses --sims-schedule, whose values must be positive."""
     try:
@@ -270,8 +290,16 @@ def main():
     parser.add_argument(
         "--lr-final",
         type=float,
-        default=1e-4,
-        help="the learning rate at the end of the run (it decays along a cosine)",
+        default=None,
+        help="instead of --lr-drops' schedule, decay along a cosine to this learning rate; "
+        "equal to --lr for a constant learning rate",
+    )
+    parser.add_argument(
+        "--lr-drops",
+        type=lr_drops,
+        default=None,
+        help="hold --lr and drop in steps: FRACTION:LR,... of the run's training steps "
+        "(default: 0.7:1e-4,0.9:1e-5, two drops of 10x)",
     )
     parser.add_argument(
         "--weight-decay",
@@ -514,6 +542,8 @@ def main():
         parser.error("--resume needs the run's --ckpt-dir")
     if args.init_without_buffers and args.init_from is None:
         parser.error("--init-without-buffers needs --init-from")
+    if args.lr_final is not None and args.lr_drops:
+        parser.error("--lr-final and --lr-drops are different schedules: pass one")
     if args.no_persist_tree and args.count_reused_visits:
         parser.error(
             "--count-reused-visits counts the visits of the subtree a search keeps, which "
@@ -674,7 +704,11 @@ def main():
         loss_fn=partial(az_default_loss_fn, value_target_q=args.value_target_q),
         # decays from --lr to --lr-final over the run
         optimizer=make_optimizer(
-            args.epochs * args.train_steps, args.lr, args.lr_final, args.weight_decay
+            args.epochs * args.train_steps,
+            args.lr,
+            args.lr if args.lr_final is None else args.lr_final,
+            args.weight_decay,
+            args.lr_drops or (DEFAULT_LR_DROPS if args.lr_final is None else ()),
         ),
         evaluator=evaluator,
         # stores `capacity` positions for each of the `batch_size` environments

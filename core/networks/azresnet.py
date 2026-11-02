@@ -42,6 +42,10 @@ class AZResnetConfig:
             the parameters, BatchNorm, the activations between residual blocks and the heads stay in
             float32, and the gradients reach the float32 parameters. bfloat16 has float32's exponent
             range, so the loss needs no scaling
+        bn_momentum: how slowly BatchNorm's running averages of the batch statistics, which inference
+            uses, follow them: at about 1 / (1 - momentum) training steps. A long window lags the
+            weights while they move fast: 0.9 had about a third of 0.99's jumps in value error
+            between epochs at a learning rate of 1e-3 (4x64, one run), and played level
         remat: in training, keep only each residual block's input for the backward pass, and compute
             the activations inside the block again from it (gradient checkpointing, see `jax.checkpoint`):
             training takes much less memory, for about one more forward pass of compute. The
@@ -61,6 +65,7 @@ class AZResnetConfig:
     value_hidden_size: int = 256
     inference_dtype: str = "float32"
     train_dtype: str = "float32"
+    bn_momentum: float = 0.9
     remat: bool = False
 
 
@@ -72,7 +77,7 @@ def conv(
     )
 
 
-def batch_norm(channels: int) -> eqx.nn.BatchNorm:
+def batch_norm(channels: int, momentum: float = 0.99) -> eqx.nn.BatchNorm:
     """BatchNorm whose running averages of the batch statistics both start at 0.
 
     Equinox (0.13) starts the running variance at 1, but divides both running averages by
@@ -80,7 +85,9 @@ def batch_norm(channels: int) -> eqx.nn.BatchNorm:
     the variance was too large by momentum^steps / (1 - momentum^steps), 99 times after one training
     step, a third too large after 128, and only negligibly so after about 1000.
     """
-    bn = eqx.nn.BatchNorm(channels, axis_name=BATCH_AXIS, mode="batch")
+    bn = eqx.nn.BatchNorm(
+        channels, axis_name=BATCH_AXIS, mode="batch", momentum=momentum
+    )
     zeros = jnp.zeros((channels,))
     return eqx.tree_at(
         lambda bn: bn.batch_state_index, bn, eqx.nn.StateIndex((zeros, zeros))
@@ -152,7 +159,14 @@ class ResidualBlock(eqx.Module):
     bn2: eqx.nn.BatchNorm
     pool_channels: int = eqx.field(static=True)
 
-    def __init__(self, channels: int, pool_channels: int = 0, *, key: jax.Array):
+    def __init__(
+        self,
+        channels: int,
+        pool_channels: int = 0,
+        *,
+        key: jax.Array,
+        bn_momentum: float = 0.99,
+    ):
         """
         Args:
             channels: number of channels
@@ -162,14 +176,14 @@ class ResidualBlock(eqx.Module):
         """
         key1, key2, key3 = jax.random.split(key, 3)
         self.conv1 = conv(channels, channels, 3, key1)
-        self.bn1 = batch_norm(channels)
+        self.bn1 = batch_norm(channels, bn_momentum)
         self.pool_linear = (
             eqx.nn.Linear(2 * pool_channels, channels - pool_channels, key=key3)
             if pool_channels
             else None
         )
         self.conv2 = conv(channels - pool_channels, channels, 3, key2)
-        self.bn2 = batch_norm(channels)
+        self.bn2 = batch_norm(channels, bn_momentum)
         self.pool_channels = pool_channels
 
     def __call__(
@@ -202,6 +216,7 @@ class BottleneckBlock(eqx.Module):
         inner_pool_channels: list[int],
         *,
         key: jax.Array,
+        bn_momentum: float = 0.99,
     ):
         """
         Args:
@@ -213,13 +228,13 @@ class BottleneckBlock(eqx.Module):
         """
         keys = jax.random.split(key, len(inner_pool_channels) + 2)
         self.down_conv = conv(channels, inner_channels, 1, keys[0])
-        self.down_bn = batch_norm(inner_channels)
+        self.down_bn = batch_norm(inner_channels, bn_momentum)
         self.inner = [
-            ResidualBlock(inner_channels, pool, key=k)
+            ResidualBlock(inner_channels, pool, key=k, bn_momentum=bn_momentum)
             for pool, k in zip(inner_pool_channels, keys[2:], strict=True)
         ]
         self.up_conv = conv(inner_channels, channels, 1, keys[1])
-        self.up_bn = batch_norm(channels)
+        self.up_bn = batch_norm(channels, bn_momentum)
 
     def __call__(
         self, x: jax.Array, state: eqx.nn.State, dtype: jnp.dtype
@@ -270,14 +285,15 @@ class AlphaZeroHeads(eqx.Module):
         value_hidden_size: int,
         *,
         key: jax.Array,
+        bn_momentum: float = 0.99,
     ):
         keys = jax.random.split(key, 5)
         self.policy_conv = conv(channels, 2, 1, keys[0])
-        self.policy_bn = batch_norm(2)
+        self.policy_bn = batch_norm(2, bn_momentum)
         self.policy_linear = eqx.nn.Linear(2 * squares, num_actions, key=keys[1])
         # as AlphaZero's: a 1x1 convolution to one channel, then a hidden layer
         self.value_conv = conv(channels, 1, 1, keys[2])
-        self.value_bn = batch_norm(1)
+        self.value_bn = batch_norm(1, bn_momentum)
         self.value_hidden = eqx.nn.Linear(squares, value_hidden_size, key=keys[3])
         self.value_linear = eqx.nn.Linear(value_hidden_size, 1, key=keys[4])
 
@@ -318,19 +334,20 @@ class PooledHeads(eqx.Module):
         value_hidden_size: int,
         *,
         key: jax.Array,
+        bn_momentum: float = 0.99,
     ):
         keys = jax.random.split(key, 8)
         self.policy_conv = conv(channels, head_channels, 1, keys[0])
-        self.policy_bn = batch_norm(head_channels)
+        self.policy_bn = batch_norm(head_channels, bn_momentum)
         self.policy_pool_conv = conv(channels, head_channels, 1, keys[1])
-        self.policy_pool_bn = batch_norm(head_channels)
+        self.policy_pool_bn = batch_norm(head_channels, bn_momentum)
         self.policy_pool_linear = eqx.nn.Linear(
             2 * head_channels, head_channels, key=keys[2]
         )
         self.policy_square_conv = conv(head_channels, 1, 1, keys[3])
         self.pass_linear = eqx.nn.Linear(2 * head_channels, 1, key=keys[4])
         self.value_conv = conv(channels, head_channels, 1, keys[5])
-        self.value_bn = batch_norm(head_channels)
+        self.value_bn = batch_norm(head_channels, bn_momentum)
         self.value_hidden = eqx.nn.Linear(
             2 * head_channels, value_hidden_size, key=keys[6]
         )
@@ -388,7 +405,7 @@ class AZResnet(eqx.Module):
         channels = config.num_channels
         # initial conv layer
         self.stem_conv = conv(in_channels, channels, 3, stem_key)
-        self.stem_bn = batch_norm(channels)
+        self.stem_bn = batch_norm(channels, config.bn_momentum)
 
         # residual blocks: the global pooling channels of each basic block, counting those inside
         # bottleneck blocks
@@ -401,7 +418,7 @@ class AZResnet(eqx.Module):
         ]
         if config.block == "basic":
             self.blocks = [
-                ResidualBlock(channels, pool, key=k)
+                ResidualBlock(channels, pool, key=k, bn_momentum=config.bn_momentum)
                 for pool, k in zip(pool_channels, block_keys, strict=True)
             ]
         else:
@@ -411,6 +428,7 @@ class AZResnet(eqx.Module):
                     config.bottleneck_channels or channels // 2,
                     pool_channels[i * inner : (i + 1) * inner],
                     key=k,
+                    bn_momentum=config.bn_momentum,
                 )
                 for i, k in enumerate(block_keys)
             ]
@@ -422,6 +440,7 @@ class AZResnet(eqx.Module):
                 config.policy_head_out_size,
                 config.value_hidden_size,
                 key=heads_key,
+                bn_momentum=config.bn_momentum,
             )
         else:
             if config.policy_head_out_size != height * width + 1:
@@ -434,6 +453,7 @@ class AZResnet(eqx.Module):
                 config.head_channels,
                 config.value_hidden_size,
                 key=heads_key,
+                bn_momentum=config.bn_momentum,
             )
         self.inference_dtype = config.inference_dtype
         self.train_dtype = config.train_dtype

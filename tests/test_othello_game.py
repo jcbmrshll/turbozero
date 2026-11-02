@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+from typing import Any
 
 import equinox as eqx
 import jax
@@ -127,3 +128,16 @@ def test_symmetries_map_a_position_to_a_consistent_one():
     for transform_fn in SYMMETRY_TRANSFORM_FNS:
         for image in images:
             assert np.asarray(transform_fn(image).observation_nn).tobytes() in boards
+
+
+def test_lr_drops_hold_then_step():
+    params = {"w": jnp.zeros((2, 2))}
+    optimizer = make_optimizer(100, 1e-3, lr_drops=[(0.7, 1e-4), (0.9, 1e-5)])
+    state: Any = optimizer.init(params)
+    rates = []
+    for _ in range(100):
+        _, state = optimizer.update(jax.tree.map(jnp.ones_like, params), state, params)
+        rates.append(float(state.hyperparams["learning_rate"]))
+    assert rates[0] == pytest.approx(1e-3) and rates[69] == pytest.approx(1e-3)
+    assert rates[70] == pytest.approx(1e-4) and rates[89] == pytest.approx(1e-4)
+    assert rates[90] == pytest.approx(1e-5) and rates[99] == pytest.approx(1e-5)

@@ -3,6 +3,7 @@ turbozero talks to it, board symmetries, the network and optimizer, evaluators f
 test games, square names, and loading checkpoints."""
 
 import sys
+from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
@@ -174,16 +175,30 @@ def make_optimizer(
     lr: float = 1e-3,
     lr_final: float = 1e-4,
     weight_decay: float = WEIGHT_DECAY,
+    lr_drops: Sequence[tuple[float, float]] = (),
 ) -> optax.GradientTransformation:
     """AdamW, with the learning rate decaying from `lr` to `lr_final` over
-    `total_steps` training steps, along a cosine, and weight decay on the network's weights,
-    not its biases or BatchNorm scales and offsets (see `weight_decay_mask`). Its
-    hyperparameters are injected, for the trainer to record them and log the learning
-    rate."""
+    `total_steps` training steps, along a cosine, or with `lr_drops`, held at `lr` and then
+    dropping in steps: each (fraction of `total_steps`, the learning rate from there on). And
+    weight decay on the network's weights, not its biases or BatchNorm scales and offsets (see
+    `weight_decay_mask`). Its hyperparameters are injected, for the trainer to record them and
+    log the learning rate."""
+    schedule = optax.cosine_decay_schedule(
+        lr, decay_steps=max(total_steps, 1), alpha=lr_final / lr
+    )
+    if lr_drops:
+        rates = [lr, *(rate for _, rate in lr_drops)]
+        schedule = optax.piecewise_constant_schedule(
+            lr,
+            {
+                round(fraction * total_steps): after / before
+                for (fraction, _), before, after in zip(
+                    lr_drops, rates[:-1], rates[1:], strict=True
+                )
+            },
+        )
     return optax.inject_hyperparams(optax.adamw, static_args=("mask",))(
-        learning_rate=optax.cosine_decay_schedule(
-            lr, decay_steps=max(total_steps, 1), alpha=lr_final / lr
-        ),
+        learning_rate=schedule,
         weight_decay=weight_decay,
         mask=weight_decay_mask,
     )

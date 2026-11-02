@@ -270,7 +270,7 @@ uv run examples/othello/train.py --epochs 200 --save-state-every 10 --ckpt-dir r
 
 `--init-from` forks a new run from a state (a `state-<epoch>.npz`, or a directory to take
 the newest from). The fork is a run of its own: it starts at epoch 0, with its own
-`--epochs`, seed and schedules (`--lr` to `--lr-final` and `--sims-schedule`, both
+`--epochs`, seed and schedules (the learning rate's and `--sims-schedule`, both
 counted from its epoch 0), new games and search trees, and its
 own `--ckpt-dir`. It starts from the saved network, Adam's moments, and the replay
 buffers, so its first epochs train on as much data as the run it was forked from did
@@ -293,6 +293,10 @@ uv run examples/othello/train.py --epochs 30 --init-from runs/trunk/state-150.np
     --sims 128 --ckpt-dir runs/trunk150-sims128
 ```
 
+The learning rate holds `--lr`, then drops 10x at 70% of the run and again at 90% (`--lr-drops`).
+To read several budgets from one run, fork that same schedule: train the trunk at a constant
+learning rate to 70% of a budget, then fork the last 30%, with `--lr 1e-4 --lr-drops 0.667:1e-5`.
+
 ### Training on Modal
 
 `modal_jobs.py` runs train.py on Modal's GPUs, several at once, and brings the results to the
@@ -301,7 +305,7 @@ paths a local run would write them to, so analysis and the Elo league don't need
 ```sh
 # steps run in order on one GPU, from the commit named (it must be on GitHub)
 uv run examples/othello/modal_jobs.py launch --name trunk-a --gpu L40S --hours 4 --commit 7b52872 \
-    --step "examples/othello/train.py --epochs 93 --save-state-at 93 --monitor --name a --notes why --ckpt-dir $C/trunk > $L/trunk.log" \
+    --step "examples/othello/train.py --epochs 93 --lr-final 1e-3 --save-state-at 93 --monitor --name a --notes why --ckpt-dir $C/trunk > $L/trunk.log" \
     --step "examples/othello/train.py --epochs 19 --lr 1e-4 --lr-final 1e-4 --init-from $C/trunk/state-93.npz --ckpt-dir $C/fork > $L/fork.log"
 uv run examples/othello/modal_jobs.py list [--billed today]
 uv run examples/othello/modal_jobs.py stop trunk-a       # or --all; --now doesn't wait for the run to end as stopped
