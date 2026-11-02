@@ -1,3 +1,4 @@
+import equinox as eqx
 import jax
 import pytest
 
@@ -65,3 +66,17 @@ def test_make_network_builds_the_configured_module(spec, module):
     )
 
     assert isinstance(network, module)
+
+
+def test_bn_momentum_reaches_every_batch_norm():
+    config = network_config("resnet:2x8,heads=pooled,bn_momentum=0.9", 65)
+    network, _ = make_network(config, (8, 8, 2), jax.random.PRNGKey(0))
+    norms = [
+        leaf
+        for leaf in jax.tree.leaves(
+            network, is_leaf=lambda x: isinstance(x, eqx.nn.BatchNorm)
+        )
+        if isinstance(leaf, eqx.nn.BatchNorm)
+    ]
+    assert len(norms) == 8
+    assert {bn.momentum for bn in norms} == {0.9}
