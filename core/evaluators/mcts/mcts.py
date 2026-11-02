@@ -43,6 +43,7 @@ class MCTS(Evaluator):
         temperature: float = 1.0,
         persist_tree: bool = True,
         count_reused_visits: bool = False,
+        stop_when_full: bool = False,
         min_iterations: int = 0,
         policy_target: PolicyTarget | None = None,
         traversal_steps: int = 1,
@@ -71,9 +72,13 @@ class MCTS(Evaluator):
                 a well-explored subtree then takes fewer iterations, and every root ends with the visits
                 of a search from scratch. The tree then never holds more than
                 `num_iterations + 1 + min_iterations` nodes, so `max_nodes` needs no more
-            min_iterations: (optional) with `count_reused_visits`, the fewest iterations a search
-                takes, however many visits it reused: the root's noise (e.g. AlphaZero's) only steers
-                the visits of its own search (default: 0). At most `num_iterations`
+            stop_when_full: (optional) stop a search once its tree is full, rather than evict leaves
+                to go on, or after `num_iterations` iterations if it fills no tree (default: False).
+                Cycles past that change nothing, see `search_cycle`. Not with `count_reused_visits`
+            min_iterations: (optional) with `count_reused_visits` or `stop_when_full`, the fewest
+                iterations a search takes, however many visits it reused or however full its tree:
+                the root's noise (e.g. AlphaZero's) only steers the visits of its own search
+                (default: 0). At most `num_iterations`
             policy_target: (optional) what the policy trains towards, from the root of a finished
                 search (default: `VisitCounts`, its visit distribution)
             traversal_steps: (optional) steps down the tree a traversal takes between checks for
@@ -91,8 +96,11 @@ class MCTS(Evaluator):
                 f"min_iterations must be 0 to num_iterations ({num_iterations}), "
                 f"got {min_iterations}"
             )
+        if count_reused_visits and stop_when_full:
+            raise ValueError("count_reused_visits can't go with stop_when_full")
         super().__init__(discount=discount)
         self.count_reused_visits = count_reused_visits
+        self.stop_when_full = stop_when_full
         self.min_iterations = min_iterations
         self.eval_fn = eval_fn
         self.num_iterations = num_iterations
@@ -116,6 +124,7 @@ class MCTS(Evaluator):
             "temperature": self.temperature,
             "persist_tree": self.persist_tree,
             "count_reused_visits": self.count_reused_visits,
+            "stop_when_full": self.stop_when_full,
             "min_iterations": self.min_iterations,
             "policy_target_config": self.policy_target.get_config(),
             "traversal_steps": self.traversal_steps,
@@ -132,7 +141,7 @@ class MCTS(Evaluator):
         **kwargs,
     ) -> MCTSOutput:
         """Performs `self.num_iterations` MCTS iterations on an `MCTSTree` (fewer with
-        `count_reused_visits`, see `search_done`).
+        `count_reused_visits` or `stop_when_full`, see `search_done`).
 
         Samples an action to take from the root node after search is completed.
 
@@ -162,7 +171,7 @@ class MCTS(Evaluator):
             state: MCTSTree, i_key: tuple[jax.Array, jax.Array]
         ) -> tuple[MCTSTree, None]:
             i, k = i_key
-            if not self.count_reused_visits:
+            if not (self.count_reused_visits or self.stop_when_full):
                 return iterate(k, state), None
             # after the root's evaluation and `i` iterations, as `search_cycle` counts them
             return iterate(k, state, write=~self.search_done(state, i + 1)), None
@@ -183,12 +192,16 @@ class MCTS(Evaluator):
 
     def search_done(self, state: MCTSTree, cycles: jax.Array) -> jax.Array:
         """Done after `search_cycles`; with `count_reused_visits`, also once the root has
-        `num_iterations + 1` visits, after its evaluation and `min_iterations` iterations."""
+        `num_iterations + 1` visits, and with `stop_when_full`, also once the tree is full, either
+        after its evaluation and `min_iterations` iterations."""
         done = cycles >= self.search_cycles()
-        if not self.count_reused_visits:
+        if self.count_reused_visits:
+            stop = state.data.n[state.ROOT_INDEX] > self.num_iterations
+        elif self.stop_when_full:
+            stop = state.next_free_idx >= state.capacity
+        else:
             return done
-        visited = state.data.n[state.ROOT_INDEX] > self.num_iterations
-        return done | (visited & (cycles >= 1 + self.min_iterations))
+        return done | (stop & (cycles >= 1 + self.min_iterations))
 
     def start_search(
         self, key: jax.Array, state: MCTSTree, active: ArrayLike = True
@@ -232,7 +245,8 @@ class MCTS(Evaluator):
         """The root's evaluation (cycle 0), or an iteration: what `evaluate` does after
         `start_search`, a step at a time, with the same keys. Either way, one network evaluation, so that a batch of searches
         at different points evaluates the network once a cycle. Past `search_done`, more
-        iterations, each with a key of its own.
+        iterations, each with a key of its own; with `stop_when_full`, whose stopped tree they
+        would evict from, they write nothing, and their evaluations are spent.
 
         Args: see `Evaluator.search_cycle`.
 
@@ -268,9 +282,10 @@ class MCTS(Evaluator):
         # the traversal's reads of the tree, so XLA would copy the arrays they read (whole trees
         # of states, every cycle) rather than order them before it. Either way round, only one
         # of the two writes anything
-        state = self.expand(
-            expand_key, state, leaf, policy_logits, value, write=~at_root
-        )
+        write = ~at_root
+        if self.stop_when_full:
+            write = write & ~self.search_done(state, cycle)
+        state = self.expand(expand_key, state, leaf, policy_logits, value, write=write)
         return self.expand_root(
             root_key,
             state,

@@ -1270,6 +1270,29 @@ def test_each_environment_plays_its_move_when_its_search_is_done(
         )
 
 
+@pytest.mark.parametrize("advance_every", [1, 4])
+def test_a_search_stopping_when_full_plays_more_moves_in_the_same_cycles(
+    env, tmp_path, advance_every
+):
+    # an epoch's cycles stay what a search of `num_iterations` takes, however soon searches stop;
+    # the moves go up, by less the later they are played after their searches stop
+    def moves(**kwargs):
+        trainer = make_trainer(
+            env,
+            tmp_path,
+            evaluator=tiny_mcts(env, num_iterations=7, max_nodes=4, **kwargs),
+            advance_every=advance_every,
+        )
+        state = trainer.init_collection_state(jax.random.PRNGKey(0), trainer.batch_size)
+        keys = jax.random.split(jax.random.PRNGKey(1), trainer.batch_size)
+        return trainer.collect_steps(keys, state, None, 4).moves
+
+    fixed, stopping = moves(), moves(stop_when_full=True)
+
+    assert fixed.sum() == 4 * len(fixed)
+    assert stopping.sum() > fixed.sum()
+
+
 def test_advance_leaves_an_environment_whose_search_is_not_done_as_it_is(env, tmp_path):
     trainer, state = budget_collection(env, tmp_path, [2, 2])
     state = replace(state, search_cycles=jnp.array([1, 1]))

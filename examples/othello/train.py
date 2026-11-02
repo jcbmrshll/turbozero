@@ -219,6 +219,13 @@ def main():
         "well-explored subtree (the tree is then sized for it, and --tree-factor is unused)",
     )
     parser.add_argument(
+        "--stop-when-full",
+        action="store_true",
+        help="a self-play search stops once its tree (--tree-factor * --sims nodes) is full, "
+        "rather than evict leaves to go on, and the compute goes to the next position: an epoch "
+        "then has more moves, so raise --train-steps to hold passes per position",
+    )
+    parser.add_argument(
         "--no-persist-tree",
         action="store_true",
         help="start every self-play search from an empty tree, rather than from the subtree "
@@ -229,7 +236,8 @@ def main():
         "--min-iterations",
         type=int,
         default=0,
-        help="with --count-reused-visits, the fewest iterations a search takes",
+        help="with --count-reused-visits or --stop-when-full, the fewest iterations a "
+        "search takes",
     )
     parser.add_argument(
         "--advance-every",
@@ -237,7 +245,7 @@ def main():
         default=None,
         help="self-play cycles between plays of the moves whose searches are done (a search "
         "done in between goes on until then): by default a whole search's, or 5 with "
-        "--count-reused-visits",
+        "--count-reused-visits or --stop-when-full",
     )
     parser.add_argument(
         "--sampling-moves",
@@ -562,7 +570,9 @@ def main():
             "--count-reused-visits counts the visits of the subtree a search keeps, which "
             "--no-persist-tree discards"
         )
-    if args.advance_every is None and args.count_reused_visits:
+    if args.count_reused_visits and args.stop_when_full:
+        parser.error("--count-reused-visits can't go with --stop-when-full")
+    if args.advance_every is None and (args.count_reused_visits or args.stop_when_full):
         # searches of varying lengths: see Trainer's advance_every
         args.advance_every = 5
     if args.dirichlet_alpha <= 0:
@@ -615,6 +625,7 @@ def main():
                     dirichlet_epsilon=args.dirichlet_epsilon,
                     persist_tree=not args.no_persist_tree,
                     count_reused_visits=args.count_reused_visits,
+                    stop_when_full=args.stop_when_full,
                     min_iterations=args.min_iterations,
                     traversal_steps=args.traversal_steps,
                     policy_target=CompletedQ(args.value_scale, args.maxvisit_init)

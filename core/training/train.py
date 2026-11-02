@@ -489,7 +489,7 @@ class Trainer:
                 `advance_every - 1` cycles more. By default, every evaluator's `search_cycles`: with
                 searches of a fixed length, a check as each is done, as if every environment searched
                 and played in step. With searches of varying lengths (e.g. MCTS's
-                `count_reused_visits`), a few cycles balance the two: about
+                `count_reused_visits` or `stop_when_full`), a few cycles balance the two: about
                 sqrt(2 * mean search cycles * cost of a check / cost of a cycle).
             extract_model_params_fn: (optional) function to extract model parameters from TrainState
             monitor: (optional) `seaglass.Monitor` to log metrics and test episodes to (see a tester's `episode_fn`),

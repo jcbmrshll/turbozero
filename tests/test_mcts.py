@@ -761,8 +761,10 @@ def search_until_done(search, env):
         {},
         {"count_reused_visits": True},
         {"count_reused_visits": True, "min_iterations": 2},
+        {"stop_when_full": True},
+        {"stop_when_full": True, "min_iterations": 2},
     ],
-    ids=["iterations", "visits", "visits-min-2"],
+    ids=["iterations", "visits", "visits-min-2", "full", "full-min-2"],
 )
 def test_a_search_a_cycle_at_a_time_is_evaluate(env, cls, reused, budget):
     # with the root's evaluation first, the same keys, a tree too small for every iteration, and
@@ -849,6 +851,109 @@ def test_a_search_counting_reused_visits_ends_with_as_many_root_visits(
 
     assert int(root(searched).n) == visits
     assert_consistent(searched)
+
+
+@pytest.mark.parametrize(
+    "max_nodes, min_iterations, done_from",
+    [
+        # room to spare (5 nodes of 16): done after its evaluation and 4 iterations, as without
+        (16, 0, 5),
+        # full: done once evaluated
+        (5, 0, 1),
+        # but for 2 iterations more
+        (5, 2, 3),
+    ],
+)
+def test_a_search_stopping_when_full_is_done_with_a_full_tree(
+    env, max_nodes, min_iterations, done_from
+):
+    search = make_mcts(
+        max_nodes=max_nodes,
+        num_iterations=4,
+        stop_when_full=True,
+        min_iterations=min_iterations,
+    )
+    tree = build_tree(search, env, SHAPES[2])
+    assert int(tree.next_free_idx) == 5
+
+    done = [bool(search.search_done(tree, jnp.array(c))) for c in range(7)]
+
+    assert done == [c >= done_from for c in range(7)]
+
+
+def test_a_search_stopping_when_full_fills_its_tree_and_evicts_nothing(env):
+    search = make_mcts(
+        max_nodes=8, eval_fn=state_eval_fn, num_iterations=30, stop_when_full=True
+    )
+    tree = build_tree(search, env, SHAPES[2])
+    state, meta = env.init_fn(jax.random.PRNGKey(0))
+    before = np.asarray(tree.parents)
+
+    searched = search.evaluate(
+        jax.random.PRNGKey(0), tree, state, meta, None, env_step_fn=env.step_fn
+    ).eval_state
+
+    assert int(searched.next_free_idx) == 8
+    # nodes stay in the order they were added: none has taken an evicted one's slot
+    np.testing.assert_array_equal(np.asarray(searched.parents)[:5], before[:5])
+    assert_consistent(searched)
+
+
+@pytest.mark.parametrize("min_iterations", [0, 2], ids=["no-min", "min-2"])
+def test_cycles_past_a_full_trees_stop_change_nothing(env, min_iterations):
+    # self-play plays a move only every few cycles, and the cycles until then must neither evict
+    # nor add visits
+    search = make_mcts(
+        max_nodes=7,
+        eval_fn=state_eval_fn,
+        num_iterations=8,
+        stop_when_full=True,
+        min_iterations=min_iterations,
+    )
+    tree = build_tree(search, env, SHAPES[2])
+    key = jax.random.PRNGKey(3)
+    done = search_until_done(search, env)(key, tree)
+    assert bool(search.search_done(done, jnp.array(1 + min_iterations)))
+
+    # up to the search's budget and past it, with their own keys
+    later = search_cycles(search, env, range(5, 14))(key, done)
+
+    assert_trees_equal(later, search.start_search(key, done))
+
+
+def test_cycles_past_a_search_stopping_when_full_budget_change_nothing(env):
+    # with room to spare: done by its iterations, and no extra visits in the wait for its move
+    search = make_mcts(
+        max_nodes=32, eval_fn=state_eval_fn, num_iterations=4, stop_when_full=True
+    )
+    key = jax.random.PRNGKey(3)
+    tree = build_tree(search, env, SHAPES[0])
+    done = search_until_done(search, env)(key, tree)
+
+    later = search_cycles(search, env, range(5, 9))(key, done)
+
+    assert_trees_equal(later, search.start_search(key, done))
+
+
+def test_stop_when_full_keeps_an_unfilled_search_as_it_was(env):
+    # with room to spare the rule never fires: the same search, up to its config
+    kwargs = {"max_nodes": 32, "eval_fn": state_eval_fn, "num_iterations": 6}
+    tree = build_tree(make_mcts(**kwargs), env, SHAPES[2])
+    state, meta = env.init_fn(jax.random.PRNGKey(0))
+
+    outputs = [
+        make_mcts(stop_when_full=stop, **kwargs).evaluate(
+            jax.random.PRNGKey(0), tree, state, meta, None, env_step_fn=env.step_fn
+        )
+        for stop in (False, True)
+    ]
+
+    assert_trees_equal(*outputs)
+
+
+def test_stop_when_full_does_not_go_with_counting_reused_visits():
+    with pytest.raises(ValueError, match="stop_when_full"):
+        make_mcts(count_reused_visits=True, stop_when_full=True)
 
 
 def test_min_iterations_is_at_most_num_iterations():
@@ -944,14 +1049,19 @@ def open_loops_in_loop(hlo: str) -> int:
         pytest.param(AZ_WEIGHTED, id="AlphaZero(WeightedMCTS)"),
     ],
 )
-def test_search_cycles_write_the_trees_in_place(env, cls):
+@pytest.mark.parametrize(
+    "budget", [{}, {"stop_when_full": True}], ids=["iterations", "full"]
+)
+def test_search_cycles_write_the_trees_in_place(env, cls, budget):
     # a copy of an array of the trees' nodes in a cycle makes each cycle's cost grow with the
     # trees' capacity: e.g. where the root's update reads what the iteration writes (or the other
     # way round) and XLA doesn't order the reads first, it copies the arrays to read from.
     # (WeightedMCTS's backpropagation is a loop within the cycle's, which under vmap selects its
     # statistics every step, see `backprop_stats`)
     batch, capacity = 5, 24
-    search = make_mcts(cls, max_nodes=capacity, eval_fn=state_eval_fn, num_iterations=6)
+    search = make_mcts(
+        cls, max_nodes=capacity, eval_fn=state_eval_fn, num_iterations=6, **budget
+    )
     trees = jax.vmap(lambda _: search.init(template_embedding=env.init_fn(None)[0]))(
         jnp.arange(batch)
     )
@@ -972,10 +1082,15 @@ def test_search_cycles_write_the_trees_in_place(env, cls):
         pytest.param(AZ_WEIGHTED, 2, id="AlphaZero(WeightedMCTS)"),
     ],
 )
-def test_a_search_cycle_loops_only_to_traverse(env, cls, loops):
+@pytest.mark.parametrize(
+    "budget", [{}, {"stop_when_full": True}], ids=["iterations", "full"]
+)
+def test_a_search_cycle_loops_only_to_traverse(env, cls, loops, budget):
     # the root's noise is drawn once, before the cycles (its Gamma draws are rejection sampling,
     # a loop until every draw in the batch is accepted)
-    search = make_mcts(cls, max_nodes=24, eval_fn=state_eval_fn, num_iterations=6)
+    search = make_mcts(
+        cls, max_nodes=24, eval_fn=state_eval_fn, num_iterations=6, **budget
+    )
     trees = jax.vmap(lambda _: search.init(template_embedding=env.init_fn(None)[0]))(
         jnp.arange(5)
     )
