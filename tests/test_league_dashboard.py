@@ -33,7 +33,7 @@ class FakeGame(LeagueGame):
     def load_network(self, path, net, dtype):
         raise NotImplementedError
 
-    def make_evaluator(self, network, sims):
+    def make_evaluator(self, network, sims, tree_factor=2):
         raise NotImplementedError
 
     def num_openings(self):

@@ -1,6 +1,7 @@
 """The league's command line: a game's script hands its `LeagueGame` to `main`.
 
 add-network NAME CHECKPOINT --net SPEC --run RUN --sims 128 1000 [--url URL]
+add-player NETWORK --sims 4000 16000 [--tree-factor 4]
 link NAME URL
 add-external NAME ENGINE --settings '{"level": 8}'
 add-result A B WINS DRAWS LOSSES --source SOURCE
@@ -29,7 +30,14 @@ import numpy as np
 
 from core.league.game import LeagueGame, check_match
 from core.league.ratings import Ratings
-from core.league.store import GameRecord, Player, Store, changed_settings
+from core.league.scheduler import SchedulerConfig
+from core.league.store import (
+    DEFAULT_TREE_FACTOR,
+    GameRecord,
+    Player,
+    Store,
+    changed_settings,
+)
 
 # seconds a player rides out slick being unreachable, as when it restarts
 PLAYER_QUEUE_OUTAGE = 300.0
@@ -140,6 +148,18 @@ def main(make_game: Callable[[], LeagueGame], default_root: Path, argv=None) -> 
     add.add_argument("--sims", type=int, nargs="+", required=True)
     add.add_argument("--url", help="where to read about it, e.g. its run's page")
 
+    player = commands.add_parser(
+        "add-player", help="more players of a network: NETWORK@SIMS[-tFACTOR]"
+    )
+    player.add_argument("network")
+    player.add_argument("--sims", type=int, nargs="+", required=True)
+    player.add_argument(
+        "--tree-factor",
+        type=int,
+        default=DEFAULT_TREE_FACTOR,
+        help="the tree's nodes per iteration of the search",
+    )
+
     link = commands.add_parser("link", help="link a network to any URL")
     link.add_argument("name")
     link.add_argument("url")
@@ -211,6 +231,24 @@ def main(make_game: Callable[[], LeagueGame], default_root: Path, argv=None) -> 
     commands.add_parser("stop", help="stop the worker, at once")
     play_cmd = commands.add_parser("play", help="the player itself: the queue runs it")
     play_cmd.add_argument("--max-batches", type=int, default=None)
+    play_cmd.add_argument(
+        "--batch-seconds",
+        type=float,
+        default=SchedulerConfig.batch_seconds,
+        help="how long a batch should take at most: longer ones run at larger batches, faster, "
+        "but lose more when it gives way",
+    )
+    play_cmd.add_argument(
+        "--max-tree-nodes",
+        type=int,
+        default=SchedulerConfig.max_tree_nodes,
+        help="the most tree nodes a batch may hold at once",
+    )
+    play_cmd.add_argument(
+        "--requests-only",
+        action="store_true",
+        help="stop once no requested series can be played",
+    )
     dashboard_cmd = commands.add_parser("dashboard", help="serve the web page")
     dashboard_cmd.add_argument("--host", default="0.0.0.0")
     dashboard_cmd.add_argument("--port", type=int, default=8031)
@@ -227,6 +265,15 @@ def main(make_game: Callable[[], LeagueGame], default_root: Path, argv=None) -> 
             store.set_network_url(args.name, args.url)
         added = next(p for p in store.players() if p.network == args.name)
         export_network(store, make_game(), added)
+    elif args.command == "add-player":
+        default = args.tree_factor == DEFAULT_TREE_FACTOR
+        for sims in args.sims:
+            store.add_net_player(
+                args.network,
+                sims,
+                "" if default else f"t{args.tree_factor}",
+                {} if default else {"tree_factor": args.tree_factor},
+            )
     elif args.command == "link":
         store.set_network_url(args.name, args.url)
     elif args.command == "add-external":
@@ -308,7 +355,14 @@ def main(make_game: Callable[[], LeagueGame], default_root: Path, argv=None) -> 
             queue_outage=PLAYER_QUEUE_OUTAGE,
         )
         reason = play(
-            store, make_game(), ThrottledGate(gate), max_batches=args.max_batches
+            store,
+            make_game(),
+            ThrottledGate(gate),
+            SchedulerConfig(
+                batch_seconds=args.batch_seconds, max_tree_nodes=args.max_tree_nodes
+            ),
+            max_batches=args.max_batches,
+            requests_only=args.requests_only,
         )
         print(reason)
         if reason == "no two players can play":

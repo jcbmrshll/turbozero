@@ -73,7 +73,7 @@ def select(which, on_true, on_false):
 
 @dataclass(frozen=True)
 class Program:
-    """A network spec's compiled search, for one batch size and search budget."""
+    """A network spec's compiled search, for one batch size, search budget and tree size."""
 
     init: Callable
     search: Callable
@@ -110,12 +110,12 @@ class Programs:
         return found
 
     def program(self, player: Player, games: int) -> Program:
-        key = (player.net, player.sims, games)
+        key = (player.net, player.sims, player.tree_factor, games)
         found = self.programs.get(key)
         if found is None:
             assert player.sims is not None
             network, _ = self.network(player)
-            found = self._compile(network, player.sims)
+            found = self._compile(network, player.sims, player.tree_factor)
             self.programs[key] = found
             self.compiled = True
             if len(self.programs) > self.keep:
@@ -123,9 +123,9 @@ class Programs:
         self.programs.move_to_end(key)
         return found
 
-    def _compile(self, network: Any, sims: int) -> Program:
+    def _compile(self, network: Any, sims: int, tree_factor: int) -> Program:
         game = self.game
-        evaluator = game.make_evaluator(network, sims)
+        evaluator = game.make_evaluator(network, sims, tree_factor)
         return Program(
             init=jax.jit(
                 jax.vmap(lambda state: evaluator.init(template_embedding=state))

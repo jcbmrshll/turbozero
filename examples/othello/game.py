@@ -246,7 +246,9 @@ def load_checkpoint(path: str, net: str, inference_dtype: str = "float32"):
     return network, (params, network_state)
 
 
-def make_test_evaluator(eval_fn, num_iterations: int = 64, noise: bool = True) -> MCTS:
+def make_test_evaluator(
+    eval_fn, num_iterations: int = 64, noise: bool = True, tree_factor: int = 2
+) -> MCTS:
     """Evaluator used in test games: temperature 0 to always play the most-visited
     action. Opponents share these settings, so that only the quality of their
     policy/value estimates and their search budget differ.
@@ -260,7 +262,7 @@ def make_test_evaluator(eval_fn, num_iterations: int = 64, noise: bool = True) -
         num_iterations=num_iterations,
         # the tree is kept between moves: room for the subtree a search reuses, and its own
         # iterations on top (as self-play's, see train.py's --tree-factor)
-        max_nodes=2 * num_iterations,
+        max_nodes=tree_factor * num_iterations,
         branching_factor=env.num_actions,
         action_selector=PUCTSelector(),
         temperature=0.0,

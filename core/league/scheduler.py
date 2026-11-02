@@ -44,8 +44,8 @@ class SchedulerConfig:
         batch_sizes: the sizes of batch to choose from, in games, each even: the search
             compiles for each, so the fewer the better
         max_tree_nodes: the most tree nodes (of both sides' searches) a batch may hold at
-            once, for the memory they take: 6M ran a 16 GB GPU out of memory, at 4x64 with
-            4000 sims against 128 in a batch of 1024
+            once, for the memory they take: 4.2M, nearly all on one side, ran a 16 GB GPU out of
+            memory, at 4x64 with 4000 sims against 128 in a batch of 1024
         request_batch_sizes: further sizes for requested series, whose games can be too slow
             for the smallest of `batch_sizes`. Nothing smaller: a batch's games are played
             at once, up to the cores engines get (8), so fewer take as long and just waste them
@@ -80,8 +80,8 @@ def batch_size(
     config: SchedulerConfig, a: Player, b: Player, seconds_per_game: float
 ) -> int:
     """The largest batch of the pair's that takes at most `batch_seconds` and fits in
-    memory, or the smallest there is. A game's search keeps 2 * sims nodes for each side."""
-    nodes = 2 * ((a.sims or 0) + (b.sims or 0))
+    memory, or the smallest there is."""
+    nodes = a.tree_nodes + b.tree_nodes
     fits = [
         size
         for size in sorted(config.batch_sizes)

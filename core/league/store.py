@@ -157,6 +157,8 @@ MIGRATIONS = {
 }
 # how many of a search's moves are kept, the most visited first
 TOP_MOVES = 4
+# a network's tree holds this many nodes per iteration of its search, unless its settings say
+DEFAULT_TREE_FACTOR = 2
 # settings recorded that can't change a move: a traversal's checks only say when to stop looking
 # (see `MCTS`), and a policy target is for training
 NOT_PLAY_SETTINGS = frozenset({"traversal_steps", "policy_target_config"})
@@ -176,7 +178,7 @@ class Player:
         net: its network's spec (see `core.networks.spec`)
         url: where to read about it, e.g. its training run's page (an engine's is its settings')
         external: its engine's name, if it's an engine (see `game.LeagueGame.external_player`)
-        settings: its engine's settings, e.g. its level
+        settings: its engine's settings, e.g. its level, or its search's: its `tree_factor`
         retired: whether it no longer plays new games (it stays rated)
         description: what someone wrote about it: a network's is shared by its search budgets
         tags: labels someone gave it, shared the same way
@@ -203,6 +205,16 @@ class Player:
     @property
     def is_external(self) -> bool:
         return self.external is not None
+
+    @property
+    def tree_factor(self) -> int:
+        """The nodes its search's tree holds, per iteration of the search."""
+        return self.settings.get("tree_factor", DEFAULT_TREE_FACTOR)
+
+    @property
+    def tree_nodes(self) -> int:
+        """The nodes its search's tree holds, for one game."""
+        return self.tree_factor * (self.sims or 0)
 
 
 @dataclass(frozen=True)
@@ -642,9 +654,15 @@ class Store:
                     (json.dumps(unique), key),
                 )
 
-    def add_net_player(self, network: str, sims: int, variant: str = "") -> int:
+    def add_net_player(
+        self,
+        network: str,
+        sims: int,
+        variant: str = "",
+        settings: dict[str, Any] | None = None,
+    ) -> int:
         """The player that is `network` searching `sims` iterations a move; with `variant`, a
-        player of its own, for settings other than the first's."""
+        player of its own, for settings other than the first's, among them `settings`."""
         row = self.db.execute(
             "SELECT id FROM networks WHERE name = ?", (network,)
         ).fetchone()
@@ -652,8 +670,9 @@ class Store:
             raise ValueError(f"no network {network} in the store")
         return self._add_player(
             f"{network}@{sims}" + (f"-{variant}" if variant else ""),
-            "INSERT INTO players (name, network_id, sims, added) VALUES (?, ?, ?, ?)",
-            (row["id"], sims),
+            "INSERT INTO players (name, network_id, sims, settings, added) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (row["id"], sims, json.dumps(settings or {}, sort_keys=True)),
         )
 
     def add_external_player(
@@ -682,8 +701,12 @@ class Store:
         settings it's given from now on; returns its name. `player` stays as it is."""
         if player.network is not None:
             assert player.sims is not None
-            self.add_net_player(player.network, player.sims, variant)
-            return f"{player.network}@{player.sims}-{variant}"
+            base = f"{player.network}@{player.sims}"
+            # keeps what already sets it apart: a variant of n@128-t4 isn't one of n@128
+            suffix = player.name.removeprefix(base).lstrip("-")
+            suffix = f"{suffix}-{variant}" if suffix else variant
+            self.add_net_player(player.network, player.sims, suffix, player.settings)
+            return f"{base}-{suffix}"
         assert player.external is not None
         name = f"{player.name}-{variant}"
         self.add_external_player(name, player.external, player.settings)

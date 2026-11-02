@@ -27,7 +27,7 @@ class FakeGame(LeagueGame):
     def load_network(self, path, net, dtype):
         raise NotImplementedError
 
-    def make_evaluator(self, network, sims):
+    def make_evaluator(self, network, sims, tree_factor=2):
         raise NotImplementedError
 
     def openings(self, indices):
@@ -459,6 +459,13 @@ def test_a_requested_series_comes_first_then_the_scheduler_takes_over(store):
     assert tuple(state) == ("done", 40)
     run_play(store, max_batches=10)
     assert {(row[0], row[1]) for row in batches_of(store)[3:]} != {(x, y)}
+
+
+def test_requests_only_stops_when_the_series_are_done(store):
+    x, y = ids(store)["n@8"], ids(store)["edax-1"]
+    store.request_match(x, y, 16)
+    assert run_play(store, requests_only=True) == "no requested series left"
+    assert [tuple(row) for row in batches_of(store)] == [(x, y, 16)]
 
 
 def test_series_are_played_in_the_queues_order(store):
