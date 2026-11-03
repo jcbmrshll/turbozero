@@ -19,7 +19,7 @@ Othello model and against two strong open-source Othello engines,
 | `bench_cpu_backends.py` | Evals a second by CPU backend and batch, each checked against JAX's outputs |
 | `quantize.py`, `fidelity.py`, `bench_quantized.py` | Quantizes a network to int8 for playing on CPU, and measures its outputs and speed against bf16 |
 | `engine_set.py`, `label_positions.py`, `score_engine_set.py` | The engine-labelled set: fixed positions with every legal move scored by Edax, to build, and to score checkpoints on (train.py scores the network on it every epoch) |
-| `distill.py` | Trains a network on a saved training state's replay buffer, with no self-play, on a teacher network's values or the games' outcomes |
+| `distill.py` | Trains a network on a saved training state's replay buffer or a run's kept positions, with no self-play, on a teacher network's values or the games' outcomes |
 | `bench_nets.py` | Times networks on their own: a forward pass at self-play's batch, a training step at training's |
 | `game.py` | What the scripts share: the environment, board symmetries, network, evaluators |
 | `xot.py`, `xot-openings.txt` | The XOT opening list |
@@ -296,6 +296,36 @@ uv run examples/othello/train.py --epochs 30 --init-from runs/trunk/state-150.np
 The learning rate holds `--lr`, then drops 10x at 70% of the run and again at 90% (`--lr-drops`).
 To read several budgets from one run, fork that same schedule: train the trunk at a constant
 learning rate to 70% of a budget, then fork the last 30%, with `--lr 1e-4 --lr-drops 0.667:1e-5`.
+
+### Keeping self-play's positions
+
+`--save-positions-from` keeps a local run's positions for good, for `distill.py` to train on with no
+further search (Modal jobs refuse it: bringing the positions here costs more in egress than they're
+worth). It doesn't change training. `0` keeps all; an epoch or a fraction of `--epochs`
+(`0.7`) keeps those of games finishing from there on, the later ones being the valuable ones:
+
+```
+uv run examples/othello/train.py --epochs 229 --save-positions-from 0.5 --ckpt-dir runs/trunk
+uv run examples/othello/distill.py train --data runs/trunk --from-epoch 150 --net NET --heldout state-3.npz
+```
+
+Each epoch writes `positions-<epoch>.npy` to `--ckpt-dir`, a numpy structured array of about 473
+bytes a position (131k positions an epoch, so about 62 MB), with all `distill.py` reads and the
+epoch. A position is written once, when its game finishes, with that game's outcome and that epoch:
+
+- Games in progress at the end of a run, and games truncated at the step limit, are never written.
+  Everything else is, so the files hold the final buffer too: `--data` given a state and a run counts
+  positions in both once.
+- `--resume` goes back to its state's epoch, replacing the files from there on.
+- A fork writes only the games it finishes. What it inherits is its parent's, in its parent's files:
+  `distill.py` given a fork's directory also reads its ancestors', up to where each forked, and
+  `--from-epoch` and `--to-epoch` count epochs along that lineage. So pass the flag to the trunk and to
+  each fork. Two forks given together share their ancestors' positions once.
+
+`distill.py` holds `--chunk-positions` at a time, 4M by default (about 1.9 GB on the device, and
+twice that in memory): shuffled blocks of 8192 from across the whole dataset, every block once a pass.
+A saved state's positions alone stay in memory whole, as before. `distill.py values` computes a
+teacher's values one file at a time, and goes on from where it stopped.
 
 ### Training on Modal
 

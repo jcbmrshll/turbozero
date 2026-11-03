@@ -19,6 +19,7 @@ from seaglass.client import to_number
 from core.common import step_env_and_evaluator, step_with_output
 from core.evaluators.evaluator import Evaluator
 from core.evaluators.mcts.mcts import MCTS
+from core.memory.position_archive import PositionArchive, drop_positions_from
 from core.memory.replay_memory import (
     BaseExperience,
     DataTransformFn,
@@ -423,6 +424,7 @@ class Trainer:
         keep_every: int | None = None,
         save_state_at: Collection[int] = (),
         save_state_every: int | None = None,
+        save_positions_from: int | None = None,
         extra_config: dict | None = None,
     ):
         """Initializes a Trainer.
@@ -505,6 +507,9 @@ class Trainer:
             save_state_every: (optional) also save the whole training state after every this many epochs,
                 keeping only the newest of these, to `resume` the run from if it stops. A state takes
                 as much disk space as the replay buffers' device memory.
+            save_positions_from: (optional) save self-play's positions to `ckpt_dir` for good, those of
+                games finishing from this epoch on (see `core.memory.position_archive`). It doesn't
+                change training. The replay buffer must hold more than an epoch's moves and a game.
             extra_config: (optional) extra config to record with the monitor's run
         """
         # environment
@@ -594,6 +599,8 @@ class Trainer:
         self.keep_every = keep_every
         self.save_state_at = frozenset(save_state_at)
         self.save_state_every = save_state_every
+        self.save_positions_from = save_positions_from
+        self.position_archive: PositionArchive | None = None
         os.makedirs(ckpt_dir, exist_ok=True)
         # monitor
         self.monitor = monitor
@@ -1578,8 +1585,8 @@ class Trainer:
         With the run's configuration (see `load_state`), the continued run is the same as if it
         hadn't stopped (its rng is saved, so `train_loop`'s seed is unused), given deterministic computations (e.g. on the CPU; GPU convolutions'
         autotuning may differ). It logs to the run's monitor run (whose metrics then hold the
-        epochs between the state and the stop twice), and deletes the checkpoints saved after
-        the state, which it saves again.
+        epochs between the state and the stop twice), and deletes the checkpoints and positions
+        saved after the state, which it saves again.
 
         Args:
             path: (optional) the saved state, or a directory to take the newest from. If not
@@ -1609,6 +1616,7 @@ class Trainer:
         for epoch in checkpoint_epochs(self.ckpt_dir):
             if epoch >= state.cur_epoch:
                 os.remove(checkpoint_path(self.ckpt_dir, epoch))
+        drop_positions_from(self.ckpt_dir, state.cur_epoch)
         print(f"resuming from {path}: {state.cur_epoch} epochs done", flush=True)
         return state
 
@@ -2070,6 +2078,16 @@ class Trainer:
                 # the last epoch
                 total=num_epochs - 1,
             )
+        self.position_archive = (
+            PositionArchive(
+                self.ckpt_dir,
+                self.memory_buffer.capacity,
+                self.save_positions_from,
+                self.parent,
+            )
+            if self.save_positions_from is not None
+            else None
+        )
         try:
             output = self._train_loop(
                 seed,
@@ -2085,6 +2103,9 @@ class Trainer:
                     "stopped" if isinstance(e, KeyboardInterrupt) else "crashed"
                 )
             raise
+        finally:
+            if self.position_archive is not None:
+                self.position_archive.close()
         if self.monitor is not None:
             self.monitor.finish()
         return output
@@ -2136,6 +2157,10 @@ class Trainer:
             # initialize tester states
             tester_states = [tester.init(params=params) for tester in self.testers]
 
+        if self.position_archive is not None:
+            self.position_archive.start(
+                collection_state.buffer_state, collection_state.moves
+            )
         evaluator, collection_state = self.follow_schedule(
             cur_epoch, evaluator, collection_state
         )
@@ -2235,10 +2260,17 @@ class Trainer:
             # save checkpoint
             self.set_activity(f"epoch {cur_epoch}: saving checkpoint")
             self.save_checkpoint(train_state, cur_epoch)
+            if self.position_archive is not None:
+                self.position_archive.save(
+                    cur_epoch, collection_state.buffer_state, collection_state.moves
+                )
             # next epoch
             cur_epoch += 1
             if self.should_save_state(cur_epoch):
                 self.set_activity(f"epoch {cur_epoch - 1}: saving the training state")
+                # a run continuing from the state takes these positions as saved
+                if self.position_archive is not None:
+                    self.position_archive.flush()
                 self.save_state(
                     TrainLoopOutput(
                         collection_state=collection_state,
@@ -2249,6 +2281,8 @@ class Trainer:
                     )
                 )
 
+        if self.position_archive is not None:
+            self.position_archive.flush()
         # return state so that training can be continued!
         return TrainLoopOutput(
             collection_state=collection_state,

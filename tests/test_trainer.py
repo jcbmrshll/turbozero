@@ -9,7 +9,9 @@ trainer, see `real`) a whole run, its exact resumption, and the donation of the 
 import fnmatch
 import gc
 import itertools
+import json
 import os
+import shutil
 import warnings
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
@@ -29,6 +31,11 @@ from core.evaluators.evaluation_fns import make_nn_eval_fn
 from core.evaluators.evaluator import EvalOutput, Evaluator
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.mcts.mcts import MCTS
+from core.memory.position_archive import (
+    ARCHIVE_META,
+    position_epochs,
+    positions_path,
+)
 from core.memory.replay_memory import BaseExperience, EpisodeReplayBuffer
 from core.monitoring import DECLARED
 from core.networks.azresnet import batch_norm
@@ -1787,6 +1794,89 @@ def test_a_run_resumed_from_its_saved_state_is_bit_identical(
         real.load_train_state_from_checkpoint(str(tmp_path), 3),
         real_run.output.train_state,
     )
+
+
+def kept_rows(directory):
+    """A run's kept positions, by epoch."""
+    return {e: np.load(positions_path(directory, e)) for e in position_epochs(directory)}  # fmt: skip
+
+
+@pytest.fixture(scope="module")
+def kept_run(real, real_run, tmp_path_factory):
+    """`real_run` again, keeping its positions: its output and files."""
+    directory = tmp_path_factory.mktemp("kept")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(real, "monitor", FakeMonitor())
+        patch.setattr(real, "ckpt_dir", str(directory))
+        patch.setattr(real, "save_positions_from", 0)
+        output = snapshot(real.train_loop(seed=0, num_epochs=4))
+    return SimpleNamespace(output=output, dir=directory, rows=kept_rows(directory))
+
+
+def test_keeping_positions_doesnt_change_a_run(kept_run, real_run):
+    # train state, replay buffers, games, search trees, testers' states, rng
+    assert jax.tree.all(jax.tree.map(np.array_equal, kept_run.output, real_run.output))
+
+
+def test_a_run_keeps_every_finished_position_once(env, kept_run):
+    assert list(kept_run.rows) == [0, 1, 2, 3]
+    assert all((rows["epoch"] == e).all() for e, rows in kept_run.rows.items())
+    rows = np.concatenate(list(kept_run.rows.values()))
+    buffers = kept_run.output.collection_state.buffer_state
+    finished = np.asarray(buffers.populated & buffers.has_reward)
+    # the games of the environment are 3 moves each, all finished ones kept
+    assert len(rows) == 3 * int(kept_run.output.collection_state.episodes.sum())
+    # what's in the final buffer is among them
+    final = np.asarray(buffers.buffer.search_value)[finished]
+    assert np.isin(final, rows["search_value"]).all()
+    assert finished.sum() <= len(rows)
+    # all with their targets, and their game's outcome
+    assert (np.abs(rows["reward"]).sum(axis=1) > 0).all()
+    np.testing.assert_allclose(rows["policy_weights"].sum(axis=1), 1, rtol=1e-5)
+
+
+def test_a_resumed_run_keeps_what_it_would_have(real, real_run, kept_run, tmp_path):
+    # as the first run left its directory, had it died after epoch 3's positions
+    shutil.copytree(kept_run.dir, tmp_path, dirs_exist_ok=True)
+    (tmp_path / "positions-9.npy").touch()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(real, "monitor", FakeMonitor())
+        patch.setattr(real, "ckpt_dir", str(tmp_path))
+        patch.setattr(real, "save_positions_from", 0)
+        real.train_loop(seed=0, num_epochs=4, initial_state=real.resume(real_run.path))
+    rows = kept_rows(tmp_path)
+    assert list(rows) == list(kept_run.rows)
+    for epoch in rows:
+        assert rows[epoch].tobytes() == kept_run.rows[epoch].tobytes()
+
+
+def test_a_fork_keeps_only_what_it_plays(real, real_run, kept_run, tmp_path):
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(real, "monitor", FakeMonitor())
+        patch.setattr(real, "ckpt_dir", str(tmp_path))
+        patch.setattr(real, "save_positions_from", 0)
+        output = snapshot(
+            real.train_loop(seed=7, num_epochs=1, fork_from=real_run.path)
+        )
+    parent = json.loads((tmp_path / ARCHIVE_META).read_text())["parent"]
+    assert parent["epoch"] == 2
+    rows = kept_rows(tmp_path)[0]
+    # all from its own self-play: warmup's and epoch 0's, 3 moves a game
+    state = output.collection_state
+    saved = read_saved_episodes(real_run.path)
+    assert len(rows) == 3 * (int(state.episodes.sum()) - saved)
+    # what it inherited isn't among them
+    inherited = np.concatenate(
+        [rows_["search_value"] for e, rows_ in kept_run.rows.items() if e < 2]
+    )
+    assert not np.isin(rows["search_value"], inherited).any()
+
+
+def read_saved_episodes(path):
+    with np.load(path) as saved:
+        meta = json.loads(str(saved["meta"]))
+        index = {leaf[0]: i for i, leaf in enumerate(meta["leaves"]["collection_state"])}  # fmt: skip
+        return int(saved[f"collection_state.{index['.episodes']}"].sum())
 
 
 def test_collection_updates_the_collection_state_in_place(real):

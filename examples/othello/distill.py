@@ -1,7 +1,8 @@
-"""Trains a network on another run's games, with no self-play: supervised on the search policies
-in a saved training state's replay buffer (see `Trainer.save_state`), and on a value target of the
-game's outcome, the search's value stored with each position, the value a teacher network gives it
-(see the `values` command), or a mix of the outcome and one of those.
+"""Trains a network on other runs' games, with no self-play: supervised on the search policies in
+saved training states' replay buffers (see `Trainer.save_state`) or the positions a run kept with
+train.py's --save-positions-from, and on a value target of the game's outcome, the search's value
+stored with each position, the value a teacher network gives it (see the `values` command), or a
+mix of the outcome and one of those.
 
     uv run examples/othello/distill.py values --teacher 37.eqx --teacher-net NET \\
         --data state-188.npz state-3.npz --out teacher-values
@@ -10,14 +11,23 @@ game's outcome, the search's value stored with each position, the value a teache
         --value-source teacher --value-target-q 1 --teacher-values teacher-values \\
         --ckpt-dir runs/student --monitor --notes "does a student learn from its teacher?"
 
-Its checkpoints load with `game.load_checkpoint`, like train.py's.
+--data takes kept positions by run directory, a fork's with its ancestors' from before it forked.
+They stay on disk, however many: training reads --chunk-positions at a time, in shuffled blocks.
+
+    uv run examples/othello/distill.py train --data runs/fork --from-epoch 100 --heldout state-3.npz \\
+        --net resnet:4x64,pool_every=2,heads=pooled,pool_channels=16 --ckpt-dir runs/student
+
+A state's positions that are also among kept ones given with it count once. Its checkpoints load with `game.load_checkpoint`, like train.py's.
 """
 
 import argparse
 import dataclasses
 import json
+import os
 import time
-from dataclasses import replace
+from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -36,6 +46,13 @@ from game import (
     make_optimizer,
 )
 
+from core.memory.position_archive import (
+    PositionFile,
+    from_rows,
+    read_memmap,
+    select_files,
+    to_rows,
+)
 from core.memory.replay_memory import BaseExperience, transform_randomly
 from core.monitoring import DEFAULT_URL, Monitor
 from core.networks.utils import apply_nn
@@ -43,6 +60,9 @@ from core.training.loss_fns import az_default_loss_fn
 
 # positions evaluated at once when measuring a network, not training it
 EVAL_BATCH = 4096
+# positions read from disk together, in training: enough for chunks to mix games from across a
+# large dataset (a chunk of 4M holds about 490 of them), small enough to seek little
+BLOCK = 8192
 
 
 def load_positions(path: str) -> BaseExperience:
@@ -63,6 +83,161 @@ def load_positions(path: str) -> BaseExperience:
             for field in dataclasses.fields(BaseExperience)
         }
         return BaseExperience(**fields)
+
+
+def row_hashes(rows: np.ndarray) -> np.ndarray:
+    """A 64-bit hash of each row's position and search results, to recognize it elsewhere."""
+    hashes = np.zeros(len(rows), np.uint64)
+    for name in ("observation_nn", "policy_weights", "search_value"):
+        x = rows[name].reshape(len(rows), -1)
+        words = x.astype(np.uint8) if x.dtype == bool else x.view(np.uint32)
+        odd = np.random.default_rng(len(name)).integers(
+            0, 2**63, words.shape[1], np.uint64
+        )
+        hashes = hashes * np.uint64(0x9E3779B97F4A7C15) + (words * (2 * odd + 1)).sum(
+            axis=1, dtype=np.uint64
+        )
+    return hashes
+
+
+def already_kept(rows: np.ndarray, files: list[PositionFile]) -> np.ndarray:
+    """Which of a state's rows are also in `files`. A state's positions are those finished last,
+    so this looks from the newest file back, until it finds no more."""
+    hashes = row_hashes(rows)
+    found = np.zeros(len(rows), bool)
+    for file in reversed(files):
+        matched = np.isin(hashes, row_hashes(read_memmap(file.path)))
+        if found.any() and not matched.any():
+            break
+        found |= matched
+        if found.all():
+            break
+    return found
+
+
+@dataclass(frozen=True)
+class Source:
+    """Rows to train on (see `core.memory.position_archive.to_rows`).
+
+    Attributes:
+        rows: the rows in memory, as a state's, or the file they're in
+        values: (optional) a teacher's values of the rows of a file, the file they're in
+    """
+
+    rows: np.ndarray | str
+    values: str | None = None
+
+    def __len__(self) -> int:
+        return len(self._open())
+
+    def _open(self) -> np.ndarray:
+        return read_memmap(self.rows) if isinstance(self.rows, str) else self.rows
+
+    def read(self, at: slice | np.ndarray) -> np.ndarray:
+        """New rows in memory. Files stay mapped only for as long as this takes."""
+        rows = np.array(self._open()[at])
+        if self.values is not None:
+            rows["search_value"] = read_memmap(self.values)[at]
+        return rows
+
+
+class Dataset:
+    """Positions to train on, from any number of sources, in memory only as they're used."""
+
+    def __init__(self, sources: list[Source], chunk_positions: int | None = None):
+        """
+        Args:
+            sources: where the positions are
+            chunk_positions: at most how many to hold at once in training (see `batches`). If
+                not given, all of them.
+        """
+        self.sources = sources
+        self.starts = np.cumsum([0, *(len(source) for source in sources)])
+        self.chunk_positions = chunk_positions
+
+    @classmethod
+    def of(cls, positions: BaseExperience) -> "Dataset":
+        """Positions in memory, as a whole."""
+        return cls([Source(to_rows(positions, 0))])
+
+    def __len__(self) -> int:
+        return int(self.starts[-1])
+
+    def take(self, indices: np.ndarray) -> BaseExperience:
+        """Those positions, read in order of where they are."""
+        ranks = np.argsort(indices, kind="stable")
+        ordered = indices[ranks]
+        at_source = np.searchsorted(self.starts, ordered, side="right") - 1
+        rows = np.concatenate(
+            [
+                self.sources[i].read(ordered[at_source == i] - self.starts[i])
+                for i in np.unique(at_source)
+            ]
+        )
+        restore = np.empty_like(ranks)
+        restore[ranks] = np.arange(len(ranks))
+        return from_rows(rows[restore])
+
+    def _blocks(self, rng: np.random.Generator) -> Iterator[np.ndarray]:
+        """Rows in blocks, in a new random order of all of them each pass, without end."""
+        blocks = [
+            (source, start, min(start + BLOCK, len(source)))
+            for source in self.sources
+            for start in range(0, len(source), BLOCK)
+        ]
+        while True:
+            for i in rng.permutation(len(blocks)):
+                source, start, stop = blocks[i]
+                yield source.read(slice(start, stop))
+
+    def batches(
+        self, batch_size: int, rng: np.random.Generator
+    ) -> Iterator[tuple[BaseExperience, jax.Array]]:
+        """Training's batches without end, each as positions on the device and a batch's indices
+        in them.
+
+        If it's allowed to hold all the positions, it does, and each pass goes through them in a
+        new random order. Otherwise, it holds a chunk at a time: blocks of `BLOCK` positions from
+        across the whole dataset, shuffled together. A pass of a chunk at a time still sees every
+        block once. The next chunk is read while the last trains.
+        """
+        total = len(self)
+        if self.chunk_positions is None or total <= self.chunk_positions:
+            on_device = jax.tree.map(jnp.asarray, self.take(np.arange(total)))
+            while True:
+                order = rng.permutation(total)
+                for i in range(total // batch_size):
+                    yield (
+                        on_device,
+                        jnp.asarray(order[i * batch_size : (i + 1) * batch_size]),
+                    )
+        # a whole number of batches, all chunks one size: training compiles for each size
+        size = max(self.chunk_positions // batch_size, 1) * batch_size
+        blocks = self._blocks(rng)
+        rest = next(blocks)
+
+        def next_chunk(rest: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            parts, count = [rest], len(rest)
+            while count < size:
+                parts.append(next(blocks))
+                count += len(parts[-1])
+            rows = np.concatenate(parts)
+            return rows[:size], rows[size:]
+
+        with ThreadPoolExecutor(max_workers=1) as reader:
+            coming = reader.submit(next_chunk, rest)
+            while True:
+                rows, rest = coming.result()
+                coming = reader.submit(next_chunk, rest)
+                on_device = jax.tree.map(jnp.asarray, from_rows(rows))
+                del rows
+                order = rng.permutation(size)
+                for i in range(size // batch_size):
+                    yield (
+                        on_device,
+                        jnp.asarray(order[i * batch_size : (i + 1) * batch_size]),
+                    )
+                del on_device
 
 
 def outcomes(positions: BaseExperience) -> np.ndarray:
@@ -114,18 +289,6 @@ def measure(
     return metrics, value
 
 
-def with_value_source(
-    positions: BaseExperience, source: str, teacher_values: np.ndarray | None
-) -> BaseExperience:
-    """`positions` with the value `az_default_loss_fn` mixes into its target (`search_value`) taken
-    from `source`: "root", the value stored with the position, or "teacher"."""
-    if source == "root":
-        return positions
-    if teacher_values is None:
-        raise ValueError("the teacher value source needs teacher values")
-    return replace(positions, search_value=teacher_values)
-
-
 def make_train_step(optimizer, value_target_q: float):
     """One supervised step on a batch, under a random symmetry for each position; the loss is
     self-play training's (see `az_default_loss_fn`), so the steps differ only in their data."""
@@ -148,7 +311,7 @@ def make_train_step(optimizer, value_target_q: float):
 def train(
     network,
     nn_state,
-    positions: BaseExperience,
+    positions: Dataset,
     heldout: BaseExperience,
     heldout_teacher: np.ndarray | None,
     *,
@@ -172,30 +335,28 @@ def train(
     Returns:
         (params, nn_state): the trained parameters and network state
     """
-    steps_per_pass = len(positions.reward) // batch_size
+    steps_per_pass = len(positions) // batch_size
     if steps_per_pass < 1:
         raise ValueError(
-            f"{len(positions.reward)} positions are too few for batches of {batch_size}"
+            f"{len(positions)} positions are too few for batches of {batch_size}"
         )
     optimizer = make_optimizer(passes * steps_per_pass, lr, lr_final, weight_decay)
     params, static = eqx.partition(network, eqx.is_inexact_array)
     opt_state = optimizer.init(params)
     step = make_train_step(optimizer, value_target_q)
-    on_device = jax.tree.map(jnp.asarray, positions)
     rng = np.random.default_rng(seed)
     key = jax.random.PRNGKey(seed)
-    probe_size = min(train_probe_size, len(positions.reward))
-    probe_indices = rng.choice(len(positions.reward), probe_size, replace=False)
-    probe = jax.tree.map(lambda x: x[probe_indices], positions)
+    probe_size = min(train_probe_size, len(positions))
+    probe = positions.take(rng.choice(len(positions), probe_size, replace=False))
+    batches = positions.batches(batch_size, rng)
     if ckpt_dir is not None:
         ckpt_dir.mkdir(parents=True, exist_ok=True)
     started = time.time()
     train_metrics: dict[str, jax.Array] = {}
     for done in range(passes):
-        order = rng.permutation(len(positions.reward))
-        for i in range(steps_per_pass):
+        for _ in range(steps_per_pass):
             key, step_key = jax.random.split(key)
-            indices = jnp.asarray(order[i * batch_size : (i + 1) * batch_size])
+            on_device, indices = next(batches)
             params, nn_state, opt_state, train_metrics = step(
                 params, static, nn_state, opt_state, on_device, indices, step_key
             )
@@ -227,10 +388,22 @@ def values_command(args) -> None:
     network, params = load_checkpoint(args.teacher, args.teacher_net)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    for path in args.data:
-        positions = load_positions(path)
+    states, directories = split_data(args.data)
+    files = select_files(directories, args.from_epoch, args.to_epoch)
+    for path in [*states, *(file.path for file in files)]:
+        target = teacher_values_path(out, path)
+        # an interrupted run goes on from where it was
+        if target.exists():
+            continue
+        positions = (
+            load_positions(path)
+            if path in states
+            else from_rows(np.array(read_memmap(path)))
+        )
         metrics, values = measure(network, params, positions)
-        np.save(teacher_values_path(out, path), values)
+        with open(f"{target}.tmp", "wb") as f:
+            np.save(f, values)
+        os.replace(f"{target}.tmp", target)
         z = outcomes(positions)
         print(
             json.dumps(
@@ -257,8 +430,46 @@ def teacher_values_path(directory: Path, state: str) -> Path:
     return directory / f"{state_path.parent.name}-{state_path.stem}.npy"
 
 
+def split_data(data: list[str]) -> tuple[list[str], list[str]]:
+    """--data's saved states, and its run directories."""
+    return [p for p in data if not os.path.isdir(p)], [
+        p for p in data if os.path.isdir(p)
+    ]
+
+
+def load_dataset(args) -> Dataset:
+    """The positions of --data: its saved states', but for those also kept in its run directories,
+    and those kept in its run directories, within --from-epoch and --to-epoch."""
+    states, directories = split_data(args.data)
+    files = select_files(directories, args.from_epoch, args.to_epoch)
+    if directories and not files:
+        raise ValueError(f"no positions kept in {directories} in those epochs")
+    teacher = args.value_source == "teacher"
+    directory = Path(args.teacher_values) if teacher else None
+    if teacher and args.teacher_values is None:
+        raise ValueError("the teacher value source needs teacher values")
+    sources = []
+    for path in states:
+        rows = to_rows(load_positions(path), 0)
+        repeated = already_kept(rows, files)
+        if directory is not None:
+            rows["search_value"] = np.load(teacher_values_path(directory, path))
+        print(f"{path}: {(~repeated).sum()} of {len(rows)} positions are new")
+        sources.append(Source(rows[~repeated]))
+    sources += [
+        Source(
+            file.path,
+            str(teacher_values_path(directory, file.path)) if directory else None,
+        )
+        for file in files
+    ]
+    dataset = Dataset(sources, args.chunk_positions if directories else None)
+    print(f"{len(dataset)} positions, from {len(sources)} sources", flush=True)
+    return dataset
+
+
 def train_command(args) -> None:
-    positions = load_positions(args.data)
+    positions = load_dataset(args)
     heldout = load_positions(args.heldout)
     if args.heldout_size < len(heldout.reward):
         chosen = np.random.default_rng(0).choice(
@@ -267,12 +478,10 @@ def train_command(args) -> None:
         heldout = jax.tree.map(lambda x: x[chosen], heldout)
     else:
         chosen = np.arange(len(heldout.reward))
-    teacher_values = heldout_teacher = None
+    heldout_teacher = None
     if args.teacher_values is not None:
         directory = Path(args.teacher_values)
-        teacher_values = np.load(teacher_values_path(directory, args.data))
         heldout_teacher = np.load(teacher_values_path(directory, args.heldout))[chosen]
-    positions = with_value_source(positions, args.value_source, teacher_values)
     network, nn_state = make_network(
         args.net,
         seed=args.seed,
@@ -321,9 +530,25 @@ def train_command(args) -> None:
         monitor.finish()
 
 
+def add_epoch_filter(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--from-epoch",
+        type=int,
+        default=None,
+        help="of kept positions, only those of games finished from this epoch on, counted along "
+        "the lineage: a fork forked after E epochs goes on from E",
+    )
+    parser.add_argument(
+        "--to-epoch",
+        type=int,
+        default=None,
+        help="of kept positions, only those of games finished before this epoch",
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Trains a network on the games in a saved training state."
+        description="Trains a network on other runs' games."
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -333,14 +558,30 @@ def main():
     values.add_argument("--teacher", required=True, help="the teacher's checkpoint")
     values.add_argument("--teacher-net", required=True, help="the teacher's --net")
     values.add_argument(
-        "--data", nargs="+", required=True, help="saved training states"
+        "--data",
+        nargs="+",
+        required=True,
+        help="saved training states, and run directories of positions kept",
     )
+    add_epoch_filter(values)
     values.add_argument("--out", required=True, help="directory to write the values to")
     values.set_defaults(run=values_command)
 
-    fit = commands.add_parser("train", help="train a network on a state's positions")
+    fit = commands.add_parser("train", help="train a network on positions")
     fit.add_argument(
-        "--data", required=True, help="the saved training state to learn from"
+        "--data",
+        nargs="+",
+        required=True,
+        help="what to learn from: saved training states, and directories of runs that kept their "
+        "positions (train.py's --save-positions-from), a fork's with its ancestors'",
+    )
+    add_epoch_filter(fit)
+    fit.add_argument(
+        "--chunk-positions",
+        type=int,
+        default=4_000_000,
+        help="with kept positions, at most how many to train on at once, in memory and on the "
+        "device: about 470 MB a million, twice that in memory as the next is read",
     )
     fit.add_argument(
         "--heldout",

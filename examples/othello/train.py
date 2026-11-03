@@ -53,9 +53,13 @@ with --resume, or to fork short runs from with --init-from (see README.md):
     uv run examples/othello/train.py --epochs 30 --init-from runs/trunk --ckpt-dir runs/fork-control
     uv run examples/othello/train.py --epochs 200 --save-state-every 10 --ckpt-dir runs/long
     uv run examples/othello/train.py --epochs 200 --save-state-every 10 --ckpt-dir runs/long --resume
+
+With --save-positions-from, self-play's positions are kept for good too, for distill.py to train
+on with no further search (see core/memory/position_archive.py).
 """
 
 import argparse
+import math
 import tempfile
 import warnings
 from functools import partial
@@ -136,6 +140,19 @@ def lr_drops(text: str) -> list[tuple[float, float]]:
     if fractions != sorted(set(fractions)) or not 0 < fractions[0] <= fractions[-1] < 1:
         raise argparse.ArgumentTypeError(f"{text!r}: fractions rise, between 0 and 1")
     return drops
+
+
+def positions_from(text: str) -> float | int:
+    """Parses --save-positions-from: an epoch, or a fraction of the run under 1."""
+    try:
+        value = float(text)
+    except ValueError:
+        value = -1.0
+    if value < 0 or (value >= 1 and not value.is_integer()):
+        raise argparse.ArgumentTypeError(
+            f"expected an epoch or a fraction of the run under 1, got {text!r}"
+        )
+    return value if value < 1 and "." in text else int(value)
 
 
 def positive_schedule(text: str) -> list[tuple[int, int]]:
@@ -514,6 +531,17 @@ def main():
         help="also save the whole training state every N epochs, keeping the newest, to "
         "continue the run with --resume if it stops",
     )
+    parser.add_argument(
+        "--save-positions-from",
+        type=positions_from,
+        default=None,
+        metavar="EPOCH_OR_FRACTION",
+        help="also keep self-play's positions, for distill.py to train on, in --ckpt-dir as "
+        "positions-<EPOCH>.npy: those of games finishing from this epoch on (0 for all), or "
+        "from this fraction of --epochs, e.g. 0.5. About 470 bytes a position, 60 MB an epoch; "
+        "training isn't changed. A fork keeps only its own games: distill.py reads its parent's "
+        "from before the fork too (see README.md)",
+    )
     init = parser.add_mutually_exclusive_group()
     init.add_argument(
         "--init-from",
@@ -762,6 +790,11 @@ def main():
         else None,
         save_state_at=args.save_state_at,
         save_state_every=args.save_state_every,
+        save_positions_from=None
+        if args.save_positions_from is None
+        else math.ceil(args.save_positions_from * args.epochs)
+        if isinstance(args.save_positions_from, float)
+        else args.save_positions_from,
         # every argument but how the run starts (a fork records its parent)
         extra_config={
             "args": {
