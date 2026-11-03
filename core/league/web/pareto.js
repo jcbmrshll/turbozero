@@ -1,10 +1,11 @@
 // The main page's plot: what a player's moves cost on fixed hardware against its rating. Each
 // run of timings is one host, shown on its own, with that hardware named under the plot.
 
-import { api, el, elo, showTip, svg } from "./dom.js";
+import { api, el, elo, showTip, state, svg } from "./dom.js";
 
 let run = 0;
 let int8 = localStorage.getItem("pareto-int8") === "1";
+let paused = localStorage.getItem("pareto-paused") === "1";
 // measured int8 speedups with the search at batch 16, by the network's size; unmeasured sizes
 // take the largest nets'. Batch 1 gains nothing. Ratings stay as they are, from bf16
 const INT8_SPEEDUP = { "4x64": 1.26, "6x96": 1.38, "8x128": 1.66, "10x128": 1.59 };
@@ -31,11 +32,22 @@ function decades(lo, hi) {
 }
 
 function withInt8(points) {
-  const shown = points.map((p) => {
+  return points.map((p) => {
     const size = p.name.match(/^\d+x\d+/)?.[0];
     const speedup = size && p.batch > 1 ? INT8_SPEEDUP[size] ?? 1.6 : 1;
-    return { ...p, seconds: p.seconds / speedup, frontier: false };
+    return { ...p, seconds: p.seconds / speedup };
   });
+}
+
+// the engines stay whether paused or not: a paused engine still marks what its level can do
+function withoutPaused(points) {
+  const players = state.summary?.players ?? [];
+  const hidden = new Set(players.filter((p) => p.retired && !p.external).map((p) => p.id));
+  return points.filter((p) => !hidden.has(p.player));
+}
+
+function withFrontier(points) {
+  const shown = points.map((p) => ({ ...p, frontier: false }));
   let best = -Infinity;
   for (const p of [...shown].sort((a, b) => a.seconds - b.seconds || b.elo - a.elo)) {
     if (p.solid && p.elo > best) { p.frontier = true; best = p.elo; }
@@ -101,9 +113,17 @@ export async function drawPareto() {
     drawPareto();
   } } });
   toggle.checked = int8;
-  body.replaceChildren(plot(int8 ? withInt8(found.points) : found.points),
+  const showPaused = el("input", { type: "checkbox", on: { change: (e) => {
+    paused = e.target.checked;
+    localStorage.setItem("pareto-paused", paused ? "1" : "0");
+    drawPareto();
+  } } });
+  showPaused.checked = paused;
+  const kept = paused ? found.points : withoutPaused(found.points);
+  body.replaceChildren(plot(withFrontier(int8 ? withInt8(kept) : kept)),
     el("div", { class: "under dim" }, choose,
       el("label", {}, toggle, "int8"),
+      el("label", {}, showPaused, "Paused"),
       el("span", {}, hardware(found)),
       el("span", { class: "keys" },
         el("i", { class: "key on" }), "Frontier", el("i", { class: "key" }), "Below", el("i", { class: "key open" }), "Batch unverified")));
