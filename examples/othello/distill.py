@@ -287,24 +287,47 @@ def state_positions(args):
 
 
 def corpus_positions(
-    corpus: Corpus, heldout_size: int
-) -> tuple[BaseExperience, BaseExperience]:
-    """A labelled corpus's training split, and `heldout_size` of its held-out positions."""
-    heldout = corpus.split("heldout")
+    corpus: Corpus,
+    heldout_size: int,
+    policy: str = "teacher",
+    value: str = "teacher",
+    searchers: np.ndarray | None = None,
+) -> tuple[BaseExperience, BaseExperience, np.ndarray]:
+    """A labelled corpus's training split, `heldout_size` of its held-out positions, and the
+    teacher's values of those, with `policy` and `value` targets from the "teacher" or the
+    recorded "search" (see `Corpus.experiences`); with `searchers`, only positions one of these
+    players searched."""
+    heldout = corpus.split("heldout", searchers)
     if heldout_size < len(heldout):
         heldout = np.random.default_rng(0).choice(heldout, heldout_size, replace=False)
-    return corpus.experiences(corpus.split("train")), corpus.experiences(heldout)
+    heldout = np.sort(heldout)
+    return (
+        corpus.experiences(corpus.split("train", searchers), policy, value),
+        corpus.experiences(heldout, policy, value),
+        np.asarray(corpus.value[heldout], np.float32),
+    )
 
 
 def train_command(args) -> None:
     if args.corpus is not None:
-        if args.value_source == "root":
+        corpus = Corpus(args.corpus)
+        if (args.value_source == "root" or args.policy_source == "search") and not (
+            corpus.searched and args.searchers
+        ):
             raise SystemExit(
-                "a corpus has no search values: pass --value-source teacher"
+                "a corpus's search targets need its searches (league_corpus.py searches) "
+                "and --searchers"
             )
-        positions, heldout = corpus_positions(Corpus(args.corpus), args.heldout_size)
+        positions, heldout, heldout_teacher = corpus_positions(
+            corpus,
+            args.heldout_size,
+            policy=args.policy_source,
+            value="search" if args.value_source == "root" else "teacher",
+            searchers=np.load(args.searchers) if args.searchers else None,
+        )
         teacher_values = np.asarray(positions.search_value)
-        heldout_teacher = np.asarray(heldout.search_value)
+    elif args.policy_source != "teacher" or args.searchers:
+        raise SystemExit("--policy-source and --searchers are for a corpus")
     elif args.data is None or args.heldout is None:
         raise SystemExit("pass --corpus, or --data and --heldout")
     else:
@@ -398,7 +421,27 @@ def main():
         default=0.0,
         help="weight of --value-source in the value target, the rest being the game's outcome",
     )
-    fit.add_argument("--value-source", choices=("root", "teacher"), default="root")
+    fit.add_argument(
+        "--value-source",
+        choices=("root", "teacher"),
+        default="root",
+        help="the value mixed into the target: the search's root value (a corpus's recorded "
+        "searches') or the teacher's",
+    )
+    fit.add_argument(
+        "--policy-source",
+        choices=("teacher", "search"),
+        default="teacher",
+        help="with --corpus, train the policy on the teacher's, or on the recorded searches' "
+        "(see league_corpus.py searches)",
+    )
+    fit.add_argument(
+        "--searchers",
+        default=None,
+        metavar="PATH",
+        help="with --corpus, only positions these players searched: an .npy of their ids in "
+        "the league's store",
+    )
     fit.add_argument(
         "--teacher-values",
         default=None,

@@ -18,8 +18,15 @@ move's observation, see game.state_to_nn_input), `legal` (packed bits of the leg
 `game` (the league's game id), `opening` (its XOT opening, a row of xot-openings.txt), `ply`
 (moves from the standard start, passes and the opening's included) and `z` (the game's outcome
 for the player to move); `heldout_openings` and `heldout-openings.txt`, the held-out openings as
-indices and as an opening list (e.g. for vs_engine.py's --xot); and once labelled, `policy` (the
-teacher's policy over legal actions, float16) and `value` (its value).
+indices and as an opening list (e.g. for vs_engine.py's --xot); once labelled, `policy` (the
+teacher's policy over legal actions, float16) and `value` (its value); and with `searches`, what
+the league's own players' searches made of the positions they moved from, where the store kept
+them: `search_policy` (the visits of the search's most visited moves, as a policy, float16),
+`search_value` (its root value, NaN where there's no search) and `searcher` (the player's id in the
+store, -1 where there's none).
+
+    uv run examples/othello/league_corpus.py searches --corpus corpus \\
+        --root ~/.cache/turbozero/othello/league
 """
 
 import argparse
@@ -36,6 +43,7 @@ import numpy as np
 from game import env, load_checkpoint
 from xot import XOT_PATH, load_xot
 
+from core.league.store import NetSearch, decode_searches
 from core.memory.replay_memory import BaseExperience
 from core.networks.utils import apply_nn
 
@@ -232,6 +240,85 @@ def build(
     return summary
 
 
+def attach_searches(directory: Path, db_path: str | Path, log=print) -> dict:
+    """Adds the league store's recorded searches to the corpus in `directory` (see the module's
+    docstring): for each position a network moved from, in a game whose searches the store kept,
+    the visits of its search's most visited moves as a policy, its root value, and who searched.
+    Positions an engine moved from, and games from before searches were kept, get none.
+
+    Returns:
+        counts: of positions with a search, in all and by split
+    """
+    game = np.load(directory / "game.npy")
+    ply = np.load(directory / "ply.npy")
+    # each position's row, found by its game and ply
+    key = game.astype(np.int64) * 1024 + ply
+    order = np.argsort(key)
+    sorted_key = key[order]
+    wanted = set(np.unique(game).tolist())
+    db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=60)
+    try:
+        rows = [
+            row
+            for row in db.execute(
+                "SELECT g.id, g.first_id, g.second_id, g.moves, s.searches FROM games g "
+                "JOIN game_searches s ON s.game_id = g.id ORDER BY g.id"
+            )
+            if row[0] in wanted
+        ]
+    finally:
+        db.close()
+    policy = np.zeros((len(game), env.num_actions), np.float16)
+    value = np.full(len(game), np.nan, np.float32)
+    searcher = np.full(len(game), -1, np.int32)
+    started = time.time()
+    for start in range(0, len(rows), REPLAY_BATCH):
+        chunk = rows[start : start + REPLAY_BATCH]
+        moves = [np.frombuffer(r[3], dtype=np.uint16).astype(np.int32) for r in chunk]
+        # who was to move at each ply: the game's first player or its second
+        players = _players(moves)
+        for (g, first, second, _, blob), mover in zip(chunk, players, strict=True):
+            for p, search in decode_searches(blob).items():
+                if not isinstance(search, NetSearch) or not search.top:
+                    continue
+                i = np.searchsorted(sorted_key, g * 1024 + p)
+                if i == len(sorted_key) or sorted_key[i] != g * 1024 + p:
+                    continue  # a ply the corpus doesn't keep, e.g. in the opening
+                row = order[i]
+                visits = np.array([m.visits for m in search.top], np.float64)
+                policy[row, [m.action for m in search.top]] = visits / visits.sum()
+                value[row] = search.value
+                searcher[row] = first if mover[p] else second
+        log(
+            f"{min(start + REPLAY_BATCH, len(rows))}/{len(rows)} games' searches ({time.time() - started:.0f} s)"
+        )
+    np.save(directory / "search_policy.npy", policy)
+    np.save(directory / "searcher.npy", searcher)
+    # search_value.npy last: its presence marks a corpus with searches
+    np.save(directory / "search_value.npy", value)
+    heldout = np.isin(
+        np.load(directory / "opening.npy"), np.load(directory / "heldout_openings.npy")
+    )
+    has = searcher >= 0
+    return {
+        "games_with_searches": len(rows),
+        "positions_with_searches": int(has.sum()),
+        "train_positions_with_searches": int((has & ~heldout).sum()),
+        "heldout_positions_with_searches": int((has & heldout).sum()),
+    }
+
+
+def _players(moves: list[np.ndarray]) -> list[np.ndarray]:
+    """For each game, whether its first player was to move at each ply."""
+    length = max(len(m) for m in moves)
+    padded = np.full((len(moves), length), -1, np.int32)
+    for i, m in enumerate(moves):
+        padded[i, : len(m)] = m
+    _, _, (_, _, player, _, _) = jax.tree.map(np.asarray, _replay(jnp.asarray(padded)))
+    # player is (plies, games)
+    return [player[: len(m), i] == player[0, i] for i, m in enumerate(moves)]
+
+
 class Corpus:
     """A corpus that `build` made, its arrays memory-mapped."""
 
@@ -249,14 +336,28 @@ class Corpus:
         self.labelled = (self.directory / "value.npy").exists()
         if self.labelled:
             self.policy, self.value = load("policy"), load("value")
+        self.searched = (self.directory / "search_value.npy").exists()
+        if self.searched:
+            self.search_policy, self.search_value, self.searcher = (
+                load(k) for k in ("search_policy", "search_value", "searcher")
+            )
 
     def __len__(self) -> int:
         return len(self.z)
 
-    def split(self, name: str) -> np.ndarray:
-        """The indices of the "train" or "heldout" positions."""
-        heldout = np.isin(self.opening, self.heldout)
-        return np.flatnonzero(heldout if name == "heldout" else ~heldout)
+    def split(self, name: str, searchers: np.ndarray | None = None) -> np.ndarray:
+        """The indices of the "train" or "heldout" positions; with `searchers` (player ids), only
+        those one of these players searched (see `attach_searches`)."""
+        keep = np.isin(self.opening, self.heldout)
+        if name != "heldout":
+            keep = ~keep
+        if searchers is not None:
+            if not self.searched:
+                raise ValueError(
+                    f"{self.directory} has no searches: run `searches` first"
+                )
+            keep &= np.isin(self.searcher, searchers)
+        return np.flatnonzero(keep)
 
     def observations(self, indices: np.ndarray) -> np.ndarray:
         """(len(indices), 8, 8, 2) bool, the positions' observations."""
@@ -268,21 +369,32 @@ class Corpus:
         bits = np.unpackbits(self.legal[indices], axis=1, count=env.num_actions)
         return bits.astype(bool)
 
-    def experiences(self, indices: np.ndarray) -> BaseExperience:
+    def experiences(
+        self, indices: np.ndarray, policy: str = "teacher", value: str = "teacher"
+    ) -> BaseExperience:
         """Positions as training samples, as self-play would store them: policy targets the
-        teacher's policies (float16, to keep them small), the player to move player 0, its
-        outcome the game's, and `search_value` the teacher's value. Needs a labelled corpus."""
+        teacher's policies, or with `policy="search"` the recorded searches' (float16, to keep them
+        small), the player to move player 0, its outcome the game's, and `search_value` the
+        teacher's value, or with `value="search"` the recorded search's root value. Needs a
+        labelled corpus, and for "search", positions with searches."""
         if not self.labelled:
             raise ValueError(f"{self.directory} isn't labelled: run `label` first")
         indices = np.sort(indices)
+        if "search" in (policy, value) and (
+            not self.searched or (np.asarray(self.searcher[indices]) < 0).any()
+        ):
+            raise ValueError("search targets need positions with searches")
         z = np.asarray(self.z[indices], np.float32)
+        source = {"teacher": (self.policy, self.value)}
+        if self.searched:
+            source["search"] = (self.search_policy, self.search_value)
         fields: dict[str, Any] = {
             "reward": np.stack([z, -z], axis=1),
-            "policy_weights": np.asarray(self.policy[indices]),
+            "policy_weights": np.asarray(source[policy][0][indices]),
             "policy_mask": self.legal_actions(indices),
             "observation_nn": self.observations(indices),
             "cur_player_id": np.zeros(len(indices), np.int32),
-            "search_value": np.asarray(self.value[indices], np.float32),
+            "search_value": np.asarray(source[value][1][indices], np.float32),
         }
         return BaseExperience(**fields)
 
@@ -356,6 +468,11 @@ def main():
     build_parser.add_argument(
         "--seed", type=int, default=0, help="draws the held-out openings"
     )
+    searches_parser = commands.add_parser(
+        "searches", help="add the league players' recorded searches"
+    )
+    searches_parser.add_argument("--corpus", required=True)
+    searches_parser.add_argument("--root", required=True, help="the league's store")
     label_parser = commands.add_parser("label", help="label it with a teacher")
     label_parser.add_argument("--corpus", required=True)
     label_parser.add_argument("--teacher", required=True, help="a checkpoint")
@@ -367,6 +484,13 @@ def main():
             Path(args.out),
             args.heldout_fraction,
             args.seed,
+            log=lambda line: print(line, flush=True),
+        )
+        print(json.dumps(summary, indent=2))
+    elif args.command == "searches":
+        summary = attach_searches(
+            Path(args.corpus),
+            Path(args.root) / "league.db",
             log=lambda line: print(line, flush=True),
         )
         print(json.dumps(summary, indent=2))

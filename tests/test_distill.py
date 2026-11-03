@@ -148,6 +148,8 @@ def test_values_then_train_with_teacher_targets(tmp_path):
             data=str(data),
             corpus=None,
             init_weights=None,
+            policy_source="teacher",
+            searchers=None,
             heldout=str(heldout),
             heldout_size=5,
             teacher_values=str(out),

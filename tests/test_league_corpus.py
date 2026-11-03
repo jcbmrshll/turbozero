@@ -8,9 +8,13 @@ import numpy as np
 import pytest
 from example_modules import load_example
 
+from core.league.store import EngineSearch, NetSearch, TopMove, encode_searches
+
 league_corpus, game, xot, distill = load_example(
     "othello", "league_corpus", "game", "xot", "distill"
 )
+
+FIRST, SECOND = 10, 20
 
 NET = "resnet:1x4"
 OPENINGS = [3, 50, 7000, 10783]
@@ -53,7 +57,10 @@ def league(tmp_path_factory):
     db = sqlite3.connect(root / "league.db")
     db.execute(
         "CREATE TABLE games (id INTEGER PRIMARY KEY, opening INTEGER, result INTEGER, "
-        "moves BLOB)"
+        "moves BLOB, first_id INTEGER, second_id INTEGER)"
+    )
+    db.execute(
+        "CREATE TABLE game_searches (game_id INTEGER PRIMARY KEY, searches BLOB)"
     )
     for i, (opening, moves) in enumerate(
         zip(OPENINGS + [OPENINGS[0]], games, strict=True)
@@ -62,10 +69,40 @@ def league(tmp_path_factory):
         if i == len(OPENINGS):
             result = 1 if result != 1 else -1
         db.execute(
-            "INSERT INTO games VALUES (?, ?, ?, ?)",
-            (i + 1, opening, result, np.asarray(moves, np.uint16).tobytes()),
+            "INSERT INTO games VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                i + 1,
+                opening,
+                result,
+                np.asarray(moves, np.uint16).tobytes(),
+                FIRST,
+                SECOND,
+            ),
         )
-    db.execute("INSERT INTO games VALUES (99, 0, 1, ?)", (b"",))
+    # every game's searches: one at every ply, its move given 3 visits of 4 (in the first game an
+    # engine's at ply 9; and one in each opening, which the corpus doesn't keep)
+    for g, moves in enumerate(games[: len(OPENINGS)]):
+        searches = {
+            p: NetSearch(
+                value=p / 100,
+                net_value=0.0,
+                visits=4,
+                evals=4,
+                tree=4,
+                top=(
+                    TopMove(moves[p], 3, 0.0),
+                    TopMove(64 if moves[p] != 64 else 0, 1, 0.0),
+                ),
+            )
+            for p in range(len(moves))
+        }
+        if g == 0:
+            searches[9] = EngineSearch(score=2, depth=10)
+        db.execute(
+            "INSERT INTO game_searches VALUES (?, ?)",
+            (g + 1, encode_searches(searches)),
+        )
+    db.execute("INSERT INTO games VALUES (99, 0, 1, ?, 1, 2)", (b"",))
     db.commit()
     db.close()
     return root, games[: len(OPENINGS)]
@@ -183,8 +220,10 @@ def test_distill_trains_on_a_corpus(corpus, tmp_path):
         "eval_every": 1,
         "ckpt_dir": str(tmp_path / "student"),
         "init_weights": None,
+        "policy_source": "teacher",
+        "searchers": None,
     }
-    with pytest.raises(SystemExit, match="no search values"):
+    with pytest.raises(SystemExit, match="searches"):
         distill.train_command(SimpleNamespace(**{**args, "value_source": "root"}))
     distill.train_command(SimpleNamespace(**args))
     game.load_checkpoint(str(tmp_path / "student" / "1.eqx"), NET)
@@ -222,3 +261,80 @@ def test_seed_positions_fill_every_environment_from_the_training_split(
     # distinct positions of the training split, each with its own labels
     train_values = set(np.asarray(loaded.value)[loaded.split("train")].tolist())
     assert set(positions.search_value.tolist()) <= train_values
+
+
+def test_searches_attach_each_position_its_movers_search(league, tmp_path):
+    root, games = league
+    out = tmp_path / "corpus"
+    league_corpus.build(root / "league.db", out, fraction=0.5, seed=1)
+    summary = league_corpus.attach_searches(
+        out, root / "league.db", log=lambda line: None
+    )
+    loaded = league_corpus.Corpus(out)
+    game_ids, ply = np.load(out / "game.npy"), np.load(out / "ply.npy")
+    rows = np.flatnonzero(game_ids == 1)
+    # every kept position but the engine's move at ply 9 of game 1 has a search
+    assert summary["positions_with_searches"] == len(loaded) - 1
+    state = game.env.init(jax.random.PRNGKey(0))
+    first = int(state.current_player)
+    for p, a in enumerate(games[0]):
+        if p >= 8:
+            row = rows[ply[rows] == p][0]
+            if p == 9:
+                assert loaded.searcher[row] == -1
+            else:
+                mover = FIRST if int(state.current_player) == first else SECOND
+                assert loaded.searcher[row] == mover
+                assert loaded.search_value[row] == pytest.approx(p / 100, abs=1e-3)
+                assert float(loaded.search_policy[row][a]) == pytest.approx(
+                    0.75, abs=1e-3
+                )
+        state = game.env.step(state, a)
+    first_moves = (
+        loaded.split("train", np.array([FIRST])).tolist()
+        + loaded.split("heldout", np.array([FIRST])).tolist()
+    )
+    assert (
+        sorted(first_moves)
+        == np.flatnonzero(np.asarray(loaded.searcher) == FIRST).tolist()
+    )
+    label_corpus(out, tmp_path)
+    loaded = league_corpus.Corpus(out)
+    searched = np.flatnonzero(np.asarray(loaded.searcher) >= 0)
+    batch = loaded.experiences(searched, policy="search", value="search")
+    np.testing.assert_allclose(
+        batch.search_value, np.asarray(loaded.search_value)[searched], atol=1e-6
+    )
+    with pytest.raises(ValueError, match="searches"):
+        loaded.experiences(np.arange(len(loaded)), policy="search")
+    # a student of the searches of one player: its positions only, on their visits and root values
+    searchers = tmp_path / "searchers.npy"
+    np.save(searchers, np.array([FIRST]))
+    distill.train_command(
+        SimpleNamespace(
+            data=None,
+            heldout=None,
+            corpus=str(out),
+            heldout_size=5,
+            teacher_values=None,
+            value_source="root",
+            value_target_q=1.0,
+            policy_source="search",
+            searchers=str(searchers),
+            net=NET,
+            train_dtype="float32",
+            seed=0,
+            monitor=None,
+            name=None,
+            notes=None,
+            passes=1,
+            batch=2,
+            lr=1e-3,
+            lr_final=1e-4,
+            weight_decay=0.5,
+            eval_every=1,
+            init_weights=None,
+            ckpt_dir=str(tmp_path / "searched"),
+        )
+    )
+    game.load_checkpoint(str(tmp_path / "searched" / "1.eqx"), NET)
