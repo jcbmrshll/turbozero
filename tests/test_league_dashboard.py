@@ -588,6 +588,18 @@ def test_there_are_no_points_without_timings(url):
     assert get(url, "/api/pareto") == []
 
 
+def test_per_move_is_the_benchmark_from_the_latest_run_to_time_a_player(url, store):
+    (store.root / "timings.json").write_text(json.dumps({"runs": [
+        run_of(measured(engine="edax", level=8, seconds_per_move=0.5)),
+        run_of(measured(engine="edax", level=8, seconds_per_move=0.25)),
+    ]}))  # fmt: skip
+    per_move = {
+        p["name"]: p["seconds_per_move"] for p in get(url, "/api/summary")["players"]
+    }
+    assert per_move.pop("x") == 0.25
+    assert not any(per_move.values())
+
+
 def test_a_timings_file_is_read_again_when_it_changes(url, store):
     path = store.root / "timings.json"
     path.write_text(json.dumps({"runs": [run_of(measured(engine="edax", level=8))]}))

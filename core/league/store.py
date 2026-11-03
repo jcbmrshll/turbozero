@@ -1003,18 +1003,6 @@ class Store:
         )
         return [(row[0], row[1], row[2], row[3]) for row in rows]
 
-    def seconds_per_move(self) -> dict[int, float]:
-        """How long each player that has been timed takes to choose a move, leaving out
-        batches that compiled something."""
-        rows = self.db.execute(
-            "SELECT player, SUM(seconds) / SUM(moves) FROM ("
-            "SELECT a_id AS player, a_seconds AS seconds, a_moves AS moves FROM batches "
-            "WHERE compiled = 0 UNION ALL "
-            "SELECT b_id, b_seconds, b_moves FROM batches WHERE compiled = 0"
-            ") WHERE moves > 0 GROUP BY player"
-        )
-        return {row[0]: row[1] for row in rows}
-
     def num_games(self) -> int:
         return self.db.execute("SELECT COUNT(*) FROM games").fetchone()[0]
 
