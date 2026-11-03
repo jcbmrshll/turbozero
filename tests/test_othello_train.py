@@ -131,3 +131,12 @@ def test_anchor_blends_a_frozen_networks_outputs_into_the_targets(
     for bad in (["--anchor-value", "1.5"], ["--value-target-q", "0.5"]):
         with pytest.raises(SystemExit):
             run_main(monkeypatch, "--anchor", str(path), *bad)
+
+
+def test_freeze_batchnorm_trains_with_batchnorm_in_inference_mode(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, "--freeze-batchnorm")
+    assert built.value.kwargs["nn"].stem_bn.inference
+    for bad in (["--train-dtype", "float32"], ["--remat"]):
+        with pytest.raises(SystemExit):
+            run_main(monkeypatch, "--freeze-batchnorm", *bad)

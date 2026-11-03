@@ -102,7 +102,7 @@ from core.evaluators.random_evaluator import RandomEvaluator
 from core.memory.replay_memory import BaseExperience, EpisodeReplayBuffer
 from core.monitoring import DEFAULT_URL, Monitor
 from core.monitoring.episodes import pgx_two_player_episode
-from core.networks.utils import apply_nn
+from core.networks.utils import apply_nn, freeze_batchnorm
 from core.testing.ladder import LadderTester, Rung
 from core.testing.scored_positions import ScoredPositionsTester
 from core.testing.tester import BaseTester
@@ -596,6 +596,13 @@ def main():
         "outcome. Self-play replaces them as it plays. Not with --init-from or --resume",
     )
     parser.add_argument(
+        "--freeze-batchnorm",
+        action="store_true",
+        help="train with BatchNorm normalizing by its stored running statistics, which then stay "
+        "as they are (e.g. those of the network --init-weights starts from); its scales and "
+        "offsets still train. Needs the same --inference-dtype and --train-dtype",
+    )
+    parser.add_argument(
         "--anchor",
         default=None,
         metavar="CHECKPOINT",
@@ -665,6 +672,15 @@ def main():
         parser.error(
             "anchor the value (--anchor-value) or mix in the search's, not both"
         )
+    if args.freeze_batchnorm and args.inference_dtype != args.train_dtype:
+        # the network computes in its inference dtype once its BatchNorm is in inference mode
+        parser.error(
+            "--freeze-batchnorm needs the same --inference-dtype and --train-dtype"
+        )
+    if args.freeze_batchnorm and args.remat:
+        parser.error(
+            "--freeze-batchnorm trains as in inference mode, which --remat skips"
+        )
     if args.seed_buffer and (args.init_from or args.resume):
         parser.error("--seed-buffer is for a run that starts with empty buffers")
     if not 0 <= args.lr_warmup < args.epochs:
@@ -711,6 +727,8 @@ def main():
         network, network_state = load_weights(
             args.init_weights, args.net, network, network_state
         )
+    if args.freeze_batchnorm:
+        network = freeze_batchnorm(network)
 
     # AlphaZero takes an arbitrary search backend, here classic MCTS. Temperature 1.0
     # samples moves in proportion to visit counts, for exploration during self-play.

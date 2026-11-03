@@ -1,4 +1,5 @@
 from collections.abc import Callable
+from typing import Any
 
 import equinox as eqx
 import jax
@@ -31,4 +32,22 @@ def apply_nn(
         return jax.vmap(nn)(x), None
     return jax.vmap(nn, axis_name=BATCH_AXIS, in_axes=(0, None), out_axes=(0, None))(
         x, nn_state
+    )
+
+
+def freeze_batchnorm(nn: Any) -> Any:
+    """`nn` with every BatchNorm in inference mode, so that it normalizes by its running statistics
+    in training too and they stay as they are, as fine-tuning commonly does; its scales and offsets
+    still train. (A network may also pick its compute dtype by its BatchNorm's mode: see
+    `core.networks.azresnet.AZResnet`.)"""
+
+    def is_batchnorm(x: Any) -> bool:
+        return isinstance(x, eqx.nn.BatchNorm)
+
+    return jax.tree.map(
+        lambda x: (
+            eqx.tree_at(lambda bn: bn.inference, x, True) if is_batchnorm(x) else x
+        ),
+        nn,
+        is_leaf=is_batchnorm,
     )
