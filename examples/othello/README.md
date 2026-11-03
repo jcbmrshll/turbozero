@@ -299,8 +299,9 @@ learning rate to 70% of a budget, then fork the last 30%, with `--lr 1e-4 --lr-d
 
 ### Keeping self-play's positions
 
-`--save-positions-from` keeps a run's positions for good, for `distill.py` to train on with no
-further search. It doesn't change training. `0` keeps all; an epoch or a fraction of `--epochs`
+`--save-positions-from` keeps a local run's positions for good, for `distill.py` to train on with no
+further search (Modal jobs refuse it: bringing the positions here costs more in egress than they're
+worth). It doesn't change training. `0` keeps all; an epoch or a fraction of `--epochs`
 (`0.7`) keeps those of games finishing from there on, the later ones being the valuable ones:
 
 ```
