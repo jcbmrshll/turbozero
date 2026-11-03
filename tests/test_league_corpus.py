@@ -8,7 +8,13 @@ import numpy as np
 import pytest
 from example_modules import load_example
 
-from core.league.store import EngineSearch, NetSearch, TopMove, encode_searches
+from core.league.store import (
+    EngineSearch,
+    NetSearch,
+    Search,
+    TopMove,
+    encode_searches,
+)
 
 league_corpus, game, xot, distill = load_example(
     "othello", "league_corpus", "game", "xot", "distill"
@@ -82,7 +88,7 @@ def league(tmp_path_factory):
     # every game's searches: one at every ply, its move given 3 visits of 4 (in the first game an
     # engine's at ply 9; and one in each opening, which the corpus doesn't keep)
     for g, moves in enumerate(games[: len(OPENINGS)]):
-        searches = {
+        searches: dict[int, Search] = {
             p: NetSearch(
                 value=p / 100,
                 net_value=0.0,
