@@ -9,7 +9,8 @@ It has no login. Anything that writes takes a JSON body, which another site's pa
 to it from a browser on the tailnet without the server agreeing to it first, which it doesn't.
 
 `timings.json`, beside the store, holds what players' moves cost on fixed hardware, for the
-runtime against rating plot. Each of its `runs` is one host: see `pareto`.
+runtime against rating plot and the time per move in the ratings. Each of its `runs` is one host:
+see `pareto`.
 """
 
 import json
@@ -59,6 +60,37 @@ def _config_of(player: Player) -> tuple[str | int | None, ...]:
     return ("net", player.net, player.sims)
 
 
+def _measured(
+    run: dict[str, Any],
+) -> dict[tuple[str | int | None, ...], dict[str, Any]]:
+    """The configs of `run` that count as its timings, by what they're a timing of."""
+    configs = {}
+    for config in run.get("configs", []):
+        if config.get("source") != "measured" or not config.get("plot"):
+            continue
+        key = (
+            ("net", config["net"], config.get("sims"))
+            if "net" in config
+            else ("engine", config.get("engine"), config.get("level"))
+        )
+        configs[key] = config
+    return configs
+
+
+def seconds_per_move(
+    timings: dict[str, Any], players: list[Player]
+) -> dict[int, float]:
+    """What each benchmarked player's move costs, from the latest run that timed it."""
+    configs = {}
+    for run in timings.get("runs", []):
+        configs.update(_measured(run))
+    return {
+        player.id: configs[_config_of(player)]["seconds_per_move"]
+        for player in players
+        if _config_of(player) in configs
+    }
+
+
 def pareto(
     timings: dict[str, Any], players: list[Player], ratings: Ratings
 ) -> list[dict[str, Any]]:
@@ -68,16 +100,7 @@ def pareto(
     player beats on both, among the solid ones. Runs stay apart: each is its own hardware."""
     runs = []
     for run in timings.get("runs", []):
-        configs = {}
-        for config in run.get("configs", []):
-            if config.get("source") != "measured" or not config.get("plot"):
-                continue
-            key = (
-                ("net", config["net"], config.get("sims"))
-                if "net" in config
-                else ("engine", config.get("engine"), config.get("level"))
-            )
-            configs[key] = config
+        configs = _measured(run)
         points = []
         for i, player in enumerate(players):
             config = configs.get(_config_of(player))
@@ -164,7 +187,7 @@ class League:
                 "JOIN games g ON g.batch_id = b.id GROUP BY b.id "
                 "ORDER BY b.id DESC LIMIT 12"
             ).fetchall()
-            per_move = store.seconds_per_move()
+            per_move = seconds_per_move(self._timings(), players)
             total = store.db.execute(
                 "SELECT COUNT(*), COALESCE(SUM(seconds), 0) FROM batches"
             ).fetchone()
