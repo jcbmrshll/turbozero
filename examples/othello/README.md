@@ -19,7 +19,8 @@ Othello model and against two strong open-source Othello engines,
 | `bench_cpu_backends.py` | Evals a second by CPU backend and batch, each checked against JAX's outputs |
 | `quantize.py`, `fidelity.py`, `bench_quantized.py` | Quantizes a network to int8 for playing on CPU, and measures its outputs and speed against bf16 |
 | `engine_set.py`, `label_positions.py`, `score_engine_set.py` | The engine-labelled set: fixed positions with every legal move scored by Edax, to build, and to score checkpoints on (train.py scores the network on it every epoch) |
-| `distill.py` | Trains a network on a saved training state's replay buffer, with no self-play, on a teacher network's values or the games' outcomes |
+| `distill.py` | Trains a network on a saved training state's replay buffer, or on a league corpus, with no self-play, on a teacher network's values or the games' outcomes |
+| `league_corpus.py` | A corpus of the Elo league's positions, split by opening and labelled by a teacher network, to pre-train networks on and to start self-play's replay memory with |
 | `bench_nets.py` | Times networks on their own: a forward pass at self-play's batch, a training step at training's |
 | `game.py` | What the scripts share: the environment, board symmetries, network, evaluators |
 | `xot.py`, `xot-openings.txt` | The XOT opening list |
@@ -296,6 +297,36 @@ uv run examples/othello/train.py --epochs 30 --init-from runs/trunk/state-150.np
 The learning rate holds `--lr`, then drops 10x at 70% of the run and again at 90% (`--lr-drops`).
 To read several budgets from one run, fork that same schedule: train the trunk at a constant
 learning rate to 70% of a budget, then fork the last 30%, with `--lr 1e-4 --lr-drops 0.667:1e-5`.
+
+### Starting from a pre-trained network
+
+The Elo league's games (see below) are a corpus of positions far better played than a new
+network's self-play. `league_corpus.py build` replays every one of them from its store and
+keeps each position after its XOT opening, with its game, opening, ply and outcome, and holds
+out a fixed share of the openings (10% by default) with all their games' positions.
+`league_corpus.py label` then runs a teacher network over every position once, keeping its
+policy and value. On the 5080, 18.5M positions took 6 minutes for a 12x144 teacher.
+
+```
+uv run examples/othello/league_corpus.py build --root ~/.cache/turbozero/othello/league --out corpus
+uv run --extra cuda examples/othello/league_corpus.py label --corpus corpus \
+    --teacher 82.eqx --teacher-net resnet:12x144,pool_every=2,heads=pooled,pool_channels=32
+uv run --extra cuda examples/othello/distill.py train --corpus corpus --passes 4 --eval-every 1 \
+    --net resnet:6x96,pool_every=2,heads=pooled,pool_channels=32 \
+    --value-source teacher --value-target-q 1 --ckpt-dir runs/pretrained
+uv run --extra cuda examples/othello/train.py --init-weights runs/pretrained/4.eqx --seed-buffer corpus \
+    --exclude-openings corpus/heldout_openings.npy --lr 1e-4 --lr-final 1e-4 --epochs 20 \
+    --net resnet:6x96,pool_every=2,heads=pooled,pool_channels=32 --ckpt-dir runs/from-pretrained
+```
+
+`distill.py train --corpus` trains on the corpus's training split, on the teacher's policies
+and its values (`--value-source teacher`) or the outcome, and measures the network on its
+held-out split. `--init-weights` starts self-play from that network, with a new optimizer;
+`--seed-buffer` fills the replay memory with the corpus's positions first, `--buffer` of them
+for each environment, as if self-play had played them, each with the teacher's policy and its
+game's outcome; and `--exclude-openings` keeps self-play off the held-out openings, so that
+games from them still test both networks fairly (`vs_engine.py --xot corpus/heldout-openings.txt`
+plays Edax from them).
 
 ### Training on Modal
 
