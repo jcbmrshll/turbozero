@@ -28,6 +28,7 @@ p.add_argument("--save-state-every", type=int)
 p.add_argument("--init-from")
 p.add_argument("--init-without-buffers", action="store_true")
 p.add_argument("--resume", action="store_true")
+p.add_argument("--save-positions-from", type=int)
 p.add_argument("--monitor", nargs="?", const="")
 p.add_argument("--name")
 p.add_argument("--notes")
@@ -41,6 +42,9 @@ if args.resume:
     states = sorted(int(re.fullmatch(r"state-(\\d+).npz", f.name).group(1)) for f in ckpt.glob("state-*.npz"))
     start = states[-1]
     run_id = json.loads((ckpt / f"state-{start}.npz").read_text())["run"]
+    for f in ckpt.glob("positions-*.npy"):
+        if int(f.name[10:-4]) >= start:
+            f.unlink()
     print(f"resuming from {start}", flush=True)
 if args.init_from:
     assert Path(args.init_from).exists()
@@ -63,6 +67,10 @@ try:
         if epoch == args.hang_at:
             time.sleep(60)
         (ckpt / f"{epoch}.eqx").write_text("net")
+        if args.save_positions_from is not None:
+            tmp = ckpt / f"positions-{epoch}.npy.tmp"
+            tmp.write_text(str(os.getpid()))
+            os.replace(tmp, ckpt / f"positions-{epoch}.npy")
         kept = [
             e
             for e in sorted(int(f.stem) for f in ckpt.glob("*.eqx"))
@@ -325,6 +333,54 @@ def test_a_preempted_job_goes_on_from_its_state_on_a_new_machine(scene):
     t = next(m for m in metas if m["name"] == "t")
     assert t["status"] == "finished"
     assert t["step"] == 11
+
+
+def test_kept_positions_come_here_whole_across_a_preemption(scene, monkeypatch):
+    scene.job(
+        step("t", "--epochs 12 --save-positions-from 0 --save-state-at 12 --die-at 8"),
+        name="p",
+        resume_every=5,
+    )
+    with pytest.raises(RuntimeError, match="lost"):
+        scene.runner("p").run()
+    keep = (scene.root / "c" / "t.died").read_text()
+    scene.wipe_container()
+    (scene.root / "c").mkdir(parents=True)
+    (scene.root / "c" / "t.died").write_text(keep)
+
+    fetched = []
+    get_file = scene.store.get_file
+    monkeypatch.setattr(
+        scene.store,
+        "get_file",
+        lambda key, path: fetched.append(key) or get_file(key, path),
+    )
+    assert scene.runner("p").run() == "done"
+    # the second attempt doesn't fetch what it doesn't read, which can be many GB
+    assert not [key for key in fetched if "positions-" in key]
+    # and the sent files of the epochs it repeated aren't in the manifest as they were
+    scene.wipe_container()
+    scene.sync().run()
+    directory = scene.root / "c" / "t"
+    writers = [(directory / f"positions-{e}.npy").read_text() for e in range(12)]
+    # each epoch once: those before its state from the first attempt, the rest from the second
+    assert len(set(writers[:5])) == 1 and len(set(writers[5:])) == 1
+    assert writers[4] != writers[5]
+
+
+def test_a_stale_kept_position_leaves_the_manifest_when_its_step_goes_back(scene):
+    job = scene.job(step("t", "--epochs 5"), name="p")
+    key = job.key_of(str(scene.root / "c" / "t" / "positions-3.npy"))
+    older = job.key_of(str(scene.root / "c" / "t" / "positions-1.npy"))
+    other = job.key_of(str(scene.root / "c" / "t" / "3.eqx"))
+    modal_store.put_json(
+        scene.store,
+        modal_spec.job_key("p", "manifest.json"),
+        {key: [1, 1], older: [1, 1], other: [1, 1]},
+    )
+    mirror = modal_run.Mirror(scene.store, job, "p", scene.place())
+    mirror.forget_positions_from(job.steps[0], 2)
+    assert mirror.manifest.keys() == {older, other}
 
 
 def test_a_step_interrupted_before_its_first_state_starts_over(scene):

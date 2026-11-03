@@ -14,6 +14,8 @@ from typing import Any
 
 SCRIPT = "examples/othello/train.py"
 STATE = r"state-(\d+)\.npz"
+# a run's kept positions (see core/memory/position_archive.py)
+POSITIONS = r"positions-(\d+)\.npy"
 # on-demand list prices, per second, read from modal.com/pricing on 2026-10-31
 GPU_PER_SECOND = {
     "CPU": 0.0,  # no GPU: for trying out the harness on a tiny net

@@ -4,12 +4,17 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import equinox as eqx
+import jax
 import numpy as np
-import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "examples" / "othello"))
 
+import distill
 from distill import (
+    Dataset,
+    Source,
+    already_kept,
+    load_dataset,
     load_positions,
     measure,
     outcomes,
@@ -17,9 +22,10 @@ from distill import (
     train,
     train_command,
     values_command,
-    with_value_source,
 )
 from game import load_checkpoint, make_network
+
+from core.memory.position_archive import ARCHIVE_META, positions_path, to_rows
 
 NET = "resnet:1x4"
 ENVS, CAPACITY = 2, 8
@@ -73,15 +79,192 @@ def test_load_positions_keeps_only_those_that_can_be_sampled(tmp_path):
     assert (outcomes(positions) == 1).all()
 
 
-def test_with_value_source(tmp_path):
-    path = tmp_path / "state.npz"
-    save_state(path)
-    positions = load_positions(str(path))
-    assert with_value_source(positions, "root", None) is positions
-    teacher = np.full(len(positions.reward), 0.25, np.float32)
-    assert (with_value_source(positions, "teacher", teacher).search_value == 0.25).all()
-    with pytest.raises(ValueError, match="teacher values"):
-        with_value_source(positions, "teacher", None)
+def keep_positions(
+    directory: Path, epochs: range, first_value: float = 0.0, parent: dict | None = None
+) -> None:
+    """A run's kept positions: 5 in each of `epochs`, numbered in `search_value` from `first_value`
+    along the epochs."""
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / ARCHIVE_META).write_text(json.dumps({"parent": parent}))
+    template = load_template(directory)
+    for i, epoch in enumerate(epochs):
+        rows = to_rows(template, epoch)
+        rows["search_value"] = first_value + 5 * i + np.arange(5)
+        np.save(positions_path(directory, epoch), rows)
+
+
+def load_template(tmp: Path):
+    state = tmp / "template.npz"
+    save_state(state)
+    positions = load_positions(str(state))
+    state.unlink()
+    return jax.tree.map(lambda x: x[:5], positions)
+
+
+def dataset_args(data, **more):
+    return SimpleNamespace(
+        **{
+            "data": [str(p) for p in data],
+            "from_epoch": None,
+            "to_epoch": None,
+            "value_source": "root",
+            "teacher_values": None,
+            "chunk_positions": 1000,
+            **more,
+        }
+    )
+
+
+def values_of(dataset: Dataset) -> list[float]:
+    return sorted(dataset.take(np.arange(len(dataset))).search_value.tolist())
+
+
+def test_a_fork_reads_its_ancestors_up_to_where_it_forked(tmp_path):
+    trunk, fork = tmp_path / "trunk", tmp_path / "fork"
+    keep_positions(trunk, range(4))
+    parent = {"path": str(trunk / "state-2.npz"), "epoch": 2, "parent": None}
+    keep_positions(fork, range(2), first_value=100, parent=parent)
+    # the trunk's last 2 epochs aren't the fork's history
+    assert values_of(load_dataset(dataset_args([fork]))) == [
+        *range(10),
+        *range(100, 110),
+    ]
+    # counted along the lineage: the fork's first epoch is 2
+    assert values_of(load_dataset(dataset_args([fork], from_epoch=1, to_epoch=3))) == [
+        *range(5, 10),
+        *range(100, 105),
+    ]
+    # two forks share their ancestors' positions, once
+    other = tmp_path / "other"
+    keep_positions(other, range(1), first_value=200, parent=parent)
+    assert len(load_dataset(dataset_args([fork, other]))) == 10 + 10 + 5
+
+
+def test_a_final_buffer_counts_once_with_kept_positions(tmp_path):
+    run = tmp_path / "run"
+    keep_positions(run, range(3))
+    state = tmp_path / "state.npz"
+    save_state(state)
+    rows = to_rows(load_positions(str(state)), 0)
+    assert not already_kept(rows, [])[0]
+    # the state's first positions were kept (by another epoch's file, whose column differs), the
+    # rest weren't
+    kept = to_rows(load_positions(str(state)), 7)[:4]
+    np.save(positions_path(run, 3), kept)
+    dataset = load_dataset(dataset_args([state, run]))
+    assert len(dataset) == 3 * 5 + 4 + len(rows) - 4
+
+
+def test_teacher_values_of_kept_positions_are_read_with_them(tmp_path):
+    run = tmp_path / "run"
+    keep_positions(run, range(2))
+    network, nn_state = make_network(NET)
+    teacher = tmp_path / "teacher.eqx"
+    eqx.tree_serialise_leaves(
+        teacher, (eqx.filter(network, eqx.is_inexact_array), nn_state)
+    )
+    out = tmp_path / "values"
+    args = SimpleNamespace(
+        teacher=str(teacher),
+        teacher_net=NET,
+        data=[str(run)],
+        out=str(out),
+        from_epoch=None,
+        to_epoch=None,
+    )
+    values_command(args)
+    computed = teacher_values_path(out, positions_path(run, 1))
+    assert np.load(computed).shape == (5,)
+    # a second run only computes what's missing
+    computed.write_bytes(b"kept")
+    values_command(args)
+    assert computed.read_bytes() == b"kept"
+    np.save(computed, np.full(5, 0.25, np.float32))
+    np.save(
+        teacher_values_path(out, positions_path(run, 0)), np.full(5, 0.5, np.float32)
+    )
+    dataset = load_dataset(
+        dataset_args([run], value_source="teacher", teacher_values=str(out))
+    )
+    assert values_of(dataset) == [0.25] * 5 + [0.5] * 5
+
+
+def test_batches_in_chunks_see_every_position_each_pass(tmp_path, monkeypatch):
+    run = tmp_path / "run"
+    keep_positions(run, range(40))
+    monkeypatch.setattr(distill, "BLOCK", 2)
+    dataset = load_dataset(dataset_args([run], chunk_positions=32))
+    assert len(dataset) == 200
+    batches = dataset.batches(8, np.random.default_rng(0))
+    # whole chunks of 4 batches, as near a pass as they come, then nearly 3 passes in all
+    seen, on_device = [], None
+    for _ in range(18):
+        for _ in range(4):
+            on_device, indices = next(batches)
+            assert len(on_device.reward) == 32
+            seen += np.asarray(on_device.search_value[indices]).tolist()
+        if len(seen) == 192:
+            assert len(set(seen)) == 192  # no position twice in a pass
+    values, counts = np.unique(seen, return_counts=True)
+    assert len(values) == 200 and set(counts) <= {2, 3}
+    # blocks from across the dataset: a chunk isn't a run of epochs
+    assert on_device is not None and np.ptp(on_device.search_value) > 32
+
+
+def test_all_positions_are_held_if_they_fit(tmp_path):
+    run = tmp_path / "run"
+    keep_positions(run, range(2))
+    dataset = load_dataset(dataset_args([run]))
+    batches = dataset.batches(4, np.random.default_rng(0))
+    on_device, _ = next(batches)
+    assert len(on_device.reward) == 10
+    assert next(batches)[0] is on_device
+
+
+def test_take_returns_positions_in_the_order_asked(tmp_path):
+    a, b = np.arange(3), np.arange(3, 7)
+    template = load_template(tmp_path)
+    sources = []
+    for values in (a, b):
+        rows = to_rows(template, 0)[: len(values)]
+        rows["search_value"] = values
+        sources.append(Source(rows))
+    taken = Dataset(sources).take(np.array([5, 0, 3, 2]))
+    assert taken.search_value.tolist() == [5, 0, 3, 2]
+
+
+def test_training_on_kept_positions_too_many_for_a_chunk(tmp_path):
+    run, heldout = tmp_path / "run", tmp_path / "held" / "state.npz"
+    keep_positions(run, range(10))
+    heldout.parent.mkdir()
+    save_state(heldout)
+    train_command(
+        SimpleNamespace(
+            data=[str(run)],
+            from_epoch=2,
+            to_epoch=None,
+            chunk_positions=16,
+            heldout=str(heldout),
+            heldout_size=5,
+            teacher_values=None,
+            value_source="root",
+            value_target_q=0.0,
+            net=NET,
+            train_dtype="float32",
+            seed=0,
+            monitor=None,
+            name=None,
+            notes=None,
+            passes=1,
+            batch=4,
+            lr=1e-3,
+            lr_final=1e-4,
+            weight_decay=0.5,
+            eval_every=1,
+            ckpt_dir=str(tmp_path / "student"),
+        )
+    )
+    load_checkpoint(str(tmp_path / "student" / "1.eqx"), NET)
 
 
 def test_train_learns_and_saves_loadable_checkpoints(tmp_path):
@@ -96,7 +279,7 @@ def test_train_learns_and_saves_loadable_checkpoints(tmp_path):
     train(
         network,
         nn_state,
-        positions,
+        Dataset.of(positions),
         positions,
         None,
         passes=100,
@@ -138,6 +321,8 @@ def test_values_then_train_with_teacher_targets(tmp_path):
             teacher_net=NET,
             data=[str(data), str(heldout)],
             out=str(out),
+            from_epoch=None,
+            to_epoch=None,
         )
     )
     # one value per position, in `load_positions`' order
@@ -145,7 +330,10 @@ def test_values_then_train_with_teacher_targets(tmp_path):
     assert values.shape == (len(load_positions(str(data)).reward),)
     train_command(
         SimpleNamespace(
-            data=str(data),
+            data=[str(data)],
+            from_epoch=None,
+            to_epoch=None,
+            chunk_positions=None,
             heldout=str(heldout),
             heldout_size=5,
             teacher_values=str(out),

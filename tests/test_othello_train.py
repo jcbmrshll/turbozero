@@ -45,3 +45,24 @@ def test_root_noise_options_reach_self_play_only(monkeypatch):
 def test_root_noise_options_out_of_range_are_refused(monkeypatch, option):
     with pytest.raises(SystemExit):
         run_main(monkeypatch, *option)
+
+
+@pytest.mark.parametrize(
+    "flags, first_epoch",
+    [
+        ((), None),
+        (("--save-positions-from", "0"), 0),
+        (("--save-positions-from", "30"), 30),
+        (("--save-positions-from", "0.75", "--epochs", "10"), 8),
+    ],
+)
+def test_keeping_positions_is_off_unless_asked(monkeypatch, flags, first_epoch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, *flags)
+    assert built.value.kwargs["save_positions_from"] == first_epoch
+
+
+@pytest.mark.parametrize("value", ["-1", "1.5", "soon"])
+def test_keeping_positions_from_nonsense_is_refused(monkeypatch, value):
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, "--save-positions-from", value)
