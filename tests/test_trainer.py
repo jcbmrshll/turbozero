@@ -990,6 +990,9 @@ def test_filled_buffer_shares_positions_between_the_environments(env, tmp_path):
     assert mask[:, :3].all() and not mask[:, 3:].any()
     np.testing.assert_array_equal(filled.next_idx, [3, 3])
     np.testing.assert_array_equal(filled.episode_start_idx, [3, 3])
+    # every field its own array, as self-play's donation needs
+    pointers = [x.unsafe_buffer_pointer() for x in jax.tree.leaves(filled)]
+    assert len(set(pointers)) == len(pointers)
     for count in (5, 18):
         with pytest.raises(ValueError, match="evenly"):
             trainer.filled_buffer(state, positions_like(trainer, count))

@@ -1842,9 +1842,12 @@ class Trainer:
             buffer_state.buffer,
         )
         valid = jnp.ones((self.batch_size, per_env), dtype=bool)
-        return jax.vmap(self.memory_buffer.add_experiences)(
+        filled = jax.vmap(self.memory_buffer.add_experiences)(
             buffer_state, experiences, valid
         )
+        # its own array for each field (`next_idx` and `episode_start_idx` are one), since
+        # self-play donates them
+        return jax.tree.map(jnp.copy, filled)
 
     def make_template_env_state(self) -> Any:
         """Create a template environment state used for initializing data structures that hold environment states to the correct shape.
