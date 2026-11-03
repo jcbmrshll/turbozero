@@ -6,7 +6,8 @@ const STORED = "league-filters";
 let sortKey = "elo", sortDir = -1;
 let chosen = {};
 let text = "";
-try { ({ chosen = {}, text = "" } = JSON.parse(localStorage.getItem(STORED)) ?? {}); } catch {}
+let showPaused = false;
+try { ({ chosen = {}, text = "", showPaused = false } = JSON.parse(localStorage.getItem(STORED)) ?? {}); } catch {}
 
 const list = el("tbody");
 const count = el("span", { class: "dim" });
@@ -42,20 +43,23 @@ function facets() {
 }
 
 function matches(player) {
+  if (player.retired && !showPaused && !chosen.status?.includes(status(player))) return false;
   if (text && !player.name.toLowerCase().includes(text.toLowerCase())) return false;
   const values = valuesOf(player);
   return Object.entries(chosen).every(([label, wanted]) => !wanted.length || (values[label] ?? []).some((v) => wanted.includes(v)));
 }
 
 function save() {
-  localStorage.setItem(STORED, JSON.stringify({ chosen, text }));
+  localStorage.setItem(STORED, JSON.stringify({ chosen, text, showPaused }));
 }
 
 function drawFacets() {
   const open = new Set([...facetBar.querySelectorAll("details[open]")].map((d) => d.dataset.label));
   const search = el("input", { type: "search", placeholder: "Player", value: text, on: { input: (e) => { text = e.target.value; save(); drawRows(); } } });
   const active = Object.values(chosen).some((wanted) => wanted.length) || text;
-  facetBar.replaceChildren(search, ...facets().map(([label, values]) => {
+  const paused = el("input", { type: "checkbox", on: { change: (e) => { showPaused = e.target.checked; save(); drawRows(); } } });
+  paused.checked = showPaused;
+  facetBar.replaceChildren(search, el("label", {}, paused, "Paused"), ...facets().map(([label, values]) => {
     const wanted = chosen[label] ?? [];
     const details = el("details", { "data-label": label, class: wanted.length ? "facet on" : "facet" },
       el("summary", {}, wanted.length ? `${label}: ${wanted.join(", ")}` : label),
