@@ -959,6 +959,58 @@ def test_fork_resizes_the_replay_buffers(env, tmp_path, capacity):
     assert np.asarray(loaded.buffer_state.next_idx).tolist() == [0, 0]
 
 
+def positions_like(trainer, count):
+    """`count` experiences shaped like `trainer`'s, numbered by their search value, with their
+    policies in float16 (as a corpus keeps them)."""
+    template = trainer.make_template_experience()
+    positions = jax.tree.map(
+        lambda x: np.zeros((count, *x.shape), np.asarray(x).dtype), template
+    )
+    return replace(
+        positions,
+        search_value=np.arange(count, dtype=np.float32),
+        policy_weights=positions.policy_weights.astype(np.float16),
+    )
+
+
+def test_filled_buffer_shares_positions_between_the_environments(env, tmp_path):
+    trainer = make_trainer(env, tmp_path)
+    state = trainer.memory_buffer.init(
+        trainer.batch_size, trainer.make_template_experience()
+    )
+
+    filled = trainer.filled_buffer(state, positions_like(trainer, 6))
+
+    # 3 positions in each of the 2 environments' 8 places, in order, sampled like any others
+    np.testing.assert_array_equal(
+        filled.buffer.search_value[:, :3], np.arange(6).reshape(2, 3)
+    )
+    assert filled.buffer.policy_weights.dtype == jnp.float32
+    mask = np.asarray(trainer.memory_buffer.sample_mask(filled))
+    assert mask[:, :3].all() and not mask[:, 3:].any()
+    np.testing.assert_array_equal(filled.next_idx, [3, 3])
+    np.testing.assert_array_equal(filled.episode_start_idx, [3, 3])
+    for count in (5, 18):
+        with pytest.raises(ValueError, match="evenly"):
+            trainer.filled_buffer(state, positions_like(trainer, count))
+
+
+def test_a_run_can_start_with_positions_in_its_buffers(env, tmp_path, fake_loop):
+    trainer = make_trainer(env, tmp_path / "run", warmup_steps=0)
+    fake_loop(trainer)
+    output = trainer.train_loop(
+        seed=0, num_epochs=1, initial_positions=positions_like(trainer, 16)
+    )
+    assert np.asarray(output.collection_state.buffer_state.populated).all()
+    with pytest.raises(ValueError, match="from scratch"):
+        trainer.train_loop(
+            seed=0,
+            num_epochs=1,
+            initial_state=output,
+            initial_positions=positions_like(trainer, 16),
+        )
+
+
 def test_fork_without_replay_buffers(env, tmp_path):
     saved, path = save_a_state(tree_trainer(env, tmp_path / "trunk"))
     # the number of environments needn't match without them

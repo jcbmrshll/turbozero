@@ -61,6 +61,8 @@ import warnings
 from functools import partial
 from pathlib import Path
 
+import jax
+import numpy as np
 import pgx
 from engine_set import DEFAULT_PATH as DEFAULT_ENGINE_SET
 from engine_set import EngineSet
@@ -74,12 +76,14 @@ from game import (
     episode_metrics,
     export_last,
     greedy_eval,
+    load_weights,
     make_network,
     make_optimizer,
     make_test_evaluator,
     state_to_nn_input,
     step_fn,
 )
+from league_corpus import Corpus
 from vs_engine import EngineMatch, EngineMatchTester, describe_scores
 from xot import load_xot, make_xot_init_fn, xot_episode_fn
 
@@ -92,7 +96,7 @@ from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.mcts.mcts import MCTS
 from core.evaluators.mcts.policy_targets import CompletedQ, VisitCounts
 from core.evaluators.random_evaluator import RandomEvaluator
-from core.memory.replay_memory import EpisodeReplayBuffer
+from core.memory.replay_memory import BaseExperience, EpisodeReplayBuffer
 from core.monitoring import DEFAULT_URL, Monitor
 from core.monitoring.episodes import pgx_two_player_episode
 from core.testing.ladder import LadderTester, Rung
@@ -122,6 +126,8 @@ def epoch_list(text: str) -> list[int]:
 # levels, and about where Lc0's example configuration and KataGo drop. At 110 epochs of 4x64 it
 # played within noise of one drop at 83%, and far above a constant learning rate
 DEFAULT_LR_DROPS = [(0.7, 1e-4), (0.9, 1e-5)]
+# self-play environments, each playing a game at a time
+NUM_ENVS = 1024
 
 
 def lr_drops(text: str) -> list[tuple[float, float]]:
@@ -147,6 +153,21 @@ def positive_schedule(text: str) -> list[tuple[int, int]]:
     if any(value < 1 for _, value in schedule):
         raise argparse.ArgumentTypeError(f"values must be positive, got {text!r}")
     return schedule
+
+
+def seed_positions(corpus_dir: str, per_env: int, seed: int) -> BaseExperience:
+    """`per_env` positions for each self-play environment, drawn at random from a labelled
+    corpus's training split (see --seed-buffer)."""
+    corpus = Corpus(corpus_dir)
+    train = corpus.split("train")
+    chosen = np.random.default_rng(seed).choice(
+        train, NUM_ENVS * per_env, replace=False
+    )
+    # in random order, so that each environment's share is a random one
+    return jax.tree.map(
+        lambda x: x[np.random.default_rng(seed).permutation(len(chosen))],
+        corpus.experiences(chosen),
+    )
 
 
 def load_engine_set(
@@ -525,6 +546,29 @@ def main():
         "--lr) and replay buffers. Needs the same --net; --buffer may "
         "differ (each environment's newest entries are kept)",
     )
+    init.add_argument(
+        "--init-weights",
+        default=None,
+        metavar="CHECKPOINT",
+        help="start from a checkpoint's network (of the same --net, e.g. one distill.py "
+        "trained) instead of a random one, with a new optimizer; otherwise a run from scratch",
+    )
+    parser.add_argument(
+        "--seed-buffer",
+        default=None,
+        metavar="CORPUS",
+        help="start the replay memory full of a labelled corpus's positions (see "
+        "league_corpus.py) instead of empty: --buffer of them for each environment, drawn "
+        "at random from its training split, each with its teacher's policy and its game's "
+        "outcome. Self-play replaces them as it plays. Not with --init-from or --resume",
+    )
+    parser.add_argument(
+        "--exclude-openings",
+        default=None,
+        metavar="PATH",
+        help="XOT openings self-play doesn't start from, as an .npy of their rows in "
+        "xot-openings.txt: e.g. a corpus's held-out ones, CORPUS/heldout_openings.npy",
+    )
     parser.add_argument(
         "--init-without-buffers",
         action="store_true",
@@ -555,6 +599,8 @@ def main():
         parser.error("--resume needs the run's --ckpt-dir")
     if args.init_without_buffers and args.init_from is None:
         parser.error("--init-without-buffers needs --init-from")
+    if args.seed_buffer and (args.init_from or args.resume):
+        parser.error("--seed-buffer is for a run that starts with empty buffers")
     if args.lr_final is not None and args.lr_drops:
         parser.error("--lr-final and --lr-drops are different schedules: pass one")
     if args.no_persist_tree and args.count_reused_visits:
@@ -578,7 +624,10 @@ def main():
 
     # self-play starts games from XOT openings (see xot.py) for varied, balanced
     # games
-    selfplay_init_fn = make_xot_init_fn(load_xot(), args.standard_starts)
+    openings = load_xot()
+    if args.exclude_openings:
+        openings = np.delete(openings, np.load(args.exclude_openings), axis=0)
+    selfplay_init_fn = make_xot_init_fn(openings, args.standard_starts)
     # test games all start from XOT openings
     test_init_fn = make_xot_init_fn(load_xot(), standard_start_fraction=0)
 
@@ -590,6 +639,10 @@ def main():
         train_dtype=args.train_dtype,
         remat=args.remat,
     )
+    if args.init_weights:
+        network, network_state = load_weights(
+            args.init_weights, args.net, network, network_state
+        )
 
     # AlphaZero takes an arbitrary search backend, here classic MCTS. Temperature 1.0
     # samples moves in proportion to visit counts, for exploration during self-play.
@@ -711,7 +764,7 @@ def main():
     # each epoch collects `collection_steps_per_epoch` self-play steps in each of
     # `batch_size` environments, then takes `train_steps_per_epoch` training steps
     trainer = Trainer(
-        batch_size=1024,
+        batch_size=NUM_ENVS,
         train_batch_size=args.train_batch,
         warmup_steps=0,
         collection_steps_per_epoch=128,
@@ -780,6 +833,9 @@ def main():
         initial_state=trainer.resume() if args.resume else None,
         fork_from=args.init_from,
         fork_replay_buffers=not args.init_without_buffers,
+        initial_positions=seed_positions(args.seed_buffer, args.buffer, args.seed)
+        if args.seed_buffer
+        else None,
     )
     export_last(ckpt_dir, args.net)
 

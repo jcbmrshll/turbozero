@@ -1816,6 +1816,36 @@ class Trainer:
             state, entry_data = buffer.resized(state, *entry_data)
         return jax.tree.map(_to_device, state), [_to_device(x) for x in entry_data]
 
+    def filled_buffer(
+        self, buffer_state: ReplayBufferState, positions: BaseExperience
+    ) -> ReplayBufferState:
+        """`buffer_state` with `positions` added, as if self-play had played them, an equal
+        share of them in each environment's buffer, in order: the first share the first
+        environment's (see `train_loop`'s `initial_positions`).
+
+        Raises:
+            ValueError: if the positions don't divide evenly between the environments, or more
+                than fit
+        """
+        count = len(positions.reward)
+        per_env, rest = divmod(count, self.batch_size)
+        if rest or per_env > self.memory_buffer.capacity:
+            raise ValueError(
+                f"{count} positions don't fill {self.batch_size} environments' replay buffers "
+                f"evenly, at most {self.memory_buffer.capacity} each"
+            )
+        experiences = jax.tree.map(
+            lambda x, kept: jnp.asarray(x, kept.dtype).reshape(
+                self.batch_size, per_env, *x.shape[1:]
+            ),
+            positions,
+            buffer_state.buffer,
+        )
+        valid = jnp.ones((self.batch_size, per_env), dtype=bool)
+        return jax.vmap(self.memory_buffer.add_experiences)(
+            buffer_state, experiences, valid
+        )
+
     def make_template_env_state(self) -> Any:
         """Create a template environment state used for initializing data structures that hold environment states to the correct shape.
 
@@ -2005,6 +2035,7 @@ class Trainer:
         initial_state: TrainLoopOutput | None = None,
         fork_from: str | None = None,
         fork_replay_buffers: bool = True,
+        initial_positions: BaseExperience | None = None,
     ) -> TrainLoopOutput:
         """Runs the training loop for `num_epochs` epochs. Mostly configured by the Trainer's attributes.
 
@@ -2036,11 +2067,19 @@ class Trainer:
                 `parent`. Not with `initial_state`.
             fork_replay_buffers: with `fork_from`, start with its replay buffers (default), or with
                 empty ones
+            initial_positions: (optional) for a run from scratch, positions to start its replay
+                buffers with (e.g. from games played elsewhere), with a leading dimension that
+                divides evenly between the environments (see `filled_buffer`). Self-play
+                overwrites them, oldest first, as it would its own
 
         Returns:
             TrainLoopOutput: contains train_state, collection_state, test_states, cur_epoch after
                 training loop, and the rng to continue it with
         """
+        if initial_positions is not None and (
+            initial_state is not None or fork_from is not None
+        ):
+            raise ValueError("initial_positions are for a run from scratch")
         if fork_from is not None:
             if initial_state is not None:
                 raise ValueError("pass initial_state or fork_from, not both")
@@ -2078,6 +2117,7 @@ class Trainer:
                 initial_state,
                 fork_from,
                 fork_replay_buffers,
+                initial_positions,
             )
         except BaseException as e:
             if self.monitor is not None:
@@ -2097,6 +2137,7 @@ class Trainer:
         initial_state: TrainLoopOutput | None,
         fork_from: str | None = None,
         fork_replay_buffers: bool = True,
+        initial_positions: BaseExperience | None = None,
     ) -> TrainLoopOutput:
         # init rng
         key = jax.random.PRNGKey(seed)
@@ -2125,6 +2166,13 @@ class Trainer:
                 collection_state = self.init_collection_state(
                     init_key, self.batch_size, evaluator
                 )
+                if initial_positions is not None:
+                    collection_state = replace(
+                        collection_state,
+                        buffer_state=self.filled_buffer(
+                            collection_state.buffer_state, initial_positions
+                        ),
+                    )
                 # initialize train state
                 train_state = self.init_train_state()
             else:

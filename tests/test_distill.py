@@ -146,6 +146,7 @@ def test_values_then_train_with_teacher_targets(tmp_path):
     train_command(
         SimpleNamespace(
             data=str(data),
+            corpus=None,
             heldout=str(heldout),
             heldout_size=5,
             teacher_values=str(out),

@@ -228,7 +228,18 @@ def load_checkpoint(path: str, net: str, inference_dtype: str = "float32"):
         to evaluate it with, as `core.evaluators.evaluation_fns.make_nn_eval_fn` takes them
     """
     network, network_state = make_network(net, inference_dtype=inference_dtype)
-    params = eqx.filter(network, eqx.is_inexact_array)
+    network, network_state = load_weights(path, net, network, network_state)
+    return network, (eqx.filter(network, eqx.is_inexact_array), network_state)
+
+
+def load_weights(path: str, net: str, network, network_state):
+    """`network` and `network_state` (as `make_network` makes them, for `net`) with the
+    parameters and state saved in a training checkpoint instead.
+
+    Raises:
+        ValueError: if the checkpoint doesn't hold a `net` network
+    """
+    params, static = eqx.partition(network, eqx.is_inexact_array)
     # a checkpoint is a TrainState's arrays in order, params and network state first: read
     # just those, so that it loads whatever optimizer trained it
     with open(path, "rb") as f:
@@ -243,7 +254,7 @@ def load_checkpoint(path: str, net: str, inference_dtype: str = "float32"):
                 f"with (before {DEFAULT_NET} became the default, runs trained "
                 "resnet:6x128)"
             ) from e
-    return network, (params, network_state)
+    return eqx.combine(params, static), network_state
 
 
 def make_test_evaluator(
