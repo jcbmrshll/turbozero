@@ -37,6 +37,7 @@ from game import (
     WEIGHT_DECAY,
     export_last,
     load_checkpoint,
+    load_weights,
     make_network,
     make_optimizer,
 )
@@ -315,6 +316,8 @@ def train_command(args) -> None:
         inference_dtype="float32",
         train_dtype=args.train_dtype,
     )
+    if args.init_weights is not None:
+        network, nn_state = load_weights(args.init_weights, args.net, network, nn_state)
     monitor = (
         Monitor(args.monitor, project="othello", name=args.name, notes=args.notes)
         if args.monitor
@@ -401,6 +404,13 @@ def main():
         default=None,
         help="the `values` command's directory: needed with --value-source teacher, else "
         "just reported against",
+    )
+    fit.add_argument(
+        "--init-weights",
+        default=None,
+        metavar="CHECKPOINT",
+        help="start from a checkpoint's network (of the same --net) instead of a random one, "
+        "with a new optimizer",
     )
     fit.add_argument("--passes", type=int, default=32, help="passes over the positions")
     fit.add_argument("--batch", type=int, default=4096, help="samples per step")

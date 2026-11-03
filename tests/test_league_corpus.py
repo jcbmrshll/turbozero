@@ -182,11 +182,30 @@ def test_distill_trains_on_a_corpus(corpus, tmp_path):
         "weight_decay": 0.5,
         "eval_every": 1,
         "ckpt_dir": str(tmp_path / "student"),
+        "init_weights": None,
     }
     with pytest.raises(SystemExit, match="no search values"):
         distill.train_command(SimpleNamespace(**{**args, "value_source": "root"}))
     distill.train_command(SimpleNamespace(**args))
     game.load_checkpoint(str(tmp_path / "student" / "1.eqx"), NET)
+    # and on from that network, with steps too small to change it leaving it as it was
+    first = tmp_path / "student" / "1.eqx"
+    distill.train_command(
+        SimpleNamespace(
+            **{
+                **args,
+                "init_weights": str(first),
+                "lr": 1e-20,
+                "lr_final": 1e-20,
+                "weight_decay": 0.0,
+                "ckpt_dir": str(tmp_path / "continued"),
+            }
+        )
+    )
+    before = game.load_checkpoint(str(first), NET)[1][0]
+    after = game.load_checkpoint(str(tmp_path / "continued" / "1.eqx"), NET)[1][0]
+    for x, y in zip(jax.tree.leaves(before), jax.tree.leaves(after), strict=True):
+        np.testing.assert_array_equal(x, y)
 
 
 def test_seed_positions_fill_every_environment_from_the_training_split(
