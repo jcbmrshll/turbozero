@@ -141,3 +141,19 @@ def test_lr_drops_hold_then_step():
     assert rates[0] == pytest.approx(1e-3) and rates[69] == pytest.approx(1e-3)
     assert rates[70] == pytest.approx(1e-4) and rates[89] == pytest.approx(1e-4)
     assert rates[90] == pytest.approx(1e-5) and rates[99] == pytest.approx(1e-5)
+
+
+def test_warmup_rises_then_follows_the_schedule():
+    params = {"w": jnp.zeros((2, 2))}
+    optimizer = make_optimizer(10, 1e-3, 1e-3, warmup_steps=4, lr_drops=[(0.5, 1e-4)])
+    state: Any = optimizer.init(params)
+    rates = []
+    for _ in range(10):
+        _, state = optimizer.update(jax.tree.map(jnp.ones_like, params), state, params)
+        rates.append(float(state.hyperparams["learning_rate"]))
+    # 0 to 1e-3 over 4 steps, then the drops over the other 6: at half of those
+    assert rates[:4] == pytest.approx([0, 2.5e-4, 5e-4, 7.5e-4])
+    assert rates[4:7] == pytest.approx([1e-3] * 3)
+    assert rates[7:] == pytest.approx([1e-4] * 3)
+    with pytest.raises(ValueError, match="warmup"):
+        make_optimizer(4, warmup_steps=4)

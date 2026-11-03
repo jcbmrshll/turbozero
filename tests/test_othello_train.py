@@ -2,6 +2,9 @@
 
 import sys
 
+import equinox as eqx
+import jax
+import numpy as np
 import pytest
 from example_modules import load_example
 
@@ -45,3 +48,95 @@ def test_root_noise_options_reach_self_play_only(monkeypatch):
 def test_root_noise_options_out_of_range_are_refused(monkeypatch, option):
     with pytest.raises(SystemExit):
         run_main(monkeypatch, *option)
+
+
+def test_init_weights_start_from_a_checkpoint(monkeypatch, tmp_path):
+    game = load_example("othello", "game")[0]
+    network, nn_state = game.make_network("resnet:1x4", seed=3)
+    path = tmp_path / "pretrained.eqx"
+    eqx.tree_serialise_leaves(
+        path, (eqx.filter(network, eqx.is_inexact_array), nn_state)
+    )
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, "--init-weights", str(path))
+    for a, b in zip(
+        jax.tree.leaves(eqx.filter(built.value.kwargs["nn"], eqx.is_inexact_array)),
+        jax.tree.leaves(eqx.filter(network, eqx.is_inexact_array)),
+        strict=True,
+    ):
+        np.testing.assert_array_equal(a, b)
+
+
+def test_seed_buffer_is_for_runs_that_start_empty(monkeypatch, tmp_path):
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, "--seed-buffer", "corpus", "--resume", "--ckpt-dir", "x")
+
+
+def test_self_play_keeps_off_excluded_openings(monkeypatch, tmp_path):
+    xot = load_example("othello", "xot")[0]
+    openings = xot.load_xot()
+    excluded = tmp_path / "excluded.npy"
+    # all but opening 5
+    np.save(excluded, np.delete(np.arange(len(openings)), 5))
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, "--exclude-openings", str(excluded))
+    init_fn = built.value.kwargs["env_init_fn"]
+    expected = xot.make_xot_init_fn(openings[5:6], 0.0)(jax.random.PRNGKey(0))[0]
+    for seed in range(3):
+        state, _ = init_fn(jax.random.PRNGKey(seed))
+        np.testing.assert_array_equal(state.observation, expected.observation)
+
+
+def test_lr_warmup_starts_the_learning_rate_at_zero(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, "--epochs", "4", "--lr-warmup", "1", "--lr-final", "1e-3")
+    optimizer = built.value.kwargs["optimizer"]
+    params = {"w": jax.numpy.zeros(2)}
+    state = optimizer.init(params)
+    rates = []
+    for _ in range(129):
+        _, state = optimizer.update({"w": jax.numpy.ones(2)}, state, params)
+        rates.append(float(state.hyperparams["learning_rate"]))
+    # one epoch of 128 steps from 0 to 1e-3
+    assert rates[0] == 0
+    assert rates[64] == pytest.approx(5e-4, rel=1e-6)
+    assert rates[128] == pytest.approx(1e-3, rel=1e-6)
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, "--epochs", "4", "--lr-warmup", "4")
+
+
+def test_anchor_blends_a_frozen_networks_outputs_into_the_targets(
+    monkeypatch, tmp_path
+):
+    game = load_example("othello", "game")[0]
+    network, nn_state = game.make_network("resnet:1x4", seed=5)
+    path = tmp_path / "anchor.eqx"
+    eqx.tree_serialise_leaves(
+        path, (eqx.filter(network, eqx.is_inexact_array), nn_state)
+    )
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, "--anchor", str(path), "--anchor-policy", "0.25")
+    loss_fn = built.value.kwargs["loss_fn"]
+    assert loss_fn.func.__name__ == "anchored_loss_fn"
+    assert loss_fn.keywords["policy_weight"] == 0.25
+    assert loss_fn.keywords["value_weight"] == 0.5
+    reference = loss_fn.keywords["reference"]
+    assert str(path) in str(reference)
+    # the reference's policy is over the legal actions only
+    obs = jax.numpy.zeros((3, 8, 8, 2), bool)
+    legal = jax.numpy.zeros((3, 65), bool).at[:, :2].set(True)
+    policy, value = reference(obs, legal)
+    np.testing.assert_allclose(policy.sum(-1), 1, rtol=1e-6)
+    assert (policy[:, 2:] == 0).all() and value.shape == (3,)
+    for bad in (["--anchor-value", "1.5"], ["--value-target-q", "0.5"]):
+        with pytest.raises(SystemExit):
+            run_main(monkeypatch, "--anchor", str(path), *bad)
+
+
+def test_freeze_batchnorm_trains_with_batchnorm_in_inference_mode(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, "--freeze-batchnorm")
+    assert built.value.kwargs["nn"].stem_bn.inference
+    for bad in (["--train-dtype", "float32"], ["--remat"]):
+        with pytest.raises(SystemExit):
+            run_main(monkeypatch, "--freeze-batchnorm", *bad)

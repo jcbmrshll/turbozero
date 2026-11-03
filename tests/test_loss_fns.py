@@ -2,9 +2,10 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from core.memory.replay_memory import BaseExperience
-from core.training.loss_fns import az_default_loss_fn
+from core.training.loss_fns import anchored_loss_fn, az_default_loss_fn
 
 
 class OutputAsParams(eqx.Module):
@@ -165,3 +166,56 @@ def test_network_state_comes_back_updated():
 
     assert nn_state is not None
     assert int(nn_state.get(net.calls)) == 1
+
+
+def reference_of(policy, value):
+    """A frozen reference that gives every batch these outputs."""
+    return lambda obs, mask: (jnp.asarray(policy), jnp.asarray(value))
+
+
+def test_an_anchor_of_weight_zero_changes_nothing():
+    batch, logits, value = two_positions()
+    net = OutputAsParams(logits, value)
+    ref = reference_of([[0.9, 0.1], [0.5, 0.5]], [0.3, -0.3])
+
+    plain, (plain_metrics, _) = az_default_loss_fn(net, None, batch)
+    anchored, (metrics, _) = anchored_loss_fn(net, None, batch, ref, 0.0, 0.0)
+
+    np.testing.assert_allclose(anchored, plain, rtol=1e-6)
+    for name in plain_metrics:
+        np.testing.assert_allclose(metrics[name], plain_metrics[name], rtol=1e-6)
+
+
+def test_an_anchor_blends_the_references_outputs_into_the_targets():
+    batch, logits, value = two_positions()
+    net = OutputAsParams(logits, value)
+    ref_policy, ref_value = jnp.array([[0.9, 0.1], [0.5, 0.5]]), jnp.array([0.3, -0.3])
+
+    _, (metrics, _) = anchored_loss_fn(
+        net, None, batch, reference_of(ref_policy, ref_value), 0.25, 0.5
+    )
+
+    # the same as training on a quarter of the reference's policy and half of its value
+    blended = experience(
+        rewards=[[1, -1], [1, -1]],
+        cur_player_id=[0, 1],
+        policy_weights=0.75 * batch.policy_weights + 0.25 * ref_policy,
+        policy_mask=[[True, True]] * 2,
+        search_value=ref_value,
+    )
+    _, (expected, _) = az_default_loss_fn(net, None, blended, value_target_q=0.5)
+    for name in ("policy_loss", "value_loss"):
+        np.testing.assert_allclose(metrics[name], expected[name], rtol=1e-6)
+
+
+def test_the_anchors_distance_is_zero_when_the_network_is_the_reference():
+    batch, logits, value = two_positions()
+    net = OutputAsParams(logits, value)
+    ref = reference_of(jax.nn.softmax(logits), value.reshape(-1))
+
+    _, (metrics, _) = anchored_loss_fn(net, None, batch, ref, 0.5, 0.5)
+
+    np.testing.assert_allclose(metrics["anchor_policy_kl"], 0.0, atol=1e-6)
+    np.testing.assert_allclose(metrics["anchor_value_mse"], 0.0, atol=1e-12)
+    with pytest.raises(ValueError, match="not both"):
+        anchored_loss_fn(net, None, batch, ref, 0.5, 0.5, value_target_q=0.5)

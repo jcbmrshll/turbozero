@@ -32,6 +32,14 @@ CORE_PER_SECOND = 0.0000131
 GIB_PER_SECOND = 0.00000222
 # in-run games need Edax, which the image doesn't build
 UNSUPPORTED = ("--vs-engine-every", "--vs-engine-last")
+# flags naming files of this machine a step reads, which a job takes to the bucket
+INPUTS = (
+    "--init-from",
+    "--init-weights",
+    "--anchor",
+    "--exclude-openings",
+    "--engine-set",
+)
 
 
 def flag(argv: list[str], name: str) -> str | None:
@@ -136,8 +144,10 @@ def parse_step(text: str, home: str) -> Step:
             raise ValueError(
                 f"{name}: the Modal image has no Edax; the Elo league measures strength here"
             )
+    if flag(argv, "--seed-buffer") is not None:
+        raise ValueError("--seed-buffer: a job doesn't take a corpus to the bucket")
     root = Path(home) / ".cache" / "turbozero"
-    for path in (ckpt_dir, log, flag(argv, "--init-from"), flag(argv, "--engine-set")):
+    for path in (ckpt_dir, log, *(flag(argv, name) for name in INPUTS)):
         if path is not None and not Path(path).is_relative_to(root):
             raise ValueError(f"{path} isn't under {root}: it wouldn't come back here")
     return Step(argv, log)

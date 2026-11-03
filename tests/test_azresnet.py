@@ -15,7 +15,7 @@ from core.networks.azresnet import (
     conv_bn,
     inference_affine,
 )
-from core.networks.utils import BATCH_AXIS, apply_nn
+from core.networks.utils import BATCH_AXIS, apply_nn, freeze_batchnorm
 
 INPUT_SHAPE = (3, 3, 2)
 
@@ -344,3 +344,23 @@ def test_global_pooling_carries_information_across_the_board(pool_channels, reac
         return block(jnp.asarray(x), state, jnp.dtype("float32"))[0][:, 6, 6]
 
     assert np.allclose(far_corner(x), far_corner(y)) != reaches
+
+
+def test_frozen_batch_norm_trains_with_the_stored_statistics():
+    net, state = make_net()
+    x = jnp.asarray(observations(np.random.default_rng(1)))
+    # some statistics to freeze: a training step's
+    _, state = apply_nn(net, state, x)
+    frozen = freeze_batchnorm(net)
+
+    (policy, value), after = apply_nn(frozen, state, x)
+    (inf_policy, inf_value), _ = apply_nn(eqx.nn.inference_mode(net), state, x)
+
+    # the state stays as it was, and the outputs are inference mode's
+    for a, b in zip(jax.tree.leaves(after), jax.tree.leaves(state), strict=True):
+        np.testing.assert_array_equal(a, b)
+    np.testing.assert_allclose(policy, inf_policy, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(value, inf_value, rtol=1e-5, atol=1e-6)
+    # and it still trains: BatchNorm's scales get gradients
+    grads = eqx.filter_grad(lambda n: (apply_nn(n, state, x)[0][1] ** 2).mean())(frozen)
+    assert np.abs(np.asarray(grads.stem_bn.weight)).sum() > 0

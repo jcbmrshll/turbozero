@@ -1,7 +1,9 @@
 """Trains a network on another run's games, with no self-play: supervised on the search policies
 in a saved training state's replay buffer (see `Trainer.save_state`), and on a value target of the
 game's outcome, the search's value stored with each position, the value a teacher network gives it
-(see the `values` command), or a mix of the outcome and one of those.
+(see the `values` command), or a mix of the outcome and one of those. Or on a labelled corpus of the
+league's games instead (see league_corpus.py, and --corpus): on its teacher's policies, and its
+teacher's values or the outcome, measured on the corpus's held-out openings.
 
     uv run examples/othello/distill.py values --teacher 37.eqx --teacher-net NET \\
         --data state-188.npz state-3.npz --out teacher-values
@@ -9,6 +11,9 @@ game's outcome, the search's value stored with each position, the value a teache
         --net resnet:4x64,pool_every=2,heads=pooled,pool_channels=16 \\
         --value-source teacher --value-target-q 1 --teacher-values teacher-values \\
         --ckpt-dir runs/student --monitor --notes "does a student learn from its teacher?"
+    uv run examples/othello/distill.py train --corpus corpus --passes 4 --eval-every 1 \\
+        --net resnet:4x64,pool_every=2,heads=pooled,pool_channels=16 \\
+        --value-source teacher --value-target-q 1 --ckpt-dir runs/pretrained
 
 Its checkpoints load with `game.load_checkpoint`, like train.py's.
 """
@@ -32,9 +37,11 @@ from game import (
     WEIGHT_DECAY,
     export_last,
     load_checkpoint,
+    load_weights,
     make_network,
     make_optimizer,
 )
+from league_corpus import Corpus
 
 from core.memory.replay_memory import BaseExperience, transform_randomly
 from core.monitoring import DEFAULT_URL, Monitor
@@ -77,7 +84,7 @@ def _evaluate(net, nn_state, batch: BaseExperience) -> tuple[jax.Array, jax.Arra
     """Each position's policy KL, scored as in `az_default_loss_fn`, and value."""
     (logits, value), _ = apply_nn(net, nn_state, batch.observation_nn)
     logits = jnp.where(batch.policy_mask, logits, jnp.finfo(jnp.float32).min)
-    targets = batch.policy_weights
+    targets = batch.policy_weights.astype(jnp.float32)
     entropy = -jnp.where(targets > 0, targets * jnp.log(targets), 0.0).sum(-1)
     return optax.softmax_cross_entropy(logits, targets) - entropy, value.reshape(-1)
 
@@ -134,6 +141,8 @@ def make_train_step(optimizer, value_target_q: float):
     @eqx.filter_jit
     def step(params, static, nn_state, opt_state, positions, indices, key):
         batch = jax.tree.map(lambda x: x[indices], positions)
+        # a corpus keeps its policies in float16
+        batch = replace(batch, policy_weights=batch.policy_weights.astype(jnp.float32))
         batch = transform_randomly(key, batch, SYMMETRY_TRANSFORM_FNS)
         grad_fn = eqx.filter_value_and_grad(loss_fn, has_aux=True)
         (_, (metrics, nn_state)), grads = grad_fn(
@@ -257,7 +266,9 @@ def teacher_values_path(directory: Path, state: str) -> Path:
     return directory / f"{state_path.parent.name}-{state_path.stem}.npy"
 
 
-def train_command(args) -> None:
+def state_positions(args):
+    """--data's positions and --heldout's (--heldout-size of them), with their teacher's values
+    if --teacher-values has them."""
     positions = load_positions(args.data)
     heldout = load_positions(args.heldout)
     if args.heldout_size < len(heldout.reward):
@@ -272,6 +283,55 @@ def train_command(args) -> None:
         directory = Path(args.teacher_values)
         teacher_values = np.load(teacher_values_path(directory, args.data))
         heldout_teacher = np.load(teacher_values_path(directory, args.heldout))[chosen]
+    return positions, heldout, teacher_values, heldout_teacher
+
+
+def corpus_positions(
+    corpus: Corpus,
+    heldout_size: int,
+    policy: str = "teacher",
+    value: str = "teacher",
+    searchers: np.ndarray | None = None,
+) -> tuple[BaseExperience, BaseExperience, np.ndarray]:
+    """A labelled corpus's training split, `heldout_size` of its held-out positions, and the
+    teacher's values of those, with `policy` and `value` targets from the "teacher" or the
+    recorded "search" (see `Corpus.experiences`); with `searchers`, only positions one of these
+    players searched."""
+    heldout = corpus.split("heldout", searchers)
+    if heldout_size < len(heldout):
+        heldout = np.random.default_rng(0).choice(heldout, heldout_size, replace=False)
+    heldout = np.sort(heldout)
+    return (
+        corpus.experiences(corpus.split("train", searchers), policy, value),
+        corpus.experiences(heldout, policy, value),
+        np.asarray(corpus.value[heldout], np.float32),
+    )
+
+
+def train_command(args) -> None:
+    if args.corpus is not None:
+        corpus = Corpus(args.corpus)
+        if (args.value_source == "root" or args.policy_source == "search") and not (
+            corpus.searched and args.searchers
+        ):
+            raise SystemExit(
+                "a corpus's search targets need its searches (league_corpus.py searches) "
+                "and --searchers"
+            )
+        positions, heldout, heldout_teacher = corpus_positions(
+            corpus,
+            args.heldout_size,
+            policy=args.policy_source,
+            value="search" if args.value_source == "root" else "teacher",
+            searchers=np.load(args.searchers) if args.searchers else None,
+        )
+        teacher_values = np.asarray(positions.search_value)
+    elif args.policy_source != "teacher" or args.searchers:
+        raise SystemExit("--policy-source and --searchers are for a corpus")
+    elif args.data is None or args.heldout is None:
+        raise SystemExit("pass --corpus, or --data and --heldout")
+    else:
+        positions, heldout, teacher_values, heldout_teacher = state_positions(args)
     positions = with_value_source(positions, args.value_source, teacher_values)
     network, nn_state = make_network(
         args.net,
@@ -279,6 +339,8 @@ def train_command(args) -> None:
         inference_dtype="float32",
         train_dtype=args.train_dtype,
     )
+    if args.init_weights is not None:
+        network, nn_state = load_weights(args.init_weights, args.net, network, nn_state)
     monitor = (
         Monitor(args.monitor, project="othello", name=args.name, notes=args.notes)
         if args.monitor
@@ -339,13 +401,17 @@ def main():
     values.set_defaults(run=values_command)
 
     fit = commands.add_parser("train", help="train a network on a state's positions")
-    fit.add_argument(
-        "--data", required=True, help="the saved training state to learn from"
+    data = fit.add_mutually_exclusive_group(required=True)
+    data.add_argument("--data", help="the saved training state to learn from")
+    data.add_argument(
+        "--corpus",
+        help="a labelled corpus to learn from instead (see league_corpus.py), its training "
+        "split, measured on its held-out one",
     )
     fit.add_argument(
         "--heldout",
-        required=True,
-        help="a saved training state of games the network and teacher never trained on",
+        help="with --data, a saved training state of games the network and teacher never "
+        "trained on",
     )
     fit.add_argument("--heldout-size", type=int, default=100_000)
     fit.add_argument("--net", required=True, help="the network, as train.py's --net")
@@ -355,12 +421,39 @@ def main():
         default=0.0,
         help="weight of --value-source in the value target, the rest being the game's outcome",
     )
-    fit.add_argument("--value-source", choices=("root", "teacher"), default="root")
+    fit.add_argument(
+        "--value-source",
+        choices=("root", "teacher"),
+        default="root",
+        help="the value mixed into the target: the search's root value (a corpus's recorded "
+        "searches') or the teacher's",
+    )
+    fit.add_argument(
+        "--policy-source",
+        choices=("teacher", "search"),
+        default="teacher",
+        help="with --corpus, train the policy on the teacher's, or on the recorded searches' "
+        "(see league_corpus.py searches)",
+    )
+    fit.add_argument(
+        "--searchers",
+        default=None,
+        metavar="PATH",
+        help="with --corpus, only positions these players searched: an .npy of their ids in "
+        "the league's store",
+    )
     fit.add_argument(
         "--teacher-values",
         default=None,
         help="the `values` command's directory: needed with --value-source teacher, else "
         "just reported against",
+    )
+    fit.add_argument(
+        "--init-weights",
+        default=None,
+        metavar="CHECKPOINT",
+        help="start from a checkpoint's network (of the same --net) instead of a random one, "
+        "with a new optimizer",
     )
     fit.add_argument("--passes", type=int, default=32, help="passes over the positions")
     fit.add_argument("--batch", type=int, default=4096, help="samples per step")

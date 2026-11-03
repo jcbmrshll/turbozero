@@ -176,13 +176,19 @@ def make_optimizer(
     lr_final: float = 1e-4,
     weight_decay: float = WEIGHT_DECAY,
     lr_drops: Sequence[tuple[float, float]] = (),
+    warmup_steps: int = 0,
 ) -> optax.GradientTransformation:
     """AdamW, with the learning rate decaying from `lr` to `lr_final` over
     `total_steps` training steps, along a cosine, or with `lr_drops`, held at `lr` and then
-    dropping in steps: each (fraction of `total_steps`, the learning rate from there on). And
+    dropping in steps: each (fraction of `total_steps`, the learning rate from there on). With
+    `warmup_steps`, it first rises linearly from 0 to `lr` over that many steps, and the
+    schedule runs over the rest. And
     weight decay on the network's weights, not its biases or BatchNorm scales and offsets (see
     `weight_decay_mask`). Its hyperparameters are injected, for the trainer to record them and
     log the learning rate."""
+    if not 0 <= warmup_steps < max(total_steps, 1):
+        raise ValueError(f"{warmup_steps} warmup steps don't fit in {total_steps}")
+    total_steps -= warmup_steps
     schedule = optax.cosine_decay_schedule(
         lr, decay_steps=max(total_steps, 1), alpha=lr_final / lr
     )
@@ -196,6 +202,10 @@ def make_optimizer(
                     lr_drops, rates[:-1], rates[1:], strict=True
                 )
             },
+        )
+    if warmup_steps:
+        schedule = optax.join_schedules(
+            [optax.linear_schedule(0.0, lr, warmup_steps), schedule], [warmup_steps]
         )
     return optax.inject_hyperparams(optax.adamw, static_args=("mask",))(
         learning_rate=schedule,
@@ -228,7 +238,18 @@ def load_checkpoint(path: str, net: str, inference_dtype: str = "float32"):
         to evaluate it with, as `core.evaluators.evaluation_fns.make_nn_eval_fn` takes them
     """
     network, network_state = make_network(net, inference_dtype=inference_dtype)
-    params = eqx.filter(network, eqx.is_inexact_array)
+    network, network_state = load_weights(path, net, network, network_state)
+    return network, (eqx.filter(network, eqx.is_inexact_array), network_state)
+
+
+def load_weights(path: str, net: str, network, network_state):
+    """`network` and `network_state` (as `make_network` makes them, for `net`) with the
+    parameters and state saved in a training checkpoint instead.
+
+    Raises:
+        ValueError: if the checkpoint doesn't hold a `net` network
+    """
+    params, static = eqx.partition(network, eqx.is_inexact_array)
     # a checkpoint is a TrainState's arrays in order, params and network state first: read
     # just those, so that it loads whatever optimizer trained it
     with open(path, "rb") as f:
@@ -243,7 +264,7 @@ def load_checkpoint(path: str, net: str, inference_dtype: str = "float32"):
                 f"with (before {DEFAULT_NET} became the default, runs trained "
                 "resnet:6x128)"
             ) from e
-    return network, (params, network_state)
+    return eqx.combine(params, static), network_state
 
 
 def make_test_evaluator(

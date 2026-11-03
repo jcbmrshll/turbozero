@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from typing import Any
 
 import equinox as eqx
@@ -41,11 +42,20 @@ def az_default_loss_fn(
             - nn_state: updated state of the neural network
     """
 
-    # get predictions
     (pred_policy, pred_value), nn_state = apply_nn(
         nn, nn_state, experience.observation_nn
     )
+    loss, metrics = _az_loss(pred_policy, pred_value, experience, value_target_q)
+    return loss, (metrics, nn_state)
 
+
+def _az_loss(
+    pred_policy: jax.Array,
+    pred_value: jax.Array,
+    experience: BaseExperience,
+    value_target_q: float,
+) -> tuple[jax.Array, dict]:
+    """`az_default_loss_fn`'s loss and metrics, from the network's outputs on the batch."""
     # set invalid actions in policy to -inf
     pred_policy = jnp.where(
         experience.policy_mask, pred_policy, jnp.finfo(jnp.float32).min
@@ -83,4 +93,70 @@ def az_default_loss_fn(
         "policy_target_entropy": target_entropy,
         "policy_kl": policy_loss - target_entropy,
     }
-    return loss, (aux_metrics, nn_state)
+    return loss, aux_metrics
+
+
+# a frozen network's view of a batch: (observations, legal actions) -> (policy over legal actions,
+# value for the player to move)
+Reference = Callable[[jax.Array, jax.Array], tuple[jax.Array, jax.Array]]
+
+
+def anchored_loss_fn(
+    nn: Any,
+    nn_state: eqx.nn.State | None,
+    experience: BaseExperience,
+    reference: Reference,
+    policy_weight: float,
+    value_weight: float,
+    value_target_q: float = 0.0,
+) -> tuple[jax.Array, tuple[dict, eqx.nn.State | None]]:
+    """`az_default_loss_fn`, with targets anchored to a frozen reference network (e.g. the network
+    training started from, or a teacher): the policy target is `policy_weight` of the reference's
+    policy and the rest the experience's, and the value target `value_weight` of the reference's
+    value and the rest the outcome's (or the outcome and search value's, with `value_target_q`).
+
+    Training on these blended targets is the same, but for the loss's scale, as adding a penalty
+    of policy_weight / (1 - policy_weight) times KL(reference's policy || network's policy) to the
+    policy loss, and the like for the value: a pull back toward the reference wherever the network's
+    own targets lead it away. Gradients don't reach the reference.
+
+    Logs, besides `az_default_loss_fn`'s metrics, `anchor_policy_kl` and `anchor_value_mse`: how far
+    the network is from the reference.
+
+    Raises:
+        ValueError: if a value weight and `value_target_q` are both set
+    """
+    if value_weight and value_target_q:
+        raise ValueError("anchor the value or mix in the search's value, not both")
+    ref_policy, ref_value = jax.lax.stop_gradient(
+        reference(experience.observation_nn, experience.policy_mask)
+    )
+    targets = (
+        1 - policy_weight
+    ) * experience.policy_weights + policy_weight * ref_policy
+    anchored = BaseExperience(
+        reward=experience.reward,
+        policy_weights=targets,
+        policy_mask=experience.policy_mask,
+        observation_nn=experience.observation_nn,
+        cur_player_id=experience.cur_player_id,
+        search_value=ref_value.reshape(experience.search_value.shape)
+        if value_weight
+        else experience.search_value,
+    )
+    (logits, value), nn_state = apply_nn(nn, nn_state, experience.observation_nn)
+    loss, metrics = _az_loss(logits, value, anchored, value_weight or value_target_q)
+    # how far the network is from the reference, by its outputs on this batch
+    log_policy = jax.nn.log_softmax(
+        jnp.where(experience.policy_mask, logits, jnp.finfo(jnp.float32).min)
+    )
+    ref_entropy = jnp.where(ref_policy > 0, ref_policy * jnp.log(ref_policy), 0.0)
+    metrics["anchor_policy_kl"] = jax.lax.stop_gradient(
+        (ref_entropy - jnp.where(ref_policy > 0, ref_policy * log_policy, 0.0))
+        .sum(-1)
+        .mean()
+    )
+    metrics["anchor_value_mse"] = jax.lax.stop_gradient(
+        ((value.reshape(-1) - ref_value.reshape(-1)) ** 2).mean()
+    )
+    return loss, (metrics, nn_state)

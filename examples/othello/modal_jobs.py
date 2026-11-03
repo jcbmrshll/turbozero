@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from modal_run import engine_set_path
-from modal_spec import GPU_PER_SECOND, Job, flag, job_key, parse_step
+from modal_spec import GPU_PER_SECOND, INPUTS, Job, flag, job_key, parse_step
 from modal_store import GcsStore, Store, get_json, put_json
 from modal_sync import TERMINAL, Sync, jobs_in
 
@@ -94,11 +94,11 @@ def resolve_commit(commit: str) -> str:
 
 def inputs_to_upload(job: Job) -> list[str]:
     """Files of this machine a job reads: those no earlier step of it makes. The engine set
-    always (train.py's default), and whichever states and sets its flags name."""
+    always (train.py's default), and whichever files its flags name (see `INPUTS`)."""
     out = [engine_set_path(job.home)]
     made = {step.ckpt_dir for step in job.steps}
     for step in job.steps:
-        for name in ("--init-from", "--engine-set"):
+        for name in INPUTS:
             path = flag(step.argv, name)
             if path is not None and os.path.dirname(path) not in made:
                 out.append(path)
