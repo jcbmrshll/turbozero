@@ -9,8 +9,8 @@ from pathlib import Path
 import pytest
 from example_modules import load_example
 
-modal_run, modal_spec, modal_store, modal_sync = load_example(
-    "othello", "modal_run", "modal_spec", "modal_store", "modal_sync"
+modal_jobs, modal_run, modal_spec, modal_store, modal_sync = load_example(
+    "othello", "modal_jobs", "modal_run", "modal_spec", "modal_store", "modal_sync"
 )
 
 # as train.py: rolling checkpoints, keep-every, states, --resume, a run that continues
@@ -26,6 +26,8 @@ p.add_argument("--keep-every", type=int)
 p.add_argument("--save-state-at", default="")
 p.add_argument("--save-state-every", type=int)
 p.add_argument("--init-from")
+p.add_argument("--init-weights")
+p.add_argument("--exclude-openings")
 p.add_argument("--init-without-buffers", action="store_true")
 p.add_argument("--resume", action="store_true")
 p.add_argument("--monitor", nargs="?", const="")
@@ -44,6 +46,11 @@ if args.resume:
     print(f"resuming from {start}", flush=True)
 if args.init_from:
     assert Path(args.init_from).exists()
+if args.init_weights and args.resume:
+    sys.exit("--init-weights and --resume")
+for path in (args.init_weights, args.exclude_openings):
+    if path:
+        assert Path(path).exists(), path
 at = {int(e) for e in args.save_state_at.split(",") if e}
 monitor = None
 if args.monitor is not None:
@@ -217,6 +224,8 @@ def test_parse_step_takes_a_local_command():
             "examples/othello/train.py --init-from ~/.cache/turbozero/dir --ckpt-dir ~/.cache/turbozero/c > ~/.cache/turbozero/l",
             "state-<EPOCH>",
         ),
+        ("examples/othello/train.py --init-weights /tmp/w.eqx --ckpt-dir ~/.cache/turbozero/c > ~/.cache/turbozero/l", "wouldn't come back"),
+        ("examples/othello/train.py --seed-buffer ~/.cache/turbozero/corpus --ckpt-dir ~/.cache/turbozero/c > ~/.cache/turbozero/l", "corpus"),
     ],
 )  # fmt: skip
 def test_parse_step_refuses_what_wouldnt_work(text, says):
@@ -325,6 +334,33 @@ def test_a_preempted_job_goes_on_from_its_state_on_a_new_machine(scene):
     t = next(m for m in metas if m["name"] == "t")
     assert t["status"] == "finished"
     assert t["step"] == 11
+
+
+def test_a_preempted_step_from_pretrained_weights_resumes_without_them(scene):
+    weights = ".cache/turbozero/w/pretrained.eqx"
+    openings = ".cache/turbozero/w/heldout.npy"
+    for key in (weights, openings):
+        scene.store.put_bytes(f"files/{key}", b"x")  # as `launch` uploads them
+    job = scene.job(
+        step(
+            "t",
+            f"--epochs 8 --die-at 6 --init-weights ~/{weights} --exclude-openings ~/{openings}",
+        ),
+        name="p",
+        resume_every=5,
+    )
+    assert modal_jobs.inputs_to_upload(job)[1:] == [
+        str(scene.home / weights),
+        str(scene.home / openings),
+    ]
+    with pytest.raises(RuntimeError, match="lost"):
+        scene.runner("p").run()
+    died = (scene.root / "c" / "t.died").read_text()
+    scene.wipe_container()
+    (scene.root / "c").mkdir(parents=True)
+    (scene.root / "c" / "t.died").write_text(died)
+    assert scene.runner("p").run() == "done"
+    assert "resuming from 5" in (scene.root / "l" / "t.log").read_text()
 
 
 def test_a_step_interrupted_before_its_first_state_starts_over(scene):

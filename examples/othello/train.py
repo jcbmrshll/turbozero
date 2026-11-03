@@ -336,6 +336,14 @@ def main():
         "(default: 0.7:1e-4,0.9:1e-5, two drops of 10x)",
     )
     parser.add_argument(
+        "--lr-warmup",
+        type=int,
+        default=0,
+        metavar="EPOCHS",
+        help="raise the learning rate linearly from 0 to --lr over this many epochs first, "
+        "then follow the schedule over the rest (0, the default, for none)",
+    )
+    parser.add_argument(
         "--weight-decay",
         type=float,
         default=WEIGHT_DECAY,
@@ -601,6 +609,8 @@ def main():
         parser.error("--init-without-buffers needs --init-from")
     if args.seed_buffer and (args.init_from or args.resume):
         parser.error("--seed-buffer is for a run that starts with empty buffers")
+    if not 0 <= args.lr_warmup < args.epochs:
+        parser.error("--lr-warmup must be fewer epochs than --epochs")
     if args.lr_final is not None and args.lr_drops:
         parser.error("--lr-final and --lr-drops are different schedules: pass one")
     if args.no_persist_tree and args.count_reused_visits:
@@ -781,6 +791,7 @@ def main():
             args.lr if args.lr_final is None else args.lr_final,
             args.weight_decay,
             args.lr_drops or (DEFAULT_LR_DROPS if args.lr_final is None else ()),
+            warmup_steps=args.lr_warmup * args.train_steps,
         ),
         evaluator=evaluator,
         # stores `capacity` positions for each of the `batch_size` environments

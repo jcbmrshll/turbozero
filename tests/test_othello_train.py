@@ -85,3 +85,21 @@ def test_self_play_keeps_off_excluded_openings(monkeypatch, tmp_path):
     for seed in range(3):
         state, _ = init_fn(jax.random.PRNGKey(seed))
         np.testing.assert_array_equal(state.observation, expected.observation)
+
+
+def test_lr_warmup_starts_the_learning_rate_at_zero(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, "--epochs", "4", "--lr-warmup", "1", "--lr-final", "1e-3")
+    optimizer = built.value.kwargs["optimizer"]
+    params = {"w": jax.numpy.zeros(2)}
+    state = optimizer.init(params)
+    rates = []
+    for _ in range(129):
+        _, state = optimizer.update({"w": jax.numpy.ones(2)}, state, params)
+        rates.append(float(state.hyperparams["learning_rate"]))
+    # one epoch of 128 steps from 0 to 1e-3
+    assert rates[0] == 0
+    assert rates[64] == pytest.approx(5e-4, rel=1e-6)
+    assert rates[128] == pytest.approx(1e-3, rel=1e-6)
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, "--epochs", "4", "--lr-warmup", "4")

@@ -176,13 +176,19 @@ def make_optimizer(
     lr_final: float = 1e-4,
     weight_decay: float = WEIGHT_DECAY,
     lr_drops: Sequence[tuple[float, float]] = (),
+    warmup_steps: int = 0,
 ) -> optax.GradientTransformation:
     """AdamW, with the learning rate decaying from `lr` to `lr_final` over
     `total_steps` training steps, along a cosine, or with `lr_drops`, held at `lr` and then
-    dropping in steps: each (fraction of `total_steps`, the learning rate from there on). And
+    dropping in steps: each (fraction of `total_steps`, the learning rate from there on). With
+    `warmup_steps`, it first rises linearly from 0 to `lr` over that many steps, and the
+    schedule runs over the rest. And
     weight decay on the network's weights, not its biases or BatchNorm scales and offsets (see
     `weight_decay_mask`). Its hyperparameters are injected, for the trainer to record them and
     log the learning rate."""
+    if not 0 <= warmup_steps < max(total_steps, 1):
+        raise ValueError(f"{warmup_steps} warmup steps don't fit in {total_steps}")
+    total_steps -= warmup_steps
     schedule = optax.cosine_decay_schedule(
         lr, decay_steps=max(total_steps, 1), alpha=lr_final / lr
     )
@@ -196,6 +202,10 @@ def make_optimizer(
                     lr_drops, rates[:-1], rates[1:], strict=True
                 )
             },
+        )
+    if warmup_steps:
+        schedule = optax.join_schedules(
+            [optax.linear_schedule(0.0, lr, warmup_steps), schedule], [warmup_steps]
         )
     return optax.inject_hyperparams(optax.adamw, static_args=("mask",))(
         learning_rate=schedule,
