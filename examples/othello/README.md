@@ -297,6 +297,21 @@ The learning rate holds `--lr`, then drops 10x at 70% of the run and again at 90
 To read several budgets from one run, fork that same schedule: train the trunk at a constant
 learning rate to 70% of a budget, then fork the last 30%, with `--lr 1e-4 --lr-drops 0.667:1e-5`.
 
+A drop at a share of the budget comes too late in long runs: at 1e-3, 6x96 and 8x128 nets stop
+gaining after about 120-160 epochs whatever the budget. `--lr-plateau` drops when training
+stops improving instead: from `--lr` to 1e-4, then 1e-5 (or the rates it's given), each time the
+training loss (`loss`) improved by less than `--lr-plateau-threshold` (0.004) over the last
+`--lr-plateau-window` (40) epochs, by the slope of a least-squares line through them, once
+`--lr-plateau-min-epochs` (40) have been spent at the rate. `--epochs` caps the run, and
+`--lr-plateau-stop` ends it early once the last rate plateaus. Each drop is logged as `lr_drop`
+(the new rate), at the epoch that made it, with that epoch's `lr_plateau_improvement`. A run
+resumed with `--resume` carries on with the rule where it stopped. A fork starts again at
+its own `--lr`: to carry on at 1e-4, fork with `--lr 1e-4 --lr-plateau 1e-5`.
+
+```
+uv run examples/othello/train.py --epochs 600 --lr-plateau --save-state-every 10 --ckpt-dir runs/plateau
+```
+
 ### Training on Modal
 
 `modal_jobs.py` runs train.py on Modal's GPUs, several at once, and brings the results to the

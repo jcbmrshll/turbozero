@@ -13,7 +13,7 @@ import os
 import warnings
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import equinox as eqx
 import jax
@@ -36,6 +36,7 @@ from core.networks.utils import apply_nn
 from core.testing.tester import BaseTester
 from core.testing.two_player_tester import TwoPlayerTester
 from core.training.loss_fns import az_default_loss_fn
+from core.training.lr_plateau import LRPlateau, LRPlateauProgress
 from core.training.schedule import EvaluatorSchedule, describe
 from core.training.train import (
     CollectionStats,
@@ -43,6 +44,7 @@ from core.training.train import (
     TrainLoopOutput,
     checkpoint_epochs,
     extract_params,
+    lr_plateau_states,
     read_state_meta,
     state_epochs,
     state_path,
@@ -1071,6 +1073,186 @@ def test_saved_states_must_fit_the_trainer(env, tmp_path, method, kwargs, match)
             trainer.fork_state(path, jax.random.PRNGKey(0))
 
 
+# a learning rate that drops on plateaus
+
+
+# drops after at least 3 epochs at a rate, when its last 3 epochs' losses fell by less than 0.15
+PLATEAU = LRPlateau((1e-3, 1e-4, 1e-5), window=3, threshold=0.15, min_epochs=3)
+
+
+def plateau_trainer(env, ckpt_dir, rule=PLATEAU, **kwargs):
+    return make_trainer(
+        env,
+        ckpt_dir,
+        optimizer=optax.inject_hyperparams(optax.adam)(learning_rate=rule),
+        lr_plateau=rule,
+        **kwargs,
+    )
+
+
+def falling_loss(fake_loop, trainer):
+    """`fake_loop(trainer)`, its training reporting a loss of 1 / (epoch + 1): with `PLATEAU`,
+    the rate drops after epochs 5 and 8, and the last plateaus after epoch 11."""
+    calls = fake_loop(trainer)
+    train_steps = trainer.train_steps
+
+    def with_loss(key, collection_state, train_state, num_steps, epoch=0):
+        collection_state, train_state, _ = train_steps(
+            key, collection_state, train_state, num_steps, epoch
+        )
+        return collection_state, train_state, {"loss": jnp.float32(1 / (epoch + 1))}
+
+    trainer.train_steps = with_loss
+    return calls
+
+
+def rate_index(train_state):
+    (state,) = lr_plateau_states(train_state.opt_state)
+    return int(state.rate_index)
+
+
+def logged(monitor, name):
+    return {
+        epoch: float(metrics[name])
+        for epoch, metrics in monitor.by_epoch().items()
+        if name in metrics
+    }
+
+
+def test_the_learning_rate_drops_on_plateaus(env, tmp_path, fake_loop, capsys):
+    monitor = FakeMonitor()
+    trainer = plateau_trainer(env, tmp_path, monitor=monitor, keep_every=1)
+    falling_loss(fake_loop, trainer)
+
+    output = trainer.train_loop(seed=0, num_epochs=14)
+
+    assert logged(monitor, "lr_drop") == {
+        5: pytest.approx(1e-4),
+        8: pytest.approx(1e-5),
+    }
+    assert logged(monitor, "lr_last_plateau") == {11: pytest.approx(1e-5)}
+    # each epoch the window is full: it starts again at each rate
+    assert list(logged(monitor, "lr_plateau_improvement")) == [2, 3, 4, 5, 8, 11]
+    assert logged(monitor, "lr_plateau_improvement")[5] == pytest.approx(0.125)
+    # the epoch that drops it saves the new rate with its checkpoint, to train the next at
+    assert [
+        rate_index(trainer.load_train_state_from_checkpoint(str(tmp_path), e))
+        for e in (4, 5, 7, 8)
+    ] == [0, 1, 1, 2]
+    # without stop, the run goes on to its end
+    assert output.cur_epoch == 14 and rate_index(output.train_state) == 2
+    assert "the learning rate drops from 0.001 to 0.0001" in capsys.readouterr().out
+
+
+def test_the_run_stops_once_the_last_rate_plateaus(env, tmp_path, fake_loop):
+    monitor = FakeMonitor()
+    trainer = plateau_trainer(
+        env, tmp_path, rule=replace(PLATEAU, stop=True), monitor=monitor
+    )
+    falling_loss(fake_loop, trainer)
+
+    output = trainer.train_loop(seed=0, num_epochs=20)
+
+    assert output.cur_epoch == 12 and checkpoint_epochs(str(tmp_path))[-1] == 11
+    assert monitor.finished == ["finished"]
+
+
+def test_a_resumed_run_carries_on_with_the_rule(env, tmp_path, fake_loop):
+    straight_monitor = FakeMonitor()
+    straight = plateau_trainer(env, tmp_path / "straight", monitor=straight_monitor)
+    falling_loss(fake_loop, straight)
+    expected = straight.train_loop(seed=0, num_epochs=12)
+    stopped = plateau_trainer(env, tmp_path / "stopped", save_state_at=[4])
+    falling_loss(fake_loop, stopped)
+    stopped.train_loop(seed=0, num_epochs=4)
+
+    resumed_monitor = FakeMonitor()
+    resumed = plateau_trainer(env, tmp_path / "stopped", monitor=resumed_monitor)
+    falling_loss(fake_loop, resumed)
+    output = resumed.train_loop(seed=0, num_epochs=12, initial_state=resumed.resume())
+
+    # the state holds the epochs at the rate and the window's losses
+    assert read_state_meta(state_path(str(tmp_path / "stopped"), 4))["lr_plateau"] == {
+        "epochs": 4,
+        "losses": [float(jnp.float32(1 / e)) for e in (2, 3, 4)],
+    }
+    for name in ("lr_drop", "lr_last_plateau", "lr_plateau_improvement"):
+        assert logged(resumed_monitor, name) == {
+            e: v for e, v in logged(straight_monitor, name).items() if e >= 4
+        }
+    assert output.lr_plateau == expected.lr_plateau
+    assert rate_index(output.train_state) == rate_index(expected.train_state) == 2
+
+
+def test_a_fork_starts_the_rule_again_at_its_first_rate(env, tmp_path, fake_loop):
+    trunk = plateau_trainer(env, tmp_path / "trunk", save_state_at=[7])
+    falling_loss(fake_loop, trunk)
+    trunk.train_loop(seed=0, num_epochs=7)
+    monitor = FakeMonitor()
+    fork = plateau_trainer(env, tmp_path / "fork", monitor=monitor)
+    falling_loss(fake_loop, fork)
+
+    output = fork.train_loop(seed=0, num_epochs=9, fork_from=str(tmp_path / "trunk"))
+
+    # the trunk had dropped once, a fork drops as a run from scratch does
+    assert rate_index(trunk.load_train_state_from_checkpoint(trunk.ckpt_dir, 6)) == 1
+    assert logged(monitor, "lr_drop") == {
+        5: pytest.approx(1e-4),
+        8: pytest.approx(1e-5),
+    }
+    assert output.lr_plateau == LRPlateauProgress()
+
+
+def test_a_fork_switches_between_a_schedule_and_the_rule(env, tmp_path):
+    def schedule_trainer(ckpt_dir):
+        return make_trainer(
+            env,
+            ckpt_dir,
+            optimizer=optax.inject_hyperparams(optax.adam)(
+                learning_rate=optax.linear_schedule(1e-2, 0.0, 10)
+            ),
+        )
+
+    _, schedule_path = save_a_state(schedule_trainer(tmp_path / "schedule"))
+    _, plateau_path = save_a_state(plateau_trainer(env, tmp_path / "plateau"))
+
+    _, plateau_fork = plateau_trainer(env, tmp_path / "fork1").fork_state(
+        schedule_path, jax.random.PRNGKey(0)
+    )
+    schedule = schedule_trainer(tmp_path / "fork2")
+    _, schedule_fork = schedule.fork_state(plateau_path, jax.random.PRNGKey(0))
+
+    assert rate_index(plateau_fork) == 0
+    _, opt_state = schedule.optimizer.update(
+        schedule_fork.params, schedule_fork.opt_state, schedule_fork.params
+    )
+    assert float(cast(Any, opt_state).hyperparams["learning_rate"]) == pytest.approx(
+        1e-2
+    )
+
+
+def test_lr_plateau_needs_its_optimizer_and_saved_progress(env, tmp_path):
+    with pytest.raises(ValueError, match="pass lr_plateau with an optimizer"):
+        make_trainer(env, tmp_path, lr_plateau=PLATEAU)
+    with pytest.raises(ValueError, match="pass lr_plateau with an optimizer"):
+        make_trainer(
+            env,
+            tmp_path,
+            optimizer=optax.inject_hyperparams(optax.adam)(learning_rate=PLATEAU),
+        )
+    _, path = save_a_state(
+        make_trainer(
+            env,
+            tmp_path / "schedule",
+            optimizer=optax.inject_hyperparams(optax.adam)(
+                learning_rate=optax.linear_schedule(1e-3, 0.0, 10)
+            ),
+        )
+    )
+    with pytest.raises(ValueError, match="saved by a run without lr_plateau"):
+        plateau_trainer(env, tmp_path / "other").load_state(path)
+
+
 # self-play data collection
 
 
@@ -1671,13 +1853,15 @@ def test_grad_accum_updates_batch_norm_statistics_once_per_step(env, tmp_path):
 # replay buffer capacities no other test's arrays have, so the real trainer's replay buffers are
 # the live arrays of their shapes
 REAL_CAPACITY, REAL_TREE_CAPACITY = 37, 41
+REAL_PLATEAU = LRPlateau((1e-3, 1e-4), window=3, threshold=1e9, min_epochs=3)
 
 
 @pytest.fixture(scope="module")
 def real(env, tmp_path_factory):
     """A Trainer with AlphaZero self-play whose search grows from 2 to 3 iterations at epoch 2, a
     network with BatchNorm, gradient accumulation, tree positions with a data transform, a
-    TwoPlayerTester, and a (fake) monitor. It saves its state after 2 epochs."""
+    TwoPlayerTester, a learning rate that drops after epoch 2 (on a plateau, of any loss), and a
+    (fake) monitor. It saves its state after 2 epochs."""
     network = eqx.nn.make_with_state(NormMLP)(
         2, env.num_actions, key=jax.random.PRNGKey(0)
     )
@@ -1696,6 +1880,8 @@ def real(env, tmp_path_factory):
         data_transform_fns=[swap_actions],
         grad_accum_steps=2,
         save_state_at=[2],
+        optimizer=optax.inject_hyperparams(optax.adam)(learning_rate=REAL_PLATEAU),
+        lr_plateau=REAL_PLATEAU,
     )
 
 
@@ -1738,6 +1924,7 @@ def test_a_real_run_trains_and_reports_its_metrics(real_run):
             "tree_mean_visits",
             "tree_batch_fraction",
             "tree_buffer_samples",
+            "learning_rate",
         } <= real_run.logged[epoch].keys()
     assert [int(real_run.logged[e]["search_iterations"]) for e in range(4)] == [
         2,
@@ -1746,6 +1933,11 @@ def test_a_real_run_trains_and_reports_its_metrics(real_run):
         3,
     ]
     assert real_run.checkpoints == [2, 3] and real_run.states == [2]
+    # the epoch after the drop trains at the next rate
+    assert [float(real_run.logged[e]["learning_rate"]) for e in range(4)] == [
+        pytest.approx(r) for r in (1e-3, 1e-3, 1e-3, 1e-4)
+    ]
+    assert float(real_run.logged[2]["lr_drop"]) == pytest.approx(1e-4)
 
 
 def test_runs_describe_every_metric_a_real_run_logs(real_run):
