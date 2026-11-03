@@ -230,6 +230,7 @@ class Dataset:
                 rows, rest = coming.result()
                 coming = reader.submit(next_chunk, rest)
                 on_device = jax.tree.map(jnp.asarray, from_rows(rows))
+                del rows
                 order = rng.permutation(size)
                 for i in range(size // batch_size):
                     yield (
