@@ -14,8 +14,6 @@ from typing import Any
 
 SCRIPT = "examples/othello/train.py"
 STATE = r"state-(\d+)\.npz"
-# a run's kept positions (see core/memory/position_archive.py)
-POSITIONS = r"positions-(\d+)\.npy"
 # on-demand list prices, per second, read from modal.com/pricing on 2026-10-31
 GPU_PER_SECOND = {
     "CPU": 0.0,  # no GPU: for trying out the harness on a tiny net
@@ -138,6 +136,11 @@ def parse_step(text: str, home: str) -> Step:
             raise ValueError(
                 f"{name}: the Modal image has no Edax; the Elo league measures strength here"
             )
+    if flag(argv, "--save-positions-from") is not None:
+        raise ValueError(
+            "--save-positions-from is for local runs: bringing the positions here from the "
+            "bucket costs more in egress than they're worth"
+        )
     root = Path(home) / ".cache" / "turbozero"
     for path in (ckpt_dir, log, flag(argv, "--init-from"), flag(argv, "--engine-set")):
         if path is not None and not Path(path).is_relative_to(root):

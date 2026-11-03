@@ -22,9 +22,6 @@ from pathlib import Path
 from typing import Any
 
 from modal_spec import (
-    POSITIONS as POSITIONS_PATTERN,
-)
-from modal_spec import (
     STATE as STATE_PATTERN,
 )
 from modal_spec import (
@@ -39,7 +36,6 @@ from modal_spec import (
 from modal_store import GcsStore, Store, get_json, put_json
 
 STATE = re.compile(STATE_PATTERN)
-POSITIONS = re.compile(POSITIONS_PATTERN)
 SEAGLASS_PORT = 8008
 # how long a step may wait for what's uploading to finish, once it's over or interrupted
 FLUSH_RETRIES = 5
@@ -149,30 +145,14 @@ class Mirror:
                 self._send_resume_state(index, path, sig)
             elif self._send(key, path, sig):
                 self.manifest[key] = [stat.st_size, stat.st_mtime_ns]
-        # what train.py deleted is gone from a local run too; a saved state it asked for and kept
-        # positions stay, sent on and needed on no disk here after a restart
+        # what train.py deleted is gone from a local run too; a saved state it asked for stays,
+        # sent on and needed on no disk here after a restart
         live = {key for _, key, _ in self._files(step)}
         prefix = self.job.key_of(step.ckpt_dir) + "/"
         for key in list(self.manifest):
             name = key.rsplit("/", 1)[-1]
-            if (
-                key.startswith(prefix)
-                and key not in live
-                and not STATE.fullmatch(name)
-                and not POSITIONS.fullmatch(name)
-            ):
+            if key.startswith(prefix) and key not in live and not STATE.fullmatch(name):
                 del self.manifest[key]
-
-    def forget_positions_from(self, step: Step, epoch: int) -> None:
-        """A step goes back to `epoch`: the positions it kept from there on aren't its any more,
-        as it writes them again (train.py deletes them on a local run). They stay in the bucket
-        until they're replaced."""
-        prefix = self.job.key_of(step.ckpt_dir) + "/"
-        with self.lock:
-            for key in list(self.manifest):
-                match = POSITIONS.fullmatch(key.removeprefix(prefix))
-                if key.startswith(prefix) and match and int(match.group(1)) >= epoch:
-                    del self.manifest[key]
 
     def _send_resume_state(self, index: int, path: str, sig: tuple[int, int]) -> None:
         key = job_key(self.name, "resume", str(index), "state.npz")
@@ -209,12 +189,9 @@ def restore_seaglass(store: Store, name: str, root: str) -> None:
         path.write_bytes(data[: data.rfind(b"\n") + 1])
 
 
-def restore_step(
-    store: Store, job: Job, name: str, index: int, step: Step
-) -> int | None:
-    """A step's files as the bucket has them, its newest state among them, but for kept positions,
-    which it doesn't read and can be many GB. The state's epoch, if there's one to continue from:
-    otherwise the step starts over, on what it sent before."""
+def restore_step(store: Store, job: Job, name: str, index: int, step: Step) -> bool:
+    """A step's files as the bucket has them, its newest state among them. Whether there's a
+    state to continue from: otherwise the step starts over, on what it sent before."""
     prefix = job.key_of(step.ckpt_dir) + "/"
     states: dict[int, str] = {}
     for key in store.sizes(prefix):
@@ -227,20 +204,16 @@ def restore_step(
     if marker:
         states[marker["epoch"]] = implicit_key
     if not states:
-        return None
+        return False
     epoch = max(states)
     store.get_file(states[epoch], os.path.join(step.ckpt_dir, f"state-{epoch}.npz"))
     manifest = get_json(store, job_key(name, "manifest.json")) or {}
     for key in manifest:
         filename = key.removeprefix(prefix)
-        if (
-            key.startswith(prefix)
-            and not STATE.fullmatch(filename)
-            and not POSITIONS.fullmatch(filename)
-        ):
+        if key.startswith(prefix) and not STATE.fullmatch(filename):
             store.get_file(key, os.path.join(step.ckpt_dir, filename))
     store.get_file(job.key_of(step.log), step.log)
-    return epoch
+    return True
 
 
 def ensure_input(store: Store, job: Job, path: str | None) -> None:
@@ -392,9 +365,7 @@ class Runner:
         os.makedirs(os.path.dirname(step.log), exist_ok=True)
         ensure_input(self.store, job, flag(step.argv, "--init-from"))
         ensure_input(self.store, job, flag(step.argv, "--engine-set"))
-        resumed_at = restore_step(self.store, job, self.name, index, step)
-        resume = resumed_at is not None
-        self.mirror.forget_positions_from(step, resumed_at or 0)
+        resume = restore_step(self.store, job, self.name, index, step)
         if not resume:
             self._crash_runs(done.get("runs", []))
             done["runs"] = []
