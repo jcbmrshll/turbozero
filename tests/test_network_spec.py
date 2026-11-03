@@ -80,3 +80,19 @@ def test_bn_momentum_reaches_every_batch_norm():
     ]
     assert len(norms) == 8
     assert {bn.momentum for bn in norms} == {0.9}
+
+
+@pytest.mark.parametrize("norm", ["layer", "group", "rms", "fixed", "ws"])
+def test_a_spec_names_a_batch_independent_norm_with_no_state(norm):
+    config = network_config(f"resnet:2x8,heads=pooled,norm={norm},norm_groups=4", 65)
+    network, state = make_network(config, (8, 8, 2), jax.random.PRNGKey(0))
+
+    assert isinstance(config, AZResnetConfig)
+    assert config.norm == norm and config.norm_groups == 4
+    assert not any(
+        isinstance(leaf, eqx.nn.BatchNorm)
+        for leaf in jax.tree.leaves(
+            network, is_leaf=lambda x: isinstance(x, eqx.nn.BatchNorm)
+        )
+    )
+    assert jax.tree.leaves(state) == []
