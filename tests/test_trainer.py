@@ -12,6 +12,7 @@ import itertools
 import os
 import warnings
 from dataclasses import dataclass, replace
+from functools import partial
 from types import SimpleNamespace
 from typing import cast
 
@@ -35,7 +36,7 @@ from core.networks.azresnet import batch_norm
 from core.networks.utils import apply_nn
 from core.testing.tester import BaseTester
 from core.testing.two_player_tester import TwoPlayerTester
-from core.training.loss_fns import az_default_loss_fn
+from core.training.loss_fns import anchored_loss_fn, az_default_loss_fn
 from core.training.schedule import EvaluatorSchedule, describe
 from core.training.train import (
     CollectionStats,
@@ -170,7 +171,7 @@ def make_trainer(env, ckpt_dir, evaluator=None, network=None, **kwargs):
     return Trainer(
         nn=net,
         nn_state=nn_state,
-        loss_fn=az_default_loss_fn,
+        loss_fn=kwargs.pop("loss_fn", az_default_loss_fn),
         evaluator=evaluator if evaluator is not None else TaggedEvaluator(0.0),
         env_step_fn=env.step_fn,
         env_init_fn=env.init_fn,
@@ -1012,6 +1013,24 @@ def test_a_run_can_start_with_positions_in_its_buffers(env, tmp_path, fake_loop)
             initial_state=output,
             initial_positions=positions_like(trainer, 16),
         )
+
+
+def test_training_with_an_anchor_logs_its_distance(env, tmp_path):
+    def uniform(obs, legal):
+        return legal / legal.sum(-1, keepdims=True), jnp.zeros(legal.shape[0])
+
+    monitor = FakeMonitor()
+    trainer = make_trainer(
+        env,
+        tmp_path,
+        monitor=monitor,
+        loss_fn=partial(
+            anchored_loss_fn, reference=uniform, policy_weight=0.5, value_weight=0.5
+        ),
+    )
+    trainer.train_loop(seed=0, num_epochs=1)
+    logged = {k for _, metrics in monitor.logged for k in metrics}
+    assert {"anchor_policy_kl", "anchor_value_mse", "policy_loss"} <= logged
 
 
 def test_fork_without_replay_buffers(env, tmp_path):

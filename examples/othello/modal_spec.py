@@ -33,7 +33,13 @@ GIB_PER_SECOND = 0.00000222
 # in-run games need Edax, which the image doesn't build
 UNSUPPORTED = ("--vs-engine-every", "--vs-engine-last")
 # flags naming files of this machine a step reads, which a job takes to the bucket
-INPUTS = ("--init-from", "--init-weights", "--exclude-openings", "--engine-set")
+INPUTS = (
+    "--init-from",
+    "--init-weights",
+    "--anchor",
+    "--exclude-openings",
+    "--engine-set",
+)
 
 
 def flag(argv: list[str], name: str) -> str | None:

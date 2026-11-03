@@ -103,3 +103,31 @@ def test_lr_warmup_starts_the_learning_rate_at_zero(monkeypatch):
     assert rates[128] == pytest.approx(1e-3, rel=1e-6)
     with pytest.raises(SystemExit):
         run_main(monkeypatch, "--epochs", "4", "--lr-warmup", "4")
+
+
+def test_anchor_blends_a_frozen_networks_outputs_into_the_targets(
+    monkeypatch, tmp_path
+):
+    game = load_example("othello", "game")[0]
+    network, nn_state = game.make_network("resnet:1x4", seed=5)
+    path = tmp_path / "anchor.eqx"
+    eqx.tree_serialise_leaves(
+        path, (eqx.filter(network, eqx.is_inexact_array), nn_state)
+    )
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, "--anchor", str(path), "--anchor-policy", "0.25")
+    loss_fn = built.value.kwargs["loss_fn"]
+    assert loss_fn.func.__name__ == "anchored_loss_fn"
+    assert loss_fn.keywords["policy_weight"] == 0.25
+    assert loss_fn.keywords["value_weight"] == 0.5
+    reference = loss_fn.keywords["reference"]
+    assert str(path) in str(reference)
+    # the reference's policy is over the legal actions only
+    obs = jax.numpy.zeros((3, 8, 8, 2), bool)
+    legal = jax.numpy.zeros((3, 65), bool).at[:, :2].set(True)
+    policy, value = reference(obs, legal)
+    np.testing.assert_allclose(policy.sum(-1), 1, rtol=1e-6)
+    assert (policy[:, 2:] == 0).all() and value.shape == (3,)
+    for bad in (["--anchor-value", "1.5"], ["--value-target-q", "0.5"]):
+        with pytest.raises(SystemExit):
+            run_main(monkeypatch, "--anchor", str(path), *bad)

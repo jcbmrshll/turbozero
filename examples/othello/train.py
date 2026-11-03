@@ -61,7 +61,9 @@ import warnings
 from functools import partial
 from pathlib import Path
 
+import equinox as eqx
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pgx
 from engine_set import DEFAULT_PATH as DEFAULT_ENGINE_SET
@@ -76,6 +78,7 @@ from game import (
     episode_metrics,
     export_last,
     greedy_eval,
+    load_checkpoint,
     load_weights,
     make_network,
     make_optimizer,
@@ -99,11 +102,12 @@ from core.evaluators.random_evaluator import RandomEvaluator
 from core.memory.replay_memory import BaseExperience, EpisodeReplayBuffer
 from core.monitoring import DEFAULT_URL, Monitor
 from core.monitoring.episodes import pgx_two_player_episode
+from core.networks.utils import apply_nn
 from core.testing.ladder import LadderTester, Rung
 from core.testing.scored_positions import ScoredPositionsTester
 from core.testing.tester import BaseTester
 from core.training.exploration import Exploration
-from core.training.loss_fns import az_default_loss_fn
+from core.training.loss_fns import anchored_loss_fn, az_default_loss_fn
 from core.training.schedule import EvaluatorSchedule, parse_schedule
 from core.training.train import Trainer
 from core.training.tree_positions import TreePositions
@@ -153,6 +157,27 @@ def positive_schedule(text: str) -> list[tuple[int, int]]:
     if any(value < 1 for _, value in schedule):
         raise argparse.ArgumentTypeError(f"values must be positive, got {text!r}")
     return schedule
+
+
+class FrozenReference:
+    """A checkpoint's network, frozen in inference mode, as `anchored_loss_fn`'s reference: its
+    policy over the legal actions and its value of each position of a batch."""
+
+    def __init__(self, path: str, net: str, dtype: str):
+        network, (params, state) = load_checkpoint(path, net, dtype)
+        self.network = eqx.nn.inference_mode(eqx.combine(params, network))
+        self.state = state
+        self.description = f"{path} ({net})"
+
+    def __call__(self, obs: jax.Array, legal: jax.Array) -> tuple[jax.Array, jax.Array]:
+        (logits, value), _ = apply_nn(self.network, self.state, obs)
+        logits = jnp.where(
+            legal, logits.astype(jnp.float32), jnp.finfo(jnp.float32).min
+        )
+        return jax.nn.softmax(logits, axis=-1), value.reshape(-1).astype(jnp.float32)
+
+    def __str__(self) -> str:
+        return self.description
 
 
 def seed_positions(corpus_dir: str, per_env: int, seed: int) -> BaseExperience:
@@ -571,6 +596,31 @@ def main():
         "outcome. Self-play replaces them as it plays. Not with --init-from or --resume",
     )
     parser.add_argument(
+        "--anchor",
+        default=None,
+        metavar="CHECKPOINT",
+        help="anchor training to a frozen network (e.g. the one --init-weights starts from, or "
+        "its teacher): blend its policy and value into every training target, --anchor-policy "
+        "and --anchor-value of them (see core.training.loss_fns.anchored_loss_fn)",
+    )
+    parser.add_argument(
+        "--anchor-net",
+        default=None,
+        help="--anchor's network, as --net names it (default: --net)",
+    )
+    parser.add_argument(
+        "--anchor-policy",
+        type=float,
+        default=0.5,
+        help="with --anchor, the share of the policy target that is the anchor's policy",
+    )
+    parser.add_argument(
+        "--anchor-value",
+        type=float,
+        default=0.5,
+        help="with --anchor, the share of the value target that is the anchor's value",
+    )
+    parser.add_argument(
         "--exclude-openings",
         default=None,
         metavar="PATH",
@@ -607,6 +657,14 @@ def main():
         parser.error("--resume needs the run's --ckpt-dir")
     if args.init_without_buffers and args.init_from is None:
         parser.error("--init-without-buffers needs --init-from")
+    if args.anchor and not (
+        0 <= args.anchor_policy <= 1 and 0 <= args.anchor_value <= 1
+    ):
+        parser.error("--anchor-policy and --anchor-value are shares, from 0 to 1")
+    if args.anchor and args.anchor_value and args.value_target_q:
+        parser.error(
+            "anchor the value (--anchor-value) or mix in the search's, not both"
+        )
     if args.seed_buffer and (args.init_from or args.resume):
         parser.error("--seed-buffer is for a run that starts with empty buffers")
     if not 0 <= args.lr_warmup < args.epochs:
@@ -783,7 +841,17 @@ def main():
         grad_accum_steps=args.grad_accum,
         nn=network,
         nn_state=network_state,
-        loss_fn=partial(az_default_loss_fn, value_target_q=args.value_target_q),
+        loss_fn=partial(
+            anchored_loss_fn,
+            reference=FrozenReference(
+                args.anchor, args.anchor_net or args.net, args.inference_dtype
+            ),
+            policy_weight=args.anchor_policy,
+            value_weight=args.anchor_value,
+            value_target_q=args.value_target_q,
+        )
+        if args.anchor
+        else partial(az_default_loss_fn, value_target_q=args.value_target_q),
         # decays from --lr to --lr-final over the run
         optimizer=make_optimizer(
             args.epochs * args.train_steps,
