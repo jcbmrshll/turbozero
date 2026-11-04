@@ -129,6 +129,16 @@ from the AlphaZero paper with 6 blocks of 128 channels. Its variants
 - `block=bottleneck`: KataGo's nested bottleneck blocks, a 1x1 convolution down to
   half the width, a basic block (`bottleneck_inner` of them) and a 1x1 convolution
   back up, which cost under a third of a basic block.
+- `norm=`: what follows each convolution. `batch`, BatchNorm, is the default. The others
+  treat each position on its own, so the network has no state and training and play
+  compute the same function: `layer`, `group` (`norm_groups`) and `rms` normalize over
+  the channels and the board; `fixed` (KataGo's fixed variance initialization) and `ws`
+  (weight standardization) don't normalize, but scale each convolution to unit variance
+  at initialization. `fixed` and `ws` fold into the convolutions as BatchNorm does, so
+  play costs the same, and train steps are about 20% faster. `layer`, `group` and `rms`
+  cost an extra pass: self-play is 16% (`rms`) to 30% slower. At 4x64, 68 minutes, in
+  direct games against BatchNorm (one seed each, BatchNorm reruns about 16 Elo apart):
+  `ws` -49 ±12 at 128 visits and -39 ±14 at 1000; `fixed` and `rms` about -110.
 
 The default, `resnet:6x128,pool_every=2,heads=pooled` (`DEFAULT_NET` in `game.py`), has
 both kinds of global pooling. Trained for 50 epochs at 64 sims a move, then searching
