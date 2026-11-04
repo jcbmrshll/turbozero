@@ -491,6 +491,7 @@ class Trainer:
         save_state_at: Collection[int] = (),
         save_state_every: int | None = None,
         lr_plateau: LRPlateau | None = None,
+        lr_plateau_metric: str = "loss",
         extra_config: dict | None = None,
     ):
         """Initializes a Trainer.
@@ -581,6 +582,11 @@ class Trainer:
                 whose loss made it drop; and `lr_last_plateau`, the last rate, when that plateaus.
                 A continued run carries on with the rule's progress (see `save_state`); a fork
                 starts again from the first rate (see `restart_schedules`).
+            lr_plateau_metric: with `lr_plateau`, what the rule watches, lower being better:
+                "loss", the epoch's training loss, or the name of a metric a tester logs every
+                epoch (e.g. a `ScoredPositionsTester`'s "engine_value_mse", on fixed positions
+                whose targets don't move as the network improves). For a tester's metric the rule
+                is applied after the epoch's tests, and an epoch that didn't log it is an error.
             extra_config: (optional) extra config to record with the monitor's run
         """
         # environment
@@ -609,6 +615,7 @@ class Trainer:
                 "pass lr_plateau with an optimizer whose learning rate it is, and only then"
             )
         self.lr_plateau = lr_plateau
+        self.lr_plateau_metric = lr_plateau_metric
         self.extract_model_params_fn = extract_model_params_fn
         # data collection
         self.batch_size = batch_size
@@ -722,7 +729,10 @@ class Trainer:
             "loss_fn": describe_fn(self.loss_fn),
             "optimizer": self.optimizer_config or None,
             **(
-                {"lr_plateau": self.lr_plateau.get_config()}
+                {
+                    "lr_plateau": self.lr_plateau.get_config(),
+                    "lr_plateau_metric": self.lr_plateau_metric,
+                }
                 if self.lr_plateau is not None
                 else {}
             ),
@@ -2106,9 +2116,9 @@ class Trainer:
         epoch: int,
         train_state: TrainState,
         progress: LRPlateauProgress,
-        loss: jax.Array | float,
+        value: jax.Array | float,
     ) -> tuple[TrainState, LRPlateauProgress, dict, bool]:
-        """Applies `lr_plateau`'s rule after `epoch`, whose training loss was `loss`.
+        """Applies `lr_plateau`'s rule after `epoch`, whose `lr_plateau_metric` was `value`.
 
         Returns:
             Tuple[TrainState, LRPlateauProgress, dict, bool]: the train state, at the rate to train
@@ -2118,15 +2128,20 @@ class Trainer:
         rule = self.lr_plateau
         assert rule is not None
         index = int(lr_plateau_states(train_state.opt_state)[0].rate_index)
-        step = rule.after_epoch(progress, index, float(loss))
+        step = rule.after_epoch(progress, index, float(value))
         metrics = {}
         if step.improvement is not None:
             metrics["lr_plateau_improvement"] = step.improvement
         if not step.plateaued:
             return train_state, step.progress, metrics, False
         rate = rule.rates[index]
+        watched = (
+            "the training loss"
+            if self.lr_plateau_metric == "loss"
+            else self.lr_plateau_metric
+        )
         plateau = (
-            f"epoch {epoch}: the training loss improved {step.improvement:.4f} over the "
+            f"epoch {epoch}: {watched} improved {step.improvement:.4f} over the "
             f"last {rule.window} epochs, under {rule.threshold:g}"
         )
         if step.index == index:
@@ -2355,7 +2370,8 @@ class Trainer:
             )
             params = self.extract_model_params_fn(train_state)
             stop = False
-            if self.lr_plateau is not None and lr_progress is not None:
+            watch_loss = self.lr_plateau_metric == "loss"
+            if self.lr_plateau is not None and lr_progress is not None and watch_loss:
                 train_state, lr_progress, lr_metrics, stop = self.follow_lr_plateau(
                     cur_epoch, train_state, lr_progress, metrics["loss"]
                 )
@@ -2364,6 +2380,7 @@ class Trainer:
             self.log_metrics({**metrics, **collection_metrics}, cur_epoch)
 
             # test
+            tested: dict = {}
             if cur_epoch % eval_every == 0:
                 for i, test_state in enumerate(tester_states):
                     run_key, key = jax.random.split(key)
@@ -2388,12 +2405,29 @@ class Trainer:
                     if metrics:
                         metrics = {k: v.mean() for k, v in metrics.items()}
                         self.log_metrics(metrics, cur_epoch)
+                        tested.update(metrics)
                     # the run's views draw the episode, so the training loop never does
                     if episode is not None and self.monitor is not None:
                         self.monitor.log(
                             cur_epoch, {f"{self.testers[i].name}_game": episode}
                         )
                     tester_states[i] = new_test_state
+            # a tester's metric: the rule follows it once the epoch's tests have run
+            if (
+                self.lr_plateau is not None
+                and lr_progress is not None
+                and not watch_loss
+            ):
+                if self.lr_plateau_metric not in tested:
+                    raise ValueError(
+                        f"lr_plateau_metric {self.lr_plateau_metric!r} wasn't logged at epoch "
+                        f"{cur_epoch}: a tester must log it every epoch"
+                    )
+                train_state, lr_progress, lr_metrics, stop = self.follow_lr_plateau(
+                    cur_epoch, train_state, lr_progress, tested[self.lr_plateau_metric]
+                )
+                if lr_metrics:
+                    self.log_metrics(lr_metrics, cur_epoch)
             # save checkpoint
             self.set_activity(f"epoch {cur_epoch}: saving checkpoint")
             self.save_checkpoint(train_state, cur_epoch)

@@ -1145,6 +1145,47 @@ def test_the_learning_rate_drops_on_plateaus(env, tmp_path, fake_loop, capsys):
     assert "the learning rate drops from 0.001 to 0.0001" in capsys.readouterr().out
 
 
+class ProbeTester(FakeTester):
+    """Logs `probe_error`, 1 / (epoch + 1), every epoch: a metric on fixed positions, as a
+    `ScoredPositionsTester`'s are."""
+
+    def run(self, *args, epoch_num=0, **kwargs):  # pyright: ignore[reportIncompatibleMethodOverride]
+        return kwargs["state"], {"probe_error": jnp.array([1 / (epoch_num + 1)])}, None
+
+
+def test_the_rule_can_follow_a_testers_metric(env, tmp_path, fake_loop, capsys):
+    monitor = FakeMonitor()
+    trainer = plateau_trainer(
+        env,
+        tmp_path,
+        monitor=monitor,
+        testers=[ProbeTester()],
+        lr_plateau_metric="probe_error",
+    )
+    # training reports a flat loss of 0, which on its own would drop the rate at the first chance
+    fake_loop(trainer)
+
+    trainer.train_loop(seed=0, num_epochs=14)
+
+    # the drops follow the tester's falling metric, as test_the_learning_rate_drops_on_plateaus's
+    # follow the falling loss
+    assert logged(monitor, "lr_drop") == {
+        5: pytest.approx(1e-4),
+        8: pytest.approx(1e-5),
+    }
+    assert logged(monitor, "lr_last_plateau") == {11: pytest.approx(1e-5)}
+    assert "probe_error improved" in capsys.readouterr().out
+
+
+def test_a_watched_metric_no_tester_logs_is_an_error(env, tmp_path, fake_loop):
+    trainer = plateau_trainer(
+        env, tmp_path, testers=[FakeTester()], lr_plateau_metric="probe_error"
+    )
+    fake_loop(trainer)
+    with pytest.raises(ValueError, match="'probe_error' wasn't logged at epoch 0"):
+        trainer.train_loop(seed=0, num_epochs=2)
+
+
 def test_the_run_stops_once_the_last_rate_plateaus(env, tmp_path, fake_loop):
     monitor = FakeMonitor()
     trainer = plateau_trainer(
