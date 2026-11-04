@@ -143,6 +143,8 @@ def test_freeze_batchnorm_trains_with_batchnorm_in_inference_mode(monkeypatch):
     for bad in (["--train-dtype", "float32"], ["--remat"]):
         with pytest.raises(SystemExit):
             run_main(monkeypatch, "--freeze-batchnorm", *bad)
+
+
 def test_lr_plateau_steps_from_lr_to_its_rates(monkeypatch):
     with pytest.raises(BuiltTrainer) as built:
         run_main(
