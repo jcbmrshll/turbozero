@@ -46,6 +46,8 @@ class MCTS(Evaluator):
         min_iterations: int = 0,
         policy_target: PolicyTarget | None = None,
         traversal_steps: int = 1,
+        snapshot_iterations: int | None = None,
+        play_snapshot: bool = False,
     ):
         """Initializes an MCTS evaluator.
 
@@ -81,6 +83,12 @@ class MCTS(Evaluator):
                 the same whatever the number; but on GPU each check waits on the host, and under
                 vmap a traversal goes on until the deepest in the batch is done: more steps a check
                 wait less and compute more, and which is fastest depends on the trees' depth
+            snapshot_iterations: (optional) keep the root's children's visits after the search's
+                first `snapshot_iterations` iterations (`MCTSTree.root_snapshot_n`), for a shallower
+                search's policy target (`VisitCounts(snapshot=True)`) or move (`play_snapshot`) from
+                the same search. 1 to `num_iterations`; not with `count_reused_visits`
+            play_snapshot: (optional) choose the move from the snapshot's visits rather than the
+                full search's (default: False)
         """
         if traversal_steps < 1:
             raise ValueError(
@@ -91,7 +99,25 @@ class MCTS(Evaluator):
                 f"min_iterations must be 0 to num_iterations ({num_iterations}), "
                 f"got {min_iterations}"
             )
+        if snapshot_iterations is not None:
+            if not 1 <= snapshot_iterations <= num_iterations:
+                raise ValueError(
+                    f"snapshot_iterations must be 1 to num_iterations ({num_iterations}), "
+                    f"got {snapshot_iterations}"
+                )
+            if count_reused_visits:
+                raise ValueError(
+                    "snapshot_iterations can't go with count_reused_visits: a search can "
+                    "stop before its snapshot"
+                )
+        wants_snapshot = play_snapshot or getattr(policy_target, "snapshot", False)
+        if wants_snapshot and snapshot_iterations is None:
+            raise ValueError(
+                "play_snapshot and VisitCounts(snapshot=True) need snapshot_iterations"
+            )
         super().__init__(discount=discount)
+        self.snapshot_iterations = snapshot_iterations
+        self.play_snapshot = play_snapshot
         self.count_reused_visits = count_reused_visits
         self.min_iterations = min_iterations
         self.eval_fn = eval_fn
@@ -118,6 +144,8 @@ class MCTS(Evaluator):
             "count_reused_visits": self.count_reused_visits,
             "min_iterations": self.min_iterations,
             "policy_target_config": self.policy_target.get_config(),
+            "snapshot_iterations": self.snapshot_iterations,
+            "play_snapshot": self.play_snapshot,
             "traversal_steps": self.traversal_steps,
         }
 
@@ -163,7 +191,7 @@ class MCTS(Evaluator):
         ) -> tuple[MCTSTree, None]:
             i, k = i_key
             if not self.count_reused_visits:
-                return iterate(k, state), None
+                return self.take_snapshot(iterate(k, state), i + 1), None
             # after the root's evaluation and `i` iterations, as `search_cycle` counts them
             return iterate(k, state, write=~self.search_done(state, i + 1)), None
 
@@ -172,9 +200,35 @@ class MCTS(Evaluator):
         )
         # sample action based on root visit counts
         # (also get normalized policy weights for training purposes)
-        action, policy_weights = self.sample_root_action(sample_key, eval_state)
+        action, policy_weights, play_weights = self.sample_root_action(
+            sample_key, eval_state
+        )
         return MCTSOutput(
-            eval_state=eval_state, action=action, policy_weights=policy_weights
+            eval_state=eval_state,
+            action=action,
+            policy_weights=policy_weights,
+            play_weights=play_weights,
+        )
+
+    def take_snapshot(self, tree: MCTSTree, iterations: ArrayLike) -> MCTSTree:
+        """With `snapshot_iterations`, the tree with the root's children's visits kept in
+        `root_snapshot_n` once the search has made that many iterations.
+
+        Args:
+            tree: the tree after `iterations` iterations of its search
+            iterations: how many
+
+        Returns:
+            MCTSTree: the tree
+        """
+        if self.snapshot_iterations is None:
+            return tree
+        n = tree.get_child_data("n", tree.ROOT_INDEX)
+        return replace(
+            tree,
+            root_snapshot_n=jnp.where(
+                iterations == self.snapshot_iterations, n, tree.root_snapshot_n
+            ),
         )
 
     def search_cycles(self) -> int:
@@ -271,7 +325,7 @@ class MCTS(Evaluator):
         state = self.expand(
             expand_key, state, leaf, policy_logits, value, write=~at_root
         )
-        return self.expand_root(
+        state = self.expand_root(
             root_key,
             state,
             env_state,
@@ -280,6 +334,8 @@ class MCTS(Evaluator):
             value,
             write=at_root,
         )
+        # cycle 0 is the root's evaluation: after cycle `c`, `c` iterations
+        return self.take_snapshot(state, cycle)
 
     def search_output(
         self,
@@ -298,9 +354,14 @@ class MCTS(Evaluator):
             MCTSOutput: as `evaluate`'s
         """
         _, _, sample_key = jax.random.split(key, 3)
-        action, policy_weights = self.sample_root_action(sample_key, state)
+        action, policy_weights, play_weights = self.sample_root_action(
+            sample_key, state
+        )
         return MCTSOutput(
-            eval_state=state, action=action, policy_weights=policy_weights
+            eval_state=state,
+            action=action,
+            policy_weights=policy_weights,
+            play_weights=play_weights,
         )
 
     def get_value(self, state: MCTSTree) -> jax.Array:
@@ -639,18 +700,20 @@ class MCTS(Evaluator):
 
     def sample_root_action(
         self, key: jax.Array, tree: MCTSTree
-    ) -> tuple[jax.Array, jax.Array]:
-        """Sample an action based on the root visit counts.
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Sample an action based on the root visit counts (the snapshot's, with
+        `play_snapshot`).
 
         Args:
             key: rng
             tree: MCTSTree to evaluate
 
         Returns:
-            Tuple[jax.Array, jax.Array]: sampled action, the policy target (see `policy_target`)
+            Tuple[jax.Array, jax.Array, jax.Array]: sampled action, the policy target (see
+                `policy_target`), the visit distribution it was sampled from (before temperature)
         """
         target = self.policy_target(tree, self.discount)
-        policy_weights = VisitCounts()(tree, self.discount)
+        policy_weights = VisitCounts(snapshot=self.play_snapshot)(tree, self.discount)
 
         # zero temperature == argmax
         if self.temperature == 0:
@@ -659,7 +722,7 @@ class MCTS(Evaluator):
             action = jnp.argmax(
                 jnp.where(policy_weights == policy_weights.max(), noise, -1.0)
             )
-            return action, target
+            return action, target, policy_weights
 
         # apply temperature
         policy_weights_t = policy_weights ** (1 / self.temperature)
@@ -667,7 +730,7 @@ class MCTS(Evaluator):
         policy_weights_t /= policy_weights_t.sum()
         # sample action
         action = jax.random.choice(key, policy_weights_t.shape[-1], p=policy_weights_t)
-        return action, target
+        return action, target, policy_weights
 
     @staticmethod
     def visit_node(

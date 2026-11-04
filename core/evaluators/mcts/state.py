@@ -50,11 +50,15 @@ class MCTSTree(Tree[MCTSNode]):
         root_value: () the network's value of the root
         root_noise: (F) the noise the root's prior takes (e.g. AlphaZero's Dirichlet noise), drawn
             when the search starts (see `MCTS.start_search`)
+        root_snapshot_n: (F) the root's children's visits after the search's first
+            `MCTS.snapshot_iterations` iterations, those of a subtree it reused included; zeros
+            without a snapshot
     """
 
     root_logits: jax.Array
     root_value: jax.Array
     root_noise: jax.Array
+    root_snapshot_n: jax.Array
 
 
 def init_mcts_tree(
@@ -70,6 +74,7 @@ def init_mcts_tree(
         root_logits=jnp.zeros((branching_factor,), dtype=jnp.float32),
         root_value=jnp.array(0.0, dtype=jnp.float32),
         root_noise=jnp.zeros((branching_factor,), dtype=jnp.float32),
+        root_snapshot_n=jnp.zeros((branching_factor,), dtype=tree.data.n.dtype),
     )
 
 
@@ -152,11 +157,14 @@ class MCTSOutput(EvalOutput):
 
     Attributes:
         eval_state: The updated internal state of the Evaluator.
-        policy_weights: The policy weights assigned to each action.
+        policy_weights: The policy target (see `MCTS.policy_target`).
+        play_weights: The distribution `action` was drawn from, before temperature: the root's
+            visit distribution, or its snapshot's (see `MCTS.play_snapshot`).
     """
 
     eval_state: MCTSTree
     policy_weights: jax.Array
+    play_weights: jax.Array
 
 
 @jax.tree_util.register_dataclass

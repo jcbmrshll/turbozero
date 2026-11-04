@@ -19,8 +19,9 @@ class Exploration:
 
     Attributes:
         num_sampling_moves: play the evaluator's move for the first `num_sampling_moves`
-            moves of an episode, then the action with the highest policy weight (ties broken
-            at random). With an MCTS evaluator at temperature 1 this is AlphaZero's schedule
+            moves of an episode, then the action with the highest weight in the distribution the
+            move was drawn from (an MCTS search's `play_weights`, else `policy_weights`; ties
+            broken at random). With an MCTS evaluator at temperature 1 this is AlphaZero's schedule
             (`num_sampling_moves = 30` in its pseudocode): sample in proportion to visit counts
             early, play the most-visited move after.
             It explores *less* than sampling every move, trading late-game variety for value
@@ -58,7 +59,10 @@ class Exploration:
         mask = metadata.action_mask
         action = output.action
         if self.num_sampling_moves is not None:
-            weights = jnp.where(mask, output.policy_weights, -jnp.inf)
+            # the distribution the move was drawn from (an MCTS search's visits, see
+            # `MCTSOutput.play_weights`), which needn't be the policy target
+            played = getattr(output, "play_weights", output.policy_weights)
+            weights = jnp.where(mask, played, -jnp.inf)
             best = mask & (weights == weights.max())
             greedy = jax.random.choice(greedy_key, mask.shape[-1], p=best / best.sum())
             action = jnp.where(metadata.step < self.num_sampling_moves, action, greedy)

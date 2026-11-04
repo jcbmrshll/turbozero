@@ -125,3 +125,17 @@ def test_the_visit_counts_target():
     tree = root_tree(np.log(PRIOR), RAW_VALUE, VISITS, Q)
 
     np.testing.assert_allclose(VisitCounts()(tree, -1.0), VISITS / 4)
+
+
+def test_visit_counts_from_the_snapshot_read_the_snapshots_visits():
+    tree = replace(
+        init_mcts_tree(4, 3, node(0, 0.0)),
+        root_snapshot_n=jnp.array([0, 3, 1], dtype=jnp.int32),
+    )
+    np.testing.assert_allclose(
+        VisitCounts(snapshot=True)(tree, -1.0), [0.0, 0.75, 0.25]
+    )
+    # none yet: uniform, as the full search's
+    np.testing.assert_allclose(
+        VisitCounts(snapshot=True)(init_mcts_tree(4, 3, node(0, 0.0)), -1.0), 1 / 3
+    )
