@@ -53,6 +53,7 @@ class AZResnetConfig:
             - "layer": each input normalized on its own, over its channels and the board (LayerNorm)
             - "group": the same over each of `norm_groups` groups of channels (GroupNorm)
             - "rms": as "layer", divided by the root mean square, the mean not subtracted (RMSNorm)
+            - "channel": each square's channels normalized on their own (ConvNeXt's LayerNorm)
             - "fixed": no normalization, but a fixed scale that gives the convolution's output
               about unit variance at initialization (KataGo's fixed variance initialization)
             - "ws": no normalization, but the convolution's weights standardized, each output
@@ -61,7 +62,15 @@ class AZResnetConfig:
             Each then has a learned scale and offset per channel. All but "batch" treat each input
             on its own: the network has no state, and training and inference compute the same.
             "fixed" and "ws" fold into the convolution as BatchNorm does in inference; "layer",
-            "group" and "rms" cost a pass over the activations
+            "group", "rms" and "channel" cost a pass over the activations
+        layout: where the residual blocks normalize. "post", AlphaZero's: each convolution followed
+            by its normalization, then a ReLU; a block's output relu(x + branch). Or "pre", the
+            pre-activation residual network's (as KataGo's, and pre-norm transformers'): each
+            convolution preceded by a normalization and a ReLU, a block's output x + branch, the
+            trunk itself never normalized, and a normalization and a ReLU at its end before the
+            heads. Every branch then sees normalized input, however the trunk grows with depth.
+            Not with "fixed" or "ws", which scale the convolution they follow. BatchNorm in "pre"
+            doesn't fold into a convolution in inference
         norm_groups: "group"'s groups of channels: of a layer of C channels, gcd(norm_groups, C)
         bn_momentum: how slowly BatchNorm's running averages of the batch statistics, which inference
             uses, follow them: at about 1 / (1 - momentum) training steps. A long window lags the
@@ -86,7 +95,8 @@ class AZResnetConfig:
     value_hidden_size: int = 256
     inference_dtype: str = "float32"
     train_dtype: str = "float32"
-    norm: Literal["batch", "layer", "group", "rms", "fixed", "ws"] = "batch"
+    norm: Literal["batch", "layer", "group", "rms", "channel", "fixed", "ws"] = "batch"
+    layout: Literal["post", "pre"] = "post"
     norm_groups: int = 8
     bn_momentum: float = 0.9
     remat: bool = False
@@ -144,7 +154,8 @@ def inference_affine(
 class GroupNorm(eqx.Module):
     """Normalizes each input on its own: each group of its channels, over them and the board, to mean
     0 and variance 1 (GroupNorm; LayerNorm with one group), or without `center` only divided by its
-    root mean square (RMSNorm). Then a learned scale and offset for each channel. Computes in
+    root mean square (RMSNorm); or, not `over_board`, each square's channels on their own
+    (ConvNeXt's LayerNorm). Then a learned scale and offset for each channel. Computes in
     float32."""
 
     weight: jax.Array
@@ -152,21 +163,34 @@ class GroupNorm(eqx.Module):
     inference: bool
     groups: int = eqx.field(static=True)
     center: bool = eqx.field(static=True)
+    over_board: bool = eqx.field(static=True)
     eps: float = eqx.field(static=True)
 
     def __init__(
-        self, channels: int, groups: int = 1, center: bool = True, eps: float = 1e-5
+        self,
+        channels: int,
+        groups: int = 1,
+        center: bool = True,
+        over_board: bool = True,
+        eps: float = 1e-5,
     ):
         self.weight = jnp.ones((channels,))
         self.bias = jnp.zeros((channels,))
         self.inference = False
         self.groups = groups
         self.center = center
+        self.over_board = over_board
         self.eps = eps
 
     def __call__(self, x: jax.Array) -> jax.Array:
         """(channels, height, width) features, normalized, in float32."""
-        grouped = x.astype(jnp.float32).reshape(self.groups, -1)
+        x = x.astype(jnp.float32)
+        # (groups, values normalized together, squares normalized apart)
+        grouped = (
+            x.reshape(self.groups, -1, 1)
+            if self.over_board
+            else x.reshape(1, x.shape[0], -1)
+        )
         if self.center:
             grouped = grouped - grouped.mean(axis=1, keepdims=True)
         square = jnp.square(grouped).mean(axis=1, keepdims=True)
@@ -257,6 +281,8 @@ def norm_maker(
             return GroupNorm(channels, math.gcd(groups, channels))
         if norm == "rms":
             return GroupNorm(channels, center=False)
+        if norm == "channel":
+            return GroupNorm(channels, over_board=False)
         # zero padding: of a kernel's taps, on average this fraction falls on the board
         coverage = math.prod((n - (kernel - 1) / kernel) / n for n in board)
         moment, variance = (coverage * stat for stat in stats)
@@ -271,6 +297,12 @@ def norm_maker(
         raise ValueError(f"no normalization {norm!r}")
 
     return make
+
+
+def convolve(conv: eqx.nn.Conv2d, x: jax.Array, dtype: jnp.dtype) -> jax.Array:
+    """`conv` of `x`, computing in `dtype`."""
+    cast = eqx.tree_at(lambda c: c.weight, conv, conv.weight.astype(dtype))
+    return cast(x.astype(dtype))
 
 
 def conv_norm(
@@ -289,21 +321,39 @@ def conv_norm(
     weights and a bias, one pass over the activations instead of two (or more).
     """
 
-    def convolve(weight: jax.Array) -> jax.Array:
-        cast = eqx.tree_at(lambda c: c.weight, conv, weight.astype(dtype))
-        return cast(x.astype(dtype))
+    def weighted(weight: jax.Array) -> jax.Array:
+        return convolve(eqx.tree_at(lambda c: c.weight, conv, weight), x, dtype)
 
     if isinstance(norm, eqx.nn.BatchNorm):
         if not norm.inference:
-            return norm(convolve(conv.weight).astype(jnp.float32), state)
+            return norm(convolve(conv, x, dtype).astype(jnp.float32), state)
         scale, offset = inference_affine(norm, state)
-        y = convolve(conv.weight * scale.reshape(-1, 1, 1, 1))
+        y = weighted(conv.weight * scale.reshape(-1, 1, 1, 1))
         return y + offset.reshape(-1, 1, 1).astype(dtype), state
     out_dtype = dtype if norm.inference else jnp.dtype(jnp.float32)
     if isinstance(norm, FixedScale):
-        y = convolve(norm.conv_weight(conv.weight)).astype(out_dtype)
+        y = weighted(norm.conv_weight(conv.weight)).astype(out_dtype)
         return y + norm.bias.reshape(-1, 1, 1).astype(out_dtype), state
-    return norm(convolve(conv.weight)).astype(out_dtype), state
+    return norm(convolve(conv, x, dtype)).astype(out_dtype), state
+
+
+def norm_act(
+    norm: Norm, x: jax.Array, state: eqx.nn.State, dtype: jnp.dtype
+) -> tuple[jax.Array, eqx.nn.State]:
+    """A normalization of `x`, (channels, height, width), then a ReLU, as the "pre" layout puts
+    before each convolution (see `AZResnetConfig.layout`): in float32 in training, `dtype` in
+    inference mode."""
+    if isinstance(norm, FixedScale):
+        raise TypeError("fixed scales go after a convolution, not before")
+    if isinstance(norm, eqx.nn.BatchNorm) and norm.inference:
+        scale, offset = inference_affine(norm, state)
+        y = x.astype(jnp.float32) * scale.reshape(-1, 1, 1) + offset.reshape(-1, 1, 1)
+    elif isinstance(norm, eqx.nn.BatchNorm):
+        y, state = norm(x.astype(jnp.float32), state)
+    else:
+        y = norm(x)
+    y = jax.nn.relu(y)
+    return (y.astype(dtype) if norm.inference else y), state
 
 
 def board_pool(x: jax.Array) -> jax.Array:
@@ -423,7 +473,105 @@ class BottleneckBlock(eqx.Module):
         return jax.nn.relu(x + y), state
 
 
-Block = ResidualBlock | BottleneckBlock
+class PreActBlock(eqx.Module):
+    """A pre-activation residual block (see `AZResnetConfig.layout`): x + conv2(relu(norm2(conv1(
+    relu(norm1(x)))))), optionally with KataGo's global pooling bias, from the last
+    `pool_channels` of conv1's normalized output."""
+
+    norm1: Norm
+    conv1: eqx.nn.Conv2d
+    norm2: Norm
+    pool_linear: eqx.nn.Linear | None
+    conv2: eqx.nn.Conv2d
+    pool_channels: int = eqx.field(static=True)
+
+    def __init__(
+        self,
+        channels: int,
+        pool_channels: int = 0,
+        *,
+        key: jax.Array,
+        make_norm: NormMaker,
+        stats: Stats,
+    ):
+        """
+        Args:
+            channels: number of channels
+            pool_channels: channels of the first convolution's output pooled over the board to bias
+                the others, 0 for no global pooling bias
+            key: rng used to initialize parameters
+            make_norm: makes the normalizations (see `norm_maker`)
+            stats: unused: the normalizations before the convolutions need none
+        """
+        key1, key2, key3 = jax.random.split(key, 3)
+        self.norm1 = make_norm(channels, stats, 3)
+        self.conv1 = conv(channels, channels, 3, key1)
+        self.norm2 = make_norm(channels, stats, 3)
+        self.pool_linear = (
+            eqx.nn.Linear(2 * pool_channels, channels - pool_channels, key=key3)
+            if pool_channels
+            else None
+        )
+        self.conv2 = conv(channels - pool_channels, channels, 3, key2)
+        self.pool_channels = pool_channels
+
+    def __call__(
+        self, x: jax.Array, state: eqx.nn.State, dtype: jnp.dtype
+    ) -> tuple[jax.Array, eqx.nn.State]:
+        y, state = norm_act(self.norm1, x, state, dtype)
+        y = convolve(self.conv1, y, dtype)
+        y, state = norm_act(self.norm2, y, state, dtype)
+        if self.pool_linear is not None:
+            y, pooled = y[: -self.pool_channels], y[-self.pool_channels :]
+            bias = self.pool_linear(board_pool(pooled))
+            y = y + bias.reshape(-1, 1, 1).astype(y.dtype)
+        y = convolve(self.conv2, y, dtype)
+        return x + y.astype(x.dtype), state
+
+
+class PreActBottleneck(eqx.Module):
+    """KataGo's nested bottleneck block in the pre-activation layout: x + up(relu(norm(inner(down(
+    relu(norm(x))))))), the inner blocks pre-activation basic blocks."""
+
+    down_norm: Norm
+    down_conv: eqx.nn.Conv2d
+    inner: list[PreActBlock]
+    up_norm: Norm
+    up_conv: eqx.nn.Conv2d
+
+    def __init__(
+        self,
+        channels: int,
+        inner_channels: int,
+        inner_pool_channels: list[int],
+        *,
+        key: jax.Array,
+        make_norm: NormMaker,
+        stats: Stats,
+    ):
+        keys = jax.random.split(key, len(inner_pool_channels) + 2)
+        self.down_norm = make_norm(channels, stats, 1)
+        self.down_conv = conv(channels, inner_channels, 1, keys[0])
+        self.inner = [
+            PreActBlock(inner_channels, pool, key=k, make_norm=make_norm, stats=stats)
+            for pool, k in zip(inner_pool_channels, keys[2:], strict=True)
+        ]
+        self.up_norm = make_norm(inner_channels, stats, 1)
+        self.up_conv = conv(inner_channels, channels, 1, keys[1])
+
+    def __call__(
+        self, x: jax.Array, state: eqx.nn.State, dtype: jnp.dtype
+    ) -> tuple[jax.Array, eqx.nn.State]:
+        y, state = norm_act(self.down_norm, x, state, dtype)
+        y = convolve(self.down_conv, y, dtype)
+        for block in self.inner:
+            y, state = block(y, state, dtype)
+        y, state = norm_act(self.up_norm, y, state, dtype)
+        y = convolve(self.up_conv, y, dtype)
+        return x + y.astype(x.dtype), state
+
+
+Block = ResidualBlock | BottleneckBlock | PreActBlock | PreActBottleneck
 
 
 def checkpointed(
@@ -559,9 +707,11 @@ class AZResnet(eqx.Module):
     """
 
     stem_conv: eqx.nn.Conv2d
-    stem_norm: Norm
+    stem_norm: Norm | None
     blocks: list[Block]
+    final_norm: Norm | None
     heads: AlphaZeroHeads | PooledHeads
+    inference: bool
     inference_dtype: str = eqx.field(static=True)
     train_dtype: str = eqx.field(static=True)
     remat: bool = eqx.field(static=True)
@@ -585,9 +735,14 @@ class AZResnet(eqx.Module):
         make_norm = norm_maker(
             config.norm, config.norm_groups, config.bn_momentum, (height, width)
         )
-        # initial conv layer
+        pre = config.layout == "pre"
+        if pre and config.norm in ("fixed", "ws"):
+            raise ValueError(
+                f'norm={config.norm} scales the convolution it follows: not with layout="pre"'
+            )
+        # initial conv layer: in the pre-activation layout, the trunk starts from it unnormalized
         self.stem_conv = conv(in_channels, channels, 3, stem_key)
-        self.stem_norm = make_norm(channels, INPUT_STATS, 3)
+        self.stem_norm = None if pre else make_norm(channels, INPUT_STATS, 3)
 
         # residual blocks: the global pooling channels of each basic block, counting those inside
         # bottleneck blocks
@@ -599,18 +754,19 @@ class AZResnet(eqx.Module):
             for i in range(config.num_blocks * inner)
         ]
         stats = residual_stats(config.num_blocks)
+        basic, bottleneck = (
+            (PreActBlock, PreActBottleneck) if pre else (ResidualBlock, BottleneckBlock)
+        )
         if config.block == "basic":
             self.blocks = [
-                ResidualBlock(
-                    channels, pool, key=k, make_norm=make_norm, stats=block_stats
-                )
+                basic(channels, pool, key=k, make_norm=make_norm, stats=block_stats)
                 for pool, k, block_stats in zip(
                     pool_channels, block_keys, stats[:-1], strict=True
                 )
             ]
         else:
             self.blocks = [
-                BottleneckBlock(
+                bottleneck(
                     channels,
                     config.bottleneck_channels or channels // 2,
                     pool_channels[i * inner : (i + 1) * inner],
@@ -620,6 +776,9 @@ class AZResnet(eqx.Module):
                 )
                 for i, k in enumerate(block_keys)
             ]
+
+        # the pre-activation trunk's end: normalized, and a ReLU, before the heads
+        self.final_norm = make_norm(channels, stats[-1], 1) if pre else None
 
         if config.heads == "alphazero":
             self.heads = AlphaZeroHeads(
@@ -645,6 +804,7 @@ class AZResnet(eqx.Module):
                 make_norm=make_norm,
                 stats=stats[-1],
             )
+        self.inference = False
         self.inference_dtype = config.inference_dtype
         self.train_dtype = config.train_dtype
         self.remat = config.remat
@@ -654,20 +814,25 @@ class AZResnet(eqx.Module):
     ) -> tuple[tuple[jax.Array, jax.Array], eqx.nn.State]:
         # the convolutions compute in the inference dtype in inference mode (and so do the activations
         # between them), in the train dtype in training
-        dtype = jnp.dtype(
-            self.inference_dtype if self.stem_norm.inference else self.train_dtype
-        )
+        dtype = jnp.dtype(self.inference_dtype if self.inference else self.train_dtype)
         # inputs are channels-last (and may be e.g. boolean), equinox convolutions are channels-first
         x = jnp.moveaxis(x, -1, 0).astype(dtype)
         # initial conv layer
-        x, state = conv_norm(self.stem_conv, self.stem_norm, x, state, dtype)
-        x = jax.nn.relu(x)
+        if self.stem_norm is None:
+            # the pre-activation trunk, in float32 in training as the post-activation one is
+            x = convolve(self.stem_conv, x, dtype)
+            x = x if self.inference else x.astype(jnp.float32)
+        else:
+            x, state = conv_norm(self.stem_conv, self.stem_norm, x, state, dtype)
+            x = jax.nn.relu(x)
 
         # residual blocks
         for block in self.blocks:
-            if self.remat and not self.stem_norm.inference:
+            if self.remat and not self.inference:
                 x, state = checkpointed(block, x, state, dtype)
             else:
                 x, state = block(x, state, dtype)
 
+        if self.final_norm is not None:
+            x, state = norm_act(self.final_norm, x, state, dtype)
         return self.heads(x, state, dtype)

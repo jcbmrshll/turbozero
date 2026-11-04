@@ -82,7 +82,7 @@ def test_bn_momentum_reaches_every_batch_norm():
     assert {bn.momentum for bn in norms} == {0.9}
 
 
-@pytest.mark.parametrize("norm", ["layer", "group", "rms", "fixed", "ws"])
+@pytest.mark.parametrize("norm", ["layer", "group", "rms", "channel", "fixed", "ws"])
 def test_a_spec_names_a_batch_independent_norm_with_no_state(norm):
     config = network_config(f"resnet:2x8,heads=pooled,norm={norm},norm_groups=4", 65)
     network, state = make_network(config, (8, 8, 2), jax.random.PRNGKey(0))
@@ -95,4 +95,13 @@ def test_a_spec_names_a_batch_independent_norm_with_no_state(norm):
             network, is_leaf=lambda x: isinstance(x, eqx.nn.BatchNorm)
         )
     )
+    assert jax.tree.leaves(state) == []
+
+
+def test_a_spec_names_the_pre_activation_layout():
+    config = network_config("resnet:2x8,heads=pooled,norm=channel,layout=pre", 65)
+    network, state = make_network(config, (8, 8, 2), jax.random.PRNGKey(0))
+
+    assert isinstance(network, AZResnet) and network.final_norm is not None
+    assert network.stem_norm is None
     assert jax.tree.leaves(state) == []

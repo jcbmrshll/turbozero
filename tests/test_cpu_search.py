@@ -403,7 +403,19 @@ def test_a_match_replays_from_its_seed_however_many_play_at_once():
     assert np.array_equal(results(8, 0), results(3, 0))
 
 
-@pytest.mark.parametrize("norm", ["batch", "layer", "group", "rms", "fixed", "ws"])
+@pytest.mark.parametrize(
+    "norm",
+    [
+        "batch",
+        "layer",
+        "group",
+        "rms",
+        "channel",
+        "fixed",
+        "ws",
+        *(f"{norm},layout=pre" for norm in ("batch", "layer", "channel", "rms")),
+    ],
+)
 def test_export_matches_the_network(norm):
     import equinox as eqx
     from cpu_search import openvino_eval, ort_eval, ort_session

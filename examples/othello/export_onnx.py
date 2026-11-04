@@ -30,6 +30,7 @@ from core.networks.azresnet import (
     GroupNorm,
     Norm,
     PooledHeads,
+    PreActBlock,
     ResidualBlock,
     inference_affine,
 )
@@ -94,24 +95,45 @@ class Graph:
         return self.group_norm(norm, self.conv(layer, x))
 
     def group_norm(self, norm: GroupNorm, x: str) -> str:
-        """`norm` of (batch, channels, height, width) features, in plain ops: each group of
-        channels to (batch, groups, rest)."""
-        grouped = self.node(
-            "Reshape", x, self.weight(np.array([0, norm.groups, -1]), "shape")
-        )
+        """`norm` of (batch, channels, height, width) features, in plain ops, in the pattern
+        OpenVINO fuses into one normalization: over each group of channels and the board (as
+        (batch, groups, rest)), or over each square's channels."""
+        if norm.over_board:
+            grouped = self.node(
+                "Reshape", x, self.weight(np.array([0, norm.groups, -1]), "shape")
+            )
+            axis = 2
+        else:
+            grouped, axis = x, 1
         if norm.center:
-            mean = self.node("ReduceMean", grouped, axes=[2], keepdims=1)
+            mean = self.node("ReduceMean", grouped, axes=[axis], keepdims=1)
             grouped = self.node("Sub", grouped, mean)
-        square = self.node("ReduceMean", self.node("Mul", grouped, grouped), axes=[2])
-        eps = self.weight(np.array(norm.eps, np.float32), "eps")
-        root = self.node("Sqrt", self.add(square, eps))
-        normalized = self.node(
-            "Reshape", self.node("Div", grouped, root), self.node("Shape", x)
+        two = self.weight(np.array(2, np.float32), "two")
+        square = self.node(
+            "ReduceMean", self.node("Pow", grouped, two), axes=[axis], keepdims=1
         )
+        eps = self.weight(np.array(norm.eps, np.float32), "eps")
+        normalized = self.node("Div", grouped, self.node("Sqrt", self.add(square, eps)))
+        if norm.over_board:
+            normalized = self.node("Reshape", normalized, self.node("Shape", x))
         channelwise = np.asarray(norm.weight, np.float32).reshape(-1, 1, 1)
         scaled = self.node("Mul", normalized, self.weight(channelwise, "scale"))
         offset = np.asarray(norm.bias, np.float32).reshape(-1, 1, 1)
         return self.add(scaled, self.weight(offset, "offset"))
+
+    def norm_relu(self, norm: Norm | None, state: eqx.nn.State, x: str) -> str:
+        """A normalization of features and a ReLU, before a convolution (the pre-activation
+        layout's, see `core.networks.azresnet.norm_act`)."""
+        if isinstance(norm, eqx.nn.BatchNorm):
+            scale, offset = inference_affine(norm, state)
+            scaled = self.node(
+                "Mul", x, self.weight(np.asarray(scale, np.float32).reshape(-1, 1, 1))
+            )
+            offset = np.asarray(offset, np.float32).reshape(-1, 1, 1)
+            return self.relu(self.add(scaled, self.weight(offset, "offset")))
+        if not isinstance(norm, GroupNorm):
+            raise TypeError(f"no normalization before a convolution: {norm!r}")
+        return self.relu(self.group_norm(norm, x))
 
     def linear(self, layer: eqx.nn.Linear, x: str) -> str:
         assert layer.bias is not None
@@ -157,6 +179,18 @@ class Graph:
         y = self.conv_norm(block.conv2, block.norm2, state, y)
         return self.relu(self.add(x, y))
 
+    def pre_block(self, block: PreActBlock, state: eqx.nn.State, x: str) -> str:
+        y = self.conv(block.conv1, self.norm_relu(block.norm1, state, x))
+        y = self.norm_relu(block.norm2, state, y)
+        if block.pool_linear is not None:
+            channels = block.conv1.out_channels
+            assert isinstance(channels, int)
+            kept = channels - block.pool_channels
+            pooled = self.board_pool(self.slice_channels(y, kept, channels))
+            y = self.slice_channels(y, 0, kept)
+            y = self.add(y, self.board_bias(self.linear(block.pool_linear, pooled)))
+        return self.add(x, self.conv(block.conv2, y))
+
     def heads(self, heads: PooledHeads, state: eqx.nn.State, x: str) -> tuple[str, str]:
         policy = self.conv_norm(heads.policy_conv, heads.policy_norm, state, x)
         pooled = self.conv_norm(
@@ -184,11 +218,19 @@ def to_onnx(network: AZResnet, state: eqx.nn.State) -> onnx.ModelProto:
         raise TypeError("only pooled heads export")
     graph = Graph()
     x = "input"
-    x = graph.relu(graph.conv_norm(network.stem_conv, network.stem_norm, state, x))
+    if network.stem_norm is None:
+        x = graph.conv(network.stem_conv, x)
+    else:
+        x = graph.relu(graph.conv_norm(network.stem_conv, network.stem_norm, state, x))
     for block in network.blocks:
-        if not isinstance(block, ResidualBlock):
+        if isinstance(block, ResidualBlock):
+            x = graph.block(block, state, x)
+        elif isinstance(block, PreActBlock):
+            x = graph.pre_block(block, state, x)
+        else:
             raise TypeError("only basic blocks export")
-        x = graph.block(block, state, x)
+    if network.final_norm is not None:
+        x = graph.norm_relu(network.final_norm, state, x)
     policy, value = graph.heads(network.heads, state, x)
     graph.nodes.append(helper.make_node("Identity", [policy], ["policy"]))
     graph.nodes.append(helper.make_node("Identity", [value], ["value"]))
