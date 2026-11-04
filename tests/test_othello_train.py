@@ -4,8 +4,8 @@ import sys
 
 import equinox as eqx
 import jax
-import numpy as np
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from example_modules import load_example
 
@@ -51,15 +51,17 @@ def test_root_noise_options_out_of_range_are_refused(monkeypatch, option):
         run_main(monkeypatch, *option)
 
 
-def test_init_weights_start_from_a_checkpoint(monkeypatch, tmp_path):
+# and a network without state: no BatchNorm, nothing but its parameters
+@pytest.mark.parametrize("net", ["resnet:1x4", "resnet:1x4,norm=channel,layout=pre"])
+def test_init_weights_start_from_a_checkpoint(monkeypatch, tmp_path, net):
     game = load_example("othello", "game")[0]
-    network, nn_state = game.make_network("resnet:1x4", seed=3)
+    network, nn_state = game.make_network(net, seed=3)
     path = tmp_path / "pretrained.eqx"
     eqx.tree_serialise_leaves(
         path, (eqx.filter(network, eqx.is_inexact_array), nn_state)
     )
     with pytest.raises(BuiltTrainer) as built:
-        run_main(monkeypatch, "--init-weights", str(path))
+        run_main(monkeypatch, "--net", net, "--init-weights", str(path))
     for a, b in zip(
         jax.tree.leaves(eqx.filter(built.value.kwargs["nn"], eqx.is_inexact_array)),
         jax.tree.leaves(eqx.filter(network, eqx.is_inexact_array)),
@@ -95,13 +97,13 @@ def test_lr_warmup_starts_the_learning_rate_at_zero(monkeypatch):
     params = {"w": jax.numpy.zeros(2)}
     state = optimizer.init(params)
     rates = []
-    for _ in range(129):
+    for _ in range(257):
         _, state = optimizer.update({"w": jax.numpy.ones(2)}, state, params)
         rates.append(float(state.hyperparams["learning_rate"]))
-    # one epoch of 128 steps from 0 to 1e-3
+    # one epoch of 256 steps from 0 to 1e-3
     assert rates[0] == 0
-    assert rates[64] == pytest.approx(5e-4, rel=1e-6)
-    assert rates[128] == pytest.approx(1e-3, rel=1e-6)
+    assert rates[128] == pytest.approx(5e-4, rel=1e-6)
+    assert rates[256] == pytest.approx(1e-3, rel=1e-6)
     with pytest.raises(SystemExit):
         run_main(monkeypatch, "--epochs", "4", "--lr-warmup", "4")
 
@@ -137,7 +139,7 @@ def test_anchor_blends_a_frozen_networks_outputs_into_the_targets(
 def test_freeze_batchnorm_trains_with_batchnorm_in_inference_mode(monkeypatch):
     with pytest.raises(BuiltTrainer) as built:
         run_main(monkeypatch, "--freeze-batchnorm")
-    assert built.value.kwargs["nn"].stem_bn.inference
+    assert built.value.kwargs["nn"].stem_norm.inference
     for bad in (["--train-dtype", "float32"], ["--remat"]):
         with pytest.raises(SystemExit):
             run_main(monkeypatch, "--freeze-batchnorm", *bad)

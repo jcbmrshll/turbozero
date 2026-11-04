@@ -372,7 +372,7 @@ def test_frozen_batch_norm_trains_with_the_stored_statistics():
     np.testing.assert_allclose(value, inf_value, rtol=1e-5, atol=1e-6)
     # and it still trains: BatchNorm's scales get gradients
     grads = eqx.filter_grad(lambda n: (apply_nn(n, state, x)[0][1] ** 2).mean())(frozen)
-    assert np.abs(np.asarray(grads.stem_bn.weight)).sum() > 0
+    assert np.abs(np.asarray(grads.stem_norm.weight)).sum() > 0
 BATCH_INDEPENDENT = [
     *(("post", norm) for norm in ("layer", "group", "rms", "channel", "fixed", "ws")),
     *(("pre", norm) for norm in ("layer", "group", "rms", "channel")),

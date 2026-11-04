@@ -200,7 +200,9 @@ def test_label_gives_policies_over_legal_actions(corpus, tmp_path):
     assert (batch.cur_player_id == 0).all()
 
 
-def test_distill_trains_on_a_corpus(corpus, tmp_path):
+# and a network without state: no BatchNorm, nothing but its parameters to save and load
+@pytest.mark.parametrize("net", [NET, f"{NET},norm=channel,layout=pre"])
+def test_distill_trains_on_a_corpus(corpus, tmp_path, net):
     out, _ = corpus
     if not league_corpus.Corpus(out).labelled:
         label_corpus(out, tmp_path)
@@ -212,7 +214,7 @@ def test_distill_trains_on_a_corpus(corpus, tmp_path):
         "teacher_values": None,
         "value_source": "teacher",
         "value_target_q": 1.0,
-        "net": NET,
+        "net": net,
         "train_dtype": "float32",
         "seed": 0,
         "monitor": None,
@@ -232,7 +234,7 @@ def test_distill_trains_on_a_corpus(corpus, tmp_path):
     with pytest.raises(SystemExit, match="searches"):
         distill.train_command(SimpleNamespace(**{**args, "value_source": "root"}))
     distill.train_command(SimpleNamespace(**args))
-    game.load_checkpoint(str(tmp_path / "student" / "1.eqx"), NET)
+    game.load_checkpoint(str(tmp_path / "student" / "1.eqx"), net)
     # and on from that network, with steps too small to change it leaving it as it was
     first = tmp_path / "student" / "1.eqx"
     distill.train_command(
@@ -247,8 +249,8 @@ def test_distill_trains_on_a_corpus(corpus, tmp_path):
             }
         )
     )
-    before = game.load_checkpoint(str(first), NET)[1][0]
-    after = game.load_checkpoint(str(tmp_path / "continued" / "1.eqx"), NET)[1][0]
+    before = game.load_checkpoint(str(first), net)[1][0]
+    after = game.load_checkpoint(str(tmp_path / "continued" / "1.eqx"), net)[1][0]
     for x, y in zip(jax.tree.leaves(before), jax.tree.leaves(after), strict=True):
         np.testing.assert_array_equal(x, y)
 
