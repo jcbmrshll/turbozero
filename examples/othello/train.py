@@ -55,9 +55,13 @@ with --resume, or to fork short runs from with --init-from (see README.md):
     uv run examples/othello/train.py --epochs 200 --save-state-every 10 --ckpt-dir runs/long --resume
 
 With --lr-plateau, the learning rate drops when the training loss stops improving instead,
-from --lr to each of its rates in turn, --epochs only capping the run (see README.md):
+from --lr to each of its rates in turn, --epochs only capping the run (see README.md); with
+--lr-plateau-signal, when another measure does, such as the Elo against frozen --anchor networks,
+played every --anchor-every epochs:
 
     uv run examples/othello/train.py --epochs 600 --lr-plateau --save-state-every 10 --ckpt-dir runs/plateau
+    uv run examples/othello/train.py --epochs 600 --lr-plateau --lr-plateau-signal anchor-elo \
+        --anchor e100 runs/long/100.eqx resnet:6x96 420 --ckpt-dir runs/plateau-elo
 """
 
 import argparse
@@ -67,6 +71,7 @@ from functools import partial
 from pathlib import Path
 
 import pgx
+from elo_league import Othello
 from engine_set import DEFAULT_PATH as DEFAULT_ENGINE_SET
 from engine_set import EngineSet
 from engines import ENGINES
@@ -97,6 +102,7 @@ from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.mcts.mcts import MCTS
 from core.evaluators.mcts.policy_targets import CompletedQ, VisitCounts
 from core.evaluators.random_evaluator import RandomEvaluator
+from core.league.anchors import Anchor, AnchorTester
 from core.memory.replay_memory import EpisodeReplayBuffer
 from core.monitoring import DEFAULT_URL, Monitor
 from core.monitoring.episodes import pgx_two_player_episode
@@ -106,6 +112,7 @@ from core.testing.tester import BaseTester
 from core.training.exploration import Exploration
 from core.training.loss_fns import az_default_loss_fn
 from core.training.lr_plateau import LRPlateau
+from core.training.plateau import Plateau
 from core.training.schedule import EvaluatorSchedule, parse_schedule
 from core.training.train import Trainer
 from core.training.tree_positions import TreePositions
@@ -148,6 +155,32 @@ def lr_drops(text: str) -> list[tuple[float, float]]:
 # six rated 6x96 and 8x128 phases at 1e-3 and 1e-4, the rule (40 epochs, 0.004) fired between
 # about 7 epochs before and 36 after their Elo stopped rising
 DEFAULT_LR_PLATEAU = [1e-4, 1e-5]
+
+
+# what --lr-plateau-signal can follow: the metric, whether it improves by rising, and the rule's
+# window and threshold by default. On eight rated 6x96 and 8x128 phases, with a phase's stall where
+# a saturating fit to its Elo had under 20 left to gain, the loss's fired between 12 epochs before
+# and 63 after the stall; the engine value error's, over 60 epochs, between 27 and 120 after, and
+# not in the two shortest phases; the anchors' Elo, simulated from the league's ratings with the
+# noise of 400 games every 10 epochs, between about 17 before and 34 after
+PLATEAU_SIGNALS = {
+    "loss": ("loss", False, 40, 0.004),
+    "engine-value": ("engine_value_mse", False, 60, 0.004),
+    "anchor-elo": ("anchor_elo", True, 40, 20.0),
+}
+
+
+def anchor(values: list[str]) -> Anchor:
+    """Parses --anchor's NAME PATH NET ELO."""
+    name, path, net, elo = values
+    if not Path(path).exists():
+        raise argparse.ArgumentTypeError(f"--anchor {name}: no checkpoint at {path}")
+    try:
+        return Anchor(name, path, net, float(elo))
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"--anchor {name}: its Elo must be a number, got {elo!r}"
+        ) from None
 
 
 def rate_list(text: str) -> list[float]:
@@ -353,17 +386,28 @@ def main():
         "epochs at the rate (default: 1e-4,1e-5). A fork starts again at --lr",
     )
     parser.add_argument(
+        "--lr-plateau-signal",
+        choices=sorted(PLATEAU_SIGNALS),
+        default="loss",
+        help="with --lr-plateau, what has to stop improving: the training loss (`loss`, the "
+        "default); the engine-labelled set's value error (`engine_value_mse`, see "
+        "--engine-set); or the Elo against --anchor's networks (`anchor_elo`)",
+    )
+    parser.add_argument(
         "--lr-plateau-window",
         type=int,
-        default=40,
+        default=None,
         metavar="EPOCHS",
-        help="with --lr-plateau, the epochs the loss's improvement is measured over",
+        help="with --lr-plateau, the epochs the signal's improvement is measured over (default: "
+        "40, or 60 for engine-value)",
     )
     parser.add_argument(
         "--lr-plateau-threshold",
         type=float,
-        default=0.004,
-        help="with --lr-plateau, the improvement over the window below which the rate drops",
+        default=None,
+        help="with --lr-plateau, the improvement over the window below which the rate drops, in "
+        "the signal's units (default: 0.004 for the loss and engine-value, 20 Elo for "
+        "anchor-elo)",
     )
     parser.add_argument(
         "--lr-plateau-min-epochs",
@@ -377,6 +421,13 @@ def main():
         action="store_true",
         help="with --lr-plateau, end the run once the last rate plateaus, before --epochs "
         "(--vs-engine-last's games are then not played)",
+    )
+    parser.add_argument(
+        "--grad-noise",
+        action="store_true",
+        help="also log how much of each epoch's gradients is signal: the norm of their mean "
+        "(`grad_mean_norm`), the steps' spread around it (`grad_spread`), and one step's "
+        "signal-to-noise ratio (`grad_snr`, see core.training.train.gradient_noise_metrics)",
     )
     parser.add_argument(
         "--weight-decay",
@@ -550,6 +601,38 @@ def main():
         "colors: the same ones every time, and in every run",
     )
     parser.add_argument(
+        "--anchor",
+        nargs=4,
+        action="append",
+        default=[],
+        metavar=("NAME", "PATH", "NET", "ELO"),
+        help="a frozen network to play every --anchor-every epochs, as the Elo league plays its "
+        "direct games: its name in the metrics, its checkpoint, its --net and its Elo, e.g. a "
+        "league player's at --anchor-sims; again for each anchor. Logs anchor_<NAME>_score, "
+        "anchor_<NAME>_elo (with _se), and anchor_elo, the rating from all of them on their "
+        "scale (see core/league/anchors.py)",
+    )
+    parser.add_argument(
+        "--anchor-every",
+        type=int,
+        default=10,
+        metavar="N",
+        help="epochs between games against the anchors",
+    )
+    parser.add_argument(
+        "--anchor-games",
+        type=int,
+        default=400,
+        help="games against each anchor, from XOT openings, each played with both colors: "
+        "the same ones every time",
+    )
+    parser.add_argument(
+        "--anchor-sims",
+        type=int,
+        default=128,
+        help="MCTS iterations a move in games against the anchors, both sides'",
+    )
+    parser.add_argument(
         "--ckpt-dir",
         default=None,
         help="where to save checkpoints (default: a new temporary directory)",
@@ -623,16 +706,38 @@ def main():
         parser.error(
             "--lr-final, --lr-drops and --lr-plateau are different schedules: pass one"
         )
+    try:
+        anchors = [anchor(values) for values in args.anchor]
+    except argparse.ArgumentTypeError as e:
+        parser.error(str(e))
     lr_plateau = None
     if args.lr_plateau is not None:
         if args.lr_plateau[0] >= args.lr:
             parser.error("--lr-plateau's rates must be below --lr")
+        signal, maximize, window, threshold = PLATEAU_SIGNALS[args.lr_plateau_signal]
+        window = args.lr_plateau_window or window
+        if args.lr_plateau_signal == "anchor-elo":
+            if not anchors:
+                parser.error("--lr-plateau-signal anchor-elo needs an --anchor")
+            if window < 2 * args.anchor_every:
+                parser.error(
+                    "--lr-plateau-window must hold two of the anchors' evaluations: at least "
+                    "twice --anchor-every"
+                )
+        if args.lr_plateau_signal == "engine-value" and args.engine_eval_every != 1:
+            parser.error("--lr-plateau-signal engine-value needs --engine-eval-every 1")
         try:
             lr_plateau = LRPlateau(
                 (args.lr, *args.lr_plateau),
-                window=args.lr_plateau_window,
-                threshold=args.lr_plateau_threshold,
-                min_epochs=args.lr_plateau_min_epochs,
+                Plateau(
+                    signal,
+                    maximize,
+                    window=window,
+                    threshold=threshold
+                    if args.lr_plateau_threshold is None
+                    else args.lr_plateau_threshold,
+                    min_epochs=args.lr_plateau_min_epochs,
+                ),
                 stop=args.lr_plateau_stop,
             )
         except ValueError as e:
@@ -744,6 +849,12 @@ def main():
         )
     # the network's raw moves and values against Edax's, on the engine-labelled set
     engine_set = load_engine_set(parser, args)
+    if (
+        engine_set is None
+        and lr_plateau is not None
+        and args.lr_plateau_signal == "engine-value"
+    ):
+        parser.error("--lr-plateau-signal engine-value needs the engine-labelled set")
     if engine_set is not None:
         testers.append(
             ScoredPositionsTester(
@@ -787,6 +898,25 @@ def main():
         testers.append(match_tester)
         if monitor is not None:
             describe_scores(monitor, match_tester.score_names())
+    # games against frozen networks, between epochs, in this process (see core/league/anchors.py)
+    if anchors:
+        try:
+            testers.append(
+                AnchorTester(
+                    Othello(),
+                    network,
+                    anchors,
+                    sims=args.anchor_sims,
+                    games=args.anchor_games,
+                    every=args.anchor_every,
+                    dtype=args.inference_dtype,
+                    results=Path(ckpt_dir) / "anchors.jsonl",
+                )
+            )
+        except ValueError as e:
+            parser.error(str(e))
+        if monitor is not None:
+            describe_scores(monitor, ["anchor_elo"])
 
     # each epoch collects `collection_steps_per_epoch` self-play steps in each of
     # `batch_size` environments, then takes `train_steps_per_epoch` training steps
@@ -798,6 +928,7 @@ def main():
         train_steps_per_epoch=args.train_steps,
         advance_every=args.advance_every,
         grad_accum_steps=args.grad_accum,
+        grad_noise=args.grad_noise,
         nn=network,
         nn_state=network_state,
         loss_fn=partial(az_default_loss_fn, value_target_q=args.value_target_q),

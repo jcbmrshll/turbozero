@@ -29,7 +29,8 @@ from core.memory.replay_memory import (
 from core.pytree import where_tree
 from core.testing.tester import BaseTester, TestState
 from core.training.exploration import Exploration
-from core.training.lr_plateau import LRPlateau, LRPlateauProgress, LRPlateauState
+from core.training.lr_plateau import LRPlateau, LRPlateauState
+from core.training.plateau import PlateauProgress
 from core.training.schedule import EvaluatorSchedule, describe
 from core.training.tree_positions import (
     TreePositions,
@@ -137,8 +138,8 @@ class TrainLoopOutput:
         cur_epoch: current epoch num
         key: (optional) the training loop's rng, for the next epoch. With it, a run continued
             from this state carries on exactly as if it hadn't stopped (see `Trainer.train_loop`).
-        lr_plateau: (optional) with the Trainer's `lr_plateau`, the rule's progress at the
-            current rate (its index is in the optimizer's state)
+        lr_plateau: (optional) with the Trainer's `lr_plateau`, its plateau's progress at the
+            current rate (the rate's index is in the optimizer's state)
     """
 
     collection_state: CollectionState
@@ -146,9 +147,7 @@ class TrainLoopOutput:
     test_states: list[TestState]
     cur_epoch: int
     key: jax.Array | None = None
-    lr_plateau: LRPlateauProgress | None = field(
-        default=None, metadata={"static": True}
-    )
+    lr_plateau: PlateauProgress | None = field(default=None, metadata={"static": True})
 
 
 def extract_params(state: TrainState) -> Any:
@@ -310,6 +309,34 @@ def update_size_metrics(params: Any, updates: Any) -> dict:
     }
 
 
+def gradient_noise_metrics(
+    grad_sum: Any, squared_norm_sum: jax.Array, steps: int
+) -> dict:
+    """How much of an epoch's gradients is signal, from the sum of its `steps` steps' gradients g_t
+    and of their squared norms:
+    - `grad_mean_norm`: the norm of their mean, ||mean(g_t)||
+    - `grad_spread`: the steps' spread around it, sqrt(sum_t ||g_t - mean||^2 / (steps - 1))
+    - `grad_snr`: the mean's squared norm, less what the spread alone would give it
+      (spread^2 / steps), relative to the spread squared: the signal-to-noise ratio of one step's
+      gradient. Near 0, and as often below as above, once noise swamps the signal
+
+    The steps' parameters move as the epoch trains, so the spread counts that movement too, and the
+    mean is the direction the epoch's gradients kept to. A step's spread scales as one over its
+    batch: the gradient noise scale of McCandlish et al. (2018) is about the batch size / `grad_snr`.
+    """
+    if steps < 2:
+        raise ValueError("gradient noise needs at least 2 training steps an epoch")
+    mean_sq = squared_norm_sum / steps
+    mean = jax.tree.map(lambda g: g / steps, grad_sum)
+    mean_norm_sq = sum(jnp.sum(jnp.square(g)) for g in jax.tree.leaves(mean))
+    variance = (mean_sq - mean_norm_sq) * steps / (steps - 1)
+    return {
+        "grad_mean_norm": jnp.sqrt(mean_norm_sq),
+        "grad_spread": jnp.sqrt(jnp.maximum(variance, 0)),
+        "grad_snr": (mean_norm_sq - variance / steps) / variance,
+    }
+
+
 def restart_schedules(opt_state: Any) -> Any:
     """`opt_state` with its learning rate schedules' step counts back at 0, so that they start
     over: optax's `ScaleByScheduleState` (a schedule passed as an optimizer's learning rate), and
@@ -448,6 +475,7 @@ class Trainer:
         testers: Sequence[BaseTester],
         nn_state: eqx.nn.State | None = None,
         grad_accum_steps: int = 1,
+        grad_noise: bool = False,
         evaluator_test: Evaluator | None = None,
         test_env_init_fn: EnvInitFn | None = None,
         exploration: Exploration | None = None,
@@ -502,6 +530,10 @@ class Trainer:
                 mean of the micro-batches' updates (for BatchNorm's running mean, that's the
                 minibatch's; its running variance misses the variance between micro-batches' means).
                 Default 1: no accumulation.
+            grad_noise: (optional) also log how much of each epoch's gradients is signal and how much
+                noise (see `gradient_noise_metrics`), which takes one more copy of the parameters'
+                size while training. Training is the same, up to float rounding: the gradients are
+                kept for the sums, where XLA would otherwise fuse them into the optimizer's update
             evaluator_test: (optional) evaluator to use during testing. If not provided, `evaluator` is used
                 (required with a schedule of several evaluators).
             test_env_init_fn: (optional) environment initialization function for test episodes, e.g. to test from
@@ -546,11 +578,12 @@ class Trainer:
                 keeping only the newest of these, to `resume` the run from if it stops. A state takes
                 as much disk space as the replay buffers' device memory.
             lr_plateau: (optional) the `optimizer`'s learning rate, if it's an `LRPlateau`: after
-                every epoch, the rule is applied to the epoch's training loss (its mean `loss`),
-                dropping to the next rate when the current one plateaus, and with its `stop`, ending
-                training once the last does. It logs `lr_plateau_improvement`, the fitted
-                improvement, every epoch the window is full; `lr_drop`, the new rate, at the epoch
-                whose loss made it drop; and `lr_last_plateau`, the last rate, when that plateaus.
+                every epoch and its tests, the rule is applied to the epoch's measure of its
+                plateau's signal (e.g. its mean `loss`, or a tester's metric, on the epochs it's
+                logged), dropping to the next rate when the current one plateaus, and with its
+                `stop`, ending training once the last does. It logs `lr_plateau_improvement`, the
+                fitted improvement, every epoch it has one; `lr_drop`, the new rate, at the epoch
+                that made it drop; and `lr_last_plateau`, the last rate, when that plateaus.
                 A continued run carries on with the rule's progress (see `save_state`); a fork
                 starts again from the first rate (see `restart_schedules`).
             extra_config: (optional) extra config to record with the monitor's run
@@ -624,6 +657,9 @@ class Trainer:
                 f"{train_batch_size}, got {grad_accum_steps}"
             )
         self.grad_accum_steps = grad_accum_steps
+        if grad_noise and train_steps_per_epoch < 2:
+            raise ValueError("grad_noise needs at least 2 training steps an epoch")
+        self.grad_noise = grad_noise
         if lr_plateau is not None and train_steps_per_epoch < 1:
             raise ValueError("lr_plateau needs training steps, to measure the loss")
         # testing
@@ -704,6 +740,7 @@ class Trainer:
                 if self.grad_accum_steps > 1
                 else {}
             ),
+            **({"grad_noise": True} if self.grad_noise else {}),
             "evaluator_train": evaluator_train.__class__.__name__,
             "evaluator_train_config": evaluator_train.get_config(),
             **(
@@ -1104,6 +1141,13 @@ class Trainer:
         Returns:
             Tuple[TrainState, dict]: updated TrainState and metrics
         """
+        ts, metrics, _ = self.train_step_with_grads(ts, batch)
+        return ts, metrics
+
+    def train_step_with_grads(
+        self, ts: TrainState, batch: BaseExperience
+    ) -> tuple[TrainState, dict, Any]:
+        """`train_step`, also returning the step's gradients."""
         # calculate loss, get gradients
         nn = eqx.combine(ts.params, self.nn_static)
         grad_fn = eqx.filter_value_and_grad(self.loss_fn, has_aux=True)
@@ -1130,7 +1174,7 @@ class Trainer:
             "loss": loss,
             **injected_hyperparams(opt_state, scheduled_only=True),
         }
-        return ts, metrics
+        return ts, metrics, grads
 
     def accumulate_grads(
         self,
@@ -1225,10 +1269,8 @@ class Trainer:
             else None
         )
 
-        def step(
-            carry: tuple[jax.Array, TrainState], _
-        ) -> tuple[tuple[jax.Array, TrainState], dict]:
-            key, ts = carry
+        def step(carry: tuple, _) -> tuple[tuple, dict]:
+            key, ts, *noise = carry
             step_key, key = jax.random.split(key)
             # sample from replay memory
             indices = jnp.unravel_index(
@@ -1244,13 +1286,30 @@ class Trainer:
             transform_key, key = jax.random.split(key)
             batch = transform_randomly(transform_key, batch, self.transform_fns)
             # make training step
-            ts, metrics = self.train_step(ts, batch)
-            return (key, ts), metrics
+            if not noise:
+                ts, metrics = self.train_step(ts, batch)
+                return (key, ts), metrics
+            ts, metrics, grads = self.train_step_with_grads(ts, batch)
+            grad_sum, squared_norm_sum = noise
+            grad_sum = jax.tree.map(jnp.add, grad_sum, grads)
+            squared_norm_sum += sum(
+                jnp.sum(jnp.square(g)) for g in jax.tree.leaves(grads)
+            )
+            return (key, ts, grad_sum, squared_norm_sum), metrics
 
-        (_, train_state), metrics = jax.lax.scan(
-            step, (key, train_state), length=num_steps
-        )
-        return train_state, jax.tree.map(jnp.mean, metrics)
+        carry = (key, train_state)
+        if self.grad_noise:
+            # the steps' gradients summed, and their squared norms
+            carry += (
+                jax.tree.map(jnp.zeros_like, train_state.params),
+                jnp.zeros((), jnp.float32),
+            )
+        (_, train_state, *noise), metrics = jax.lax.scan(step, carry, length=num_steps)
+        metrics = jax.tree.map(jnp.mean, metrics)
+        if noise:
+            grad_sum, squared_norm_sum = noise
+            metrics |= gradient_noise_metrics(grad_sum, squared_norm_sum, num_steps)
+        return train_state, metrics
 
     def tree_sample_mask(self, state: CollectionState) -> jax.Array:
         """Marks the tree positions (see `tree_positions`) training can sample: those stored within
@@ -1443,6 +1502,11 @@ class Trainer:
         if self.monitor is not None:
             self.monitor.log(epoch, metrics)
 
+    def log_and_keep(self, metrics: dict, kept: dict, epoch: int) -> None:
+        """Logs metrics (see `log_metrics`), adding them to `kept` too."""
+        kept.update(metrics)
+        self.log_metrics(metrics, epoch)
+
     def set_activity(self, text: str | None, echo: bool = False) -> None:
         """Tells the monitor what the training loop is doing now, so the run's page can show
         what a slow step is busy with.
@@ -1632,8 +1696,8 @@ class Trainer:
                     f"{path} was saved by a run without lr_plateau: fork a run from it instead"
                 )
             progress = meta["lr_plateau"]
-            lr_plateau = LRPlateauProgress(
-                progress["epochs"], tuple(progress["losses"])
+            lr_plateau = PlateauProgress(
+                progress["epochs"], tuple((e, v) for e, v in progress["points"])
             )
         return TrainLoopOutput(
             collection_state=collection_state,
@@ -2074,41 +2138,46 @@ class Trainer:
         self,
         epoch: int,
         train_state: TrainState,
-        progress: LRPlateauProgress,
-        loss: jax.Array | float,
-    ) -> tuple[TrainState, LRPlateauProgress, dict, bool]:
-        """Applies `lr_plateau`'s rule after `epoch`, whose training loss was `loss`.
+        progress: PlateauProgress,
+        epoch_metrics: dict,
+    ) -> tuple[TrainState, PlateauProgress, dict, bool]:
+        """Applies `lr_plateau`'s rule after `epoch`, whose logged metrics were `epoch_metrics`.
 
         Returns:
-            Tuple[TrainState, LRPlateauProgress, dict, bool]: the train state, at the rate to train
+            Tuple[TrainState, PlateauProgress, dict, bool]: the train state, at the rate to train
                 the next epoch at; the rule's progress; its metrics (see `lr_plateau`); and whether
                 to stop training
         """
         rule = self.lr_plateau
         assert rule is not None
         index = int(lr_plateau_states(train_state.opt_state)[0].rate_index)
-        step = rule.after_epoch(progress, index, float(loss))
+        plateau = rule.plateau
+        value = epoch_metrics.get(plateau.signal)
+        step = rule.after_epoch(
+            progress, index, None if value is None else float(value)
+        )
         metrics = {}
         if step.improvement is not None:
             metrics["lr_plateau_improvement"] = step.improvement
         if not step.plateaued:
             return train_state, step.progress, metrics, False
         rate = rule.rates[index]
-        plateau = (
-            f"epoch {epoch}: the training loss improved {step.improvement:.4f} over the "
-            f"last {rule.window} epochs, under {rule.threshold:g}"
+        assert step.improvement is not None
+        happened = (
+            f"epoch {epoch}: {plateau.signal} improved {step.improvement:.4g} over the "
+            f"last {plateau.window} epochs, under {plateau.threshold:g}"
         )
         if step.index == index:
             metrics["lr_last_plateau"] = rate
             print(
-                f"{plateau}: the last learning rate, {rate:g}, has plateaued"
+                f"{happened}: the last learning rate, {rate:g}, has plateaued"
                 + (", stopping" if rule.stop else ""),
                 flush=True,
             )
             return train_state, step.progress, metrics, rule.stop
         metrics["lr_drop"] = rule.rates[step.index]
         print(
-            f"{plateau}: the learning rate drops from {rate:g} to "
+            f"{happened}: the learning rate drops from {rate:g} to "
             f"{rule.rates[step.index]:g}",
             flush=True,
         )
@@ -2263,7 +2332,7 @@ class Trainer:
             cur_epoch, evaluator, collection_state
         )
         if self.lr_plateau is not None and lr_progress is None:
-            lr_progress = LRPlateauProgress()
+            lr_progress = PlateauProgress()
         params = self.extract_model_params_fn(train_state)
         if not exact:
             # warmup
@@ -2323,15 +2392,13 @@ class Trainer:
                 epoch=cur_epoch,
             )
             params = self.extract_model_params_fn(train_state)
-            stop = False
-            if self.lr_plateau is not None and lr_progress is not None:
-                train_state, lr_progress, lr_metrics, stop = self.follow_lr_plateau(
-                    cur_epoch, train_state, lr_progress, metrics["loss"]
-                )
-                metrics = {**metrics, **lr_metrics}
-            # log metrics
-            self.log_metrics({**metrics, **collection_metrics}, cur_epoch)
+            # log metrics, keeping the epoch's for `lr_plateau`
+            epoch_metrics = {**metrics, **collection_metrics}
+            self.log_metrics(epoch_metrics, cur_epoch)
 
+            log_test_metrics = partial(
+                self.log_and_keep, kept=epoch_metrics, epoch=cur_epoch
+            )
             # test
             if cur_epoch % eval_every == 0:
                 for i, test_state in enumerate(tester_states):
@@ -2339,7 +2406,7 @@ class Trainer:
                     self.set_activity(
                         f"epoch {cur_epoch}: testing {self.testers[i].name}"
                     )
-                    new_test_state, metrics, episode = self.testers[i].run(
+                    new_test_state, test_metrics, episode = self.testers[i].run(
                         key=run_key,
                         epoch_num=cur_epoch,
                         max_steps=self.max_episode_steps,
@@ -2348,21 +2415,29 @@ class Trainer:
                         evaluator=self.evaluator_test,
                         state=test_state,
                         params=params,
-                        log_fn=partial(self.log_metrics, epoch=cur_epoch),
+                        log_fn=log_test_metrics,
                         activity_fn=lambda text, epoch=cur_epoch: self.set_activity(
                             f"epoch {epoch}: {text}", echo=True
                         ),
                     )
 
-                    if metrics:
-                        metrics = {k: v.mean() for k, v in metrics.items()}
-                        self.log_metrics(metrics, cur_epoch)
+                    if test_metrics:
+                        log_test_metrics({k: v.mean() for k, v in test_metrics.items()})
                     # the run's views draw the episode, so the training loop never does
                     if episode is not None and self.monitor is not None:
                         self.monitor.log(
                             cur_epoch, {f"{self.testers[i].name}_game": episode}
                         )
                     tester_states[i] = new_test_state
+            # after the tests, whose metrics may be its signal: the rate it sets is the next
+            # epoch's
+            stop = False
+            if self.lr_plateau is not None and lr_progress is not None:
+                train_state, lr_progress, lr_metrics, stop = self.follow_lr_plateau(
+                    cur_epoch, train_state, lr_progress, epoch_metrics
+                )
+                if lr_metrics:
+                    self.log_metrics(lr_metrics, cur_epoch)
             # save checkpoint
             self.set_activity(f"epoch {cur_epoch}: saving checkpoint")
             self.save_checkpoint(train_state, cur_epoch)

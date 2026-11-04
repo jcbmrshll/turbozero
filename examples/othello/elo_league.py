@@ -31,8 +31,9 @@ import re
 import subprocess
 import sys
 
-# only the player needs the GPU: everything else stays off it, where it would take memory
-if "play" not in sys.argv:
+# only the player needs the GPU: everything else stays off it, where it would take memory (train.py
+# imports the game, whose anchors play on its GPU)
+if __name__ == "__main__" and "play" not in sys.argv:
     os.environ["JAX_PLATFORMS"] = "cpu"
 
 from concurrent.futures import ThreadPoolExecutor
