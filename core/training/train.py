@@ -310,6 +310,34 @@ def update_size_metrics(params: Any, updates: Any) -> dict:
     }
 
 
+def reduce_step_metrics(metrics: dict) -> dict:
+    """An epoch's metrics from its training steps' (each array one value per step): their means,
+    besides what a mean hides, the spikes that come before training blows up:
+    - `grad_norm_max`, `grad_norm_median`: the largest and the median of the steps' global
+      gradient norms, and `grad_norm_spike`, their ratio
+    - `loss_spike`: the largest step's loss over the median step's
+    - `nonfinite_steps`: how many steps had a loss or gradient that wasn't finite (a count, not a mean)
+    """
+    out = {
+        name: jnp.mean(values)
+        for name, values in metrics.items()
+        if name != "nonfinite_steps"
+    }
+    if "grad_norm" in metrics:
+        grad_norm = metrics["grad_norm"]
+        median = jnp.median(grad_norm)
+        out["grad_norm_max"] = jnp.max(grad_norm)
+        out["grad_norm_median"] = median
+        out["grad_norm_spike"] = jnp.max(grad_norm) / jnp.maximum(median, 1e-12)
+    if "loss" in metrics:
+        out["loss_spike"] = jnp.max(metrics["loss"]) / jnp.maximum(
+            jnp.median(metrics["loss"]), 1e-12
+        )
+    if "nonfinite_steps" in metrics:
+        out["nonfinite_steps"] = jnp.sum(metrics["nonfinite_steps"]).astype(jnp.float32)
+    return out
+
+
 def restart_schedules(opt_state: Any) -> Any:
     """`opt_state` with its learning rate schedules' step counts back at 0, so that they start
     over: optax's `ScaleByScheduleState` (a schedule passed as an optimizer's learning rate), and
@@ -1116,6 +1144,7 @@ class Trainer:
         # apply gradients
         updates, opt_state = self.optimizer.update(grads, ts.opt_state, ts.params)
         update_size = update_size_metrics(ts.params, updates)
+        grad_norm = optax.tree.norm(grads).astype(jnp.float32)
         ts = replace(
             ts,
             params=optax.apply_updates(ts.params, updates),
@@ -1128,6 +1157,8 @@ class Trainer:
             **metrics,
             **update_size,
             "loss": loss,
+            "grad_norm": grad_norm,
+            "nonfinite_steps": ~(jnp.isfinite(loss) & jnp.isfinite(grad_norm)),
             **injected_hyperparams(opt_state, scheduled_only=True),
         }
         return ts, metrics
@@ -1250,7 +1281,7 @@ class Trainer:
         (_, train_state), metrics = jax.lax.scan(
             step, (key, train_state), length=num_steps
         )
-        return train_state, jax.tree.map(jnp.mean, metrics)
+        return train_state, reduce_step_metrics(metrics)
 
     def tree_sample_mask(self, state: CollectionState) -> jax.Array:
         """Marks the tree positions (see `tree_positions`) training can sample: those stored within
