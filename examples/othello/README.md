@@ -324,7 +324,10 @@ The training loss is measured against targets that improve as the network does, 
   direct games: no noise, XOT openings with both colours, and the same openings every time.
   It logs `anchor_<NAME>_score`, `anchor_<NAME>_elo` with `_se`, `anchor_elo` (all anchors at once,
   on their scale) and `anchor_seconds`, and appends each result to `anchors.jsonl` in
-  `--ckpt-dir`. The anchors can be logged without the rule too.
+  `--ckpt-dir`. The anchors can be logged without the rule too. For 8x128 on an RTX 5080, 400
+  games take about 17 s per anchor, a quarter of a 73 s epoch: two anchors every 10 epochs add
+  about 5% to training time. Rating a league checkpoint this way against two others gave 537 ± 14,
+  where the league had 541 ± 15.
 
 Over eight rated 6x96 and 8x128 phases, the stall is where a saturating fit to the phase's
 league Elo had under 20 Elo left to gain. The loss rule fired between 12 epochs before and 63
@@ -332,7 +335,8 @@ after the stall. The value error over 60 epochs fired 27 to 120 after, and never
 shortest phases. The anchors' Elo, simulated from league ratings with the noise of 400 games every
 10 epochs, fired about 17 before to 34 after, leaving more Elo behind (13 on average against 7). The
 loss stays the default. `--grad-noise` also logs how much of each epoch's gradients is signal
-(`grad_mean_norm`, `grad_spread`, `grad_snr`), a candidate signal with no history yet.
+(`grad_mean_norm`, `grad_spread`, `grad_snr`), a candidate signal with no history yet. It adds no
+measurable time to an 8x128 epoch.
 
 ```
 uv run examples/othello/train.py --epochs 600 --lr-plateau --lr-plateau-signal anchor-elo \
