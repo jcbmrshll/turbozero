@@ -53,6 +53,11 @@ with --resume, or to fork short runs from with --init-from (see README.md):
     uv run examples/othello/train.py --epochs 30 --init-from runs/trunk --ckpt-dir runs/fork-control
     uv run examples/othello/train.py --epochs 200 --save-state-every 10 --ckpt-dir runs/long
     uv run examples/othello/train.py --epochs 200 --save-state-every 10 --ckpt-dir runs/long --resume
+
+With --lr-plateau, the learning rate drops when the training loss stops improving instead,
+from --lr to each of its rates in turn, --epochs only capping the run (see README.md):
+
+    uv run examples/othello/train.py --epochs 600 --lr-plateau --save-state-every 10 --ckpt-dir runs/plateau
 """
 
 import argparse
@@ -100,6 +105,7 @@ from core.testing.scored_positions import ScoredPositionsTester
 from core.testing.tester import BaseTester
 from core.training.exploration import Exploration
 from core.training.loss_fns import az_default_loss_fn
+from core.training.lr_plateau import LRPlateau
 from core.training.schedule import EvaluatorSchedule, parse_schedule
 from core.training.train import Trainer
 from core.training.tree_positions import TreePositions
@@ -136,6 +142,25 @@ def lr_drops(text: str) -> list[tuple[float, float]]:
     if fractions != sorted(set(fractions)) or not 0 < fractions[0] <= fractions[-1] < 1:
         raise argparse.ArgumentTypeError(f"{text!r}: fractions rise, between 0 and 1")
     return drops
+
+
+# the rates --lr-plateau drops to from --lr's 1e-3, as --lr-drops' do. On the training losses of
+# six rated 6x96 and 8x128 phases at 1e-3 and 1e-4, the rule (40 epochs, 0.004) fired between
+# about 7 epochs before and 36 after their Elo stopped rising
+DEFAULT_LR_PLATEAU = [1e-4, 1e-5]
+
+
+def rate_list(text: str) -> list[float]:
+    """Parses --lr-plateau: learning rates separated by commas, each below the last."""
+    try:
+        rates = [float(rate) for rate in text.split(",")]
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected learning rates separated by commas, e.g. 1e-4,1e-5, got {text!r}"
+        ) from None
+    if any(rate <= 0 for rate in rates) or rates != sorted(set(rates), reverse=True):
+        raise argparse.ArgumentTypeError(f"{text!r}: rates fall, and are positive")
+    return rates
 
 
 def positive_schedule(text: str) -> list[tuple[int, int]]:
@@ -185,7 +210,7 @@ def main():
     )
     sims = parser.add_mutually_exclusive_group()
     sims.add_argument(
-        "--sims", type=int, default=64, help="MCTS iterations per self-play move"
+        "--sims", type=int, default=128, help="MCTS iterations per self-play move"
     )
     sims.add_argument(
         "--sims-schedule",
@@ -199,9 +224,10 @@ def main():
     parser.add_argument(
         "--tree-factor",
         type=float,
-        default=2.0,
+        default=4.0,
         help="self-play search tree capacity, in nodes per MCTS iteration (the tree is "
-        "kept between moves, so it needs room for the reused subtree too)",
+        "kept between moves, so it needs room for the reused subtree too; at 2, reused "
+        "trees fill and searches get clipped)",
     )
     parser.add_argument(
         "--traversal-steps",
@@ -242,12 +268,12 @@ def main():
     parser.add_argument(
         "--sampling-moves",
         type=int,
-        default=None,
+        default=20,
         metavar="N",
         help="self-play samples moves in proportion to visit counts for the first N "
         "moves of a game, then plays the most-visited move, as AlphaZero (30) and "
         "OLIVAW (20) did. N counts from the standard start, so it includes an XOT "
-        "opening's 8 moves. By default every move is sampled",
+        "opening's 8 moves. 0 samples none; one past a game's length, every move",
     )
     parser.add_argument(
         "--dirichlet-alpha",
@@ -270,7 +296,7 @@ def main():
         "network, see --remat and --grad-accum, which keep the batch",
     )
     parser.add_argument(
-        "--train-steps", type=int, default=128, help="training steps per epoch"
+        "--train-steps", type=int, default=256, help="training steps per epoch"
     )
     parser.add_argument(
         "--remat",
@@ -293,8 +319,8 @@ def main():
     parser.add_argument(
         "--buffer",
         type=int,
-        default=375,
-        help="replay memory: positions kept per environment (375 is about 3 epochs of "
+        default=1125,
+        help="replay memory: positions kept per environment (1125 is about 9 epochs of "
         "self-play). Training maps each position it samples through a random symmetry",
     )
     parser.add_argument(
@@ -313,6 +339,45 @@ def main():
         default=None,
         help="hold --lr and drop in steps: FRACTION:LR,... of the run's training steps "
         "(default: 0.7:1e-4,0.9:1e-5, two drops of 10x)",
+    )
+    parser.add_argument(
+        "--lr-plateau",
+        type=rate_list,
+        nargs="?",
+        const=DEFAULT_LR_PLATEAU,
+        default=None,
+        metavar="LR,...",
+        help="instead of --lr-drops' schedule, hold --lr and drop to each of these in turn when "
+        "the training loss stops improving: when it improved by less than "
+        "--lr-plateau-threshold over the last --lr-plateau-window epochs, by the slope of a "
+        "least-squares line through the epochs' losses, after at least --lr-plateau-min-epochs "
+        "epochs at the rate (default: 1e-4,1e-5). A fork starts again at --lr",
+    )
+    parser.add_argument(
+        "--lr-plateau-window",
+        type=int,
+        default=40,
+        metavar="EPOCHS",
+        help="with --lr-plateau, the epochs the loss's improvement is measured over",
+    )
+    parser.add_argument(
+        "--lr-plateau-threshold",
+        type=float,
+        default=0.004,
+        help="with --lr-plateau, the improvement over the window below which the rate drops",
+    )
+    parser.add_argument(
+        "--lr-plateau-min-epochs",
+        type=int,
+        default=40,
+        metavar="EPOCHS",
+        help="with --lr-plateau, the epochs to train at a rate before it can drop",
+    )
+    parser.add_argument(
+        "--lr-plateau-stop",
+        action="store_true",
+        help="with --lr-plateau, end the run once the last rate plateaus, before --epochs "
+        "(--vs-engine-last's games are then not played)",
     )
     parser.add_argument(
         "--weight-decay",
@@ -555,8 +620,24 @@ def main():
         parser.error("--resume needs the run's --ckpt-dir")
     if args.init_without_buffers and args.init_from is None:
         parser.error("--init-without-buffers needs --init-from")
-    if args.lr_final is not None and args.lr_drops:
-        parser.error("--lr-final and --lr-drops are different schedules: pass one")
+    if sum(x is not None for x in (args.lr_final, args.lr_drops, args.lr_plateau)) > 1:
+        parser.error(
+            "--lr-final, --lr-drops and --lr-plateau are different schedules: pass one"
+        )
+    lr_plateau = None
+    if args.lr_plateau is not None:
+        if args.lr_plateau[0] >= args.lr:
+            parser.error("--lr-plateau's rates must be below --lr")
+        try:
+            lr_plateau = LRPlateau(
+                (args.lr, *args.lr_plateau),
+                window=args.lr_plateau_window,
+                threshold=args.lr_plateau_threshold,
+                min_epochs=args.lr_plateau_min_epochs,
+                stop=args.lr_plateau_stop,
+            )
+        except ValueError as e:
+            parser.error(str(e))
     if args.no_persist_tree and args.count_reused_visits:
         parser.error(
             "--count-reused-visits counts the visits of the subtree a search keeps, which "
@@ -721,14 +802,16 @@ def main():
         nn=network,
         nn_state=network_state,
         loss_fn=partial(az_default_loss_fn, value_target_q=args.value_target_q),
-        # decays from --lr to --lr-final over the run
+        # decays from --lr to --lr-final over the run, drops at --lr-drops, or on plateaus
         optimizer=make_optimizer(
             args.epochs * args.train_steps,
             args.lr,
             args.lr if args.lr_final is None else args.lr_final,
             args.weight_decay,
             args.lr_drops or (DEFAULT_LR_DROPS if args.lr_final is None else ()),
+            lr_plateau=lr_plateau,
         ),
+        lr_plateau=lr_plateau,
         evaluator=evaluator,
         # stores `capacity` positions for each of the `batch_size` environments
         memory_buffer=EpisodeReplayBuffer(capacity=args.buffer),
@@ -757,9 +840,7 @@ def main():
         keep_every=args.keep_every,
         # how often self-play games are drawn
         episode_metrics_fn=episode_metrics,
-        exploration=Exploration(num_sampling_moves=args.sampling_moves)
-        if args.sampling_moves is not None
-        else None,
+        exploration=Exploration(num_sampling_moves=args.sampling_moves),
         save_state_at=args.save_state_at,
         save_state_every=args.save_state_every,
         # every argument but how the run starts (a fork records its parent)

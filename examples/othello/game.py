@@ -21,6 +21,7 @@ from core.evaluators.mcts.mcts import MCTS
 from core.memory.replay_memory import BaseExperience
 from core.networks.spec import make_network as build_network
 from core.networks.spec import network_config
+from core.training.lr_plateau import LRPlateau
 from core.training.train import checkpoint_epochs, checkpoint_path, weight_decay_mask
 from core.types import StepMetadata
 
@@ -176,10 +177,13 @@ def make_optimizer(
     lr_final: float = 1e-4,
     weight_decay: float = WEIGHT_DECAY,
     lr_drops: Sequence[tuple[float, float]] = (),
+    lr_plateau: LRPlateau | None = None,
 ) -> optax.GradientTransformation:
     """AdamW, with the learning rate decaying from `lr` to `lr_final` over
     `total_steps` training steps, along a cosine, or with `lr_drops`, held at `lr` and then
-    dropping in steps: each (fraction of `total_steps`, the learning rate from there on). And
+    dropping in steps: each (fraction of `total_steps`, the learning rate from there on), or
+    with `lr_plateau`, its rates, dropping when training stops improving (the trainer's
+    `lr_plateau` too; `lr`, `lr_final` and `lr_drops` are unused). And
     weight decay on the network's weights, not its biases or BatchNorm scales and offsets (see
     `weight_decay_mask`). Its hyperparameters are injected, for the trainer to record them and
     log the learning rate."""
@@ -198,7 +202,7 @@ def make_optimizer(
             },
         )
     return optax.inject_hyperparams(optax.adamw, static_args=("mask",))(
-        learning_rate=schedule,
+        learning_rate=schedule if lr_plateau is None else lr_plateau,
         weight_decay=weight_decay,
         mask=weight_decay_mask,
     )
