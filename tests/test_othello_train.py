@@ -3,6 +3,7 @@
 import sys
 
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from example_modules import load_example
 
@@ -88,5 +89,44 @@ def test_without_lr_plateau_the_rule_is_off(monkeypatch):
     ],
 )
 def test_bad_lr_plateau_options_are_refused(monkeypatch, options):
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, *options)
+
+
+def test_lr_plateau_can_watch_the_engine_sets_value_error(monkeypatch, tmp_path):
+    from test_engine_set import tiny_set
+
+    tiny_set(np.random.default_rng(0)).save(tmp_path / "set.npz")
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(
+            monkeypatch,
+            "--lr-plateau",
+            "--lr-plateau-metric",
+            "engine_value_mse",
+            "--engine-eval-every",
+            "1",
+            "--engine-set",
+            str(tmp_path / "set.npz"),
+        )
+    assert built.value.kwargs["lr_plateau_metric"] == "engine_value_mse"
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        # without the rule
+        ("--lr-plateau-metric", "engine_value_mse", "--engine-eval-every", "1"),
+        # without the set scored every epoch
+        (
+            "--lr-plateau",
+            "--lr-plateau-metric",
+            "engine_value_mse",
+            "--engine-eval-every",
+            "2",
+        ),
+        ("--lr-plateau", "--lr-plateau-metric", "engine_value_mse"),
+    ],
+)
+def test_lr_plateau_metric_needs_the_rule_and_the_set_every_epoch(monkeypatch, options):
     with pytest.raises(SystemExit):
         run_main(monkeypatch, *options)

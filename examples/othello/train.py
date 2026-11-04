@@ -374,6 +374,17 @@ def main():
         help="with --lr-plateau, the epochs to train at a rate before it can drop",
     )
     parser.add_argument(
+        "--lr-plateau-metric",
+        default="loss",
+        choices=["loss", "engine_value_mse", "engine_exp_regret"],
+        help="with --lr-plateau, what the rule watches: the training loss, or the network's raw value "
+        "error (engine_value_mse) or expected regret (engine_exp_regret) on the engine-labelled set "
+        "(see --engine-set), fixed positions whose targets don't move as the network improves. "
+        "Scored every epoch for it (--engine-eval-every 1). A conservative setting that waits for "
+        "Elo to stop rising (small Othello nets): engine_value_mse with --lr-plateau-window 60 "
+        "--lr-plateau-threshold 0.005",
+    )
+    parser.add_argument(
         "--lr-plateau-stop",
         action="store_true",
         help="with --lr-plateau, end the run once the last rate plateaus, before --epochs "
@@ -638,6 +649,13 @@ def main():
             )
         except ValueError as e:
             parser.error(str(e))
+    if args.lr_plateau_metric != "loss":
+        if args.lr_plateau is None:
+            parser.error("--lr-plateau-metric goes with --lr-plateau")
+        if args.engine_eval_every != 1:
+            parser.error(
+                f"--lr-plateau-metric {args.lr_plateau_metric} needs --engine-eval-every 1"
+            )
     if args.no_persist_tree and args.count_reused_visits:
         parser.error(
             "--count-reused-visits counts the visits of the subtree a search keeps, which "
@@ -745,6 +763,10 @@ def main():
         )
     # the network's raw moves and values against Edax's, on the engine-labelled set
     engine_set = load_engine_set(parser, args)
+    if engine_set is None and args.lr_plateau_metric != "loss":
+        parser.error(
+            f"--lr-plateau-metric {args.lr_plateau_metric} needs an engine-labelled set"
+        )
     if engine_set is not None:
         testers.append(
             ScoredPositionsTester(
@@ -812,6 +834,7 @@ def main():
             lr_plateau=lr_plateau,
         ),
         lr_plateau=lr_plateau,
+        lr_plateau_metric=args.lr_plateau_metric,
         evaluator=evaluator,
         # stores `capacity` positions for each of the `batch_size` environments
         memory_buffer=EpisodeReplayBuffer(capacity=args.buffer),
