@@ -403,7 +403,20 @@ def test_a_match_replays_from_its_seed_however_many_play_at_once():
     assert np.array_equal(results(8, 0), results(3, 0))
 
 
-def test_export_matches_the_network():
+@pytest.mark.parametrize(
+    "norm",
+    [
+        "batch",
+        "layer",
+        "group",
+        "rms",
+        "channel",
+        "fixed",
+        "ws",
+        *(f"{norm},layout=pre" for norm in ("batch", "layer", "channel", "rms")),
+    ],
+)
+def test_export_matches_the_network(norm):
     import equinox as eqx
     from cpu_search import openvino_eval, ort_eval, ort_session
     from export_onnx import to_onnx
@@ -412,9 +425,21 @@ def test_export_matches_the_network():
     from core.networks.utils import apply_nn
 
     network, state = make_network(
-        "resnet:2x8,pool_every=2,heads=pooled,pool_channels=4,head_channels=4"
+        "resnet:2x8,pool_every=2,heads=pooled,pool_channels=4,head_channels=4,"
+        f"norm={norm},norm_groups=2"
     )
-    model = eqx.nn.inference_mode(network)
+    # random scales and offsets in the normalizations, and every weight nonzero (the
+    # pre-activation branches start at zero), so that they're all checked
+    rng = np.random.default_rng(1)
+    params, static = eqx.partition(network, eqx.is_inexact_array)
+    params = jax.tree.map(
+        lambda x: (
+            x
+            + (0.3 if x.ndim == 1 else 0.05) * rng.normal(size=x.shape).astype(x.dtype)
+        ),
+        params,
+    )
+    model = eqx.nn.inference_mode(eqx.combine(params, static))
     x = np.random.default_rng(0).random((5, 8, 8, 2)) < 0.3
     (logits, values), _ = apply_nn(model, state, jnp.asarray(x, jnp.float32))
     graph = to_onnx(model, state).SerializeToString()
@@ -438,7 +463,8 @@ def test_an_arm_names_a_quantized_model_and_a_precision():
     assert model_and_precision("net", "int8-a_b-bf16")[1] == "bf16"
 
 
-def test_float_heads_stay_unquantized_and_follow_the_network():
+@pytest.mark.parametrize("norm", ["batch", "layer"])
+def test_float_heads_stay_unquantized_and_follow_the_network(norm):
     import equinox as eqx
     import openvino as ov
     from cpu_search import openvino_eval
@@ -447,7 +473,8 @@ def test_float_heads_stay_unquantized_and_follow_the_network():
     from quantize import BEST, quantize_graph
 
     network, state = make_network(
-        "resnet:2x8,pool_every=2,heads=pooled,pool_channels=4,head_channels=4"
+        "resnet:2x8,pool_every=2,heads=pooled,pool_channels=4,head_channels=4,"
+        f"norm={norm}"
     )
     graph = to_onnx(eqx.nn.inference_mode(network), state).SerializeToString()
     x = (np.random.default_rng(0).random((64, 2, 8, 8)) < 0.3).astype(np.float32)

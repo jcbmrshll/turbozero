@@ -9,11 +9,15 @@ from core.networks.azresnet import (
     AZResnet,
     AZResnetConfig,
     BottleneckBlock,
+    FixedScale,
+    GroupNorm,
     ResidualBlock,
     batch_norm,
     conv,
-    conv_bn,
+    conv_norm,
     inference_affine,
+    norm_maker,
+    residual_stats,
 )
 from core.networks.utils import BATCH_AXIS, apply_nn
 
@@ -58,7 +62,7 @@ def test_inference_folds_batch_norm_into_the_convolution(dtype, tolerance):
     state = with_statistics(bn, state, mean, var)
     x = jnp.asarray(rng.normal(size=(2, 4, 4)), dtype=jnp.float32)
 
-    y, _ = conv_bn(convolution, bn, x, state, jnp.dtype(dtype))
+    y, _ = conv_norm(convolution, bn, x, state, jnp.dtype(dtype))
 
     def channelwise(a):
         return np.asarray(a)[:, None, None]
@@ -89,12 +93,13 @@ def make_net(inference_dtype="float32", remat=False, train_dtype="float32"):
 
 def batch_norms(net: AZResnet) -> list[eqx.nn.BatchNorm]:
     assert isinstance(net.heads, AlphaZeroHeads)
-    return [net.stem_bn, net.heads.policy_bn, net.heads.value_bn] + [
-        bn
+    norms = [net.stem_norm, net.heads.policy_norm, net.heads.value_norm] + [
+        norm
         for block in net.blocks
         if isinstance(block, ResidualBlock)
-        for bn in (block.bn1, block.bn2)
+        for norm in (block.norm1, block.norm2)
     ]
+    return [norm for norm in norms if isinstance(norm, eqx.nn.BatchNorm)]
 
 
 def observations(rng: np.random.Generator, batch_size=4):
@@ -108,15 +113,15 @@ def unfolded(net: AZResnet, state, x):
         return bn(conv(x), state, inference=True)[0]
 
     x = jnp.moveaxis(x, -1, 0).astype(jnp.float32)
-    x = jax.nn.relu(conv_bn(net.stem_conv, net.stem_bn, x))
+    x = jax.nn.relu(conv_bn(net.stem_conv, net.stem_norm, x))
     for block in net.blocks:
         assert isinstance(block, ResidualBlock)
-        y = jax.nn.relu(conv_bn(block.conv1, block.bn1, x))
-        x = jax.nn.relu(x + conv_bn(block.conv2, block.bn2, y))
+        y = jax.nn.relu(conv_bn(block.conv1, block.norm1, x))
+        x = jax.nn.relu(x + conv_bn(block.conv2, block.norm2, y))
     heads = net.heads
     assert isinstance(heads, AlphaZeroHeads)
-    policy = jax.nn.relu(conv_bn(heads.policy_conv, heads.policy_bn, x))
-    value = jax.nn.relu(conv_bn(heads.value_conv, heads.value_bn, x))
+    policy = jax.nn.relu(conv_bn(heads.policy_conv, heads.policy_norm, x))
+    value = jax.nn.relu(conv_bn(heads.value_conv, heads.value_norm, x))
     policy = heads.policy_linear(policy.reshape(-1))
     value = jax.nn.relu(heads.value_hidden(value.reshape(-1)))
     value = jnp.tanh(heads.value_linear(value))
@@ -277,7 +282,7 @@ VARIANTS = {
 
 
 def make_variant(name: str, **options):
-    config = AZResnetConfig(policy_head_out_size=10, **VARIANTS[name], **options)
+    config = AZResnetConfig(policy_head_out_size=10, **{**VARIANTS[name], **options})
     return eqx.nn.make_with_state(AZResnet)(
         config, INPUT_SHAPE, key=jax.random.PRNGKey(0)
     )
@@ -333,7 +338,11 @@ def test_global_pooling_carries_information_across_the_board(pool_channels, reac
     # a basic block's two 3x3 convolutions reach two squares away; with global pooling a change
     # in one corner of a 7x7 board reaches the opposite corner
     block, state = eqx.nn.make_with_state(ResidualBlock)(
-        6, pool_channels, key=jax.random.PRNGKey(0)
+        6,
+        pool_channels,
+        key=jax.random.PRNGKey(0),
+        make_norm=norm_maker(board=(7, 7)),
+        stats=residual_stats(0)[0],
     )
     block = eqx.nn.inference_mode(block)
     x = np.abs(np.random.default_rng(0).normal(size=(6, 7, 7))).astype(np.float32)
@@ -344,3 +353,167 @@ def test_global_pooling_carries_information_across_the_board(pool_channels, reac
         return block(jnp.asarray(x), state, jnp.dtype("float32"))[0][:, 6, 6]
 
     assert np.allclose(far_corner(x), far_corner(y)) != reaches
+
+
+BATCH_INDEPENDENT = [
+    *(("post", norm) for norm in ("layer", "group", "rms", "channel", "fixed", "ws")),
+    *(("pre", norm) for norm in ("layer", "group", "rms", "channel")),
+]
+
+
+@pytest.mark.parametrize("layout, norm", BATCH_INDEPENDENT)
+@pytest.mark.parametrize("name", VARIANTS)
+def test_batch_independent_norms_train_as_they_infer_one_input_at_a_time(
+    name, layout, norm
+):
+    # no state, and each input's outputs its own: the same in training as in inference, and
+    # whatever else is in the batch
+    net, state = make_variant(name, norm=norm, norm_groups=2, layout=layout)
+    # random scales and offsets, and every weight nonzero (the pre-activation branches start at
+    # zero), so that they're all checked
+    rng = np.random.default_rng(0)
+    params, static = eqx.partition(net, eqx.is_inexact_array)
+    params = jax.tree.map(
+        lambda x: (
+            x + (1 if x.ndim == 1 else 0.1) * rng.normal(size=x.shape).astype(x.dtype)
+        ),
+        params,
+    )
+    net = eqx.combine(params, static)
+    x = observations(rng, batch_size=8)
+
+    @eqx.filter_jit
+    def run(net, state, x):
+        training, _ = apply_nn(net, state, x)
+        inference, _ = apply_nn(eqx.nn.inference_mode(net), state, x)
+        alone, _ = apply_nn(net, state, x[:1])
+        return training, inference, alone
+
+    training, inference, alone = run(net, state, x)
+
+    assert jax.tree.leaves(state) == []
+    for a, b, c in zip(training, inference, alone, strict=True):
+        np.testing.assert_allclose(a, b, atol=1e-5, rtol=1e-5)
+        np.testing.assert_allclose(c, a[:1], atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "groups, center, over_board",
+    [(1, True, True), (2, True, True), (1, False, True), (1, True, False)],
+)
+def test_group_norm_normalizes_each_group_over_the_board_or_each_square(
+    groups, center, over_board
+):
+    rng = np.random.default_rng(0)
+    norm = GroupNorm(4, groups, center, over_board)
+    weight, bias = rng.normal(size=(2, 4)).astype(np.float32)
+    norm = eqx.tree_at(lambda n: (n.weight, n.bias), norm, (weight, bias))
+    x = (3 + 2 * rng.normal(size=(4, 3, 3))).astype(np.float32)
+
+    # (groups, normalized together, apart)
+    grouped = x.reshape(groups, -1, 1) if over_board else x.reshape(1, 4, -1)
+    if center:
+        grouped = grouped - grouped.mean(axis=1, keepdims=True)
+    rms = np.sqrt(np.mean(grouped**2, axis=1, keepdims=True) + norm.eps)
+    expected = (grouped / rms).reshape(x.shape) * weight[:, None, None]
+    np.testing.assert_allclose(
+        norm(jnp.asarray(x)), expected + bias[:, None, None], atol=1e-5
+    )
+
+
+def test_weight_standardization_ignores_the_scale_and_mean_of_the_weights():
+    # each output channel's weights to mean 0 and norm 1: scaling them, or shifting them, leaves
+    # the convolution as it was
+    norm = FixedScale(3, 0.5, standardize=True)
+    weight = jax.random.normal(jax.random.PRNGKey(0), (3, 2, 3, 3))
+
+    standardized = norm.conv_weight(weight)
+
+    np.testing.assert_allclose(
+        norm.conv_weight(7 * weight - 2), standardized, atol=1e-5
+    )
+    np.testing.assert_allclose(standardized.mean(axis=(1, 2, 3)), 0, atol=1e-6)
+    np.testing.assert_allclose(
+        np.sum(np.square(standardized), axis=(1, 2, 3)), 0.25, rtol=1e-4
+    )
+
+
+@pytest.mark.parametrize("norm", ["fixed", "ws"])
+def test_norm_free_branches_start_at_about_unit_variance(norm):
+    # the fixed scales stand in for normalization at initialization: each block's first
+    # convolution's output has about unit variance, as BatchNorm's would (within a few times:
+    # `residual_stats` takes features as independent, which they aren't), however deep
+    net, state = make_variant("global pooling", norm=norm, num_blocks=6)
+    rng = np.random.default_rng(0)
+    x = jnp.asarray(
+        np.moveaxis(observations(rng, batch_size=64), -1, 1), dtype=jnp.float32
+    )
+    dtype = jnp.dtype("float32")
+
+    def branches(x):
+        assert net.stem_norm is not None
+        h, _ = conv_norm(net.stem_conv, net.stem_norm, x, state, dtype)
+        h = jax.nn.relu(h)
+        outputs = []
+        for block in net.blocks:
+            assert isinstance(block, ResidualBlock)
+            y, _ = conv_norm(block.conv1, block.norm1, h, state, dtype)
+            outputs.append(y)
+            h, _ = block(h, state, dtype)
+        return jnp.stack(outputs)
+
+    # each channel's variance over the batch and the board, as BatchNorm normalizes it
+    y = jax.vmap(branches)(x)
+    variances = np.asarray(y.var(axis=(0, 3, 4)).mean(axis=-1))
+    assert np.all((0.3 < variances) & (variances < 5)), variances
+
+
+def test_residual_stats_grow_with_depth():
+    stats = residual_stats(4)
+
+    moments, variances = np.array(stats).T
+    # a ReLU of a standard normal: E[x^2] 1/2, variance 1/2 - 1/(2 pi)
+    np.testing.assert_allclose(moments[0], 0.5, atol=0.01)
+    np.testing.assert_allclose(variances[0], 0.5 - 1 / (2 * np.pi), atol=0.01)
+    assert np.all(np.diff(moments) > 0.5) and np.all(np.diff(variances) > 0.2)
+
+
+@pytest.mark.parametrize("name", VARIANTS)
+def test_pre_activation_batch_norm_infers_as_it_trained_on_its_batch(name):
+    # BatchNorm before each convolution: after one training step, inference on the same batch
+    # gives the outputs training did, as in the post-activation layout
+    net, state = make_variant(name, layout="pre")
+    x = observations(np.random.default_rng(0), batch_size=8)
+
+    @eqx.filter_jit
+    def run(net, state, x):
+        training, state = apply_nn(net, state, x)
+        inference, _ = apply_nn(eqx.nn.inference_mode(net), state, x)
+        return training, inference
+
+    training, inference = run(net, state, x)
+
+    for a, b in zip(inference, training, strict=True):
+        np.testing.assert_allclose(a, b, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("norm", ["fixed", "ws"])
+def test_fixed_scales_refuse_the_pre_activation_layout(norm):
+    with pytest.raises(ValueError, match="pre"):
+        make_variant("pooled heads", norm=norm, layout="pre")
+
+
+@pytest.mark.parametrize("name", ["global pooling", "bottleneck"])
+def test_the_pre_activation_trunk_starts_as_the_stem(name):
+    # x + branch, each branch's last convolution starting at zero: at initialization the trunk is
+    # the stem's output however deep, and the branches add to it once trained
+    net, state = make_variant(name, norm="channel", layout="pre")
+    x = jnp.moveaxis(observations(np.random.default_rng(0), 1)[0], -1, 0)
+    dtype = jnp.dtype("float32")
+
+    stem = net.stem_conv(x.astype(dtype))
+    trunk = stem
+    for block in net.blocks:
+        trunk, _ = block(trunk, state, dtype)
+
+    np.testing.assert_allclose(trunk, stem, atol=1e-6)
