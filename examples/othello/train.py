@@ -224,9 +224,10 @@ def main():
     parser.add_argument(
         "--tree-factor",
         type=float,
-        default=2.0,
+        default=4.0,
         help="self-play search tree capacity, in nodes per MCTS iteration (the tree is "
-        "kept between moves, so it needs room for the reused subtree too)",
+        "kept between moves, so it needs room for the reused subtree too; at 2, reused "
+        "trees fill and searches get clipped)",
     )
     parser.add_argument(
         "--traversal-steps",
