@@ -312,6 +312,35 @@ its own `--lr`: to carry on at 1e-4, fork with `--lr 1e-4 --lr-plateau 1e-5`.
 uv run examples/othello/train.py --epochs 600 --lr-plateau --save-state-every 10 --ckpt-dir runs/plateau
 ```
 
+The training loss is measured against targets that improve as the network does, so
+`--lr-plateau-signal` can follow a measure whose reference stays put instead:
+
+- `engine-value`: the value error on the engine-labelled set (`engine_value_mse`), by default over
+  60 epochs with threshold 0.004.
+- `anchor-elo`: the Elo against frozen networks of known rating (`anchor_elo`), by default 20 Elo
+  over 40 epochs. Each `--anchor NAME PATH NET ELO` is one such network, for example a league
+  player's checkpoint, net and rating at `--anchor-sims` (128). Every `--anchor-every` epochs (10)
+  the network plays `--anchor-games` (400) against each anchor, as the Elo league plays its
+  direct games: no noise, XOT openings with both colours, and the same openings every time.
+  It logs `anchor_<NAME>_score`, `anchor_<NAME>_elo` with `_se`, `anchor_elo` (all anchors at once,
+  on their scale) and `anchor_seconds`, and appends each result to `anchors.jsonl` in
+  `--ckpt-dir`. The anchors can be logged without the rule too.
+
+Over eight rated 6x96 and 8x128 phases, the stall is where a saturating fit to the phase's
+league Elo had under 20 Elo left to gain. The loss rule fired between 12 epochs before and 63
+after the stall. The value error over 60 epochs fired 27 to 120 after, and never in the two
+shortest phases. The anchors' Elo, simulated from league ratings with the noise of 400 games every
+10 epochs, fired about 17 before to 34 after, leaving more Elo behind (13 on average against 7). The
+loss stays the default. `--grad-noise` also logs how much of each epoch's gradients is signal
+(`grad_mean_norm`, `grad_spread`, `grad_snr`), a candidate signal with no history yet.
+
+```
+uv run examples/othello/train.py --epochs 600 --lr-plateau --lr-plateau-signal anchor-elo \
+    --anchor e50 $L/networks/950c7d69...eqx resnet:8x128,pool_every=2,heads=pooled,pool_channels=32 425 \
+    --anchor e580 $L/networks/5968b315...eqx resnet:8x128,pool_every=2,heads=pooled,pool_channels=32 761 \
+    --grad-noise --ckpt-dir runs/plateau-elo
+```
+
 ### Training on Modal
 
 `modal_jobs.py` runs train.py on Modal's GPUs, several at once, and brings the results to the

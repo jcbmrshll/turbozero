@@ -168,3 +168,43 @@ def fit_ratings(
         if counts[components[at]] == counts.max():
             elo = elo - elo[at]
     return Ratings(ids, elo, cov, components, games)
+
+
+@dataclass(frozen=True)
+class FixedScaleRating:
+    """A player's rating from its games against players of known ratings (see `rate_against`)."""
+
+    elo: float
+    sd: float
+
+
+def rate_against(
+    elos: Sequence[float] | np.ndarray,
+    scores: Sequence[float] | np.ndarray,
+    games: Sequence[int] | np.ndarray,
+    pair_draws: float = 1.0,
+    max_iterations: int = 100,
+    tolerance: float = 1e-4,
+) -> FixedScaleRating:
+    """The most likely rating of a player who scored `scores` (a draw counting half) in `games`
+    games against opponents rated `elos`, theirs held fixed, by Newton's method, with
+    `pair_draws` virtual draws against each as `fit_ratings` has, so that a perfect score stays
+    finite. Its standard deviation is the curvature's, the opponents' ratings taken as exact.
+    """
+    elo_of = np.asarray(elos, dtype=np.float64)
+    score = np.asarray(scores, dtype=np.float64) + pair_draws / 2
+    num = np.asarray(games, dtype=np.float64) + pair_draws
+    if not len(elo_of):
+        raise ValueError("no opponents to rate against")
+    # start where an even score against their mean would put it
+    elo = float(np.average(elo_of, weights=num))
+    for _ in range(max_iterations):
+        p = expected_score(elo - elo_of)
+        gradient = K * (score - num * p).sum()
+        curvature = K**2 * (num * p * (1 - p)).sum()
+        step = float(np.clip(gradient / curvature, -400.0, 400.0))
+        elo += step
+        if abs(step) < tolerance:
+            break
+    p = expected_score(elo - elo_of)
+    return FixedScaleRating(elo, float(1 / np.sqrt(K**2 * (num * p * (1 - p)).sum())))

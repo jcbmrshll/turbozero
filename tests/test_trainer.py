@@ -36,7 +36,8 @@ from core.networks.utils import apply_nn
 from core.testing.tester import BaseTester
 from core.testing.two_player_tester import TwoPlayerTester
 from core.training.loss_fns import az_default_loss_fn
-from core.training.lr_plateau import LRPlateau, LRPlateauProgress
+from core.training.lr_plateau import LRPlateau
+from core.training.plateau import Plateau, PlateauProgress
 from core.training.schedule import EvaluatorSchedule, describe
 from core.training.train import (
     CollectionStats,
@@ -44,6 +45,7 @@ from core.training.train import (
     TrainLoopOutput,
     checkpoint_epochs,
     extract_params,
+    gradient_noise_metrics,
     lr_plateau_states,
     read_state_meta,
     state_epochs,
@@ -1077,7 +1079,7 @@ def test_saved_states_must_fit_the_trainer(env, tmp_path, method, kwargs, match)
 
 
 # drops after at least 3 epochs at a rate, when its last 3 epochs' losses fell by less than 0.15
-PLATEAU = LRPlateau((1e-3, 1e-4, 1e-5), window=3, threshold=0.15, min_epochs=3)
+PLATEAU = LRPlateau((1e-3, 1e-4, 1e-5), Plateau(window=3, threshold=0.15, min_epochs=3))
 
 
 def plateau_trainer(env, ckpt_dir, rule=PLATEAU, **kwargs):
@@ -1171,10 +1173,10 @@ def test_a_resumed_run_carries_on_with_the_rule(env, tmp_path, fake_loop):
     falling_loss(fake_loop, resumed)
     output = resumed.train_loop(seed=0, num_epochs=12, initial_state=resumed.resume())
 
-    # the state holds the epochs at the rate and the window's losses
+    # the state holds the epochs at the rate and the window's losses, by epoch at the rate
     assert read_state_meta(state_path(str(tmp_path / "stopped"), 4))["lr_plateau"] == {
         "epochs": 4,
-        "losses": [float(jnp.float32(1 / e)) for e in (2, 3, 4)],
+        "points": [[e, float(jnp.float32(1 / e))] for e in (2, 3, 4)],
     }
     for name in ("lr_drop", "lr_last_plateau", "lr_plateau_improvement"):
         assert logged(resumed_monitor, name) == {
@@ -1200,7 +1202,7 @@ def test_a_fork_starts_the_rule_again_at_its_first_rate(env, tmp_path, fake_loop
         5: pytest.approx(1e-4),
         8: pytest.approx(1e-5),
     }
-    assert output.lr_plateau == LRPlateauProgress()
+    assert output.lr_plateau == PlateauProgress()
 
 
 def test_a_fork_switches_between_a_schedule_and_the_rule(env, tmp_path):
@@ -1229,6 +1231,62 @@ def test_a_fork_switches_between_a_schedule_and_the_rule(env, tmp_path):
     assert float(cast(Any, opt_state).hyperparams["learning_rate"]) == pytest.approx(
         1e-2
     )
+
+
+class SignalTester(FakeTester):
+    """Logs `signal` with `log_fn` after every `every` epochs, `values[n]` the nth time."""
+
+    def __init__(self, values, every, signal="anchor_elo"):
+        super().__init__()
+        self.values, self.every, self.signal = values, every, signal
+
+    def run(self, *args, log_fn=None, **kwargs):  # pyright: ignore[reportIncompatibleMethodOverride]
+        assert log_fn is not None
+        epoch = kwargs["epoch_num"]
+        if (epoch + 1) % self.every == 0:
+            log_fn({self.signal: self.values[epoch // self.every]})
+        return kwargs["state"], {}, None
+
+
+def test_the_rule_can_follow_a_testers_metric(env, tmp_path, fake_loop):
+    """Measured every 2 epochs, as games against anchors are, and better higher."""
+    rule = LRPlateau(
+        (1e-3, 1e-4),
+        Plateau("anchor_elo", maximize=True, window=4, threshold=5.0, min_epochs=4),
+    )
+    monitor = FakeMonitor()
+    # after epochs 1, 3, 5, ...: rising 10 a measure for 3 measures, then flat
+    tester = SignalTester([0.0, 10.0, 20.0, 30.0, 30.0, 30.0, 30.0, 30.0], every=2)
+    trainer = plateau_trainer(
+        env, tmp_path, rule=rule, testers=[tester], monitor=monitor
+    )
+    fake_loop(trainer)
+
+    output = trainer.train_loop(seed=0, num_epochs=12)
+
+    # the window of epochs 6-9 holds the measures after 7 and 9, 30 and 30, so the rate drops
+    # after epoch 9, the epoch whose tests measured it
+    assert logged(monitor, "lr_drop") == {9: pytest.approx(1e-4)}
+    # the window of epochs 0-3 holds 0 and 10, two epochs apart: 20 over 4 epochs
+    assert logged(monitor, "lr_plateau_improvement")[3] == pytest.approx(20.0)
+    assert rate_index(output.train_state) == 1
+
+
+def test_the_rule_can_follow_a_metric_a_tester_returns(env, tmp_path, fake_loop):
+    # FakeTester returns an outcome of 1 every epoch: flat, so it drops once the window's full
+    rule = LRPlateau(
+        (1e-3, 1e-4),
+        Plateau("outcome", window=3, threshold=0.1, min_epochs=3),
+    )
+    monitor = FakeMonitor()
+    trainer = plateau_trainer(
+        env, tmp_path, rule=rule, testers=[FakeTester()], monitor=monitor
+    )
+    fake_loop(trainer)
+
+    trainer.train_loop(seed=0, num_epochs=4)
+
+    assert logged(monitor, "lr_drop") == {2: pytest.approx(1e-4)}
 
 
 def test_lr_plateau_needs_its_optimizer_and_saved_progress(env, tmp_path):
@@ -1790,6 +1848,51 @@ def test_grad_accum_matches_one_minibatch_without_batch_norm(env, tmp_path):
     assert_trees_close(accumulated_metrics, whole_metrics)
 
 
+def test_gradient_noise_metrics():
+    # a mean of (1, 0), each step 1 off it in the second direction
+    grads = [{"w": jnp.array([1.0, s])} for s in (1.0, -1.0, 1.0, -1.0)]
+    grad_sum = jax.tree.map(lambda *g: sum(g), *grads)
+    squared_norm_sum = jnp.sum(jnp.stack([jnp.sum(jnp.square(g["w"])) for g in grads]))
+
+    metrics = gradient_noise_metrics(grad_sum, squared_norm_sum, 4)
+
+    assert float(metrics["grad_mean_norm"]) == pytest.approx(1.0)
+    # sum_t ||g_t - mean||^2 / (4 - 1) = 4 / 3
+    assert float(metrics["grad_spread"]) == pytest.approx(np.sqrt(4 / 3))
+    # (1 - (4 / 3) / 4) / (4 / 3)
+    assert float(metrics["grad_snr"]) == pytest.approx(0.5)
+
+
+def test_gradient_noise_leaves_training_as_it_was(env, tmp_path):
+    def train(grad_noise):
+        trainer = make_trainer(
+            env, tmp_path, grad_noise=grad_noise, train_steps_per_epoch=3
+        )
+        state = trainer.init_collection_state(jax.random.PRNGKey(0), trainer.batch_size)
+        state = replace(state, buffer_state=written(state.buffer_state, 8))
+        _, train_state, metrics = trainer.train_steps(
+            jax.random.PRNGKey(0), state, trainer.init_train_state(), 3
+        )
+        return train_state, metrics
+
+    plain_state, plain = train(False)
+    noisy_state, noisy = train(True)
+
+    # up to float rounding: XLA no longer fuses the gradients into Adam's update
+    assert_trees_close(noisy_state, plain_state, rtol=1e-6, atol=1e-9)
+    assert_trees_close({k: noisy[k] for k in plain}, plain, rtol=1e-6, atol=1e-9)
+    assert noisy.keys() - plain.keys() == {"grad_mean_norm", "grad_spread", "grad_snr"}
+    assert all(np.isfinite(float(v)) for v in noisy.values())
+    assert float(noisy["grad_mean_norm"]) > 0 and float(noisy["grad_spread"]) > 0
+    for name in noisy.keys() - plain.keys():
+        assert any(fnmatch.fnmatchcase(name, p) for p in DECLARED)
+
+
+def test_gradient_noise_needs_two_steps_an_epoch(env, tmp_path):
+    with pytest.raises(ValueError, match="at least 2 training steps"):
+        make_trainer(env, tmp_path, grad_noise=True)
+
+
 def test_train_step_reports_the_scheduled_hyperparameters_it_used(env, tmp_path):
     trainer = make_trainer(
         env,
@@ -1853,7 +1956,7 @@ def test_grad_accum_updates_batch_norm_statistics_once_per_step(env, tmp_path):
 # replay buffer capacities no other test's arrays have, so the real trainer's replay buffers are
 # the live arrays of their shapes
 REAL_CAPACITY, REAL_TREE_CAPACITY = 37, 41
-REAL_PLATEAU = LRPlateau((1e-3, 1e-4), window=3, threshold=1e9, min_epochs=3)
+REAL_PLATEAU = LRPlateau((1e-3, 1e-4), Plateau(window=3, threshold=1e9, min_epochs=3))
 
 
 @pytest.fixture(scope="module")

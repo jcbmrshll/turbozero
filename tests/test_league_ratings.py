@@ -3,7 +3,12 @@
 import numpy as np
 import pytest
 
-from core.league.ratings import connected_components, expected_score, fit_ratings
+from core.league.ratings import (
+    connected_components,
+    expected_score,
+    fit_ratings,
+    rate_against,
+)
 from core.league.store import PairRecord
 
 
@@ -108,3 +113,41 @@ def test_no_players_and_no_games():
     fit = fit_ratings([3, 4], [])
     assert fit.elo.tolist() == [0.0, 0.0]
     assert not fit.connected
+
+
+def test_against_one_fixed_opponent_the_rating_is_its_score_in_elo():
+    # 300 of 400 with a virtual draw: (300.5 / 100.5) odds
+    rating = rate_against([120.0], [300.0], [400])
+    assert rating.elo == pytest.approx(120 + 400 * np.log10(300.5 / 100.5))
+    # an even score is the opponent's rating, with a 400-game match's error
+    even = rate_against([120.0], [200.0], [400])
+    assert even.elo == pytest.approx(120.0)
+    assert even.sd == pytest.approx(17.3, abs=0.1)
+
+
+def test_a_perfect_score_against_fixed_opponents_stays_finite():
+    rating = rate_against([0.0], [10.0], [10])
+    assert 300 < rating.elo < 800 and np.isfinite(rating.sd)
+
+
+def test_against_fixed_opponents_it_agrees_with_the_joint_fit():
+    """The fit of everyone with the opponents' ratings as they come out: the same rating."""
+    elo = np.array([0.0, 100.0, 300.0])
+    records = [r for r in simulated(np.append(elo, 180.0), 4000) if r.b == 3]
+    fit = fit_ratings(range(4), records, prior_sd=1e6)
+    known = fit.elo[:3]
+
+    # each record's wins are the opponent's
+    rating = rate_against(
+        known,
+        [r.losses + r.draws / 2 for r in records],
+        [r.wins + r.draws + r.losses for r in records],
+    )
+
+    assert rating.elo == pytest.approx(fit.elo[3], abs=1.0)
+    assert abs(rating.elo - known.mean() - 180 + elo.mean()) < 20
+
+
+def test_rating_needs_an_opponent():
+    with pytest.raises(ValueError, match="no opponents"):
+        rate_against([], [], [])

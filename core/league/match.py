@@ -82,6 +82,32 @@ class Program:
     config: dict[str, Any]
 
 
+def compile_program(
+    game: LeagueGame, network: Any, sims: int, tree_factor: int
+) -> Program:
+    """`network`'s search in `game` as a league player's, `sims` iterations a move with a tree of
+    `tree_factor` * `sims` nodes, compiled when first called."""
+    evaluator = game.make_evaluator(network, sims, tree_factor)
+    return Program(
+        init=jax.jit(jax.vmap(lambda state: evaluator.init(template_embedding=state))),
+        search=jax.jit(
+            jax.vmap(
+                lambda key, tree, state, params: evaluator.evaluate(
+                    key=key,
+                    eval_state=tree,
+                    env_state=state,
+                    root_metadata=game.metadata(state),
+                    params=params,
+                    env_step_fn=game.step_fn,
+                ),
+                in_axes=(0, 0, 0, None),
+            )
+        ),
+        advance=jax.jit(jax.vmap(evaluator.step)),
+        config=evaluator.get_config(),
+    )
+
+
 class Programs:
     """The programs compiled so far, and the networks loaded so far, most recent kept. Each
     program compiles when first called; `compiled` says whether any new one has been asked
@@ -115,37 +141,13 @@ class Programs:
         if found is None:
             assert player.sims is not None
             network, _ = self.network(player)
-            found = self._compile(network, player.sims, player.tree_factor)
+            found = compile_program(self.game, network, player.sims, player.tree_factor)
             self.programs[key] = found
             self.compiled = True
             if len(self.programs) > self.keep:
                 self.programs.popitem(last=False)
         self.programs.move_to_end(key)
         return found
-
-    def _compile(self, network: Any, sims: int, tree_factor: int) -> Program:
-        game = self.game
-        evaluator = game.make_evaluator(network, sims, tree_factor)
-        return Program(
-            init=jax.jit(
-                jax.vmap(lambda state: evaluator.init(template_embedding=state))
-            ),
-            search=jax.jit(
-                jax.vmap(
-                    lambda key, tree, state, params: evaluator.evaluate(
-                        key=key,
-                        eval_state=tree,
-                        env_state=state,
-                        root_metadata=game.metadata(state),
-                        params=params,
-                        env_step_fn=game.step_fn,
-                    ),
-                    in_axes=(0, 0, 0, None),
-                )
-            ),
-            advance=jax.jit(jax.vmap(evaluator.step)),
-            config=evaluator.get_config(),
-        )
 
     def settings(self, player: Player, games: int) -> dict[str, Any]:
         """Everything `player` plays with here, but for what it's playing on."""
