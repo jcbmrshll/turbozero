@@ -210,7 +210,7 @@ def main():
     )
     sims = parser.add_mutually_exclusive_group()
     sims.add_argument(
-        "--sims", type=int, default=64, help="MCTS iterations per self-play move"
+        "--sims", type=int, default=128, help="MCTS iterations per self-play move"
     )
     sims.add_argument(
         "--sims-schedule",
@@ -267,12 +267,12 @@ def main():
     parser.add_argument(
         "--sampling-moves",
         type=int,
-        default=None,
+        default=20,
         metavar="N",
         help="self-play samples moves in proportion to visit counts for the first N "
         "moves of a game, then plays the most-visited move, as AlphaZero (30) and "
         "OLIVAW (20) did. N counts from the standard start, so it includes an XOT "
-        "opening's 8 moves. By default every move is sampled",
+        "opening's 8 moves. 0 samples none; one past a game's length, every move",
     )
     parser.add_argument(
         "--dirichlet-alpha",
@@ -295,7 +295,7 @@ def main():
         "network, see --remat and --grad-accum, which keep the batch",
     )
     parser.add_argument(
-        "--train-steps", type=int, default=128, help="training steps per epoch"
+        "--train-steps", type=int, default=256, help="training steps per epoch"
     )
     parser.add_argument(
         "--remat",
@@ -318,8 +318,8 @@ def main():
     parser.add_argument(
         "--buffer",
         type=int,
-        default=375,
-        help="replay memory: positions kept per environment (375 is about 3 epochs of "
+        default=1125,
+        help="replay memory: positions kept per environment (1125 is about 9 epochs of "
         "self-play). Training maps each position it samples through a random symmetry",
     )
     parser.add_argument(
@@ -839,9 +839,7 @@ def main():
         keep_every=args.keep_every,
         # how often self-play games are drawn
         episode_metrics_fn=episode_metrics,
-        exploration=Exploration(num_sampling_moves=args.sampling_moves)
-        if args.sampling_moves is not None
-        else None,
+        exploration=Exploration(num_sampling_moves=args.sampling_moves),
         save_state_at=args.save_state_at,
         save_state_every=args.save_state_every,
         # every argument but how the run starts (a fork records its parent)
