@@ -71,13 +71,30 @@ class PolicyTarget:
         return {"policy_target": type(self).__name__}
 
 
+def visit_distribution(n: jax.Array) -> jax.Array:
+    """(F) visits normalized to a distribution; uniform if there are none."""
+    total = n.sum(axis=-1, keepdims=True)
+    return jnp.where(total > 0, n / jnp.maximum(total, 1), 1 / n.shape[-1])
+
+
 class VisitCounts(PolicyTarget):
-    """The root's visit distribution, as in AlphaZero; uniform if its children have none."""
+    """The root's visit distribution, as in AlphaZero; uniform if its children have none.
+
+    With `snapshot`, the distribution of the visits after the search's first
+    `MCTS.snapshot_iterations` iterations (`MCTSTree.root_snapshot_n`) instead: a shallower
+    search's target from the same search, whose full visits can still choose the move played.
+    """
+
+    def __init__(self, snapshot: bool = False):
+        self.snapshot = snapshot
+
+    def get_config(self) -> dict:
+        return {"snapshot": self.snapshot, **super().get_config()}
 
     def __call__(self, tree: MCTSTree, discount: float) -> jax.Array:
-        n = tree.get_child_data("n", tree.ROOT_INDEX)
-        total = n.sum(axis=-1)
-        return jnp.where(total > 0, n / jnp.maximum(total, 1), 1 / n.shape[-1])
+        if self.snapshot:
+            return visit_distribution(tree.root_snapshot_n)
+        return visit_distribution(tree.get_child_data("n", tree.ROOT_INDEX))
 
 
 class CompletedQ(PolicyTarget):

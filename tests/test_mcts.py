@@ -14,7 +14,7 @@ import pytest
 from core.evaluators.alphazero import AlphaZero
 from core.evaluators.mcts.action_selection import MCTSActionSelector, PUCTSelector
 from core.evaluators.mcts.mcts import MCTS
-from core.evaluators.mcts.policy_targets import CompletedQ
+from core.evaluators.mcts.policy_targets import CompletedQ, VisitCounts
 from core.evaluators.mcts.weighted_mcts import WeightedMCTS, WeightedMCTSNode
 
 AZ_MCTS = AlphaZero(MCTS)
@@ -290,7 +290,7 @@ def test_temperature_zero_plays_a_most_visited_move(fixed_length_env):
     tree = root_with_child_visits(search, env, [3, 0, 5, 5])
     keys = jax.random.split(jax.random.PRNGKey(0), 64)
 
-    actions, weights = jax.vmap(search.sample_root_action, in_axes=(0, None))(
+    actions, weights, _ = jax.vmap(search.sample_root_action, in_axes=(0, None))(
         keys, tree
     )
 
@@ -310,9 +310,9 @@ def test_moves_are_sampled_by_their_visits_to_the_power_of_one_over_the_temperat
     tree = root_with_child_visits(search, env, [3, 0, 5, 5])
     keys = jax.random.split(jax.random.PRNGKey(0), 4000)
 
-    actions, weights = jax.jit(jax.vmap(search.sample_root_action, in_axes=(0, None)))(
-        keys, tree
-    )
+    actions, weights, _ = jax.jit(
+        jax.vmap(search.sample_root_action, in_axes=(0, None))
+    )(keys, tree)
 
     frequencies = np.bincount(np.asarray(actions), minlength=4) / len(keys)
     np.testing.assert_allclose(
@@ -330,7 +330,7 @@ def test_the_move_is_chosen_by_visits_whatever_the_policy_target(fixed_length_en
         search, env, [(None, None, 9, 0.0), (0, 0, 5, 0.5), (0, 1, 3, -0.5)]
     )
 
-    action, weights = search.sample_root_action(jax.random.PRNGKey(0), tree)
+    action, weights, _ = search.sample_root_action(jax.random.PRNGKey(0), tree)
 
     assert int(action) == 0
     np.testing.assert_allclose(weights, CompletedQ()(tree, search.discount))
@@ -342,7 +342,7 @@ def test_a_root_without_visited_children_has_a_uniform_policy(fixed_length_env):
     search = make_mcts(num_actions=4)
     tree = root_with_child_visits(search, env, [0, 0, 0, 0])
 
-    _, weights = search.sample_root_action(jax.random.PRNGKey(0), tree)
+    _, weights, _ = search.sample_root_action(jax.random.PRNGKey(0), tree)
 
     np.testing.assert_allclose(weights, 0.25)
 
@@ -537,7 +537,11 @@ class KeyRecordingMCTS(MCTS):
 
     def sample_root_action(self, key, tree):
         self.record("sample_root_action", key)
-        return jnp.array(0), jnp.zeros((self.branching_factor,))
+        return (
+            jnp.array(0),
+            jnp.zeros((self.branching_factor,)),
+            jnp.zeros((self.branching_factor,)),
+        )
 
 
 def test_evaluate_gives_every_consumer_an_independent_key(env):
@@ -761,8 +765,9 @@ def search_until_done(search, env):
         {},
         {"count_reused_visits": True},
         {"count_reused_visits": True, "min_iterations": 2},
+        {"snapshot_iterations": 3},
     ],
-    ids=["iterations", "visits", "visits-min-2"],
+    ids=["iterations", "visits", "visits-min-2", "snapshot-3"],
 )
 def test_a_search_a_cycle_at_a_time_is_evaluate(env, cls, reused, budget):
     # with the root's evaluation first, the same keys, a tree too small for every iteration, and
@@ -1114,3 +1119,96 @@ def test_searches_in_a_tree_too_small_for_them(make_search, ttt, cls):
     # and values still reach the root
     out, _ = run_search(search, jax.random.PRNGKey(0), WIN_MOVES, ttt)
     assert out.action == WINNING_ACTION and root(out.eval_state).q > 0
+
+
+# a snapshot of the root's visits partway through the search
+
+
+@pytest.mark.parametrize("cls", BACKUPS)
+@pytest.mark.parametrize("reused", [False, True], ids=["empty", "reused"])
+def test_the_snapshot_is_the_roots_visits_after_its_first_iterations(env, cls, reused):
+    search = make_mcts(
+        cls,
+        max_nodes=16,
+        eval_fn=state_eval_fn,
+        num_iterations=6,
+        snapshot_iterations=3,
+    )
+    root_state, root_meta = env.init_fn(jax.random.PRNGKey(0))
+    tree = (
+        build_tree(search, env, SHAPES[2])
+        if reused
+        else search.init(template_embedding=root_state)
+    )
+    key = jax.random.PRNGKey(3)
+
+    full = jax.jit(search.evaluate, static_argnames="env_step_fn")(
+        key, tree, root_state, root_meta, None, env_step_fn=env.step_fn
+    )
+    # the root's evaluation and the first 3 iterations, with the same keys
+    partial_tree = jax.jit(search_cycles(search, env, [0, 1, 2, 3]))(key, tree)
+
+    snapshot = full.eval_state.root_snapshot_n
+    np.testing.assert_array_equal(snapshot, root_child_visits(partial_tree))
+    # a reused subtree's visits included: 3 more than the reused root's children had
+    before = root_child_visits(tree) if reused else 0
+    assert int(np.sum(snapshot) - np.sum(before)) == 3
+    assert int(np.sum(root_child_visits(full.eval_state)) - np.sum(before)) == 6
+
+
+def tree_with_a_snapshot(search, env, visits, snapshot):
+    tree = root_with_child_visits(search, env, visits)
+    return replace(tree, root_snapshot_n=jnp.asarray(snapshot, dtype=jnp.int32))
+
+
+def test_the_move_can_come_from_the_snapshot_and_the_target_from_the_full_search(
+    fixed_length_env,
+):
+    env = fixed_length_env(length=10, num_actions=3)
+    search = make_mcts(
+        temperature=0.0, num_iterations=8, snapshot_iterations=2, play_snapshot=True
+    )
+    tree = tree_with_a_snapshot(search, env, [1, 6, 1], [2, 0, 0])
+
+    action, target, played = search.sample_root_action(jax.random.PRNGKey(0), tree)
+
+    assert int(action) == 0
+    np.testing.assert_allclose(played, [1.0, 0.0, 0.0])
+    np.testing.assert_allclose(target, np.array([1, 6, 1]) / 8, rtol=1e-6)
+
+
+def test_the_target_can_come_from_the_snapshot_and_the_move_from_the_full_search(
+    fixed_length_env,
+):
+    env = fixed_length_env(length=10, num_actions=3)
+    search = make_mcts(
+        temperature=0.0,
+        num_iterations=8,
+        snapshot_iterations=2,
+        policy_target=VisitCounts(snapshot=True),
+    )
+    tree = tree_with_a_snapshot(search, env, [1, 6, 1], [2, 0, 0])
+
+    action, target, played = search.sample_root_action(jax.random.PRNGKey(0), tree)
+
+    assert int(action) == 1
+    np.testing.assert_allclose(played, np.array([1, 6, 1]) / 8, rtol=1e-6)
+    np.testing.assert_allclose(target, [1.0, 0.0, 0.0])
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({"snapshot_iterations": 0}, "snapshot_iterations must be 1 to"),
+        ({"snapshot_iterations": 5}, "snapshot_iterations must be 1 to"),
+        (
+            {"snapshot_iterations": 2, "count_reused_visits": True},
+            "can't go with count_reused_visits",
+        ),
+        ({"play_snapshot": True}, "need snapshot_iterations"),
+        ({"policy_target": VisitCounts(snapshot=True)}, "need snapshot_iterations"),
+    ],
+)
+def test_snapshot_settings_are_checked(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        make_mcts(num_iterations=4, **kwargs)

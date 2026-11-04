@@ -10,6 +10,7 @@ import pytest
 
 from core.common import step_env_and_evaluator
 from core.evaluators.evaluator import EvalOutput
+from core.evaluators.mcts.state import MCTSNode, MCTSOutput, init_mcts_tree
 from core.training.exploration import Exploration
 from core.types import StepMetadata
 
@@ -146,3 +147,24 @@ def test_collect_stores_the_evaluators_policy_not_the_move_played(
     buffer = collect(num_steps=4).buffer_state.buffer
 
     np.testing.assert_array_equal(buffer.policy_weights[0, :4], [[1, 0, 0]] * 4)
+
+
+def test_after_the_sampling_moves_the_greedy_move_follows_the_play_weights():
+    # the policy target favours action 2, the visits the move was drawn from action 0
+    template = MCTSNode(
+        n=jnp.array(0),
+        p=jnp.zeros(3),
+        q=jnp.array(0.0),
+        terminated=jnp.array(False),
+        embedding=jnp.array(0),
+    )
+    output = MCTSOutput(
+        eval_state=init_mcts_tree(1, 3, template),
+        action=jnp.array(1),
+        policy_weights=jnp.array([0.1, 0.2, 0.7]),
+        play_weights=jnp.array([0.6, 0.3, 0.1]),
+    )
+    actions = choose(
+        Exploration(num_sampling_moves=2), output, step_metadata([1, 1, 1], step=5)
+    )
+    assert set(np.asarray(actions).tolist()) == {0}

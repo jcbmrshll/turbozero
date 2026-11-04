@@ -130,3 +130,35 @@ def test_lr_plateau_can_watch_the_engine_sets_value_error(monkeypatch, tmp_path)
 def test_lr_plateau_metric_needs_the_rule_and_the_set_every_epoch(monkeypatch, options):
     with pytest.raises(SystemExit):
         run_main(monkeypatch, *options)
+
+
+@pytest.mark.parametrize(
+    "option, snapshot_target, play_snapshot",
+    [("--policy-sims", True, False), ("--play-sims", False, True)],
+)
+def test_policy_and_play_sims_snapshot_the_search(
+    monkeypatch, option, snapshot_target, play_snapshot
+):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, "--sims", "16", option, "8")
+    evaluator = built.value.kwargs["evaluator"].at(0)
+    assert evaluator.num_iterations == 16
+    assert evaluator.snapshot_iterations == 8
+    assert evaluator.policy_target.snapshot == snapshot_target
+    assert evaluator.play_snapshot == play_snapshot
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ("--sims", "16", "--policy-sims", "8", "--play-sims", "8"),
+        ("--sims", "16", "--policy-sims", "16"),
+        ("--sims", "16", "--play-sims", "0"),
+        ("--sims", "16", "--policy-sims", "8", "--count-reused-visits"),
+        ("--sims", "16", "--policy-sims", "8", "--policy-target", "completed-q"),
+        ("--sims", "16", "--policy-sims", "8", "--tree-positions", "4"),
+    ],
+)
+def test_bad_policy_and_play_sims_are_refused(monkeypatch, options):
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, *options)

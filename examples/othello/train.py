@@ -433,6 +433,25 @@ def main():
         "children the search found better (see core/evaluators/mcts/policy_targets.py)",
     )
     parser.add_argument(
+        "--policy-sims",
+        type=int,
+        default=None,
+        metavar="K",
+        help="train the policy on the root's visits after the self-play search's first K "
+        "iterations, while the move is still chosen from all --sims: a shallower search's "
+        "target from the same search (decouples the sims behind the policy targets from "
+        "those behind the games, so their value targets)",
+    )
+    parser.add_argument(
+        "--play-sims",
+        type=int,
+        default=None,
+        metavar="K",
+        help="choose the self-play move from the root's visits after the search's first K "
+        "iterations, while the policy trains on all --sims' visits: the mirror of "
+        "--policy-sims",
+    )
+    parser.add_argument(
         "--value-scale",
         type=float,
         default=0.1,
@@ -670,6 +689,27 @@ def main():
         parser.error("--dirichlet-epsilon must be between 0 and 1")
     if args.vs_engine_last > args.epochs:
         parser.error("--vs-engine-last can't be more than --epochs")
+    snapshot = args.policy_sims if args.policy_sims is not None else args.play_sims
+    if snapshot is not None:
+        if args.policy_sims is not None and args.play_sims is not None:
+            parser.error("--policy-sims and --play-sims can't go together")
+        stage_sims = [sims for _, sims in args.sims_schedule or [(0, args.sims)]]
+        if not 1 <= snapshot < min(stage_sims):
+            parser.error(
+                f"--policy-sims / --play-sims must be 1 to fewer than --sims ({min(stage_sims)})"
+            )
+        if args.count_reused_visits:
+            parser.error(
+                "--policy-sims / --play-sims can't go with --count-reused-visits: a search "
+                "can stop before its first K iterations"
+            )
+        if args.policy_sims is not None and (
+            args.policy_target != "visits" or args.tree_positions > 0
+        ):
+            # a tree position's target is the full search's visits below the root
+            parser.error(
+                "--policy-sims goes with --policy-target visits, without --tree-positions"
+            )
     if args.policy_target == "completed-q" and args.tree_positions > 0:
         # a tree position's target is its visits: the network's policy before the
         # search isn't kept below the root
@@ -718,7 +758,9 @@ def main():
                     traversal_steps=args.traversal_steps,
                     policy_target=CompletedQ(args.value_scale, args.maxvisit_init)
                     if args.policy_target == "completed-q"
-                    else VisitCounts(),
+                    else VisitCounts(snapshot=args.policy_sims is not None),
+                    snapshot_iterations=snapshot,
+                    play_snapshot=args.play_sims is not None,
                 ),
             )
             for epoch, sims in args.sims_schedule or [(0, args.sims)]
