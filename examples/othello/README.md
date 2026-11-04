@@ -129,16 +129,26 @@ from the AlphaZero paper with 6 blocks of 128 channels. Its variants
 - `block=bottleneck`: KataGo's nested bottleneck blocks, a 1x1 convolution down to
   half the width, a basic block (`bottleneck_inner` of them) and a 1x1 convolution
   back up, which cost under a third of a basic block.
-- `norm=`: what follows each convolution. `batch`, BatchNorm, is the default. The others
-  treat each position on its own, so the network has no state and training and play
-  compute the same function: `layer`, `group` (`norm_groups`) and `rms` normalize over
-  the channels and the board; `fixed` (KataGo's fixed variance initialization) and `ws`
-  (weight standardization) don't normalize, but scale each convolution to unit variance
-  at initialization. `fixed` and `ws` fold into the convolutions as BatchNorm does, so
-  play costs the same, and train steps are about 20% faster. `layer`, `group` and `rms`
-  cost an extra pass: self-play is 16% (`rms`) to 30% slower. At 4x64, 68 minutes, in
-  direct games against BatchNorm (one seed each, BatchNorm reruns about 16 Elo apart):
-  `ws` -49 ±12 at 128 visits and -39 ±14 at 1000; `fixed` and `rms` about -110.
+- `norm=`: the normalization. `batch`, BatchNorm, is the default. The others treat each
+  position on its own, so the network has no state and training and play compute the
+  same function: `channel` normalizes each square's channels (a transformer's per-token
+  LayerNorm), `layer`, `group` (`norm_groups`) and `rms` the channels and the board
+  together; `fixed` (KataGo's fixed variance initialization) and `ws` (weight
+  standardization) don't normalize, but scale each convolution to unit variance at
+  initialization, and fold into the convolutions as BatchNorm does.
+- `layout=pre`: the pre-activation residual network: a normalization and a ReLU before
+  each convolution, branches added to a trunk that is never normalized, and one more
+  normalization before the heads. Every branch reads unit-scale input however deep the
+  network, and each branch's last convolution starts at zero, so the network starts as
+  the stem and the heads. Not with `fixed` or `ws`.
+
+  On the 5080, `norm=channel,layout=pre` costs 4% of self-play and 10% of a train step
+  against BatchNorm (8x128), and 10-13% of CPU play in bf16; `layer`, `group` and `rms`
+  cost 16-30%. At 16x64, 40 epochs at 1e-3, it learned faster than BatchNorm (engine
+  regret 5.7 against 7.3 at epoch 8), where `ws` trailed and random-initialized
+  branches started 10-15 epochs late. In the post-activation layout, `ws`'s residual
+  stream grows multiplicatively with depth, and at 4x64, 68 minutes, it lost to
+  BatchNorm in direct games by 49 ±12 Elo at 128 visits (`fixed` and `rms` about 110).
 
 The default, `resnet:6x128,pool_every=2,heads=pooled` (`DEFAULT_NET` in `game.py`), has
 both kinds of global pooling. Trained for 50 epochs at 64 sims a move, then searching
