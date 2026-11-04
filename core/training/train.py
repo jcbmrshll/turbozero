@@ -4,7 +4,7 @@ import os
 import re
 import zipfile
 from collections.abc import Callable, Collection, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
@@ -29,6 +29,7 @@ from core.memory.replay_memory import (
 from core.pytree import where_tree
 from core.testing.tester import BaseTester, TestState
 from core.training.exploration import Exploration
+from core.training.lr_plateau import LRPlateau, LRPlateauProgress, LRPlateauState
 from core.training.schedule import EvaluatorSchedule, describe
 from core.training.tree_positions import (
     TreePositions,
@@ -136,6 +137,8 @@ class TrainLoopOutput:
         cur_epoch: current epoch num
         key: (optional) the training loop's rng, for the next epoch. With it, a run continued
             from this state carries on exactly as if it hadn't stopped (see `Trainer.train_loop`).
+        lr_plateau: (optional) with the Trainer's `lr_plateau`, the rule's progress at the
+            current rate (its index is in the optimizer's state)
     """
 
     collection_state: CollectionState
@@ -143,6 +146,9 @@ class TrainLoopOutput:
     test_states: list[TestState]
     cur_epoch: int
     key: jax.Array | None = None
+    lr_plateau: LRPlateauProgress | None = field(
+        default=None, metadata={"static": True}
+    )
 
 
 def extract_params(state: TrainState) -> Any:
@@ -307,7 +313,8 @@ def update_size_metrics(params: Any, updates: Any) -> dict:
 def restart_schedules(opt_state: Any) -> Any:
     """`opt_state` with its learning rate schedules' step counts back at 0, so that they start
     over: optax's `ScaleByScheduleState` (a schedule passed as an optimizer's learning rate), and
-    `optax.inject_hyperparams`' own step count and its schedules' states.
+    `optax.inject_hyperparams`' own step count and its schedules' states, an `LRPlateau`'s back
+    at its first rate.
 
     Everything else (e.g. Adam's moments, and the step count of its bias correction) is
     kept."""
@@ -321,6 +328,11 @@ def restart_schedules(opt_state: Any) -> Any:
     def restart_count(x: Any) -> Any:
         return x._replace(count=jnp.zeros_like(x.count))
 
+    def restart_schedule_state(x: Any) -> Any:
+        if isinstance(x, LRPlateauState):
+            return LRPlateauState(rate_index=jnp.zeros_like(x.rate_index))
+        return restart_count(x) if has_count(x) else x
+
     def restart(x: Any) -> Any:
         if isinstance(x, optax.ScaleByScheduleState):
             return restart_count(x)
@@ -329,9 +341,9 @@ def restart_schedules(opt_state: Any) -> Any:
             # each schedule counts its own steps (optax's `WrappedScheduleState`)
             x = x._replace(
                 hyperparams_states=jax.tree.map(
-                    lambda s: restart_count(s) if has_count(s) else s,
+                    restart_schedule_state,
                     x.hyperparams_states,
-                    is_leaf=has_count,
+                    is_leaf=lambda s: has_count(s) or isinstance(s, LRPlateauState),
                 )
             )
         return x
@@ -365,6 +377,33 @@ def injected_hyperparams(
             if not scheduled_only or name in scheduled
         )
     return hyperparams
+
+
+def _is_lr_plateau(x: Any) -> bool:
+    return isinstance(x, LRPlateauState)
+
+
+def lr_plateau_states(opt_state: Any) -> list[LRPlateauState]:
+    """The states of the `LRPlateau` schedules in `opt_state`."""
+    return [
+        x
+        for x in jax.tree.leaves(opt_state, is_leaf=_is_lr_plateau)
+        if _is_lr_plateau(x)
+    ]
+
+
+def with_rate_index(opt_state: Any, rate_index: int) -> Any:
+    """`opt_state` with its `LRPlateau` schedules at rate `rate_index`, in an array like the one
+    it replaces, so that nothing compiles again."""
+    return jax.tree.map(
+        lambda x: (
+            LRPlateauState(jnp.full_like(x.rate_index, rate_index))
+            if _is_lr_plateau(x)
+            else x
+        ),
+        opt_state,
+        is_leaf=_is_lr_plateau,
+    )
 
 
 def describe_fn(fn: Callable) -> dict:
@@ -423,6 +462,7 @@ class Trainer:
         keep_every: int | None = None,
         save_state_at: Collection[int] = (),
         save_state_every: int | None = None,
+        lr_plateau: LRPlateau | None = None,
         extra_config: dict | None = None,
     ):
         """Initializes a Trainer.
@@ -505,6 +545,14 @@ class Trainer:
             save_state_every: (optional) also save the whole training state after every this many epochs,
                 keeping only the newest of these, to `resume` the run from if it stops. A state takes
                 as much disk space as the replay buffers' device memory.
+            lr_plateau: (optional) the `optimizer`'s learning rate, if it's an `LRPlateau`: after
+                every epoch, the rule is applied to the epoch's training loss (its mean `loss`),
+                dropping to the next rate when the current one plateaus, and with its `stop`, ending
+                training once the last does. It logs `lr_plateau_improvement`, the fitted
+                improvement, every epoch the window is full; `lr_drop`, the new rate, at the epoch
+                whose loss made it drop; and `lr_last_plateau`, the last rate, when that plateaus.
+                A continued run carries on with the rule's progress (see `save_state`); a fork
+                starts again from the first rate (see `restart_schedules`).
             extra_config: (optional) extra config to record with the monitor's run
         """
         # environment
@@ -522,13 +570,17 @@ class Trainer:
         self.nn_state = nn_state
         self.loss_fn = loss_fn
         self.optimizer = optimizer
+        init_opt_state = jax.jit(optimizer.init)(eqx.filter(nn, eqx.is_inexact_array))
         # the injected hyperparameters' initial values, for the config
         self.optimizer_config = {
             name: _to_config(value)
-            for name, value in injected_hyperparams(
-                jax.jit(optimizer.init)(eqx.filter(nn, eqx.is_inexact_array))
-            ).items()
+            for name, value in injected_hyperparams(init_opt_state).items()
         }
+        if (lr_plateau is not None) != bool(lr_plateau_states(init_opt_state)):
+            raise ValueError(
+                "pass lr_plateau with an optimizer whose learning rate it is, and only then"
+            )
+        self.lr_plateau = lr_plateau
         self.extract_model_params_fn = extract_model_params_fn
         # data collection
         self.batch_size = batch_size
@@ -572,6 +624,8 @@ class Trainer:
                 f"{train_batch_size}, got {grad_accum_steps}"
             )
         self.grad_accum_steps = grad_accum_steps
+        if lr_plateau is not None and train_steps_per_epoch < 1:
+            raise ValueError("lr_plateau needs training steps, to measure the loss")
         # testing
         self.testers = testers
         if evaluator_test is None:
@@ -639,6 +693,11 @@ class Trainer:
             ),
             "loss_fn": describe_fn(self.loss_fn),
             "optimizer": self.optimizer_config or None,
+            **(
+                {"lr_plateau": self.lr_plateau.get_config()}
+                if self.lr_plateau is not None
+                else {}
+            ),
             "data_transforms": len(self.transform_fns),
             **(
                 {"grad_accum_steps": self.grad_accum_steps}
@@ -1452,7 +1511,7 @@ class Trainer:
     def save_state(self, state: TrainLoopOutput) -> str:
         """Saves the whole training state to `ckpt_dir`, as `state-<epochs done>.npz`: the train
         state, the collection state (with the replay buffers), the testers' states, the number of
-        epochs done and the training loop's rng.
+        epochs done, the training loop's rng, and with `lr_plateau`, the rule's progress.
 
         The run continues from it exactly (see `resume`), and new runs fork from it (see
         `train_loop`'s `fork_from`). It also records the run's configuration, its monitor run, and
@@ -1487,6 +1546,9 @@ class Trainer:
             else None,
             "monitor_run": self.monitor.run_id if self.monitor is not None else None,
             "parent": self.parent,
+            "lr_plateau": asdict(state.lr_plateau)
+            if state.lr_plateau is not None
+            else None,
             "config": {**self.get_config(), **self.extra_config},
             "leaves": {part: _describe(tree) for part, tree in parts.items()},
         }
@@ -1563,12 +1625,23 @@ class Trainer:
                 ),
             )
             key = _to_device(saved["key"])
+        lr_plateau = None
+        if self.lr_plateau is not None:
+            if meta["lr_plateau"] is None:
+                raise ValueError(
+                    f"{path} was saved by a run without lr_plateau: fork a run from it instead"
+                )
+            progress = meta["lr_plateau"]
+            lr_plateau = LRPlateauProgress(
+                progress["epochs"], tuple(progress["losses"])
+            )
         return TrainLoopOutput(
             collection_state=collection_state,
             train_state=train_state,
             test_states=test_states,
             cur_epoch=epoch,
             key=key,
+            lr_plateau=lr_plateau,
         )
 
     def resume(self, path: str | None = None) -> TrainLoopOutput:
@@ -2030,6 +2103,53 @@ class Trainer:
             search_cycles=jnp.zeros((num_envs,), dtype=jnp.int32),
         )
 
+    def follow_lr_plateau(
+        self,
+        epoch: int,
+        train_state: TrainState,
+        progress: LRPlateauProgress,
+        loss: jax.Array | float,
+    ) -> tuple[TrainState, LRPlateauProgress, dict, bool]:
+        """Applies `lr_plateau`'s rule after `epoch`, whose training loss was `loss`.
+
+        Returns:
+            Tuple[TrainState, LRPlateauProgress, dict, bool]: the train state, at the rate to train
+                the next epoch at; the rule's progress; its metrics (see `lr_plateau`); and whether
+                to stop training
+        """
+        rule = self.lr_plateau
+        assert rule is not None
+        index = int(lr_plateau_states(train_state.opt_state)[0].rate_index)
+        step = rule.after_epoch(progress, index, float(loss))
+        metrics = {}
+        if step.improvement is not None:
+            metrics["lr_plateau_improvement"] = step.improvement
+        if not step.plateaued:
+            return train_state, step.progress, metrics, False
+        rate = rule.rates[index]
+        plateau = (
+            f"epoch {epoch}: the training loss improved {step.improvement:.4f} over the "
+            f"last {rule.window} epochs, under {rule.threshold:g}"
+        )
+        if step.index == index:
+            metrics["lr_last_plateau"] = rate
+            print(
+                f"{plateau}: the last learning rate, {rate:g}, has plateaued"
+                + (", stopping" if rule.stop else ""),
+                flush=True,
+            )
+            return train_state, step.progress, metrics, rule.stop
+        metrics["lr_drop"] = rule.rates[step.index]
+        print(
+            f"{plateau}: the learning rate drops from {rate:g} to "
+            f"{rule.rates[step.index]:g}",
+            flush=True,
+        )
+        train_state = replace(
+            train_state, opt_state=with_rate_index(train_state.opt_state, step.index)
+        )
+        return train_state, step.progress, metrics, False
+
     def train_loop(
         self,
         seed: int,
@@ -2052,7 +2172,8 @@ class Trainer:
         Args:
             seed: rng seed (int)
             num_epochs: number of epochs to run the training loop for, in all: a continued run
-                stops after this many epochs, counting those done before
+                stops after this many epochs, counting those done before (or sooner, when
+                `lr_plateau` stops it)
             eval_every: number of epochs between evaluations
             initial_state: (optional) TrainLoopOutput, used to continue training from a previous state
                 - its collection state must hold the states of the self-play evaluator scheduled for
@@ -2153,6 +2274,7 @@ class Trainer:
             train_state = initial_state.train_state
             tester_states = initial_state.test_states
             cur_epoch = initial_state.cur_epoch
+            lr_progress = initial_state.lr_plateau
             if initial_state.key is not None:
                 key = initial_state.key
             else:
@@ -2162,6 +2284,7 @@ class Trainer:
             evaluator = self.collection_schedule.at(max(cur_epoch - 1, 0))
         else:
             cur_epoch = 0
+            lr_progress = None
             evaluator = self.collection_schedule.at(0)
             init_key, key = jax.random.split(key)
             if fork_from is None:
@@ -2190,6 +2313,8 @@ class Trainer:
         evaluator, collection_state = self.follow_schedule(
             cur_epoch, evaluator, collection_state
         )
+        if self.lr_plateau is not None and lr_progress is None:
+            lr_progress = LRPlateauProgress()
         params = self.extract_model_params_fn(train_state)
         if not exact:
             # warmup
@@ -2249,6 +2374,12 @@ class Trainer:
                 epoch=cur_epoch,
             )
             params = self.extract_model_params_fn(train_state)
+            stop = False
+            if self.lr_plateau is not None and lr_progress is not None:
+                train_state, lr_progress, lr_metrics, stop = self.follow_lr_plateau(
+                    cur_epoch, train_state, lr_progress, metrics["loss"]
+                )
+                metrics = {**metrics, **lr_metrics}
             # log metrics
             self.log_metrics({**metrics, **collection_metrics}, cur_epoch)
 
@@ -2297,8 +2428,11 @@ class Trainer:
                         test_states=tester_states,
                         cur_epoch=cur_epoch,
                         key=key,
+                        lr_plateau=lr_progress,
                     )
                 )
+            if stop:
+                break
 
         # return state so that training can be continued!
         return TrainLoopOutput(
@@ -2307,4 +2441,5 @@ class Trainer:
             test_states=tester_states,
             cur_epoch=cur_epoch,
             key=key,
+            lr_plateau=lr_progress,
         )

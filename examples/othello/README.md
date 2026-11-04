@@ -94,15 +94,15 @@ The default, 8, was the fastest of 1, 2, 4, 8 and 16 on one RTX 5080 (1024 games
 sims), self-play 1.2 to 1.25 times as fast as with 1.
 
 `--buffer` sets replay memory, the positions kept per environment, which training samples
-from. Self-play adds 128 an epoch (a position a move), so the default 375 is about the last
-3 epochs. The run's page plots the positions training can sample as `buffer_samples`, and
+from. Self-play adds 128 an epoch (a position a move), so the default 1125 is about the last
+9 epochs. The run's page plots the positions training can sample as `buffer_samples`, and
 how many of them are distinct, a position's symmetric images counting as one, as
 `buffer_distinct_positions`.
 
 The buffer's size sets how old the data training samples is, not how often each position
 is trained on: on average, that's the samples training takes each epoch over the positions
-self-play adds, whatever the size. With the defaults, 128 steps of 4096 samples
-against 1024 environments adding 128 positions each, it's 4, each time in a symmetry drawn
+self-play adds, whatever the size. With the defaults, 256 steps of 4096 samples
+against 1024 environments adding 128 positions each, it's 8, each time in a symmetry drawn
 at random. `--train-steps` changes it (or `--train-batch`).
 
 The network computes in bfloat16 by default: in self-play and test games
@@ -130,6 +130,26 @@ from the AlphaZero paper with 6 blocks of 128 channels. Its variants
 - `block=bottleneck`: KataGo's nested bottleneck blocks, a 1x1 convolution down to
   half the width, a basic block (`bottleneck_inner` of them) and a 1x1 convolution
   back up, which cost under a third of a basic block.
+- `norm=`: the normalization. `batch`, BatchNorm, is the default. The others treat each
+  position on its own, so the network has no state and training and play compute the
+  same function: `channel` normalizes each square's channels (a transformer's per-token
+  LayerNorm), `layer`, `group` (`norm_groups`) and `rms` the channels and the board
+  together; `fixed` (KataGo's fixed variance initialization) and `ws` (weight
+  standardization) don't normalize, but scale each convolution to unit variance at
+  initialization, and fold into the convolutions as BatchNorm does.
+- `layout=pre`: the pre-activation residual network: a normalization and a ReLU before
+  each convolution, branches added to a trunk that is never normalized, and one more
+  normalization before the heads. Every branch reads unit-scale input however deep the
+  network, and each branch's last convolution starts at zero, so the network starts as
+  the stem and the heads. Not with `fixed` or `ws`.
+
+  On the 5080, `norm=channel,layout=pre` costs 4% of self-play and 10% of a train step
+  against BatchNorm (8x128), and 10-13% of CPU play in bf16; `layer`, `group` and `rms`
+  cost 16-30%. At 16x64, 40 epochs at 1e-3, it learned faster than BatchNorm (engine
+  regret 5.7 against 7.3 at epoch 8), where `ws` trailed and random-initialized
+  branches started 10-15 epochs late. In the post-activation layout, `ws`'s residual
+  stream grows multiplicatively with depth, and at 4x64, 68 minutes, it lost to
+  BatchNorm in direct games by 49 ±12 Elo at 128 visits (`fixed` and `rms` about 110).
 
 The default, `resnet:6x128,pool_every=2,heads=pooled` (`DEFAULT_NET` in `game.py`), has
 both kinds of global pooling. Trained for 50 epochs at 64 sims a move, then searching
@@ -211,13 +231,13 @@ OLIVAW (Norelli & Panconesi, section IV-B) and "Lessons from implementing AlphaZ
   is stored at most once, by the last search it's in.
 
 Tree positions follow replay memory (`--buffer`): training samples those stored in the
-moves its played positions come from (the last 375 at the default `--buffer`), however many positions each move stored. They're kept in a replay buffer of their
+moves its played positions come from (the last 1125 at the default `--buffer`), however many positions each move stored. They're kept in a replay buffer of their
 own, by default K times `--buffer`, which holds that span even when every move stores K;
 `--tree-buffer` sets its size instead (a move stores fewer than K when too few nodes qualify, and about 1.3 of 2
 with `--tree-discarded-only`, so a smaller buffer can still hold the whole span).
 
-Each K adds to GPU memory what raising `--buffer` by as much again would: 0.18 GB per K at
-`--buffer 375` (about 480 bytes a position, in each of 1024 environments). Training holds
+Each K adds to GPU memory what raising `--buffer` by as much again would: 0.54 GB per K at
+`--buffer 1125` (about 480 bytes a position, in each of 1024 environments). Training holds
 two copies of the replay memory (the epoch's, and the one before it, for the self-play
 metrics), and preallocates 75% of the GPU, 12 GB of a 16 GB card. 6000 positions per
 environment, played and tree positions together (2.9 GB), are known to fit. Keeping the
@@ -327,6 +347,21 @@ for each environment, as if self-play had played them, each with the teacher's p
 game's outcome; and `--exclude-openings` keeps self-play off the held-out openings, so that
 games from them still test both networks fairly (`vs_engine.py --xot corpus/heldout-openings.txt`
 plays Edax from them).
+
+A drop at a share of the budget comes too late in long runs: at 1e-3, 6x96 and 8x128 nets stop
+gaining after about 120-160 epochs whatever the budget. `--lr-plateau` drops when training
+stops improving instead: from `--lr` to 1e-4, then 1e-5 (or the rates it's given), each time the
+training loss (`loss`) improved by less than `--lr-plateau-threshold` (0.004) over the last
+`--lr-plateau-window` (40) epochs, by the slope of a least-squares line through them, once
+`--lr-plateau-min-epochs` (40) have been spent at the rate. `--epochs` caps the run, and
+`--lr-plateau-stop` ends it early once the last rate plateaus. Each drop is logged as `lr_drop`
+(the new rate), at the epoch that made it, with that epoch's `lr_plateau_improvement`. A run
+resumed with `--resume` carries on with the rule where it stopped. A fork starts again at
+its own `--lr`: to carry on at 1e-4, fork with `--lr 1e-4 --lr-plateau 1e-5`.
+
+```
+uv run examples/othello/train.py --epochs 600 --lr-plateau --save-state-every 10 --ckpt-dir runs/plateau
+```
 
 ### Training on Modal
 

@@ -46,11 +46,11 @@ def test_the_mask_selects_the_convolution_and_linear_weights():
     } | {
         f".{bn}.{param}"
         for bn in (
-            "stem_bn",
-            "blocks[0].bn1",
-            "blocks[0].bn2",
-            "heads.policy_bn",
-            "heads.value_bn",
+            "stem_norm",
+            "blocks[0].norm1",
+            "blocks[0].norm2",
+            "heads.policy_norm",
+            "heads.value_norm",
         )
         for param in ("weight", "bias")
     }
