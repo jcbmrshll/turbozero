@@ -473,10 +473,18 @@ class BottleneckBlock(eqx.Module):
         return jax.nn.relu(x + y), state
 
 
+def zeroed(conv: eqx.nn.Conv2d) -> eqx.nn.Conv2d:
+    """`conv` with its weights at zero: a residual branch ending in it starts adding nothing, so a
+    pre-activation trunk starts as the stem's features (SkipInit, Fixup's zeroed last layer). With
+    random branches, 16 of them drowned the stem's features (RMS 7 against 0.24 at 16x64), and the
+    network learned 10-15 epochs late."""
+    return eqx.tree_at(lambda c: c.weight, conv, jnp.zeros_like(conv.weight))
+
+
 class PreActBlock(eqx.Module):
     """A pre-activation residual block (see `AZResnetConfig.layout`): x + conv2(relu(norm2(conv1(
     relu(norm1(x)))))), optionally with KataGo's global pooling bias, from the last
-    `pool_channels` of conv1's normalized output."""
+    `pool_channels` of conv1's normalized output. conv2 starts at zero (see `zeroed`)."""
 
     norm1: Norm
     conv1: eqx.nn.Conv2d
@@ -512,7 +520,7 @@ class PreActBlock(eqx.Module):
             if pool_channels
             else None
         )
-        self.conv2 = conv(channels - pool_channels, channels, 3, key2)
+        self.conv2 = zeroed(conv(channels - pool_channels, channels, 3, key2))
         self.pool_channels = pool_channels
 
     def __call__(
@@ -531,7 +539,8 @@ class PreActBlock(eqx.Module):
 
 class PreActBottleneck(eqx.Module):
     """KataGo's nested bottleneck block in the pre-activation layout: x + up(relu(norm(inner(down(
-    relu(norm(x))))))), the inner blocks pre-activation basic blocks."""
+    relu(norm(x))))))), the inner blocks pre-activation basic blocks. up starts at zero (see
+    `zeroed`)."""
 
     down_norm: Norm
     down_conv: eqx.nn.Conv2d
@@ -557,7 +566,7 @@ class PreActBottleneck(eqx.Module):
             for pool, k in zip(inner_pool_channels, keys[2:], strict=True)
         ]
         self.up_norm = make_norm(inner_channels, stats, 1)
-        self.up_conv = conv(inner_channels, channels, 1, keys[1])
+        self.up_conv = zeroed(conv(inner_channels, channels, 1, keys[1]))
 
     def __call__(
         self, x: jax.Array, state: eqx.nn.State, dtype: jnp.dtype

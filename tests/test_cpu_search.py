@@ -428,12 +428,14 @@ def test_export_matches_the_network(norm):
         "resnet:2x8,pool_every=2,heads=pooled,pool_channels=4,head_channels=4,"
         f"norm={norm},norm_groups=2"
     )
-    # random scales and offsets in the normalizations, so that they're checked too
+    # random scales and offsets in the normalizations, and every weight nonzero (the
+    # pre-activation branches start at zero), so that they're all checked
     rng = np.random.default_rng(1)
     params, static = eqx.partition(network, eqx.is_inexact_array)
     params = jax.tree.map(
         lambda x: (
-            x + 0.3 * rng.normal(size=x.shape).astype(x.dtype) if x.ndim == 1 else x
+            x
+            + (0.3 if x.ndim == 1 else 0.05) * rng.normal(size=x.shape).astype(x.dtype)
         ),
         params,
     )

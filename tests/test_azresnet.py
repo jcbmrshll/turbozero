@@ -369,11 +369,14 @@ def test_batch_independent_norms_train_as_they_infer_one_input_at_a_time(
     # no state, and each input's outputs its own: the same in training as in inference, and
     # whatever else is in the batch
     net, state = make_variant(name, norm=norm, norm_groups=2, layout=layout)
-    # random scales and offsets, so that they're checked too
+    # random scales and offsets, and every weight nonzero (the pre-activation branches start at
+    # zero), so that they're all checked
     rng = np.random.default_rng(0)
     params, static = eqx.partition(net, eqx.is_inexact_array)
     params = jax.tree.map(
-        lambda x: x + rng.normal(size=x.shape).astype(x.dtype) if x.ndim == 1 else x,
+        lambda x: (
+            x + (1 if x.ndim == 1 else 0.1) * rng.normal(size=x.shape).astype(x.dtype)
+        ),
         params,
     )
     net = eqx.combine(params, static)
@@ -500,14 +503,11 @@ def test_fixed_scales_refuse_the_pre_activation_layout(norm):
         make_variant("pooled heads", norm=norm, layout="pre")
 
 
-def test_the_pre_activation_trunk_adds_its_branches_unnormalized():
-    # x + branch: zero the last convolution of every block and the trunk is the stem's output
-    net, state = make_variant("global pooling", norm="channel", layout="pre")
-    net = eqx.tree_at(
-        lambda n: [block.conv2.weight for block in n.blocks],
-        net,
-        replace_fn=jnp.zeros_like,
-    )
+@pytest.mark.parametrize("name", ["global pooling", "bottleneck"])
+def test_the_pre_activation_trunk_starts_as_the_stem(name):
+    # x + branch, each branch's last convolution starting at zero: at initialization the trunk is
+    # the stem's output however deep, and the branches add to it once trained
+    net, state = make_variant(name, norm="channel", layout="pre")
     x = jnp.moveaxis(observations(np.random.default_rng(0), 1)[0], -1, 0)
     dtype = jnp.dtype("float32")
 
