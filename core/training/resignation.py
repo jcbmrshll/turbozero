@@ -43,12 +43,12 @@ class Resignation:
     played out; AlphaZero played out 20%).
 
     Attributes:
-        threshold: resign at a root value of `-threshold` or below, e.g. 0.9 for an expected score
-            of 5% with values in [-1, 1]
+        threshold: resign at a root value of `-threshold` or below: by default 0.95, an expected
+            score of 2.5% with values in [-1, 1] (0.9 is 5%)
         calibration_fraction: the fraction of games played to the end
     """
 
-    threshold: float
+    threshold: float = 0.95
     calibration_fraction: float = 0.1
 
     def __post_init__(self):

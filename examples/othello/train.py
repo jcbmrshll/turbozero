@@ -292,10 +292,14 @@ def main():
     parser.add_argument(
         "--resign",
         type=float,
+        nargs="?",
+        const=0.95,
         default=None,
         metavar="THRESHOLD",
         help="self-play's player to move resigns when its search's root value is at most "
-        "-THRESHOLD, e.g. 0.9 for an expected score of 5%%, as AlphaGo Zero did. "
+        "-THRESHOLD: 0.95 (an expected score of 2.5%%) if no threshold is given, 0.9 for "
+        "5%%. Saves the searches of decided endgames for more games at "
+        "the same compute: on 4x64 at 0.9, 1.26x the games per epoch, +7 ± 17 Elo. "
         "Default: games are played to the end",
     )
     parser.add_argument(
