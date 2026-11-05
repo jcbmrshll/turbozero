@@ -49,6 +49,32 @@ def test_root_noise_options_out_of_range_are_refused(monkeypatch, option):
         run_main(monkeypatch, *option)
 
 
+@pytest.mark.parametrize(
+    "options, resignation",
+    [
+        ((), None),
+        (("--resign",), (0.95, 0.1)),
+        (("--resign", "0.9", "--resign-calibration", "0.2"), (0.9, 0.2)),
+    ],
+)
+def test_resignation_is_off_unless_asked_for(monkeypatch, options, resignation):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, *options)
+    got = built.value.kwargs["resignation"]
+    if resignation is None:
+        assert got is None
+    else:
+        assert (got.threshold, got.calibration_fraction) == resignation
+
+
+@pytest.mark.parametrize(
+    "option", [("--resign", "0"), ("--resign", "1.5"), ("--resign-calibration", "2")]
+)
+def test_resignation_options_out_of_range_are_refused(monkeypatch, option):
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, *option)
+
+
 def test_lr_plateau_steps_from_lr_to_its_rates(monkeypatch):
     with pytest.raises(BuiltTrainer) as built:
         run_main(

@@ -109,6 +109,7 @@ from core.training.exploration import Exploration
 from core.training.growth import Growth, Learner
 from core.training.loss_fns import az_default_loss_fn
 from core.training.lr_plateau import LRPlateau
+from core.training.resignation import Resignation
 from core.training.schedule import EvaluatorSchedule, parse_schedule
 from core.training.train import Trainer
 from core.training.tree_positions import TreePositions
@@ -336,6 +337,26 @@ def main():
         type=float,
         default=0.25,
         help="share of each self-play root's prior that is Dirichlet noise (0 for none)",
+    )
+    parser.add_argument(
+        "--resign",
+        type=float,
+        nargs="?",
+        const=0.95,
+        default=None,
+        metavar="THRESHOLD",
+        help="self-play's player to move resigns when its search's root value is at most "
+        "-THRESHOLD: 0.95 (an expected score of 2.5%%) if no threshold is given, 0.9 for "
+        "5%%. Saves the searches of decided endgames for more games at "
+        "the same compute: on 4x64 at 0.9, 1.26x the games per epoch, +7 ± 17 Elo. "
+        "Default: games are played to the end",
+    )
+    parser.add_argument(
+        "--resign-calibration",
+        type=float,
+        default=0.1,
+        help="with --resign, the fraction of games played to the end anyway, to measure how "
+        "often resigning would have been wrong (logged as resign_false)",
     )
     parser.add_argument(
         "--train-batch",
@@ -713,6 +734,10 @@ def main():
     if args.advance_every is None and args.count_reused_visits:
         # searches of varying lengths: see Trainer's advance_every
         args.advance_every = 5
+    if args.resign is not None and not 0 < args.resign <= 1:
+        parser.error("--resign must be in (0, 1]")
+    if not 0 <= args.resign_calibration <= 1:
+        parser.error("--resign-calibration must be between 0 and 1")
     if args.dirichlet_alpha <= 0:
         parser.error("--dirichlet-alpha must be positive")
     if not 0 <= args.dirichlet_epsilon <= 1:
@@ -976,6 +1001,9 @@ def main():
         # how often self-play games are drawn
         episode_metrics_fn=episode_metrics,
         exploration=Exploration(num_sampling_moves=args.sampling_moves),
+        resignation=Resignation(args.resign, args.resign_calibration)
+        if args.resign is not None
+        else None,
         save_state_at=args.save_state_at,
         save_state_every=args.save_state_every,
         # every argument but how the run starts (a fork records its parent)
