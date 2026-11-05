@@ -30,6 +30,7 @@ from core.pytree import where_tree
 from core.testing.tester import BaseTester, TestState
 from core.training.exploration import Exploration
 from core.training.lr_plateau import LRPlateau, LRPlateauProgress, LRPlateauState
+from core.training.resignation import Resignation, ResignState
 from core.training.schedule import EvaluatorSchedule, describe
 from core.training.tree_positions import (
     TreePositions,
@@ -74,6 +75,8 @@ class CollectionState:
         tree_buffer_state: state of the replay buffer of search tree positions, None without them
         tree_written_at: for each entry of the tree position replay buffer, the number of moves made
             before it was written (see `Trainer.tree_sample_mask`), None without tree positions
+        resign_state: each environment's resignation state (see `Trainer`'s `resignation`), None
+            without resignation
     """
 
     eval_state: Any
@@ -89,6 +92,7 @@ class CollectionState:
     search_cycles: jax.Array
     tree_buffer_state: ReplayBufferState | None = None
     tree_written_at: jax.Array | None = None
+    resign_state: ResignState | None = None
 
 
 @dataclass(frozen=True)
@@ -102,6 +106,7 @@ class CollectionStats:
         tree_positions: number of search tree positions stored so far
         tree_visits: their visit counts, summed
         episode_metrics: sums over the terminated episodes of each episode metric
+        resign_state: the resignation state's counters, None without resignation
     """
 
     episodes: jax.Array
@@ -109,6 +114,7 @@ class CollectionStats:
     tree_positions: jax.Array
     tree_visits: jax.Array
     episode_metrics: dict[str, jax.Array]
+    resign_state: ResignState | None = None
 
     @classmethod
     def of(cls, state: CollectionState) -> "CollectionStats":
@@ -120,6 +126,7 @@ class CollectionStats:
             tree_positions=jnp.copy(state.tree_positions),
             tree_visits=jnp.copy(state.tree_visits),
             episode_metrics={k: jnp.copy(v) for k, v in state.episode_metrics.items()},
+            resign_state=jax.tree.map(jnp.copy, state.resign_state),
         )
 
 
@@ -479,6 +486,7 @@ class Trainer:
         evaluator_test: Evaluator | None = None,
         test_env_init_fn: EnvInitFn | None = None,
         exploration: Exploration | None = None,
+        resignation: Resignation | None = None,
         episode_metrics_fn: Callable[[jax.Array], dict[str, jax.Array]] | None = None,
         data_transform_fns: Sequence[DataTransformFn] = (),
         tree_positions: TreePositions | None = None,
@@ -538,6 +546,9 @@ class Trainer:
             exploration: (optional) chooses the move data collection plays from the evaluator's output,
                 e.g. to play random moves some of the time (see core.training.exploration). The evaluator's
                 policy weights stay the training target. If not provided, collection plays the evaluator's move.
+            resignation: (optional) self-play's players resign lost games (see core.training.resignation),
+                ending them early as losses. Two-player zero-sum games only. Resigned games count as
+                terminated episodes. If not provided, every game is played to the end.
             episode_metrics_fn: (optional) metrics of a finished episode to track, from its final rewards (one per
                 player) to a dict of scalars, e.g. `lambda rewards: {"draw": (rewards == 0).all()}`. Each is logged
                 every epoch as `episode_<name>`, its mean over the episodes that terminated that epoch (truncated
@@ -633,6 +644,7 @@ class Trainer:
             raise ValueError(f"advance_every must be positive, got {advance_every}")
         self.advance_every = advance_every
         self.exploration = exploration
+        self.resignation = resignation
         self.episode_metrics_fn = episode_metrics_fn
         if tree_positions is not None and not all(
             isinstance(e, MCTS) for _, e in self.collection_schedule.stages
@@ -754,6 +766,11 @@ class Trainer:
             "exploration_config": self.exploration.get_config()
             if self.exploration is not None
             else None,
+            **(
+                {"resignation": self.resignation.get_config()}
+                if self.resignation is not None
+                else {}
+            ),
             "episode_metrics_fn": getattr(self.episode_metrics_fn, "__name__", None)
             if self.episode_metrics_fn is not None
             else None,
@@ -877,6 +894,20 @@ class Trainer:
             evaluator = self.collection_schedule.at(0)
         done = evaluator.search_done(state.eval_state, state.search_cycles)
         evaluate_key, key, tree_key = self.move_keys(state.move_key)
+        output = evaluator.search_output(
+            evaluate_key,
+            state.eval_state,
+            state.env_state,
+            state.metadata,
+            params,
+            self.env_step_fn,
+        )
+        search_value = evaluator.get_value(output.eval_state)
+        resigned = (
+            done & self.resignation.resigns(state.resign_state, search_value)
+            if self.resignation is not None and state.resign_state is not None
+            else jnp.array(False)
+        )
         # step environment and evaluator
         (
             eval_output,
@@ -888,14 +919,7 @@ class Trainer:
             searched_eval_state,
         ) = step_with_output(
             key=key,
-            output=evaluator.search_output(
-                evaluate_key,
-                state.eval_state,
-                state.env_state,
-                state.metadata,
-                params,
-                self.env_step_fn,
-            ),
+            output=output,
             env_state=state.env_state,
             env_state_metadata=state.metadata,
             evaluator=evaluator,
@@ -906,9 +930,33 @@ class Trainer:
             if self.exploration is not None
             else None,
             active=done,
+            end=resigned,
         )
-        search_value = evaluator.get_value(searched_eval_state)
         terminated, truncated = done & terminated, done & truncated
+        resign_state = state.resign_state
+        if self.resignation is not None and resign_state is not None:
+            resign_state = self.resignation.update(
+                jax.random.fold_in(key, 1),
+                resign_state,
+                moved=done,
+                value=search_value,
+                player=state.metadata.cur_player_id,
+                resigned=resigned,
+                terminated=terminated,
+                ended=terminated | truncated | resigned,
+                rewards=rewards,
+            )
+            # the player to move loses, the other wins
+            rewards = jnp.where(
+                resigned,
+                jnp.where(
+                    jnp.arange(rewards.shape[-1]) == state.metadata.cur_player_id,
+                    -1.0,
+                    1.0,
+                ).astype(rewards.dtype),
+                rewards,
+            )
+            terminated = terminated | resigned
 
         # store experience in replay buffer
         buffer_state = self.memory_buffer.add_experience(
@@ -962,6 +1010,7 @@ class Trainer:
                 state.episode_metrics, rewards, terminated
             ),
             search_cycles=jnp.where(done, 0, state.search_cycles),
+            resign_state=resign_state,
         )
 
     def collect(
@@ -1440,6 +1489,10 @@ class Trainer:
                 - `buffer_distinct_positions`: distinct observations among them, those a data
                   transform maps to one another counting as one (e.g. a board and its rotations)
                 - `buffer_distinct_fraction`: that as a fraction of those experiences
+                - with `resignation`: `resigned`, the fraction of those episodes that ended in a
+                  resignation; `resign_calibration_games`, the calibration games that ended;
+                  `resign_calibration_below`, the fraction of them in which a player's value fell to
+                  the threshold; and `resign_false`, the fraction of those that player didn't lose
                 - with `tree_positions`: `tree_positions` stored in between,
                   `tree_positions_per_move`, and their `tree_mean_visits`
         """
@@ -1457,6 +1510,24 @@ class Trainer:
             for name, total_after in after.episode_metrics.items():
                 change = (total_after - before.episode_metrics[name]).sum()
                 metrics[f"episode_{name}"] = change / episodes
+        if after.resign_state is not None and before.resign_state is not None:
+
+            def resign_change(name: str) -> jax.Array:
+                return (
+                    getattr(after.resign_state, name)
+                    - getattr(before.resign_state, name)
+                ).sum()
+
+            calibration_games = resign_change("calibration_games")
+            calibration_below = resign_change("calibration_below")
+            metrics["resigned"] = resign_change("resigned") / jnp.maximum(episodes, 1)
+            metrics["resign_calibration_games"] = calibration_games
+            metrics["resign_calibration_below"] = calibration_below / jnp.maximum(
+                calibration_games, 1
+            )
+            metrics["resign_false"] = resign_change("calibration_false") / jnp.maximum(
+                calibration_below, 1
+            )
         if self.tree_positions is not None:
             positions = (after.tree_positions - before.tree_positions).sum()
             visits = (after.tree_visits - before.tree_visits).sum()
@@ -1824,6 +1895,7 @@ class Trainer:
             ),
             **self.init_moves(key, self.batch_size),
             **stats,
+            resign_state=self.init_resign_state(key, self.batch_size),
         )
         return collection_state, train_state
 
@@ -2043,6 +2115,16 @@ class Trainer:
             )
             if self.tree_buffer is not None
             else None,
+            resign_state=self.init_resign_state(key, batch_size),
+        )
+
+    def init_resign_state(self, key: jax.Array, batch_size: int) -> ResignState | None:
+        """`CollectionState`'s resignation states, for `batch_size` environments whose games start
+        now; None without resignation."""
+        if self.resignation is None:
+            return None
+        return jax.vmap(self.resignation.init)(
+            jax.random.split(jax.random.fold_in(key, 1), batch_size)
         )
 
     @staticmethod
