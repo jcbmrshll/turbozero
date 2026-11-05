@@ -346,13 +346,17 @@ def test_supervisor_survives_the_queue_refusing(store):
     assert "no such task" in store.get_meta("supervisor")["reason"]
 
 
-def board(running=None, queued=()):
+def board(running=None, queued=(), priority=0, queued_priority=0):
     return {
         "resources": [
             {
                 "name": "5080",
-                "running": running and {"id": running, "about": "training"},
-                "queued": [{"id": q, "about": "next"} for q in queued],
+                "running": running
+                and {"id": running, "about": "training", "priority": priority},
+                "queued": [
+                    {"id": q, "about": "next", "priority": queued_priority}
+                    for q in queued
+                ],
             }
         ]
     }
@@ -381,6 +385,13 @@ def test_gate_sees_the_queue(gpu):
     assert "#3" in str(SlickGate().busy())
     assert SlickGate(own_job=3).busy() is None
     gpu["board"] = board(running=3, queued=[9])
+    assert "#9" in str(SlickGate(own_job=3).busy())
+
+
+def test_gate_lets_lower_priorities_wait(gpu):
+    gpu["board"] = board(running=3, queued=[9], queued_priority=-10)
+    assert SlickGate(own_job=3).busy() is None
+    gpu["board"] = board(running=3, queued=[9], priority=1, queued_priority=1)
     assert "#9" in str(SlickGate(own_job=3).busy())
 
 
