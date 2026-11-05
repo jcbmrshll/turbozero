@@ -24,6 +24,7 @@ from core.memory.replay_memory import (
     DataTransformFn,
     EpisodeReplayBuffer,
     ReplayBufferState,
+    buffer_capacity,
     transform_randomly,
 )
 from core.pytree import where_tree
@@ -1293,13 +1294,78 @@ class Trainer:
         )
         return train_state, reduce_step_metrics(metrics)
 
+    def resize_replay_buffer(
+        self,
+        state: CollectionState,
+        capacity: int,
+        tree_capacity: int | None = None,
+    ) -> CollectionState:
+        """Changes the capacity of a collection state's replay buffer between epochs. Training
+        samples the whole buffer, so this sets the replay window: the newest `capacity` positions
+        of each environment.
+
+        Each environment keeps its newest entries, as many as fit (see
+        `EpisodeReplayBuffer.resized`): shrinking drops the oldest, and growing leaves room that
+        self-play fills, but can't bring back positions dropped before. Games in progress carry
+        on, entries and all.
+
+        With tree positions (see `tree_positions`), their buffer is resized too, by default by the
+        same factor (rounded up), so that it still holds the replay buffer's span of self-play,
+        which training samples them from (see `tree_sample_mask`).
+
+        The arrays change shape, so self-play and training compile again, once for each new
+        capacity. `save_state` saves the capacities with the state, and `load_state` (so `resume`)
+        takes them back; a fork takes its trainer's (see `fork_state`).
+
+        The buffers are resized on the host and copied back to the device: that takes about the
+        host memory of the old buffers and the new ones, and the device memory of both until
+        `state` is dropped.
+
+        Args:
+            state: collection state, between epochs
+            capacity: the replay buffer's new capacity, entries per environment
+            tree_capacity: (optional) the tree position buffer's new capacity, entries per
+                environment, only with tree positions. If not provided, the old one times
+                `capacity` over the replay buffer's old capacity, rounded up.
+
+        Returns:
+            CollectionState: the collection state, its buffers resized
+        """
+        if capacity < 1 or (tree_capacity is not None and tree_capacity < 1):
+            raise ValueError(
+                f"capacities must be positive, got {capacity} and {tree_capacity}"
+            )
+        old_capacity = buffer_capacity(state.buffer_state)
+        buffer_state, _ = EpisodeReplayBuffer(capacity).resized(
+            jax.tree.map(_to_host, state.buffer_state)
+        )
+        resized = replace(state, buffer_state=jax.tree.map(_to_device, buffer_state))
+        if state.tree_buffer_state is None or state.tree_written_at is None:
+            if tree_capacity is not None:
+                raise ValueError("tree_capacity needs tree positions")
+            return resized
+        if tree_capacity is None:
+            old_tree = buffer_capacity(state.tree_buffer_state)
+            tree_capacity = -(-old_tree * capacity // old_capacity)
+        tree_buffer_state, (tree_written_at,) = EpisodeReplayBuffer(
+            tree_capacity
+        ).resized(
+            jax.tree.map(_to_host, state.tree_buffer_state),
+            _to_host(state.tree_written_at),
+        )
+        return replace(
+            resized,
+            tree_buffer_state=jax.tree.map(_to_device, tree_buffer_state),
+            tree_written_at=_to_device(tree_written_at),
+        )
+
     def tree_sample_mask(self, state: CollectionState) -> jax.Array:
         """Marks the tree positions (see `tree_positions`) training can sample: those stored within
         the replay buffer's span of self-play.
 
-        The replay buffer holds each environment's newest C played positions (C its capacity), its
-        last C moves. Tree positions are sampled from the ones stored in as many moves, however many
-        each move stored.
+        The replay buffer holds each environment's newest C played positions (C its capacity, which
+        `resize_replay_buffer` may have changed), its last C moves. Tree positions are sampled
+        from the ones stored in as many moves, however many each move stored.
 
         Args:
             state: current collection state
@@ -1309,7 +1375,7 @@ class Trainer:
         """
         assert self.tree_buffer is not None
         assert state.tree_buffer_state is not None and state.tree_written_at is not None
-        moves = self.memory_buffer.capacity
+        moves = buffer_capacity(state.buffer_state)
         # positions the last move stored are 1 move old
         age = state.moves[..., None] - state.tree_written_at
         return self.tree_buffer.sample_mask(state.tree_buffer_state) & (age <= moves)
@@ -1434,6 +1500,8 @@ class Trainer:
             dict: metrics
                 - `moves`: self-play moves played in between, in all environments
                 - `episodes`: episodes that terminated in between
+                - `buffer_capacity`: the replay buffer's capacity, entries per environment (see
+                  `resize_replay_buffer`)
                 - with `episode_metrics_fn`: `episode_<name>`, each metric's mean over those
                   episodes, omitted if none terminated
                 - `buffer_samples`: experiences in the replay buffer training can sample
@@ -1449,6 +1517,7 @@ class Trainer:
         metrics = {
             "moves": moves,
             "episodes": episodes,
+            "buffer_capacity": jnp.asarray(buffer_capacity(after.buffer_state)),
             "buffer_samples": total,
             "buffer_distinct_positions": distinct,
             "buffer_distinct_fraction": distinct / jnp.maximum(total, 1),
@@ -1581,9 +1650,11 @@ class Trainer:
             "format": STATE_FORMAT,
             "epoch": state.cur_epoch,
             "num_envs": int(state.collection_state.episodes.shape[0]),
-            "buffer_capacity": self.memory_buffer.capacity,
-            "tree_buffer_capacity": self.tree_buffer.capacity
-            if self.tree_buffer is not None
+            "buffer_capacity": buffer_capacity(state.collection_state.buffer_state),
+            "tree_buffer_capacity": buffer_capacity(
+                state.collection_state.tree_buffer_state
+            )
+            if state.collection_state.tree_buffer_state is not None
             else None,
             "monitor_run": self.monitor.run_id if self.monitor is not None else None,
             "parent": self.parent,
@@ -1625,9 +1696,10 @@ class Trainer:
         `train_loop` as its `initial_state` (see `resume`, which also takes care of the run's
         checkpoints and monitor run).
 
-        The trainer must be configured as the run's was: the number of environments, replay
-        buffer capacities, network, optimizer, self-play evaluator (the one scheduled for the last
-        epoch done) and testers must match, so that every array does.
+        The trainer must be configured as the run's was: the number of environments, network,
+        optimizer, self-play evaluator (the one scheduled for the last epoch done), tree positions
+        or none, and testers must match, so that every array does. The replay buffers keep the
+        capacities they were saved with, which `resize_replay_buffer` may have changed.
 
         Args:
             path: the saved state
@@ -1640,7 +1712,17 @@ class Trainer:
         """
         with np.load(path) as saved:
             meta = self._check_meta(path, json.loads(str(saved["meta"])))
-            self._check_sizes(path, meta, resizable=False)
+            self._check_sizes(path, meta)
+            if (meta["tree_buffer_capacity"] is None) != (self.tree_buffer is None):
+                theirs, ours = (
+                    ("with", "without")
+                    if self.tree_buffer is None
+                    else ("without", "with")
+                )
+                raise ValueError(
+                    f"{path} was saved {theirs} tree positions, this run is {ours}: continuing "
+                    "a run needs the same (a fork can differ)"
+                )
             epoch = meta["epoch"]
             # the evaluator whose states the collection state holds
             evaluator = self.collection_schedule.at(max(epoch - 1, 0))
@@ -1652,7 +1734,11 @@ class Trainer:
                 "collection_state",
                 jax.eval_shape(
                     lambda: self.init_collection_state(
-                        jax.random.PRNGKey(0), self.batch_size, evaluator
+                        jax.random.PRNGKey(0),
+                        self.batch_size,
+                        evaluator,
+                        meta["buffer_capacity"],
+                        meta["tree_buffer_capacity"],
                     )
                 ),
             )
@@ -1765,7 +1851,7 @@ class Trainer:
             )
             if not replay_buffers:
                 return self.init_collection_state(key, self.batch_size), train_state
-            self._check_sizes(path, meta, resizable=True)
+            self._check_sizes(path, meta)
             index = {
                 leaf_path: i
                 for i, (leaf_path, _, _) in enumerate(
@@ -1835,28 +1921,13 @@ class Trainer:
             )
         return meta
 
-    def _check_sizes(self, path: str, meta: dict, resizable: bool) -> None:
-        """Checks that a saved state's number of environments, and unless `resizable` its replay
-        buffers' capacities, are this trainer's."""
+    def _check_sizes(self, path: str, meta: dict) -> None:
+        """Checks that a saved state's number of environments is this trainer's."""
         if meta["num_envs"] != self.batch_size:
             raise ValueError(
                 f"{path} was saved with {meta['num_envs']} self-play environments, this run "
                 f"has {self.batch_size}: they must be the same"
             )
-        if resizable:
-            return
-        tree_capacity = (
-            self.tree_buffer.capacity if self.tree_buffer is not None else None
-        )
-        for name, saved, ours in [
-            ("replay buffer", meta["buffer_capacity"], self.memory_buffer.capacity),
-            ("tree position buffer", meta["tree_buffer_capacity"], tree_capacity),
-        ]:
-            if saved != ours:
-                raise ValueError(
-                    f"{path} was saved with a {name} capacity of {saved}, this run's is "
-                    f"{ours}: continuing a run needs the same (a fork can differ)"
-                )
 
     def _load_part(self, saved: Any, meta: dict, part: str, template: Any) -> Any:
         """Loads part of a saved state (see `save_state`) into new device arrays, checking each
@@ -2000,7 +2071,12 @@ class Trainer:
         }
 
     def init_collection_state(
-        self, key: jax.Array, batch_size: int, evaluator: Evaluator | None = None
+        self,
+        key: jax.Array,
+        batch_size: int,
+        evaluator: Evaluator | None = None,
+        capacity: int | None = None,
+        tree_capacity: int | None = None,
     ) -> CollectionState:
         """Initializes the collection state (see CollectionState).
 
@@ -2009,6 +2085,10 @@ class Trainer:
             batch_size: number of parallel environments
             evaluator: (optional) the self-play evaluator to initialize states for. If not
                 provided, the first in the schedule.
+            capacity: (optional) the replay buffer's capacity, if not `memory_buffer`'s (see
+                `resize_replay_buffer`)
+            tree_capacity: (optional) with tree positions, their buffer's capacity, if not
+                `tree_positions`'
 
         Returns:
             CollectionState: initialized collection state
@@ -2018,10 +2098,18 @@ class Trainer:
         # make template experience
         template_experience = self.make_template_experience()
         # init buffer state
-        buffer_state = self.memory_buffer.init(batch_size, template_experience)
+        memory_buffer = (
+            self.memory_buffer if capacity is None else EpisodeReplayBuffer(capacity)
+        )
+        buffer_state = memory_buffer.init(batch_size, template_experience)
+        tree_buffer = (
+            self.tree_buffer
+            if self.tree_buffer is None or tree_capacity is None
+            else EpisodeReplayBuffer(tree_capacity)
+        )
         tree_buffer_state = (
-            self.tree_buffer.init(batch_size, template_experience)
-            if self.tree_buffer is not None
+            tree_buffer.init(batch_size, template_experience)
+            if tree_buffer is not None
             else None
         )
         env_state, metadata, eval_state = self.init_games(key, batch_size, evaluator)
@@ -2039,9 +2127,9 @@ class Trainer:
             **self.init_moves(key, batch_size),
             tree_buffer_state=tree_buffer_state,
             tree_written_at=jnp.zeros(
-                (batch_size, self.tree_buffer.capacity), dtype=jnp.int32
+                (batch_size, tree_buffer.capacity), dtype=jnp.int32
             )
-            if self.tree_buffer is not None
+            if tree_buffer is not None
             else None,
         )
 

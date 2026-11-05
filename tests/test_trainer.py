@@ -1038,13 +1038,8 @@ def test_a_fork_records_its_parent(env, tmp_path, fake_loop):
         ),
         (
             "resume",
-            {"memory_buffer": EpisodeReplayBuffer(capacity=16)},
-            "replay buffer capacity of 8, this run's is 16",
-        ),
-        (
-            "resume",
             {"tree_positions": None, "evaluator": TaggedEvaluator(0.0)},
-            "tree position buffer capacity of 16, this run's is None",
+            "saved with tree positions, this run is without",
         ),
         # search trees of a different size
         (
@@ -1072,6 +1067,129 @@ def test_saved_states_must_fit_the_trainer(env, tmp_path, method, kwargs, match)
             trainer.resume(path)
         else:
             trainer.fork_state(path, jax.random.PRNGKey(0))
+
+
+# resizing the replay buffer between epochs
+
+
+def entries_by_age(buffer_state, *entry_data):
+    """A replay buffer's entries, each environment's newest first: whether populated, whether
+    with a reward, the search values, and `entry_data`'s."""
+    _, (buffer, *data) = by_age(
+        buffer_state, buffer_state.populated, buffer_state.has_reward, *entry_data
+    )
+    return np.stack([np.asarray(buffer.search_value), *map(np.asarray, data)])
+
+
+@pytest.mark.parametrize("capacity", [4, 16])
+def test_resize_keeps_the_newest_entries_and_the_games_in_progress(
+    env, tmp_path, capacity
+):
+    trainer = tree_trainer(env, tmp_path)
+    # a replay buffer of 8 that has wrapped around, the last 2 entries of a game in progress,
+    # and a tree position buffer of 16
+    saved, _ = save_a_state(trainer)
+    state = saved.collection_state
+    buffer = trainer.memory_buffer
+
+    resized = trainer.resize_replay_buffer(state, capacity)
+
+    # each environment's newest entries, at the same ages
+    assert resized.buffer_state.populated.shape == (2, capacity)
+    kept = min(8, capacity)
+    old, new = entries_by_age(state.buffer_state), entries_by_age(resized.buffer_state)
+    np.testing.assert_array_equal(new[:, :, :kept], old[:, :, :kept])
+    assert not new[1][:, kept:].any()
+    # the tree positions too, in a buffer resized by the same factor, with the moves they were
+    # written at
+    assert resized.tree_buffer_state is not None
+    assert resized.tree_buffer_state.populated.shape == (2, 2 * capacity)
+    tree_kept = min(16, 2 * capacity)
+    old, new = (
+        entries_by_age(s.tree_buffer_state, s.tree_written_at) for s in (state, resized)
+    )
+    np.testing.assert_array_equal(new[:, :, :tree_kept], old[:, :, :tree_kept])
+    # the games in progress carry on: when they end, their entries get their rewards...
+    ended = jax.vmap(buffer.assign_rewards)(resized.buffer_state, jnp.ones((2, 2)))
+    assert int(buffer.sample_mask(ended).sum()) == 2 * kept
+    # ... or truncating discards just them
+    truncated = jax.vmap(buffer.truncate)(resized.buffer_state)
+    assert int(truncated.populated.sum()) == 2 * (kept - 2)
+    assert int(buffer.sample_mask(truncated).sum()) == 2 * (kept - 2)
+
+
+def test_resize_can_set_the_tree_position_buffers_capacity(env, tmp_path):
+    trainer = tree_trainer(env, tmp_path)
+    saved, _ = save_a_state(trainer)
+
+    resized = trainer.resize_replay_buffer(saved.collection_state, 4, tree_capacity=5)
+
+    assert resized.tree_buffer_state is not None and resized.tree_written_at is not None
+    assert resized.tree_buffer_state.populated.shape == (2, 5)
+    assert resized.tree_written_at.shape == (2, 5)
+    plain = make_trainer(env, tmp_path / "plain")
+    with pytest.raises(ValueError, match="tree_capacity needs tree positions"):
+        plain.resize_replay_buffer(
+            plain.init_collection_state(jax.random.PRNGKey(0), plain.batch_size),
+            4,
+            tree_capacity=5,
+        )
+    with pytest.raises(ValueError, match="must be positive"):
+        trainer.resize_replay_buffer(resized, 0)
+
+
+def test_a_resized_state_saves_and_resumes_at_its_capacities(env, tmp_path):
+    trainer = tree_trainer(env, tmp_path)
+    saved, _ = save_a_state(trainer)
+    resized = replace(
+        saved,
+        collection_state=trainer.resize_replay_buffer(saved.collection_state, 12),
+        cur_epoch=2,
+    )
+    expected = snapshot(resized)
+
+    path = trainer.save_state(resized)
+
+    meta = read_state_meta(path)
+    assert (meta["buffer_capacity"], meta["tree_buffer_capacity"]) == (12, 24)
+    # as in a new process, configured with the run's first capacities
+    state = tree_trainer(env, tmp_path).resume(path)
+    assert jax.tree.all(jax.tree.map(np.array_equal, snapshot(state), expected))
+
+
+def test_self_play_and_training_carry_on_in_a_resized_buffer(env, tmp_path):
+    # games of 3 moves, a buffer of 8 positions per environment
+    trainer = make_trainer(env, tmp_path)
+    buffer = trainer.memory_buffer
+    state = trainer.init_collection_state(jax.random.PRNGKey(0), trainer.batch_size)
+    train_state = trainer.init_train_state()
+
+    def collect(state, num_steps, seed):
+        keys = jax.random.split(jax.random.PRNGKey(seed), trainer.batch_size)
+        before = CollectionStats.of(state)
+        state = trainer.collect_steps(keys, state, train_state.params, num_steps)
+        return state, trainer.collection_metrics(before, state)
+
+    def sampleable(state):
+        return np.asarray(buffer.sample_mask(state.buffer_state)).sum(-1).tolist()
+
+    # 4 moves: a game, and one in progress
+    state, _ = collect(state, 4, 1)
+    # down to the newest 2: the first game's last move, and the move in progress
+    state = trainer.resize_replay_buffer(state, 2)
+    assert sampleable(state) == [1, 1]
+    # 2 more moves end the second game, which keeps its newest 2 entries
+    state, metrics = collect(state, 2, 2)
+    assert sampleable(state) == [2, 2]
+    assert int(metrics["buffer_capacity"]) == 2
+    trainer.train_steps(jax.random.PRNGKey(3), state, train_state, 1)
+    # up to 12: room for 4 more games' moves besides
+    state = trainer.resize_replay_buffer(state, 12)
+    state, metrics = collect(state, 7, 4)
+    assert sampleable(state) == [8, 8]
+    assert int(metrics["buffer_capacity"]) == 12
+    np.testing.assert_array_equal(state.moves, [13, 13])
+    trainer.train_steps(jax.random.PRNGKey(5), state, train_state, 1)
 
 
 # a learning rate that drops on plateaus
@@ -1708,9 +1826,7 @@ def test_tree_position_sampler_fills_the_first_places(env, tmp_path):
     assert jax.tree.all(jax.tree.map(np.array_equal, mixed, batch))
 
 
-def test_tree_positions_follow_the_replay_buffers_span_of_collection(
-    env, tmp_path, monkeypatch
-):
+def test_tree_positions_follow_the_replay_buffers_span_of_collection(env, tmp_path):
     trainer = tree_trainer(env, tmp_path)
     state = trainer.init_collection_state(jax.random.PRNGKey(0), trainer.batch_size)
     tree_state, written_at = state.tree_buffer_state, state.tree_written_at
@@ -1724,12 +1840,15 @@ def test_tree_positions_follow_the_replay_buffers_span_of_collection(
         ),
         tree_written_at=written_at.at[:, :6].set(jnp.array([3, 4, 10, 15, 19, 0])),
     )
-    # a buffer of 16 played positions spans 16 moves, one of 4 spans 4
+    # a buffer of 16 played positions spans 16 moves, one of 4 spans 4: the state's buffer,
+    # whatever the trainer's capacity (see `resize_replay_buffer`)
     for capacity, expected in [(16, [1, 2, 3, 4]), (4, [4])]:
-        monkeypatch.setattr(
-            trainer, "memory_buffer", EpisodeReplayBuffer(capacity=capacity)
+        buffer_state = EpisodeReplayBuffer(capacity=capacity).init(
+            trainer.batch_size, trainer.make_template_experience()
         )
-        mask = np.asarray(trainer.tree_sample_mask(state))
+        mask = np.asarray(
+            trainer.tree_sample_mask(replace(state, buffer_state=buffer_state))
+        )
         for env_index in range(trainer.batch_size):
             assert np.flatnonzero(mask[env_index]).tolist() == expected
 
