@@ -34,6 +34,7 @@ p.add_argument("--notes")
 p.add_argument("--die-at", type=int)
 p.add_argument("--fail-at", type=int)
 p.add_argument("--hang-at", type=int)
+p.add_argument("--grow-into")
 args = p.parse_args()
 ckpt = Path(args.ckpt_dir)
 start, run_id = 0, None
@@ -63,6 +64,9 @@ try:
         if epoch == args.hang_at:
             time.sleep(60)
         (ckpt / f"{epoch}.eqx").write_text("net")
+        if args.grow_into:  # as a growth run: a network's checkpoints in a directory of its own
+            (ckpt / args.grow_into).mkdir(exist_ok=True)
+            (ckpt / args.grow_into / f"{epoch}.eqx").write_text("grown")
         kept = [
             e
             for e in sorted(int(f.stem) for f in ckpt.glob("*.eqx"))
@@ -288,6 +292,16 @@ def test_a_sequence_ends_up_here_like_a_local_run(scene):
     assert meta["provenance"]["modal"]["chip"] == "fake"
     rows = (scene.slick / meta["id"] / "metrics.jsonl").read_text().splitlines()
     assert len(rows) == 25
+
+
+def test_a_growth_runs_networks_directories_end_up_here(scene):
+    scene.job(step("grow", "--epochs 3 --keep-every 1 --grow-into 4x64"))
+    assert scene.runner().run() == "done"
+    scene.wipe_container()
+    scene.sync().run()
+    grown = scene.root / "c" / "grow" / "4x64"
+    assert sorted(p.name for p in grown.iterdir()) == ["0.eqx", "1.eqx", "2.eqx"]
+    assert (grown / "2.eqx").read_text() == "grown"
 
 
 def test_a_preempted_job_goes_on_from_its_state_on_a_new_machine(scene):

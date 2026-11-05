@@ -116,9 +116,10 @@ class Mirror:
         ) is None and epoch not in state_epochs_requested(step.argv)
 
     def _files(self, step: Step) -> list[tuple[str, str, bool]]:
-        """A step's (path, key, whether it's a state only to continue from), smallest first."""
+        """A step's (path, key, whether it's a state only to continue from), smallest first: the
+        files in its --ckpt-dir and the directories in it (a growth run's networks' checkpoints)."""
         out = []
-        for path in Path(step.ckpt_dir).glob("*"):
+        for path in Path(step.ckpt_dir).rglob("*"):
             if path.name.endswith((".tmp", ".part")) or not path.is_file():
                 continue
             match = STATE.fullmatch(path.name)
