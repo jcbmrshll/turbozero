@@ -156,3 +156,68 @@ def test_lr_plateau_can_watch_the_engine_sets_value_error(monkeypatch, tmp_path)
 def test_lr_plateau_metric_needs_the_rule_and_the_set_every_epoch(monkeypatch, options):
     with pytest.raises(SystemExit):
         run_main(monkeypatch, *options)
+
+
+def test_grow_builds_a_network_to_grow_into_with_its_own_search_and_tests(
+    monkeypatch, tmp_path
+):
+    from test_engine_set import tiny_set
+
+    tiny_set(np.random.default_rng(0)).save(tmp_path / "set.npz")
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(
+            monkeypatch,
+            "--grow",
+            "resnet:2x8",
+            "--grow-window",
+            "5",
+            "--sims",
+            "16",
+            "--engine-eval-every",
+            "1",
+            "--engine-set",
+            str(tmp_path / "set.npz"),
+            "--ckpt-dir",
+            str(tmp_path / "run"),
+        )
+    growth = built.value.kwargs["growth"]
+    assert growth.names == ("1x4", "2x8")
+    assert (growth.metric, growth.window, growth.min_epochs, growth.switch_at) == (
+        "engine_value_mse",
+        5,
+        10,
+        (),
+    )
+    (grown,) = growth.learners
+    assert grown.nn is not built.value.kwargs["nn"]
+    assert grown.schedule.at(0).num_iterations == 16
+    assert grown.evaluator_test is not built.value.kwargs["evaluator_test"]
+    # each network has its own engine-set tester, of its own network
+    (own,), (theirs,) = built.value.kwargs["testers"], grown.testers
+    assert own is not theirs and theirs.name == own.name == "engine"
+
+
+def test_grow_can_switch_at_fixed_epochs_without_the_engine_set(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, "--grow", "resnet:2x8", "--grow-switch-at", "80")
+    assert built.value.kwargs["growth"].switch_at == (80,)
+    assert built.value.kwargs["growth"].learners[0].testers == []
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        # growth's settings without --grow
+        ("--grow-window", "5"),
+        ("--grow-switch-at", "80"),
+        # the rule without the engine set every epoch
+        ("--grow", "resnet:2x8"),
+        # one switch epoch per network
+        ("--grow", "resnet:2x8", "--grow-switch-at", "80,90"),
+        # the same size twice
+        ("--grow", "resnet:1x4,heads=pooled", "--grow-switch-at", "80"),
+    ],
+)
+def test_bad_grow_options_are_refused(monkeypatch, options):
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, *options)
