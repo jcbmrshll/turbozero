@@ -27,7 +27,7 @@ class FakeGame(LeagueGame):
     def load_network(self, path, net, dtype):
         raise NotImplementedError
 
-    def make_evaluator(self, network, sims, tree_factor=2):
+    def make_evaluator(self, network, sims, tree_factor=2, prior_temperature=1.0):
         raise NotImplementedError
 
     def openings(self, indices):

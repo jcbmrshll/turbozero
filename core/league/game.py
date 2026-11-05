@@ -8,7 +8,12 @@ from typing import Any
 import numpy as np
 
 from core.evaluators.evaluator import Evaluator
-from core.league.store import DEFAULT_TREE_FACTOR, Player, Search
+from core.league.store import (
+    DEFAULT_PRIOR_TEMPERATURE,
+    DEFAULT_TREE_FACTOR,
+    Player,
+    Search,
+)
 from core.types import EnvStepFn, StepMetadata
 
 
@@ -84,7 +89,7 @@ class LeagueGame(ABC):
     # and `board_js`'s `engines`
     browser_engines: str | None = None
 
-    def facts(self, player: Player) -> dict[str, str | int | bool]:
+    def facts(self, player: Player) -> dict[str, str | float | bool]:
         """What can be read from `player`'s name and settings, to filter by: label to value."""
         return {}
 
@@ -117,11 +122,16 @@ class LeagueGame(ABC):
 
     @abstractmethod
     def make_evaluator(
-        self, network: Any, sims: int, tree_factor: int = DEFAULT_TREE_FACTOR
+        self,
+        network: Any,
+        sims: int,
+        tree_factor: int = DEFAULT_TREE_FACTOR,
+        prior_temperature: float = DEFAULT_PRIOR_TEMPERATURE,
     ) -> Evaluator:
         """The evaluator of `network`, as it plays at full strength: `sims` iterations a
-        move, temperature 0, no root noise, with a tree of `tree_factor` * `sims` nodes.
-        Called once per player in a batch."""
+        move, temperature 0, no root noise, with a tree of `tree_factor` * `sims` nodes and its
+        prior the policy's softmax at `prior_temperature` (see `MCTS`). Called once per player
+        in a batch."""
 
     @abstractmethod
     def num_openings(self) -> int:

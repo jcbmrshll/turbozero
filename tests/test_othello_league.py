@@ -360,8 +360,8 @@ def net_player(network, sims=1000, net=NET):
 def test_a_self_play_networks_facts_come_from_its_name():
     assert player_facts(net_player("8x128-128s-8p-w1125-274m")) == {
         "kind": "net", "net": "8x128", "blocks": 8, "channels": 128, "play sims": 1000,
-        "tree factor": 2, "train sims": 128, "passes": 8, "window": 1125, "minutes": 274,
-        "vtq": False, "planned": False,
+        "tree factor": 2, "prior temperature": 1.0, "train sims": 128, "passes": 8,
+        "window": 1125, "minutes": 274, "vtq": False, "planned": False,
     }  # fmt: skip
 
 
@@ -386,7 +386,7 @@ def test_a_students_facts_come_from_its_name():
 def test_a_name_that_doesnt_fit_still_has_its_nets_facts():
     assert player_facts(net_player("something-else")) == {
         "kind": "net", "net": "8x128", "blocks": 8, "channels": 128, "play sims": 1000,
-        "tree factor": 2,
+        "tree factor": 2, "prior temperature": 1.0,
     }  # fmt: skip
 
 
@@ -394,6 +394,12 @@ def test_a_players_tree_is_its_factor_times_its_sims():
     othello = Othello()
     assert othello.make_evaluator(None, 100).max_nodes == 200
     assert othello.make_evaluator(None, 100, 4).max_nodes == 400
+
+
+def test_a_players_prior_temperature_reaches_its_search():
+    othello = Othello()
+    assert othello.make_evaluator(None, 100).prior_temperature == 1.0
+    assert othello.make_evaluator(None, 100, 2, 1.6).prior_temperature == 1.6
 
 
 def test_an_engines_facts_come_from_its_settings():
