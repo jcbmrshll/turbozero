@@ -63,7 +63,8 @@ class SlickGate:
     Args:
         resource: the queue's name for the GPU
         url: slick's server
-        own_job: the queue entry that's allowed to be running
+        own_job: the queue entry that's allowed to be running; it gives way to what's queued
+            at its priority or above, and lets lower priorities wait
         own_pid: the process that's allowed to be on the GPU
         queue_outage: seconds the queue may go unread before that counts as busy, since slick
             restarting shouldn't end a session and lose its batch
@@ -104,8 +105,10 @@ class SlickGate:
         running = found.get("running")
         if running and running.get("id") != self.own_job:
             return f"queue running #{running.get('id')}: {running.get('about', '')}"
+        # what's queued at a lower priority than this entry waits for it anyway
+        own = running.get("priority", 0) if running else 0
         for job in found.get("queued") or []:
-            if job.get("id") != self.own_job:
+            if job.get("id") != self.own_job and job.get("priority", 0) >= own:
                 return f"queue waiting #{job.get('id')}: {job.get('about', '')}"
         return None
 
