@@ -251,7 +251,11 @@ def load_checkpoint(path: str, net: str, inference_dtype: str = "float32"):
 
 
 def make_test_evaluator(
-    eval_fn, num_iterations: int = 64, noise: bool = True, tree_factor: int = 2
+    eval_fn,
+    num_iterations: int = 64,
+    noise: bool = True,
+    tree_factor: int = 2,
+    prior_temperature: float = 1.0,
 ) -> MCTS:
     """Evaluator used in test games: temperature 0 to always play the most-visited
     action. Opponents share these settings, so that only the quality of their
@@ -260,7 +264,8 @@ def make_test_evaluator(
     With `noise`, AlphaZero's Dirichlet noise is mixed into the root policy, so that
     two deterministic players don't replay the same game; turn it off to measure an
     evaluator at full strength when the games get their variety elsewhere (e.g. from
-    XOT openings, see `xot.py`)."""
+    XOT openings, see `xot.py`). `prior_temperature` flattens (above 1) or sharpens the
+    search's prior (see `MCTS`)."""
     return AlphaZero(MCTS)(
         eval_fn=eval_fn,
         num_iterations=num_iterations,
@@ -272,4 +277,5 @@ def make_test_evaluator(
         temperature=0.0,
         dirichlet_epsilon=0.25 if noise else 0.0,
         traversal_steps=TRAVERSAL_STEPS,
+        prior_temperature=prior_temperature,
     )

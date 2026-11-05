@@ -159,6 +159,8 @@ MIGRATIONS = {
 TOP_MOVES = 4
 # a network's tree holds this many nodes per iteration of its search, unless its settings say
 DEFAULT_TREE_FACTOR = 2
+# a network's prior is its policy's softmax at this temperature, unless its settings say
+DEFAULT_PRIOR_TEMPERATURE = 1.0
 # settings recorded that can't change a move: a traversal's checks only say when to stop looking
 # (see `MCTS`), and a policy target is for training
 NOT_PLAY_SETTINGS = frozenset({"traversal_steps", "policy_target_config"})
@@ -178,7 +180,8 @@ class Player:
         net: its network's spec (see `core.networks.spec`)
         url: where to read about it, e.g. its training run's page (an engine's is its settings')
         external: its engine's name, if it's an engine (see `game.LeagueGame.external_player`)
-        settings: its engine's settings, e.g. its level, or its search's: its `tree_factor`
+        settings: its engine's settings, e.g. its level, or its search's: its `tree_factor` and
+            `prior_temperature`
         retired: whether it no longer plays new games (it stays rated)
         description: what someone wrote about it: a network's is shared by its search budgets
         tags: labels someone gave it, shared the same way
@@ -210,6 +213,11 @@ class Player:
     def tree_factor(self) -> int:
         """The nodes its search's tree holds, per iteration of the search."""
         return self.settings.get("tree_factor", DEFAULT_TREE_FACTOR)
+
+    @property
+    def prior_temperature(self) -> float:
+        """The softmax temperature of its search's prior (see `MCTS`)."""
+        return self.settings.get("prior_temperature", DEFAULT_PRIOR_TEMPERATURE)
 
     @property
     def tree_nodes(self) -> int:

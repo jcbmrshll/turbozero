@@ -271,6 +271,38 @@ def test_the_root_keeps_the_networks_policy_without_the_noise(fixed_length_env):
     )
 
 
+@pytest.mark.parametrize("cls", BACKUPS)
+@pytest.mark.parametrize("temperature", [0.5, 2.0])
+def test_the_prior_is_the_policys_softmax_at_its_temperature_at_every_node(
+    fixed_length_env, cls, temperature
+):
+    mask = (True, False, True)
+    env = fixed_length_env(length=10, num_actions=3, action_mask=mask)
+    logits = jnp.array([1.0, 5.0, 0.0])
+    search = make_mcts(
+        cls, logits=logits, selector=FirstAction(), prior_temperature=temperature
+    )
+    state, meta = env.init_fn(jax.random.PRNGKey(0))
+    tree = search.update_root(
+        jax.random.PRNGKey(0), search.init(template_embedding=state), state, None, meta
+    )
+
+    tree = iterate(search, env)(jax.random.PRNGKey(0), tree)
+
+    flattened = masked_softmax(logits / temperature, mask)
+    np.testing.assert_allclose(root(tree).p, flattened, rtol=1e-6)
+    np.testing.assert_allclose(tree.data_at(1).p, flattened, rtol=1e-6)
+    # the policy target's logits are still the network's own
+    np.testing.assert_allclose(
+        jax.nn.softmax(tree.root_logits), masked_softmax(logits, mask), rtol=1e-6
+    )
+
+
+def test_the_prior_temperature_is_positive():
+    with pytest.raises(ValueError, match="prior_temperature"):
+        make_mcts(prior_temperature=0.0)
+
+
 # choosing the move to play
 
 

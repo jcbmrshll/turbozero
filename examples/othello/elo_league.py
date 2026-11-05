@@ -56,7 +56,13 @@ from xot import XOT_PATH, load_xot
 from core.evaluators.evaluation_fns import make_nn_eval_fn
 from core.league.cli import main
 from core.league.game import ExternalPlayer, LeagueGame
-from core.league.store import DEFAULT_TREE_FACTOR, EngineSearch, Player, Search
+from core.league.store import (
+    DEFAULT_PRIOR_TEMPERATURE,
+    DEFAULT_TREE_FACTOR,
+    EngineSearch,
+    Player,
+    Search,
+)
 from core.monitoring.episodes import BOARDS
 
 # a self-play network's name and a student's (see `distill.py`)
@@ -69,11 +75,11 @@ STUDENT = re.compile(
 )
 
 
-def player_facts(player: Player) -> dict[str, str | int | bool]:
+def player_facts(player: Player) -> dict[str, str | float | bool]:
     """What's in a player's settings and name, as in 8x128-128s-8p-w1125-274m@1000: its net, its
     training sims, passes per position, window and GPU-minutes, and its sims in play."""
     if player.external is not None:
-        facts: dict[str, str | int | bool] = {
+        facts: dict[str, str | float | bool] = {
             "kind": "engine",
             "engine": player.external,
         }
@@ -89,6 +95,7 @@ def player_facts(player: Player) -> dict[str, str | int | bool]:
     if player.sims is not None:
         facts["play sims"] = player.sims
     facts["tree factor"] = player.tree_factor
+    facts["prior temperature"] = player.prior_temperature
     if name := SELF_PLAY.fullmatch(player.network):
         facts |= {
             "train sims": int(name["sims"]),
@@ -207,7 +214,7 @@ class Othello(LeagueGame):
     def __init__(self, xot: Path = XOT_PATH):
         self.xot = load_xot(xot)
 
-    def facts(self, player: Player) -> dict[str, str | int | bool]:
+    def facts(self, player: Player) -> dict[str, str | float | bool]:
         return player_facts(player)
 
     def export_network(self, checkpoint: str, net: str, out: Path) -> None:
@@ -230,13 +237,18 @@ class Othello(LeagueGame):
         return load_checkpoint(path, net, dtype)
 
     def make_evaluator(
-        self, network: Any, sims: int, tree_factor: int = DEFAULT_TREE_FACTOR
+        self,
+        network: Any,
+        sims: int,
+        tree_factor: int = DEFAULT_TREE_FACTOR,
+        prior_temperature: float = DEFAULT_PRIOR_TEMPERATURE,
     ):
         return make_test_evaluator(
             make_nn_eval_fn(network, state_to_nn_input),
             sims,
             noise=False,
             tree_factor=tree_factor,
+            prior_temperature=prior_temperature,
         )
 
     def num_openings(self) -> int:

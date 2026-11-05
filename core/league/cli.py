@@ -1,7 +1,7 @@
 """The league's command line: a game's script hands its `LeagueGame` to `main`.
 
 add-network NAME CHECKPOINT --net SPEC --run RUN --sims 128 1000 [--url URL]
-add-player NETWORK --sims 4000 16000 [--tree-factor 4]
+add-player NETWORK --sims 4000 16000 [--tree-factor 4] [--prior-temperature 1.6]
 link NAME URL
 add-external NAME ENGINE --settings '{"level": 8}'
 add-result A B WINS DRAWS LOSSES --source SOURCE
@@ -32,6 +32,7 @@ from core.league.game import LeagueGame, check_match
 from core.league.ratings import Ratings
 from core.league.scheduler import SchedulerConfig
 from core.league.store import (
+    DEFAULT_PRIOR_TEMPERATURE,
     DEFAULT_TREE_FACTOR,
     GameRecord,
     Player,
@@ -149,7 +150,8 @@ def main(make_game: Callable[[], LeagueGame], default_root: Path, argv=None) -> 
     add.add_argument("--url", help="where to read about it, e.g. its run's page")
 
     player = commands.add_parser(
-        "add-player", help="more players of a network: NETWORK@SIMS[-tFACTOR]"
+        "add-player",
+        help="more players of a network: NETWORK@SIMS[-tFACTOR][-TTEMPERATURE]",
     )
     player.add_argument("network")
     player.add_argument("--sims", type=int, nargs="+", required=True)
@@ -158,6 +160,12 @@ def main(make_game: Callable[[], LeagueGame], default_root: Path, argv=None) -> 
         type=int,
         default=DEFAULT_TREE_FACTOR,
         help="the tree's nodes per iteration of the search",
+    )
+    player.add_argument(
+        "--prior-temperature",
+        type=float,
+        default=DEFAULT_PRIOR_TEMPERATURE,
+        help="the softmax temperature of the search's prior: above 1 flattens it",
     )
 
     link = commands.add_parser("link", help="link a network to any URL")
@@ -266,14 +274,17 @@ def main(make_game: Callable[[], LeagueGame], default_root: Path, argv=None) -> 
         added = next(p for p in store.players() if p.network == args.name)
         export_network(store, make_game(), added)
     elif args.command == "add-player":
-        default = args.tree_factor == DEFAULT_TREE_FACTOR
+        # each setting that isn't the default is in the name, e.g. n@1000-t4-T1.6
+        settings: dict[str, Any] = {}
+        suffixes = []
+        if args.tree_factor != DEFAULT_TREE_FACTOR:
+            settings["tree_factor"] = args.tree_factor
+            suffixes.append(f"t{args.tree_factor}")
+        if args.prior_temperature != DEFAULT_PRIOR_TEMPERATURE:
+            settings["prior_temperature"] = args.prior_temperature
+            suffixes.append(f"T{args.prior_temperature:g}")
         for sims in args.sims:
-            store.add_net_player(
-                args.network,
-                sims,
-                "" if default else f"t{args.tree_factor}",
-                {} if default else {"tree_factor": args.tree_factor},
-            )
+            store.add_net_player(args.network, sims, "-".join(suffixes), settings)
     elif args.command == "link":
         store.set_network_url(args.name, args.url)
     elif args.command == "add-external":

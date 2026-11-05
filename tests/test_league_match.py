@@ -70,7 +70,7 @@ class TicTacToe(LeagueGame):
         logits = jax.random.normal(jax.random.PRNGKey(seed), (9,))
         return None, {"logits": logits, "value": jnp.array(0.0)}
 
-    def make_evaluator(self, network, sims, tree_factor=2):
+    def make_evaluator(self, network, sims, tree_factor=2, prior_temperature=1.0):
         return AlphaZero(MCTS)(
             eval_fn=eval_fn,
             num_iterations=sims,
@@ -79,6 +79,7 @@ class TicTacToe(LeagueGame):
             action_selector=PUCTSelector(),
             temperature=0.0,
             dirichlet_epsilon=0.0,
+            prior_temperature=prior_temperature,
         )
 
     def num_openings(self):
@@ -450,6 +451,17 @@ def test_a_tree_factor_is_a_program_of_its_own(game, tmp_path):
     programs = Programs(game, "float32")
     assert programs.program(plain, 2).config["max_nodes"] == 16
     assert programs.program(wide, 2).config["max_nodes"] == 32
+
+
+def test_a_prior_temperature_is_a_program_of_its_own(game, tmp_path):
+    path = tmp_path / "1.ckpt"
+    path.write_text("1")
+    plain = Player(id=1, name="n@8", network="n", net="tiny", sims=8, path=str(path))
+    flat = replace(plain, id=2, name="n@8-T1.6", settings={"prior_temperature": 1.6})
+    programs = Programs(game, "float32")
+    # the settings a batch records: a player at another temperature isn't the same player
+    assert programs.settings(plain, 2)["prior_temperature"] == 1.0
+    assert programs.settings(flat, 2)["prior_temperature"] == 1.6
 
 
 def test_a_tiny_league_plays_and_rates(game, tmp_path):
