@@ -1514,6 +1514,71 @@ def test_each_move_starting_in_a_call_takes_the_calls_next_key(env, tmp_path):
     np.testing.assert_array_equal(state.move_key[1], jax.random.split(keys[1], 6)[1])
 
 
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class PlyState:
+    """`EveryOtherMove`'s state: the moves played so far in the game."""
+
+    ply: jax.Array
+
+
+class EveryOtherMove(Evaluator):
+    """Plays the first legal move, and trains on every other one (see `Evaluator.trains_on`),
+    the game's first, third, ...: as playout cap randomization's fast searches are played
+    without being stored. Its value is the game's ply, so the experiences show which moves were
+    stored."""
+
+    def __init__(self):
+        super().__init__(discount=-1.0)
+
+    def init(self, *args, **kwargs):
+        return PlyState(ply=jnp.array(0))
+
+    def reset(self, state):
+        return PlyState(ply=jnp.zeros_like(state.ply))
+
+    def step(self, state, action):
+        return PlyState(ply=state.ply + 1)
+
+    def trains_on(self, state):
+        return state.ply % 2 == 0
+
+    def evaluate(self, key, eval_state, env_state, root_metadata, **kwargs):
+        action = jnp.argmax(root_metadata.action_mask)
+        return EvalOutput(
+            eval_state=eval_state,
+            action=action,
+            policy_weights=jax.nn.one_hot(action, root_metadata.action_mask.shape[-1]),
+        )
+
+    def get_value(self, state):
+        return state.ply.astype(jnp.float32)
+
+
+def test_collect_stores_only_the_moves_the_evaluator_trains_on(env, tmp_path):
+    trainer = make_trainer(env, tmp_path, evaluator=EveryOtherMove())
+    state = trainer.init_collection_state(jax.random.PRNGKey(0), trainer.batch_size)
+    keys = jax.random.split(jax.random.PRNGKey(1), trainer.batch_size)
+
+    # two whole games of 3 moves, and a move of a third
+    state = trainer.collect_steps(keys, state, None, 7)
+
+    np.testing.assert_array_equal(state.moves, [7, 7])
+    np.testing.assert_array_equal(state.episodes, [2, 2])
+    buffer_state = state.buffer_state
+    # each game's first and third moves, then the third game's first, still in progress
+    np.testing.assert_array_equal(buffer_state.next_idx, [5, 5])
+    np.testing.assert_array_equal(buffer_state.episode_start_idx, [4, 4])
+    np.testing.assert_array_equal(
+        buffer_state.buffer.search_value[:, :5], [[0, 2, 0, 2, 0]] * 2
+    )
+    # the finished games' stored moves have their outcomes: (1, -1), whoever moved
+    np.testing.assert_array_equal(buffer_state.has_reward[:, :5], [[1, 1, 1, 1, 0]] * 2)
+    np.testing.assert_array_equal(
+        buffer_state.buffer.reward[:, :4], [[[1, -1]] * 4] * 2
+    )
+
+
 def test_collect_stores_each_position_once(env, tmp_path):
     trainer = tree_trainer(
         env,

@@ -94,7 +94,7 @@ from core.evaluators.evaluation_fns import (
     make_nn_eval_fn_no_params_callable,
 )
 from core.evaluators.mcts.action_selection import PUCTSelector
-from core.evaluators.mcts.mcts import MCTS
+from core.evaluators.mcts.mcts import MCTS, PlayoutCap
 from core.evaluators.mcts.policy_targets import CompletedQ, VisitCounts
 from core.evaluators.random_evaluator import RandomEvaluator
 from core.memory.replay_memory import EpisodeReplayBuffer
@@ -172,6 +172,22 @@ def positive_schedule(text: str) -> list[tuple[int, int]]:
     if any(value < 1 for _, value in schedule):
         raise argparse.ArgumentTypeError(f"values must be positive, got {text!r}")
     return schedule
+
+
+def playout_cap(text: str) -> PlayoutCap:
+    """Parses --playout-cap, FULL_PROBABILITY:FAST_SIMS, e.g. 0.25:43."""
+    try:
+        probability, fast = text.split(":")
+        cap = PlayoutCap(float(probability), int(fast))
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{text!r}: expected FULL_PROBABILITY:FAST_SIMS, e.g. 0.25:43"
+        ) from None
+    if not (0 < cap.full_probability <= 1 and cap.fast_iterations > 0):
+        raise argparse.ArgumentTypeError(
+            f"{text!r}: the probability is in (0, 1], the fast sims positive"
+        )
+    return cap
 
 
 def load_engine_set(
@@ -264,6 +280,26 @@ def main():
         help="self-play cycles between plays of the moves whose searches are done (a search "
         "done in between goes on until then): by default a whole search's, or 5 with "
         "--count-reused-visits",
+    )
+    parser.add_argument(
+        "--playout-cap",
+        type=playout_cap,
+        default=None,
+        metavar="P:FAST",
+        help="playout cap randomization (KataGo): search each self-play move with --sims "
+        "iterations with probability P, and otherwise with FAST, without the root's noise; "
+        "only the --sims searches' positions are stored for training, e.g. 0.25:43. Size "
+        "--buffer by the share stored, and see --selfplay-cycles and --advance-every",
+    )
+    parser.add_argument(
+        "--selfplay-cycles",
+        type=int,
+        default=None,
+        metavar="CYCLES",
+        help="self-play's compute per epoch, in search cycles per environment (a cycle is a "
+        "network evaluation of the root or of an iteration's leaf): by default 128 moves' "
+        "searches, 128 x (--sims + 1). Holds self-play's compute fixed across settings, e.g. "
+        "with --playout-cap, whose moves take fewer on average. A multiple of --sims + 1",
     )
     parser.add_argument(
         "--sampling-moves",
@@ -661,9 +697,26 @@ def main():
             "--count-reused-visits counts the visits of the subtree a search keeps, which "
             "--no-persist-tree discards"
         )
-    if args.advance_every is None and args.count_reused_visits:
+    if args.advance_every is None and (
+        args.count_reused_visits or args.playout_cap is not None
+    ):
         # searches of varying lengths: see Trainer's advance_every
         args.advance_every = 5
+    if args.playout_cap is not None:
+        if args.sims_schedule is not None:
+            parser.error("--playout-cap goes with --sims, not --sims-schedule")
+        if args.playout_cap.fast_iterations >= args.sims:
+            parser.error("--playout-cap's fast sims must be fewer than --sims")
+    collection_steps = 128
+    if args.selfplay_cycles is not None:
+        if args.sims_schedule is not None:
+            parser.error("--selfplay-cycles goes with --sims, not --sims-schedule")
+        if args.selfplay_cycles < 1 or args.selfplay_cycles % (args.sims + 1):
+            parser.error(
+                f"--selfplay-cycles must be a positive multiple of --sims + 1 ({args.sims + 1})"
+            )
+        # self-play runs as many cycles as this many moves' searches take at most
+        collection_steps = args.selfplay_cycles // (args.sims + 1)
     if args.dirichlet_alpha <= 0:
         parser.error("--dirichlet-alpha must be positive")
     if not 0 <= args.dirichlet_epsilon <= 1:
@@ -719,6 +772,7 @@ def main():
                     policy_target=CompletedQ(args.value_scale, args.maxvisit_init)
                     if args.policy_target == "completed-q"
                     else VisitCounts(),
+                    playout_cap=args.playout_cap,
                 ),
             )
             for epoch, sims in args.sims_schedule or [(0, args.sims)]
@@ -811,13 +865,14 @@ def main():
         if monitor is not None:
             describe_scores(monitor, match_tester.score_names())
 
-    # each epoch collects `collection_steps_per_epoch` self-play steps in each of
-    # `batch_size` environments, then takes `train_steps_per_epoch` training steps
+    # each epoch collects `collection_steps_per_epoch` self-play steps' compute (see
+    # --selfplay-cycles) in each of `batch_size` environments, then takes
+    # `train_steps_per_epoch` training steps
     trainer = Trainer(
         batch_size=1024,
         train_batch_size=args.train_batch,
         warmup_steps=0,
-        collection_steps_per_epoch=128,
+        collection_steps_per_epoch=collection_steps,
         train_steps_per_epoch=args.train_steps,
         advance_every=args.advance_every,
         grad_accum_steps=args.grad_accum,
@@ -869,7 +924,7 @@ def main():
         # every argument but how the run starts (a fork records its parent)
         extra_config={
             "args": {
-                k: v
+                k: v.get_config() if isinstance(v, PlayoutCap) else v
                 for k, v in vars(args).items()
                 if k not in ("resume", "init_from", "init_without_buffers", "notes")
             }

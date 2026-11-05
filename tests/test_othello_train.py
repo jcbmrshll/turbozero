@@ -130,3 +130,52 @@ def test_lr_plateau_can_watch_the_engine_sets_value_error(monkeypatch, tmp_path)
 def test_lr_plateau_metric_needs_the_rule_and_the_set_every_epoch(monkeypatch, options):
     with pytest.raises(SystemExit):
         run_main(monkeypatch, *options)
+
+
+def test_playout_cap_and_selfplay_cycles_reach_self_play(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(
+            monkeypatch,
+            "--sims",
+            "63",
+            "--playout-cap",
+            "0.25:21",
+            "--selfplay-cycles",
+            str(128 * 65),
+        )
+    evaluator = built.value.kwargs["evaluator"].at(0)
+    assert evaluator.playout_cap == train.PlayoutCap(0.25, 21)
+    assert evaluator.num_iterations == 63
+    # 8320 cycles: 130 full searches' worth
+    assert built.value.kwargs["collection_steps_per_epoch"] == 130
+    # searches of varying lengths: played every few cycles rather than every full search's
+    assert built.value.kwargs["advance_every"] == 5
+    assert built.value.kwargs["extra_config"]["args"]["playout_cap"] == {
+        "full_probability": 0.25,
+        "fast_iterations": 21,
+    }
+
+
+def test_without_playout_cap_every_search_is_full(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, "--sims", "64")
+    assert built.value.kwargs["evaluator"].at(0).playout_cap is None
+    assert built.value.kwargs["collection_steps_per_epoch"] == 128
+    assert built.value.kwargs["advance_every"] is None
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ("--playout-cap", "0.25"),
+        ("--playout-cap", "0:21"),
+        ("--playout-cap", "1.5:21"),
+        ("--sims", "32", "--playout-cap", "0.25:32"),
+        ("--sims-schedule", "0:32,10:64", "--playout-cap", "0.25:8"),
+        ("--sims", "63", "--selfplay-cycles", "100"),
+        ("--sims-schedule", "0:32,10:64", "--selfplay-cycles", "330"),
+    ],
+)
+def test_bad_playout_cap_options_are_refused(monkeypatch, options):
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, *options)

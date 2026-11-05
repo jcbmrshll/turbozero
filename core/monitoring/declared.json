@@ -35,7 +35,7 @@
   "tree_positions": {"description": "Search tree positions stored this epoch, besides the positions played."},
   "tree_positions_per_move": {"description": "Search tree positions stored per self-play move."},
   "tree_mean_visits": {"description": "The mean visits of the search tree positions stored this epoch."},
-  "search_iterations": {"description": "MCTS iterations a self-play search runs, per move."},
+  "search_iterations": {"description": "MCTS iterations a self-play search runs, per move (their mean, with playout cap randomization)."},
   "cycles_per_move": {"description": "Search cycles (the root's evaluation and each iteration) per self-play move played, counting cycles spent waiting for a move to be played: self-play's compute per move."},
   "*_level*_sims*_game": {"description": "A game the network, searching sims iterations a move, played against the engine at that level, with its opening."},
   "*_level*_sims*_last*_se": {"description": "The standard error of the mean score of the last networks against the engine (the _last* metric): how much it would move with other openings, each game's result averaged over the networks first, since they all play the same games."},
