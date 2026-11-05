@@ -250,8 +250,32 @@ def test_dirichlet_noise_is_mixed_into_the_root_prior_over_legal_moves_only(
     assert (noise > -1e-5).all()
     np.testing.assert_allclose(noise.sum(axis=-1), 1.0, rtol=1e-5)
     np.testing.assert_allclose(noise[:, ~mask], 0.0, atol=1e-6)
-    # a symmetric Dirichlet: each legal move gets an equal share on average
-    np.testing.assert_allclose(noise[:, mask].mean(axis=0), 1 / mask.sum(), atol=0.06)
+    # a symmetric Dirichlet: each legal move gets an equal share on average, spread as
+    # Dirichlet(alpha)'s, (1/k)(1 - 1/k) / (k alpha + 1) over k legal moves
+    k = mask.sum()
+    np.testing.assert_allclose(noise[:, mask].mean(axis=0), 1 / k, atol=0.06)
+    np.testing.assert_allclose(
+        noise[:, mask].var(), (1 / k) * (1 - 1 / k) / (k * alpha + 1), rtol=0.15
+    )
+
+
+def test_drawing_the_root_noise_has_no_open_loops():
+    # on GPU, each trip of a loop whose trip count XLA doesn't know waits on the host: self-play
+    # starts searches (and draws their noise) for every environment at every check
+    search = make_mcts(AZ_MCTS, num_actions=6, logits=jnp.zeros(6))
+    keys = jax.random.split(jax.random.PRNGKey(0), 5)
+
+    hlo = (
+        jax.jit(jax.vmap(lambda key: search.root_noise(key, (6,))))
+        .lower(keys)
+        .compile()
+        .as_text()
+    )
+
+    assert hlo is not None
+    # (the random bits' hash rounds may stay a loop, of a known trip count)
+    loops = [line for line in hlo.splitlines() if " while(" in line]
+    assert all("known_trip_count" in line for line in loops)
 
 
 def test_the_root_keeps_the_networks_policy_without_the_noise(fixed_length_env):
@@ -989,8 +1013,7 @@ def test_search_cycles_write_the_trees_in_place(env, cls):
     ],
 )
 def test_a_search_cycle_loops_only_to_traverse(env, cls, loops):
-    # the root's noise is drawn once, before the cycles (its Gamma draws are rejection sampling,
-    # a loop until every draw in the batch is accepted)
+    # the root's noise is drawn once, before the cycles
     search = make_mcts(cls, max_nodes=24, eval_fn=state_eval_fn, num_iterations=6)
     trees = jax.vmap(lambda _: search.init(template_embedding=env.init_fn(None)[0]))(
         jnp.arange(5)

@@ -278,12 +278,27 @@ def make_search():
     return make
 
 
+class Collector:
+    """`make_collector`'s `collect`, with its `trainer`."""
+
+    def __init__(self, trainer: Trainer):
+        self.trainer = trainer
+        self.step = jax.jit(jax.vmap(partial(trainer.collect, params=None)))
+
+    def __call__(self, num_steps: int):
+        state = self.trainer.init_collection_state(jax.random.PRNGKey(0), batch_size=1)
+        for i in range(num_steps):
+            state = self.step(jax.random.split(jax.random.PRNGKey(i), 1), state)
+        return state
+
+
 @pytest.fixture(scope="session")
 def make_collector():
     """Factory for self-play collection in a single environment, through a `Trainer`'s `collect`.
 
     `make_collector(env, evaluator, max_episode_steps, ckpt_dir, **trainer_kwargs)` returns
     `collect(num_steps)`: the `CollectionState` after `num_steps` steps from the initial state.
+    `collect.trainer` is the trainer.
     """
 
     def make(env, evaluator, max_episode_steps, ckpt_dir, **trainer_kwargs):
@@ -307,15 +322,7 @@ def make_collector():
             ckpt_dir=str(ckpt_dir),
             **trainer_kwargs,
         )
-        step = jax.jit(jax.vmap(partial(trainer.collect, params=None)))
-
-        def collect(num_steps):
-            state = trainer.init_collection_state(jax.random.PRNGKey(0), batch_size=1)
-            for i in range(num_steps):
-                state = step(jax.random.split(jax.random.PRNGKey(i), 1), state)
-            return state
-
-        return collect
+        return Collector(trainer)
 
     return make
 

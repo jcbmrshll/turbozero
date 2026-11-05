@@ -1,4 +1,12 @@
 {
+  "selfplay_seconds": {"description": "Wall time of the epoch's self-play, compiling included the first time a search plays. With the run's other *_seconds, what to compare runs by at equal GPU time.", "unit": "s"},
+  "train_seconds": {"description": "Wall time of the epoch's training, every network that trains (with growth, each network's own is <name>/train_seconds), compiling included the first time.", "unit": "s"},
+  "test_seconds": {"description": "Wall time of the epoch's tests, every network's that trains (with growth, each network's own is <name>/test_seconds).", "unit": "s"},
+  "epoch_seconds": {"description": "Wall time of the whole epoch: self-play, training, tests and checkpoints.", "unit": "s"},
+  "run_seconds": {"description": "Wall time of the run's training loop so far, startup and compiling included, carried over when a run is continued from a saved state (not when it's forked).", "unit": "s"},
+  "growth_playing": {"description": "With growth: the index of the network self-play played with this epoch (the run's first network is 0)."},
+  "growth_gap": {"description": "With growth: the next network's switch metric (e.g. engine_value_mse), averaged over the rule's window, minus the playing network's. The next takes over once it's at or below 0, after its minimum epochs."},
+  "growth_switch": {"description": "With growth: the index of the network that takes over self-play, logged at the epoch whose results made it; it plays from the next epoch."},
   "loss": {"description": "The loss training minimizes, averaged over the epoch's training steps. With the default loss function, policy_loss + value_loss.", "better": "lower", "headline": true},
   "policy_loss": {"description": "Cross-entropy of the network's policy against the search's policy target (its visit counts, or Gumbel MuZero's completed-Q policy), averaged over the epoch's training steps.", "unit": "nats", "better": "lower", "headline": true},
   "value_loss": {"description": "Half the squared error of the network's value against its target (the game's outcome for the player to move, mixed with the search's value with value_target_q), averaged over the epoch's training steps.", "better": "lower", "headline": true},
@@ -65,5 +73,6 @@
   "*_exp_regret*": {"description": "The score the network's policy gives up against the engine's best action, expected over its policy, on the engine-labelled positions (a suffix names a group). Less noisy than regret, but it also measures how sharp the policy is: compare it only between runs with the same search and policy target (across them, use regret and value_mse). No search.", "better": "lower"},
   "*_regret*": {"description": "The score the network's most likely action gives up against the engine's best, on the engine-labelled positions (a suffix names a group). No search.", "better": "lower"},
   "*_value_mse*": {"description": "(value - z)^2 of the network's value, z the outcome the engine predicts (+1, 0 or -1), on the engine-labelled positions (a suffix names a group). No search.", "better": "lower"},
-  "*_value_sign*": {"description": "How often the network's value has the sign of the outcome the engine predicts, over the engine-labelled positions it doesn't call a draw (a suffix names a group). No search.", "better": "higher"}
+  "*_value_sign*": {"description": "How often the network's value has the sign of the outcome the engine predicts, over the engine-labelled positions it doesn't call a draw (a suffix names a group). No search.", "better": "higher"},
+  "*/*": {"description": "With growth: one network's own metric, <its name>/<metric>; the metric is as it is described without the prefix. The network playing self-play also logs its metrics without it."}
 }

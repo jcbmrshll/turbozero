@@ -344,6 +344,38 @@ its own `--lr`: to carry on at 1e-4, fork with `--lr 1e-4 --lr-plateau 1e-5`.
 uv run examples/othello/train.py --epochs 600 --lr-plateau --save-state-every 10 --ckpt-dir runs/plateau
 ```
 
+### Growing the network
+
+Self-play costs far more than training. KataGo started with small nets and trained the next
+size up on the same games, switching when it caught up. `--grow NET` (repeat it for several,
+smallest first) does the same: `--net` plays self-play, and the next network trains on the same
+replay buffer each epoch without playing. When it takes over, the one before stops, and the
+one after that, if any, starts training from scratch on the buffer as it is. So two networks
+train at a time.
+
+The next network takes over when its `--grow-metric` on the engine-labelled set
+(`engine_value_mse`, scored every epoch) is at or below the playing one's. Each is averaged over
+the last `--grow-window` (10) epochs, and the next must have trained `--grow-min-epochs` (10) first.
+With `--grow-switch-at EPOCHS`, it takes over after fixed numbers of epochs instead. Either way,
+a playing network whose `--lr-plateau-stop` rule is done hands over rather than stopping the
+run. A waiting network trains at `--lr`, and follows `--lr-plateau` from its first rate once it
+plays.
+
+Each network's checkpoints go to `--ckpt-dir/<its size>`, e.g. `runs/grow/2x32` and `runs/grow/4x64`.
+Saved states hold every network, in `--ckpt-dir`. Each network's metrics are logged as
+`<its size>/<metric>`, and the playing network's also without the prefix. The run logs which
+network played (`growth_playing`), the next's mean metric minus the playing one's (`growth_gap`),
+and the switch (`growth_switch`). Every run logs its compute per epoch, to compare runs at equal
+GPU time: `selfplay_seconds`, `train_seconds` and `test_seconds` (with `--grow`, each network's
+as `<its size>/train_seconds` and `<its size>/test_seconds`), `epoch_seconds`, and the run's total,
+`run_seconds`.
+
+```
+uv run examples/othello/train.py --net resnet:2x32,pool_every=2,heads=pooled,pool_channels=8 \
+    --grow resnet:4x64,pool_every=2,heads=pooled,pool_channels=16 --engine-eval-every 1 \
+    --lr-plateau --lr-plateau-stop --epochs 600 --ckpt-dir runs/grow
+```
+
 ### Training on Modal
 
 `modal_jobs.py` runs train.py on Modal's GPUs, several at once, and brings the results to the

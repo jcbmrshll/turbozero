@@ -2,6 +2,7 @@ import inspect
 import json
 import os
 import re
+import time
 import zipfile
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import asdict, dataclass, field, replace
@@ -29,7 +30,9 @@ from core.memory.replay_memory import (
 from core.pytree import where_tree
 from core.testing.tester import BaseTester, TestState
 from core.training.exploration import Exploration
+from core.training.growth import Growth, GrowthProgress, Learner
 from core.training.lr_plateau import LRPlateau, LRPlateauProgress, LRPlateauState
+from core.training.resignation import Resignation, ResignState
 from core.training.schedule import EvaluatorSchedule, describe
 from core.training.tree_positions import (
     TreePositions,
@@ -74,6 +77,8 @@ class CollectionState:
         tree_buffer_state: state of the replay buffer of search tree positions, None without them
         tree_written_at: for each entry of the tree position replay buffer, the number of moves made
             before it was written (see `Trainer.tree_sample_mask`), None without tree positions
+        resign_state: each environment's resignation state (see `Trainer`'s `resignation`), None
+            without resignation
     """
 
     eval_state: Any
@@ -89,6 +94,7 @@ class CollectionState:
     search_cycles: jax.Array
     tree_buffer_state: ReplayBufferState | None = None
     tree_written_at: jax.Array | None = None
+    resign_state: ResignState | None = None
 
 
 @dataclass(frozen=True)
@@ -102,6 +108,7 @@ class CollectionStats:
         tree_positions: number of search tree positions stored so far
         tree_visits: their visit counts, summed
         episode_metrics: sums over the terminated episodes of each episode metric
+        resign_state: the resignation state's counters, None without resignation
     """
 
     episodes: jax.Array
@@ -109,6 +116,7 @@ class CollectionStats:
     tree_positions: jax.Array
     tree_visits: jax.Array
     episode_metrics: dict[str, jax.Array]
+    resign_state: ResignState | None = None
 
     @classmethod
     def of(cls, state: CollectionState) -> "CollectionStats":
@@ -120,6 +128,7 @@ class CollectionStats:
             tree_positions=jnp.copy(state.tree_positions),
             tree_visits=jnp.copy(state.tree_visits),
             episode_metrics={k: jnp.copy(v) for k, v in state.episode_metrics.items()},
+            resign_state=jax.tree.map(jnp.copy, state.resign_state),
         )
 
 
@@ -132,23 +141,40 @@ class TrainLoopOutput:
 
     Attributes:
         collection_state: state of self-play episode collection.
-        train_state: TrainState, holds model params and state, optimizer state
-        test_states: states of testers
+        train_states: each network's TrainState (model params and state, optimizer state): the
+            Trainer's own, then, with `growth`, each it grows into
+        test_states: each network's testers' states
         cur_epoch: current epoch num
         key: (optional) the training loop's rng, for the next epoch. With it, a run continued
             from this state carries on exactly as if it hadn't stopped (see `Trainer.train_loop`).
-        lr_plateau: (optional) with the Trainer's `lr_plateau`, the rule's progress at the
-            current rate (its index is in the optimizer's state)
+        lr_plateau: with the Trainer's `lr_plateau`, each network's progress with the rule at its
+            current rate (its index is in the optimizer's state), None for a network the rule
+            doesn't follow (yet); empty without the rule
+        growth: (optional) with the Trainer's `growth`, which network plays and the switch rule's
+            progress
+        seconds: the wall time the run's training loop has taken so far, over every call
     """
 
     collection_state: CollectionState
-    train_state: TrainState
-    test_states: list[TestState]
+    train_states: tuple[TrainState, ...]
+    test_states: tuple[list[TestState], ...]
     cur_epoch: int
     key: jax.Array | None = None
-    lr_plateau: LRPlateauProgress | None = field(
-        default=None, metadata={"static": True}
+    lr_plateau: tuple[LRPlateauProgress | None, ...] = field(
+        default=(), metadata={"static": True}
     )
+    growth: GrowthProgress | None = field(default=None, metadata={"static": True})
+    seconds: float = field(default=0.0, metadata={"static": True})
+
+    @property
+    def playing(self) -> int:
+        """The index of the network self-play plays with."""
+        return self.growth.playing if self.growth is not None else 0
+
+    @property
+    def train_state(self) -> TrainState:
+        """The TrainState of the network self-play plays with."""
+        return self.train_states[self.playing]
 
 
 def extract_params(state: TrainState) -> Any:
@@ -213,7 +239,7 @@ def read_state_meta(path: str) -> dict:
 
 
 # saved states' format, recorded in their metadata
-STATE_FORMAT = 1
+STATE_FORMAT = 2
 
 
 def _describe(tree: Any) -> list[tuple[str, tuple[int, ...], str]]:
@@ -479,6 +505,7 @@ class Trainer:
         evaluator_test: Evaluator | None = None,
         test_env_init_fn: EnvInitFn | None = None,
         exploration: Exploration | None = None,
+        resignation: Resignation | None = None,
         episode_metrics_fn: Callable[[jax.Array], dict[str, jax.Array]] | None = None,
         data_transform_fns: Sequence[DataTransformFn] = (),
         tree_positions: TreePositions | None = None,
@@ -492,6 +519,7 @@ class Trainer:
         save_state_every: int | None = None,
         lr_plateau: LRPlateau | None = None,
         lr_plateau_metric: str = "loss",
+        growth: Growth | None = None,
         extra_config: dict | None = None,
     ):
         """Initializes a Trainer.
@@ -538,6 +566,9 @@ class Trainer:
             exploration: (optional) chooses the move data collection plays from the evaluator's output,
                 e.g. to play random moves some of the time (see core.training.exploration). The evaluator's
                 policy weights stay the training target. If not provided, collection plays the evaluator's move.
+            resignation: (optional) self-play's players resign lost games (see core.training.resignation),
+                ending them early as losses. Two-player zero-sum games only. Resigned games count as
+                terminated episodes. If not provided, every game is played to the end.
             episode_metrics_fn: (optional) metrics of a finished episode to track, from its final rewards (one per
                 player) to a dict of scalars, e.g. `lambda rewards: {"draw": (rewards == 0).all()}`. Each is logged
                 every epoch as `episode_<name>`, its mean over the episodes that terminated that epoch (truncated
@@ -587,6 +618,12 @@ class Trainer:
                 epoch (e.g. a `ScoredPositionsTester`'s "engine_value_mse", on fixed positions
                 whose targets don't move as the network improves). For a tester's metric the rule
                 is applied after the epoch's tests, and an epoch that didn't log it is an error.
+            growth: (optional) bigger networks to grow into (see `core.training.growth.Growth`):
+                `nn` plays self-play first, and each of them takes over in turn, training alongside
+                the one playing until it does, on the same replay buffer. Each network's
+                checkpoints go to `<ckpt_dir>/<its name>`, and its metrics, its training's and its
+                testers', are logged as `<its name>/<metric>`; those of the network playing are
+                also logged as they are without growth. `testers` and `evaluator_test` are `nn`'s.
             extra_config: (optional) extra config to record with the monitor's run
         """
         # environment
@@ -633,6 +670,7 @@ class Trainer:
             raise ValueError(f"advance_every must be positive, got {advance_every}")
         self.advance_every = advance_every
         self.exploration = exploration
+        self.resignation = resignation
         self.episode_metrics_fn = episode_metrics_fn
         if tree_positions is not None and not all(
             isinstance(e, MCTS) for _, e in self.collection_schedule.stages
@@ -677,13 +715,40 @@ class Trainer:
             env_init_fn=self.test_env_init_fn,
             max_steps=self.max_episode_steps,
         )
+        # growth: the networks, the Trainer's own first
+        self.growth = growth
+        own = Learner(
+            name=growth.first if growth is not None else "",
+            nn=nn,
+            evaluator=self.collection_schedule,
+            evaluator_test=evaluator_test,
+            testers=testers,
+            nn_state=nn_state,
+        )
+        self.learners: tuple[Learner, ...] = (
+            (own, *growth.learners) if growth is not None else (own,)
+        )
+        for learner in self.learners[1:]:
+            if tree_positions is not None and not all(
+                isinstance(e, MCTS) for _, e in learner.schedule.stages
+            ):
+                raise ValueError("tree_positions needs MCTS self-play evaluators")
+            if lr_plateau is not None:
+                state = jax.eval_shape(
+                    optimizer.init, eqx.filter(learner.nn, eqx.is_inexact_array)
+                )
+                if not lr_plateau_states(state):
+                    raise ValueError(
+                        f"{learner.name}: the optimizer's learning rate must be lr_plateau"
+                    )
         # checkpoints
         self.ckpt_dir = ckpt_dir
         self.max_checkpoints = max_checkpoints
         self.keep_every = keep_every
         self.save_state_at = frozenset(save_state_at)
         self.save_state_every = save_state_every
-        os.makedirs(ckpt_dir, exist_ok=True)
+        for d in self.ckpt_dirs:
+            os.makedirs(d, exist_ok=True)
         # monitor
         self.monitor = monitor
         self.extra_config = extra_config if extra_config is not None else {}
@@ -691,16 +756,28 @@ class Trainer:
         # config and in states the run saves
         self.parent: dict | None = None
 
-    def init_train_state(self) -> TrainState:
+    @property
+    def ckpt_dirs(self) -> tuple[str, ...]:
+        """Each network's checkpoint directory: `ckpt_dir`, or with `growth`, a directory in it
+        for each network, by its name."""
+        if self.growth is None:
+            return (self.ckpt_dir,)
+        return tuple(os.path.join(self.ckpt_dir, name) for name in self.growth.names)
+
+    def init_train_state(self, learner: int = 0) -> TrainState:
         """Initializes the training state (params, optimizer, etc.) from `nn` and `nn_state`.
+
+        Args:
+            learner: (optional) with `growth`, the network's index (`nn` is 0)
 
         Returns:
             TrainState: initialized training state
         """
-        params = eqx.filter(self.nn, eqx.is_inexact_array)
+        net = self.learners[learner]
+        params = eqx.filter(net.nn, eqx.is_inexact_array)
         return TrainState(
             params=params,
-            nn_state=self.nn_state,
+            nn_state=net.nn_state,
             opt_state=self.optimizer.init(params),
             step=jnp.array(0, dtype=jnp.int32),
         )
@@ -754,6 +831,11 @@ class Trainer:
             "exploration_config": self.exploration.get_config()
             if self.exploration is not None
             else None,
+            **(
+                {"resignation": self.resignation.get_config()}
+                if self.resignation is not None
+                else {}
+            ),
             "episode_metrics_fn": getattr(self.episode_metrics_fn, "__name__", None)
             if self.episode_metrics_fn is not None
             else None,
@@ -763,6 +845,7 @@ class Trainer:
             if self.tree_positions is not None
             else None,
             "testers": [tester.get_config() for tester in self.testers],
+            **({"growth": self.growth.get_config()} if self.growth is not None else {}),
         }
 
     def move_keys(
@@ -880,6 +963,20 @@ class Trainer:
         # played, and count towards their game's length and outcome, without being stored
         stored = done & evaluator.trains_on(state.eval_state)
         evaluate_key, key, tree_key = self.move_keys(state.move_key)
+        output = evaluator.search_output(
+            evaluate_key,
+            state.eval_state,
+            state.env_state,
+            state.metadata,
+            params,
+            self.env_step_fn,
+        )
+        search_value = evaluator.get_value(output.eval_state)
+        resigned = (
+            done & self.resignation.resigns(state.resign_state, search_value)
+            if self.resignation is not None and state.resign_state is not None
+            else jnp.array(False)
+        )
         # step environment and evaluator
         (
             eval_output,
@@ -891,14 +988,7 @@ class Trainer:
             searched_eval_state,
         ) = step_with_output(
             key=key,
-            output=evaluator.search_output(
-                evaluate_key,
-                state.eval_state,
-                state.env_state,
-                state.metadata,
-                params,
-                self.env_step_fn,
-            ),
+            output=output,
             env_state=state.env_state,
             env_state_metadata=state.metadata,
             evaluator=evaluator,
@@ -909,9 +999,33 @@ class Trainer:
             if self.exploration is not None
             else None,
             active=done,
+            end=resigned,
         )
-        search_value = evaluator.get_value(searched_eval_state)
         terminated, truncated = done & terminated, done & truncated
+        resign_state = state.resign_state
+        if self.resignation is not None and resign_state is not None:
+            resign_state = self.resignation.update(
+                jax.random.fold_in(key, 1),
+                resign_state,
+                moved=done,
+                value=search_value,
+                player=state.metadata.cur_player_id,
+                resigned=resigned,
+                terminated=terminated,
+                ended=terminated | truncated | resigned,
+                rewards=rewards,
+            )
+            # the player to move loses, the other wins
+            rewards = jnp.where(
+                resigned,
+                jnp.where(
+                    jnp.arange(rewards.shape[-1]) == state.metadata.cur_player_id,
+                    -1.0,
+                    1.0,
+                ).astype(rewards.dtype),
+                rewards,
+            )
+            terminated = terminated | resigned
 
         # store experience in replay buffer
         buffer_state = self.memory_buffer.add_experience(
@@ -965,6 +1079,7 @@ class Trainer:
                 state.episode_metrics, rewards, terminated
             ),
             search_cycles=jnp.where(done, 0, state.search_cycles),
+            resign_state=resign_state,
         )
 
     def collect(
@@ -1134,19 +1249,23 @@ class Trainer:
         return jax.vmap(collect_env)(key, state)
 
     def train_step(
-        self, ts: TrainState, batch: BaseExperience
+        self, ts: TrainState, batch: BaseExperience, learner: int = 0
     ) -> tuple[TrainState, dict]:
         """Make a single training step.
 
         Args:
             ts: TrainState
             batch: minibatch of experiences
+            learner: (optional) with `growth`, the index of the network `ts` is (`nn` is 0)
 
         Returns:
             Tuple[TrainState, dict]: updated TrainState and metrics
         """
         # calculate loss, get gradients
-        nn = eqx.combine(ts.params, self.nn_static)
+        nn_static = eqx.filter(
+            self.learners[learner].nn, eqx.is_inexact_array, inverse=True
+        )
+        nn = eqx.combine(ts.params, nn_static)
         grad_fn = eqx.filter_value_and_grad(self.loss_fn, has_aux=True)
         if self.grad_accum_steps == 1:
             (loss, (metrics, nn_state)), grads = grad_fn(nn, ts.nn_state, batch)
@@ -1227,7 +1346,7 @@ class Trainer:
             jax.tree.map(lambda g: g / n, grads),
         )
 
-    @partial(jax.jit, static_argnums=(0, 4))
+    @partial(jax.jit, static_argnums=(0, 4), static_argnames=("learner",))
     def train_epoch(
         self,
         key: jax.Array,
@@ -1237,6 +1356,7 @@ class Trainer:
         tree_buffer_state: ReplayBufferState | None = None,
         tree_mask: jax.Array | None = None,
         num_tree: jax.Array | None = None,
+        learner: int = 0,
     ) -> tuple[TrainState, dict]:
         """Performs `num_steps` training steps, compiled into a single `jax.lax.scan`.
 
@@ -1255,6 +1375,7 @@ class Trainer:
             tree_mask: the tree positions that can be sampled (see `tree_sample_mask`)
             num_tree: number of tree positions in each minibatch, a traced value so that changing it
                 doesn't recompile. With none to sample, it must be 0.
+            learner: (optional) with `growth`, the index of the network `train_state` is
 
         Returns:
             Tuple[TrainState, dict]: updated training state and metrics (mean across steps)
@@ -1288,7 +1409,7 @@ class Trainer:
             transform_key, key = jax.random.split(key)
             batch = transform_randomly(transform_key, batch, self.transform_fns)
             # make training step
-            ts, metrics = self.train_step(ts, batch)
+            ts, metrics = self.train_step(ts, batch, learner)
             return (key, ts), metrics
 
         (_, train_state), metrics = jax.lax.scan(
@@ -1366,6 +1487,7 @@ class Trainer:
         train_state: TrainState,
         num_steps: int,
         epoch: int = 0,
+        learner: int = 0,
     ) -> tuple[CollectionState, TrainState, dict]:
         """Performs `num_steps` training steps.
 
@@ -1381,6 +1503,7 @@ class Trainer:
             train_state: current training state
             num_steps: number of training steps to perform
             epoch: the current epoch, which sets the share of tree positions (see `TreePositions.ratio_at`)
+            learner: (optional) with `growth`, the index of the network `train_state` is
 
         Returns:
             Tuple[CollectionState, TrainState, dict]:
@@ -1399,7 +1522,11 @@ class Trainer:
         )
         if self.tree_positions is None:
             train_state, metrics = self.train_epoch(
-                key, collection_state.buffer_state, train_state, num_steps
+                key,
+                collection_state.buffer_state,
+                train_state,
+                num_steps,
+                learner=learner,
             )
             return collection_state, train_state, metrics
         tree_mask = self.tree_sample_mask(collection_state)
@@ -1416,6 +1543,7 @@ class Trainer:
             tree_buffer_state=collection_state.tree_buffer_state,
             tree_mask=tree_mask,
             num_tree=jnp.array(num_tree, dtype=jnp.int32),
+            learner=learner,
         )
         metrics = {
             **metrics,
@@ -1443,6 +1571,10 @@ class Trainer:
                 - `buffer_distinct_positions`: distinct observations among them, those a data
                   transform maps to one another counting as one (e.g. a board and its rotations)
                 - `buffer_distinct_fraction`: that as a fraction of those experiences
+                - with `resignation`: `resigned`, the fraction of those episodes that ended in a
+                  resignation; `resign_calibration_games`, the calibration games that ended;
+                  `resign_calibration_below`, the fraction of them in which a player's value fell to
+                  the threshold; and `resign_false`, the fraction of those that player didn't lose
                 - with `tree_positions`: `tree_positions` stored in between,
                   `tree_positions_per_move`, and their `tree_mean_visits`
         """
@@ -1460,6 +1592,24 @@ class Trainer:
             for name, total_after in after.episode_metrics.items():
                 change = (total_after - before.episode_metrics[name]).sum()
                 metrics[f"episode_{name}"] = change / episodes
+        if after.resign_state is not None and before.resign_state is not None:
+
+            def resign_change(name: str) -> jax.Array:
+                return (
+                    getattr(after.resign_state, name)
+                    - getattr(before.resign_state, name)
+                ).sum()
+
+            calibration_games = resign_change("calibration_games")
+            calibration_below = resign_change("calibration_below")
+            metrics["resigned"] = resign_change("resigned") / jnp.maximum(episodes, 1)
+            metrics["resign_calibration_games"] = calibration_games
+            metrics["resign_calibration_below"] = calibration_below / jnp.maximum(
+                calibration_games, 1
+            )
+            metrics["resign_false"] = resign_change("calibration_false") / jnp.maximum(
+                calibration_below, 1
+            )
         if self.tree_positions is not None:
             positions = (after.tree_positions - before.tree_positions).sum()
             visits = (after.tree_visits - before.tree_visits).sum()
@@ -1500,8 +1650,11 @@ class Trainer:
         if self.monitor is not None:
             self.monitor.activity(text)
 
-    def save_checkpoint(self, train_state: TrainState, epoch: int) -> None:
-        """Saves a checkpoint of the training state to `ckpt_dir`.
+    def save_checkpoint(
+        self, train_state: TrainState, epoch: int, learner: int = 0
+    ) -> None:
+        """Saves a checkpoint of the training state to `ckpt_dir` (with `growth`, to the
+        network's directory in it).
 
         Deletes the oldest checkpoints so that at most `max_checkpoints` remain, besides
         those kept by `keep_every`.
@@ -1509,15 +1662,17 @@ class Trainer:
         Args:
             train_state: current training state
             epoch: current epoch
+            learner: (optional) with `growth`, the index of the network `train_state` is
         """
-        epochs = checkpoint_epochs(self.ckpt_dir)
+        ckpt_dir = self.ckpt_dirs[learner]
+        epochs = checkpoint_epochs(ckpt_dir)
         if epochs and epochs[-1] >= epoch:
             raise ValueError(
-                f"{self.ckpt_dir} already has a checkpoint at or after epoch {epoch}, "
+                f"{ckpt_dir} already has a checkpoint at or after epoch {epoch}, "
                 "resume from it or use a different ckpt_dir"
             )
         # write to a temporary file first so an interrupted save doesn't leave a partial checkpoint
-        path = checkpoint_path(self.ckpt_dir, epoch)
+        path = checkpoint_path(ckpt_dir, epoch)
         with open(path + ".tmp", "wb") as f:
             eqx.tree_serialise_leaves(f, train_state)
         os.replace(path + ".tmp", path)
@@ -1527,22 +1682,23 @@ class Trainer:
             if epoch % self.keep_every == 0:
                 return
         for old_epoch in epochs[: max(0, len(epochs) + 1 - self.max_checkpoints)]:
-            os.remove(checkpoint_path(self.ckpt_dir, old_epoch))
+            os.remove(checkpoint_path(ckpt_dir, old_epoch))
 
     def load_train_state_from_checkpoint(
-        self, path_to_checkpoint: str, epoch: int
+        self, path_to_checkpoint: str, epoch: int, learner: int = 0
     ) -> TrainState:
         """Loads a training state from a checkpoint.
 
         Args:
             path_to_checkpoint: path to checkpoint
             epoch: epoch to load
+            learner: (optional) with `growth`, the index of the network it's a checkpoint of
 
         Returns:
             TrainState: loaded training state
         """
         with open(checkpoint_path(path_to_checkpoint, epoch), "rb") as f:
-            return eqx.tree_deserialise_leaves(f, self.init_train_state())
+            return eqx.tree_deserialise_leaves(f, self.init_train_state(learner))
 
     def should_save_state(self, epochs_done: int) -> bool:
         """Whether to save the whole training state after `epochs_done` epochs (see
@@ -1554,8 +1710,9 @@ class Trainer:
 
     def save_state(self, state: TrainLoopOutput) -> str:
         """Saves the whole training state to `ckpt_dir`, as `state-<epochs done>.npz`: the train
-        state, the collection state (with the replay buffers), the testers' states, the number of
-        epochs done, the training loop's rng, and with `lr_plateau`, the rule's progress.
+        states (with `growth`, every network's), the collection state (with the replay buffers),
+        the testers' states, the number of epochs done, the training loop's rng, the wall time it
+        has taken, with `lr_plateau` the rule's progress, and with `growth` its progress.
 
         The run continues from it exactly (see `resume`), and new runs fork from it (see
         `train_loop`'s `fork_from`). It also records the run's configuration, its monitor run, and
@@ -1576,7 +1733,7 @@ class Trainer:
         if state.key is None:
             raise ValueError("can't save a training state without its rng (`key`)")
         parts = {
-            "train_state": state.train_state,
+            "train_states": state.train_states,
             "collection_state": state.collection_state,
             "test_states": state.test_states,
         }
@@ -1590,9 +1747,12 @@ class Trainer:
             else None,
             "monitor_run": self.monitor.run_id if self.monitor is not None else None,
             "parent": self.parent,
-            "lr_plateau": asdict(state.lr_plateau)
-            if state.lr_plateau is not None
-            else None,
+            "lr_plateau": [
+                asdict(progress) if progress is not None else None
+                for progress in state.lr_plateau
+            ],
+            "growth": asdict(state.growth) if state.growth is not None else None,
+            "seconds": state.seconds,
             "config": {**self.get_config(), **self.extra_config},
             "leaves": {part: _describe(tree) for part, tree in parts.items()},
         }
@@ -1629,8 +1789,8 @@ class Trainer:
         checkpoints and monitor run).
 
         The trainer must be configured as the run's was: the number of environments, replay
-        buffer capacities, network, optimizer, self-play evaluator (the one scheduled for the last
-        epoch done) and testers must match, so that every array does.
+        buffer capacities, networks, optimizer, self-play evaluator (the one scheduled for the last
+        epoch done, of the network playing) and testers must match, so that every array does.
 
         Args:
             path: the saved state
@@ -1645,10 +1805,28 @@ class Trainer:
             meta = self._check_meta(path, json.loads(str(saved["meta"])))
             self._check_sizes(path, meta, resizable=False)
             epoch = meta["epoch"]
+            if (meta["growth"] is None) != (self.growth is None):
+                raise ValueError(
+                    f"{path} was saved by a run {'without' if meta['growth'] is None else 'with'} "
+                    "growth: continuing it needs the same"
+                )
+            growth = (
+                GrowthProgress(
+                    meta["growth"]["playing"],
+                    tuple(meta["growth"]["trained"]),
+                    tuple(tuple(v) for v in meta["growth"]["values"]),
+                )
+                if meta["growth"] is not None
+                else None
+            )
+            playing = growth.playing if growth is not None else 0
             # the evaluator whose states the collection state holds
-            evaluator = self.collection_schedule.at(max(epoch - 1, 0))
-            train_template = jax.eval_shape(self.init_train_state)
-            train_state = self._load_part(saved, meta, "train_state", train_template)
+            evaluator = self.learners[playing].schedule.at(max(epoch - 1, 0))
+            train_templates = tuple(
+                jax.eval_shape(partial(self.init_train_state, i))
+                for i in range(len(self.learners))
+            )
+            train_states = self._load_part(saved, meta, "train_states", train_templates)
             collection_state = self._load_part(
                 saved,
                 meta,
@@ -1663,29 +1841,43 @@ class Trainer:
                 saved,
                 meta,
                 "test_states",
-                jax.eval_shape(
-                    lambda params: [t.init(params=params) for t in self.testers],
-                    self.extract_model_params_fn(train_template),
-                ),
+                self.test_state_templates(train_templates),
             )
             key = _to_device(saved["key"])
-        lr_plateau = None
+        lr_plateau: tuple[LRPlateauProgress | None, ...] = ()
         if self.lr_plateau is not None:
-            if meta["lr_plateau"] is None:
+            if not meta["lr_plateau"]:
                 raise ValueError(
                     f"{path} was saved by a run without lr_plateau: fork a run from it instead"
                 )
-            progress = meta["lr_plateau"]
-            lr_plateau = LRPlateauProgress(
-                progress["epochs"], tuple(progress["losses"])
+            lr_plateau = tuple(
+                LRPlateauProgress(progress["epochs"], tuple(progress["losses"]))
+                if progress is not None
+                else None
+                for progress in meta["lr_plateau"]
             )
         return TrainLoopOutput(
             collection_state=collection_state,
-            train_state=train_state,
+            train_states=train_states,
             test_states=test_states,
             cur_epoch=epoch,
             key=key,
             lr_plateau=lr_plateau,
+            growth=growth,
+            seconds=meta["seconds"],
+        )
+
+    def test_state_templates(self, train_states: Sequence[Any]) -> tuple[list, ...]:
+        """The shapes of every network's testers' states, from the networks' train states (or
+        their shapes)."""
+        return tuple(
+            jax.eval_shape(
+                lambda params, testers=learner.testers: [
+                    t.init(params=params) for t in testers
+                ],
+                self.extract_model_params_fn(ts),
+            )
+            for learner, ts in zip(self.learners, train_states, strict=True)
         )
 
     def resume(self, path: str | None = None) -> TrainLoopOutput:
@@ -1723,9 +1915,10 @@ class Trainer:
         self.parent = meta["parent"]
         if self.monitor is not None and self.monitor.run_id is None:
             self.monitor.run_id = meta["monitor_run"]
-        for epoch in checkpoint_epochs(self.ckpt_dir):
-            if epoch >= state.cur_epoch:
-                os.remove(checkpoint_path(self.ckpt_dir, epoch))
+        for ckpt_dir in self.ckpt_dirs:
+            for epoch in checkpoint_epochs(ckpt_dir):
+                if epoch >= state.cur_epoch:
+                    os.remove(checkpoint_path(ckpt_dir, epoch))
         print(f"resuming from {path}: {state.cur_epoch} epochs done", flush=True)
         return state
 
@@ -1743,7 +1936,9 @@ class Trainer:
           keeps each environment's newest entries (see `EpisodeReplayBuffer.resized`).
         - without, a new collection state, as a run from scratch starts with
 
-        The number of environments, network and optimizer must match the saved run's.
+        The number of environments, network and optimizer must match the saved run's. A run
+        with `growth` forks from a run without: the saved network is the Trainer's own, and
+        those it grows into start from scratch.
 
         Args:
             path: the saved state (see `save_state`)
@@ -1758,8 +1953,12 @@ class Trainer:
         """
         with np.load(path) as saved:
             meta = self._check_meta(path, json.loads(str(saved["meta"])))
-            train_state = self._load_part(
-                saved, meta, "train_state", jax.eval_shape(self.init_train_state)
+            if meta["growth"] is not None:
+                raise ValueError(
+                    f"{path} was saved by a run with growth: forks start from a run without"
+                )
+            (train_state,) = self._load_part(
+                saved, meta, "train_states", (jax.eval_shape(self.init_train_state),)
             )
             train_state = replace(
                 train_state,
@@ -1827,6 +2026,7 @@ class Trainer:
             ),
             **self.init_moves(key, self.batch_size),
             **stats,
+            resign_state=self.init_resign_state(key, self.batch_size),
         )
         return collection_state, train_state
 
@@ -1872,9 +2072,9 @@ class Trainer:
         name = part.replace("_", " ")
         if len(described) != len(expected):
             raise ValueError(
-                f"the saved {name} has {len(described)} arrays, this run's has "
-                f"{len(expected)}: was it saved with different settings (e.g. the network, "
-                "optimizer, self-play search, tree positions or testers)?"
+                f"saved {name}: {len(described)} arrays, this run's: {len(expected)}: was "
+                "it saved with different settings (e.g. the networks, optimizer, self-play "
+                "search, tree positions, testers or growth)?"
             )
         mismatched = [
             f"  {leaf_path}: saved {s_shape} {s_dtype}, this run's {shape} {dtype}"
@@ -2046,6 +2246,16 @@ class Trainer:
             )
             if self.tree_buffer is not None
             else None,
+            resign_state=self.init_resign_state(key, batch_size),
+        )
+
+    def init_resign_state(self, key: jax.Array, batch_size: int) -> ResignState | None:
+        """`CollectionState`'s resignation states, for `batch_size` environments whose games start
+        now; None without resignation."""
+        if self.resignation is None:
+            return None
+        return jax.vmap(self.resignation.init)(
+            jax.random.split(jax.random.fold_in(key, 1), batch_size)
         )
 
     @staticmethod
@@ -2081,9 +2291,15 @@ class Trainer:
         return env_state, metadata, self.init_eval_state(evaluator, batch_size)
 
     def follow_schedule(
-        self, epoch: int, evaluator: Evaluator, collection_state: CollectionState
+        self,
+        epoch: int,
+        evaluator: Evaluator,
+        collection_state: CollectionState,
+        learner: int = 0,
     ) -> tuple[Evaluator, CollectionState]:
-        """Switches self-play to the evaluator scheduled for `epoch`, if it isn't `evaluator`.
+        """Switches self-play to the evaluator scheduled for `epoch`, if it isn't `evaluator`:
+        with `growth`, the evaluator of network `learner`, the one playing (so also when a
+        network takes over).
 
         The new evaluator's states replace the old one's, initialized from scratch: they may
         differ in shape (e.g. MCTS trees with a different `max_nodes`). Games in progress
@@ -2093,16 +2309,18 @@ class Trainer:
             epoch: the epoch about to start
             evaluator: the evaluator whose states `collection_state` holds
             collection_state: current collection state
+            learner: (optional) with `growth`, the index of the network playing
 
         Returns:
             Tuple[Evaluator, CollectionState]: the evaluator for `epoch`, and the collection
                 state with its states
         """
-        scheduled = self.collection_schedule.at(epoch)
+        scheduled = self.learners[learner].schedule.at(epoch)
         if scheduled is evaluator:
             return evaluator, collection_state
+        whose = f" ({self.learners[learner].name})" if self.growth is not None else ""
         self.set_activity(
-            f"epoch {epoch}: self-play switches to {describe(scheduled)} (compiling)",
+            f"epoch {epoch}: self-play switches to {describe(scheduled)}{whose} (compiling)",
             echo=True,
         )
         num_envs = collection_state.episodes.shape[0]
@@ -2259,6 +2477,20 @@ class Trainer:
             self.monitor.finish()
         return output
 
+    def log_learner_metrics(
+        self, metrics: dict, epoch: int, learner: int, playing: int
+    ) -> None:
+        """Logs a network's metrics (or media): without `growth`, as they are; with it, as
+        `<its name>/<metric>`, and as they are too if it's the network playing."""
+        if self.growth is None:
+            self.log_metrics(metrics, epoch)
+            return
+        name = self.learners[learner].name
+        named = {f"{name}/{k}": v for k, v in metrics.items()}
+        if learner == playing:
+            named = {**metrics, **named}
+        self.log_metrics(named, epoch)
+
     def _train_loop(
         self,
         seed: int,
@@ -2268,29 +2500,39 @@ class Trainer:
         fork_from: str | None = None,
         fork_replay_buffers: bool = True,
     ) -> TrainLoopOutput:
+        started = time.perf_counter()
         # init rng
         key = jax.random.PRNGKey(seed)
         # an exact continuation picks up where the run stopped, without a warmup
         exact = initial_state is not None and initial_state.key is not None
+        num_learners = len(self.learners)
 
         # initialize states
         if initial_state:
             collection_state = initial_state.collection_state
-            train_state = initial_state.train_state
-            tester_states = initial_state.test_states
+            train_states = list(initial_state.train_states)
+            tester_states = [list(states) for states in initial_state.test_states]
             cur_epoch = initial_state.cur_epoch
-            lr_progress = initial_state.lr_plateau
+            lr_progress: list[LRPlateauProgress | None] = (
+                list(initial_state.lr_plateau) or [None] * num_learners
+            )
+            growth = initial_state.growth
+            seconds = initial_state.seconds
             if initial_state.key is not None:
                 key = initial_state.key
             else:
                 # don't replay the keys the original run used from epoch 0
                 key = jax.random.fold_in(key, cur_epoch)
             # the evaluator whose states the collection state holds
-            evaluator = self.collection_schedule.at(max(cur_epoch - 1, 0))
+            evaluator = self.learners[initial_state.playing].schedule.at(
+                max(cur_epoch - 1, 0)
+            )
         else:
             cur_epoch = 0
-            lr_progress = None
-            evaluator = self.collection_schedule.at(0)
+            lr_progress = [None] * num_learners
+            growth = self.growth.start() if self.growth is not None else None
+            seconds = 0.0
+            evaluator = self.learners[0].schedule.at(0)
             init_key, key = jax.random.split(key)
             if fork_from is None:
                 # initialize collection state
@@ -2298,22 +2540,55 @@ class Trainer:
                     init_key, self.batch_size, evaluator
                 )
                 # initialize train state
-                train_state = self.init_train_state()
+                own = self.init_train_state()
             else:
                 self.set_activity(f"loading {fork_from}", echo=True)
-                collection_state, train_state = self.fork_state(
+                collection_state, own = self.fork_state(
                     fork_from, init_key, fork_replay_buffers
                 )
-            params = self.extract_model_params_fn(train_state)
+            train_states = [own] + [
+                self.init_train_state(i) for i in range(1, num_learners)
+            ]
             # initialize tester states
-            tester_states = [tester.init(params=params) for tester in self.testers]
+            tester_states = [
+                [
+                    tester.init(params=self.extract_model_params_fn(ts))
+                    for tester in learner.testers
+                ]
+                for learner, ts in zip(self.learners, train_states, strict=True)
+            ]
+
+        def playing_now() -> int:
+            return growth.playing if growth is not None else 0
+
+        def training_now() -> tuple[int, ...]:
+            if growth is None or self.growth is None:
+                return (0,)
+            return self.growth.training(growth)
+
+        def state_now() -> TrainLoopOutput:
+            return TrainLoopOutput(
+                collection_state=collection_state,
+                train_states=tuple(train_states),
+                test_states=tuple(tester_states),
+                cur_epoch=cur_epoch,
+                key=key,
+                lr_plateau=tuple(lr_progress) if self.lr_plateau is not None else (),
+                growth=growth,
+                seconds=seconds + time.perf_counter() - started,
+            )
+
+        def named(learner: int, text: str) -> str:
+            if self.growth is None:
+                return text
+            return f"{text} ({self.learners[learner].name})"
 
         evaluator, collection_state = self.follow_schedule(
-            cur_epoch, evaluator, collection_state
+            cur_epoch, evaluator, collection_state, playing_now()
         )
-        if self.lr_plateau is not None and lr_progress is None:
-            lr_progress = LRPlateauProgress()
-        params = self.extract_model_params_fn(train_state)
+        if self.lr_plateau is not None and lr_progress[playing_now()] is None:
+            lr_progress[playing_now()] = LRPlateauProgress()
+        params = self.extract_model_params_fn(train_states[playing_now()])
         if not exact:
             # warmup
             # populate replay buffer with initial self-play games
@@ -2331,10 +2606,13 @@ class Trainer:
 
         # training loop
         while cur_epoch < num_epochs:
-            # collect self-play games
+            epoch_started = time.perf_counter()
+            playing, training = playing_now(), training_now()
+            # collect self-play games, with the network playing
             evaluator, collection_state = self.follow_schedule(
-                cur_epoch, evaluator, collection_state
+                cur_epoch, evaluator, collection_state, playing
             )
+            params = self.extract_model_params_fn(train_states[playing])
             collect_key, key = jax.random.split(key)
             collect_keys = jax.random.split(collect_key, self.batch_size)
             # only the counts outlive the state donated to self-play: keeping the whole state
@@ -2349,6 +2627,9 @@ class Trainer:
                 evaluator=evaluator,
             )
             collection_metrics = self.collection_metrics(before, collection_state)
+            # self-play's time includes measuring its data, so that training's is its own
+            jax.block_until_ready((collection_state, collection_metrics))
+            selfplay_seconds = time.perf_counter() - epoch_started
             if isinstance(evaluator, MCTS):
                 collection_metrics["search_iterations"] = jnp.asarray(
                     evaluator.mean_iterations()
@@ -2361,102 +2642,180 @@ class Trainer:
             )
             moves = (collection_state.moves - before.moves).sum()
             collection_metrics["cycles_per_move"] = cycles / jnp.maximum(moves, 1)
-            # train
-            self.set_activity(f"epoch {cur_epoch}: training")
-            train_key, key = jax.random.split(key)
-            collection_state, train_state, metrics = self.train_steps(
-                train_key,
-                collection_state,
-                train_state,
-                self.train_steps_per_epoch,
-                epoch=cur_epoch,
-            )
-            params = self.extract_model_params_fn(train_state)
+            # train every network that trains, on the same replay buffer
+            train_metrics: dict[int, dict] = {}
+            train_seconds: dict[int, float] = {}
+            for i in training:
+                train_started = time.perf_counter()
+                self.set_activity(named(i, f"epoch {cur_epoch}: training"))
+                train_key, key = jax.random.split(key)
+                collection_state, train_states[i], train_metrics[i] = self.train_steps(
+                    train_key,
+                    collection_state,
+                    train_states[i],
+                    self.train_steps_per_epoch,
+                    epoch=cur_epoch,
+                    learner=i,
+                )
+                jax.block_until_ready(train_states[i])
+                train_seconds[i] = time.perf_counter() - train_started
+            # the learning rate rule follows the network playing
             stop = False
             watch_loss = self.lr_plateau_metric == "loss"
-            if self.lr_plateau is not None and lr_progress is not None and watch_loss:
-                train_state, lr_progress, lr_metrics, stop = self.follow_lr_plateau(
-                    cur_epoch, train_state, lr_progress, metrics["loss"]
+            if self.lr_plateau is not None and watch_loss:
+                progress = lr_progress[playing]
+                assert progress is not None
+                train_states[playing], lr_progress[playing], lr_metrics, stop = (
+                    self.follow_lr_plateau(
+                        cur_epoch,
+                        train_states[playing],
+                        progress,
+                        train_metrics[playing]["loss"],
+                    )
                 )
-                metrics = {**metrics, **lr_metrics}
+                train_metrics[playing] = {**train_metrics[playing], **lr_metrics}
             # log metrics
-            self.log_metrics({**metrics, **collection_metrics}, cur_epoch)
+            self.log_metrics(collection_metrics, cur_epoch)
+            for i in training:
+                self.log_learner_metrics(train_metrics[i], cur_epoch, i, playing)
 
-            # test
-            tested: dict = {}
+            # test every network that trains
+            tested: dict[int, dict] = {i: {} for i in training}
+            test_seconds: dict[int, float] = {}
             if cur_epoch % eval_every == 0:
-                for i, test_state in enumerate(tester_states):
-                    run_key, key = jax.random.split(key)
-                    self.set_activity(
-                        f"epoch {cur_epoch}: testing {self.testers[i].name}"
-                    )
-                    new_test_state, metrics, episode = self.testers[i].run(
-                        key=run_key,
-                        epoch_num=cur_epoch,
-                        max_steps=self.max_episode_steps,
-                        env_step_fn=self.env_step_fn,
-                        env_init_fn=self.test_env_init_fn,
-                        evaluator=self.evaluator_test,
-                        state=test_state,
-                        params=params,
-                        log_fn=partial(self.log_metrics, epoch=cur_epoch),
-                        activity_fn=lambda text, epoch=cur_epoch: self.set_activity(
-                            f"epoch {epoch}: {text}", echo=True
-                        ),
-                    )
-
-                    if metrics:
-                        metrics = {k: v.mean() for k, v in metrics.items()}
-                        self.log_metrics(metrics, cur_epoch)
-                        tested.update(metrics)
-                    # the run's views draw the episode, so the training loop never does
-                    if episode is not None and self.monitor is not None:
-                        self.monitor.log(
-                            cur_epoch, {f"{self.testers[i].name}_game": episode}
+                for i in training:
+                    test_started = time.perf_counter()
+                    learner = self.learners[i]
+                    learner_params = self.extract_model_params_fn(train_states[i])
+                    for j, test_state in enumerate(tester_states[i]):
+                        tester = learner.testers[j]
+                        run_key, key = jax.random.split(key)
+                        self.set_activity(
+                            named(i, f"epoch {cur_epoch}: testing {tester.name}")
                         )
-                    tester_states[i] = new_test_state
+                        new_test_state, metrics, episode = tester.run(
+                            key=run_key,
+                            epoch_num=cur_epoch,
+                            max_steps=self.max_episode_steps,
+                            env_step_fn=self.env_step_fn,
+                            env_init_fn=self.test_env_init_fn,
+                            evaluator=learner.evaluator_test,
+                            state=test_state,
+                            params=learner_params,
+                            log_fn=partial(
+                                self.log_learner_metrics,
+                                epoch=cur_epoch,
+                                learner=i,
+                                playing=playing,
+                            ),
+                            activity_fn=lambda text, epoch=cur_epoch, i=i: (
+                                self.set_activity(
+                                    named(i, f"epoch {epoch}: {text}"), echo=True
+                                )
+                            ),
+                        )
+
+                        if metrics:
+                            metrics = {k: v.mean() for k, v in metrics.items()}
+                            self.log_learner_metrics(metrics, cur_epoch, i, playing)
+                            tested[i].update(metrics)
+                        # the run's views draw the episode, so the training loop never does
+                        if episode is not None and self.monitor is not None:
+                            self.log_learner_metrics(
+                                {f"{tester.name}_game": episode}, cur_epoch, i, playing
+                            )
+                        tester_states[i][j] = new_test_state
+                    test_seconds[i] = time.perf_counter() - test_started
             # a tester's metric: the rule follows it once the epoch's tests have run
-            if (
-                self.lr_plateau is not None
-                and lr_progress is not None
-                and not watch_loss
-            ):
-                if self.lr_plateau_metric not in tested:
+            if self.lr_plateau is not None and not watch_loss:
+                if self.lr_plateau_metric not in tested[playing]:
                     raise ValueError(
                         f"lr_plateau_metric {self.lr_plateau_metric!r} wasn't logged at epoch "
                         f"{cur_epoch}: a tester must log it every epoch"
                     )
-                train_state, lr_progress, lr_metrics, stop = self.follow_lr_plateau(
-                    cur_epoch, train_state, lr_progress, tested[self.lr_plateau_metric]
+                progress = lr_progress[playing]
+                assert progress is not None
+                train_states[playing], lr_progress[playing], lr_metrics, stop = (
+                    self.follow_lr_plateau(
+                        cur_epoch,
+                        train_states[playing],
+                        progress,
+                        tested[playing][self.lr_plateau_metric],
+                    )
                 )
                 if lr_metrics:
-                    self.log_metrics(lr_metrics, cur_epoch)
-            # save checkpoint
+                    self.log_learner_metrics(lr_metrics, cur_epoch, playing, playing)
+            # growth: does the next network take over?
+            if growth is not None and self.growth is not None:
+                metric = self.growth.metric
+                if not self.growth.switch_at and any(
+                    metric not in tested[i] for i in training
+                ):
+                    raise ValueError(
+                        f"growth's metric {metric!r} wasn't logged at epoch {cur_epoch} by "
+                        "every network that trains: their testers must log it every epoch"
+                    )
+                check = self.growth.after_epoch(
+                    growth,
+                    cur_epoch + 1,
+                    {
+                        i: float(tested[i][metric])
+                        for i in training
+                        if metric in tested[i]
+                    },
+                    rule_done=stop,
+                )
+                growth = check.progress
+                growth_metrics: dict = {"growth_playing": playing}
+                if check.gap is not None:
+                    growth_metrics["growth_gap"] = check.gap
+                if check.switched:
+                    growth_metrics["growth_switch"] = growth.playing
+                    taking_over = self.learners[growth.playing].name
+                    why = (
+                        f"{self.learners[playing].name}'s learning rate rule is done"
+                        if stop
+                        else f"{metric} {check.gap:+.4f} over the last {self.growth.window} "
+                        "epochs"
+                        if check.gap is not None and not self.growth.switch_at
+                        else f"after {cur_epoch + 1} epochs"
+                    )
+                    print(
+                        f"epoch {cur_epoch}: {taking_over} takes over self-play from "
+                        f"{self.learners[playing].name} ({why})",
+                        flush=True,
+                    )
+                    # its own learning rate rule starts, at the rate it has trained at
+                    if self.lr_plateau is not None:
+                        lr_progress[growth.playing] = LRPlateauProgress()
+                    stop = False
+                self.log_metrics(growth_metrics, cur_epoch)
+            # save checkpoints
             self.set_activity(f"epoch {cur_epoch}: saving checkpoint")
-            self.save_checkpoint(train_state, cur_epoch)
+            for i in training:
+                self.save_checkpoint(train_states[i], cur_epoch, i)
+            # the epoch's compute: self-play, and each network's training and tests
+            timing = {
+                "selfplay_seconds": selfplay_seconds,
+                "train_seconds": sum(train_seconds.values()),
+                "test_seconds": sum(test_seconds.values()),
+                "epoch_seconds": time.perf_counter() - epoch_started,
+                "run_seconds": seconds + time.perf_counter() - started,
+            }
+            if self.growth is not None:
+                for i in training:
+                    name = self.learners[i].name
+                    timing[f"{name}/train_seconds"] = train_seconds[i]
+                    if i in test_seconds:
+                        timing[f"{name}/test_seconds"] = test_seconds[i]
+            self.log_metrics(timing, cur_epoch)
             # next epoch
             cur_epoch += 1
             if self.should_save_state(cur_epoch):
                 self.set_activity(f"epoch {cur_epoch - 1}: saving the training state")
-                self.save_state(
-                    TrainLoopOutput(
-                        collection_state=collection_state,
-                        train_state=train_state,
-                        test_states=tester_states,
-                        cur_epoch=cur_epoch,
-                        key=key,
-                        lr_plateau=lr_progress,
-                    )
-                )
+                self.save_state(state_now())
             if stop:
                 break
 
         # return state so that training can be continued!
-        return TrainLoopOutput(
-            collection_state=collection_state,
-            train_state=train_state,
-            test_states=tester_states,
-            cur_epoch=cur_epoch,
-            key=key,
-            lr_plateau=lr_progress,
-        )
+        return state_now()
