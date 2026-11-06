@@ -29,6 +29,7 @@ BENCH = {
         "forward_batch": 1024,
     },
 }
+COSTS = controller.Costs(BENCH)
 
 
 def config(tmp_path, **kwargs):
@@ -46,6 +47,7 @@ def config(tmp_path, **kwargs):
             "branch_turnovers": 1.0,
             "max_periods": 2,
             "ladder": None,
+            "average_epochs": None,
             **kwargs,
         }
     )
@@ -106,6 +108,9 @@ def test_bad_searches_are_refused(kwargs):
         ({"games": 401}, "even"),
         ({"nets": [SMALL, "resnet:2x32,heads=pooled"]}, "must differ"),
         ({"trunk_turnovers": 0}, "positive"),
+        ({"margin_se": -1.0}, "negative"),
+        ({"average_epochs": 0.5}, "at least 1"),
+        ({"selfplay_average": True}, "needs average_epochs"),
     ],
 )
 def test_bad_configs_are_refused(tmp_path, kwargs, match):
@@ -117,32 +122,32 @@ def test_the_waiting_network_trains_the_steps_its_own_play_would_afford(tmp_path
     c = config(tmp_path)
     # 4x64 playing alone (the last): 128 moves x 64 cycles at 2 ms, and 256 steps at 30 ms
     last = 16.384 + 0.256 * 30
-    assert controller.regime_seconds(c, Search(63), 1, BENCH) == pytest.approx(last)
+    assert controller.regime_seconds(c, Search(63), 1, COSTS) == pytest.approx(last)
     # 2x32 playing, 4x64 waiting at the share s = E / last of the steps: E = own + s T
     own, t = 8.192 + 0.256 * 10, 0.256 * 30
     e = own / (1 - t / last)
-    assert controller.regime_seconds(c, Search(63), 0, BENCH) == pytest.approx(e)
+    assert controller.regime_seconds(c, Search(63), 0, COSTS) == pytest.approx(e)
     assert e == pytest.approx(own + e / last * t)
     assert (
-        controller.waiting_steps(c, Search(63), 0, BENCH)
+        controller.waiting_steps(c, Search(63), 0, COSTS)
         == round(256 * e / last)
         == 168
     )
-    assert controller.waiting_steps(c, Search(63), 1, BENCH) is None
+    assert controller.waiting_steps(c, Search(63), 1, COSTS) is None
     # a deeper search makes the bigger network's self-play cost more: fewer steps
-    assert controller.waiting_steps(c, Search(127), 0, BENCH) == 148
+    assert controller.waiting_steps(c, Search(127), 0, COSTS) == 148
 
 
 def test_an_epochs_compute_is_its_networks_evaluations_and_steps(tmp_path):
     c = config(tmp_path)
-    compute = controller.epoch_compute(c, Search(63), 0, BENCH)
+    compute = controller.epoch_compute(c, Search(63), 0, COSTS)
     # 2x32 evaluates 128 moves x 64 cycles at 1 ms a cycle and takes 256 steps; 4x64, waiting,
     # 168
     assert compute["seconds"] == pytest.approx(8.192 + 0.256 * 10 + 0.168 * 30)
     assert compute["selfplay_evals"] == 8192 * 1024
     assert compute["train_samples"] == {"2x32": 256 * 4096, "4x64": 168 * 4096}
     # the last network plays and trains alone
-    alone = controller.epoch_compute(c, Search(63), 1, BENCH)
+    alone = controller.epoch_compute(c, Search(63), 1, COSTS)
     assert alone["seconds"] == pytest.approx(16.384 + 0.256 * 30)
     assert alone["train_samples"] == {"4x64": 256 * 4096}
     total = controller.added(controller.scaled(compute, 2), alone)
@@ -154,12 +159,12 @@ def test_an_epochs_compute_is_its_networks_evaluations_and_steps(tmp_path):
 
 def test_branches_match_on_benchmarked_time(tmp_path):
     c = config(tmp_path)
-    stay, double = controller.branch_epochs(c, Search(63), 0, BENCH, c.buffer)
+    stay, double = controller.branch_epochs(c, Search(63), 0, COSTS, c.buffer)
     # double fills its buffer once (2 epochs); stay takes the epochs of the same time
     assert double == 2
 
     def cost(search):
-        return controller.epoch_compute(c, search, 0, BENCH)["seconds"]
+        return controller.epoch_compute(c, search, 0, COSTS)["seconds"]
 
     assert stay == round(2 * cost(Search(127)) / cost(Search(63))) == 3
 
@@ -232,7 +237,9 @@ class FakeRunner:
     network takes over during a step (the controller runs every step --grow-manual); with
     --take-over the next plays from its start."""
 
-    def __init__(self):
+    def __init__(self, overhead_ms=0.0):
+        # the search's own time per cycle, besides the playing network's forward pass
+        self.overhead_ms = overhead_ms
         self.calls = []
 
     def bench(self, nets, args, out):
@@ -262,9 +269,27 @@ class FakeRunner:
                 if i < len(nets):
                     trained[i] += 1
         directory.mkdir(parents=True)
+        averages = (
+            [f"avg{float(value('--average-epochs')):g}"]
+            if "--average-epochs" in args
+            else []
+        )
         for net in nets[playing : playing + 2]:
-            (directory / controller.net_name(net)).mkdir()
-            (directory / controller.net_name(net) / f"{last - 1}.eqx").touch()
+            for kept in ("", *averages):
+                (directory / controller.net_name(net) / kept).mkdir(exist_ok=True)
+                (
+                    directory / controller.net_name(net) / kept / f"{last - 1}.eqx"
+                ).touch()
+        # each epoch's self-play time, as train.py logs it
+        cycle_ms = BENCH[nets[playing]]["forward_ms"] + self.overhead_ms
+        seconds = Search(int(value("--sims"))).epoch_cycles() * cycle_ms / 1e3
+        with open(log, "a") as f:
+            if "--branch-from" in args:
+                f.write("branching from ...\n")
+            f.writelines(
+                f"Epoch {e}: {{'selfplay_seconds': '{seconds:.4f}'}}\n"
+                for e in range(epoch, last)
+            )
         meta = {
             "epoch": last,
             "growth": {"playing": playing, "trained": trained, "values": []},
@@ -432,7 +457,7 @@ def test_a_period_branches_on_the_search_and_keeps_the_winner(tmp_path):
     c = config(tmp_path)
 
     def cost(search):
-        return controller.epoch_compute(c, search, 0, BENCH)["seconds"]
+        return controller.epoch_compute(c, search, 0, COSTS)["seconds"]
 
     # period 0's trunk at 63 sims, then its double and period 1's trunk and stay at 127
     assert data["kept"]["seconds"] == pytest.approx(
@@ -792,3 +817,138 @@ def test_steps_share_a_compilation_cache(tmp_path, monkeypatch):
         tmp_path / "run" / "compiled"
     )
     assert "JAX_PLATFORMS" not in calls[0]["env"]
+
+
+# the cost model's measured part, the margins, averaged weights
+
+
+def test_costs_add_the_search_overhead_measured_at_the_nearest_budget():
+    assert COSTS.cycle_ms(SMALL, Search(63)) == 1.0
+    costs = controller.Costs(BENCH, {"63s": 0.5, "pcr25x255-63s": 0.75})
+    assert costs.cycle_ms(SMALL, Search(63)) == 1.5
+    # not measured: the nearest budget's (by ratio), the bigger one on a tie
+    assert costs.overhead(Search(100)) == 0.5
+    assert costs.overhead(Search(511)) == 0.75
+    tie = controller.Costs(BENCH, {"64s": 0.5, "256s": 0.75})
+    assert tie.overhead(Search(128)) == 0.75
+    assert costs.train_ms(BIG) == 30.0
+
+
+def test_a_steps_self_play_overhead_comes_from_its_log_without_compiling_epochs(
+    tmp_path,
+):
+    log = tmp_path / "step.log"
+    # 8192 cycles of 2x32 (1 ms each): each process's first epoch compiles; a retry's last try
+    # counts
+    log.write_text(
+        "branching from x\n"
+        "Epoch 2: {'selfplay_seconds': '60.0000', 'train_seconds': '1.0'}\n"
+        "Epoch 3: {'selfplay_seconds': '12.288', 'train_seconds': '1.0'}\n"
+        "Epoch 4: {'selfplay_seconds': '99.0'}\n"
+        "resuming from y\n"
+        "Epoch 4: {'selfplay_seconds': '70.0'}\n"
+        "Epoch 5: {'selfplay_seconds': '12.288'}\n"
+        "Epoch 6: {'selfplay_seconds': '16.384'}\n"
+    )
+    measured = controller.selfplay_overhead(log, Search(63), SMALL, COSTS)
+    assert measured is not None
+    # epochs 3, 5 and 6: median 12.288 s, 1.5 ms a cycle, 0.5 beyond the forward pass
+    assert measured["epochs"] == 3 and measured["selfplay_seconds"] == 12.288
+    assert measured["overhead_ms"] == pytest.approx(0.5)
+    assert (
+        controller.selfplay_overhead(tmp_path / "none.log", Search(63), SMALL, COSTS)
+        is None
+    )
+
+
+def test_the_run_prices_its_steps_with_the_overhead_they_measure(tmp_path):
+    run_dir = tmp_path / "run"
+    queue, runner = FakeQueue(), FakeRunner(overhead_ms=0.5)
+    league = FakeLeague(lambda a, b: -10.0)
+    Controller.init(
+        run_dir,
+        config(tmp_path, max_periods=1),
+        queue=queue,
+        runner=runner,
+        league=league,
+    ).start()
+
+    drain(run_dir, queue, runner, league)
+
+    ctl = Controller(run_dir, queue, runner, league)
+    trunk = ctl.step("p000-trunk")
+    assert trunk["measured"]["overhead_ms"] == pytest.approx(0.5)
+    # the trunk counts what it measured; the branches were matched with it, double at 127
+    # sims taking 63's overhead until it measured its own
+    c = config(tmp_path, max_periods=1)
+    measured = controller.Costs(BENCH, {"63s": 0.5})
+    assert trunk["compute"]["seconds"] == pytest.approx(
+        2 * controller.epoch_compute(c, Search(63), 0, measured)["seconds"]
+    )
+    stay, double = controller.branch_epochs(c, Search(63), 0, measured, 256)
+    assert (
+        ctl.step("p000-stay")["last_epoch"],
+        ctl.step("p000-double")["last_epoch"],
+    ) == (
+        2 + stay,
+        2 + double,
+    )
+    assert ctl.step("p000-stay")["waiting_steps"] == controller.waiting_steps(
+        c, Search(63), 0, measured
+    )
+    assert ctl.costs.overhead_ms == pytest.approx({"63s": 0.5, "127s": 0.5})
+
+
+@pytest.mark.parametrize(
+    "elo, margin_se, decision",
+    [(60.0, 2.0, "double"), (40.0, 2.0, "stay"), (40.0, 1.0, "double")],
+)
+def test_a_challenger_must_win_by_its_series_standard_errors(
+    tmp_path, elo, margin_se, decision
+):
+    run_dir = tmp_path / "run"
+    queue, runner = FakeQueue(), FakeRunner()
+    # 200 games: a standard error of about 25 Elo
+    league = FakeLeague(lambda a, b: elo if "double" in a else -10.0)
+    Controller.init(
+        run_dir,
+        config(tmp_path, max_periods=1, margin_se=margin_se),
+        queue=queue,
+        runner=runner,
+        league=league,
+    ).start()
+
+    drain(run_dir, queue, runner, league)
+
+    (made,) = decisions(run_dir)
+    assert made["decision"] == decision and made["margin_se"] == margin_se
+    sims = made["series"][1]
+    assert sims["question"] == "sims" and 20 < sims["se"] < 30
+
+
+def test_the_league_rates_the_networks_weights_averaged(tmp_path):
+    run_dir = tmp_path / "run"
+    queue, runner = FakeQueue(), FakeRunner()
+    league = FakeLeague(lambda a, b: -10.0)
+    Controller.init(
+        run_dir,
+        config(tmp_path, max_periods=1, average_epochs=4.0, selfplay_average=True),
+        queue=queue,
+        runner=runner,
+        league=league,
+    ).start()
+
+    drain(run_dir, queue, runner, league)
+
+    args = {Path(a[a.index("--ckpt-dir") + 1]).name: a for a in runner.calls}
+    for step_args in args.values():
+        assert step_args[step_args.index("--average-epochs") + 1] == "4"
+        assert step_args[step_args.index("--selfplay-average") + 1] == "4"
+    assert league.matches[0][:2] == (
+        "4x64-ctl-p000-stay-e5-avg4@128",
+        "2x32-ctl-p000-stay-e5-avg4@128",
+    )
+    registered = league.registered["2x32-ctl-p000-stay-e5-avg4"]
+    assert registered.checkpoint == str(
+        run_dir / "p000-stay" / "2x32" / "avg4" / "4.eqx"
+    )

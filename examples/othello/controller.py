@@ -11,21 +11,23 @@ Every period:
    over either: `double` searches twice the iterations (both budgets, with playout cap
    randomization) for `branch_turnovers` turnovers of its buffer, and `stay` keeps the search
    for as many epochs as cost the same.
-3. test: the branches' networks play series. Growing comes first: if the next network, as it
-   trained in `stay`, scores `size_margin` Elo or more against `stay`'s playing one, it takes
-   over from `stay`'s state at the next trunk (--take-over), at `stay`'s search. Otherwise the
-   search doubles if `double`'s playing network scores `sims_margin` Elo or more against
-   `stay`'s, and the run goes on from `double`; else from `stay`. Sims only go up while the
-   next network doesn't pay its way. Longer trunks (`trunk_turnovers`) test less often.
+3. test: the branches' networks play series, with their weights averaged over the last
+   `average_epochs` epochs (train.py --average-epochs). Growing comes first: if the next
+   network, as it trained in `stay`, scores `margin_se` standard errors (of its series) or
+   more against `stay`'s playing one, it takes over from `stay`'s state at the next trunk
+   (--take-over), at `stay`'s search. Otherwise the search doubles if `double`'s playing
+   network scores `margin_se` standard errors or more against `stay`'s, and the run goes on
+   from `double`; else from `stay`. Sims only go up while the next network doesn't pay its way.
+   Longer trunks (`trunk_turnovers`) test less often.
 4. ladder: the network the run kept climbs the league's Edax players (`ladder`), a series each,
    from the rung the last period lost to, on to the next while it scores over half: its games
    put the kept line on the league's scale.
 
 Compute is counted two ways: in network evaluations (self-play's positions evaluated, and the
-samples each network trains on), and in benchmarked GPU time, each network's forward pass at
-self-play's batch and its training step at training's (bench_nets.py, run first) times those.
-Flat costs (moving the games, writing the buffer, compiling) aren't counted. A branch that loses
-counts in what the run spent, not in the line of states it kept.
+samples each network trains on), and in GPU time (see `Costs`): each network's forward pass at
+self-play's batch and its training step at training's (bench_nets.py, run first), plus the
+search's own bookkeeping per cycle, measured from the run's epochs. Compiling and tests aren't
+counted. A branch that loses counts in what the run spent, not in the line of states it kept.
 
     uv run examples/othello/controller.py init runs/big --config big.json
     uv run examples/othello/controller.py start runs/big
@@ -76,6 +78,8 @@ OWN_ARGS = (
     "--grow-guard",
     "--grow-switch-at",
     "--grow-train-steps",
+    "--average-epochs",
+    "--selfplay-average",
     "--sims",
     "--sims-schedule",
     "--playout-cap",
@@ -273,9 +277,13 @@ class Config:
         branch_turnovers: the `double` branch's length, in turnovers of its replay buffer
         games: games a series (even: both colours of each opening)
         play_sims: the league's search for the series, iterations a move
-        sims_margin: the Elo `double` must score against `stay` to be kept
-        size_margin: the Elo the next network, as it trained in `stay`, must score against
-            `stay`'s playing one for the run to grow into it
+        margin_se: the standard errors of its own series a challenger must score above the one
+            it challenges: the next network as it trained in `stay` against the one playing
+            there (to grow), and `double`'s playing network against `stay`'s (to double)
+        average_epochs: (optional) train.py --average-epochs: every step keeps each network's
+            weights averaged over about this many epochs, and the league rates the averages
+            (the test's and the ladder's players). None rates the networks' weights as they are
+        selfplay_average: self-play plays with the average too (train.py --selfplay-average)
         max_periods: (optional) the periods to run
         budget_hours: (optional) benchmarked GPU hours the run may spend, losing branches
             included: no period starts past it
@@ -312,8 +320,9 @@ class Config:
     branch_turnovers: float = 1.0
     games: int = 400
     play_sims: int = 128
-    sims_margin: float = 30.0
-    size_margin: float = 30.0
+    margin_se: float = 2.0
+    average_epochs: float | None = 4.0
+    selfplay_average: bool = False
     max_periods: int | None = None
     budget_hours: float | None = None
     save_state_every: int = 20
@@ -344,6 +353,14 @@ class Config:
             )
         if self.trunk_turnovers <= 0 or self.branch_turnovers <= 0:
             raise ValueError("trunk_turnovers and branch_turnovers must be positive")
+        if self.margin_se < 0:
+            raise ValueError(f"margin_se can't be negative, got {self.margin_se}")
+        if self.average_epochs is not None and self.average_epochs < 1:
+            raise ValueError(
+                f"average_epochs is at least 1 epoch, got {self.average_epochs}"
+            )
+        if self.selfplay_average and self.average_epochs is None:
+            raise ValueError("selfplay_average needs average_epochs")
         if self.games < 2 or self.games % 2:
             raise ValueError(f"games must be even, got {self.games}")
         if self.ladder is not None and (
@@ -369,24 +386,62 @@ class Config:
 # compute
 
 
+@dataclass(frozen=True)
+class Costs:
+    """What an epoch costs in GPU time: each network's forward pass per search cycle at
+    self-play's batch and its training step at training's (`bench`, from bench_nets.py), and
+    the search's own bookkeeping per cycle, by search (`overhead_ms`, by `Search.label`: the
+    time self-play's epochs took per cycle less the playing network's forward pass, measured
+    from the run's steps; the benchmark leaves it out). A search not measured yet takes the
+    overhead of the measured one with the nearest budget, none before any."""
+
+    bench: dict[str, dict]
+    overhead_ms: dict[str, float] = field(default_factory=dict)
+
+    def overhead(self, search: Search) -> float:
+        if search.label() in self.overhead_ms:
+            return self.overhead_ms[search.label()]
+        if not self.overhead_ms:
+            return 0.0
+
+        def full(label: str) -> int:
+            # 64s, or pcr25x127-31s: the full budget
+            found = re.match(r"(?:pcr\d+x)?(\d+)", label)
+            assert found is not None, label
+            return int(found.group(1))
+
+        nearest = min(
+            self.overhead_ms,
+            key=lambda label: (abs(math.log(full(label) / search.full)), -full(label)),
+        )
+        return self.overhead_ms[nearest]
+
+    def cycle_ms(self, net: str, search: Search) -> float:
+        """A search cycle's time with `net` playing: its forward pass, and the search's own."""
+        return self.bench[net]["forward_ms"] + self.overhead(search)
+
+    def train_ms(self, net: str) -> float:
+        return self.bench[net]["train_step_ms"]
+
+
 def epoch_compute(
-    config: Config, search: Search, playing: int, bench: dict[str, dict]
+    config: Config, search: Search, playing: int, costs: Costs
 ) -> dict[str, Any]:
     """An epoch's compute: the network playing (index into `config.nets`) evaluates every
     environment's position each search cycle and takes `config.train_steps` training steps, and
     the next (if any) takes `waiting_steps`.
 
     Returns:
-        dict: `seconds`, benchmarked GPU time; `selfplay_evals`, positions evaluated in self-play;
-            `train_samples`, by network
+        dict: `seconds`, GPU time (see `Costs`); `selfplay_evals`, positions evaluated in
+            self-play; `train_samples`, by network
     """
     cycles = search.epoch_cycles()
     steps = {playing: config.train_steps}
-    waiting = waiting_steps(config, search, playing, bench)
+    waiting = waiting_steps(config, search, playing, costs)
     if waiting is not None:
         steps[playing + 1] = waiting
-    seconds = cycles * bench[config.nets[playing]]["forward_ms"] / 1e3 + sum(
-        n * bench[config.nets[i]]["train_step_ms"] / 1e3 for i, n in steps.items()
+    seconds = cycles * costs.cycle_ms(config.nets[playing], search) / 1e3 + sum(
+        n * costs.train_ms(config.nets[i]) / 1e3 for i, n in steps.items()
     )
     return {
         "seconds": seconds,
@@ -397,29 +452,27 @@ def epoch_compute(
     }
 
 
-def regime_seconds(
-    config: Config, search: Search, playing: int, bench: dict[str, dict]
-) -> float:
-    """Benchmarked GPU seconds of an epoch while network `playing` plays at `search`: its
-    self-play and training, and the training of the next network waiting beside it, at the
-    steps `waiting_steps` gives it. Solved from the last network back: with E this cost, the
-    waiting network takes E / E_next of the steps, so E = own + (E / E_next) * T_next."""
+def regime_seconds(config: Config, search: Search, playing: int, costs: Costs) -> float:
+    """GPU seconds of an epoch while network `playing` plays at `search`: its self-play and
+    training, and the training of the next network waiting beside it, at the steps
+    `waiting_steps` gives it. Solved from the last network back: with E this cost, the waiting
+    network takes E / E_next of the steps, so E = own + (E / E_next) * T_next."""
     nets = config.nets
 
     def train(i: int) -> float:
-        return config.train_steps * bench[nets[i]]["train_step_ms"] / 1e3
+        return config.train_steps * costs.train_ms(nets[i]) / 1e3
 
-    own = search.epoch_cycles() * bench[nets[playing]]["forward_ms"] / 1e3 + train(
+    own = search.epoch_cycles() * costs.cycle_ms(nets[playing], search) / 1e3 + train(
         playing
     )
     if playing + 1 >= len(nets):
         return own
-    after = regime_seconds(config, search, playing + 1, bench)
+    after = regime_seconds(config, search, playing + 1, costs)
     return own / (1 - train(playing + 1) / after)
 
 
 def waiting_steps(
-    config: Config, search: Search, playing: int, bench: dict[str, dict]
+    config: Config, search: Search, playing: int, costs: Costs
 ) -> int | None:
     """The training steps an epoch of the next network while `playing` plays (None for the
     last): the steps its own play would afford for the same compute, `config.train_steps`
@@ -429,10 +482,42 @@ def waiting_steps(
     the bigger network must beat the smaller one's training at about equal compute."""
     if playing + 1 >= len(config.nets):
         return None
-    share = regime_seconds(config, search, playing, bench) / regime_seconds(
-        config, search, playing + 1, bench
+    share = regime_seconds(config, search, playing, costs) / regime_seconds(
+        config, search, playing + 1, costs
     )
     return max(1, round(config.train_steps * share))
+
+
+def selfplay_overhead(
+    log: Path, search: Search, net: str, costs: Costs
+) -> dict[str, float] | None:
+    """The search's own bookkeeping per cycle in a training step, from its log: the median
+    epoch's self-play time per cycle less `net`'s forward pass, leaving out each process's
+    first epoch, which compiles. None for a step without such epochs."""
+    seconds: dict[int, float] = {}
+    compiling: set[int] = set()
+    fresh = True
+    for line in log.read_text().splitlines() if log.exists() else []:
+        if line.startswith(("branching from", "resuming from")):
+            fresh = True
+        found = re.match(r"^Epoch (\d+): \{'selfplay_seconds': '([0-9.]+)'", line)
+        if found:
+            epoch = int(found.group(1))
+            if fresh:
+                compiling.add(epoch)
+                fresh = False
+            # a retried epoch's last try counts
+            seconds[epoch] = float(found.group(2))
+    kept = [v for e, v in seconds.items() if e not in compiling]
+    if not kept:
+        return None
+    median = float(np.median(kept))
+    per_cycle = median / search.epoch_cycles() * 1e3
+    return {
+        "selfplay_seconds": median,
+        "epochs": len(kept),
+        "overhead_ms": max(0.0, per_cycle - costs.bench[net]["forward_ms"]),
+    }
 
 
 def scaled(compute: dict[str, Any], epochs: int) -> dict[str, Any]:
@@ -465,16 +550,16 @@ def branch_epochs(
     config: Config,
     search: Search,
     playing: int,
-    bench: dict[str, dict],
+    costs: Costs,
     capacity: int,
 ) -> tuple[int, int]:
     """The epochs of a period's two branches: `double`'s, `branch_turnovers` turnovers of its
-    buffer, and `stay`'s, those whose benchmarked GPU time is closest to it."""
+    buffer, and `stay`'s, those whose GPU time (see `Costs`) is closest to it."""
     double = max(
         1, math.ceil(config.branch_turnovers * turnover_epochs(capacity, search))
     )
-    stay_cost = epoch_compute(config, search, playing, bench)["seconds"]
-    double_cost = epoch_compute(config, search.doubled(), playing, bench)["seconds"]
+    stay_cost = epoch_compute(config, search, playing, costs)["seconds"]
+    double_cost = epoch_compute(config, search.doubled(), playing, costs)["seconds"]
     stay = max(1, round(double * double_cost / stay_cost))
     return stay, double
 
@@ -876,6 +961,27 @@ class Controller:
         return self.data["bench"]
 
     @property
+    def costs(self) -> Costs:
+        return self.costs_with()
+
+    def costs_with(
+        self, search: Search | None = None, measured: dict | None = None
+    ) -> Costs:
+        """The run's cost model (see `Costs`): the benchmark, and each search's overhead, the
+        median of what its training steps measured (with `measured`, a step's at `search`,
+        that hasn't been recorded yet)."""
+        by_label: dict[str, list[float]] = {}
+        for step in self.data["steps"].values():
+            if step.get("measured") is not None:
+                label = Search(**step["search"]).label()
+                by_label.setdefault(label, []).append(step["measured"]["overhead_ms"])
+        if search is not None and measured is not None:
+            by_label.setdefault(search.label(), []).append(measured["overhead_ms"])
+        return Costs(
+            self.bench, {label: float(np.median(v)) for label, v in by_label.items()}
+        )
+
+    @property
     def ladder(self) -> list[str]:
         ladder = self.config.ladder
         assert ladder is not None
@@ -1031,6 +1137,10 @@ class Controller:
                 args += ["--engine-eval-every", "1"]
         if step["waiting_steps"] is not None:
             args += ["--grow-train-steps", str(step["waiting_steps"])]
+        if config.average_epochs is not None:
+            args += ["--average-epochs", f"{config.average_epochs:g}"]
+            if config.selfplay_average:
+                args += ["--selfplay-average", f"{config.average_epochs:g}"]
         args += search.train_args()
         directory = self.dir / step["name"]
         args += [
@@ -1072,9 +1182,8 @@ class Controller:
         if directory.exists() and not any(directory.glob("state-*.npz")):
             # a try that stopped before saving a state: start the step again
             shutil.rmtree(directory)
-        self.runner.train(
-            self.train_args(step), self.dir / "logs" / f"{step['name']}.log"
-        )
+        log = self.dir / "logs" / f"{step['name']}.log"
+        self.runner.train(self.train_args(step), log)
         state = directory / f"state-{step['last_epoch']}.npz"
         if not state.exists():
             raise FileNotFoundError(f"{step['name']} saved no state at {state}")
@@ -1086,32 +1195,46 @@ class Controller:
         spans = players(
             start, read_meta(str(state)), step["first_epoch"], step["last_epoch"]
         )
-        # its compute, at each network's cost while it played
+        # what its self-play cost beyond the benchmark, then its compute, at each network's
+        # cost while it played
+        search = Search(**step["search"])
+        measured = selfplay_overhead(
+            log, search, self.config.nets[spans[-1][0]], self.costs
+        )
+        costs = self.costs_with(search, measured)
         compute: dict[str, Any] = {}
         for net, begin, end in spans:
             compute = added(
                 compute,
-                scaled(
-                    epoch_compute(
-                        self.config, Search(**step["search"]), net, self.bench
-                    ),
-                    end - begin,
-                ),
+                scaled(epoch_compute(self.config, search, net, costs), end - begin),
             )
-        return {"state": str(state), "players": spans, "compute": compute}
+        return {
+            "state": str(state),
+            "players": spans,
+            "compute": compute,
+            "measured": measured,
+        }
 
     def checkpoint(self, step: dict, net: int) -> str:
-        """The last checkpoint of a network (index into `config.nets`) in a training step."""
+        """The checkpoint the league rates of a network (index into `config.nets`) at a
+        training step's end: its weights averaged over `average_epochs`, or as they are."""
         directory = self.dir / step["name"]
         if len(self.config.nets) > 1:
             directory = directory / net_name(self.config.nets[net])
+        if self.config.average_epochs is not None:
+            directory = directory / f"avg{self.config.average_epochs:g}"
         return str(directory / f"{step['last_epoch'] - 1}.eqx")
 
     def player(self, step: dict, net: int) -> str:
-        """The league's name for a network's last checkpoint in a training step."""
+        """The league's name for the checkpoint it rates of a network in a training step."""
+        average = (
+            f"-avg{self.config.average_epochs:g}"
+            if self.config.average_epochs is not None
+            else ""
+        )
         return (
             f"{net_name(self.config.nets[net])}-{self.config.name}-{step['name']}"
-            f"-e{step['last_epoch']}"
+            f"-e{step['last_epoch']}{average}"
         )
 
     def run_series(self, step: dict) -> dict:
@@ -1263,9 +1386,14 @@ class Controller:
             series["question"]: result
             for series, result in zip(step["series"], step["results"], strict=True)
         }
+
+        def wins(result: dict) -> bool:
+            # by margin_se standard errors of its own series
+            return result["elo"] >= self.config.margin_se * result["se"]
+
         # growing first: the search only doubles if the next network doesn't take over
-        grow = "size" in results and results["size"]["elo"] >= self.config.size_margin
-        doubled = not grow and results["sims"]["elo"] >= self.config.sims_margin
+        grow = "size" in results and wins(results["size"])
+        doubled = not grow and wins(results["sims"])
         kept, lost = (double, stay) if doubled else (stay, double)
         decision = "grow" if grow else "double" if doubled else "stay"
         step["kept"], step["decision"] = kept["name"], decision
@@ -1298,10 +1426,7 @@ class Controller:
                         step["series"], step["results"], strict=True
                     )
                 ],
-                "margins": {
-                    "size": self.config.size_margin,
-                    "sims": self.config.sims_margin,
-                },
+                "margin_se": self.config.margin_se,
                 "decision": decision,
                 "search": kept["search"],
                 "playing": net_name(self.config.nets[playing]),
@@ -1361,7 +1486,7 @@ class Controller:
         if prefix + "stay" in steps:
             return [self.test_series(period)]
         stay, double = branch_epochs(
-            self.config, head.search, head.playing, self.bench, self.capacity(head)
+            self.config, head.search, head.playing, self.costs, self.capacity(head)
         )
         return [
             self.train_step(prefix + "stay", head, head.search, "stay", stay),
@@ -1391,7 +1516,7 @@ class Controller:
                 ),
             )
         compute = scaled(
-            epoch_compute(self.config, search, playing, self.bench), epochs
+            epoch_compute(self.config, search, playing, self.costs), epochs
         )
         what = {None: "trunk", "stay": "stay branch", "double": "double branch"}[branch]
         return {
@@ -1405,7 +1530,7 @@ class Controller:
             "branch": branch,
             "start": head.state,
             "take_over": branch is None and head.take_over,
-            "waiting_steps": waiting_steps(self.config, search, playing, self.bench),
+            "waiting_steps": waiting_steps(self.config, search, playing, self.costs),
             "search": asdict(search),
             "playing": playing,
             "first_epoch": head.epoch,

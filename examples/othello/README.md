@@ -436,14 +436,18 @@ Each period:
    which no network takes over either. `double` searches twice the iterations, both budgets
    with playout cap randomization, for `branch_turnovers` turnovers of its buffer; `stay` keeps
    the search for as many epochs as cost the same.
-3. **Test**: the branches' networks play series. Growing comes first: if the next network,
-   as it trained in `stay`, scores `size_margin` Elo (30) or more against `stay`'s playing one,
-   it takes over from `stay`'s state at the next trunk (`--take-over`), at `stay`'s search.
-   Otherwise the search doubles if `double`'s playing network scores `sims_margin` Elo (30) or
-   more against `stay`'s, and the run goes on from `double`; else from `stay`. So the search
-   only goes up while the next network doesn't pay its way: a bigger network is what makes
-   more search worth it. `double`'s next network plays `stay`'s too. One branch is thrown away
-   each period: longer trunks (`trunk_turnovers`) test less often.
+3. **Test**: the branches' networks play series, each with its weights averaged over the last
+   `average_epochs` (4) epochs (`--average-epochs`; see weight averages above), which plays
+   about 60-70 Elo above the current weights at a constant learning rate. Growing comes first:
+   if the next network, as it trained in `stay`, scores `margin_se` (2) standard errors of its
+   series or more against `stay`'s playing one, it takes over from `stay`'s state at the next
+   trunk (`--take-over`), at `stay`'s search. Otherwise the search doubles if `double`'s
+   playing network scores `margin_se` standard errors or more against `stay`'s, and the run
+   goes on from `double`; else from `stay`. So the search only goes up while the next network
+   doesn't pay its way: a bigger network is what makes more search worth it. `double`'s next
+   network plays `stay`'s too. One branch is thrown away each period: longer trunks
+   (`trunk_turnovers`) test less often. With `selfplay_average`, self-play plays the averages
+   too (`--selfplay-average`).
 4. **Ladder**: the network the run kept plays the league's Edax players in turn (`ladder`,
    edax-L1 up to edax-L24), a series each, from the rung the last period lost to, on to the next
    while it scores over half. Its games put the kept line on the league's scale.
@@ -456,10 +460,12 @@ the target is 25% past its capacity. With playout cap randomization n counts the
 stored. Periods are in turnovers of the buffer, so they lengthen as it grows.
 
 Compute is counted in network evaluations (self-play's positions evaluated, the samples each
-network trains on) and in benchmarked GPU time: the first step times each network's forward
-pass at self-play's batch and its training step at training's (`bench_nets.py`), and a step's
-time is those times its evaluations and steps. Flat costs (moving the games, writing the
-buffer, compiling) aren't counted. The losing branch counts in what the run spent (`spent`), not
+network trains on) and in GPU time: the first step times each network's forward pass at
+self-play's batch and its training step at training's (`bench_nets.py`), and each training
+step measures what the search's own bookkeeping adds per cycle (its epochs' self-play time
+less the forward passes, about 20% at 8x128; each search's median, the nearest budget's for a
+search not run yet). A step's time is those times its cycles and steps: branches are matched
+on it, and the waiting network's steps follow it. Compiling and tests aren't counted. The losing branch counts in what the run spent (`spent`), not
 in the line of states it kept (`kept`). Decisions, with their series, go to `decisions.jsonl`.
 
 The learning rate (`lr`, 5e-4) is constant through the run, as KataGo held its until its final
