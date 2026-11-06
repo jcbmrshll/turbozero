@@ -316,7 +316,7 @@ class Config:
     window: Window | None = None
     train_steps: int = 256
     train_batch: int = 4096
-    trunk_turnovers: float = 2.0
+    trunk_turnovers: float = 4.0
     branch_turnovers: float = 1.0
     games: int = 400
     play_sims: int = 128
