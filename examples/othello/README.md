@@ -421,32 +421,22 @@ other work can be slotted in between them, and decides between steps what the ru
 Each period:
 
 1. **Trunk**: the run trains on at its current settings, for `trunk_turnovers` turnovers of
-   its replay buffer, the next network training beside the one playing. No network takes over
-   in a trunk (`--grow-manual`): the next's training loss on the data both train on, averaged
-   over growth's window, only says whether it's worth testing, once it has caught up (lower
-   than the playing one's by `grow_margin`, 0 by default, KataGo's rule) and is no worse on
-   `grow_guard`, the engine set's value error on positions neither trains on. The trunk's saved
-   state records it (`growth_caught_up`).
-2. **A test**: two branches of the run (`--branch-from`) at equal benchmarked compute, whose
-   playing networks play a series; the run goes on from the one that wins it. A period tests
-   one thing:
-   - **Size**, if the next network has caught up and the last period didn't test size. In
-     `grow` the next plays (`--take-over`) for `branch_turnovers` turnovers of its buffer; in
-     `stay` the one playing goes on for as many epochs as cost the same, more epochs, its
-     self-play and training being cheaper. The bigger network is only worth growing into if it
-     beats the smaller one's training at equal compute, since a generator's speed counts as
-     well as its quality: the run grows if `grow`'s network scores `size_margin` Elo (30) or
-     more against `stay`'s. A second series plays it against itself as it trained in `stay`,
-     on the other's games: what playing its own was worth.
-   - **Sims**, otherwise: `double` searches twice the iterations, both budgets with playout
-     cap randomization, for `branch_turnovers` turnovers of its buffer, and `stay` keeps the
-     search for as many epochs as cost the same; no network takes over in either, so that
-     they compare the same networks. The run doubles if `double`'s network scores
-     `sims_margin` Elo (30) or more (the next networks play a series too).
-
-   One branch of each test is thrown away, so testing costs compute: longer trunks
-   (`trunk_turnovers`) test less often.
-3. **Ladder**: the network the run kept plays the league's Edax players in turn (`ladder`,
+   its replay buffer, the next network training beside the one playing, on its games. No
+   network takes over during it (`--grow-manual`); the next's training loss against the
+   playing one's is logged (`growth_gap`, `growth_caught_up`), but nothing switches on it.
+2. **Branches**: two branches of the run (`--branch-from`) at equal benchmarked compute, in
+   which no network takes over either. `double` searches twice the iterations, both budgets
+   with playout cap randomization, for `branch_turnovers` turnovers of its buffer; `stay` keeps
+   the search for as many epochs as cost the same.
+3. **Test**: the branches' networks play series. Growing comes first: if the next network,
+   as it trained in `stay`, scores `size_margin` Elo (30) or more against `stay`'s playing one,
+   it takes over from `stay`'s state at the next trunk (`--take-over`), at `stay`'s search.
+   Otherwise the search doubles if `double`'s playing network scores `sims_margin` Elo (30) or
+   more against `stay`'s, and the run goes on from `double`; else from `stay`. So the search
+   only goes up while the next network doesn't pay its way: a bigger network is what makes
+   more search worth it. `double`'s next network plays `stay`'s too. One branch is thrown away
+   each period: longer trunks (`trunk_turnovers`) test less often.
+4. **Ladder**: the network the run kept plays the league's Edax players in turn (`ladder`,
    edax-L1 up to edax-L24), a series each, from the rung the last period lost to, on to the next
    while it scores over half. Its games put the kept line on the league's scale.
 
