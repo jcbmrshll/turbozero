@@ -379,16 +379,19 @@ def test_a_period_branches_on_the_search_and_keeps_the_winner(tmp_path):
 
     steps = drain(run_dir, queue, runner, league)
 
+    # 4x64 doesn't pay its way after either trunk: each period branches on the search
     assert steps == [
         "bench",
         "p000-trunk",
+        "p000-size",
         "p000-stay",
         "p000-double",
-        "p000-test",
+        "p000-sims",
         "p001-trunk",
+        "p001-size",
         "p001-stay",
         "p001-double",
-        "p001-test",
+        "p001-sims",
     ]
     # each step queued from the frozen worktree, with an estimate
     assert all(
@@ -433,10 +436,10 @@ def test_a_period_branches_on_the_search_and_keeps_the_winner(tmp_path):
         run_dir / "p000-double" / "state-4.npz"
     )
     assert nxt[nxt.index("--sims") + 1] == "127"
-    # the series: stay's next network against its playing one (size), double's playing network
-    # against stay's (sims), and double's next one against stay's
+    # the series: the trunk's next network against its playing one (size), then double's
+    # playing network against stay's (sims), and double's next one against stay's
     assert [m[:2] for m in league.matches[:3]] == [
-        ("4x64-ctl-p000-stay-e5@128", "2x32-ctl-p000-stay-e5@128"),
+        ("4x64-ctl-p000-trunk-e2@128", "2x32-ctl-p000-trunk-e2@128"),
         ("2x32-ctl-p000-double-e4@128", "2x32-ctl-p000-stay-e5@128"),
         ("4x64-ctl-p000-double-e4@128", "4x64-ctl-p000-stay-e5@128"),
     ]
@@ -455,11 +458,13 @@ def test_a_period_branches_on_the_search_and_keeps_the_winner(tmp_path):
     # the decisions, and the states no branch can start from any more are gone
     made = decisions(run_dir)
     assert [(d["period"], d["question"], d["decision"]) for d in made] == [
-        (0, "test", "double"),
-        (1, "test", "stay"),
+        (0, "size", "stay"),
+        (0, "sims", "double"),
+        (1, "size", "stay"),
+        (1, "sims", "stay"),
     ]
-    assert [s["question"] for s in made[0]["series"]] == ["size", "sims", "next sims"]
-    assert made[0]["series"][1]["elo"] == pytest.approx(60, abs=5)
+    assert [s["question"] for s in made[1]["series"]] == ["sims", "next sims"]
+    assert made[1]["series"][0]["elo"] == pytest.approx(60, abs=5)
     assert not (run_dir / "p000-trunk" / "state-2.npz").exists()
     assert not (run_dir / "p000-stay" / "state-5.npz").exists()
     # spent counts every step, kept only the line of states the run went on from
@@ -479,10 +484,12 @@ def test_a_period_branches_on_the_search_and_keeps_the_winner(tmp_path):
     assert "period 2" in status and "+60" in status
 
 
-def test_the_next_network_takes_over_once_it_beats_the_playing_one_in_stay(tmp_path):
+def test_the_next_network_takes_over_from_the_trunk_once_it_beats_the_playing_one(
+    tmp_path,
+):
     run_dir = tmp_path / "run"
     queue, runner = FakeQueue(), FakeRunner()
-    # in period 0, stay's 4x64 beats its 2x32 by 60, and double beats stay too: growing first
+    # after period 0's trunk, its 4x64 beats its 2x32 by 60: no branches that period
     league = FakeLeague(lambda a, b: 60.0 if "p000" in a else -10.0)
     Controller.init(
         run_dir, config(tmp_path), queue=queue, runner=runner, league=league
@@ -490,45 +497,45 @@ def test_the_next_network_takes_over_once_it_beats_the_playing_one_in_stay(tmp_p
 
     steps = drain(run_dir, queue, runner, league)
 
+    # 4x64, the last, plays period 1: no size step, only its sims
     assert steps[1:] == [
         "p000-trunk",
-        "p000-stay",
-        "p000-double",
-        "p000-test",
+        "p000-size",
         "p001-trunk",
         "p001-stay",
         "p001-double",
-        "p001-test",
+        "p001-sims",
     ]
     made = decisions(run_dir)
-    assert [(d["period"], d["decision"], d["playing"]) for d in made] == [
-        (0, "grow", "4x64"),
-        (1, "stay", "4x64"),
+    assert [
+        (d["period"], d["question"], d["decision"], d["playing"]) for d in made
+    ] == [
+        (0, "size", "grow", "4x64"),
+        (1, "sims", "stay", "4x64"),
     ]
-    assert made[0]["series"][0]["question"] == "size"
     assert made[0]["series"][0]["elo"] == pytest.approx(60, abs=5)
-    # 4x64 takes over from stay's state at the next trunk, at stay's search
+    # 4x64 takes over from the trunk's state, at its search
     args = {Path(a[a.index("--ckpt-dir") + 1]).name: a for a in runner.calls}
     trunk = args["p001-trunk"]
     assert trunk[trunk.index("--branch-from") + 1] == str(
-        run_dir / "p000-stay" / "state-5.npz"
+        run_dir / "p000-trunk" / "state-2.npz"
     )
     assert "--take-over" in trunk and trunk[trunk.index("--sims") + 1] == "63"
     assert all(
         "--take-over" not in a for name, a in args.items() if name != "p001-trunk"
     )
     ctl = Controller(run_dir, queue, runner, league)
-    assert ctl.step("p001-trunk")["players"] == [[0, 5, 5], [1, 5, 7]]
+    assert ctl.step("p001-trunk")["players"] == [[0, 2, 2], [1, 2, 4]]
     # its trunk costs 4x64's epochs, playing alone
     assert ctl.step("p001-trunk")["compute"]["seconds"] == pytest.approx(
         2 * (16.384 + 0.256 * 30)
     )
-    # 4x64, the last, plays period 1: only its sims are tested
-    assert [m[:2] for m in league.matches[3:]] == [
-        ("4x64-ctl-p001-double-e9@128", "4x64-ctl-p001-stay-e10@128")
+    assert [m[:2] for m in league.matches[1:]] == [
+        ("4x64-ctl-p001-double-e6@128", "4x64-ctl-p001-stay-e7@128")
     ]
     assert ctl.head.playing == 1 and not ctl.head.take_over
-    assert not (run_dir / "p000-double" / "state-4.npz").exists()
+    # the period's kept state, the trunk's, stays
+    assert (run_dir / "p000-trunk" / "state-2.npz").exists()
 
 
 def test_sims_only_go_up_while_the_next_network_does_not_pay_its_way(tmp_path):
@@ -536,13 +543,7 @@ def test_sims_only_go_up_while_the_next_network_does_not_pay_its_way(tmp_path):
     queue, runner = FakeQueue(), FakeRunner()
     # 4x64 stays 10 behind; double wins by 60 in period 0, by 20 in period 1 (under the margin)
     league = FakeLeague(
-        lambda a, b: (
-            -10.0
-            if a.startswith("4x64-ctl-p00") and "stay" in a
-            else 60.0
-            if "p000-double" in a
-            else 20.0
-        )
+        lambda a, b: -10.0 if "trunk" in a else 60.0 if "p000-double" in a else 20.0
     )
     Controller.init(
         run_dir, config(tmp_path), queue=queue, runner=runner, league=league
@@ -550,7 +551,12 @@ def test_sims_only_go_up_while_the_next_network_does_not_pay_its_way(tmp_path):
 
     drain(run_dir, queue, runner, league)
 
-    assert [d["decision"] for d in decisions(run_dir)] == ["double", "stay"]
+    assert [(d["question"], d["decision"]) for d in decisions(run_dir)] == [
+        ("size", "stay"),
+        ("sims", "double"),
+        ("size", "stay"),
+        ("sims", "stay"),
+    ]
     ctl = Controller(run_dir, queue, runner, league)
     assert ctl.head.playing == 0 and ctl.head.search == Search(127)
 
@@ -569,15 +575,16 @@ def test_a_rating_step_that_gives_way_goes_back_in_the_queue(tmp_path):
 
     steps = drain(run_dir, queue, runner, league)
 
+    # the size step gave way, went back in the queue, and played its series once
     assert steps == [
         "bench",
         "p000-trunk",
+        "p000-size",
+        "p000-size",
         "p000-stay",
         "p000-double",
-        "p000-test",
-        "p000-test",
+        "p000-sims",
     ]
-    # its series asked for once, its players registered once
     assert len(league.matches) == 3
 
 
@@ -697,19 +704,21 @@ def test_each_period_climbs_the_ladder_from_where_the_last_stopped(tmp_path):
     assert steps == [
         "bench",
         "p000-trunk",
+        "p000-size",
         "p000-stay",
         "p000-double",
-        "p000-test",
+        "p000-sims",
         "p000-ladder",
         "p001-trunk",
+        "p001-size",
         "p001-stay",
         "p001-double",
-        "p001-test",
+        "p001-sims",
         "p001-ladder",
     ]
     ctl = Controller(run_dir, queue, runner, league)
     first, second = ctl.step("p000-ladder"), ctl.step("p001-ladder")
-    # the kept network: stay's playing one at its last epoch, a player of the test's series
+    # the kept network: stay's playing one at its last epoch, a player of the sims series
     player = "2x32-ctl-p000-stay-e5@128"
     assert first["player"]["name"] == player
     assert first["player"]["checkpoint"] == str(
@@ -731,7 +740,7 @@ def test_each_period_climbs_the_ladder_from_where_the_last_stopped(tmp_path):
     assert (second["beaten"], second["next_rung"]) == ("edax-L4", "edax-L4")
     assert ctl.head.rung == 2
     assert (player, "edax-L1", 400) in league.matches
-    # retired after the test (once, though it played two series), and after its ladder
+    # retired after the sims series, and after its ladder
     assert player in league.resumed and league.retired.count(player) == 2
     ladders = [d for d in decisions(run_dir) if d["question"] == "ladder"]
     assert [(d["period"], d["beaten"], d["next"]) for d in ladders] == [
@@ -930,9 +939,10 @@ def test_a_challenger_must_win_by_its_series_standard_errors(
 
     drain(run_dir, queue, runner, league)
 
-    (made,) = decisions(run_dir)
+    size, made = decisions(run_dir)
+    assert size["decision"] == "stay"
     assert made["decision"] == decision and made["margin_se"] == margin_se
-    sims = made["series"][1]
+    sims = made["series"][0]
     assert sims["question"] == "sims" and 20 < sims["se"] < 30
 
 
@@ -955,8 +965,8 @@ def test_the_league_rates_the_networks_weights_averaged(tmp_path):
         assert step_args[step_args.index("--average-epochs") + 1] == "4"
         assert step_args[step_args.index("--selfplay-average") + 1] == "4"
     assert league.matches[0][:2] == (
-        "4x64-ctl-p000-stay-e5-avg4@128",
-        "2x32-ctl-p000-stay-e5-avg4@128",
+        "4x64-ctl-p000-trunk-e2-avg4@128",
+        "2x32-ctl-p000-trunk-e2-avg4@128",
     )
     registered = league.registered["2x32-ctl-p000-stay-e5-avg4"]
     assert registered.checkpoint == str(
@@ -984,26 +994,22 @@ def test_the_clock_plays_the_sizes_at_equal_time_and_climbs_its_own_ladder(tmp_p
 
     steps = drain(run_dir, queue, runner, league)
 
-    assert steps[-3:] == ["p000-test", "p000-ladder", "p000-clock-ladder"]
+    assert steps[-3:] == ["p000-sims", "p000-ladder", "p000-clock-ladder"]
     ctl = Controller(run_dir, queue, runner, league)
-    test = ctl.step("p000-test")
-    assert [s["question"] for s in test["series"]] == [
-        "size",
-        "sims",
-        "next sims",
-        "size on the clock",
-    ]
-    assert league.matches[3][:2] == (
-        "4x64-ctl-p000-stay-e5@300-t4",
-        "2x32-ctl-p000-stay-e5@600-t4",
+    size = ctl.step("p000-size")
+    assert [s["question"] for s in size["series"]] == ["size", "size on the clock"]
+    assert league.matches[1][:2] == (
+        "4x64-ctl-p000-trunk-e2@300-t4",
+        "2x32-ctl-p000-trunk-e2@600-t4",
     )
     # the clock's players have trees of 4 nodes an iteration
-    assert league.registered["4x64-ctl-p000-stay-e5"].sims == [128, (300, 4)]
+    assert league.registered["4x64-ctl-p000-trunk-e2"].sims == [128, (300, 4)]
     # its win decides nothing
-    assert test["decision"] == "stay" and ctl.head.playing == 0
+    assert size["decision"] == "stay" and ctl.head.playing == 0
     made = decisions(run_dir)
     assert [(d["question"], d.get("decision")) for d in made] == [
-        ("test", "stay"),
+        ("size", "stay"),
+        ("sims", "stay"),
         ("ladder", None),
         ("clock ladder", None),
     ]
@@ -1034,9 +1040,11 @@ def test_retired_networks_train_on_and_play_the_one_playing_for_the_record(tmp_p
 
     assert all("--grow-train-retired" in a for a in runner.calls)
     ctl = Controller(run_dir, queue, runner, league)
-    test = ctl.step("p001-test")
-    assert [s["question"] for s in test["series"]] == ["sims", "retired 2x32"]
-    assert test["series"][1]["a"]["name"] == "2x32-ctl-p001-stay-e10@128"
-    assert test["series"][1]["b"]["name"] == "4x64-ctl-p001-stay-e10@128"
-    assert test["decision"] == "stay"
+    # 4x64 grew from period 0's trunk; period 1 has no size step, so its sims step plays the
+    # retired 2x32
+    sims = ctl.step("p001-sims")
+    assert [s["question"] for s in sims["series"]] == ["sims", "retired 2x32"]
+    assert sims["series"][1]["a"]["name"] == "2x32-ctl-p001-stay-e7@128"
+    assert sims["series"][1]["b"]["name"] == "4x64-ctl-p001-stay-e7@128"
+    assert sims["decision"] == "stay"
     assert ctl.data["spent"]["retired_seconds"] > 0

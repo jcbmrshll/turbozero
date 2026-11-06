@@ -434,22 +434,21 @@ Each period:
    back). With 8x128 playing at 255/63 sims, 12x144 takes 146 of 256 steps; the smaller steps
    of the ladder about 40%. So when the test plays the two, the bigger one has trained about
    what the run would have spent on it as the one playing.
-2. **Branches**: two branches of the run (`--branch-from`) at equal benchmarked compute, in
-   which no network takes over either. `double` searches twice the iterations, both budgets
+2. **Size**: if there's a next network, it plays the one playing, both as they trained in the
+   trunk, each with its weights averaged over the last `average_epochs` (4) epochs
+   (`--average-epochs`; see weight averages above). If it scores `margin_se` (2) standard
+   errors of its series or more, the run grows: the next network takes over from the trunk's
+   state at the next trunk (`--take-over`), and the period needs no branches. Growing comes
+   first: the search only goes up while the next network doesn't pay its way, a bigger network
+   being what makes more search worth it.
+3. **Sims**, otherwise: two branches of the run (`--branch-from`) at equal benchmarked compute,
+   in which no network takes over either. `double` searches twice the iterations, both budgets
    with playout cap randomization, for `branch_turnovers` turnovers of its buffer; `stay` keeps
-   the search for as many epochs as cost the same.
-3. **Test**: the branches' networks play series, each with its weights averaged over the last
-   `average_epochs` (4) epochs (`--average-epochs`; see weight averages above), which plays
-   about 60-70 Elo above the current weights at a constant learning rate. Growing comes first:
-   if the next network, as it trained in `stay`, scores `margin_se` (2) standard errors of its
-   series or more against `stay`'s playing one, it takes over from `stay`'s state at the next
-   trunk (`--take-over`), at `stay`'s search. Otherwise the search doubles if `double`'s
-   playing network scores `margin_se` standard errors or more against `stay`'s, and the run
-   goes on from `double`; else from `stay`. So the search only goes up while the next network
-   doesn't pay its way: a bigger network is what makes more search worth it. `double`'s next
-   network plays `stay`'s too. One branch is thrown away each period: longer trunks
-   (`trunk_turnovers`) test less often. With `selfplay_average`, self-play plays the averages
-   too (`--selfplay-average`).
+   the search for as many epochs as cost the same. If `double`'s playing network scores
+   `margin_se` standard errors or more against `stay`'s, the run goes on from `double`, else
+   from `stay`; `double`'s next network plays `stay`'s too, for the record. One branch is
+   thrown away: longer trunks (`trunk_turnovers`) test less often. With `selfplay_average`,
+   self-play plays the averages too (`--selfplay-average`).
 4. **Ladder**: the network the run kept plays the league's Edax players in turn (`ladder`,
    edax-L1 up to edax-L24), a series each, from the rung the last period lost to, on to the next
    while it scores over half. Its games put the kept line on the league's scale.
@@ -457,15 +456,16 @@ Each period:
 Every network is rated at 128 sims, the best model per search; for the record, the run also
 plays them at equal time. `clock_sims` gives each size the sims that take it about 1 s of one
 side's clock a game on the contest CPU path (bf16 OpenVINO, 8 threads, batched search, from the
-league's `timings.json`): 4x64 3000, 6x96 1100, 8x128 520, 12x144 250. Each test plays the next
+league's `timings.json`): 4x64 3000, 6x96 1100, 8x128 520, 12x144 250. The size step plays the next
 network against the one playing at those sims too (`size on the clock`), and the kept network
 climbs a second ladder of its own at its clock's sims (`pNNN-clock-ladder`). Those players have
 4 tree nodes an iteration (`clock_tree_factor`): at thousands of sims, the default 2 costs
 strength. Nothing is decided on the clock's games.
 
 With `train_retired`, the networks that played before keep training on the run's games, as many
-steps as the one playing (train.py `--grow-train-retired`), and each test plays each of them
-against the one playing (`retired <size>`): whether a smaller network keeps up on a bigger one's
+steps as the one playing (train.py `--grow-train-retired`), and the period's first test (the size
+step, or the sims step once the last network plays) plays each of them against the one playing
+(`retired <size>`): whether a smaller network keeps up on a bigger one's
 games, or falls behind for want of capacity. It isn't compute-optimal (about 10% more compute,
 15% with three retired), so it's counted in the run's compute and on its own
 (`retired_seconds`), but not in the next network's steps or any decision. It isn't part of a

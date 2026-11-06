@@ -7,21 +7,22 @@ Every period:
 1. trunk: the run trains on at its current settings, `trunk_turnovers` turnovers of its replay
    buffer, the next network training beside the one playing, on its games. No network takes
    over during a trunk (--grow-manual).
-2. branches: two branches of the run at equal benchmarked compute, in which no network takes
-   over either: `double` searches twice the iterations (both budgets, with playout cap
+2. size: if there's a next network, it plays the one playing, both as they trained in the
+   trunk, with their weights averaged over the last `average_epochs` epochs (train.py
+   --average-epochs). If it scores `margin_se` standard errors (of its series) or more, the run
+   grows: it takes over from the trunk's state at the next trunk (--take-over), and the period
+   needs no branches. Growing comes first: the search only goes up while the next network
+   doesn't pay its way.
+3. sims, otherwise: two branches of the run at equal benchmarked compute, in which no network
+   takes over: `double` searches twice the iterations (both budgets, with playout cap
    randomization) for `branch_turnovers` turnovers of its buffer, and `stay` keeps the search
-   for as many epochs as cost the same.
-3. test: the branches' networks play series, with their weights averaged over the last
-   `average_epochs` epochs (train.py --average-epochs). Growing comes first: if the next
-   network, as it trained in `stay`, scores `margin_se` standard errors (of its series) or
-   more against `stay`'s playing one, it takes over from `stay`'s state at the next trunk
-   (--take-over), at `stay`'s search. Otherwise the search doubles if `double`'s playing
-   network scores `margin_se` standard errors or more against `stay`'s, and the run goes on
-   from `double`; else from `stay`. Sims only go up while the next network doesn't pay its way.
+   for as many epochs as cost the same. If `double`'s playing network scores `margin_se`
+   standard errors or more against `stay`'s, the run goes on from `double`, else from `stay`.
    Longer trunks (`trunk_turnovers`) test less often.
-   With `clock_sims`, the next network plays the one playing at equal time too, each at the
-   sims that take it about 1 s of one side's clock a game on the CPU: for the record, no
-   decision rests on it.
+   With `clock_sims`, the size step also plays the two at equal time, each at the sims that
+   take it about 1 s of one side's clock a game on the CPU; with `train_retired`, the period's
+   first test plays each retired network against the one playing: for the record, deciding
+   nothing.
 4. ladder: the network the run kept climbs the league's Edax players (`ladder`), a series each,
    from the rung the last period lost to, on to the next while it scores over half: its games
    put the kept line on the league's scale.
@@ -1466,7 +1467,6 @@ class Controller:
             return
         period = self.data["period"]
         steps = self.period_steps(period)
-        stay, double = steps[f"p{period:03d}-stay"], steps[f"p{period:03d}-double"]
         results = {
             series["question"]: result
             for series, result in zip(step["series"], step["results"], strict=True)
@@ -1476,45 +1476,59 @@ class Controller:
             # by margin_se standard errors of its own series
             return result["elo"] >= self.config.margin_se * result["se"]
 
-        # growing first: the search only doubles if the next network doesn't take over
-        grow = "size" in results and wins(results["size"])
-        doubled = not grow and wins(results["sims"])
+        record = {
+            "period": period,
+            "question": step["kind"],
+            "series": [
+                {
+                    "question": series["question"],
+                    "a": series["a"]["name"],
+                    "b": series["b"]["name"],
+                    **result,
+                }
+                for series, result in zip(step["series"], step["results"], strict=True)
+            ],
+            "margin_se": self.config.margin_se,
+        }
+        if step["kind"] == "size":
+            # the next network takes over from the trunk's state, the head already
+            grow = wins(results["size"])
+            step["decision"] = "grow" if grow else "stay"
+            if grow:
+                step["kept"] = f"p{period:03d}-trunk"
+                self.set_head(
+                    replace(self.head, playing=self.head.playing + 1, take_over=True)
+                )
+            self.decide(
+                {
+                    **record,
+                    "decision": step["decision"],
+                    "playing": net_name(self.config.nets[self.head.playing]),
+                }
+            )
+            return
+        stay, double = steps[f"p{period:03d}-stay"], steps[f"p{period:03d}-double"]
+        doubled = wins(results["sims"])
         kept, lost = (double, stay) if doubled else (stay, double)
-        decision = "grow" if grow else "double" if doubled else "stay"
-        step["kept"], step["decision"] = kept["name"], decision
+        step["kept"], step["decision"] = kept["name"], "double" if doubled else "stay"
         self.data["kept"] = added(self.data["kept"], kept["compute"])
-        playing = kept["playing"] + int(grow)
         self.set_head(
             replace(
                 self.head,
                 state=kept["state"],
                 epoch=kept["last_epoch"],
                 search=Search(**kept["search"]),
-                playing=playing,
+                playing=kept["playing"],
                 stored=kept["stored"],
                 capacity=kept["buffer"],
-                take_over=grow,
             )
         )
         self.decide(
             {
-                "period": period,
-                "question": "test",
-                "series": [
-                    {
-                        "question": series["question"],
-                        "a": series["a"]["name"],
-                        "b": series["b"]["name"],
-                        **result,
-                    }
-                    for series, result in zip(
-                        step["series"], step["results"], strict=True
-                    )
-                ],
-                "margin_se": self.config.margin_se,
-                "decision": decision,
+                **record,
+                "decision": step["decision"],
                 "search": kept["search"],
-                "playing": net_name(self.config.nets[playing]),
+                "playing": net_name(self.config.nets[kept["playing"]]),
             }
         )
         if self.config.prune_states:
@@ -1539,13 +1553,22 @@ class Controller:
                 f"{spent_hours:.2f} benchmarked GPU hours spent"
             )
 
+    @staticmethod
+    def decided(step: dict) -> bool:
+        """Whether a step decided its period: a sims step, or a size step that grew the run."""
+        return step["status"] == "done" and (
+            step["kind"] == "sims"
+            or step["kind"] == "size"
+            and step["decision"] == "grow"
+        )
+
     def next_steps(self) -> list[dict]:
         """The steps to queue now that the last one is done (with the lock held)."""
         if self.config.ladder is not None:
-            # each period's ladder, after its test, in order: a run from before the ladder
-            # catches up first
+            # each period's ladders, once it's decided (the size step grew the run, or the sims
+            # step chose its search), in order: a run from before the ladder catches up first
             for name, test in sorted(self.data["steps"].items()):
-                if test["kind"] != "test" or test["status"] != "done":
+                if not self.decided(test):
                     continue
                 ladders = [(f"{name[:4]}-ladder", False)]
                 if self.config.clock_sims is not None:
@@ -1572,12 +1595,14 @@ class Controller:
         head = self.head
         if not steps:
             return [self.train_step(prefix + "trunk", head, head.search, None)]
-        if prefix + "test" in steps:
-            # its decisions are made, and its ladder (if any) climbed
+        if any(self.decided(s) for s in steps.values()):
+            # its decisions are made, and its ladders (if any) climbed
             self.end_period()
             return self.next_steps()
+        if prefix + "size" not in steps and head.playing + 1 < len(self.config.nets):
+            return [self.size_series(period)]
         if prefix + "stay" in steps:
-            return [self.test_series(period)]
+            return [self.sims_series(period)]
         stay, double = branch_epochs(
             self.config, head.search, head.playing, self.costs, self.capacity(head)
         )
@@ -1661,12 +1686,55 @@ class Controller:
         sims = self.config.clock_sims[net_name(self.config.nets[net])]
         return self.network_player(step, net, sims, self.config.clock_tree_factor)
 
-    def test_series(self, period: int) -> dict:
-        """A period's series, after its branches, the second network of each a branch's in
-        `stay`: size, the next network against the one playing, both as they trained in
-        `stay`; sims, `double`'s playing network against `stay`'s; and for the record,
-        `double`'s next network against `stay`'s, the size question on the clock
-        (`clock_sims`), and each retired network against the one playing (`train_retired`)."""
+    def retired_series(self, step: dict, playing: int) -> list[dict]:
+        """With `train_retired`, each network that played before against the one playing, as
+        they trained in `step`, for the record."""
+        if not self.config.train_retired:
+            return []
+        sims = self.config.play_sims
+        return [
+            {
+                "question": f"retired {net_name(self.config.nets[i])}",
+                "a": self.network_player(step, i, sims),
+                "b": self.network_player(step, playing, sims),
+            }
+            for i in range(playing)
+        ]
+
+    def size_series(self, period: int) -> dict:
+        """The size step's series, after the trunk: the next network against the one playing
+        (it decides), as they trained in the trunk; for the record, the same two at equal time
+        (`clock_sims`), and the retired networks against the one playing."""
+        trunk = self.step(f"p{period:03d}-trunk")
+        playing = trunk["playing"]
+        series = [
+            {
+                "question": "size",
+                "a": self.network_player(trunk, playing + 1, self.config.play_sims),
+                "b": self.network_player(trunk, playing, self.config.play_sims),
+            }
+        ]
+        if self.config.clock_sims is not None:
+            series.append(
+                {
+                    "question": "size on the clock",
+                    "a": self.clock_player(trunk, playing + 1),
+                    "b": self.clock_player(trunk, playing),
+                }
+            )
+        nets = self.config.nets
+        return {
+            "name": f"p{period:03d}-size",
+            "kind": "size",
+            "about": f"{net_name(nets[playing + 1])} vs {net_name(nets[playing])} at epoch "
+            f"{trunk['last_epoch']}",
+            "series": [*series, *self.retired_series(trunk, playing)],
+        }
+
+    def sims_series(self, period: int) -> dict:
+        """The sims step's series, after the branches: `double`'s playing network against
+        `stay`'s (it decides); for the record, `double`'s next network against `stay`'s, and
+        the retired networks against the one playing if the period had no size step."""
         steps = self.period_steps(period)
         stay, double = steps[f"p{period:03d}-stay"], steps[f"p{period:03d}-double"]
         sims = self.config.play_sims
@@ -1679,43 +1747,19 @@ class Controller:
             }
         ]
         if playing + 1 < len(self.config.nets):
-            series = [
-                {
-                    "question": "size",
-                    "a": self.network_player(stay, playing + 1, sims),
-                    "b": self.network_player(stay, playing, sims),
-                },
-                *series,
+            series.append(
                 {
                     "question": "next sims",
                     "a": self.network_player(double, playing + 1, sims),
                     "b": self.network_player(stay, playing + 1, sims),
-                },
-            ]
-            if self.config.clock_sims is not None:
-                # for the record: the same two at equal time
-                series.append(
-                    {
-                        "question": "size on the clock",
-                        "a": self.clock_player(stay, playing + 1),
-                        "b": self.clock_player(stay, playing),
-                    }
-                )
-        if self.config.train_retired:
-            # for the record: what those that played before made of its games
-            series += [
-                {
-                    "question": f"retired {net_name(self.config.nets[i])}",
-                    "a": self.network_player(stay, i, sims),
-                    "b": self.network_player(stay, playing, sims),
                 }
-                for i in range(playing)
-            ]
+            )
+        if f"p{period:03d}-size" not in steps:
+            series += self.retired_series(stay, playing)
         return {
-            "name": f"p{period:03d}-test",
-            "kind": "test",
-            "about": f"next vs playing, double vs stay, epochs {double['last_epoch']} and "
-            f"{stay['last_epoch']}",
+            "name": f"p{period:03d}-sims",
+            "kind": "sims",
+            "about": f"double vs stay, epochs {double['last_epoch']} and {stay['last_epoch']}",
             "series": series,
         }
 
@@ -1723,10 +1767,11 @@ class Controller:
         """A period's ladder (see `run_ladder`): its kept network, from the rung the last
         period's lost to; with `clock`, at its clock's sims, on the clock ladder's rungs."""
         prefix = f"p{period:03d}-"
-        test = self.step(prefix + "test")
-        kept = self.step(test["kept"])
-        # the network the run goes on with: the next one in `stay` if the test grew the run
-        playing = kept["playing"] + int(test["decision"] == "grow")
+        decision = self.data["steps"].get(prefix + "sims") or self.step(prefix + "size")
+        kept = self.step(decision["kept"])
+        # the network the run goes on with: the next one, as it trained in the trunk, if the
+        # size step grew the run
+        playing = kept["playing"] + int(decision["kind"] == "size")
         start = self.ladder[self.head.clock_rung if clock else self.head.rung]
         player = (
             self.clock_player(kept, playing)
