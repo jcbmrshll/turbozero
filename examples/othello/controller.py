@@ -16,6 +16,9 @@ Every period:
    buffer; `stay` keeps the search for as many epochs as cost the same. The networks playing in
    each play a series, and the run goes on from `double` if it scores `sims_margin` Elo or
    more, else from `stay`.
+4. ladder: the network the run kept climbs the league's Edax players (`ladder`), a series each,
+   from the rung the last period lost to, on to the next while it scores over half: its games
+   put the kept line on the league's scale.
 
 Compute is counted two ways: in network evaluations (self-play's positions evaluated, and the
 samples each network trains on), and in benchmarked GPU time, each network's forward pass at
@@ -28,6 +31,7 @@ counts in what the run spent, not in the line of states it kept.
     uv run examples/othello/controller.py status runs/big
     uv run examples/othello/controller.py stop runs/big          # after the step that runs now
     uv run examples/othello/controller.py retry runs/big p003-double
+    uv run examples/othello/controller.py advance runs/big   # what a step's end queues
 
 The config (JSON) names the networks, smallest first, the search to start with, train.py's other
 arguments, the periods' lengths and the margins (see `Config`). Each step runs
@@ -50,7 +54,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Generator, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -86,6 +90,21 @@ OWN_ARGS = (
     "--name",
     "--monitor",
 )
+
+
+# the Edax players of the league's pool, in climbing order (edax-L28 is retired)
+EDAX_LADDER = [
+    "edax-L1",
+    "edax-L2",
+    "edax-L4",
+    "edax-L6",
+    "edax-L8",
+    "edax-L10",
+    "edax-L12",
+    "edax-L16",
+    "edax-L20",
+    "edax-L24",
+]
 
 
 def net_name(spec: str) -> str:
@@ -256,6 +275,9 @@ class Config:
             stays: the run's line of states, to fork from later (e.g. a final learning rate drop)
         monitor: log each training step to seaglass (train.py --monitor), as its own run
         cores: the CPU cores a step runs on (taskset), so other tasks on the machine keep theirs
+        ladder: the league players each period's kept network climbs, in order, to put the kept
+            line on the league's scale: it plays the rung the last period lost to, and the next
+            while it scores over half (see `Controller.run_ladder`). None for no ladder
     """
 
     name: str
@@ -285,6 +307,7 @@ class Config:
     prune_states: bool = True
     monitor: bool = True
     cores: str = "0-7"
+    ladder: list[str] | None = field(default_factory=lambda: list(EDAX_LADDER))
 
     def __post_init__(self):
         if not self.nets:
@@ -299,6 +322,10 @@ class Config:
             raise ValueError("trunk_turnovers and branch_turnovers must be positive")
         if self.games < 2 or self.games % 2:
             raise ValueError(f"games must be even, got {self.games}")
+        if self.ladder is not None and (
+            not self.ladder or len(set(self.ladder)) != len(self.ladder)
+        ):
+            raise ValueError(f"the ladder needs distinct rungs, got {self.ladder}")
 
     @classmethod
     def from_json(cls, data: dict) -> "Config":
@@ -467,6 +494,8 @@ class League(Protocol):
         ...
 
     def retire(self, name: str) -> None: ...
+
+    def resume(self, name: str) -> None: ...
 
 
 class SlickQueue:
@@ -678,6 +707,9 @@ class LocalLeague:
     def retire(self, name: str) -> None:
         self.command("retire", name)
 
+    def resume(self, name: str) -> None:
+        self.command("resume", name)
+
 
 # the run's state
 
@@ -686,7 +718,8 @@ class LocalLeague:
 class Head:
     """Where the run's kept line of states has got to: the state to go on from (None before
     the first step), its epochs, search, the network playing, the positions it has stored per
-    environment and its replay buffer's capacity."""
+    environment, its replay buffer's capacity, and the ladder's rung the next ladder step
+    starts at (an index into the config's `ladder`)."""
 
     state: str | None
     epoch: int
@@ -694,6 +727,7 @@ class Head:
     playing: int
     stored: float
     capacity: int
+    rung: int = 0
 
 
 class Controller:
@@ -761,6 +795,12 @@ class Controller:
     def bench(self) -> dict[str, dict]:
         return self.data["bench"]
 
+    @property
+    def ladder(self) -> list[str]:
+        ladder = self.config.ladder
+        assert ladder is not None
+        return ladder
+
     def step(self, name: str) -> dict:
         return self.data["steps"][name]
 
@@ -794,6 +834,19 @@ class Controller:
             if step["status"] == "done":
                 raise RuntimeError(f"{name} is done")
             self.submit(step)
+
+    def advance(self) -> None:
+        """Queues what's next, as a step's end does: e.g. after an update of the controller, the
+        ladder steps a run from before it is missing."""
+        with self.locked():
+            if not self.data["stopped"]:
+                for new in self.next_steps():
+                    self.add(new)
+
+    def save(self, step: dict, *fields: str) -> None:
+        """Saves a running step's progress, its `fields`, holding the lock only to write."""
+        with self.locked():
+            self.step(step["name"]).update({f: step[f] for f in fields})
 
     def add(self, step: dict) -> None:
         """Adds a step to the run and queues it (with the lock held)."""
@@ -837,6 +890,8 @@ class Controller:
                 result = self.run_bench()
             elif step["kind"] == "train":
                 result = self.run_train(step)
+            elif step["kind"] == "ladder":
+                result = self.run_ladder(step)
             else:
                 result = self.run_series(step)
         except BaseException as e:
@@ -987,6 +1042,57 @@ class Controller:
                 league.retire(series[side]["name"])
         return {"results": results}
 
+    def run_ladder(self, step: dict) -> dict:
+        """Plays a ladder step's series a rung at a time: the kept network against the rung it
+        starts at, then the next while it scores over half, up to the top. Each series is saved
+        as it's asked for and as it ends, so a step that gives way goes on where it was.
+
+        Returns:
+            dict: `beaten`, the highest rung it scored over half against this time (None for
+                none), and `next_rung`, the one the next period's ladder starts at: the rung it
+                lost to, or the top
+        """
+        league, ladder = self.league, self.ladder
+        player = step["player"]
+        league.register(
+            player["network"],
+            player["checkpoint"],
+            player["net"],
+            player["run"],
+            [player["sims"]],
+        )
+        # the period's sims series retired it
+        league.resume(player["name"])
+        rung = ladder.index(step["start_rung"]) + len(step["results"])
+        log = self.dir / "logs" / f"{step['name']}.log"
+        while True:
+            if len(step["requests"]) == len(step["results"]):
+                step["series"].append({"a": player, "b": {"name": ladder[rung]}})
+                step["requests"].append(
+                    league.match(player["name"], ladder[rung], self.config.games)
+                )
+                self.save(step, "series", "requests")
+            if not league.play(
+                step["requests"][-1:], self.config.rate_hours * 3600, log
+            ):
+                return {"requeue": True}
+            wins, draws, losses = league.record(player["name"], ladder[rung])
+            elo, se = elo_of(wins, draws, losses)
+            step["results"].append(
+                {"wins": wins, "draws": draws, "losses": losses, "elo": elo, "se": se}
+            )
+            self.save(step, "results")
+            won = wins + 0.5 * draws > 0.5 * (wins + draws + losses)
+            if not won or rung + 1 == len(ladder):
+                break
+            rung += 1
+        league.retire(player["name"])
+        if won:
+            beaten = ladder[rung]
+        else:
+            beaten = ladder[rung - 1] if len(step["results"]) > 1 else None
+        return {"beaten": beaten, "next_rung": ladder[rung]}
+
     # deciding what's next
 
     def after(self, step: dict) -> None:
@@ -999,17 +1105,34 @@ class Controller:
             self.data["spent"] = added(self.data["spent"], step["compute"])
             if step["branch"] is None:
                 self.data["kept"] = added(self.data["kept"], step["compute"])
-                head = self.head
                 self.set_head(
-                    Head(
-                        step["state"],
-                        step["last_epoch"],
-                        head.search,
-                        head.playing,
-                        step["stored"],
-                        step["buffer"],
+                    replace(
+                        self.head,
+                        state=step["state"],
+                        epoch=step["last_epoch"],
+                        stored=step["stored"],
+                        capacity=step["buffer"],
                     )
                 )
+            return
+        if step["kind"] == "ladder":
+            ladder = self.ladder
+            self.set_head(replace(self.head, rung=ladder.index(step["next_rung"])))
+            self.decide(
+                {
+                    "period": int(step["name"][1:4]),
+                    "question": "ladder",
+                    "a": step["player"]["name"],
+                    "rungs": [
+                        {"b": series["b"]["name"], **result}
+                        for series, result in zip(
+                            step["series"], step["results"], strict=True
+                        )
+                    ],
+                    "beaten": step["beaten"],
+                    "next": step["next_rung"],
+                }
+            )
             return
         period = self.data["period"]
         result = step["results"][0]
@@ -1033,15 +1156,17 @@ class Controller:
         stay, double = steps[f"p{period:03d}-stay"], steps[f"p{period:03d}-double"]
         doubled = result["elo"] >= self.config.sims_margin
         kept, lost = (double, stay) if doubled else (stay, double)
+        step["kept"] = kept["name"]
         self.data["kept"] = added(self.data["kept"], kept["compute"])
         self.set_head(
-            Head(
-                kept["state"],
-                kept["last_epoch"],
-                Search(**kept["search"]),
-                kept["playing"],
-                kept["stored"],
-                kept["buffer"],
+            replace(
+                self.head,
+                state=kept["state"],
+                epoch=kept["last_epoch"],
+                search=Search(**kept["search"]),
+                playing=kept["playing"],
+                stored=kept["stored"],
+                capacity=kept["buffer"],
             )
         )
         self.decide(
@@ -1061,7 +1186,11 @@ class Controller:
             for gone in (lost["state"], kept["start"]):
                 if gone is not None:
                     Path(gone).unlink(missing_ok=True)
-        self.data["period"] = period + 1
+
+    def end_period(self) -> None:
+        """Moves the run on to its next period, once this one's decisions (and its ladder) are
+        done: the run is done after `max_periods`, or once it has spent `budget_hours`."""
+        self.data["period"] += 1
         spent_hours = self.data["spent"]["seconds"] / 3600
         if (
             self.config.max_periods is not None
@@ -1077,6 +1206,17 @@ class Controller:
 
     def next_steps(self) -> list[dict]:
         """The steps to queue now that the last one is done (with the lock held)."""
+        if self.config.ladder is not None:
+            # each period's ladder, in order: a run from before the ladder catches up first
+            for name, sims in sorted(self.data["steps"].items()):
+                if sims["kind"] != "sims" or sims["status"] != "done":
+                    continue
+                ladder = self.data["steps"].get(name.replace("-sims", "-ladder"))
+                if ladder is None:
+                    return [self.ladder_step(int(name[1:4]))]
+                if ladder["status"] != "done":
+                    # the next waits for its rung
+                    break
         if self.data["done"] is not None:
             return []
         period = self.data["period"]
@@ -1089,7 +1229,9 @@ class Controller:
         if not steps:
             return [self.train_step(prefix + "trunk", head, head.search, None, False)]
         if prefix + "sims" in steps:
-            raise RuntimeError(f"period {period} is over, but the run hasn't moved on")
+            # its decisions are made, and its ladder (if any) climbed
+            self.end_period()
+            return self.next_steps()
         if prefix + "stay" in steps:
             return [self.sims_series(period)]
         size = steps.get(prefix + "size")
@@ -1221,6 +1363,30 @@ class Controller:
             ],
         }
 
+    def ladder_step(self, period: int) -> dict:
+        """A period's ladder (see `run_ladder`): its kept network, from the rung the last
+        period's lost to."""
+        prefix = f"p{period:03d}-"
+        sims = self.step(prefix + "sims")
+        kept_name = sims.get("kept")
+        if kept_name is None:
+            # a sims step from before they recorded the branch kept
+            doubled = sims["results"][0]["elo"] >= self.config.sims_margin
+            kept_name = prefix + ("double" if doubled else "stay")
+        kept = self.step(kept_name)
+        start = self.ladder[self.head.rung]
+        return {
+            "name": prefix + "ladder",
+            "kind": "ladder",
+            "about": f"{net_name(self.config.nets[kept['playing']])} at epoch "
+            f"{kept['last_epoch']} up the ladder from {start}",
+            "player": self.network_player(kept, kept["playing"], self.config.play_sims),
+            "start_rung": start,
+            "series": [],
+            "requests": [],
+            "results": [],
+        }
+
     # reporting
 
     def status(self) -> str:
@@ -1271,6 +1437,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         ("start", "queue the first step"),
         ("status", "where the run is"),
         ("stop", "queue nothing after the steps queued now"),
+        (
+            "advance",
+            "queue what's next, as a step's end does (e.g. missing ladder steps)",
+        ),
     ]:
         commands.add_parser(name, help=text).add_argument("run")
     for name, text in [
@@ -1301,6 +1471,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         controller.run(args.name)
     elif args.command == "retry":
         controller.retry(args.name)
+    elif args.command == "advance":
+        controller.advance()
 
 
 if __name__ == "__main__":

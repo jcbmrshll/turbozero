@@ -47,6 +47,7 @@ def config(tmp_path, **kwargs):
             "trunk_turnovers": 1.0,
             "branch_turnovers": 1.0,
             "max_periods": 2,
+            "ladder": None,
             **kwargs,
         }
     )
@@ -249,12 +250,14 @@ class FakeRunner:
 
 class FakeLeague:
     """Records what's registered and asked for; a series' result is `elo(a, b)`, as 200 games
-    (in wins and losses), the first time `play` gives way `give_way` times."""
+    (in wins and losses). `play` gives way the first `give_way` times, and the first
+    `give_way_ladder` times it's asked for a series against Edax."""
 
-    def __init__(self, elo, give_way=0):
+    def __init__(self, elo, give_way=0, give_way_ladder=0):
         self.elo = elo
         self.give_way = give_way
-        self.registered, self.matches, self.retired = {}, [], []
+        self.give_way_ladder = give_way_ladder
+        self.registered, self.matches, self.retired, self.resumed = {}, [], [], []
 
     def register(self, name, checkpoint, net, run, sims):
         self.registered[name] = SimpleNamespace(
@@ -269,6 +272,10 @@ class FakeLeague:
         if self.give_way:
             self.give_way -= 1
             return False
+        edax = any(self.matches[r - 1][1].startswith("edax") for r in requests)
+        if edax and self.give_way_ladder:
+            self.give_way_ladder -= 1
+            return False
         return True
 
     def record(self, a, b):
@@ -279,10 +286,14 @@ class FakeLeague:
     def retire(self, name):
         self.retired.append(name)
 
+    def resume(self, name):
+        self.resumed.append(name)
 
-def drain(run_dir, queue, runner, league, limit=40):
-    """Runs the queued steps in order, as the queue would, until none is left."""
-    done = 0
+
+def drain(run_dir, queue, runner, league, limit=40, start=0):
+    """Runs the queued steps in order, as the queue would, from the `start`-th, until none is
+    left."""
+    done = start
     while done < len(queue.submitted):
         assert done < limit
         Controller(run_dir, queue, runner, league).run(queue.names()[done])
@@ -552,3 +563,128 @@ def test_the_window_grows_with_the_positions_the_kept_line_stored(tmp_path):
     # stay kept: 3 epochs on from epoch 4, every epoch storing 128 positions
     assert (data["head"]["epoch"], data["head"]["capacity"]) == (7, 256)
     assert data["head"]["stored"] == pytest.approx(128 * 7)
+
+
+LADDER = ["edax-L1", "edax-L2", "edax-L4"]
+
+
+def ladder_elo(a, b):
+    """stay always kept; period 0's network beats edax-L1 and loses to L2, period 1's beats L2
+    and L4, the top"""
+    if not b.startswith("edax"):
+        return -10.0
+    if "p000" in a:
+        return {"edax-L1": 100.0, "edax-L2": -20.0}[b]
+    return {"edax-L2": 60.0, "edax-L4": 40.0}[b]
+
+
+def test_each_period_climbs_the_ladder_from_where_the_last_stopped(tmp_path):
+    run_dir = tmp_path / "run"
+    queue, runner, league = FakeQueue(), FakeRunner(), FakeLeague(ladder_elo)
+    Controller.init(
+        run_dir,
+        config(tmp_path, ladder=LADDER),
+        queue=queue,
+        runner=runner,
+        league=league,
+    ).start()
+
+    steps = drain(run_dir, queue, runner, league)
+
+    # after each period's decisions, before the next period's trunk
+    assert steps == [
+        "bench",
+        "p000-trunk",
+        "p000-stay",
+        "p000-double",
+        "p000-sims",
+        "p000-ladder",
+        "p001-trunk",
+        "p001-stay",
+        "p001-double",
+        "p001-sims",
+        "p001-ladder",
+    ]
+    ctl = Controller(run_dir, queue, runner, league)
+    first, second = ctl.step("p000-ladder"), ctl.step("p001-ladder")
+    # the kept network: stay's playing one at its last epoch, the player of the sims series
+    player = "2x32-ctl-p000-stay-e5@128"
+    assert first["player"]["name"] == player
+    assert first["player"]["checkpoint"] == str(
+        run_dir / "p000-stay" / "2x32" / "4.eqx"
+    )
+    assert [x["b"]["name"] for x in first["series"]] == ["edax-L1", "edax-L2"]
+    # 200 games, whole wins
+    assert [r["elo"] for r in first["results"]] == [
+        pytest.approx(100, abs=3),
+        pytest.approx(-20, abs=3),
+    ]
+    assert (first["start_rung"], first["beaten"], first["next_rung"]) == (
+        "edax-L1",
+        "edax-L1",
+        "edax-L2",
+    )
+    # the next period starts at the rung it lost to; beating the top stays there
+    assert [x["b"]["name"] for x in second["series"]] == ["edax-L2", "edax-L4"]
+    assert (second["beaten"], second["next_rung"]) == ("edax-L4", "edax-L4")
+    assert ctl.head.rung == 2
+    assert (player, "edax-L1", 400) in league.matches
+    assert player in league.resumed and league.retired.count(player) == 2
+    ladders = [d for d in decisions(run_dir) if d["question"] == "ladder"]
+    assert [(d["period"], d["beaten"], d["next"]) for d in ladders] == [
+        (0, "edax-L1", "edax-L2"),
+        (1, "edax-L4", "edax-L4"),
+    ]
+    assert [r["b"] for r in ladders[0]["rungs"]] == ["edax-L1", "edax-L2"]
+    assert ctl.data["period"] == 2 and ctl.data["done"].startswith("after 2 periods")
+
+
+def test_a_run_from_before_the_ladder_climbs_it_in_period_order(tmp_path):
+    run_dir = tmp_path / "run"
+    queue, runner, league = FakeQueue(), FakeRunner(), FakeLeague(ladder_elo)
+    Controller.init(
+        run_dir, config(tmp_path), queue=queue, runner=runner, league=league
+    ).start()
+    drain(run_dir, queue, runner, league)
+    # as if from before the ladder: no ladder steps, and sims steps that don't say what they kept
+    data = json.loads((run_dir / "controller.json").read_text())
+    data["config"]["ladder"] = LADDER
+    for step in data["steps"].values():
+        step.pop("kept", None)
+    (run_dir / "controller.json").write_text(json.dumps(data))
+    done = len(queue.submitted)
+
+    Controller(run_dir, queue, runner, league).advance()
+
+    assert queue.names()[done:] == ["p000-ladder"]
+    assert drain(run_dir, queue, runner, league, start=done)[done:] == [
+        "p000-ladder",
+        "p001-ladder",
+    ]
+    ctl = Controller(run_dir, queue, runner, league)
+    assert ctl.step("p001-ladder")["start_rung"] == "edax-L2"
+    # nothing more: the run was done
+    ctl.advance()
+    assert len(queue.submitted) == done + 2
+
+
+def test_a_ladder_that_gives_way_goes_on_where_it_was(tmp_path):
+    run_dir = tmp_path / "run"
+    queue, runner = FakeQueue(), FakeRunner()
+    league = FakeLeague(ladder_elo, give_way_ladder=2)
+    Controller.init(
+        run_dir,
+        config(tmp_path, ladder=LADDER, max_periods=1),
+        queue=queue,
+        runner=runner,
+        league=league,
+    ).start()
+
+    steps = drain(run_dir, queue, runner, league)
+
+    # it gave way during each rung's series, and went on with the same series each time
+    assert steps[-3:] == ["p000-ladder"] * 3
+    edax = [m for m in league.matches if m[1].startswith("edax")]
+    assert [m[1] for m in edax] == ["edax-L1", "edax-L2"]
+    ladder = Controller(run_dir, queue, runner, league).step("p000-ladder")
+    assert ladder["requests"] == [3, 4] and len(ladder["results"]) == 2

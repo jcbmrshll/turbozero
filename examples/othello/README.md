@@ -416,6 +416,9 @@ Each period:
    turnovers of its buffer. `stay` keeps the search for as many epochs as cost the same. Their
    playing networks play a series (and the next ones another), and the run goes on from
    `double` if it scores `sims_margin` Elo (30) or more, else from `stay`.
+4. **Ladder**: the network the run kept plays the league's Edax players in turn (`ladder`,
+   edax-L1 up to edax-L24), a series each, from the rung the last period lost to, on to the next
+   while it scores over half. Its games put the kept line on the league's scale.
 
 With `"window"` in the config, the replay window grows with the positions the kept line of
 states has stored per environment, n, by the replay-window task's rule: n until `c` (256), then
@@ -457,7 +460,11 @@ uv run examples/othello/controller.py start runs/grow1
 uv run examples/othello/controller.py status runs/grow1
 uv run examples/othello/controller.py stop runs/grow1             # after the steps queued now
 uv run examples/othello/controller.py retry runs/grow1 p003-double
+uv run examples/othello/controller.py advance runs/grow1           # what a step's end queues
 ```
+
+`advance` also catches a run up after an update of the controller, e.g. a run from before the
+ladder plays each period's ladder, in order.
 
 A rating step runs the league's player in its own queue entry, playing only requested series,
 from the league's frozen worktree. If something queued at its priority or above takes the GPU
