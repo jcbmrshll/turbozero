@@ -390,8 +390,8 @@ def fake_loop(monkeypatch):
 
     Returns the calls, in order, as namespaces with the arguments they got: self-play's are
     `kind="collect"`, with `key`, `state`, `params`, `num_steps` and `evaluator`; training's
-    `kind="train"`, with `key`, `state` (the collection state), `epoch` and `result`, the train
-    state it returned.
+    `kind="train"`, with `key`, `state` (the collection state), `num_steps`, `epoch` and
+    `result`, the train state it returned.
     """
 
     def install(trainer):
@@ -425,6 +425,7 @@ def fake_loop(monkeypatch):
                     kind="train",
                     key=key,
                     state=collection_state,
+                    num_steps=num_steps,
                     epoch=epoch,
                     learner=learner,
                     result=result,
@@ -3023,3 +3024,35 @@ def test_a_branch_of_a_state_without_averages_starts_them_at_its_weights(
             str(tmp_path / "branch" / "avg2"), epoch
         ).params
         assert offset_from(average, initial) == pytest.approx(expected)
+
+
+def test_the_waiting_network_takes_its_own_training_steps(env, tmp_path, fake_loop):
+    monitor = FakeMonitor()
+    trainer, _ = growth_trainer(
+        env,
+        tmp_path,
+        SCRIPTS,
+        growth_kwargs={"manual": True},
+        train_steps_per_epoch=4,
+        waiting_train_steps=3,
+        monitor=monitor,
+    )
+    calls = fake_loop(trainer)
+
+    trainer.train_loop(seed=0, num_epochs=2)
+
+    assert [(c.learner, c.num_steps) for c in of_kind(calls, "train")] == [
+        (0, 4),
+        (1, 3),
+    ] * 2
+    logged = monitor.by_epoch()[1]
+    batch = trainer.train_batch_size
+    assert logged["n0/train_samples"] == 4 * batch
+    assert logged["n1/train_samples"] == 3 * batch
+    assert logged["train_samples"] == 7 * batch
+    assert trainer.get_config()["waiting_train_steps"] == 3
+
+
+def test_waiting_train_steps_need_growth(env, tmp_path):
+    with pytest.raises(ValueError, match="with growth"):
+        make_trainer(env, tmp_path, waiting_train_steps=2)

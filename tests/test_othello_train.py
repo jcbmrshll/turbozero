@@ -366,3 +366,29 @@ def test_weight_averages_reach_the_trainer(monkeypatch):
 def test_bad_average_options_are_refused(monkeypatch, options):
     with pytest.raises(SystemExit):
         run_main(monkeypatch, *options)
+
+
+def test_the_waiting_networks_training_steps_reach_the_trainer(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(
+            monkeypatch,
+            "--grow",
+            "resnet:2x8",
+            "--grow-switch-at",
+            "80",
+            "--grow-train-steps",
+            "3",
+        )
+    assert built.value.kwargs["waiting_train_steps"] == 3
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ("--grow-train-steps", "3"),
+        ("--grow", "resnet:2x8", "--grow-switch-at", "80", "--grow-train-steps", "0"),
+    ],
+)
+def test_bad_waiting_train_steps_are_refused(monkeypatch, options):
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, *options)

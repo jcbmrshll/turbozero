@@ -265,6 +265,14 @@ def main():
         "networks in lockstep don't switch (default 0: at or below)",
     )
     parser.add_argument(
+        "--grow-train-steps",
+        type=int,
+        default=None,
+        metavar="N",
+        help="with --grow, the training steps an epoch of the network that trains without "
+        "playing (default --train-steps): fewer charge it what the run could spend on it",
+    )
+    parser.add_argument(
         "--grow-guard",
         default=None,
         choices=["engine_value_mse", "engine_exp_regret"],
@@ -798,6 +806,10 @@ def main():
         parser.error("--resume needs the run's --ckpt-dir")
     if args.init_without_buffers and args.init_from is None:
         parser.error("--init-without-buffers needs --init-from")
+    if args.grow_train_steps is not None and (
+        not args.grow or args.grow_train_steps < 1
+    ):
+        parser.error("--grow-train-steps is a positive number of steps, with --grow")
     if any(h < 1 for h in args.average_epochs) or len(set(args.average_epochs)) != len(
         args.average_epochs
     ):
@@ -1118,6 +1130,7 @@ def main():
         lr_plateau=lr_plateau,
         lr_plateau_metric=args.lr_plateau_metric,
         growth=growth,
+        waiting_train_steps=args.grow_train_steps,
         averages=args.average_epochs,
         selfplay_average=args.selfplay_average,
         evaluator=evaluator,

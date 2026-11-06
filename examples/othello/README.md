@@ -379,7 +379,9 @@ the last `--grow-window` (10) epochs, and the next must have trained `--grow-min
 With `--grow-switch-at EPOCHS`, it takes over after fixed numbers of epochs instead. Either way,
 a playing network whose `--lr-plateau-stop` rule is done hands over rather than stopping the
 run. A waiting network trains at `--lr`, and follows `--lr-plateau` from its first rate once it
-plays. With `--grow-manual`, nothing takes over by itself: the run logs `growth_caught_up` (1 once
+plays. `--grow-train-steps N` has the waiting network take N training steps an epoch
+rather than `--train-steps`, e.g. what its own play would afford for the same compute. With
+`--grow-manual`, nothing takes over by itself: the run logs `growth_caught_up` (1 once
 the rule would switch), saved states record it too, and the next network takes over in a branch
 of the run, with `--branch-from` and `--take-over` (see the run controller below).
 
@@ -423,7 +425,13 @@ Each period:
 1. **Trunk**: the run trains on at its current settings, for `trunk_turnovers` turnovers of
    its replay buffer, the next network training beside the one playing, on its games. No
    network takes over during it (`--grow-manual`); the next's training loss against the
-   playing one's is logged (`growth_gap`, `growth_caught_up`), but nothing switches on it.
+   playing one's is logged (`growth_gap`, `growth_caught_up`), but nothing switches on it. The
+   next network trains the steps its own play would afford for the same compute
+   (`--grow-train-steps`): the playing one's steps times the ratio of the two regimes'
+   benchmarked epoch costs, each regime with its own waiting network (solved from the last
+   back). With 8x128 playing at 255/63 sims, 12x144 takes 146 of 256 steps; the smaller steps
+   of the ladder about 40%. So when the test plays the two, the bigger one has trained about
+   what the run would have spent on it as the one playing.
 2. **Branches**: two branches of the run (`--branch-from`) at equal benchmarked compute, in
    which no network takes over either. `double` searches twice the iterations, both budgets
    with playout cap randomization, for `branch_turnovers` turnovers of its buffer; `stay` keeps

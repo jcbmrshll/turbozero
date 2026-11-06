@@ -75,6 +75,7 @@ OWN_ARGS = (
     "--grow-margin",
     "--grow-guard",
     "--grow-switch-at",
+    "--grow-train-steps",
     "--sims",
     "--sims-schedule",
     "--playout-cap",
@@ -372,26 +373,66 @@ def epoch_compute(
     config: Config, search: Search, playing: int, bench: dict[str, dict]
 ) -> dict[str, Any]:
     """An epoch's compute: the network playing (index into `config.nets`) evaluates every
-    environment's position each search cycle, and it and the next (if any) take
-    `config.train_steps` training steps each.
+    environment's position each search cycle and takes `config.train_steps` training steps, and
+    the next (if any) takes `waiting_steps`.
 
     Returns:
         dict: `seconds`, benchmarked GPU time; `selfplay_evals`, positions evaluated in self-play;
             `train_samples`, by network
     """
-    training = [i for i in (playing, playing + 1) if i < len(config.nets)]
-    player = bench[config.nets[playing]]
     cycles = search.epoch_cycles()
-    samples = config.train_steps * config.train_batch
-    seconds = cycles * player["forward_ms"] / 1e3 + sum(
-        config.train_steps * bench[config.nets[i]]["train_step_ms"] / 1e3
-        for i in training
+    steps = {playing: config.train_steps}
+    waiting = waiting_steps(config, search, playing, bench)
+    if waiting is not None:
+        steps[playing + 1] = waiting
+    seconds = cycles * bench[config.nets[playing]]["forward_ms"] / 1e3 + sum(
+        n * bench[config.nets[i]]["train_step_ms"] / 1e3 for i, n in steps.items()
     )
     return {
         "seconds": seconds,
         "selfplay_evals": cycles * ENVS,
-        "train_samples": {net_name(config.nets[i]): samples for i in training},
+        "train_samples": {
+            net_name(config.nets[i]): n * config.train_batch for i, n in steps.items()
+        },
     }
+
+
+def regime_seconds(
+    config: Config, search: Search, playing: int, bench: dict[str, dict]
+) -> float:
+    """Benchmarked GPU seconds of an epoch while network `playing` plays at `search`: its
+    self-play and training, and the training of the next network waiting beside it, at the
+    steps `waiting_steps` gives it. Solved from the last network back: with E this cost, the
+    waiting network takes E / E_next of the steps, so E = own + (E / E_next) * T_next."""
+    nets = config.nets
+
+    def train(i: int) -> float:
+        return config.train_steps * bench[nets[i]]["train_step_ms"] / 1e3
+
+    own = search.epoch_cycles() * bench[nets[playing]]["forward_ms"] / 1e3 + train(
+        playing
+    )
+    if playing + 1 >= len(nets):
+        return own
+    after = regime_seconds(config, search, playing + 1, bench)
+    return own / (1 - train(playing + 1) / after)
+
+
+def waiting_steps(
+    config: Config, search: Search, playing: int, bench: dict[str, dict]
+) -> int | None:
+    """The training steps an epoch of the next network while `playing` plays (None for the
+    last): the steps its own play would afford for the same compute, `config.train_steps`
+    times the ratio of the two regimes' epoch costs (`regime_seconds`, each with its own
+    waiting network). So when the period's test plays it against the one playing, it has
+    trained about what the run would have spent on it as the one playing, on that one's games:
+    the bigger network must beat the smaller one's training at about equal compute."""
+    if playing + 1 >= len(config.nets):
+        return None
+    share = regime_seconds(config, search, playing, bench) / regime_seconds(
+        config, search, playing + 1, bench
+    )
+    return max(1, round(config.train_steps * share))
 
 
 def scaled(compute: dict[str, Any], epochs: int) -> dict[str, Any]:
@@ -988,6 +1029,8 @@ class Controller:
                 args += ["--grow-guard", config.grow_guard]
             if "--engine-eval-every" not in config.train_args:
                 args += ["--engine-eval-every", "1"]
+        if step["waiting_steps"] is not None:
+            args += ["--grow-train-steps", str(step["waiting_steps"])]
         args += search.train_args()
         directory = self.dir / step["name"]
         args += [
@@ -1362,6 +1405,7 @@ class Controller:
             "branch": branch,
             "start": head.state,
             "take_over": branch is None and head.take_over,
+            "waiting_steps": waiting_steps(self.config, search, playing, self.bench),
             "search": asdict(search),
             "playing": playing,
             "first_epoch": head.epoch,

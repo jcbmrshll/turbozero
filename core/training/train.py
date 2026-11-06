@@ -556,6 +556,7 @@ class Trainer:
         lr_plateau: LRPlateau | None = None,
         lr_plateau_metric: str = "loss",
         growth: Growth | None = None,
+        waiting_train_steps: int | None = None,
         averages: Sequence[float] = (),
         selfplay_average: float | None = None,
         extra_config: dict | None = None,
@@ -662,6 +663,10 @@ class Trainer:
                 checkpoints go to `<ckpt_dir>/<its name>`, and its metrics, its training's and its
                 testers', are logged as `<its name>/<metric>`; those of the network playing are
                 also logged as they are without growth. `testers` and `evaluator_test` are `nn`'s.
+            waiting_train_steps: (optional) with `growth`, the training steps an epoch of the
+                network that trains without playing (by default `train_steps_per_epoch`, as the
+                one playing): fewer charge its training what the run could spend on it, e.g. the
+                steps its own play would afford for the same compute
             averages: (optional) horizons, in epochs, of averages of each network's weights
                 (as KataGo plays and rates averaged weights while training at a constant learning
                 rate): after each epoch a network trains, each of its averages moves towards its
@@ -750,6 +755,17 @@ class Trainer:
         self.grad_accum_steps = grad_accum_steps
         if lr_plateau is not None and train_steps_per_epoch < 1:
             raise ValueError("lr_plateau needs training steps, to measure the loss")
+        if waiting_train_steps is not None and (
+            growth is None or waiting_train_steps < 1
+        ):
+            raise ValueError(
+                "waiting_train_steps is a positive number of steps, for a run with growth"
+            )
+        self.waiting_train_steps = (
+            waiting_train_steps
+            if waiting_train_steps is not None
+            else train_steps_per_epoch
+        )
         # testing
         self.testers = testers
         if evaluator_test is None:
@@ -847,6 +863,15 @@ class Trainer:
             step=jnp.array(0, dtype=jnp.int32),
         )
 
+    def steps_of(self, learner: int, playing: int) -> int:
+        """The training steps an epoch of a network that trains: the one playing's
+        `train_steps_per_epoch`, the one waiting's `waiting_train_steps`."""
+        return (
+            self.train_steps_per_epoch
+            if learner == playing
+            else self.waiting_train_steps
+        )
+
     def average_dirs(self, learner: int = 0) -> tuple[str, ...]:
         """A network's weight averages' checkpoint directories, one per horizon of `averages`
         (see `average_name`)."""
@@ -882,6 +907,11 @@ class Trainer:
             "collection_steps_per_epoch": self.collection_steps_per_epoch,
             "advance_every": self.advance_every,
             "train_steps_per_epoch": self.train_steps_per_epoch,
+            **(
+                {"waiting_train_steps": self.waiting_train_steps}
+                if self.waiting_train_steps != self.train_steps_per_epoch
+                else {}
+            ),
             "max_episode_steps": self.max_episode_steps,
             "nn": self.nn.__class__.__name__,
             "nn_params": sum(
@@ -3084,7 +3114,7 @@ class Trainer:
                     train_key,
                     collection_state,
                     train_states[i],
-                    self.train_steps_per_epoch,
+                    self.steps_of(i, playing),
                     epoch=cur_epoch,
                     learner=i,
                 )
@@ -3282,7 +3312,9 @@ class Trainer:
                     )
             # the epoch's compute: self-play, and each network's training and tests, in wall time
             # and in network evaluations (under vmap every environment pays every cycle)
-            train_samples = self.train_steps_per_epoch * self.train_batch_size
+            train_samples = {
+                i: self.steps_of(i, playing) * self.train_batch_size for i in training
+            }
             timing = {
                 "selfplay_seconds": selfplay_seconds,
                 "train_seconds": sum(train_seconds.values()),
@@ -3290,13 +3322,13 @@ class Trainer:
                 "epoch_seconds": time.perf_counter() - epoch_started,
                 "run_seconds": seconds + time.perf_counter() - started,
                 "selfplay_evals": cycles,
-                "train_samples": train_samples * len(training),
+                "train_samples": sum(train_samples.values()),
             }
             if self.growth is not None:
                 for i in training:
                     name = self.learners[i].name
                     timing[f"{name}/train_seconds"] = train_seconds[i]
-                    timing[f"{name}/train_samples"] = train_samples
+                    timing[f"{name}/train_samples"] = train_samples[i]
                     if i in test_seconds:
                         timing[f"{name}/test_seconds"] = test_seconds[i]
                 timing[f"{self.learners[playing].name}/selfplay_evals"] = cycles

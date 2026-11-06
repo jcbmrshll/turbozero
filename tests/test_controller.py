@@ -113,19 +113,43 @@ def test_bad_configs_are_refused(tmp_path, kwargs, match):
         config(tmp_path, **kwargs)
 
 
+def test_the_waiting_network_trains_the_steps_its_own_play_would_afford(tmp_path):
+    c = config(tmp_path)
+    # 4x64 playing alone (the last): 128 moves x 64 cycles at 2 ms, and 256 steps at 30 ms
+    last = 16.384 + 0.256 * 30
+    assert controller.regime_seconds(c, Search(63), 1, BENCH) == pytest.approx(last)
+    # 2x32 playing, 4x64 waiting at the share s = E / last of the steps: E = own + s T
+    own, t = 8.192 + 0.256 * 10, 0.256 * 30
+    e = own / (1 - t / last)
+    assert controller.regime_seconds(c, Search(63), 0, BENCH) == pytest.approx(e)
+    assert e == pytest.approx(own + e / last * t)
+    assert (
+        controller.waiting_steps(c, Search(63), 0, BENCH)
+        == round(256 * e / last)
+        == 168
+    )
+    assert controller.waiting_steps(c, Search(63), 1, BENCH) is None
+    # a deeper search makes the bigger network's self-play cost more: fewer steps
+    assert controller.waiting_steps(c, Search(127), 0, BENCH) == 148
+
+
 def test_an_epochs_compute_is_its_networks_evaluations_and_steps(tmp_path):
     c = config(tmp_path)
     compute = controller.epoch_compute(c, Search(63), 0, BENCH)
-    # 2x32 evaluates 128 moves x 64 cycles at 1 ms a cycle; both networks take 256 steps
-    assert compute["seconds"] == pytest.approx(8.192 + 0.256 * (10 + 30))
+    # 2x32 evaluates 128 moves x 64 cycles at 1 ms a cycle and takes 256 steps; 4x64, waiting,
+    # 168
+    assert compute["seconds"] == pytest.approx(8.192 + 0.256 * 10 + 0.168 * 30)
     assert compute["selfplay_evals"] == 8192 * 1024
-    assert compute["train_samples"] == {"2x32": 256 * 4096, "4x64": 256 * 4096}
+    assert compute["train_samples"] == {"2x32": 256 * 4096, "4x64": 168 * 4096}
     # the last network plays and trains alone
     alone = controller.epoch_compute(c, Search(63), 1, BENCH)
     assert alone["seconds"] == pytest.approx(16.384 + 0.256 * 30)
     assert alone["train_samples"] == {"4x64": 256 * 4096}
     total = controller.added(controller.scaled(compute, 2), alone)
-    assert total["train_samples"] == {"2x32": 2 * 256 * 4096, "4x64": 3 * 256 * 4096}
+    assert total["train_samples"] == {
+        "2x32": 2 * 256 * 4096,
+        "4x64": (2 * 168 + 256) * 4096,
+    }
 
 
 def test_branches_match_on_benchmarked_time(tmp_path):
@@ -133,7 +157,11 @@ def test_branches_match_on_benchmarked_time(tmp_path):
     stay, double = controller.branch_epochs(c, Search(63), 0, BENCH, c.buffer)
     # double fills its buffer once (2 epochs); stay takes the epochs of the same time
     assert double == 2
-    assert stay == round(2 * (16.384 + 10.24) / (8.192 + 10.24))
+
+    def cost(search):
+        return controller.epoch_compute(c, search, 0, BENCH)["seconds"]
+
+    assert stay == round(2 * cost(Search(127)) / cost(Search(63))) == 3
 
 
 def test_the_window_rule_grows_sublinearly_past_c():
@@ -348,6 +376,8 @@ def test_a_period_branches_on_the_search_and_keeps_the_winner(tmp_path):
     assert trunk[trunk.index("--grow-margin") + 1] == "0"
     assert trunk[trunk.index("--grow-guard") + 1] == "engine_value_mse"
     assert "--grow-manual" in trunk
+    # 4x64 trains the steps its own play would afford beside 2x32's, at the step's search
+    assert trunk[trunk.index("--grow-train-steps") + 1] == "168"
     assert trunk[-2:] == ["--seed", "1"]
     # a constant learning rate, 5e-4 unless the config says otherwise
     lr = trunk.index("--lr")
@@ -359,6 +389,7 @@ def test_a_period_branches_on_the_search_and_keeps_the_winner(tmp_path):
         assert branch[branch.index("--branch-from") + 1] == trunk_state
         assert "--grow-manual" in branch
     assert double[double.index("--sims") + 1] == "127"
+    assert double[double.index("--grow-train-steps") + 1] == "148"
     assert double[double.index("--epochs") + 1] == "4"
     assert stay[stay.index("--epochs") + 1] == str(2 + 3)
     # double won: the next trunk goes on from its state, at its search
@@ -398,10 +429,14 @@ def test_a_period_branches_on_the_search_and_keeps_the_winner(tmp_path):
     assert not (run_dir / "p000-stay" / "state-5.npz").exists()
     # spent counts every step, kept only the line of states the run went on from
     data = json.loads((run_dir / "controller.json").read_text())
-    trunk_s = 2 * (8.192 + 10.24)
-    # period 0's trunk and double, period 1's trunk and stay, all but the first at 127 sims
+    c = config(tmp_path)
+
+    def cost(search):
+        return controller.epoch_compute(c, search, 0, BENCH)["seconds"]
+
+    # period 0's trunk at 63 sims, then its double and period 1's trunk and stay at 127
     assert data["kept"]["seconds"] == pytest.approx(
-        trunk_s + (2 + 2 + 3) * (16.384 + 10.24)
+        2 * cost(Search(63)) + (2 + 2 + 3) * cost(Search(127))
     )
     assert data["spent"]["seconds"] > data["kept"]["seconds"]
     assert data["done"].startswith("after 2 periods")
