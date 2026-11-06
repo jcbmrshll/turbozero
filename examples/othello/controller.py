@@ -19,9 +19,13 @@ Every period:
    network scores `margin_se` standard errors or more against `stay`'s, and the run goes on
    from `double`; else from `stay`. Sims only go up while the next network doesn't pay its way.
    Longer trunks (`trunk_turnovers`) test less often.
+   With `clock_sims`, the next network plays the one playing at equal time too, each at the
+   sims that take it about 1 s of one side's clock a game on the CPU: for the record, no
+   decision rests on it.
 4. ladder: the network the run kept climbs the league's Edax players (`ladder`), a series each,
    from the rung the last period lost to, on to the next while it scores over half: its games
    put the kept line on the league's scale.
+   With `clock_sims`, it climbs a second ladder of its own at its clock's sims (pNNN-clock-ladder).
 
 Compute is counted two ways: in network evaluations (self-play's positions evaluated, and the
 samples each network trains on), and in GPU time (see `Costs`): each network's forward pass at
@@ -118,6 +122,12 @@ EDAX_LADDER = [
     "edax-L20",
     "edax-L24",
 ]
+
+
+# sims a move at which each network size takes about 1 s of one side's clock a game on the
+# contest CPU path (bf16 OpenVINO, 8 threads, batched C++ search), from the league's timings.json
+# (2026-11-01/02): the equal-time games' search
+CLOCK_SIMS = {"4x64": 3000, "6x96": 1100, "8x128": 520, "10x128": 390, "12x144": 250}
 
 
 def net_name(spec: str) -> str:
@@ -301,6 +311,12 @@ class Config:
         ladder: the league players each period's kept network climbs, in order, to put the kept
             line on the league's scale: it plays the rung the last period lost to, and the next
             while it scores over half (see `Controller.run_ladder`). None for no ladder
+        clock_sims: (optional) sims a move by network size (`net_name`) at equal time on the CPU
+            (`CLOCK_SIMS`: about 1 s of one side's clock a game). With them, each test also plays
+            the next network against the one playing at their clock's sims, and each period's
+            kept network climbs a second ladder at its own: for the record, deciding nothing
+        clock_tree_factor: the equal-time players' tree nodes per iteration (league
+            add-player --tree-factor): at thousands of sims, the default 2 costs strength
     """
 
     name: str
@@ -335,6 +351,8 @@ class Config:
     monitor: bool = True
     cores: str = "0-7"
     ladder: list[str] | None = field(default_factory=lambda: list(EDAX_LADDER))
+    clock_sims: dict[str, int] | None = field(default_factory=lambda: dict(CLOCK_SIMS))
+    clock_tree_factor: int = 4
 
     def __post_init__(self):
         if not self.nets:
@@ -367,6 +385,10 @@ class Config:
             not self.ladder or len(set(self.ladder)) != len(self.ladder)
         ):
             raise ValueError(f"the ladder needs distinct rungs, got {self.ladder}")
+        if self.clock_sims is not None:
+            missing = [n for n in names if n not in self.clock_sims]
+            if missing:
+                raise ValueError(f"clock_sims has no sims for {missing}")
 
     @classmethod
     def from_json(cls, data: dict) -> "Config":
@@ -633,7 +655,13 @@ class Runner(Protocol):
 
 class League(Protocol):
     def register(
-        self, name: str, checkpoint: str, net: str, run: str, sims: Sequence[int]
+        self,
+        name: str,
+        checkpoint: str,
+        net: str,
+        run: str,
+        sims: Sequence[int],
+        tree_factor: int | None = None,
     ) -> None: ...
 
     def match(self, a: str, b: str, games: int) -> int: ...
@@ -765,12 +793,40 @@ class LocalLeague:
         return out.stdout.strip()
 
     def register(
-        self, name: str, checkpoint: str, net: str, run: str, sims: Sequence[int]
+        self,
+        name: str,
+        checkpoint: str,
+        net: str,
+        run: str,
+        sims: Sequence[int],
+        tree_factor: int | None = None,
     ) -> None:
         with contextlib.closing(self.db()) as db:
-            if db.execute("SELECT 1 FROM networks WHERE name = ?", (name,)).fetchone():
-                # registered before a retry
-                return
+            # registered before a retry, or for another series
+            known = db.execute(
+                "SELECT 1 FROM networks WHERE name = ?", (name,)
+            ).fetchone()
+        if tree_factor is not None:
+            if not known:
+                self.command(
+                    "add-network",
+                    name,
+                    checkpoint,
+                    "--net",
+                    net,
+                    "--run",
+                    run,
+                    "--sims",
+                    *map(str, sims),
+                )
+            # players of their own, NETWORK@SIMS-tFACTOR; adding one again changes nothing
+            self.command(
+                "add-player", name, "--sims", *map(str, sims), "--tree-factor",
+                str(tree_factor),
+            )  # fmt: skip
+            return
+        if known:
+            return
         self.command(
             "add-network",
             name,
@@ -882,8 +938,8 @@ class Head:
     """Where the run's kept line of states has got to: the state to go on from (None before
     the first step), its epochs, search, the network playing, the positions it has stored per
     environment, its replay buffer's capacity, the ladder's rung the next ladder step starts at
-    (an index into the config's `ladder`), and whether `playing` takes over from the state's at
-    the next step (the last test grew the run)."""
+    (an index into the config's `ladder`), whether `playing` takes over from the state's at the
+    next step (the last test grew the run), and the clock ladder's rung."""
 
     state: str | None
     epoch: int
@@ -893,6 +949,7 @@ class Head:
     capacity: int
     rung: int = 0
     take_over: bool = False
+    clock_rung: int = 0
 
 
 class Controller:
@@ -1252,6 +1309,7 @@ class Controller:
                             player["net"],
                             player["run"],
                             [player["sims"]],
+                            player["tree_factor"],
                         )
                         player["registered"] = True
                 requests.append(
@@ -1303,8 +1361,9 @@ class Controller:
             player["net"],
             player["run"],
             [player["sims"]],
+            player["tree_factor"],
         )
-        # the period's sims series retired it
+        # the period's test retired it
         league.resume(player["name"])
         rung = ladder.index(step["start_rung"]) + len(step["results"])
         log = self.dir / "logs" / f"{step['name']}.log"
@@ -1361,12 +1420,16 @@ class Controller:
                 )
             return
         if step["kind"] == "ladder":
-            ladder = self.ladder
-            self.set_head(replace(self.head, rung=ladder.index(step["next_rung"])))
+            rung = self.ladder.index(step["next_rung"])
+            self.set_head(
+                replace(self.head, clock_rung=rung)
+                if step["clock"]
+                else replace(self.head, rung=rung)
+            )
             self.decide(
                 {
                     "period": int(step["name"][1:4]),
-                    "question": "ladder",
+                    "question": "clock ladder" if step["clock"] else "ladder",
                     "a": step["player"]["name"],
                     "rungs": [
                         {"b": series["b"]["name"], **result}
@@ -1462,11 +1525,19 @@ class Controller:
             for name, test in sorted(self.data["steps"].items()):
                 if test["kind"] != "test" or test["status"] != "done":
                     continue
-                ladder = self.data["steps"].get(f"{name[:4]}-ladder")
-                if ladder is None:
-                    return [self.ladder_step(int(name[1:4]))]
-                if ladder["status"] != "done":
-                    # the next waits for its rung
+                ladders = [(f"{name[:4]}-ladder", False)]
+                if self.config.clock_sims is not None:
+                    ladders.append((f"{name[:4]}-clock-ladder", True))
+                waiting = False
+                for ladder_name, clock in ladders:
+                    ladder = self.data["steps"].get(ladder_name)
+                    if ladder is None:
+                        return [self.ladder_step(int(name[1:4]), clock)]
+                    if ladder["status"] != "done":
+                        # the next waits for its rung
+                        waiting = True
+                        break
+                if waiting:
                     break
         if self.data["done"] is not None:
             return []
@@ -1548,16 +1619,25 @@ class Controller:
             return head.capacity
         return window.capacity(head.stored, head.capacity)
 
-    def network_player(self, step: dict, net: int, sims: int) -> dict:
+    def network_player(
+        self, step: dict, net: int, sims: int, tree_factor: int | None = None
+    ) -> dict:
         network = self.player(step, net)
         return {
             "network": network,
-            "name": f"{network}@{sims}",
+            "name": f"{network}@{sims}" + (f"-t{tree_factor}" if tree_factor else ""),
             "checkpoint": self.checkpoint(step, net),
             "net": self.config.nets[net],
             "run": f"{self.config.name}-{step['name']}",
             "sims": sims,
+            "tree_factor": tree_factor,
         }
+
+    def clock_player(self, step: dict, net: int) -> dict:
+        """A network's player at equal time: its clock's sims (see `Config.clock_sims`)."""
+        assert self.config.clock_sims is not None
+        sims = self.config.clock_sims[net_name(self.config.nets[net])]
+        return self.network_player(step, net, sims, self.config.clock_tree_factor)
 
     def test_series(self, period: int) -> dict:
         """A period's series, after its branches, the second network of each a branch's in
@@ -1589,6 +1669,15 @@ class Controller:
                     "b": self.network_player(stay, playing + 1, sims),
                 },
             ]
+            if self.config.clock_sims is not None:
+                # for the record: the same two at equal time
+                series.append(
+                    {
+                        "question": "size on the clock",
+                        "a": self.clock_player(stay, playing + 1),
+                        "b": self.clock_player(stay, playing),
+                    }
+                )
         return {
             "name": f"p{period:03d}-test",
             "kind": "test",
@@ -1597,21 +1686,28 @@ class Controller:
             "series": series,
         }
 
-    def ladder_step(self, period: int) -> dict:
+    def ladder_step(self, period: int, clock: bool = False) -> dict:
         """A period's ladder (see `run_ladder`): its kept network, from the rung the last
-        period's lost to."""
+        period's lost to; with `clock`, at its clock's sims, on the clock ladder's rungs."""
         prefix = f"p{period:03d}-"
         test = self.step(prefix + "test")
         kept = self.step(test["kept"])
         # the network the run goes on with: the next one in `stay` if the test grew the run
         playing = kept["playing"] + int(test["decision"] == "grow")
-        start = self.ladder[self.head.rung]
+        start = self.ladder[self.head.clock_rung if clock else self.head.rung]
+        player = (
+            self.clock_player(kept, playing)
+            if clock
+            else self.network_player(kept, playing, self.config.play_sims)
+        )
         return {
-            "name": prefix + "ladder",
+            "name": prefix + ("clock-ladder" if clock else "ladder"),
             "kind": "ladder",
+            "clock": clock,
             "about": f"{net_name(self.config.nets[playing])} at epoch "
-            f"{kept['last_epoch']} up the ladder from {start}",
-            "player": self.network_player(kept, playing, self.config.play_sims),
+            f"{kept['last_epoch']} up the ladder from {start}"
+            + (f" at {player['sims']} sims, its clock's" if clock else ""),
+            "player": player,
             "start_rung": start,
             "series": [],
             "requests": [],

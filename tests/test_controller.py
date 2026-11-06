@@ -48,6 +48,7 @@ def config(tmp_path, **kwargs):
             "max_periods": 2,
             "ladder": None,
             "average_epochs": None,
+            "clock_sims": None,
             **kwargs,
         }
     )
@@ -111,6 +112,7 @@ def test_bad_searches_are_refused(kwargs):
         ({"margin_se": -1.0}, "negative"),
         ({"average_epochs": 0.5}, "at least 1"),
         ({"selfplay_average": True}, "needs average_epochs"),
+        ({"clock_sims": {"2x32": 600}}, "no sims for"),
     ],
 )
 def test_bad_configs_are_refused(tmp_path, kwargs, match):
@@ -308,10 +310,15 @@ class FakeLeague:
         self.give_way_ladder = give_way_ladder
         self.registered, self.matches, self.retired, self.resumed = {}, [], [], []
 
-    def register(self, name, checkpoint, net, run, sims):
-        self.registered[name] = SimpleNamespace(
-            checkpoint=checkpoint, net=net, run=run, sims=list(sims)
+    def register(self, name, checkpoint, net, run, sims, tree_factor=None):
+        registered = self.registered.setdefault(
+            name, SimpleNamespace(checkpoint=checkpoint, net=net, run=run, sims=[])
         )
+        # as the league: registering a player again changes nothing
+        for n in sims:
+            player = (n, tree_factor) if tree_factor else n
+            if player not in registered.sims:
+                registered.sims.append(player)
 
     def match(self, a, b, games):
         self.matches.append((a, b, games))
@@ -952,3 +959,53 @@ def test_the_league_rates_the_networks_weights_averaged(tmp_path):
     assert registered.checkpoint == str(
         run_dir / "p000-stay" / "2x32" / "avg4" / "4.eqx"
     )
+
+
+def test_the_clock_plays_the_sizes_at_equal_time_and_climbs_its_own_ladder(tmp_path):
+    run_dir = tmp_path / "run"
+    queue, runner = FakeQueue(), FakeRunner()
+    # the clock's series and rungs never decide: 4x64 beats 2x32 on the clock only
+    league = FakeLeague(
+        lambda a, b: (
+            80.0 if a.endswith("-t4") and not b.startswith("edax") else ladder_elo(a, b)
+        )
+    )
+    clock = {"2x32": 600, "4x64": 300}
+    Controller.init(
+        run_dir,
+        config(tmp_path, max_periods=1, ladder=LADDER, clock_sims=clock),
+        queue=queue,
+        runner=runner,
+        league=league,
+    ).start()
+
+    steps = drain(run_dir, queue, runner, league)
+
+    assert steps[-3:] == ["p000-test", "p000-ladder", "p000-clock-ladder"]
+    ctl = Controller(run_dir, queue, runner, league)
+    test = ctl.step("p000-test")
+    assert [s["question"] for s in test["series"]] == [
+        "size",
+        "sims",
+        "next sims",
+        "size on the clock",
+    ]
+    assert league.matches[3][:2] == (
+        "4x64-ctl-p000-stay-e5@300-t4",
+        "2x32-ctl-p000-stay-e5@600-t4",
+    )
+    # the clock's players have trees of 4 nodes an iteration
+    assert league.registered["4x64-ctl-p000-stay-e5"].sims == [128, (300, 4)]
+    # its win decides nothing
+    assert test["decision"] == "stay" and ctl.head.playing == 0
+    made = decisions(run_dir)
+    assert [(d["question"], d.get("decision")) for d in made] == [
+        ("test", "stay"),
+        ("ladder", None),
+        ("clock ladder", None),
+    ]
+    # the kept network climbs the clock's ladder at its clock's sims, from its own rung
+    climb = ctl.step("p000-clock-ladder")
+    assert climb["player"]["name"] == "2x32-ctl-p000-stay-e5@600-t4"
+    assert climb["start_rung"] == "edax-L1"
+    assert (ctl.head.rung, ctl.head.clock_rung) == (1, 1)

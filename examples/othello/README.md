@@ -452,6 +452,15 @@ Each period:
    edax-L1 up to edax-L24), a series each, from the rung the last period lost to, on to the next
    while it scores over half. Its games put the kept line on the league's scale.
 
+Every network is rated at 128 sims, the best model per search; for the record, the run also
+plays them at equal time. `clock_sims` gives each size the sims that take it about 1 s of one
+side's clock a game on the contest CPU path (bf16 OpenVINO, 8 threads, batched search, from the
+league's `timings.json`): 4x64 3000, 6x96 1100, 8x128 520, 12x144 250. Each test plays the next
+network against the one playing at those sims too (`size on the clock`), and the kept network
+climbs a second ladder of its own at its clock's sims (`pNNN-clock-ladder`). Those players have
+4 tree nodes an iteration (`clock_tree_factor`): at thousands of sims, the default 2 costs
+strength. Nothing is decided on the clock's games.
+
 With `"window"` in the config, the replay window grows with the positions the kept line of
 states has stored per environment, n, by the replay-window task's rule: n until `c` (256), then
 `c (1 + beta ((n / c)^alpha - 1) / alpha)` (KataGo's shape, `alpha` 0.75, `beta` 0.075, which
