@@ -732,8 +732,9 @@ def main():
         help="continue a run from a saved state (state-<EPOCH>.npz, or a directory to take the "
         "newest from) in a new --ckpt-dir, with these arguments' self-play, e.g. other --sims: "
         "the run goes on at its epoch, with its networks, optimizers, buffers, games and rng; "
-        "only the moves in progress are searched again if the search changed. --epochs counts "
-        "the run's epochs before the branch too (see Trainer.branch and controller.py)",
+        "only the moves in progress are searched again if the search changed, and a different "
+        "--buffer resizes the replay buffer. --epochs counts the run's epochs before the branch "
+        "too (see Trainer.branch and controller.py)",
     )
     parser.add_argument(
         "--take-over",

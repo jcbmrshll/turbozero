@@ -352,8 +352,9 @@ another size starts its trees anew, its moves in progress searched again; with t
 settings a branch continues it exactly. Two branches of one state, one at `--sims 128` and one
 at `--sims 64`, compare the two at the same point of the same run. It works for runs with
 `--grow`, which can't be forked, and `--take-over` hands self-play to the next network from
-the branch's first epoch. The replay buffers' capacity must be the run's. The branch logs to a
-seaglass run of its own, whose config records the state as `parent`.
+the branch's first epoch. A different `--buffer` resizes the replay buffer at the branch's
+start, each environment keeping its newest positions. The branch logs to a seaglass run of its
+own, whose config records the state as `parent`.
 
 ```
 uv run examples/othello/train.py --epochs 180 --sims 128 --branch-from runs/trunk/state-150.npz \
@@ -416,6 +417,13 @@ Each period:
    playing networks play a series (and the next ones another), and the run goes on from
    `double` if it scores `sims_margin` Elo (30) or more, else from `stay`.
 
+With `"window"` in the config, the replay window grows with the positions the kept line of
+states has stored per environment, n, by the replay-window task's rule: n until `c` (256), then
+`c (1 + beta ((n / c)^alpha - 1) / alpha)` (KataGo's shape, `alpha` 0.75, `beta` 0.075, which
+reaches about 1125 at an 8x128 run's 30M positions). A step starts with the buffer resized once
+the target is 25% past its capacity. With playout cap randomization n counts the positions
+stored. Periods are in turnovers of the buffer, so they lengthen as it grows.
+
 Compute is counted in network evaluations (self-play's positions evaluated, the samples each
 network trains on) and in benchmarked GPU time: the first step times each network's forward
 pass at self-play's batch and its training step at training's (`bench_nets.py`), and a step's
@@ -435,7 +443,8 @@ playout cap randomization `full`, `fast`, `full_probability` and `cycles`, train
   "nets": ["resnet:4x64,pool_every=2,heads=pooled,pool_channels=16",
            "resnet:6x96,pool_every=2,heads=pooled,pool_channels=24"],
   "search": {"full": 127, "fast": 31, "full_probability": 0.25, "cycles": 8320},
-  "buffer": 326,
+  "buffer": 256,
+  "window": {"c": 256},
   "train_args": ["--lr-final", "1e-3"],
   "worktree": "~/worktrees/turbozero/grow1-frozen",
   "queue_cwd": "~/worktrees/turbozero/<the task's worktree>"

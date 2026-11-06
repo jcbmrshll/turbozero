@@ -126,10 +126,23 @@ def test_an_epochs_compute_is_its_networks_evaluations_and_steps(tmp_path):
 
 def test_branches_match_on_benchmarked_time(tmp_path):
     c = config(tmp_path)
-    stay, double = controller.branch_epochs(c, Search(63), 0, BENCH)
+    stay, double = controller.branch_epochs(c, Search(63), 0, BENCH, c.buffer)
     # double fills its buffer once (2 epochs); stay takes the epochs of the same time
     assert double == 2
     assert stay == round(2 * (16.384 + 10.24) / (8.192 + 10.24))
+
+
+def test_the_window_rule_grows_sublinearly_past_c():
+    window = controller.Window()
+    assert window.target(100) == 100 and window.target(256) == 256
+    # an 8x128 run's 274 minutes, about 30M positions over 1024 environments
+    assert window.target(30e6 / 1024) == pytest.approx(1125, rel=0.01)
+    # resized once the target is 25% past the capacity, rounded up to a multiple of 32
+    assert window.capacity(1000, 256) == 256
+    n = 256 * (1 + 0.25 * 0.75 / 0.075) ** (1 / 0.75)
+    assert window.capacity(n - 1, 256) == 256 and window.capacity(n + 1, 256) == 352
+    assert window.capacity(30e6 / 1024, 1000) == 1000
+    assert window.capacity(30e6 / 1024, 800) == 1152
 
 
 def test_elo_of_a_series():
@@ -501,3 +514,41 @@ def test_stop_queues_nothing_more(tmp_path):
     Controller(run_dir, queue, runner, league).stop()
 
     assert drain(run_dir, queue, runner, league) == ["bench"]
+
+
+def test_the_window_grows_with_the_positions_the_kept_line_stored(tmp_path):
+    run_dir = tmp_path / "run"
+    queue, runner = FakeQueue(), FakeRunner()
+    league = FakeLeague(lambda a, b: 60.0 if "p000" in a else -10.0)
+    # KataGo's slope: 128 positions per environment (1 epoch) then about +36% at 2 epochs
+    window = controller.Window(c=128, beta=0.4)
+    Controller.init(
+        run_dir,
+        config(tmp_path, buffer=128, window=window),
+        queue=queue,
+        runner=runner,
+        league=league,
+    ).start()
+
+    drain(run_dir, queue, runner, league)
+
+    args = {Path(a[a.index("--ckpt-dir") + 1]).name: a for a in runner.calls}
+
+    def buffer(step):
+        return args[step][args[step].index("--buffer") + 1]
+
+    # period 0: 1 epoch's 128 positions, then the branches from 128
+    assert [buffer(s) for s in ("p000-trunk", "p000-stay", "p000-double")] == [
+        "128"
+    ] * 3
+    # double kept, with 2 epochs more: 256 positions, a target of 174.5, 25% past 128
+    assert buffer("p001-trunk") == "192"
+    # its trunk: 1 turnover of the bigger buffer, 1.5 epochs at 128 a epoch, from epoch 2
+    trunk = args["p001-trunk"]
+    assert trunk[trunk.index("--epochs") + 1] == str(2 + 2)
+    # then 512 positions, a target of 252.8, 25% past 192: the branches resize to 256
+    assert buffer("p001-stay") == buffer("p001-double") == "256"
+    data = json.loads((run_dir / "controller.json").read_text())
+    # stay kept: 3 epochs on from epoch 4, every epoch storing 128 positions
+    assert (data["head"]["epoch"], data["head"]["capacity"]) == (7, 256)
+    assert data["head"]["stored"] == pytest.approx(128 * 7)

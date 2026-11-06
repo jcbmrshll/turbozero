@@ -2024,10 +2024,11 @@ class Trainer:
         schedule switches searches, or the next network takes over, see `follow_schedule`).
 
         Branches of one state are compared at equal compute, so each is the run going on,
-        rather than a fork (see `train_loop`'s `fork_from`), which starts a new run. The
-        number of environments and replay buffer capacities must be the run's. A branch logs to
-        a monitor run of its own, whose config records the state as its parent, and leaves the
-        saved run's directory as it is.
+        rather than a fork (see `train_loop`'s `fork_from`), which starts a new run. The number
+        of environments and whether there are tree positions must be the run's. The replay
+        buffers take this trainer's capacities, resized from the saved ones if they differ (see
+        `resize_replay_buffer`). A branch logs to a monitor run of its own, whose config records
+        the state as its parent, and leaves the saved run's directory as it is.
 
         Args:
             path: the saved state (see `save_state`), or a directory to take the newest from
@@ -2043,12 +2044,17 @@ class Trainer:
         path = latest_state_path(path)
         with np.load(path) as saved:
             meta = self._check_meta(path, json.loads(str(saved["meta"])))
-            self._check_sizes(path, meta, resizable=False)
+            self._check_sizes(path, meta)
             epoch = meta["epoch"]
             if (meta["growth"] is None) != (self.growth is None):
                 raise ValueError(
                     f"{path} was saved by a run {'without' if meta['growth'] is None else 'with'} "
                     "growth: a branch of it needs the same"
+                )
+            if (meta["tree_buffer_capacity"] is None) != (self.tree_buffer is None):
+                raise ValueError(
+                    f"{path} was saved {'without' if self.tree_buffer else 'with'} tree "
+                    "positions: a branch of it needs the same"
                 )
             growth = None
             if self.growth is not None:
@@ -2079,6 +2085,17 @@ class Trainer:
                 self.test_state_templates(train_templates),
             )
             key = _to_device(saved["key"])
+        resized = ""
+        if self.memory_buffer.capacity != meta["buffer_capacity"]:
+            collection_state = self.resize_replay_buffer(
+                collection_state,
+                self.memory_buffer.capacity,
+                self.tree_buffer.capacity if self.tree_buffer is not None else None,
+            )
+            resized = (
+                f", replay buffer resized from {meta['buffer_capacity']} to "
+                f"{self.memory_buffer.capacity}"
+            )
         lr_plateau: tuple[LRPlateauProgress | None, ...] = ()
         if self.lr_plateau is not None:
             if not meta["lr_plateau"]:
@@ -2106,7 +2123,8 @@ class Trainer:
         whose = f", {self.learners[playing].name} playing" if take_over else ""
         search = "its search's states kept" if kept_search else "new search states"
         print(
-            f"branching from {path}: {epoch} epochs done{whose}, {search}", flush=True
+            f"branching from {path}: {epoch} epochs done{whose}, {search}{resized}",
+            flush=True,
         )
         return TrainLoopOutput(
             collection_state=collection_state,
@@ -2122,12 +2140,17 @@ class Trainer:
     def _branch_collection_state(
         self, saved: Any, meta: dict, evaluator: Evaluator, keep_search: bool = True
     ) -> tuple[CollectionState, bool]:
-        """A saved collection state, for `evaluator`: with `keep_search`, the saved search states
-        if they have its states' shapes, else new ones, with the moves in progress searched
-        again (see `branch`). Returns it, and whether the saved search states were kept."""
+        """A saved collection state, for `evaluator`, at its saved capacities: with
+        `keep_search`, the saved search states if they have its states' shapes, else new ones,
+        with the moves in progress searched again (see `branch`). Returns it, and whether the
+        saved search states were kept."""
         template = jax.eval_shape(
             lambda: self.init_collection_state(
-                jax.random.PRNGKey(0), self.batch_size, evaluator
+                jax.random.PRNGKey(0),
+                self.batch_size,
+                evaluator,
+                meta["buffer_capacity"],
+                meta["tree_buffer_capacity"],
             )
         )
         expected = _describe(template)

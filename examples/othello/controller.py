@@ -188,6 +188,35 @@ class Search:
 
 
 @dataclass(frozen=True)
+class Window:
+    """The replay window by the positions stored per environment so far, n: the replay-window
+    task's rule, KataGo's sublinear shape. Its target is n until `c`, then
+    c (1 + beta ((n / c)^alpha - 1) / alpha), which grows as n^alpha with slope `beta` at c (the
+    defaults reach about 1125 at 30M positions, an 8x128 run's 274 minutes). The buffer is
+    resized once the target is `step` times its capacity or more, to the target rounded up to a
+    multiple of `multiple`. With playout cap randomization, n counts the positions stored (the
+    full searches'), as KataGo's counts the samples it records."""
+
+    c: int = 256
+    alpha: float = 0.75
+    beta: float = 0.075
+    step: float = 1.25
+    multiple: int = 32
+
+    def target(self, n: float) -> float:
+        if n <= self.c:
+            return n
+        return self.c * (1 + self.beta * ((n / self.c) ** self.alpha - 1) / self.alpha)
+
+    def capacity(self, n: float, current: int) -> int:
+        """The buffer's capacity after n positions per environment, from `current`."""
+        target = self.target(n)
+        if target < self.step * current:
+            return current
+        return math.ceil(target / self.multiple) * self.multiple
+
+
+@dataclass(frozen=True)
 class Config:
     """A controlled run's settings (the JSON config's keys).
 
@@ -200,7 +229,10 @@ class Config:
         queue_cwd: the slick task's worktree, where `slick queue` queues the steps
         train_args: train.py's other arguments, e.g. ["--lr-final", "1e-3"] for a constant
             learning rate. Not those the controller sets (`OWN_ARGS`)
-        buffer: train.py --buffer, positions kept per environment
+        buffer: train.py --buffer, positions kept per environment: the replay window, or with
+            `window` the one to start with (its `c`)
+        window: (optional) grow the replay window by the positions stored so far (see
+            `Window`), checked at each step's start; without, `buffer` throughout
         train_steps: train.py --train-steps, training steps an epoch
         train_batch: train.py --train-batch
         trunk_turnovers: a period's trunk, in turnovers of the replay buffer at its search
@@ -233,6 +265,7 @@ class Config:
     queue_cwd: str
     train_args: list[str] = field(default_factory=list)
     buffer: int = 1125
+    window: Window | None = None
     train_steps: int = 256
     train_batch: int = 4096
     trunk_turnovers: float = 2.0
@@ -269,7 +302,14 @@ class Config:
 
     @classmethod
     def from_json(cls, data: dict) -> "Config":
-        return cls(**{**data, "search": Search(**data["search"])})
+        window = data.get("window")
+        return cls(
+            **{
+                **data,
+                "search": Search(**data["search"]),
+                "window": Window(**window) if window is not None else None,
+            }
+        )
 
     def to_json(self) -> dict:
         return asdict(self)
@@ -325,18 +365,22 @@ def added(total: dict[str, Any], compute: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def turnover_epochs(config: Config, search: Search) -> float:
-    """Epochs self-play takes to fill the replay buffer with new positions."""
-    return config.buffer / search.stored_per_epoch()
+def turnover_epochs(capacity: int, search: Search) -> float:
+    """Epochs self-play takes to fill a replay buffer of `capacity` with new positions."""
+    return capacity / search.stored_per_epoch()
 
 
 def branch_epochs(
-    config: Config, search: Search, playing: int, bench: dict[str, dict]
+    config: Config,
+    search: Search,
+    playing: int,
+    bench: dict[str, dict],
+    capacity: int,
 ) -> tuple[int, int]:
     """The epochs of a period's two branches: `double`'s, `branch_turnovers` turnovers of its
     buffer, and `stay`'s, those whose benchmarked GPU time is closest to it."""
     double = max(
-        1, math.ceil(config.branch_turnovers * turnover_epochs(config, search))
+        1, math.ceil(config.branch_turnovers * turnover_epochs(capacity, search))
     )
     stay_cost = epoch_compute(config, search, playing, bench)["seconds"]
     double_cost = epoch_compute(config, search.doubled(), playing, bench)["seconds"]
@@ -641,12 +685,15 @@ class LocalLeague:
 @dataclass
 class Head:
     """Where the run's kept line of states has got to: the state to go on from (None before
-    the first step), its epochs, search and the network playing."""
+    the first step), its epochs, search, the network playing, the positions it has stored per
+    environment and its replay buffer's capacity."""
 
     state: str | None
     epoch: int
     search: Search
     playing: int
+    stored: float
+    capacity: int
 
 
 class Controller:
@@ -678,7 +725,7 @@ class Controller:
         data = {
             "config": config.to_json(),
             "period": 0,
-            "head": asdict(Head(None, 0, config.search, 0)),
+            "head": asdict(Head(None, 0, config.search, 0, 0.0, config.buffer)),
             "steps": {},
             "bench": None,
             "spent": {},
@@ -837,7 +884,7 @@ class Controller:
         directory = self.dir / step["name"]
         args += [
             "--buffer",
-            str(config.buffer),
+            str(step["buffer"]),
             "--train-steps",
             str(config.train_steps),
             "--train-batch",
@@ -954,7 +1001,14 @@ class Controller:
                 self.data["kept"] = added(self.data["kept"], step["compute"])
                 head = self.head
                 self.set_head(
-                    Head(step["state"], step["last_epoch"], head.search, head.playing)
+                    Head(
+                        step["state"],
+                        step["last_epoch"],
+                        head.search,
+                        head.playing,
+                        step["stored"],
+                        step["buffer"],
+                    )
                 )
             return
         period = self.data["period"]
@@ -986,6 +1040,8 @@ class Controller:
                 kept["last_epoch"],
                 Search(**kept["search"]),
                 kept["playing"],
+                kept["stored"],
+                kept["buffer"],
             )
         )
         self.decide(
@@ -1041,7 +1097,11 @@ class Controller:
             return [self.size_series(period)]
         take_over = bool(size and size["switch"])
         stay, double = branch_epochs(
-            self.config, head.search, head.playing + take_over, self.bench
+            self.config,
+            head.search,
+            head.playing + take_over,
+            self.bench,
+            self.capacity(head),
         )
         return [
             self.train_step(
@@ -1067,11 +1127,12 @@ class Controller:
         epochs: int | None = None,
     ) -> dict:
         playing = head.playing + take_over
+        capacity = self.capacity(head)
         if epochs is None:
             epochs = max(
                 1,
                 math.ceil(
-                    self.config.trunk_turnovers * turnover_epochs(self.config, search)
+                    self.config.trunk_turnovers * turnover_epochs(capacity, search)
                 ),
             )
         compute = scaled(
@@ -1083,7 +1144,8 @@ class Controller:
             "kind": "train",
             "about": (
                 f"{what}, {net_name(self.config.nets[playing])} playing at "
-                f"{search.label()}, epochs {head.epoch}-{head.epoch + epochs}"
+                f"{search.label()}, window {capacity}, epochs {head.epoch}-"
+                f"{head.epoch + epochs}"
             ),
             "branch": branch,
             "start": head.state,
@@ -1092,8 +1154,18 @@ class Controller:
             "playing": playing,
             "first_epoch": head.epoch,
             "last_epoch": head.epoch + epochs,
+            "buffer": capacity,
+            # positions stored per environment along the kept line, at the step's end
+            "stored": head.stored + epochs * search.stored_per_epoch(),
             "compute": compute,
         }
+
+    def capacity(self, head: Head) -> int:
+        """The replay buffer's capacity for a step from `head`: by the window rule, if any."""
+        window = self.config.window
+        if window is None:
+            return head.capacity
+        return window.capacity(head.stored, head.capacity)
 
     def network_player(self, step: dict, net: int, sims: int) -> dict:
         network = self.player(step, net)
@@ -1156,7 +1228,8 @@ class Controller:
         config = self.config
         lines = [
             f"{config.name}: period {self.data['period']}, epoch {head.epoch}, "
-            f"{net_name(config.nets[head.playing])} playing at {head.search.label()}"
+            f"{net_name(config.nets[head.playing])} playing at {head.search.label()}, "
+            f"window {head.capacity}"
             + (", stopped" if self.data["stopped"] else "")
             + (f", done {self.data['done']}" if self.data["done"] else ""),
         ]

@@ -29,7 +29,11 @@ from core.evaluators.evaluation_fns import make_nn_eval_fn
 from core.evaluators.evaluator import EvalOutput, Evaluator
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.mcts.mcts import MCTS
-from core.memory.replay_memory import BaseExperience, EpisodeReplayBuffer
+from core.memory.replay_memory import (
+    BaseExperience,
+    EpisodeReplayBuffer,
+    buffer_capacity,
+)
 from core.monitoring import DECLARED
 from core.networks.azresnet import batch_norm
 from core.networks.utils import apply_nn
@@ -2768,12 +2772,8 @@ def test_a_branch_must_fit_the_saved_run(env, tmp_path, fake_loop):
     trunk.train_loop(seed=0, num_epochs=1)
     path = str(tmp_path / "trunk")
 
-    with pytest.raises(
-        ValueError, match="replay buffer capacity of 8, this run's is 16"
-    ):
-        make_trainer(
-            env, tmp_path / "b1", memory_buffer=EpisodeReplayBuffer(capacity=16)
-        ).branch(path)
+    with pytest.raises(ValueError, match="saved without tree positions"):
+        tree_trainer(env, tmp_path / "b1").branch(path)
     with pytest.raises(ValueError, match="only a run with growth"):
         make_trainer(env, tmp_path / "b2").branch(path, take_over=True)
     grown, _ = growth_trainer(env, tmp_path / "b3", SCRIPTS)
@@ -2791,3 +2791,29 @@ def test_a_branch_must_fit_the_saved_run(env, tmp_path, fake_loop):
     last.train_loop(seed=0, num_epochs=3)
     with pytest.raises(ValueError, match="n2 is the last network"):
         last.branch(str(tmp_path / "b4"), take_over=True)
+
+
+def test_a_branch_takes_its_trainers_buffer_capacity(env, tmp_path, fake_loop, capsys):
+    path = saved_mid_move(make_trainer(env, tmp_path / "trunk"))
+    branch = make_trainer(
+        env,
+        tmp_path / "branch",
+        memory_buffer=EpisodeReplayBuffer(capacity=4),
+        save_state_at=[3],
+    )
+    fake_loop(branch)
+
+    start = branch.branch(path)
+
+    # each environment keeps its newest entries, as many as fit
+    state = start.collection_state.buffer_state
+    assert buffer_capacity(state) == 4
+    sampleable, (buffer,) = by_age(state)
+    assert sampleable.all()
+    np.testing.assert_array_equal(buffer.search_value[0], [5, 4, 3, 2])
+    assert "replay buffer resized from 8 to 4" in capsys.readouterr().out
+    # its saved states hold the new capacity, so a retried branch resumes at it
+    branch.train_loop(seed=0, num_epochs=3, initial_state=start)
+    assert (
+        read_state_meta(state_path(str(tmp_path / "branch"), 3))["buffer_capacity"] == 4
+    )
