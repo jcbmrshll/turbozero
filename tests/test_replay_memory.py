@@ -317,6 +317,10 @@ def test_resized_keeps_the_newest_entries_oldest_first(capacity):
     new_state, (ids,) = resized.resized(state, state.buffer.observation_nn + 100)
 
     assert sampleable(resized, new_state) == [3, 4, 5, 6, 7][-capacity:]
+    # every array keeps its dtype (e.g. the boolean policy mask)
+    assert [x.dtype for x in jax.tree.leaves(new_state)] == [
+        x.dtype for x in jax.tree.leaves(state)
+    ]
     np.testing.assert_array_equal(
         ids[new_state.populated],
         new_state.buffer.observation_nn[new_state.populated] + 100,
@@ -329,13 +333,73 @@ def test_resized_keeps_the_newest_entries_oldest_first(capacity):
     assert sampleable(resized, new_state) == [3, 4, 5, 6, 7, 8][-capacity:]
 
 
-def test_resized_needs_no_episode_in_progress():
-    buffer = EpisodeReplayBuffer(capacity=5)
-    state = add(buffer, init_single(buffer), [1, 2])
-    state = jax.tree.map(lambda x: np.asarray(x)[None], state)
+def batched(state):
+    """A single environment's state as a batch of one, in numpy arrays, as `resized` takes."""
+    return jax.tree.map(lambda x: np.asarray(x)[None], state)
 
-    with pytest.raises(ValueError, match="episode in progress"):
-        EpisodeReplayBuffer(capacity=3).resized(state)
-    # without it
-    state, _ = EpisodeReplayBuffer(capacity=3).resized(buffer.truncate(state))
-    assert not state.populated.any()
+
+def unbatched(state):
+    return jax.tree.map(lambda x: jnp.asarray(x[0]), state)
+
+
+@pytest.mark.parametrize("capacity", [4, 6, 12])
+def test_resized_keeps_an_episode_in_progress(capacity):
+    buffer = EpisodeReplayBuffer(capacity=7)
+    # a finished episode 1-5, then 6-7 in progress
+    state = buffer.assign_rewards(
+        add(buffer, init_single(buffer), [1, 2, 3, 4, 5]), jnp.array([1.0, -1.0])
+    )
+    state = add(buffer, state, [6, 7])
+
+    new_state, _ = EpisodeReplayBuffer(capacity=capacity).resized(batched(state))
+    new_state = unbatched(new_state)
+
+    # the episode in progress can't be sampled, and is kept
+    assert sampleable(buffer, new_state) == [1, 2, 3, 4, 5][-(capacity - 2) :]
+    # when it ends, its entries get its reward
+    ended = buffer.assign_rewards(add(buffer, new_state, [8]), jnp.array([-1.0, 1.0]))
+    assert sampleable(buffer, ended) == [1, 2, 3, 4, 5, 6, 7, 8][-capacity:]
+    rewards = {
+        int(obs): float(r[0])
+        for obs, r, ok in zip(
+            ended.buffer.observation_nn,
+            ended.buffer.reward,
+            ended.populated,
+            strict=True,
+        )
+        if ok
+    }
+    assert {obs: rewards[obs] for obs in (6, 7, 8)} == {6: -1.0, 7: -1.0, 8: -1.0}
+    assert all(rewards[obs] == 1.0 for obs in rewards if obs < 6)
+    # or truncating discards just its entries
+    truncated = buffer.truncate(add(buffer, new_state, [8]))
+    assert sampleable(buffer, truncated) == [1, 2, 3, 4, 5][-(capacity - 3) :]
+    assert int(truncated.populated.sum()) == min(5, capacity - 3)
+
+
+def test_resized_keeps_the_newest_entries_of_an_episode_longer_than_it():
+    buffer = EpisodeReplayBuffer(capacity=6)
+    state = add(buffer, init_single(buffer), [1, 2, 3, 4, 5])
+
+    new_state, _ = EpisodeReplayBuffer(capacity=3).resized(batched(state))
+    new_state = buffer.assign_rewards(
+        add(buffer, unbatched(new_state), [6]), jnp.ones(2)
+    )
+
+    assert sampleable(buffer, new_state) == [4, 5, 6]
+
+
+def test_buffer_operations_take_the_capacity_of_the_state():
+    # a buffer configured for 5 entries, on a state of 3
+    buffer = EpisodeReplayBuffer(capacity=5)
+    state = init_single(EpisodeReplayBuffer(capacity=3))
+
+    state = buffer.assign_rewards(add(buffer, state, [1, 2, 3, 4]), jnp.ones(2))
+    assert state.populated.shape == (3,)
+    assert sampleable(buffer, state) == [2, 3, 4]
+    assert state.next_idx == 1
+    # so do tree positions' writes
+    experiences = jax.tree.map(lambda *x: jnp.stack(x), *map(experience, [5, 6]))
+    state = buffer.add_experiences(state, experiences, jnp.array([True, True]))
+    assert sampleable(buffer, state) == [4, 5, 6]
+    assert state.next_idx == 0
