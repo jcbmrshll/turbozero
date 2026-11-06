@@ -565,19 +565,22 @@ class LocalRunner:
 
     def bench(self, nets: list[str], args: list[str], out: Path) -> dict[str, dict]:
         out.unlink(missing_ok=True)
-        subprocess.run(
-            [
-                sys.executable,
-                "examples/othello/bench_nets.py",
-                *nets,
-                *args,
-                "--json",
-                str(out),
-            ],
-            cwd=self.cwd,
-            env=gpu_env(),
-            check=True,
-        )
+        # a process each: in one, the networks' GPU memory adds up, and 12x144's training step
+        # ran out of it after three smaller ones (alone it peaks at 4.7 GB)
+        for net in nets:
+            subprocess.run(
+                [
+                    sys.executable,
+                    "examples/othello/bench_nets.py",
+                    net,
+                    *args,
+                    "--json",
+                    str(out),
+                ],
+                cwd=self.cwd,
+                env=gpu_env(),
+                check=True,
+            )
         results = [json.loads(line) for line in out.read_text().splitlines()]
         return {r["net"]: r for r in results}
 
