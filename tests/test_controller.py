@@ -276,7 +276,10 @@ class FakeRunner:
             if "--average-epochs" in args
             else []
         )
-        for net in nets[playing : playing + 2]:
+        # those that train: the one playing and the next, and with --grow-train-retired those
+        # that played before
+        first = 0 if "--grow-train-retired" in args else playing
+        for net in nets[first : playing + 2]:
             for kept in ("", *averages):
                 (directory / controller.net_name(net) / kept).mkdir(exist_ok=True)
                 (
@@ -1009,3 +1012,31 @@ def test_the_clock_plays_the_sizes_at_equal_time_and_climbs_its_own_ladder(tmp_p
     assert climb["player"]["name"] == "2x32-ctl-p000-stay-e5@600-t4"
     assert climb["start_rung"] == "edax-L1"
     assert (ctl.head.rung, ctl.head.clock_rung) == (1, 1)
+
+
+def test_retired_networks_train_on_and_play_the_one_playing_for_the_record(tmp_path):
+    c = config(tmp_path, train_retired=True)
+    # 4x64 playing: 2x32, retired, trains its 256 steps on, counted on its own too
+    compute = controller.epoch_compute(c, Search(63), 1, COSTS)
+    assert compute["retired_seconds"] == pytest.approx(0.256 * 10)
+    assert compute["seconds"] == pytest.approx(16.384 + 0.256 * 30 + 0.256 * 10)
+    assert compute["train_samples"]["2x32"] == 256 * 4096
+    # the next network's steps leave it out
+    assert controller.waiting_steps(c, Search(63), 0, COSTS) == 168
+
+    run_dir = tmp_path / "run"
+    queue, runner = FakeQueue(), FakeRunner()
+    # 4x64 wins its size test in period 0: 2x32 retires
+    league = FakeLeague(lambda a, b: 60.0 if "p000" in a else -10.0)
+    Controller.init(run_dir, c, queue=queue, runner=runner, league=league).start()
+
+    drain(run_dir, queue, runner, league)
+
+    assert all("--grow-train-retired" in a for a in runner.calls)
+    ctl = Controller(run_dir, queue, runner, league)
+    test = ctl.step("p001-test")
+    assert [s["question"] for s in test["series"]] == ["sims", "retired 2x32"]
+    assert test["series"][1]["a"]["name"] == "2x32-ctl-p001-stay-e10@128"
+    assert test["series"][1]["b"]["name"] == "4x64-ctl-p001-stay-e10@128"
+    assert test["decision"] == "stay"
+    assert ctl.data["spent"]["retired_seconds"] > 0

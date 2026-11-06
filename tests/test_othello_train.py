@@ -392,3 +392,21 @@ def test_the_waiting_networks_training_steps_reach_the_trainer(monkeypatch):
 def test_bad_waiting_train_steps_are_refused(monkeypatch, options):
     with pytest.raises(SystemExit):
         run_main(monkeypatch, *options)
+
+
+def test_retired_networks_training_reaches_the_trainer(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(
+            monkeypatch,
+            "--grow",
+            "resnet:2x8",
+            "--grow-switch-at",
+            "80",
+            "--grow-train-retired",
+        )
+    assert built.value.kwargs["train_retired"] is True
+
+
+def test_retired_networks_training_needs_grow(monkeypatch):
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, "--grow-train-retired")

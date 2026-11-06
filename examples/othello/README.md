@@ -379,7 +379,9 @@ the last `--grow-window` (10) epochs, and the next must have trained `--grow-min
 With `--grow-switch-at EPOCHS`, it takes over after fixed numbers of epochs instead. Either way,
 a playing network whose `--lr-plateau-stop` rule is done hands over rather than stopping the
 run. A waiting network trains at `--lr`, and follows `--lr-plateau` from its first rate once it
-plays. `--grow-train-steps N` has the waiting network take N training steps an epoch
+plays. `--grow-train-retired` keeps the networks that played before training on the replay buffer,
+`--train-steps` each an epoch, without playing; a resumed or branched run turns it on or off.
+`--grow-train-steps N` has the waiting network take N training steps an epoch
 rather than `--train-steps`, e.g. what its own play would afford for the same compute. With
 `--grow-manual`, nothing takes over by itself: the run logs `growth_caught_up` (1 once
 the rule would switch), saved states record it too, and the next network takes over in a branch
@@ -460,6 +462,15 @@ network against the one playing at those sims too (`size on the clock`), and the
 climbs a second ladder of its own at its clock's sims (`pNNN-clock-ladder`). Those players have
 4 tree nodes an iteration (`clock_tree_factor`): at thousands of sims, the default 2 costs
 strength. Nothing is decided on the clock's games.
+
+With `train_retired`, the networks that played before keep training on the run's games, as many
+steps as the one playing (train.py `--grow-train-retired`), and each test plays each of them
+against the one playing (`retired <size>`): whether a smaller network keeps up on a bigger one's
+games, or falls behind for want of capacity. It isn't compute-optimal (about 10% more compute,
+15% with three retired), so it's counted in the run's compute and on its own
+(`retired_seconds`), but not in the next network's steps or any decision. It isn't part of a
+saved state: changed in controller.json, it holds from the next step, and a retired network
+takes up its training where it left it.
 
 With `"window"` in the config, the replay window grows with the positions the kept line of
 states has stored per environment, n, by the replay-window task's rule: n until `c` (256), then

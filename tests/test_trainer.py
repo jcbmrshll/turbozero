@@ -3056,3 +3056,49 @@ def test_the_waiting_network_takes_its_own_training_steps(env, tmp_path, fake_lo
 def test_waiting_train_steps_need_growth(env, tmp_path):
     with pytest.raises(ValueError, match="with growth"):
         make_trainer(env, tmp_path, waiting_train_steps=2)
+
+
+def test_retired_networks_keep_training_unless_a_run_turns_it_off(
+    env, tmp_path, fake_loop
+):
+    def trainer(ckpt_dir, train_retired):
+        made, _ = growth_trainer(
+            env,
+            tmp_path / ckpt_dir,
+            SCRIPTS,
+            growth_kwargs={"manual": True},
+            train_steps_per_epoch=4,
+            waiting_train_steps=3,
+            train_retired=train_retired,
+            save_state_at=[2, 3],
+        )
+        return made, fake_loop(made)
+
+    trunk, _ = trainer("trunk", True)
+    trunk.train_loop(seed=0, num_epochs=2)
+    # n1 takes over: n0, retired, trains as many steps as n1 plays with, n2 its own
+    on, calls = trainer("on", True)
+    output = on.train_loop(
+        seed=0,
+        num_epochs=3,
+        initial_state=on.branch(str(tmp_path / "trunk"), take_over=True),
+    )
+    assert [(c.learner, c.num_steps) for c in of_kind(calls, "train")] == [
+        (0, 4),
+        (1, 4),
+        (2, 3),
+    ]
+    # the growth rule counts only playing and waiting
+    assert output.growth is not None and output.growth.trained == (2, 3, 1)
+    # a run from its state without it: only the one playing and the next train
+    off, calls = trainer("off", False)
+    off.train_loop(seed=0, num_epochs=4, initial_state=off.branch(str(tmp_path / "on")))
+    assert [(c.learner, c.num_steps) for c in of_kind(calls, "train")] == [
+        (1, 4),
+        (2, 3),
+    ]
+
+
+def test_train_retired_needs_growth(env, tmp_path):
+    with pytest.raises(ValueError, match="with growth"):
+        make_trainer(env, tmp_path, train_retired=True)

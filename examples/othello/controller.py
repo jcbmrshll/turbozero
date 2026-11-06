@@ -82,6 +82,7 @@ OWN_ARGS = (
     "--grow-guard",
     "--grow-switch-at",
     "--grow-train-steps",
+    "--grow-train-retired",
     "--average-epochs",
     "--selfplay-average",
     "--sims",
@@ -317,6 +318,12 @@ class Config:
             kept network climbs a second ladder at its own: for the record, deciding nothing
         clock_tree_factor: the equal-time players' tree nodes per iteration (league
             add-player --tree-factor): at thousands of sims, the default 2 costs strength
+        train_retired: the networks that played before keep training on the run's games, as
+            many steps as the one playing (train.py --grow-train-retired), and each test plays
+            them against the one playing: what a smaller network makes of a bigger one's
+            games, for the record. Their training counts in the run's compute (and on its own,
+            `retired_seconds`) but not in the next network's steps or any decision. Changed in
+            controller.json, it holds from the next step
     """
 
     name: str
@@ -353,6 +360,7 @@ class Config:
     ladder: list[str] | None = field(default_factory=lambda: list(EDAX_LADDER))
     clock_sims: dict[str, int] | None = field(default_factory=lambda: dict(CLOCK_SIMS))
     clock_tree_factor: int = 4
+    train_retired: bool = False
 
     def __post_init__(self):
         if not self.nets:
@@ -450,20 +458,28 @@ def epoch_compute(
     config: Config, search: Search, playing: int, costs: Costs
 ) -> dict[str, Any]:
     """An epoch's compute: the network playing (index into `config.nets`) evaluates every
-    environment's position each search cycle and takes `config.train_steps` training steps, and
-    the next (if any) takes `waiting_steps`.
+    environment's position each search cycle and takes `config.train_steps` training steps, the
+    next (if any) takes `waiting_steps`, and with `config.train_retired` each that played
+    before takes `config.train_steps`.
 
     Returns:
         dict: `seconds`, GPU time (see `Costs`); `selfplay_evals`, positions evaluated in
-            self-play; `train_samples`, by network
+            self-play; `train_samples`, by network; `retired_seconds`, the part of `seconds`
+            that trained retired networks
     """
     cycles = search.epoch_cycles()
     steps = {playing: config.train_steps}
     waiting = waiting_steps(config, search, playing, costs)
     if waiting is not None:
         steps[playing + 1] = waiting
+    retired = range(playing) if config.train_retired else range(0)
+    steps.update({i: config.train_steps for i in retired})
+
+    def train(i: int) -> float:
+        return steps[i] * costs.train_ms(config.nets[i]) / 1e3
+
     seconds = cycles * costs.cycle_ms(config.nets[playing], search) / 1e3 + sum(
-        n * costs.train_ms(config.nets[i]) / 1e3 for i, n in steps.items()
+        train(i) for i in steps
     )
     return {
         "seconds": seconds,
@@ -471,6 +487,7 @@ def epoch_compute(
         "train_samples": {
             net_name(config.nets[i]): n * config.train_batch for i, n in steps.items()
         },
+        "retired_seconds": sum(train(i) for i in retired),
     }
 
 
@@ -548,6 +565,7 @@ def scaled(compute: dict[str, Any], epochs: int) -> dict[str, Any]:
         "seconds": compute["seconds"] * epochs,
         "selfplay_evals": compute["selfplay_evals"] * epochs,
         "train_samples": {k: v * epochs for k, v in compute["train_samples"].items()},
+        "retired_seconds": compute["retired_seconds"] * epochs,
     }
 
 
@@ -560,6 +578,8 @@ def added(total: dict[str, Any], compute: dict[str, Any]) -> dict[str, Any]:
         "seconds": total.get("seconds", 0.0) + compute["seconds"],
         "selfplay_evals": total.get("selfplay_evals", 0) + compute["selfplay_evals"],
         "train_samples": samples,
+        "retired_seconds": total.get("retired_seconds", 0.0)
+        + compute["retired_seconds"],
     }
 
 
@@ -1194,6 +1214,8 @@ class Controller:
                 args += ["--engine-eval-every", "1"]
         if step["waiting_steps"] is not None:
             args += ["--grow-train-steps", str(step["waiting_steps"])]
+        if config.train_retired and len(config.nets) > 1:
+            args.append("--grow-train-retired")
         if config.average_epochs is not None:
             args += ["--average-epochs", f"{config.average_epochs:g}"]
             if config.selfplay_average:
@@ -1642,8 +1664,9 @@ class Controller:
     def test_series(self, period: int) -> dict:
         """A period's series, after its branches, the second network of each a branch's in
         `stay`: size, the next network against the one playing, both as they trained in
-        `stay`; sims, `double`'s playing network against `stay`'s; and `double`'s next network
-        against `stay`'s."""
+        `stay`; sims, `double`'s playing network against `stay`'s; and for the record,
+        `double`'s next network against `stay`'s, the size question on the clock
+        (`clock_sims`), and each retired network against the one playing (`train_retired`)."""
         steps = self.period_steps(period)
         stay, double = steps[f"p{period:03d}-stay"], steps[f"p{period:03d}-double"]
         sims = self.config.play_sims
@@ -1678,6 +1701,16 @@ class Controller:
                         "b": self.clock_player(stay, playing),
                     }
                 )
+        if self.config.train_retired:
+            # for the record: what those that played before made of its games
+            series += [
+                {
+                    "question": f"retired {net_name(self.config.nets[i])}",
+                    "a": self.network_player(stay, i, sims),
+                    "b": self.network_player(stay, playing, sims),
+                }
+                for i in range(playing)
+            ]
         return {
             "name": f"p{period:03d}-test",
             "kind": "test",

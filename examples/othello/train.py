@@ -265,6 +265,13 @@ def main():
         "networks in lockstep don't switch (default 0: at or below)",
     )
     parser.add_argument(
+        "--grow-train-retired",
+        action="store_true",
+        help="with --grow, the networks that played before the one playing keep training on "
+        "its games, --train-steps each an epoch (for the record: not compute-optimal); a "
+        "resumed or branched run can turn it on or off",
+    )
+    parser.add_argument(
         "--grow-train-steps",
         type=int,
         default=None,
@@ -810,6 +817,8 @@ def main():
         not args.grow or args.grow_train_steps < 1
     ):
         parser.error("--grow-train-steps is a positive number of steps, with --grow")
+    if args.grow_train_retired and not args.grow:
+        parser.error("--grow-train-retired is for a run with --grow")
     if any(h < 1 for h in args.average_epochs) or len(set(args.average_epochs)) != len(
         args.average_epochs
     ):
@@ -1131,6 +1140,7 @@ def main():
         lr_plateau_metric=args.lr_plateau_metric,
         growth=growth,
         waiting_train_steps=args.grow_train_steps,
+        train_retired=args.grow_train_retired,
         averages=args.average_epochs,
         selfplay_average=args.selfplay_average,
         evaluator=evaluator,

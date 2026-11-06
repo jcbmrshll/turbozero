@@ -557,6 +557,7 @@ class Trainer:
         lr_plateau_metric: str = "loss",
         growth: Growth | None = None,
         waiting_train_steps: int | None = None,
+        train_retired: bool = False,
         averages: Sequence[float] = (),
         selfplay_average: float | None = None,
         extra_config: dict | None = None,
@@ -667,6 +668,12 @@ class Trainer:
                 network that trains without playing (by default `train_steps_per_epoch`, as the
                 one playing): fewer charge its training what the run could spend on it, e.g. the
                 steps its own play would afford for the same compute
+            train_retired: (optional) with `growth`, the networks that played before the one
+                playing keep training on the replay buffer, `train_steps_per_epoch` steps an
+                epoch each, without playing: what a smaller network makes of a bigger one's
+                games (not compute-optimal). Not part of a saved state: a run or branch turns
+                it on or off from any state, and a retired network takes up its training where
+                it left it
             averages: (optional) horizons, in epochs, of averages of each network's weights
                 (as KataGo plays and rates averaged weights while training at a constant learning
                 rate): after each epoch a network trains, each of its averages moves towards its
@@ -766,6 +773,9 @@ class Trainer:
             if waiting_train_steps is not None
             else train_steps_per_epoch
         )
+        if train_retired and growth is None:
+            raise ValueError("train_retired is for a run with growth")
+        self.train_retired = train_retired
         # testing
         self.testers = testers
         if evaluator_test is None:
@@ -864,12 +874,13 @@ class Trainer:
         )
 
     def steps_of(self, learner: int, playing: int) -> int:
-        """The training steps an epoch of a network that trains: the one playing's
-        `train_steps_per_epoch`, the one waiting's `waiting_train_steps`."""
+        """The training steps an epoch of a network that trains: the one waiting's
+        `waiting_train_steps`; the one playing's, and with `train_retired` those that played
+        before, `train_steps_per_epoch`."""
         return (
-            self.train_steps_per_epoch
-            if learner == playing
-            else self.waiting_train_steps
+            self.waiting_train_steps
+            if learner == playing + 1
+            else self.train_steps_per_epoch
         )
 
     def average_dirs(self, learner: int = 0) -> tuple[str, ...]:
@@ -912,6 +923,7 @@ class Trainer:
                 if self.waiting_train_steps != self.train_steps_per_epoch
                 else {}
             ),
+            **({"train_retired": True} if self.train_retired else {}),
             "max_episode_steps": self.max_episode_steps,
             "nn": self.nn.__class__.__name__,
             "nn_params": sum(
@@ -3021,7 +3033,9 @@ class Trainer:
         def training_now() -> tuple[int, ...]:
             if growth is None or self.growth is None:
                 return (0,)
-            return self.growth.training(growth)
+            # the growth rule's (the one playing, and the next), and those retired before it
+            retired = range(growth.playing) if self.train_retired else ()
+            return (*retired, *self.growth.training(growth))
 
         def state_now() -> TrainLoopOutput:
             return TrainLoopOutput(
