@@ -2367,6 +2367,12 @@ def test_growth_hands_self_play_to_the_next_network(env, tmp_path, fake_loop, ca
         assert logged[e]["train_seconds"] == pytest.approx(
             sum(logged[e][f"{n}/train_seconds"] for n in names)
         )
+        # in network evaluations: STEPS one-cycle moves in 2 environments; 1 step of 4 samples
+        # for each network that trains
+        assert logged[e]["selfplay_evals"] == STEPS * 2
+        assert logged[e][f"{names[0]}/selfplay_evals"] == STEPS * 2
+        assert logged[e]["train_samples"] == 2 * 4
+        assert all(logged[e][f"{n}/train_samples"] == 4 for n in names)
     assert logged[8]["run_seconds"] >= logged[3]["run_seconds"]
     undescribed = {
         name
@@ -2496,3 +2502,173 @@ def test_a_real_growth_run_trains_each_network(env, tmp_path):
             trainer.load_train_state_from_checkpoint(d, last, i),
             output.train_states[i],
         )
+
+
+# branches: a saved run going on in another directory, with other self-play settings
+
+
+def test_a_branch_with_the_runs_own_settings_carries_on_exactly(
+    env, tmp_path, fake_loop
+):
+    straight, _ = growth_trainer(env, tmp_path / "straight", SCRIPTS)
+    straight_calls = fake_loop(straight)
+    expected = straight.train_loop(seed=0, num_epochs=9)
+    trunk, _ = growth_trainer(env, tmp_path / "trunk", SCRIPTS, save_state_at=[4])
+    fake_loop(trunk)
+    trunk.train_loop(seed=0, num_epochs=4)
+
+    monitor = FakeMonitor()
+    branch, _ = growth_trainer(env, tmp_path / "branch", SCRIPTS, monitor=monitor)
+    calls = fake_loop(branch)
+    # the seed is the run's rng's, whatever is passed
+    output = branch.train_loop(
+        seed=1, num_epochs=9, initial_state=branch.branch(str(tmp_path / "trunk"))
+    )
+
+    # the run goes on as if it hadn't stopped: the same switch, networks and keys
+    assert output.growth == expected.growth
+    assert leaves_equal(output.train_states, expected.train_states)
+    assert len(calls) == 15
+    for call, straight_call in zip(calls, straight_calls[-15:], strict=True):
+        assert call.kind == straight_call.kind
+        np.testing.assert_array_equal(call.key, straight_call.key)
+    # in its own directory and monitor run, which records where it branched from
+    assert [checkpoint_epochs(d) for d in branch.ckpt_dirs] == [
+        [4, 5],
+        [4, 5, 6, 7, 8],
+        [6, 7, 8],
+    ]
+    assert checkpoint_epochs(str(tmp_path / "trunk" / "n0")) == [0, 1, 2, 3]
+    assert monitor.started[0]["parent"] == {
+        "path": os.path.abspath(state_path(str(tmp_path / "trunk"), 4)),
+        "epoch": 4,
+        "branch": True,
+        "take_over": False,
+        "monitor_run": None,
+        "parent": None,
+    }
+
+
+def saved_mid_move(trainer):
+    """Saves a state of `trainer`'s run after 2 epochs, with 6 entries in its replay buffer and
+    every environment's move one search cycle in. Returns its path."""
+    state = trainer.init_collection_state(jax.random.PRNGKey(0), trainer.batch_size)
+    state = replace(
+        state,
+        buffer_state=written(state.buffer_state, 6),
+        moves=jnp.full_like(state.moves, 6),
+        search_cycles=jnp.ones_like(state.search_cycles),
+    )
+    return trainer.save_state(
+        TrainLoopOutput(
+            collection_state=state,
+            train_states=(trained_state(trainer),),
+            test_states=([],),
+            cur_epoch=2,
+            key=jax.random.PRNGKey(5),
+        )
+    )
+
+
+@pytest.mark.parametrize("bigger", [False, True])
+def test_a_branch_keeps_the_search_states_only_if_they_fit_its_search(
+    env, tmp_path, fake_loop, bigger, capsys
+):
+    small, big = tiny_mcts(env, 2, 4), tiny_mcts(env, 6, 8)
+    path = saved_mid_move(make_trainer(env, tmp_path / "trunk", evaluator=small))
+    search = big if bigger else small
+    branch = make_trainer(env, tmp_path / "branch", evaluator=search)
+    calls = fake_loop(branch)
+
+    start = branch.branch(path)
+
+    # a bigger search starts new trees, its moves in progress searched again from the start
+    assert capacity(start.collection_state) == (8 if bigger else 4)
+    np.testing.assert_array_equal(
+        start.collection_state.search_cycles, np.full(2, 0 if bigger else 1)
+    )
+    assert ("new search states" in capsys.readouterr().out) == bigger
+    # the rest of the run as it was saved
+    assert start.cur_epoch == 2
+    assert int(start.collection_state.moves[0]) == 6
+    np.testing.assert_array_equal(
+        start.collection_state.buffer_state.populated[:, :6], True
+    )
+    assert leaves_equal(start.train_states, (trained_state(branch),))
+    branch.train_loop(seed=0, num_epochs=4, initial_state=start)
+    # epochs 2 and 3 with its own search, no warmup
+    assert [c.evaluator for c in of_kind(calls, "collect")] == [search] * 2
+    assert [t.epoch for t in of_kind(calls, "train")] == [2, 3]
+    assert checkpoint_epochs(str(tmp_path / "branch")) == [2, 3]
+
+
+def test_a_manual_rule_reports_and_a_branch_hands_self_play_over(
+    env, tmp_path, fake_loop, capsys
+):
+    monitor = FakeMonitor()
+    trunk, _ = growth_trainer(
+        env,
+        tmp_path / "trunk",
+        SCRIPTS,
+        growth_kwargs={"manual": True},
+        save_state_at=[6],
+        monitor=monitor,
+    )
+    trunk_calls = fake_loop(trunk)
+    trunk.train_loop(seed=0, num_epochs=6)
+
+    # nothing takes over by itself; the rule reports n1 caught up after epoch 5
+    assert {c.evaluator.tag for c in of_kind(trunk_calls, "collect")} == {0.0}
+    assert logged(monitor, "growth_caught_up") == {1: 0, 2: 0, 3: 0, 4: 0, 5: 1}
+    assert not logged(monitor, "growth_switch")
+
+    branch, _ = growth_trainer(
+        env, tmp_path / "branch", SCRIPTS, growth_kwargs={"manual": True}
+    )
+    calls = fake_loop(branch)
+    output = branch.train_loop(
+        seed=0,
+        num_epochs=9,
+        initial_state=branch.branch(str(tmp_path / "trunk"), take_over=True),
+    )
+
+    # n1 plays from the branch's first epoch, and n2 trains beside it
+    assert [c.evaluator.tag for c in of_kind(calls, "collect")] == [1.0] * 3
+    assert [(c.epoch, c.learner) for c in of_kind(calls, "train")] == [
+        (e, i) for e in (6, 7, 8) for i in (1, 2)
+    ]
+    assert output.growth is not None
+    assert (output.growth.playing, output.growth.trained) == (1, (6, 9, 3))
+    # its search starts anew, as when the next takes over in a run: the trees are n0's
+    assert "n1 playing, new search states" in capsys.readouterr().out
+
+
+def test_a_branch_must_fit_the_saved_run(env, tmp_path, fake_loop):
+    trunk = make_trainer(env, tmp_path / "trunk", save_state_at=[1])
+    fake_loop(trunk)
+    trunk.train_loop(seed=0, num_epochs=1)
+    path = str(tmp_path / "trunk")
+
+    with pytest.raises(
+        ValueError, match="replay buffer capacity of 8, this run's is 16"
+    ):
+        make_trainer(
+            env, tmp_path / "b1", memory_buffer=EpisodeReplayBuffer(capacity=16)
+        ).branch(path)
+    with pytest.raises(ValueError, match="only a run with growth"):
+        make_trainer(env, tmp_path / "b2").branch(path, take_over=True)
+    grown, _ = growth_trainer(env, tmp_path / "b3", SCRIPTS)
+    with pytest.raises(ValueError, match="saved by a run without growth"):
+        grown.branch(path)
+    # the last network has none to hand over to
+    last, _ = growth_trainer(
+        env,
+        tmp_path / "b4",
+        SCRIPTS,
+        growth_kwargs={"switch_at": (1, 2)},
+        save_state_at=[3],
+    )
+    fake_loop(last)
+    last.train_loop(seed=0, num_epochs=3)
+    with pytest.raises(ValueError, match="n2 is the last network"):
+        last.branch(str(tmp_path / "b4"), take_over=True)

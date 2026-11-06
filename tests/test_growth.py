@@ -46,6 +46,7 @@ def run(rule, values_by_epoch, rule_done=()):
         ({"switch_at": (5,)}, "one increasing"),
         ({"switch_at": (5, 5)}, "one increasing"),
         ({"switch_at": (0, 5)}, "one increasing"),
+        ({"switch_at": (2, 5), "manual": True}, "pass one"),
     ],
 )
 def test_bad_settings_are_errors(kwargs, match):
@@ -107,3 +108,34 @@ def test_the_playing_networks_rule_being_done_hands_over():
     assert [c.switched for c in checks] == [False, False, True, False]
     # once the last plays, its rule being done hands over to nothing (the run stops)
     assert not run(rule, [{0: 0.0, 1: 1.0}, {1: 1.0}], rule_done={0, 1})[1].switched
+
+
+def test_a_manual_rule_reports_the_catch_up_and_never_switches():
+    rule = growth(window=1, min_epochs=2, manual=True)
+    # b is better from the first epoch, and a's learning rate rule is done after the third
+    checks = run(rule, [{0: 1.0, 1: 0.0}] * 4, rule_done={2})
+    assert [c.switched for c in checks] == [False] * 4
+    # caught up once b has trained its minimum epochs
+    assert [c.caught_up for c in checks] == [False, True, True, True]
+    assert all(c.progress.playing == 0 for c in checks)
+
+
+def test_caught_up_needs_a_full_window_and_no_worse_mean():
+    rule = growth(window=2, min_epochs=1)
+    assert not rule.caught_up(GrowthProgress(0, (2, 2, 0), ((1.0,), (0.0,), ())))
+    assert rule.caught_up(GrowthProgress(0, (2, 2, 0), ((1.0, 1.0), (1.0, 1.0), ())))
+    assert not rule.caught_up(
+        GrowthProgress(0, (2, 2, 0), ((1.0, 1.0), (1.0, 1.5), ()))
+    )
+    # the last plays: nothing to catch up
+    assert rule.gap(GrowthProgress(2, (2, 2, 2), ((1.0,), (1.0,), (1.0, 1.0)))) is None
+
+
+def test_take_over_hands_self_play_to_the_next_until_the_last():
+    rule = growth()
+    progress = GrowthProgress(0, (3, 3, 0), ((1.0,), (0.5,), ()))
+    taken = rule.take_over(progress)
+    assert taken == GrowthProgress(1, (3, 3, 0), ((1.0,), (0.5,), ()))
+    assert rule.training(taken) == (1, 2)
+    with pytest.raises(ValueError, match="c is the last network"):
+        rule.take_over(rule.take_over(taken))

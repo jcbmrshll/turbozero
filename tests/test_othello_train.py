@@ -265,8 +265,35 @@ def test_bad_playout_cap_options_are_refused(monkeypatch, options):
         ("--grow", "resnet:2x8", "--grow-switch-at", "80,90"),
         # the same size twice
         ("--grow", "resnet:1x4,heads=pooled", "--grow-switch-at", "80"),
+        # a manual rule without --grow, or with fixed epochs
+        ("--grow-manual",),
+        ("--grow", "resnet:2x8", "--grow-manual", "--grow-switch-at", "80"),
+        # taking over needs a branch of a run with growth
+        ("--grow", "resnet:2x8", "--grow-switch-at", "80", "--take-over"),
+        ("--branch-from", "runs/trunk", "--take-over"),
+        # a branch continues a run: it isn't also a fork or a resumed run
+        ("--branch-from", "runs/trunk", "--resume", "--ckpt-dir", "runs/b"),
+        ("--branch-from", "runs/trunk", "--init-from", "runs/trunk"),
     ],
 )
 def test_bad_grow_options_are_refused(monkeypatch, options):
     with pytest.raises(SystemExit):
         run_main(monkeypatch, *options)
+
+
+def test_a_manual_rule_reaches_growth(monkeypatch, tmp_path):
+    from test_engine_set import tiny_set
+
+    tiny_set(np.random.default_rng(0)).save(tmp_path / "set.npz")
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(
+            monkeypatch,
+            "--grow",
+            "resnet:2x8",
+            "--grow-manual",
+            "--engine-eval-every",
+            "1",
+            "--engine-set",
+            str(tmp_path / "set.npz"),
+        )
+    assert built.value.kwargs["growth"].manual

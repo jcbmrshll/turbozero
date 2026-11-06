@@ -2,7 +2,7 @@
 self-play over to bigger ones in turn (see `Growth`), as KataGo and Leela Zero grew theirs."""
 
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import equinox as eqx
 import jax
@@ -68,11 +68,14 @@ class SwitchCheck:
         switched: whether self-play moves to the next learner from the next epoch
         gap: the next learner's mean metric over the window minus the playing one's (negative
             once the next is better), None until both have a full window
+        caught_up: whether the next learner has caught up: trained its minimum epochs, with a
+            gap at or below 0 (what the rule switches on, and all a `manual` rule reports)
     """
 
     progress: GrowthProgress
     switched: bool
     gap: float | None
+    caught_up: bool = False
 
 
 @dataclass(frozen=True)
@@ -94,6 +97,10 @@ class Growth:
     A network that waits trains at the learning rate's first value (an `lr_plateau` rule only
     moves the playing network's), and follows the rule from its first rate once it plays.
 
+    With `manual`, nothing switches by itself: the rule only reports when the next has caught up
+    (`SwitchCheck.caught_up`), and the next takes over when a saved state of the run is branched
+    with `take_over` (see `Trainer.branch`), e.g. by a controller that first plays the two.
+
     Attributes:
         first: the name of the Trainer's own network (see `Learner.name`)
         learners: the networks to grow into, in order
@@ -102,6 +109,7 @@ class Growth:
         min_epochs: epochs the next learner trains before it can take over
         switch_at: (optional) instead of the rule, the numbers of epochs done after which each
             of `learners` takes over, in increasing order, one per learner
+        manual: (optional) the rule reports, and switches only on a branch's `take_over`
     """
 
     first: str
@@ -110,6 +118,7 @@ class Growth:
     window: int = 10
     min_epochs: int = 10
     switch_at: Sequence[int] = field(default=())
+    manual: bool = False
 
     def __post_init__(self):
         object.__setattr__(self, "learners", tuple(self.learners))
@@ -134,6 +143,8 @@ class Growth:
                 f"switch_at needs one increasing, positive number of epochs per network to grow "
                 f"into ({len(self.learners)}), got {list(self.switch_at)}"
             )
+        if self.manual and self.switch_at:
+            raise ValueError("a manual rule doesn't switch at fixed epochs: pass one")
 
     @property
     def names(self) -> tuple[str, ...]:
@@ -178,28 +189,55 @@ class Growth:
             trained[i] += 1
             if i in values:
                 kept[i] = (*kept[i], float(values[i]))[-self.window :]
-        playing, following = progress.playing, progress.playing + 1
-        gap = None
-        if following <= len(self.learners) and all(
-            len(kept[i]) == self.window for i in (playing, following)
-        ):
-            gap = float(np.mean(kept[following]) - np.mean(kept[playing]))
+        after = GrowthProgress(progress.playing, tuple(trained), tuple(kept))
+        gap = self.gap(after)
+        caught_up = self.caught_up(after)
+        following = progress.playing + 1
         switched = False
-        if following <= len(self.learners):
+        if following <= len(self.learners) and not self.manual:
             if rule_done:
                 switched = True
             elif self.switch_at:
                 switched = epochs_done >= self.switch_at[following - 1]
             else:
-                switched = (
-                    trained[following] >= self.min_epochs
-                    and gap is not None
-                    and gap <= 0
-                )
-        progress = GrowthProgress(
-            playing + 1 if switched else playing, tuple(trained), tuple(kept)
+                switched = caught_up
+        if switched:
+            after = self.take_over(after)
+        return SwitchCheck(after, switched, gap, caught_up)
+
+    def gap(self, progress: GrowthProgress) -> float | None:
+        """The next learner's mean metric over the last `window` epochs minus the playing one's,
+        None if the last one plays or either hasn't a full window yet."""
+        playing, following = progress.playing, progress.playing + 1
+        if following > len(self.learners) or any(
+            len(progress.values[i]) < self.window for i in (playing, following)
+        ):
+            return None
+        return float(
+            np.mean(progress.values[following]) - np.mean(progress.values[playing])
         )
-        return SwitchCheck(progress, switched, gap)
+
+    def caught_up(self, progress: GrowthProgress) -> bool:
+        """Whether the next learner has caught up with the one playing: trained `min_epochs`,
+        its mean metric over the window at or below the playing one's."""
+        gap = self.gap(progress)
+        return (
+            gap is not None
+            and gap <= 0
+            and progress.trained[progress.playing + 1] >= self.min_epochs
+        )
+
+    def take_over(self, progress: GrowthProgress) -> GrowthProgress:
+        """The progress once the next learner plays (and the one after starts training).
+
+        Raises:
+            ValueError: if the last learner already plays
+        """
+        if progress.playing + 1 > len(self.learners):
+            raise ValueError(
+                f"{self.names[progress.playing]} is the last network: none takes over from it"
+            )
+        return replace(progress, playing=progress.playing + 1)
 
     def get_config(self) -> dict:
         return {
@@ -224,4 +262,5 @@ class Growth:
             "window": self.window,
             "min_epochs": self.min_epochs,
             "switch_at": list(self.switch_at) or None,
+            "manual": self.manual,
         }

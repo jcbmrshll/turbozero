@@ -1922,6 +1922,177 @@ class Trainer:
         print(f"resuming from {path}: {state.cur_epoch} epochs done", flush=True)
         return state
 
+    def branch(self, path: str, take_over: bool = False) -> TrainLoopOutput:
+        """Loads a saved state (or the newest in a directory) to continue its run in this
+        trainer's `ckpt_dir`, with this trainer's self-play: a branch of the run, e.g. searching
+        more, or with the next network taking over. Pass it to `train_loop` as its
+        `initial_state`.
+
+        The run goes on from where it was saved, as with `resume`: its epochs, every network
+        and its optimizer state, the learning rate rule's and growth's progress, the replay
+        buffers, the games in progress, the testers' states and the rng. Its self-play search's
+        states (e.g. its trees) are kept if the same network plays and they fit this trainer's
+        search, so a branch with the run's own settings continues it exactly; otherwise they
+        start anew, and the moves in progress are searched again from the start (as when a
+        schedule switches searches, or the next network takes over, see `follow_schedule`).
+
+        Branches of one state are compared at equal compute, so each is the run going on,
+        rather than a fork (see `train_loop`'s `fork_from`), which starts a new run. The
+        number of environments and replay buffer capacities must be the run's. A branch logs to
+        a monitor run of its own, whose config records the state as its parent, and leaves the
+        saved run's directory as it is.
+
+        Args:
+            path: the saved state (see `save_state`), or a directory to take the newest from
+            take_over: (with `growth`) the next network plays from the branch's first epoch, and
+                the one after it starts training
+
+        Returns:
+            TrainLoopOutput: the run's state, to continue with `train_loop`'s `initial_state`
+
+        Raises:
+            ValueError: if the saved state doesn't fit this trainer, or nothing can take over
+        """
+        path = latest_state_path(path)
+        with np.load(path) as saved:
+            meta = self._check_meta(path, json.loads(str(saved["meta"])))
+            self._check_sizes(path, meta, resizable=False)
+            epoch = meta["epoch"]
+            if (meta["growth"] is None) != (self.growth is None):
+                raise ValueError(
+                    f"{path} was saved by a run {'without' if meta['growth'] is None else 'with'} "
+                    "growth: a branch of it needs the same"
+                )
+            growth = None
+            if self.growth is not None:
+                growth = GrowthProgress(
+                    meta["growth"]["playing"],
+                    tuple(meta["growth"]["trained"]),
+                    tuple(tuple(v) for v in meta["growth"]["values"]),
+                )
+                if take_over:
+                    growth = self.growth.take_over(growth)
+            elif take_over:
+                raise ValueError("only a run with growth has a network to take over")
+            playing = growth.playing if growth is not None else 0
+            # the search whose states the branch starts with (see `train_loop`'s initial_state)
+            evaluator = self.learners[playing].schedule.at(max(epoch - 1, 0))
+            train_templates = tuple(
+                jax.eval_shape(partial(self.init_train_state, i))
+                for i in range(len(self.learners))
+            )
+            train_states = self._load_part(saved, meta, "train_states", train_templates)
+            collection_state, kept_search = self._branch_collection_state(
+                saved, meta, evaluator, keep_search=not take_over
+            )
+            test_states = self._load_part(
+                saved,
+                meta,
+                "test_states",
+                self.test_state_templates(train_templates),
+            )
+            key = _to_device(saved["key"])
+        lr_plateau: tuple[LRPlateauProgress | None, ...] = ()
+        if self.lr_plateau is not None:
+            if not meta["lr_plateau"]:
+                raise ValueError(
+                    f"{path} was saved by a run without lr_plateau: fork a run from it instead"
+                )
+            progress = [
+                LRPlateauProgress(p["epochs"], tuple(p["losses"]))
+                if p is not None
+                else None
+                for p in meta["lr_plateau"]
+            ]
+            if take_over:
+                # its own rule starts, at the rate it has trained at (as when the rule switches)
+                progress[playing] = LRPlateauProgress()
+            lr_plateau = tuple(progress)
+        self.parent = {
+            "path": os.path.abspath(path),
+            "epoch": epoch,
+            "branch": True,
+            "take_over": take_over,
+            "monitor_run": meta["monitor_run"],
+            "parent": meta["parent"],
+        }
+        whose = f", {self.learners[playing].name} playing" if take_over else ""
+        search = "its search's states kept" if kept_search else "new search states"
+        print(
+            f"branching from {path}: {epoch} epochs done{whose}, {search}", flush=True
+        )
+        return TrainLoopOutput(
+            collection_state=collection_state,
+            train_states=train_states,
+            test_states=test_states,
+            cur_epoch=epoch,
+            key=key,
+            lr_plateau=lr_plateau,
+            growth=growth,
+            seconds=meta["seconds"],
+        )
+
+    def _branch_collection_state(
+        self, saved: Any, meta: dict, evaluator: Evaluator, keep_search: bool = True
+    ) -> tuple[CollectionState, bool]:
+        """A saved collection state, for `evaluator`: with `keep_search`, the saved search states
+        if they have its states' shapes, else new ones, with the moves in progress searched
+        again (see `branch`). Returns it, and whether the saved search states were kept."""
+        template = jax.eval_shape(
+            lambda: self.init_collection_state(
+                jax.random.PRNGKey(0), self.batch_size, evaluator
+            )
+        )
+        expected = _describe(template)
+        described = [
+            (leaf_path, tuple(shape), dtype)
+            for leaf_path, shape, dtype in meta["leaves"]["collection_state"]
+        ]
+        index = {leaf_path: i for i, (leaf_path, _, _) in enumerate(described)}
+
+        def searching(leaf_path: str) -> bool:
+            return leaf_path.startswith(".eval_state")
+
+        keep = keep_search and [d for d in described if searching(d[0])] == [
+            e for e in expected if searching(e[0])
+        ]
+        mismatched = [
+            f"  {leaf_path}: saved "
+            + (
+                f"{described[index[leaf_path]][1]} {described[index[leaf_path]][2]}"
+                if leaf_path in index
+                else "nothing"
+            )
+            + f", this run's {shape} {dtype}"
+            for leaf_path, shape, dtype in expected
+            if not searching(leaf_path)
+            and (
+                leaf_path not in index
+                or described[index[leaf_path]] != (leaf_path, shape, dtype)
+            )
+        ]
+        if mismatched:
+            raise ValueError(
+                "the saved collection state doesn't match this run's:\n"
+                + "\n".join(mismatched[:8])
+            )
+        fresh = (
+            None
+            if keep
+            else iter(jax.tree.leaves(self.init_eval_state(evaluator, self.batch_size)))
+        )
+        leaves = [
+            _to_device(saved[f"collection_state.{index[leaf_path]}"])
+            if keep or not searching(leaf_path)
+            else next(fresh)  # pyright: ignore[reportArgumentType]
+            for leaf_path, _, _ in expected
+        ]
+        state = jax.tree.unflatten(jax.tree.structure(template), leaves)
+        if not keep:
+            # the moves in progress start their searches again
+            state = replace(state, search_cycles=jnp.zeros_like(state.search_cycles))
+        return state, keep
+
     def fork_state(
         self, path: str, key: jax.Array, replay_buffers: bool = True
     ) -> tuple[CollectionState, TrainState]:
@@ -2769,6 +2940,7 @@ class Trainer:
                 growth_metrics: dict = {"growth_playing": playing}
                 if check.gap is not None:
                     growth_metrics["growth_gap"] = check.gap
+                    growth_metrics["growth_caught_up"] = int(check.caught_up)
                 if check.switched:
                     growth_metrics["growth_switch"] = growth.playing
                     taking_over = self.learners[growth.playing].name
@@ -2794,20 +2966,26 @@ class Trainer:
             self.set_activity(f"epoch {cur_epoch}: saving checkpoint")
             for i in training:
                 self.save_checkpoint(train_states[i], cur_epoch, i)
-            # the epoch's compute: self-play, and each network's training and tests
+            # the epoch's compute: self-play, and each network's training and tests, in wall time
+            # and in network evaluations (under vmap every environment pays every cycle)
+            train_samples = self.train_steps_per_epoch * self.train_batch_size
             timing = {
                 "selfplay_seconds": selfplay_seconds,
                 "train_seconds": sum(train_seconds.values()),
                 "test_seconds": sum(test_seconds.values()),
                 "epoch_seconds": time.perf_counter() - epoch_started,
                 "run_seconds": seconds + time.perf_counter() - started,
+                "selfplay_evals": cycles,
+                "train_samples": train_samples * len(training),
             }
             if self.growth is not None:
                 for i in training:
                     name = self.learners[i].name
                     timing[f"{name}/train_seconds"] = train_seconds[i]
+                    timing[f"{name}/train_samples"] = train_samples
                     if i in test_seconds:
                         timing[f"{name}/test_seconds"] = test_seconds[i]
+                timing[f"{self.learners[playing].name}/selfplay_evals"] = cycles
             self.log_metrics(timing, cur_epoch)
             # next epoch
             cur_epoch += 1

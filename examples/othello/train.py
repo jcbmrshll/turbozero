@@ -274,6 +274,13 @@ def main():
         help="with --grow, instead of --grow-metric's rule, the numbers of epochs done after "
         "which each network takes over, e.g. 80 (one per --grow)",
     )
+    parser.add_argument(
+        "--grow-manual",
+        action="store_true",
+        help="with --grow, nothing takes over by itself: the rule only logs when the next "
+        "network has caught up (growth_caught_up), and it takes over in a branch of the run "
+        "with --take-over (see controller.py)",
+    )
     sims = parser.add_mutually_exclusive_group()
     sims.add_argument(
         "--sims", type=int, default=128, help="MCTS iterations per self-play move"
@@ -718,6 +725,21 @@ def main():
         help="continue the run in --ckpt-dir from its newest saved state, exactly as if it "
         "hadn't stopped; pass the run's own arguments",
     )
+    init.add_argument(
+        "--branch-from",
+        default=None,
+        metavar="PATH",
+        help="continue a run from a saved state (state-<EPOCH>.npz, or a directory to take the "
+        "newest from) in a new --ckpt-dir, with these arguments' self-play, e.g. other --sims: "
+        "the run goes on at its epoch, with its networks, optimizers, buffers, games and rng; "
+        "only the moves in progress are searched again if the search changed. --epochs counts "
+        "the run's epochs before the branch too (see Trainer.branch and controller.py)",
+    )
+    parser.add_argument(
+        "--take-over",
+        action="store_true",
+        help="with --branch-from and --grow, the next network plays from the branch's first epoch",
+    )
     parser.add_argument("--name", default=None, help="the run's name on the server")
     parser.add_argument(
         "--notes",
@@ -804,18 +826,24 @@ def main():
 
     if not args.grow and (
         args.grow_switch_at is not None
+        or args.grow_manual
         or any(
             getattr(args, k) != parser.get_default(k)
             for k in ("grow_metric", "grow_window", "grow_min_epochs")
         )
     ):
         parser.error(
-            "--grow-metric, --grow-window, --grow-min-epochs and --grow-switch-at go with --grow"
+            "--grow-metric, --grow-window, --grow-min-epochs, --grow-switch-at and "
+            "--grow-manual go with --grow"
         )
+    if args.grow_manual and args.grow_switch_at is not None:
+        parser.error("--grow-manual and --grow-switch-at are different rules: pass one")
     if args.grow and args.grow_switch_at is None and args.engine_eval_every != 1:
         parser.error(
             f"--grow's rule needs {args.grow_metric} every epoch: --engine-eval-every 1"
         )
+    if args.take_over and (args.branch_from is None or not args.grow):
+        parser.error("--take-over goes with --branch-from and --grow")
 
     # self-play starts games from XOT openings (see xot.py) for varied, balanced
     # games
@@ -993,6 +1021,7 @@ def main():
                 window=args.grow_window,
                 min_epochs=args.grow_min_epochs,
                 switch_at=args.grow_switch_at or (),
+                manual=args.grow_manual,
             )
         except ValueError as e:
             parser.error(f"--grow: {e}")
@@ -1061,22 +1090,38 @@ def main():
         else None,
         save_state_at=args.save_state_at,
         save_state_every=args.save_state_every,
-        # every argument but how the run starts (a fork records its parent)
+        # every argument but how the run starts (a fork or branch records its parent)
         extra_config={
             "args": {
                 k: v.get_config() if isinstance(v, PlayoutCap) else v
                 for k, v in vars(args).items()
-                if k not in ("resume", "init_from", "init_without_buffers", "notes")
+                if k
+                not in (
+                    "resume",
+                    "init_from",
+                    "init_without_buffers",
+                    "branch_from",
+                    "take_over",
+                    "notes",
+                )
             }
         },
     )
+    initial_state = None
+    if args.resume:
+        initial_state = trainer.resume()
+    elif args.branch_from is not None:
+        try:
+            initial_state = trainer.branch(args.branch_from, take_over=args.take_over)
+        except ValueError as e:
+            parser.error(f"--branch-from: {e}")
     trainer.train_loop(
         seed=args.seed,
         num_epochs=args.epochs,
         # each tester keeps its own cadence (--eval-every, --engine-eval-every,
         # --vs-engine-every and --vs-engine-last)
         eval_every=1,
-        initial_state=trainer.resume() if args.resume else None,
+        initial_state=initial_state,
         fork_from=args.init_from,
         fork_replay_buffers=not args.init_without_buffers,
     )
