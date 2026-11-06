@@ -40,6 +40,7 @@
   "tree_buffer_samples": {"description": "Search tree positions in the replay buffer that training can sample."},
   "moves": {"description": "Self-play moves played this epoch, in all environments."},
   "episodes": {"description": "Self-play games that ended this epoch."},
+  "buffer_capacity": {"description": "The replay buffer's capacity, positions per self-play environment: the replay window training samples from."},
   "buffer_samples": {"description": "Experiences in the replay buffer that training can sample."},
   "buffer_distinct_positions": {"description": "Distinct observations among the replay buffer's experiences, those a data transform maps to one another (e.g. a board and its rotations) counting as one."},
   "buffer_distinct_fraction": {"description": "buffer_distinct_positions / buffer_samples. A fall means self-play is collapsing into the same few games."},

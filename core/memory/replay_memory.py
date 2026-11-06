@@ -86,10 +86,19 @@ class ReplayBufferState:
     has_reward: jax.Array
 
 
+def buffer_capacity(state: ReplayBufferState) -> int:
+    """The capacity of a replay buffer state: its entries per environment."""
+    return state.populated.shape[-1]
+
+
 class EpisodeReplayBuffer:
     """Replay buffer, stores trajectories from episodes for training.
 
     Compatible with `jax.jit` and `jax.vmap`.
+
+    `capacity` is that of the states `init` makes. Every other method takes the capacity of the
+    state it's given (see `buffer_capacity`), so it works on a state of any capacity, e.g. one
+    `resized` to another.
     """
 
     def __init__(
@@ -126,16 +135,15 @@ class EpisodeReplayBuffer:
         Returns:
             ReplayBufferState: updated replay buffer state
         """
+        capacity = buffer_capacity(state)
         # an out-of-bounds write is dropped
-        index = jnp.where(valid, state.next_idx, self.capacity)
+        index = jnp.where(valid, state.next_idx, capacity)
         return replace(
             state,
             buffer=jax.tree_util.tree_map(
                 lambda x, y: x.at[index].set(y, mode="drop"), state.buffer, experience
             ),
-            next_idx=jnp.where(
-                valid, (state.next_idx + 1) % self.capacity, state.next_idx
-            ),
+            next_idx=jnp.where(valid, (state.next_idx + 1) % capacity, state.next_idx),
             populated=state.populated.at[index].set(True, mode="drop"),
             has_reward=state.has_reward.at[index].set(False, mode="drop"),
         )
@@ -158,7 +166,7 @@ class EpisodeReplayBuffer:
             ReplayBufferState: updated replay buffer state
         """
         index = self.write_indices(state, valid)
-        next_idx = (state.next_idx + valid.sum()) % self.capacity
+        next_idx = (state.next_idx + valid.sum()) % buffer_capacity(state)
         return replace(
             state,
             buffer=jax.tree_util.tree_map(
@@ -178,14 +186,13 @@ class EpisodeReplayBuffer:
             valid: which experiences are added
 
         Returns:
-            jax.Array: each experience's index in the buffer; `capacity` (out of bounds) for those
-                not added
+            jax.Array: each experience's index in the buffer; the buffer's capacity (out of
+                bounds) for those not added
         """
+        capacity = buffer_capacity(state)
         # the i-th valid experience goes i places after `next_idx`
         offsets = jnp.cumsum(valid) - 1
-        return jnp.where(
-            valid, (state.next_idx + offsets) % self.capacity, self.capacity
-        )
+        return jnp.where(valid, (state.next_idx + offsets) % capacity, capacity)
 
     def assign_rewards(
         self, state: ReplayBufferState, reward: jax.Array
@@ -240,15 +247,16 @@ class EpisodeReplayBuffer:
         self, state: ReplayBufferState, *entry_data: np.ndarray
     ) -> tuple[ReplayBufferState, list[np.ndarray]]:
         """Copies a replay buffer state of any capacity, held in numpy arrays (e.g. loaded from a
-        file), into one of this buffer's capacity, on the host.
+        file, or copied from the device), into one of this buffer's capacity, on the host.
 
         Each environment keeps its newest entries, as many as fit, oldest first, so the next
         entry written overwrites the oldest. With more capacity than `state`, the oldest places
-        are left empty.
+        are left empty. An episode in progress carries on: its entries are the newest, so they're
+        kept (unless it has more than fit, when it keeps its newest), and its reward is assigned
+        to them when it ends, or `truncate` discards them.
 
         Args:
-            state: replay buffer state, with a batch dimension in front of the capacity
-                dimension, and no episode in progress (see `truncate`)
+            state: replay buffer state, with a batch dimension in front of the capacity dimension
             entry_data: (optional) more arrays with an entry per place in the buffer, shaped
                 (batch size, capacity, ...), to copy along with it (e.g. `Trainer`'s
                 `tree_written_at`)
@@ -258,11 +266,7 @@ class EpisodeReplayBuffer:
                 resized alike
         """
         next_idx = np.asarray(state.next_idx)
-        if not np.array_equal(next_idx, state.episode_start_idx):
-            raise ValueError(
-                "can't resize a replay buffer with an episode in progress; truncate it first"
-            )
-        old_capacity = state.populated.shape[1]
+        old_capacity = buffer_capacity(state)
         # place j holds the entry of age capacity - 1 - j, so the next one goes to place 0
         age = self.capacity - 1 - np.arange(self.capacity)
         source = (next_idx[:, None] - 1 - age) % old_capacity
@@ -272,12 +276,19 @@ class EpisodeReplayBuffer:
             x = np.asarray(x)
             index = source.reshape(source.shape + (1,) * (x.ndim - 2))
             mask = kept.reshape(index.shape)
-            return np.where(mask, np.take_along_axis(x, index, axis=1), empty)
+            copied = np.where(mask, np.take_along_axis(x, index, axis=1), empty)
+            return copied.astype(x.dtype, copy=False)
 
+        # the episode in progress: the newest entries, those without a reward yet
+        in_progress = np.sum(
+            np.asarray(state.populated) & ~np.asarray(state.has_reward), axis=1
+        )
         resized = replace(
             state,
             next_idx=np.zeros_like(next_idx),
-            episode_start_idx=np.zeros_like(next_idx),
+            episode_start_idx=(
+                -np.minimum(in_progress, self.capacity) % self.capacity
+            ).astype(next_idx.dtype),
             buffer=jax.tree.map(copy, state.buffer),
             populated=copy(state.populated, False),
             has_reward=copy(state.has_reward, True),
