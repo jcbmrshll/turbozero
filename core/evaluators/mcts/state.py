@@ -50,11 +50,14 @@ class MCTSTree(Tree[MCTSNode]):
         root_value: () the network's value of the root
         root_noise: (F) the noise the root's prior takes (e.g. AlphaZero's Dirichlet noise), drawn
             when the search starts (see `MCTS.start_search`)
+        fast: () with a `PlayoutCap`, whether the search is a fast one, drawn when it starts (see
+            `MCTS.start_search`); False without
     """
 
     root_logits: jax.Array
     root_value: jax.Array
     root_noise: jax.Array
+    fast: jax.Array
 
 
 def init_mcts_tree(
@@ -70,6 +73,7 @@ def init_mcts_tree(
         root_logits=jnp.zeros((branching_factor,), dtype=jnp.float32),
         root_value=jnp.array(0.0, dtype=jnp.float32),
         root_noise=jnp.zeros((branching_factor,), dtype=jnp.float32),
+        fast=jnp.array(False),
     )
 
 

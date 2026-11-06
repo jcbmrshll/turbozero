@@ -81,6 +81,18 @@ the replay buffer faster. `--min-iterations` sets the fewest a search takes, and
 `--advance-every` how often finished searches play their moves (5 cycles by default with
 `--count-reused-visits`; a search done in between goes on until then).
 
+`--playout-cap P:FAST` is KataGo's playout cap randomization: each move is searched with
+`--sims` iterations with probability P, and otherwise with FAST, without the root's noise.
+Only the full searches' positions are stored for training; the fast ones are played, and
+count towards their game's outcome. At the same compute, that plays more moves and so more
+games (KataGo: P 0.25, 600 and 100 playouts). `--selfplay-cycles` holds an epoch's
+self-play compute fixed across settings, in cycles per environment (by default 128 full
+searches, 128 × (`--sims` + 1)); size `--buffer` by the share of moves stored, for the
+same span of self-play, and pass a small `--advance-every` whose multiples the searches'
+cycles (iterations + 1) are, so that no search waits for its move to be played. For
+example, 25% of moves at 127 iterations and 75% at 43, at the compute of uniform 64:
+`--sims 127 --playout-cap 0.25:43 --selfplay-cycles 8320 --advance-every 4 --buffer 281`.
+
 By default every search starts from the subtree of the move played that the last search
 explored, and adds `--sims` iterations to its visits. `--no-persist-tree` starts each from
 an empty tree instead: an ablation of that reuse (a target then comes from `--sims` visits
@@ -330,6 +342,38 @@ its own `--lr`: to carry on at 1e-4, fork with `--lr 1e-4 --lr-plateau 1e-5`.
 
 ```
 uv run examples/othello/train.py --epochs 600 --lr-plateau --save-state-every 10 --ckpt-dir runs/plateau
+```
+
+### Growing the network
+
+Self-play costs far more than training. KataGo started with small nets and trained the next
+size up on the same games, switching when it caught up. `--grow NET` (repeat it for several,
+smallest first) does the same: `--net` plays self-play, and the next network trains on the same
+replay buffer each epoch without playing. When it takes over, the one before stops, and the
+one after that, if any, starts training from scratch on the buffer as it is. So two networks
+train at a time.
+
+The next network takes over when its `--grow-metric` on the engine-labelled set
+(`engine_value_mse`, scored every epoch) is at or below the playing one's. Each is averaged over
+the last `--grow-window` (10) epochs, and the next must have trained `--grow-min-epochs` (10) first.
+With `--grow-switch-at EPOCHS`, it takes over after fixed numbers of epochs instead. Either way,
+a playing network whose `--lr-plateau-stop` rule is done hands over rather than stopping the
+run. A waiting network trains at `--lr`, and follows `--lr-plateau` from its first rate once it
+plays.
+
+Each network's checkpoints go to `--ckpt-dir/<its size>`, e.g. `runs/grow/2x32` and `runs/grow/4x64`.
+Saved states hold every network, in `--ckpt-dir`. Each network's metrics are logged as
+`<its size>/<metric>`, and the playing network's also without the prefix. The run logs which
+network played (`growth_playing`), the next's mean metric minus the playing one's (`growth_gap`),
+and the switch (`growth_switch`). Every run logs its compute per epoch, to compare runs at equal
+GPU time: `selfplay_seconds`, `train_seconds` and `test_seconds` (with `--grow`, each network's
+as `<its size>/train_seconds` and `<its size>/test_seconds`), `epoch_seconds`, and the run's total,
+`run_seconds`.
+
+```
+uv run examples/othello/train.py --net resnet:2x32,pool_every=2,heads=pooled,pool_channels=8 \
+    --grow resnet:4x64,pool_every=2,heads=pooled,pool_channels=16 --engine-eval-every 1 \
+    --lr-plateau --lr-plateau-stop --epochs 600 --ckpt-dir runs/grow
 ```
 
 ### Training on Modal
