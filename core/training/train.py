@@ -154,6 +154,10 @@ class TrainLoopOutput:
         growth: (optional) with the Trainer's `growth`, which network plays and the switch rule's
             progress
         seconds: the wall time the run's training loop has taken so far, over every call
+        averages: with the Trainer's `averages`, each network's weight averages, one params tree
+            per horizon; empty without them, or for a state that has none to continue (the run
+            starts them at the networks' weights)
+        averaged: the number of epochs each network's averages hold
     """
 
     collection_state: CollectionState
@@ -166,6 +170,8 @@ class TrainLoopOutput:
     )
     growth: GrowthProgress | None = field(default=None, metadata={"static": True})
     seconds: float = field(default=0.0, metadata={"static": True})
+    averages: tuple[tuple[Any, ...], ...] = ()
+    averaged: tuple[int, ...] = field(default=(), metadata={"static": True})
 
     @property
     def playing(self) -> int:
@@ -189,6 +195,25 @@ def extract_params(state: TrainState) -> Any:
             core.evaluators.evaluation_fns.make_nn_eval_fn
     """
     return state.params, state.nn_state
+
+
+def average_name(horizon: float) -> str:
+    """The name of a network's weight average over about `horizon` epochs (see `Trainer`'s
+    `averages`): its checkpoints' directory and its metrics' prefix, e.g. avg4."""
+    return f"avg{horizon:g}"
+
+
+def average_share(averaged: int, horizon: float) -> float:
+    """The share a network's newest weights take in its average over about `horizon` epochs,
+    once `averaged` epochs are in it: the plain mean of the epochs so far until there are
+    `horizon` of them, then an exponential moving average, 1 / `horizon`."""
+    return max(1.0 / horizon, 1.0 / (averaged + 1))
+
+
+@jax.jit
+def _move_average(average: Any, params: Any, share: jax.Array) -> Any:
+    # with a share of 1, exactly the params
+    return jax.tree.map(lambda a, p: (1 - share) * a + share * p, average, params)
 
 
 def checkpoint_path(ckpt_dir: str, epoch: int) -> str:
@@ -531,6 +556,8 @@ class Trainer:
         lr_plateau: LRPlateau | None = None,
         lr_plateau_metric: str = "loss",
         growth: Growth | None = None,
+        averages: Sequence[float] = (),
+        selfplay_average: float | None = None,
         extra_config: dict | None = None,
     ):
         """Initializes a Trainer.
@@ -635,6 +662,19 @@ class Trainer:
                 checkpoints go to `<ckpt_dir>/<its name>`, and its metrics, its training's and its
                 testers', are logged as `<its name>/<metric>`; those of the network playing are
                 also logged as they are without growth. `testers` and `evaluator_test` are `nn`'s.
+            averages: (optional) horizons, in epochs, of averages of each network's weights
+                (as KataGo plays and rates averaged weights while training at a constant learning
+                rate): after each epoch a network trains, each of its averages moves towards its
+                new weights by `average_share` (the mean of the epochs so far, then an
+                exponential moving average over about the horizon). Training itself is
+                unchanged. Each average's checkpoints go to `avg<horizon>` in the network's
+                checkpoint directory (see `average_name`), and testers that are `stateless`
+                (e.g. a `ScoredPositionsTester`) also run on it, logging `avg<horizon>/<metric>`.
+                A saved state keeps them (see `save_state`); a state saved without them, or with
+                other horizons, starts them at its weights. BatchNorm statistics aren't
+                averaged: an average plays with the network's current ones.
+            selfplay_average: (optional) self-play plays with this average (one of
+                `averages`) of the network playing, rather than its current weights
             extra_config: (optional) extra config to record with the monitor's run
         """
         # environment
@@ -752,6 +792,20 @@ class Trainer:
                     raise ValueError(
                         f"{learner.name}: the optimizer's learning rate must be lr_plateau"
                     )
+        # weight averages
+        self.averages = tuple(float(h) for h in averages)
+        if any(h < 1 for h in self.averages) or len(set(self.averages)) != len(
+            self.averages
+        ):
+            raise ValueError(
+                f"averages are distinct horizons of at least 1 epoch, got {list(averages)}"
+            )
+        if selfplay_average is not None and selfplay_average not in self.averages:
+            raise ValueError(
+                f"selfplay_average must be one of averages {list(self.averages)}, got "
+                f"{selfplay_average}"
+            )
+        self.selfplay_average = selfplay_average
         # checkpoints
         self.ckpt_dir = ckpt_dir
         self.max_checkpoints = max_checkpoints
@@ -792,6 +846,26 @@ class Trainer:
             opt_state=self.optimizer.init(params),
             step=jnp.array(0, dtype=jnp.int32),
         )
+
+    def average_dirs(self, learner: int = 0) -> tuple[str, ...]:
+        """A network's weight averages' checkpoint directories, one per horizon of `averages`
+        (see `average_name`)."""
+        return tuple(
+            os.path.join(self.ckpt_dirs[learner], average_name(h))
+            for h in self.averages
+        )
+
+    def fresh_averages(self, train_state: TrainState) -> tuple[Any, ...]:
+        """A network's weight averages before any epoch is in them: copies of its weights."""
+        return tuple(jax.tree.map(jnp.copy, train_state.params) for _ in self.averages)
+
+    def selfplay_params(self, train_state: TrainState, averages: Sequence[Any]) -> Any:
+        """The model parameters self-play plays with: the network's, or with `selfplay_average`,
+        that average's."""
+        if self.selfplay_average is None:
+            return self.extract_model_params_fn(train_state)
+        average = averages[self.averages.index(self.selfplay_average)]
+        return self.extract_model_params_fn(replace(train_state, params=average))
 
     def get_config(self):
         """Returns a dictionary of the configuration of the trainer. Used for logging to the monitor.
@@ -857,6 +931,14 @@ class Trainer:
             else None,
             "testers": [tester.get_config() for tester in self.testers],
             **({"growth": self.growth.get_config()} if self.growth is not None else {}),
+            **(
+                {
+                    "averages": list(self.averages),
+                    "selfplay_average": self.selfplay_average,
+                }
+                if self.averages
+                else {}
+            ),
         }
 
     def move_keys(
@@ -1730,7 +1812,11 @@ class Trainer:
             self.monitor.activity(text)
 
     def save_checkpoint(
-        self, train_state: TrainState, epoch: int, learner: int = 0
+        self,
+        train_state: TrainState,
+        epoch: int,
+        learner: int = 0,
+        average: float | None = None,
     ) -> None:
         """Saves a checkpoint of the training state to `ckpt_dir` (with `growth`, to the
         network's directory in it).
@@ -1742,8 +1828,14 @@ class Trainer:
             train_state: current training state
             epoch: current epoch
             learner: (optional) with `growth`, the index of the network `train_state` is
+            average: (optional) the horizon of the weight average whose checkpoint it is (its
+                params are the average's), saved to that average's directory (see
+                `average_dirs`)
         """
         ckpt_dir = self.ckpt_dirs[learner]
+        if average is not None:
+            ckpt_dir = os.path.join(ckpt_dir, average_name(average))
+            os.makedirs(ckpt_dir, exist_ok=True)
         epochs = checkpoint_epochs(ckpt_dir)
         if epochs and epochs[-1] >= epoch:
             raise ValueError(
@@ -1815,6 +1907,8 @@ class Trainer:
             "train_states": state.train_states,
             "collection_state": state.collection_state,
             "test_states": state.test_states,
+            # with `averages`, the weight averages and how many epochs they hold
+            **({"averages": state.averages} if state.averages else {}),
         }
         meta = {
             "format": STATE_FORMAT,
@@ -1834,6 +1928,12 @@ class Trainer:
             ],
             "growth": asdict(state.growth) if state.growth is not None else None,
             "seconds": state.seconds,
+            "averages": {
+                "horizons": list(self.averages),
+                "averaged": list(state.averaged),
+            }
+            if state.averages
+            else None,
             "config": {**self.get_config(), **self.extra_config},
             "leaves": {part: _describe(tree) for part, tree in parts.items()},
         }
@@ -1934,6 +2034,7 @@ class Trainer:
                 "test_states",
                 self.test_state_templates(train_templates),
             )
+            averages, averaged = self._load_averages(saved, meta, train_templates)
             key = _to_device(saved["key"])
         lr_plateau: tuple[LRPlateauProgress | None, ...] = ()
         if self.lr_plateau is not None:
@@ -1956,7 +2057,29 @@ class Trainer:
             lr_plateau=lr_plateau,
             growth=growth,
             seconds=meta["seconds"],
+            averages=averages,
+            averaged=averaged,
         )
+
+    def _load_averages(
+        self, saved: Any, meta: dict, train_templates: Sequence[Any]
+    ) -> tuple[tuple[tuple[Any, ...], ...], tuple[int, ...]]:
+        """A saved state's weight averages and their epochs, if it was saved with this
+        trainer's horizons; else none, and the run starts them at its networks' weights."""
+        info = meta.get("averages")
+        if not self.averages or info is None or info["horizons"] != list(self.averages):
+            if self.averages:
+                print(
+                    f"the saved state has no averages over {list(self.averages)} epochs: they "
+                    "start at its networks' weights",
+                    flush=True,
+                )
+            return (), ()
+        template = tuple(
+            tuple(ts.params for _ in self.averages) for ts in train_templates
+        )
+        averages = self._load_part(saved, meta, "averages", template)
+        return averages, tuple(info["averaged"])
 
     def test_state_templates(self, train_states: Sequence[Any]) -> tuple[list, ...]:
         """The shapes of every network's testers' states, from the networks' train states (or
@@ -2006,7 +2129,10 @@ class Trainer:
         self.parent = meta["parent"]
         if self.monitor is not None and self.monitor.run_id is None:
             self.monitor.run_id = meta["monitor_run"]
-        for ckpt_dir in self.ckpt_dirs:
+        average_dirs = [
+            d for i in range(len(self.learners)) for d in self.average_dirs(i)
+        ]
+        for ckpt_dir in [*self.ckpt_dirs, *average_dirs]:
             for epoch in checkpoint_epochs(ckpt_dir):
                 if epoch >= state.cur_epoch:
                     os.remove(checkpoint_path(ckpt_dir, epoch))
@@ -2084,6 +2210,7 @@ class Trainer:
                 "test_states",
                 self.test_state_templates(train_templates),
             )
+            averages, averaged = self._load_averages(saved, meta, train_templates)
             key = _to_device(saved["key"])
         resized = ""
         if self.memory_buffer.capacity != meta["buffer_capacity"]:
@@ -2135,6 +2262,8 @@ class Trainer:
             lr_plateau=lr_plateau,
             growth=growth,
             seconds=meta["seconds"],
+            averages=averages,
+            averaged=averaged,
         )
 
     def _branch_collection_state(
@@ -2841,6 +2970,14 @@ class Trainer:
                 for learner, ts in zip(self.learners, train_states, strict=True)
             ]
 
+        # weight averages: the saved state's, or started at the networks' weights
+        if initial_state is not None and initial_state.averages:
+            averages = list(initial_state.averages)
+            averaged = list(initial_state.averaged)
+        else:
+            averages = [self.fresh_averages(ts) for ts in train_states]
+            averaged = [0] * num_learners
+
         def playing_now() -> int:
             return growth.playing if growth is not None else 0
 
@@ -2859,6 +2996,8 @@ class Trainer:
                 lr_plateau=tuple(lr_progress) if self.lr_plateau is not None else (),
                 growth=growth,
                 seconds=seconds + time.perf_counter() - started,
+                averages=tuple(averages) if self.averages else (),
+                averaged=tuple(averaged) if self.averages else (),
             )
 
         def named(learner: int, text: str) -> str:
@@ -2871,7 +3010,9 @@ class Trainer:
         )
         if self.lr_plateau is not None and lr_progress[playing_now()] is None:
             lr_progress[playing_now()] = LRPlateauProgress()
-        params = self.extract_model_params_fn(train_states[playing_now()])
+        params = self.selfplay_params(
+            train_states[playing_now()], averages[playing_now()]
+        )
         if not exact:
             # warmup
             # populate replay buffer with initial self-play games
@@ -2895,7 +3036,7 @@ class Trainer:
             evaluator, collection_state = self.follow_schedule(
                 cur_epoch, evaluator, collection_state, playing
             )
-            params = self.extract_model_params_fn(train_states[playing])
+            params = self.selfplay_params(train_states[playing], averages[playing])
             collect_key, key = jax.random.split(key)
             collect_keys = jax.random.split(collect_key, self.batch_size)
             # only the counts outlive the state donated to self-play: keeping the whole state
@@ -2942,6 +3083,16 @@ class Trainer:
                 )
                 jax.block_until_ready(train_states[i])
                 train_seconds[i] = time.perf_counter() - train_started
+                # its weight averages take in the epoch's weights
+                averages[i] = tuple(
+                    _move_average(
+                        average,
+                        train_states[i].params,
+                        jnp.float32(average_share(averaged[i], horizon)),
+                    )
+                    for average, horizon in zip(averages[i], self.averages, strict=True)
+                )
+                averaged[i] += 1
             # the learning rate rule follows the network playing
             stop = False
             watch_loss = self.lr_plateau_metric == "loss"
@@ -3007,6 +3158,34 @@ class Trainer:
                             self.log_learner_metrics(
                                 {f"{tester.name}_game": episode}, cur_epoch, i, playing
                             )
+                        # the network's weight averages, with keys of their own, so that the
+                        # run's rng is the same with averages as without
+                        if tester.stateless:
+                            for n, (average, horizon) in enumerate(
+                                zip(averages[i], self.averages, strict=True)
+                            ):
+                                _, average_metrics, _ = tester.run(
+                                    key=jax.random.fold_in(run_key, n + 1),
+                                    epoch_num=cur_epoch,
+                                    max_steps=self.max_episode_steps,
+                                    env_step_fn=self.env_step_fn,
+                                    env_init_fn=self.test_env_init_fn,
+                                    evaluator=learner.evaluator_test,
+                                    state=test_state,
+                                    params=self.extract_model_params_fn(
+                                        replace(train_states[i], params=average)
+                                    ),
+                                )
+                                if average_metrics:
+                                    self.log_learner_metrics(
+                                        {
+                                            f"{average_name(horizon)}/{k}": v.mean()
+                                            for k, v in average_metrics.items()
+                                        },
+                                        cur_epoch,
+                                        i,
+                                        playing,
+                                    )
                         tester_states[i][j] = new_test_state
                     test_seconds[i] = time.perf_counter() - test_started
             # a tester's metric: the rule follows it once the epoch's tests have run
@@ -3087,6 +3266,13 @@ class Trainer:
             self.set_activity(f"epoch {cur_epoch}: saving checkpoint")
             for i in training:
                 self.save_checkpoint(train_states[i], cur_epoch, i)
+                for average, horizon in zip(averages[i], self.averages, strict=True):
+                    self.save_checkpoint(
+                        replace(train_states[i], params=average),
+                        cur_epoch,
+                        i,
+                        average=horizon,
+                    )
             # the epoch's compute: self-play, and each network's training and tests, in wall time
             # and in network evaluations (under vmap every environment pays every cycle)
             train_samples = self.train_steps_per_epoch * self.train_batch_size

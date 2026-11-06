@@ -47,6 +47,7 @@ from core.training.train import (
     CollectionStats,
     Trainer,
     TrainLoopOutput,
+    average_share,
     checkpoint_epochs,
     extract_params,
     lr_plateau_states,
@@ -2095,8 +2096,8 @@ REAL_PLATEAU = LRPlateau((1e-3, 1e-4), window=3, threshold=1e9, min_epochs=3)
 def real(env, tmp_path_factory):
     """A Trainer with AlphaZero self-play whose search grows from 2 to 3 iterations at epoch 2, a
     network with BatchNorm, gradient accumulation, tree positions with a data transform, a
-    TwoPlayerTester, a learning rate that drops after epoch 2 (on a plateau, of any loss), and a
-    (fake) monitor. It saves its state after 2 epochs."""
+    TwoPlayerTester, a learning rate that drops after epoch 2 (on a plateau, of any loss), weight
+    averages over 2 epochs, and a (fake) monitor. It saves its state after 2 epochs."""
     network = eqx.nn.make_with_state(NormMLP)(
         2, env.num_actions, key=jax.random.PRNGKey(0)
     )
@@ -2117,6 +2118,7 @@ def real(env, tmp_path_factory):
         save_state_at=[2],
         optimizer=optax.inject_hyperparams(optax.adam)(learning_rate=REAL_PLATEAU),
         lr_plateau=REAL_PLATEAU,
+        averages=(2,),
     )
 
 
@@ -2878,3 +2880,144 @@ def test_growth_on_the_loss_with_a_guard_waits_for_both(env, tmp_path, fake_loop
     start = branch.branch(state_path(str(tmp_path), 4))
     assert start.growth is not None
     assert start.growth.guard_values == ((1.0, 1.0), (2.0, 2.0), ())
+
+
+# weight averages
+
+
+class StatelessTester(FakeTester):
+    stateless = True
+
+
+def offset_from(params, initial):
+    """The one amount every weight of `params` is above `initial`'s (as `fake_loop` trains)."""
+    gaps = np.concatenate(
+        [
+            (np.asarray(p, np.float64) - np.asarray(q, np.float64)).ravel()
+            for p, q in zip(
+                jax.tree.leaves(params), jax.tree.leaves(initial), strict=True
+            )
+        ]
+    )
+    np.testing.assert_allclose(gaps, gaps[0], atol=1e-5)
+    return float(gaps[0])
+
+
+def test_an_average_is_the_mean_until_its_horizon_then_moves_by_one_over_it():
+    assert [average_share(n, 4) for n in range(6)] == pytest.approx(
+        [1, 1 / 2, 1 / 3, 1 / 4, 1 / 4, 1 / 4]
+    )
+    assert [average_share(n, 1) for n in range(3)] == [1, 1, 1]
+    assert average_share(9, 2.5) == pytest.approx(0.4)
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"averages": (0.5,)}, "at least 1 epoch"),
+        ({"averages": (2, 2)}, "distinct"),
+        ({"averages": (2,), "selfplay_average": 4}, "one of averages"),
+        ({"selfplay_average": 2}, "one of averages"),
+    ],
+)
+def test_averages_are_distinct_horizons_and_self_play_plays_one_of_them(
+    env, tmp_path, kwargs, match
+):
+    with pytest.raises(ValueError, match=match):
+        make_trainer(env, tmp_path, **kwargs)
+
+
+def test_averages_follow_each_epochs_weights_and_are_checkpointed_and_scored(
+    env, tmp_path, fake_loop
+):
+    stateless, stateful = StatelessTester(name="positions"), FakeTester()
+    monitor = FakeMonitor()
+    trainer = make_trainer(
+        env,
+        tmp_path,
+        averages=(1, 4),
+        testers=[stateless, stateful],
+        monitor=monitor,
+        max_checkpoints=10,
+    )
+    fake_loop(trainer)
+    initial = trainer.init_train_state().params
+
+    output = trainer.train_loop(seed=0, num_epochs=5)
+
+    # training adds 1 to every weight an epoch: the 4-epoch average is the mean of the epochs so
+    # far, then moves a quarter of the way to each epoch's weights
+    for epoch, expected in enumerate([1, 1.5, 2, 2.5, 3.125]):
+        raw, avg1, avg4 = (
+            trainer.load_train_state_from_checkpoint(str(d), epoch).params
+            for d in (tmp_path, tmp_path / "avg1", tmp_path / "avg4")
+        )
+        assert offset_from(raw, initial) == pytest.approx(epoch + 1)
+        assert leaves_equal(avg1, raw)
+        assert offset_from(avg4, initial) == pytest.approx(expected)
+    assert output.averaged == (5,)
+    assert offset_from(output.averages[0][1], initial) == pytest.approx(3.125)
+    # the stateless tester also scores both averages, after the network; the other only it
+    assert len(stateless.calls) == 3 * 5 and len(stateful.calls) == 5
+    assert [
+        offset_from(c.params[0], initial) for c in stateless.calls[-3:]
+    ] == pytest.approx([5, 5, 3.125])
+    assert {"outcome", "avg1/outcome", "avg4/outcome"} <= monitor.by_epoch()[4].keys()
+
+
+def test_averages_leave_the_run_as_it_was(env, tmp_path, fake_loop):
+    runs = []
+    for averages in ((), (2, 8)):
+        trainer = make_trainer(
+            env,
+            tmp_path / str(len(averages)),
+            averages=averages,
+            testers=[StatelessTester()],
+        )
+        calls = fake_loop(trainer)
+        trainer.train_loop(seed=0, num_epochs=3)
+        runs.append(calls)
+
+    without, with_averages = runs
+    assert [c.kind for c in without] == [c.kind for c in with_averages]
+    for a, b in zip(without, with_averages, strict=True):
+        assert np.array_equal(a.key, b.key)
+        if a.kind == "collect":
+            assert leaves_equal(a.params[0], b.params[0])
+
+
+def test_self_play_can_play_an_average(env, tmp_path, fake_loop):
+    trainer = make_trainer(env, tmp_path, averages=(2,), selfplay_average=2)
+    calls = fake_loop(trainer)
+    initial = trainer.init_train_state().params
+
+    trainer.train_loop(seed=0, num_epochs=4)
+
+    # warmup and epoch 0 play the initial weights, then the 2-epoch average of those trained:
+    # 1, (1 + 2) / 2, then 1.5 / 2 + 3 / 2
+    assert [
+        offset_from(c.params[0], initial) for c in of_kind(calls, "collect")
+    ] == pytest.approx([0, 0, 1, 1.5, 2.25])
+
+
+def test_a_branch_of_a_state_without_averages_starts_them_at_its_weights(
+    env, tmp_path, fake_loop, capsys
+):
+    plain = make_trainer(env, tmp_path / "plain", save_state_at=[2])
+    fake_loop(plain)
+    plain.train_loop(seed=0, num_epochs=2)
+    averaging = make_trainer(env, tmp_path / "branch", averages=(2,))
+    fake_loop(averaging)
+    initial = averaging.init_train_state().params
+
+    start = averaging.branch(state_path(str(tmp_path / "plain"), 2))
+    assert start.averages == ()
+    assert "start at its networks' weights" in capsys.readouterr().out
+    averaging.train_loop(seed=0, num_epochs=4, initial_state=start)
+
+    # the weights after epoch 2, then the mean of epochs 2 and 3
+    for epoch, expected in ((2, 3), (3, 3.5)):
+        average = averaging.load_train_state_from_checkpoint(
+            str(tmp_path / "branch" / "avg2"), epoch
+        ).params
+        assert offset_from(average, initial) == pytest.approx(expected)

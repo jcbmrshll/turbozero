@@ -81,5 +81,7 @@
   "*_regret*": {"description": "The score the network's most likely action gives up against the engine's best, on the engine-labelled positions (a suffix names a group). No search.", "better": "lower"},
   "*_value_mse*": {"description": "(value - z)^2 of the network's value, z the outcome the engine predicts (+1, 0 or -1), on the engine-labelled positions (a suffix names a group). No search.", "better": "lower"},
   "*_value_sign*": {"description": "How often the network's value has the sign of the outcome the engine predicts, over the engine-labelled positions it doesn't call a draw (a suffix names a group). No search.", "better": "higher"},
+  "avg*/*": {"description": "With weight averages: the metric of the network's weights averaged over about the epochs the prefix names (avg4: 4), scored as the network's own is (see Trainer's averages); the metric is as it is described without the prefix."},
+  "*/avg*/*": {"description": "With growth and weight averages: one network's avg<horizon>/<metric>, as avg*/* describes."},
   "*/*": {"description": "With growth: one network's own metric, <its name>/<metric>; the metric is as it is described without the prefix. The network playing self-play also logs its metrics without it."}
 }

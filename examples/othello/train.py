@@ -706,6 +706,25 @@ def main():
         "only the 2 newest are kept)",
     )
     parser.add_argument(
+        "--average-epochs",
+        type=float,
+        nargs="+",
+        default=[],
+        metavar="H",
+        help="also keep averages of each network's weights over about H epochs (the mean of "
+        "the epochs so far, then an exponential moving average; training is unchanged), "
+        "checkpointed to avg<H> in its checkpoint directory and scored on the engine-labelled "
+        "set as avg<H>/engine_*",
+    )
+    parser.add_argument(
+        "--selfplay-average",
+        type=float,
+        default=None,
+        metavar="H",
+        help="self-play plays with the playing network's average over H epochs (one of "
+        "--average-epochs) rather than its current weights",
+    )
+    parser.add_argument(
         "--save-state-at",
         type=epoch_list,
         default=[],
@@ -779,6 +798,15 @@ def main():
         parser.error("--resume needs the run's --ckpt-dir")
     if args.init_without_buffers and args.init_from is None:
         parser.error("--init-without-buffers needs --init-from")
+    if any(h < 1 for h in args.average_epochs) or len(set(args.average_epochs)) != len(
+        args.average_epochs
+    ):
+        parser.error("--average-epochs are distinct horizons of at least 1 epoch")
+    if (
+        args.selfplay_average is not None
+        and args.selfplay_average not in args.average_epochs
+    ):
+        parser.error("--selfplay-average must be one of --average-epochs")
     if sum(x is not None for x in (args.lr_final, args.lr_drops, args.lr_plateau)) > 1:
         parser.error(
             "--lr-final, --lr-drops and --lr-plateau are different schedules: pass one"
@@ -1090,6 +1118,8 @@ def main():
         lr_plateau=lr_plateau,
         lr_plateau_metric=args.lr_plateau_metric,
         growth=growth,
+        averages=args.average_epochs,
+        selfplay_average=args.selfplay_average,
         evaluator=evaluator,
         # stores `capacity` positions for each of the `batch_size` environments
         memory_buffer=EpisodeReplayBuffer(capacity=args.buffer),
