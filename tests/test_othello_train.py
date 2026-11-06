@@ -349,9 +349,19 @@ def test_a_margin_and_guard_reach_growth(monkeypatch, tmp_path):
 
 def test_weight_averages_reach_the_trainer(monkeypatch):
     with pytest.raises(BuiltTrainer) as built:
-        run_main(monkeypatch, "--average-epochs", "2", "8", "--selfplay-average", "8")
+        run_main(
+            monkeypatch,
+            "--average-epochs",
+            "2",
+            "8",
+            "--selfplay-average",
+            "8",
+            "--average-warmup",
+            "5",
+        )
     assert built.value.kwargs["averages"] == [2.0, 8.0]
     assert built.value.kwargs["selfplay_average"] == 8.0
+    assert built.value.kwargs["average_warmup"] == 5.0
 
 
 @pytest.mark.parametrize(
@@ -361,6 +371,7 @@ def test_weight_averages_reach_the_trainer(monkeypatch):
         ("--average-epochs", "2", "2"),
         ("--average-epochs", "2", "--selfplay-average", "4"),
         ("--selfplay-average", "2"),
+        ("--average-epochs", "2", "--average-warmup", "0"),
     ],
 )
 def test_bad_average_options_are_refused(monkeypatch, options):

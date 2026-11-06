@@ -2906,12 +2906,19 @@ def offset_from(params, initial):
     return float(gaps[0])
 
 
-def test_an_average_is_the_mean_until_its_horizon_then_moves_by_one_over_it():
-    assert [average_share(n, 4) for n in range(6)] == pytest.approx(
+def test_an_averages_horizon_grows_by_an_epoch_every_warmup_epochs_up_to_its_own():
+    # from the newest weights alone: a horizon of 1, 1.5 after 5 epochs, 4 after 30
+    assert [average_share(n, 4, 10) for n in (0, 5, 10, 20, 30, 100)] == pytest.approx(
+        [1, 1 / 1.5, 1 / 2, 1 / 3, 1 / 4, 1 / 4]
+    )
+    assert [average_share(n, 1, 10) for n in range(3)] == [1, 1, 1]
+
+
+def test_a_warmup_of_one_makes_an_average_the_mean_until_its_horizon():
+    assert [average_share(n, 4, 1) for n in range(6)] == pytest.approx(
         [1, 1 / 2, 1 / 3, 1 / 4, 1 / 4, 1 / 4]
     )
-    assert [average_share(n, 1) for n in range(3)] == [1, 1, 1]
-    assert average_share(9, 2.5) == pytest.approx(0.4)
+    assert average_share(9, 2.5, 1) == pytest.approx(0.4)
 
 
 @pytest.mark.parametrize(
@@ -2921,6 +2928,7 @@ def test_an_average_is_the_mean_until_its_horizon_then_moves_by_one_over_it():
         ({"averages": (2, 2)}, "distinct"),
         ({"averages": (2,), "selfplay_average": 4}, "one of averages"),
         ({"selfplay_average": 2}, "one of averages"),
+        ({"averages": (2,), "average_warmup": 0}, "average_warmup must be positive"),
     ],
 )
 def test_averages_are_distinct_horizons_and_self_play_plays_one_of_them(
@@ -2939,6 +2947,7 @@ def test_averages_follow_each_epochs_weights_and_are_checkpointed_and_scored(
         env,
         tmp_path,
         averages=(1, 4),
+        average_warmup=1,
         testers=[stateless, stateful],
         monitor=monitor,
         max_checkpoints=10,
@@ -2948,8 +2957,8 @@ def test_averages_follow_each_epochs_weights_and_are_checkpointed_and_scored(
 
     output = trainer.train_loop(seed=0, num_epochs=5)
 
-    # training adds 1 to every weight an epoch: the 4-epoch average is the mean of the epochs so
-    # far, then moves a quarter of the way to each epoch's weights
+    # training adds 1 to every weight an epoch: with a warmup of 1, the 4-epoch average is the
+    # mean of the epochs so far, then moves a quarter of the way to each epoch's weights
     for epoch, expected in enumerate([1, 1.5, 2, 2.5, 3.125]):
         raw, avg1, avg4 = (
             trainer.load_train_state_from_checkpoint(str(d), epoch).params
@@ -2990,7 +2999,9 @@ def test_averages_leave_the_run_as_it_was(env, tmp_path, fake_loop):
 
 
 def test_self_play_can_play_an_average(env, tmp_path, fake_loop):
-    trainer = make_trainer(env, tmp_path, averages=(2,), selfplay_average=2)
+    trainer = make_trainer(
+        env, tmp_path, averages=(2,), selfplay_average=2, average_warmup=1
+    )
     calls = fake_loop(trainer)
     initial = trainer.init_train_state().params
 
@@ -3009,7 +3020,7 @@ def test_a_branch_of_a_state_without_averages_starts_them_at_its_weights(
     plain = make_trainer(env, tmp_path / "plain", save_state_at=[2])
     fake_loop(plain)
     plain.train_loop(seed=0, num_epochs=2)
-    averaging = make_trainer(env, tmp_path / "branch", averages=(2,))
+    averaging = make_trainer(env, tmp_path / "branch", averages=(2,), average_warmup=1)
     fake_loop(averaging)
     initial = averaging.init_train_state().params
 

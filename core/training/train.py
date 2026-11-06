@@ -203,11 +203,19 @@ def average_name(horizon: float) -> str:
     return f"avg{horizon:g}"
 
 
-def average_share(averaged: int, horizon: float) -> float:
+def average_share(averaged: int, horizon: float, warmup: float) -> float:
     """The share a network's newest weights take in its average over about `horizon` epochs,
-    once `averaged` epochs are in it: the plain mean of the epochs so far until there are
-    `horizon` of them, then an exponential moving average, 1 / `horizon`."""
-    return max(1.0 / horizon, 1.0 / (averaged + 1))
+    once `averaged` epochs are in it: an exponential moving average whose horizon starts at 1
+    (the newest weights) and grows by an epoch every `warmup` epochs averaged, up to
+    `horizon`. With a `warmup` of 1, the plain mean of the epochs so far until there are
+    `horizon` of them.
+
+    An average lags its network by about (1 - share) / share epochs. Early in training each
+    epoch improves the network a lot, and a lag of more than about a tenth of the epochs
+    trained costs more than averaging gains: in Othello, a 4-epoch average without a warmup
+    lost 110-210 Elo to the current weights at epoch 10, and a 16-epoch one 110-500 Elo
+    throughout the first 60 epochs, while 4 epochs gained 30-40 from epoch 30."""
+    return 1.0 / min(horizon, 1.0 + averaged / warmup)
 
 
 @jax.jit
@@ -560,6 +568,7 @@ class Trainer:
         train_retired: bool = False,
         averages: Sequence[float] = (),
         selfplay_average: float | None = None,
+        average_warmup: float = 10.0,
         extra_config: dict | None = None,
     ):
         """Initializes a Trainer.
@@ -677,8 +686,8 @@ class Trainer:
             averages: (optional) horizons, in epochs, of averages of each network's weights
                 (as KataGo plays and rates averaged weights while training at a constant learning
                 rate): after each epoch a network trains, each of its averages moves towards its
-                new weights by `average_share` (the mean of the epochs so far, then an
-                exponential moving average over about the horizon). Training itself is
+                new weights by `average_share` (an exponential moving average whose horizon
+                grows from 1 to the average's with `average_warmup`). Training itself is
                 unchanged. Each average's checkpoints go to `avg<horizon>` in the network's
                 checkpoint directory (see `average_name`), and testers that are `stateless`
                 (e.g. a `ScoredPositionsTester`) also run on it, logging `avg<horizon>/<metric>`.
@@ -687,6 +696,9 @@ class Trainer:
                 averaged: an average plays with the network's current ones.
             selfplay_average: (optional) self-play plays with this average (one of
                 `averages`) of the network playing, rather than its current weights
+            average_warmup: the epochs an average takes in for each epoch its horizon grows
+                by, from 1 to its own (see `average_share`); 1 makes it the plain mean of the
+                epochs so far until its horizon
             extra_config: (optional) extra config to record with the monitor's run
         """
         # environment
@@ -832,6 +844,9 @@ class Trainer:
                 f"{selfplay_average}"
             )
         self.selfplay_average = selfplay_average
+        if average_warmup <= 0:
+            raise ValueError(f"average_warmup must be positive, got {average_warmup}")
+        self.average_warmup = float(average_warmup)
         # checkpoints
         self.ckpt_dir = ckpt_dir
         self.max_checkpoints = max_checkpoints
@@ -977,6 +992,7 @@ class Trainer:
                 {
                     "averages": list(self.averages),
                     "selfplay_average": self.selfplay_average,
+                    "average_warmup": self.average_warmup,
                 }
                 if self.averages
                 else {}
@@ -3139,7 +3155,9 @@ class Trainer:
                     _move_average(
                         average,
                         train_states[i].params,
-                        jnp.float32(average_share(averaged[i], horizon)),
+                        jnp.float32(
+                            average_share(averaged[i], horizon, self.average_warmup)
+                        ),
                     )
                     for average, horizon in zip(averages[i], self.averages, strict=True)
                 )

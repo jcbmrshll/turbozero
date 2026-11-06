@@ -726,8 +726,8 @@ def main():
         nargs="+",
         default=[],
         metavar="H",
-        help="also keep averages of each network's weights over about H epochs (the mean of "
-        "the epochs so far, then an exponential moving average; training is unchanged), "
+        help="also keep averages of each network's weights over about H epochs (exponential "
+        "moving averages, see --average-warmup; training is unchanged), "
         "checkpointed to avg<H> in its checkpoint directory and scored on the engine-labelled "
         "set as avg<H>/engine_*",
     )
@@ -738,6 +738,15 @@ def main():
         metavar="H",
         help="self-play plays with the playing network's average over H epochs (one of "
         "--average-epochs) rather than its current weights",
+    )
+    parser.add_argument(
+        "--average-warmup",
+        type=float,
+        default=10.0,
+        metavar="W",
+        help="an average's horizon starts at 1 epoch and grows by one every W epochs it takes "
+        "in, up to its own: early in training, when every epoch improves the network a lot, a "
+        "long average lags it (1: the plain mean of the epochs so far until the horizon)",
     )
     parser.add_argument(
         "--save-state-at",
@@ -828,6 +837,8 @@ def main():
         and args.selfplay_average not in args.average_epochs
     ):
         parser.error("--selfplay-average must be one of --average-epochs")
+    if args.average_warmup <= 0:
+        parser.error("--average-warmup must be positive")
     if sum(x is not None for x in (args.lr_final, args.lr_drops, args.lr_plateau)) > 1:
         parser.error(
             "--lr-final, --lr-drops and --lr-plateau are different schedules: pass one"
@@ -1143,6 +1154,7 @@ def main():
         train_retired=args.grow_train_retired,
         averages=args.average_epochs,
         selfplay_average=args.selfplay_average,
+        average_warmup=args.average_warmup,
         evaluator=evaluator,
         # stores `capacity` positions for each of the `batch_size` environments
         memory_buffer=EpisodeReplayBuffer(capacity=args.buffer),
