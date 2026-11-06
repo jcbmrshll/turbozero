@@ -187,8 +187,14 @@ def make_optimizer(
     weight decay on the network's weights, not its biases or BatchNorm scales and offsets (see
     `weight_decay_mask`). Its hyperparameters are injected, for the trainer to record them and
     log the learning rate."""
-    schedule = optax.cosine_decay_schedule(
-        lr, decay_steps=max(total_steps, 1), alpha=lr_final / lr
+    schedule = (
+        # constant: its program then doesn't depend on the run's length, so a run in steps
+        # (controller.py) compiles its training once, into the persistent compilation cache
+        optax.constant_schedule(lr)
+        if lr_final == lr
+        else optax.cosine_decay_schedule(
+            lr, decay_steps=max(total_steps, 1), alpha=lr_final / lr
+        )
     )
     if lr_drops:
         rates = [lr, *(rate for _, rate in lr_drops)]
