@@ -81,6 +81,18 @@ the replay buffer faster. `--min-iterations` sets the fewest a search takes, and
 `--advance-every` how often finished searches play their moves (5 cycles by default with
 `--count-reused-visits`; a search done in between goes on until then).
 
+`--playout-cap P:FAST` is KataGo's playout cap randomization: each move is searched with
+`--sims` iterations with probability P, and otherwise with FAST, without the root's noise.
+Only the full searches' positions are stored for training; the fast ones are played, and
+count towards their game's outcome. At the same compute, that plays more moves and so more
+games (KataGo: P 0.25, 600 and 100 playouts). `--selfplay-cycles` holds an epoch's
+self-play compute fixed across settings, in cycles per environment (by default 128 full
+searches, 128 × (`--sims` + 1)); size `--buffer` by the share of moves stored, for the
+same span of self-play, and pass a small `--advance-every` whose multiples the searches'
+cycles (iterations + 1) are, so that no search waits for its move to be played. For
+example, 25% of moves at 127 iterations and 75% at 43, at the compute of uniform 64:
+`--sims 127 --playout-cap 0.25:43 --selfplay-cycles 8320 --advance-every 4 --buffer 281`.
+
 By default every search starts from the subtree of the move played that the last search
 explored, and adds `--sims` iterations to its visits. `--no-persist-tree` starts each from
 an empty tree instead: an ablation of that reuse (a target then comes from `--sims` visits

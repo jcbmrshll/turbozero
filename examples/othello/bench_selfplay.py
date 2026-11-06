@@ -35,7 +35,7 @@ from xot import load_xot, make_xot_init_fn
 from core.evaluators.alphazero import AlphaZero
 from core.evaluators.evaluation_fns import make_nn_eval_fn
 from core.evaluators.mcts.action_selection import PUCTSelector
-from core.evaluators.mcts.mcts import MCTS
+from core.evaluators.mcts.mcts import MCTS, PlayoutCap
 from core.memory.replay_memory import EpisodeReplayBuffer
 from core.training.loss_fns import az_default_loss_fn
 from core.training.train import Trainer
@@ -62,6 +62,7 @@ def make_trainer(args) -> tuple[Trainer, tuple]:
         count_reused_visits=args.count_reused_visits,
         min_iterations=args.min_iterations,
         traversal_steps=args.traversal_steps,
+        playout_cap=PlayoutCap(*args.playout_cap) if args.playout_cap else None,
     )
     trainer = Trainer(
         batch_size=args.envs,
@@ -122,6 +123,13 @@ def main():
         default=TRAVERSAL_STEPS,
         help="as train.py's: steps a traversal takes between checks for its leaf",
     )
+    parser.add_argument(
+        "--playout-cap",
+        type=lambda text: (float(text.split(":")[0]), int(text.split(":")[1])),
+        default=None,
+        metavar="P:FAST",
+        help="as train.py's: --sims with probability P, else FAST iterations",
+    )
     parser.add_argument("--ckpt", default=None, help="checkpoint to play with")
     parser.add_argument(
         "--dtype", default="float32", help="the network's dtype in self-play"
@@ -140,7 +148,7 @@ def main():
         "--compare", default=None, help="compare the warmup steps' results to a --save"
     )
     args = parser.parse_args()
-    if args.advance_every is None and args.count_reused_visits:
+    if args.advance_every is None and (args.count_reused_visits or args.playout_cap):
         args.advance_every = 5
 
     trainer, params = make_trainer(args)

@@ -940,7 +940,7 @@ class Trainer:
     ) -> CollectionState:
         """Plays the move whose search is done, if it is (see `Evaluator.search_done`).
 
-        - Stores experience in replay buffer.
+        - Stores experience in replay buffer, if the evaluator `trains_on` the search.
         - Resets environment/evaluator if episode is terminated.
 
         If the search isn't done, the state is left as it is. Under vmap, where that differs
@@ -959,6 +959,9 @@ class Trainer:
         if evaluator is None:
             evaluator = self.collection_schedule.at(0)
         done = evaluator.search_done(state.eval_state, state.search_cycles)
+        # the moves whose positions are trained on (see `Evaluator.trains_on`); the others are
+        # played, and count towards their game's length and outcome, without being stored
+        stored = done & evaluator.trains_on(state.eval_state)
         evaluate_key, key, tree_key = self.move_keys(state.move_key)
         output = evaluator.search_output(
             evaluate_key,
@@ -1035,7 +1038,7 @@ class Trainer:
                 cur_player_id=state.metadata.cur_player_id,
                 search_value=search_value,
             ),
-            valid=done,
+            valid=stored,
         )
         # assign rewards to buffer if episode is terminated
         buffer_state = where_tree(
@@ -1058,7 +1061,7 @@ class Trainer:
                 ],
             )
             state = self.store_tree_positions(
-                tree_key, state, searched_eval_state, reused, evaluator, valid=done
+                tree_key, state, searched_eval_state, reused, evaluator, valid=stored
             )
         # return new collection state
         return replace(
@@ -2629,7 +2632,7 @@ class Trainer:
             selfplay_seconds = time.perf_counter() - epoch_started
             if isinstance(evaluator, MCTS):
                 collection_metrics["search_iterations"] = jnp.asarray(
-                    evaluator.num_iterations
+                    evaluator.mean_iterations()
                 )
             # the cycles a move took, its search's and any it waited to be played
             cycles = (
