@@ -559,17 +559,23 @@ def gpu_env() -> dict[str, str]:
 
 
 class LocalRunner:
-    """train.py and bench_nets.py, in this process's environment (the frozen worktree's)."""
+    """train.py and bench_nets.py, in this process's environment (the frozen worktree's). A
+    step's train.py keeps what it compiles in `cache`, a persistent compilation cache the run's
+    steps share: the same networks' training and searches compile once, not once a step."""
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, cache: Path | None = None):
         self.cwd = os.path.expanduser(config.worktree)
+        self.cache = cache
 
     def train(self, args: list[str], log: Path) -> None:
+        env = gpu_env()
+        if self.cache is not None:
+            env["JAX_COMPILATION_CACHE_DIR"] = str(self.cache)
         with open(log, "a") as out:
             subprocess.run(
                 [sys.executable, "examples/othello/train.py", *args],
                 cwd=self.cwd,
-                env=gpu_env(),
+                env=env,
                 stdout=out,
                 stderr=subprocess.STDOUT,
                 check=True,
@@ -694,7 +700,7 @@ class LocalLeague:
             while player.poll() is None:
                 if not self.pending(requests) or time.monotonic() - started > seconds:
                     break
-                time.sleep(20)
+                time.sleep(2)
             if player.poll() is None:
                 self.command("stop")
                 try:
@@ -771,7 +777,7 @@ class Controller:
         self.data = json.loads(self.path.read_text())
         self.config = Config.from_json(self.data["config"])
         self.queue = queue or SlickQueue(self.config)
-        self.runner = runner or LocalRunner(self.config)
+        self.runner = runner or LocalRunner(self.config, self.dir / "compiled")
         self.league = league or LocalLeague(self.config)
 
     @classmethod
@@ -938,8 +944,12 @@ class Controller:
 
     def run_bench(self) -> dict:
         args = ["--train-batch", str(self.config.train_batch)]
-        if "--remat" in self.config.train_args:
+        train_args = self.config.train_args
+        if "--remat" in train_args:
             args.append("--remat")
+        if "--grad-accum" in train_args:
+            # its training steps as train.py takes them, in micro-batches
+            args += ["--grad-accum", train_args[train_args.index("--grad-accum") + 1]]
         bench = self.runner.bench(
             self.config.nets, args, self.dir / "logs" / "bench.jsonl"
         )

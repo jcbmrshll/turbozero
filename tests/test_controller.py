@@ -694,3 +694,41 @@ def test_a_ladder_that_gives_way_goes_on_where_it_was(tmp_path):
     assert [m[1] for m in edax] == ["edax-L1", "edax-L2"]
     ladder = Controller(run_dir, queue, runner, league).step("p000-ladder")
     assert ladder["requests"] == [3, 4] and len(ladder["results"]) == 2
+
+
+def test_the_benchmark_times_training_as_train_py_takes_it(tmp_path):
+    run_dir = tmp_path / "run"
+    queue, league = FakeQueue(), FakeLeague(lambda a, b: 0.0)
+
+    class Recording(FakeRunner):
+        def bench(self, nets, args, out):
+            self.bench_args = args
+            return super().bench(nets, args, out)
+
+    runner = Recording()
+    Controller.init(
+        run_dir,
+        config(tmp_path, train_args=["--grad-accum", "4", "--remat"]),
+        queue=queue,
+        runner=runner,
+        league=league,
+    ).start()
+    Controller(run_dir, queue, runner, league).run("bench")
+    assert runner.bench_args == [
+        "--train-batch",
+        "4096",
+        "--remat",
+        "--grad-accum",
+        "4",
+    ]
+
+
+def test_steps_share_a_compilation_cache(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(controller.subprocess, "run", lambda *a, **kw: calls.append(kw))
+    runner = controller.LocalRunner(config(tmp_path), tmp_path / "run" / "compiled")
+    runner.train(["--epochs", "1"], tmp_path / "log")
+    assert calls[0]["env"]["JAX_COMPILATION_CACHE_DIR"] == str(
+        tmp_path / "run" / "compiled"
+    )
+    assert "JAX_PLATFORMS" not in calls[0]["env"]
