@@ -200,9 +200,10 @@ class FakeQueue:
 
 
 class FakeRunner:
-    """Plays train.py and bench_nets.py: a step saves the state and checkpoints it would. The
-    next network catches up from epoch `caught_up_at` on, and takes over then, unless the step
-    runs with --grow-manual."""
+    """Plays train.py and bench_nets.py: a step saves the state and checkpoints it would. No
+    network takes over during a step (the controller runs every step --grow-manual); with
+    --take-over the next plays from its start. The next network has caught up from epoch
+    `caught_up_at` on (the saved state's growth_caught_up)."""
 
     def __init__(self, caught_up_at=None):
         self.caught_up_at = caught_up_at
@@ -213,6 +214,7 @@ class FakeRunner:
 
     def train(self, args, log):
         self.calls.append(args)
+        assert "--grow-manual" in args
 
         def value(flag):
             return args[args.index(flag) + 1]
@@ -227,23 +229,23 @@ class FakeRunner:
             start = controller.read_meta(value("--branch-from"))
             epoch, playing = start["epoch"], start["growth"]["playing"]
             trained = list(start["growth"]["trained"])
-        for e in range(epoch, last):
+            if "--take-over" in args:
+                playing += 1
+        for _ in range(epoch, last):
             for i in (playing, playing + 1):
                 if i < len(nets):
                     trained[i] += 1
-            if (
-                "--grow-manual" not in args
-                and self.caught_up_at is not None
-                and e + 1 >= self.caught_up_at
-                and playing + 1 < len(nets)
-            ):
-                playing += 1
         directory.mkdir(parents=True)
         for net in nets[playing : playing + 2]:
             (directory / controller.net_name(net)).mkdir()
             (directory / controller.net_name(net) / f"{last - 1}.eqx").touch()
         growth = {"playing": playing, "trained": trained, "values": []}
-        meta = {"epoch": last, "growth": growth}
+        caught_up = (
+            None
+            if playing + 1 >= len(nets)
+            else self.caught_up_at is not None and last >= self.caught_up_at
+        )
+        meta = {"epoch": last, "growth": growth, "growth_caught_up": caught_up}
         np.savez(directory / f"state-{last}.npz", meta=np.array(json.dumps(meta)))
 
 
@@ -345,12 +347,12 @@ def test_a_period_branches_on_the_search_and_keeps_the_winner(tmp_path):
     assert "--branch-from" not in trunk and trunk[trunk.index("--sims") + 1] == "63"
     assert trunk[trunk.index("--epochs") + 1] == "2"
     assert ["--grow", BIG] == trunk[2:4]
-    # the next must pull away on loss, and be no worse on the engine set; no network takes over
-    # in a branch
+    # the next is tested once it has caught up on loss, no worse on the engine set; no network
+    # takes over by itself
     assert trunk[trunk.index("--grow-metric") + 1] == "loss"
-    assert trunk[trunk.index("--grow-margin") + 1] == "0.01"
+    assert trunk[trunk.index("--grow-margin") + 1] == "0"
     assert trunk[trunk.index("--grow-guard") + 1] == "engine_value_mse"
-    assert "--grow-manual" not in trunk
+    assert "--grow-manual" in trunk
     assert trunk[-2:] == ["--seed", "1"]
     # a constant learning rate, 5e-4 unless the config says otherwise
     lr = trunk.index("--lr")
@@ -407,14 +409,94 @@ def test_a_period_branches_on_the_search_and_keeps_the_winner(tmp_path):
     assert "period 2" in status and "+60" in status
 
 
-def test_the_next_network_takes_over_in_a_trunk_once_it_catches_up(tmp_path):
+def test_size_branches_match_on_benchmarked_time(tmp_path):
+    c = config(tmp_path)
+    stay, grow = controller.size_epochs(c, Search(63), 0, BENCH, c.buffer)
+    # grow fills its buffer once (2 epochs) with 4x64 playing alone; stay, 2x32 playing beside
+    # 4x64, takes the epochs of the same time: more
+    assert grow == 2
+    assert stay == round(2 * (16.384 + 0.256 * 30) / (8.192 + 0.256 * 40)) == 3
+
+
+def test_a_caught_up_network_is_tested_at_equal_compute_and_the_run_grows_if_it_wins(
+    tmp_path,
+):
     run_dir = tmp_path / "run"
-    # 4x64 catches up after the trunk's first epoch
+    # 4x64 has caught up by the first trunk's end; growing into it wins by 60
     queue, runner = FakeQueue(), FakeRunner(caught_up_at=1)
-    league = FakeLeague(lambda a, b: 0.0)
+    league = FakeLeague(lambda a, b: 60.0 if "grow" in a else 0.0)
+    Controller.init(
+        run_dir, config(tmp_path), queue=queue, runner=runner, league=league
+    ).start()
+
+    steps = drain(run_dir, queue, runner, league)
+
+    # the run grew: 4x64, the last, plays period 1, which tests sims
+    assert steps == [
+        "bench",
+        "p000-trunk",
+        "p000-stay",
+        "p000-grow",
+        "p000-size",
+        "p001-trunk",
+        "p001-stay",
+        "p001-double",
+        "p001-sims",
+    ]
+    args = {Path(a[a.index("--ckpt-dir") + 1]).name: a for a in runner.calls}
+    trunk_state = str(run_dir / "p000-trunk" / "state-2.npz")
+    stay, grow = args["p000-stay"], args["p000-grow"]
+    # 4x64 takes over in grow from its start, for 1 turnover; stay goes on for the same time
+    assert (
+        grow[grow.index("--branch-from") + 1] == trunk_state and "--take-over" in grow
+    )
+    assert "--take-over" not in stay
+    assert grow[grow.index("--sims") + 1] == stay[stay.index("--sims") + 1] == "63"
+    assert grow[grow.index("--epochs") + 1] == "4"
+    assert stay[stay.index("--epochs") + 1] == str(2 + 3)
+    ctl = Controller(run_dir, queue, runner, league)
+    assert ctl.step("p000-grow")["players"] == [[0, 2, 2], [1, 2, 4]]
+    assert ctl.step("p000-grow")["compute"]["seconds"] == pytest.approx(
+        2 * (16.384 + 0.256 * 30)
+    )
+    # grow's 4x64 against stay's 2x32 decides; then against stay's 4x64, trained beside it
+    assert [m[:2] for m in league.matches[:2]] == [
+        ("4x64-ctl-p000-grow-e4@128", "2x32-ctl-p000-stay-e5@128"),
+        ("4x64-ctl-p000-grow-e4@128", "4x64-ctl-p000-stay-e5@128"),
+    ]
+    assert league.retired[:3] == [
+        "4x64-ctl-p000-grow-e4@128",
+        "2x32-ctl-p000-stay-e5@128",
+        "4x64-ctl-p000-stay-e5@128",
+    ]
+    made = decisions(run_dir)
+    assert [
+        (d["period"], d["question"], d["decision"], d["playing"]) for d in made
+    ] == [
+        (0, "size", "grow", "4x64"),
+        (1, "sims", "stay", "4x64"),
+    ]
+    assert made[0]["margin"] == 30.0 and made[0]["elo"] == pytest.approx(60, abs=5)
+    # the next trunk goes on from grow's state, 4x64 playing; the states no branch can start
+    # from are gone
+    nxt = args["p001-trunk"]
+    assert nxt[nxt.index("--branch-from") + 1] == str(
+        run_dir / "p000-grow" / "state-4.npz"
+    )
+    assert "--take-over" not in nxt
+    assert not (run_dir / "p000-stay" / "state-5.npz").exists()
+    assert not (run_dir / "p000-trunk" / "state-2.npz").exists()
+
+
+def test_a_network_that_loses_its_size_test_waits_while_the_next_period_tests_sims(
+    tmp_path,
+):
+    run_dir = tmp_path / "run"
+    queue, runner = FakeQueue(), FakeRunner(caught_up_at=1)
+    league = FakeLeague(lambda a, b: -10.0)
     Controller.init(
         run_dir,
-        config(tmp_path, max_periods=1),
+        config(tmp_path, max_periods=3),
         queue=queue,
         runner=runner,
         league=league,
@@ -422,41 +504,28 @@ def test_the_next_network_takes_over_in_a_trunk_once_it_catches_up(tmp_path):
 
     steps = drain(run_dir, queue, runner, league)
 
-    # no series decides it
-    assert steps == ["bench", "p000-trunk", "p000-stay", "p000-double", "p000-sims"]
+    # caught up throughout: size, then sims, then size again
+    assert steps[1:] == [
+        "p000-trunk",
+        "p000-stay",
+        "p000-grow",
+        "p000-size",
+        "p001-trunk",
+        "p001-stay",
+        "p001-double",
+        "p001-sims",
+        "p002-trunk",
+        "p002-stay",
+        "p002-grow",
+        "p002-size",
+    ]
+    assert [(d["question"], d["decision"]) for d in decisions(run_dir)] == [
+        ("size", "stay"),
+        ("sims", "stay"),
+        ("size", "stay"),
+    ]
     ctl = Controller(run_dir, queue, runner, league)
-    trunk = ctl.step("p000-trunk")
-    assert trunk["players"] == [[0, 0, 1], [1, 1, 2]]
-    # its compute: an epoch of 2x32 playing beside 4x64, then one of 4x64 alone
-    assert trunk["compute"]["seconds"] == pytest.approx(
-        (8.192 + 0.256 * (10 + 30)) + (16.384 + 0.256 * 30)
-    )
-    assert trunk["compute"]["train_samples"] == {
-        "2x32": 4096 * 256,
-        "4x64": 2 * 4096 * 256,
-    }
-    assert ctl.head.playing == 1
-    assert [d for d in decisions(run_dir) if d["question"] == "size"] == [
-        {
-            "time": decisions(run_dir)[0]["time"],
-            "period": 0,
-            "question": "size",
-            "a": "4x64",
-            "b": "2x32",
-            "epoch": 1,
-            "step": "p000-trunk",
-            "decision": "switch",
-        }
-    ]
-    # the branches go on with 4x64 playing, matched on its compute; only its series
-    args = {Path(a[a.index("--ckpt-dir") + 1]).name: a for a in runner.calls}
-    stay = args["p000-stay"]
-    assert stay[stay.index("--epochs") + 1] == str(
-        2 + round(2 * (32.768 + 7.68) / (16.384 + 7.68))
-    )
-    assert [m[:2] for m in league.matches] == [
-        ("4x64-ctl-p000-double-e4@128", "4x64-ctl-p000-stay-e5@128")
-    ]
+    assert ctl.head.playing == 0
 
 
 def test_a_rating_step_that_gives_way_goes_back_in_the_queue(tmp_path):
@@ -652,11 +721,9 @@ def test_a_run_from_before_the_ladder_climbs_it_in_period_order(tmp_path):
         run_dir, config(tmp_path), queue=queue, runner=runner, league=league
     ).start()
     drain(run_dir, queue, runner, league)
-    # as if from before the ladder: no ladder steps, and sims steps that don't say what they kept
+    # as if from before the ladder: no ladder steps
     data = json.loads((run_dir / "controller.json").read_text())
     data["config"]["ladder"] = LADDER
-    for step in data["steps"].values():
-        step.pop("kept", None)
     (run_dir / "controller.json").write_text(json.dumps(data))
     done = len(queue.submitted)
 

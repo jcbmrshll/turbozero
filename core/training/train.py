@@ -1927,6 +1927,13 @@ class Trainer:
                 for progress in state.lr_plateau
             ],
             "growth": asdict(state.growth) if state.growth is not None else None,
+            # whether the next network has caught up by the rule (e.g. for a controller to
+            # decide what a manual rule only reports), None when the last network plays
+            "growth_caught_up": self.growth.caught_up(state.growth)
+            if self.growth is not None
+            and state.growth is not None
+            and state.growth.playing < len(self.growth.learners)
+            else None,
             "seconds": state.seconds,
             "averages": {
                 "horizons": list(self.averages),

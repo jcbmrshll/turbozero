@@ -2747,10 +2747,12 @@ def test_a_manual_rule_reports_and_a_branch_hands_self_play_over(
     trunk_calls = fake_loop(trunk)
     trunk.train_loop(seed=0, num_epochs=6)
 
-    # nothing takes over by itself; the rule reports n1 caught up after epoch 5
+    # nothing takes over by itself; the rule reports n1 caught up after epoch 5, and the saved
+    # state records it, for a controller to read
     assert {c.evaluator.tag for c in of_kind(trunk_calls, "collect")} == {0.0}
     assert logged(monitor, "growth_caught_up") == {1: 0, 2: 0, 3: 0, 4: 0, 5: 1}
     assert not logged(monitor, "growth_switch")
+    assert read_state_meta(state_path(str(tmp_path / "trunk"), 6))["growth_caught_up"]
 
     branch, _ = growth_trainer(
         env, tmp_path / "branch", SCRIPTS, growth_kwargs={"manual": True}

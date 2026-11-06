@@ -380,8 +380,8 @@ With `--grow-switch-at EPOCHS`, it takes over after fixed numbers of epochs inst
 a playing network whose `--lr-plateau-stop` rule is done hands over rather than stopping the
 run. A waiting network trains at `--lr`, and follows `--lr-plateau` from its first rate once it
 plays. With `--grow-manual`, nothing takes over by itself: the run logs `growth_caught_up` (1 once
-the rule would switch), and the next network takes over in a branch of the run, with
-`--branch-from` and `--take-over` (see the run controller below).
+the rule would switch), saved states record it too, and the next network takes over in a branch
+of the run, with `--branch-from` and `--take-over` (see the run controller below).
 
 Each network's checkpoints go to `--ckpt-dir/<its size>`, e.g. `runs/grow/2x32` and `runs/grow/4x64`.
 Saved states hold every network, in `--ckpt-dir`. Each network's metrics are logged as
@@ -402,6 +402,18 @@ uv run examples/othello/train.py --net resnet:2x32,pool_every=2,heads=pooled,poo
     --lr-plateau --lr-plateau-stop --epochs 600 --ckpt-dir runs/grow
 ```
 
+### Weight averages
+
+At a constant learning rate the network's weights jitter from epoch to epoch, and so does its
+play: KataGo played and rated averaged weights. `--average-epochs 4 16` keeps averages of each
+network's weights over about 4 and 16 epochs: the mean of the epochs so far, then an exponential
+moving average that moves 1/H of the way to each epoch's weights. Training itself is unchanged,
+and so is the run's rng: a run with averages is the run without them, plus each average's
+checkpoints in `avg<H>` in the network's checkpoint directory (e.g. `runs/grow/8x128/avg4`) and
+its scores on the engine-labelled set, `avg<H>/engine_*`. Saved states keep them; a state saved
+without them starts them at its weights. `--selfplay-average 4` has self-play play with the
+4-epoch average instead of the current weights.
+
 ### The run controller
 
 `controller.py` runs a long growing run in steps, each its own entry in slick's GPU queue, so
@@ -409,18 +421,31 @@ other work can be slotted in between them, and decides between steps what the ru
 Each period:
 
 1. **Trunk**: the run trains on at its current settings, for `trunk_turnovers` turnovers of
-   its replay buffer. The next network takes over during it once it pulls away: its training
-   loss on the data both train on, averaged over growth's window, lower than the playing one's
-   by `grow_margin` (1%) of it, and no worse on `grow_guard`, the engine set's value error on
-   positions neither trains on (`--grow-metric loss --grow-margin 0.01 --grow-guard
-   engine_value_mse`). Two networks in lockstep don't switch: the bigger one costs more per
-   move. A switch goes in `decisions.jsonl` with its epoch.
-2. **Sims**: two branches of the run (`--branch-from`), at equal compute, in which no network
-   takes over (`--grow-manual`), so that they compare the same networks. `double` searches
-   twice the iterations, both budgets with playout cap randomization, for `branch_turnovers`
-   turnovers of its buffer. `stay` keeps the search for as many epochs as cost the same. Their
-   playing networks play a series (and the next ones another), and the run goes on from
-   `double` if it scores `sims_margin` Elo (30) or more, else from `stay`.
+   its replay buffer, the next network training beside the one playing. No network takes over
+   in a trunk (`--grow-manual`): the next's training loss on the data both train on, averaged
+   over growth's window, only says whether it's worth testing, once it has caught up (lower
+   than the playing one's by `grow_margin`, 0 by default, KataGo's rule) and is no worse on
+   `grow_guard`, the engine set's value error on positions neither trains on. The trunk's saved
+   state records it (`growth_caught_up`).
+2. **A test**: two branches of the run (`--branch-from`) at equal benchmarked compute, whose
+   playing networks play a series; the run goes on from the one that wins it. A period tests
+   one thing:
+   - **Size**, if the next network has caught up and the last period didn't test size. In
+     `grow` the next plays (`--take-over`) for `branch_turnovers` turnovers of its buffer; in
+     `stay` the one playing goes on for as many epochs as cost the same, more epochs, its
+     self-play and training being cheaper. The bigger network is only worth growing into if it
+     beats the smaller one's training at equal compute, since a generator's speed counts as
+     well as its quality: the run grows if `grow`'s network scores `size_margin` Elo (30) or
+     more against `stay`'s. A second series plays it against itself as it trained in `stay`,
+     on the other's games: what playing its own was worth.
+   - **Sims**, otherwise: `double` searches twice the iterations, both budgets with playout
+     cap randomization, for `branch_turnovers` turnovers of its buffer, and `stay` keeps the
+     search for as many epochs as cost the same; no network takes over in either, so that
+     they compare the same networks. The run doubles if `double`'s network scores
+     `sims_margin` Elo (30) or more (the next networks play a series too).
+
+   One branch of each test is thrown away, so testing costs compute: longer trunks
+   (`trunk_turnovers`) test less often.
 3. **Ladder**: the network the run kept plays the league's Edax players in turn (`ladder`,
    edax-L1 up to edax-L24), a series each, from the rung the last period lost to, on to the next
    while it scores over half. Its games put the kept line on the league's scale.
