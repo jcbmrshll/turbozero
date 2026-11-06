@@ -86,9 +86,10 @@ class Growth:
     without playing (off-policy). When the next takes over, the one that played stops, and the
     one after starts training from scratch on the buffer as it is.
 
-    The next takes over when its `metric` (a metric its testers log every epoch, lower being
-    better, e.g. a `ScoredPositionsTester`'s "engine_value_mse" on fixed positions: a fair test
-    of a network that doesn't play), averaged over the last `window` epochs, is at or below the
+    The next takes over when its `metric` (a metric its testers or its training log every epoch,
+    lower being better: e.g. a `ScoredPositionsTester`'s "engine_value_mse" on fixed positions,
+    a fair test of a network that doesn't play, or the training "loss" on the data both train
+    on, which KataGo compared), averaged over the last `window` epochs, is at or below the
     playing network's, once it has trained `min_epochs` epochs. Or, with `switch_at`, after
     fixed numbers of epochs regardless. Either way it takes over when the playing network's
     learning rate rule (the Trainer's `lr_plateau`) would stop the run: a network done
@@ -104,7 +105,8 @@ class Growth:
     Attributes:
         first: the name of the Trainer's own network (see `Learner.name`)
         learners: the networks to grow into, in order
-        metric: what the rule compares, a metric every learner's testers log every epoch
+        metric: what the rule compares, a metric every learner's testers or training log
+            every epoch
         window: epochs the metric is averaged over
         min_epochs: epochs the next learner trains before it can take over
         switch_at: (optional) instead of the rule, the numbers of epochs done after which each

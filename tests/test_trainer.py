@@ -2403,8 +2403,12 @@ def growth_trainer(env, ckpt_dir, scripts, growth_kwargs=None, **kwargs):
     growth = Growth(
         first="n0",
         learners=learners,
-        metric="probe_error",
-        **{"window": 2, "min_epochs": 2, **(growth_kwargs or {})},
+        **{
+            "metric": "probe_error",
+            "window": 2,
+            "min_epochs": 2,
+            **(growth_kwargs or {}),
+        },
     )
     trainer = make_trainer(
         env,
@@ -2817,3 +2821,19 @@ def test_a_branch_takes_its_trainers_buffer_capacity(env, tmp_path, fake_loop, c
     assert (
         read_state_meta(state_path(str(tmp_path / "branch"), 3))["buffer_capacity"] == 4
     )
+
+
+def test_growth_can_follow_the_training_loss(env, tmp_path, fake_loop):
+    # KataGo's rule: the training loss on the data both train on. The fake trains every network
+    # to a loss of 0, so each catches up as soon as it has its minimum epochs and a full window:
+    # n1 after epoch 1, and n2, which starts then, after epoch 3
+    trainer, _ = growth_trainer(
+        env, tmp_path, SCRIPTS, growth_kwargs={"metric": "loss"}
+    )
+    calls = fake_loop(trainer)
+
+    output = trainer.train_loop(seed=0, num_epochs=4)
+
+    assert [c.evaluator.tag for c in of_kind(calls, "collect")] == [0.0] * 3 + [1.0] * 2
+    assert output.growth is not None
+    assert (output.growth.playing, output.growth.trained) == (2, (2, 4, 2))

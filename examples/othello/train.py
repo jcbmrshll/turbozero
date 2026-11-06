@@ -249,10 +249,11 @@ def main():
     parser.add_argument(
         "--grow-metric",
         default="engine_value_mse",
-        choices=["engine_value_mse", "engine_exp_regret"],
+        choices=["engine_value_mse", "engine_exp_regret", "loss"],
         help="with --grow, what decides when the next network takes over: its error on the "
-        "engine-labelled set (scored every epoch, --engine-eval-every 1), averaged over "
-        "--grow-window epochs, at or below the playing network's",
+        "engine-labelled set (scored every epoch, --engine-eval-every 1), or its training loss "
+        "on the data both train on (KataGo's rule), averaged over --grow-window epochs, at or "
+        "below the playing network's",
     )
     parser.add_argument(
         "--grow-window",
@@ -839,7 +840,11 @@ def main():
         )
     if args.grow_manual and args.grow_switch_at is not None:
         parser.error("--grow-manual and --grow-switch-at are different rules: pass one")
-    if args.grow and args.grow_switch_at is None and args.engine_eval_every != 1:
+    # the engine set's metrics need it every epoch; the training loss is logged every epoch
+    engine_rule = (
+        args.grow and args.grow_switch_at is None and args.grow_metric != "loss"
+    )
+    if engine_rule and args.engine_eval_every != 1:
         parser.error(
             f"--grow's rule needs {args.grow_metric} every epoch: --engine-eval-every 1"
         )
@@ -906,7 +911,7 @@ def main():
         parser.error(
             f"--lr-plateau-metric {args.lr_plateau_metric} needs an engine-labelled set"
         )
-    if engine_set is None and args.grow and args.grow_switch_at is None:
+    if engine_set is None and engine_rule:
         parser.error(
             f"--grow's rule needs an engine-labelled set, for {args.grow_metric}"
         )

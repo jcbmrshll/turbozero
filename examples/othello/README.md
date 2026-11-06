@@ -371,7 +371,8 @@ one after that, if any, starts training from scratch on the buffer as it is. So 
 train at a time.
 
 The next network takes over when its `--grow-metric` on the engine-labelled set
-(`engine_value_mse`, scored every epoch) is at or below the playing one's. Each is averaged over
+(`engine_value_mse`, scored every epoch) is at or below the playing one's, or with
+`--grow-metric loss` its training loss on the data both train on, as KataGo's rule had it. Each is averaged over
 the last `--grow-window` (10) epochs, and the next must have trained `--grow-min-epochs` (10) first.
 With `--grow-switch-at EPOCHS`, it takes over after fixed numbers of epochs instead. Either way,
 a playing network whose `--lr-plateau-stop` rule is done hands over rather than stopping the
@@ -406,17 +407,16 @@ other work can be slotted in between them, and decides between steps what the ru
 Each period:
 
 1. **Trunk**: the run trains on at its current settings, for `trunk_turnovers` turnovers of
-   its replay buffer.
-2. **Size**: if the next network has caught up on the engine set's value error (growth's rule,
-   with `--grow-manual`), the two play a series in the Elo league at equal search time a move:
-   the playing network searches as many times more iterations as its forward pass is cheaper.
-   The next takes over if it scores `switch_margin` Elo (0) or more.
-3. **Sims**: two branches of the run (`--branch-from`), at equal compute. `double` searches
+   its replay buffer. The next network takes over during it as KataGo's did, once its training
+   loss on the data both train on, averaged over growth's window, is at or below the playing
+   one's (`--grow-metric loss`). A switch goes in `decisions.jsonl` with its epoch.
+2. **Sims**: two branches of the run (`--branch-from`), at equal compute, in which no network
+   takes over (`--grow-manual`), so that they compare the same networks. `double` searches
    twice the iterations, both budgets with playout cap randomization, for `branch_turnovers`
    turnovers of its buffer. `stay` keeps the search for as many epochs as cost the same. Their
    playing networks play a series (and the next ones another), and the run goes on from
    `double` if it scores `sims_margin` Elo (30) or more, else from `stay`.
-4. **Ladder**: the network the run kept plays the league's Edax players in turn (`ladder`,
+3. **Ladder**: the network the run kept plays the league's Edax players in turn (`ladder`,
    edax-L1 up to edax-L24), a series each, from the rung the last period lost to, on to the next
    while it scores over half. Its games put the kept line on the league's scale.
 

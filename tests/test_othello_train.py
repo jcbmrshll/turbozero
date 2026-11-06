@@ -297,3 +297,9 @@ def test_a_manual_rule_reaches_growth(monkeypatch, tmp_path):
             str(tmp_path / "set.npz"),
         )
     assert built.value.kwargs["growth"].manual
+
+
+def test_growth_on_the_training_loss_needs_no_engine_set(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, "--grow", "resnet:2x8", "--grow-metric", "loss")
+    assert built.value.kwargs["growth"].metric == "loss"

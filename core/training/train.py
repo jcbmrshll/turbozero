@@ -3031,22 +3031,21 @@ class Trainer:
             # growth: does the next network take over?
             if growth is not None and self.growth is not None:
                 metric = self.growth.metric
-                if not self.growth.switch_at and any(
-                    metric not in tested[i] for i in training
-                ):
+                # a tester's metric, or the network's training's (e.g. its loss)
+                values = {
+                    i: float(source[i][metric])
+                    for i in training
+                    for source in (tested, train_metrics)
+                    if metric in source[i]
+                }
+                if not self.growth.switch_at and len(values) < len(training):
                     raise ValueError(
                         f"growth's metric {metric!r} wasn't logged at epoch {cur_epoch} by "
-                        "every network that trains: their testers must log it every epoch"
+                        "every network that trains: their testers or training must log it "
+                        "every epoch"
                     )
                 check = self.growth.after_epoch(
-                    growth,
-                    cur_epoch + 1,
-                    {
-                        i: float(tested[i][metric])
-                        for i in training
-                        if metric in tested[i]
-                    },
-                    rule_done=stop,
+                    growth, cur_epoch + 1, values, rule_done=stop
                 )
                 growth = check.progress
                 growth_metrics: dict = {"growth_playing": playing}
