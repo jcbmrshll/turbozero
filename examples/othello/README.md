@@ -344,6 +344,22 @@ its own `--lr`: to carry on at 1e-4, fork with `--lr 1e-4 --lr-plateau 1e-5`.
 uv run examples/othello/train.py --epochs 600 --lr-plateau --save-state-every 10 --ckpt-dir runs/plateau
 ```
 
+`--branch-from` continues a run from a state in a new `--ckpt-dir`, with other self-play
+settings: a branch of the run rather than a new one. It goes on at the state's epoch (`--epochs`
+counts the epochs before it too), with every network and optimizer state, the learning rate
+rule's and growth's progress, the buffers, the games in progress and the rng. Only a search of
+another size starts its trees anew, its moves in progress searched again; with the run's own
+settings a branch continues it exactly. Two branches of one state, one at `--sims 128` and one
+at `--sims 64`, compare the two at the same point of the same run. It works for runs with
+`--grow`, which can't be forked, and `--take-over` hands self-play to the next network from
+the branch's first epoch. The replay buffers' capacity must be the run's. The branch logs to a
+seaglass run of its own, whose config records the state as `parent`.
+
+```
+uv run examples/othello/train.py --epochs 180 --sims 128 --branch-from runs/trunk/state-150.npz \
+    --save-state-at 180 --ckpt-dir runs/trunk150-sims128
+```
+
 ### Growing the network
 
 Self-play costs far more than training. KataGo started with small nets and trained the next
@@ -359,7 +375,9 @@ the last `--grow-window` (10) epochs, and the next must have trained `--grow-min
 With `--grow-switch-at EPOCHS`, it takes over after fixed numbers of epochs instead. Either way,
 a playing network whose `--lr-plateau-stop` rule is done hands over rather than stopping the
 run. A waiting network trains at `--lr`, and follows `--lr-plateau` from its first rate once it
-plays.
+plays. With `--grow-manual`, nothing takes over by itself: the run logs `growth_caught_up` (1 once
+the rule would switch), and the next network takes over in a branch of the run, with
+`--branch-from` and `--take-over` (see the run controller below).
 
 Each network's checkpoints go to `--ckpt-dir/<its size>`, e.g. `runs/grow/2x32` and `runs/grow/4x64`.
 Saved states hold every network, in `--ckpt-dir`. Each network's metrics are logged as
@@ -368,13 +386,73 @@ network played (`growth_playing`), the next's mean metric minus the playing one'
 and the switch (`growth_switch`). Every run logs its compute per epoch, to compare runs at equal
 GPU time: `selfplay_seconds`, `train_seconds` and `test_seconds` (with `--grow`, each network's
 as `<its size>/train_seconds` and `<its size>/test_seconds`), `epoch_seconds`, and the run's total,
-`run_seconds`.
+`run_seconds`. It also logs it in network evaluations, which don't depend on the hardware:
+`selfplay_evals`, the positions self-play evaluated (search cycles times environments, since
+every environment pays every cycle), and `train_samples`, the samples trained on (with
+`--grow`, each network's as `<its size>/train_samples`, and the evaluations under the playing
+one's name too).
 
 ```
 uv run examples/othello/train.py --net resnet:2x32,pool_every=2,heads=pooled,pool_channels=8 \
     --grow resnet:4x64,pool_every=2,heads=pooled,pool_channels=16 --engine-eval-every 1 \
     --lr-plateau --lr-plateau-stop --epochs 600 --ckpt-dir runs/grow
 ```
+
+### The run controller
+
+`controller.py` runs a long growing run in steps, each its own entry in slick's GPU queue, so
+other work can be slotted in between them, and decides between steps what the run does next.
+Each period:
+
+1. **Trunk**: the run trains on at its current settings, for `trunk_turnovers` turnovers of
+   its replay buffer.
+2. **Size**: if the next network has caught up on the engine set's value error (growth's rule,
+   with `--grow-manual`), the two play a series in the Elo league at equal search time a move:
+   the playing network searches as many times more iterations as its forward pass is cheaper.
+   The next takes over if it scores `switch_margin` Elo (0) or more.
+3. **Sims**: two branches of the run (`--branch-from`), at equal compute. `double` searches
+   twice the iterations, both budgets with playout cap randomization, for `branch_turnovers`
+   turnovers of its buffer. `stay` keeps the search for as many epochs as cost the same. Their
+   playing networks play a series (and the next ones another), and the run goes on from
+   `double` if it scores `sims_margin` Elo (30) or more, else from `stay`.
+
+Compute is counted in network evaluations (self-play's positions evaluated, the samples each
+network trains on) and in benchmarked GPU time: the first step times each network's forward
+pass at self-play's batch and its training step at training's (`bench_nets.py`), and a step's
+time is those times its evaluations and steps. Flat costs (moving the games, writing the
+buffer, compiling) aren't counted. The losing branch counts in what the run spent (`spent`), not
+in the line of states it kept (`kept`). Decisions, with their series, go to `decisions.jsonl`.
+
+The config is JSON: the networks, smallest first, the search to start with (`full`, or with
+playout cap randomization `full`, `fast`, `full_probability` and `cycles`, train.py's
+`--selfplay-cycles`), train.py's other arguments, and the steps' frozen worktree (with
+`./install.sh`'s CUDA environment) and the slick task's worktree to queue from. See
+`controller.Config` for the rest.
+
+```json
+{
+  "name": "grow1",
+  "nets": ["resnet:4x64,pool_every=2,heads=pooled,pool_channels=16",
+           "resnet:6x96,pool_every=2,heads=pooled,pool_channels=24"],
+  "search": {"full": 127, "fast": 31, "full_probability": 0.25, "cycles": 8320},
+  "buffer": 326,
+  "train_args": ["--lr-final", "1e-3"],
+  "worktree": "~/worktrees/turbozero/grow1-frozen",
+  "queue_cwd": "~/worktrees/turbozero/<the task's worktree>"
+}
+```
+
+```
+uv run examples/othello/controller.py init runs/grow1 --config grow1.json
+uv run examples/othello/controller.py start runs/grow1
+uv run examples/othello/controller.py status runs/grow1
+uv run examples/othello/controller.py stop runs/grow1             # after the steps queued now
+uv run examples/othello/controller.py retry runs/grow1 p003-double
+```
+
+A rating step runs the league's player in its own queue entry, playing only requested series,
+from the league's frozen worktree. If something queued at its priority or above takes the GPU
+first, the step goes back in the queue. Its players are retired once their series are done.
 
 ### Training on Modal
 

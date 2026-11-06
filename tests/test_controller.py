@@ -1,0 +1,503 @@
+"""The Othello run controller (examples/othello/controller.py): its search and compute
+arithmetic, and whole periods with fakes for the queue, train.py and the league."""
+
+import json
+import math
+import shlex
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+from example_modules import load_example
+
+from core.training.growth import Growth, GrowthProgress, Learner
+
+controller = load_example("othello", "controller")[0]
+Config, Search, Controller = controller.Config, controller.Search, controller.Controller
+
+SMALL, BIG = "resnet:2x32", "resnet:4x64"
+BENCH = {
+    SMALL: {
+        "net": SMALL,
+        "forward_ms": 1.0,
+        "train_step_ms": 10.0,
+        "forward_batch": 1024,
+    },
+    BIG: {
+        "net": BIG,
+        "forward_ms": 2.0,
+        "train_step_ms": 30.0,
+        "forward_batch": 1024,
+    },
+}
+
+
+def config(tmp_path, **kwargs):
+    return Config(
+        **{
+            "name": "ctl",
+            "nets": [SMALL, BIG],
+            "search": Search(63),
+            "worktree": str(tmp_path / "frozen"),
+            "queue_cwd": str(tmp_path / "task"),
+            "train_args": ["--lr-final", "1e-3"],
+            # 2 epochs of 128 moves
+            "buffer": 256,
+            "trunk_turnovers": 1.0,
+            "branch_turnovers": 1.0,
+            "max_periods": 2,
+            **kwargs,
+        }
+    )
+
+
+# searches and compute
+
+
+def test_a_search_doubles_every_budget_and_an_epochs_cycles():
+    pcr = Search(127, 31, 0.25, 8320)
+    assert pcr.doubled() == Search(255, 63, 0.25, 16640)
+    # an epoch plays and stores the same moves at twice the compute
+    assert pcr.epoch_cycles() == 8320 and pcr.cycles_per_move() == 56
+    assert pcr.stored_per_epoch() == pytest.approx(8320 / 56 * 0.25)
+    assert pcr.doubled().stored_per_epoch() == pytest.approx(pcr.stored_per_epoch())
+    assert pcr.train_args() == [
+        "--sims",
+        "127",
+        "--playout-cap",
+        "0.25:31",
+        "--selfplay-cycles",
+        "8320",
+        "--advance-every",
+        "32",
+    ]
+    assert pcr.label() == "pcr25x127-31s"
+    uniform = Search(63)
+    assert uniform.doubled() == Search(127)
+    assert uniform.epoch_cycles() == 128 * 64 and uniform.stored_per_epoch() == 128
+    assert uniform.train_args() == ["--sims", "63"] and uniform.label() == "63s"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"full": 0},
+        {"full": 127, "fast": 31},
+        {"full": 127, "full_probability": 0.5},
+        {"full": 127, "fast": 127, "full_probability": 0.25, "cycles": 8320},
+        {"full": 127, "fast": 31, "full_probability": 0.25, "cycles": 8321},
+    ],
+)
+def test_bad_searches_are_refused(kwargs):
+    with pytest.raises(ValueError):
+        Search(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"train_args": ["--sims", "64"]}, "sets these itself"),
+        ({"train_args": ["--epochs=5"]}, "sets these itself"),
+        ({"games": 401}, "even"),
+        ({"nets": [SMALL, "resnet:2x32,heads=pooled"]}, "must differ"),
+        ({"trunk_turnovers": 0}, "positive"),
+    ],
+)
+def test_bad_configs_are_refused(tmp_path, kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        config(tmp_path, **kwargs)
+
+
+def test_an_epochs_compute_is_its_networks_evaluations_and_steps(tmp_path):
+    c = config(tmp_path)
+    compute = controller.epoch_compute(c, Search(63), 0, BENCH)
+    # 2x32 evaluates 128 moves x 64 cycles at 1 ms a cycle; both networks take 256 steps
+    assert compute["seconds"] == pytest.approx(8.192 + 0.256 * (10 + 30))
+    assert compute["selfplay_evals"] == 8192 * 1024
+    assert compute["train_samples"] == {"2x32": 256 * 4096, "4x64": 256 * 4096}
+    # the last network plays and trains alone
+    alone = controller.epoch_compute(c, Search(63), 1, BENCH)
+    assert alone["seconds"] == pytest.approx(16.384 + 0.256 * 30)
+    assert alone["train_samples"] == {"4x64": 256 * 4096}
+    total = controller.added(controller.scaled(compute, 2), alone)
+    assert total["train_samples"] == {"2x32": 2 * 256 * 4096, "4x64": 3 * 256 * 4096}
+
+
+def test_branches_match_on_benchmarked_time(tmp_path):
+    c = config(tmp_path)
+    stay, double = controller.branch_epochs(c, Search(63), 0, BENCH)
+    # double fills its buffer once (2 epochs); stay takes the epochs of the same time
+    assert double == 2
+    assert stay == round(2 * (16.384 + 10.24) / (8.192 + 10.24))
+
+
+def test_elo_of_a_series():
+    assert controller.elo_of(10, 0, 10) == (
+        0.0,
+        pytest.approx(0.0 + 400 / math.log(10) / 0.25 * 0.5 / math.sqrt(20)),
+    )
+    elo, se = controller.elo_of(150, 0, 50)
+    assert elo == pytest.approx(400 * math.log10(3))
+    assert 0 < se < 30
+    # a clean sweep is clipped, not infinite
+    assert math.isfinite(controller.elo_of(400, 0, 0)[0])
+
+
+def growth_rule(window, min_epochs):
+    learner = Learner(name="b", nn=object(), evaluator=None, evaluator_test=None)  # pyright: ignore[reportArgumentType]
+    return Growth(first="a", learners=[learner], window=window, min_epochs=min_epochs)
+
+
+@pytest.mark.parametrize(
+    "progress",
+    [
+        GrowthProgress(0, (3, 3), ((1.0, 1.0), (0.9, 1.0))),
+        GrowthProgress(0, (3, 1), ((1.0, 1.0), (0.9, 1.0))),
+        GrowthProgress(0, (3, 3), ((1.0, 1.0), (1.1, 1.0))),
+        GrowthProgress(0, (3, 3), ((1.0,), (0.5,))),
+        GrowthProgress(1, (3, 3), ((1.0, 1.0), (0.5, 0.5))),
+    ],
+)
+def test_catching_up_reads_saved_states_as_growth_does(progress):
+    rule = growth_rule(window=2, min_epochs=2)
+    meta = {
+        "growth": {
+            "playing": progress.playing,
+            "trained": list(progress.trained),
+            "values": [list(v) for v in progress.values],
+        },
+        "config": {"growth": {"window": 2, "min_epochs": 2}},
+    }
+    assert controller.caught_up(meta) == rule.caught_up(progress)
+
+
+# whole periods, with fakes
+
+
+class FakeQueue:
+    def __init__(self):
+        self.submitted = []
+
+    def submit(self, about, estimate_minutes, command):
+        self.submitted.append(
+            SimpleNamespace(about=about, minutes=estimate_minutes, command=command)
+        )
+
+    def names(self):
+        return [shlex.split(s.command)[-1] for s in self.submitted]
+
+
+class FakeRunner:
+    """Plays train.py and bench_nets.py: a step saves the state and checkpoints it would. The
+    next network has caught up (on the engine set) from epoch `caught_up_at`."""
+
+    def __init__(self, caught_up_at=None):
+        self.caught_up_at = caught_up_at
+        self.calls = []
+
+    def bench(self, nets, args, out):
+        return {n: BENCH[n] for n in nets}
+
+    def train(self, args, log):
+        self.calls.append(args)
+
+        def value(flag):
+            return args[args.index(flag) + 1]
+
+        directory, epochs = Path(value("--ckpt-dir")), int(value("--epochs"))
+        playing = 0
+        if "--branch-from" in args:
+            playing = controller.read_meta(value("--branch-from"))["growth"]["playing"]
+            playing += "--take-over" in args
+        nets = [
+            value("--net"),
+            *(args[i + 1] for i, a in enumerate(args) if a == "--grow"),
+        ]
+        directory.mkdir(parents=True)
+        for net in nets[playing : playing + 2]:
+            (directory / controller.net_name(net)).mkdir()
+            (directory / controller.net_name(net) / f"{epochs - 1}.eqx").touch()
+        ahead = self.caught_up_at is not None and epochs >= self.caught_up_at
+        # the engine set's value error: the next network's is below the playing one's once ahead
+        others = [0.5, 0.5] if ahead else [2.0, 2.0]
+        meta = {
+            "epoch": epochs,
+            "growth": {
+                "playing": playing,
+                "trained": [epochs] * len(nets),
+                "values": [[1.0, 1.0]] * (playing + 1)
+                + [others] * (len(nets) - playing - 1),
+            },
+            "config": {"growth": {"window": 2, "min_epochs": 2}},
+        }
+        np.savez(directory / f"state-{epochs}.npz", meta=np.array(json.dumps(meta)))
+
+
+class FakeLeague:
+    """Records what's registered and asked for; a series' result is `elo(a, b)`, as 200 games
+    (in wins and losses), the first time `play` gives way `give_way` times."""
+
+    def __init__(self, elo, give_way=0):
+        self.elo = elo
+        self.give_way = give_way
+        self.registered, self.matches, self.retired = {}, [], []
+
+    def register(self, name, checkpoint, net, run, sims):
+        self.registered[name] = SimpleNamespace(
+            checkpoint=checkpoint, net=net, run=run, sims=list(sims)
+        )
+
+    def match(self, a, b, games):
+        self.matches.append((a, b, games))
+        return len(self.matches)
+
+    def play(self, requests, seconds, log):
+        if self.give_way:
+            self.give_way -= 1
+            return False
+        return True
+
+    def record(self, a, b):
+        score = 1 / (1 + 10 ** (-self.elo(a, b) / 400))
+        wins = round(200 * score)
+        return wins, 0, 200 - wins
+
+    def retire(self, name):
+        self.retired.append(name)
+
+
+def drain(run_dir, queue, runner, league, limit=40):
+    """Runs the queued steps in order, as the queue would, until none is left."""
+    done = 0
+    while done < len(queue.submitted):
+        assert done < limit
+        Controller(run_dir, queue, runner, league).run(queue.names()[done])
+        done += 1
+    return queue.names()
+
+
+def decisions(run_dir):
+    return [
+        json.loads(line)
+        for line in (run_dir / "decisions.jsonl").read_text().splitlines()
+    ]
+
+
+def test_a_period_branches_on_the_search_and_keeps_the_winner(tmp_path):
+    run_dir = tmp_path / "run"
+    queue, runner = FakeQueue(), FakeRunner()
+    # double wins by 60 in period 0, loses by 10 in period 1
+    league = FakeLeague(lambda a, b: 60.0 if "p000" in a else -10.0)
+    ctl = Controller.init(
+        run_dir, config(tmp_path), queue=queue, runner=runner, league=league
+    )
+    ctl.start()
+
+    steps = drain(run_dir, queue, runner, league)
+
+    assert steps == [
+        "bench",
+        "p000-trunk",
+        "p000-stay",
+        "p000-double",
+        "p000-sims",
+        "p001-trunk",
+        "p001-stay",
+        "p001-double",
+        "p001-sims",
+    ]
+    # each step queued from the frozen worktree, with an estimate
+    assert all(
+        s.command.startswith(
+            f"cd {tmp_path / 'frozen'} && taskset -c 0-7 .venv/bin/python "
+            "examples/othello/controller.py step "
+        )
+        and s.minutes >= 5
+        for s in queue.submitted
+    )
+    args = {Path(a[a.index("--ckpt-dir") + 1]).name: a for a in runner.calls}
+    # the trunk starts from scratch, 1 turnover (2 epochs) at 63 sims
+    trunk = args["p000-trunk"]
+    assert "--branch-from" not in trunk and trunk[trunk.index("--sims") + 1] == "63"
+    assert trunk[trunk.index("--epochs") + 1] == "2"
+    assert ["--grow", BIG] == trunk[2:4] and "--grow-manual" in trunk
+    assert trunk[-2:] == ["--lr-final", "1e-3"]
+    # both branches go on from its state, at equal benchmarked time
+    stay, double = args["p000-stay"], args["p000-double"]
+    trunk_state = str(run_dir / "p000-trunk" / "state-2.npz")
+    for branch in (stay, double):
+        assert branch[branch.index("--branch-from") + 1] == trunk_state
+        assert "--take-over" not in branch
+    assert double[double.index("--sims") + 1] == "127"
+    assert double[double.index("--epochs") + 1] == "4"
+    assert stay[stay.index("--epochs") + 1] == str(2 + 3)
+    # double won: the next trunk goes on from its state, at its search
+    nxt = args["p001-trunk"]
+    assert nxt[nxt.index("--branch-from") + 1] == str(
+        run_dir / "p000-double" / "state-4.npz"
+    )
+    assert nxt[nxt.index("--sims") + 1] == "127"
+    # the series: the playing networks of each branch, then the next ones'
+    assert league.matches[0] == (
+        "2x32-ctl-p000-double-e4@128",
+        "2x32-ctl-p000-stay-e5@128",
+        400,
+    )
+    assert league.matches[1][0] == "4x64-ctl-p000-double-e4@128"
+    registered = league.registered["2x32-ctl-p000-double-e4"]
+    assert registered.checkpoint == str(run_dir / "p000-double" / "2x32" / "3.eqx")
+    assert (registered.net, registered.run, registered.sims) == (
+        SMALL,
+        "ctl-p000-double",
+        [128],
+    )
+    assert set(league.retired) == {name for m in league.matches for name in m[:2]}
+    # the decisions, and the states no branch can start from any more are gone
+    made = decisions(run_dir)
+    assert [(d["period"], d["question"], d["decision"]) for d in made] == [
+        (0, "sims", "double"),
+        (1, "sims", "stay"),
+    ]
+    assert made[0]["elo"] == pytest.approx(60, abs=5)
+    assert not (run_dir / "p000-trunk" / "state-2.npz").exists()
+    assert not (run_dir / "p000-stay" / "state-5.npz").exists()
+    # spent counts every step, kept only the line of states the run went on from
+    data = json.loads((run_dir / "controller.json").read_text())
+    trunk_s = 2 * (8.192 + 10.24)
+    # period 0's trunk and double, period 1's trunk and stay, all but the first at 127 sims
+    assert data["kept"]["seconds"] == pytest.approx(
+        trunk_s + (2 + 2 + 3) * (16.384 + 10.24)
+    )
+    assert data["spent"]["seconds"] > data["kept"]["seconds"]
+    assert data["done"].startswith("after 2 periods")
+    status = Controller(run_dir, queue, runner, league).status()
+    assert "period 2" in status and "+60" in status
+
+
+def test_a_caught_up_network_takes_over_if_it_wins_at_equal_search_time(tmp_path):
+    run_dir = tmp_path / "run"
+    queue, runner = FakeQueue(), FakeRunner(caught_up_at=2)
+
+    def elo(a, b):
+        # the bigger net wins the size series; double never pays
+        return 40.0 if a.startswith("4x64") and b.startswith("2x32") else 0.0
+
+    league = FakeLeague(elo)
+    ctl = Controller.init(
+        run_dir,
+        config(tmp_path, max_periods=1),
+        queue=queue,
+        runner=runner,
+        league=league,
+    )
+    ctl.start()
+
+    steps = drain(run_dir, queue, runner, league)
+
+    assert steps == [
+        "bench",
+        "p000-trunk",
+        "p000-size",
+        "p000-stay",
+        "p000-double",
+        "p000-sims",
+    ]
+    # 4x64 searches 128 iterations, 2x32 as many more as its forward pass is cheaper
+    assert league.matches[0] == (
+        "4x64-ctl-p000-trunk-e2@128",
+        "2x32-ctl-p000-trunk-e2@256",
+        400,
+    )
+    assert league.registered["2x32-ctl-p000-trunk-e2"].sims == [256]
+    args = {Path(a[a.index("--ckpt-dir") + 1]).name: a for a in runner.calls}
+    assert all("--take-over" in args[b] for b in ("p000-stay", "p000-double"))
+    # the branches match on 4x64's compute, playing alone
+    stay = args["p000-stay"]
+    assert stay[stay.index("--epochs") + 1] == str(
+        2 + round(2 * (32.768 + 7.68) / (16.384 + 7.68))
+    )
+    # only 4x64 plays in the branches: one series
+    assert len(league.matches) == 2 and league.matches[1][0].startswith(
+        "4x64-ctl-p000-double"
+    )
+    assert [(d["question"], d["decision"]) for d in decisions(run_dir)] == [
+        ("size", "switch"),
+        ("sims", "stay"),
+    ]
+    data = json.loads((run_dir / "controller.json").read_text())
+    assert data["head"]["playing"] == 1 and data["head"]["search"]["full"] == 63
+
+
+def test_a_rating_step_that_gives_way_goes_back_in_the_queue(tmp_path):
+    run_dir = tmp_path / "run"
+    queue, runner = FakeQueue(), FakeRunner()
+    league = FakeLeague(lambda a, b: 0.0, give_way=1)
+    Controller.init(
+        run_dir,
+        config(tmp_path, max_periods=1),
+        queue=queue,
+        runner=runner,
+        league=league,
+    ).start()
+
+    steps = drain(run_dir, queue, runner, league)
+
+    assert steps == [
+        "bench",
+        "p000-trunk",
+        "p000-stay",
+        "p000-double",
+        "p000-sims",
+        "p000-sims",
+    ]
+    # its series asked for once, its players registered once
+    assert len(league.matches) == 2
+
+
+def test_a_failed_step_is_retried_from_where_it_stopped(tmp_path):
+    run_dir = tmp_path / "run"
+    queue, league = FakeQueue(), FakeLeague(lambda a, b: 0.0)
+
+    class Crashing(FakeRunner):
+        crashed = False
+
+        def train(self, args, log):
+            if "p000-stay" in " ".join(args) and not self.crashed:
+                self.crashed = True
+                # it saved a state on the way, then stopped
+                directory = Path(args[args.index("--ckpt-dir") + 1])
+                directory.mkdir(parents=True)
+                np.savez(directory / "state-3.npz", meta=np.array("{}"))
+                raise RuntimeError("out of memory")
+            super().train(args, log)
+
+    runner = Crashing()
+    Controller.init(
+        run_dir,
+        config(tmp_path, max_periods=1),
+        queue=queue,
+        runner=runner,
+        league=league,
+    ).start()
+    with pytest.raises(RuntimeError, match="out of memory"):
+        drain(run_dir, queue, runner, league)
+    ctl = Controller(run_dir, queue, runner, league)
+    assert ctl.step("p000-stay")["status"] == "failed"
+    assert "out of memory" in ctl.step("p000-stay")["error"]
+
+    ctl.retry("p000-stay")
+    # it goes on from its saved state
+    assert "--resume" in ctl.train_args(ctl.step("p000-stay"))
+    assert "--branch-from" not in ctl.train_args(ctl.step("p000-stay"))
+
+
+def test_stop_queues_nothing_more(tmp_path):
+    run_dir = tmp_path / "run"
+    queue, runner, league = FakeQueue(), FakeRunner(), FakeLeague(lambda a, b: 0.0)
+    Controller.init(
+        run_dir, config(tmp_path), queue=queue, runner=runner, league=league
+    ).start()
+    Controller(run_dir, queue, runner, league).stop()
+
+    assert drain(run_dir, queue, runner, league) == ["bench"]
