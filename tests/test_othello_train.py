@@ -267,6 +267,20 @@ def test_bad_playout_cap_options_are_refused(monkeypatch, options):
         ("--grow", "resnet:1x4,heads=pooled", "--grow-switch-at", "80"),
         # a manual rule without --grow, or with fixed epochs
         ("--grow-manual",),
+        # a margin or guard without --grow; a margin out of range; a guard without the set
+        ("--grow-margin", "0.01"),
+        ("--grow-guard", "engine_value_mse"),
+        ("--grow", "resnet:2x8", "--grow-metric", "loss", "--grow-margin", "1.5"),
+        (
+            "--grow",
+            "resnet:2x8",
+            "--grow-metric",
+            "loss",
+            "--grow-guard",
+            "engine_value_mse",
+            "--engine-set",
+            "no-such-set.npz",
+        ),
         ("--grow", "resnet:2x8", "--grow-manual", "--grow-switch-at", "80"),
         # taking over needs a branch of a run with growth
         ("--grow", "resnet:2x8", "--grow-switch-at", "80", "--take-over"),
@@ -303,3 +317,31 @@ def test_growth_on_the_training_loss_needs_no_engine_set(monkeypatch):
     with pytest.raises(BuiltTrainer) as built:
         run_main(monkeypatch, "--grow", "resnet:2x8", "--grow-metric", "loss")
     assert built.value.kwargs["growth"].metric == "loss"
+
+
+def test_a_margin_and_guard_reach_growth(monkeypatch, tmp_path):
+    from test_engine_set import tiny_set
+
+    tiny_set(np.random.default_rng(0)).save(tmp_path / "set.npz")
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(
+            monkeypatch,
+            "--grow",
+            "resnet:2x8",
+            "--grow-metric",
+            "loss",
+            "--grow-margin",
+            "0.01",
+            "--grow-guard",
+            "engine_value_mse",
+            "--engine-eval-every",
+            "1",
+            "--engine-set",
+            str(tmp_path / "set.npz"),
+        )
+    growth = built.value.kwargs["growth"]
+    assert (growth.metric, growth.margin, growth.guard) == (
+        "loss",
+        0.01,
+        "engine_value_mse",
+    )

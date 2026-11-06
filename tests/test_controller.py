@@ -101,6 +101,8 @@ def test_bad_searches_are_refused(kwargs):
         ({"train_args": ["--lr", "1e-3"]}, "sets these itself"),
         ({"train_args": ["--lr-plateau"]}, "sets these itself"),
         ({"lr": 0}, "positive"),
+        ({"grow_margin": 1.0}, "fraction"),
+        ({"train_args": ["--grow-margin", "0"]}, "sets these itself"),
         ({"games": 401}, "even"),
         ({"nets": [SMALL, "resnet:2x32,heads=pooled"]}, "must differ"),
         ({"trunk_turnovers": 0}, "positive"),
@@ -343,8 +345,11 @@ def test_a_period_branches_on_the_search_and_keeps_the_winner(tmp_path):
     assert "--branch-from" not in trunk and trunk[trunk.index("--sims") + 1] == "63"
     assert trunk[trunk.index("--epochs") + 1] == "2"
     assert ["--grow", BIG] == trunk[2:4]
-    # KataGo's rule in the trunk; no network takes over in a branch
+    # the next must pull away on loss, and be no worse on the engine set; no network takes over
+    # in a branch
     assert trunk[trunk.index("--grow-metric") + 1] == "loss"
+    assert trunk[trunk.index("--grow-margin") + 1] == "0.01"
+    assert trunk[trunk.index("--grow-guard") + 1] == "engine_value_mse"
     assert "--grow-manual" not in trunk
     assert trunk[-2:] == ["--seed", "1"]
     # a constant learning rate, 5e-4 unless the config says otherwise

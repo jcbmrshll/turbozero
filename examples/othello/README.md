@@ -372,7 +372,9 @@ train at a time.
 
 The next network takes over when its `--grow-metric` on the engine-labelled set
 (`engine_value_mse`, scored every epoch) is at or below the playing one's, or with
-`--grow-metric loss` its training loss on the data both train on, as KataGo's rule had it. Each is averaged over
+`--grow-metric loss` its training loss on the data both train on, as KataGo's rule had it.
+`--grow-margin 0.01` makes the next lead by 1% of the playing one's metric, and `--grow-guard
+engine_value_mse` makes it also no worse on the engine set's value error. Each is averaged over
 the last `--grow-window` (10) epochs, and the next must have trained `--grow-min-epochs` (10) first.
 With `--grow-switch-at EPOCHS`, it takes over after fixed numbers of epochs instead. Either way,
 a playing network whose `--lr-plateau-stop` rule is done hands over rather than stopping the
@@ -407,9 +409,12 @@ other work can be slotted in between them, and decides between steps what the ru
 Each period:
 
 1. **Trunk**: the run trains on at its current settings, for `trunk_turnovers` turnovers of
-   its replay buffer. The next network takes over during it as KataGo's did, once its training
-   loss on the data both train on, averaged over growth's window, is at or below the playing
-   one's (`--grow-metric loss`). A switch goes in `decisions.jsonl` with its epoch.
+   its replay buffer. The next network takes over during it once it pulls away: its training
+   loss on the data both train on, averaged over growth's window, lower than the playing one's
+   by `grow_margin` (1%) of it, and no worse on `grow_guard`, the engine set's value error on
+   positions neither trains on (`--grow-metric loss --grow-margin 0.01 --grow-guard
+   engine_value_mse`). Two networks in lockstep don't switch: the bigger one costs more per
+   move. A switch goes in `decisions.jsonl` with its epoch.
 2. **Sims**: two branches of the run (`--branch-from`), at equal compute, in which no network
    takes over (`--grow-manual`), so that they compare the same networks. `double` searches
    twice the iterations, both budgets with playout cap randomization, for `branch_turnovers`

@@ -232,6 +232,16 @@ def latest_state_path(path: str) -> str:
     return state_path(path, epochs[-1])
 
 
+def saved_growth(saved: dict) -> GrowthProgress:
+    """A growth run's progress, as `Trainer.save_state` saved it in a state's metadata."""
+    return GrowthProgress(
+        saved["playing"],
+        tuple(saved["trained"]),
+        tuple(tuple(v) for v in saved["values"]),
+        tuple(tuple(v) for v in saved["guard_values"]),
+    )
+
+
 def read_state_meta(path: str) -> dict:
     """The metadata of a saved state (see `Trainer.save_state`): the epochs done, the run's
     configuration, its monitor run and parent, and what each array is."""
@@ -1894,13 +1904,7 @@ class Trainer:
                     "growth: continuing it needs the same"
                 )
             growth = (
-                GrowthProgress(
-                    meta["growth"]["playing"],
-                    tuple(meta["growth"]["trained"]),
-                    tuple(tuple(v) for v in meta["growth"]["values"]),
-                )
-                if meta["growth"] is not None
-                else None
+                saved_growth(meta["growth"]) if meta["growth"] is not None else None
             )
             playing = growth.playing if growth is not None else 0
             # the evaluator whose states the collection state holds
@@ -2058,11 +2062,7 @@ class Trainer:
                 )
             growth = None
             if self.growth is not None:
-                growth = GrowthProgress(
-                    meta["growth"]["playing"],
-                    tuple(meta["growth"]["trained"]),
-                    tuple(tuple(v) for v in meta["growth"]["values"]),
-                )
+                growth = saved_growth(meta["growth"])
                 if take_over:
                     growth = self.growth.take_over(growth)
             elif take_over:
@@ -3030,28 +3030,38 @@ class Trainer:
                     self.log_learner_metrics(lr_metrics, cur_epoch, playing, playing)
             # growth: does the next network take over?
             if growth is not None and self.growth is not None:
+                # the rule's metrics: a tester's, or the network's training's (e.g. its loss)
+                logged: dict[str, dict[int, float]] = {}
+                for metric in filter(None, (self.growth.metric, self.growth.guard)):
+                    logged[metric] = {
+                        i: float(source[i][metric])
+                        for i in training
+                        for source in (tested, train_metrics)
+                        if metric in source[i]
+                    }
+                    if not self.growth.switch_at and len(logged[metric]) < len(
+                        training
+                    ):
+                        raise ValueError(
+                            f"growth's metric {metric!r} wasn't logged at epoch {cur_epoch} "
+                            "by every network that trains: their testers or training must "
+                            "log it every epoch"
+                        )
                 metric = self.growth.metric
-                # a tester's metric, or the network's training's (e.g. its loss)
-                values = {
-                    i: float(source[i][metric])
-                    for i in training
-                    for source in (tested, train_metrics)
-                    if metric in source[i]
-                }
-                if not self.growth.switch_at and len(values) < len(training):
-                    raise ValueError(
-                        f"growth's metric {metric!r} wasn't logged at epoch {cur_epoch} by "
-                        "every network that trains: their testers or training must log it "
-                        "every epoch"
-                    )
                 check = self.growth.after_epoch(
-                    growth, cur_epoch + 1, values, rule_done=stop
+                    growth,
+                    cur_epoch + 1,
+                    logged[metric],
+                    rule_done=stop,
+                    guard_values=logged.get(self.growth.guard or ""),
                 )
                 growth = check.progress
                 growth_metrics: dict = {"growth_playing": playing}
                 if check.gap is not None:
                     growth_metrics["growth_gap"] = check.gap
                     growth_metrics["growth_caught_up"] = int(check.caught_up)
+                if check.guard_gap is not None:
+                    growth_metrics["growth_guard_gap"] = check.guard_gap
                 if check.switched:
                     growth_metrics["growth_switch"] = growth.playing
                     taking_over = self.learners[growth.playing].name

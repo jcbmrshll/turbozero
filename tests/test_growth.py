@@ -47,6 +47,9 @@ def run(rule, values_by_epoch, rule_done=()):
         ({"switch_at": (5, 5)}, "one increasing"),
         ({"switch_at": (0, 5)}, "one increasing"),
         ({"switch_at": (2, 5), "manual": True}, "pass one"),
+        ({"margin": 1.0}, "fraction"),
+        ({"margin": -0.1}, "fraction"),
+        ({"metric": "loss", "guard": "loss"}, "another metric"),
     ],
 )
 def test_bad_settings_are_errors(kwargs, match):
@@ -139,3 +142,31 @@ def test_take_over_hands_self_play_to_the_next_until_the_last():
     assert rule.training(taken) == (1, 2)
     with pytest.raises(ValueError, match="c is the last network"):
         rule.take_over(rule.take_over(taken))
+
+
+def test_with_a_margin_the_next_must_pull_away():
+    rule = growth(window=1, min_epochs=1, margin=0.01)
+    # level, then 0.5% lower, then 1% lower: only a lead of 1% of the playing one's switches
+    checks = run(rule, [{0: 1.0, 1: 1.0}, {0: 1.0, 1: 0.995}, {0: 1.0, 1: 0.99}])
+    assert [c.caught_up for c in checks] == [False, False, True]
+    assert [c.switched for c in checks] == [False, False, True]
+
+
+def test_with_a_guard_the_next_must_also_be_no_worse_on_it():
+    rule = growth(window=1, min_epochs=1, metric="loss", guard="engine_value_mse")
+
+    def epochs(guards):
+        progress, checks = rule.start(), []
+        for guard in guards:
+            check = rule.after_epoch(
+                progress, len(checks) + 1, {0: 1.0, 1: 0.5}, guard_values=guard
+            )
+            checks.append(check)
+            progress = check.progress
+        return checks
+
+    # ahead on the loss, but worse on the guard: no switch, until it's level on the guard too
+    checks = epochs([{0: 0.4, 1: 0.5}, {0: 0.4, 1: 0.4}])
+    assert [c.switched for c in checks] == [False, True]
+    assert [c.guard_gap for c in checks] == [pytest.approx(0.1), pytest.approx(0.0)]
+    assert checks[0].progress.guard_values[:2] == ((0.4,), (0.5,))

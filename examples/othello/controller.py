@@ -5,9 +5,10 @@ games between its networks in the Elo league (see README.md, "The run controller
 Every period:
 
 1. trunk: the run trains on at its current settings, `trunk_turnovers` turnovers of its replay
-   buffer. The next network takes over self-play during it as KataGo's did, once its training
-   loss on the data both train on, averaged over growth's window, is at or below the playing
-   one's (train.py --grow-metric loss).
+   buffer. The next network takes over self-play during it once it pulls away: its training
+   loss on the data both train on, averaged over growth's window, lower than the playing one's
+   by `grow_margin` of it, and no worse on `grow_guard`, the engine set's value error on
+   positions neither trains on (train.py --grow-metric loss, --grow-margin, --grow-guard).
 2. sims: two branches of the run, at equal compute, in which no network takes over
    (--grow-manual), so that they compare the same networks. `double` searches twice the
    iterations (both budgets, with playout cap randomization) for `branch_turnovers` turnovers
@@ -69,6 +70,8 @@ OWN_ARGS = (
     "--grow",
     "--grow-manual",
     "--grow-metric",
+    "--grow-margin",
+    "--grow-guard",
     "--grow-switch-at",
     "--sims",
     "--sims-schedule",
@@ -253,6 +256,9 @@ class Config:
             sets (`OWN_ARGS`)
         lr: the learning rate, constant through the run, as KataGo held its (train.py --lr and
             --lr-final)
+        grow_margin: the lead in training loss the next network needs to take over, a fraction
+            of the playing one's (train.py --grow-margin)
+        grow_guard: (optional) a metric the next must also be no worse on (--grow-guard)
         buffer: train.py --buffer, positions kept per environment: the replay window, or with
             `window` the one to start with (its `c`)
         window: (optional) grow the replay window by the positions stored so far (see
@@ -290,6 +296,8 @@ class Config:
     queue_cwd: str
     train_args: list[str] = field(default_factory=list)
     lr: float = 5e-4
+    grow_margin: float = 0.01
+    grow_guard: str | None = "engine_value_mse"
     buffer: int = 1125
     window: Window | None = None
     train_steps: int = 256
@@ -323,6 +331,10 @@ class Config:
             raise ValueError(f"the controller sets these itself: {own}")
         if self.lr <= 0:
             raise ValueError(f"the learning rate must be positive, got {self.lr}")
+        if not 0 <= self.grow_margin < 1:
+            raise ValueError(
+                f"grow_margin is a fraction in [0, 1), got {self.grow_margin}"
+            )
         if self.trunk_turnovers <= 0 or self.branch_turnovers <= 0:
             raise ValueError("trunk_turnovers and branch_turnovers must be positive")
         if self.games < 2 or self.games % 2:
@@ -945,8 +957,15 @@ class Controller:
         for net in config.nets[1:]:
             args += ["--grow", net]
         if len(config.nets) > 1:
-            # KataGo's rule: the training loss on the data both train on
-            args += ["--grow-metric", "loss"]
+            # the training loss on the data both train on: the next must pull away
+            args += [
+                "--grow-metric",
+                "loss",
+                "--grow-margin",
+                f"{config.grow_margin:g}",
+            ]
+            if config.grow_guard is not None:
+                args += ["--grow-guard", config.grow_guard]
             if step["branch"] is not None:
                 # no network takes over in a branch, so that two branches compare the same ones
                 args.append("--grow-manual")

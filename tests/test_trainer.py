@@ -2590,6 +2590,7 @@ def test_a_resumed_growth_run_carries_on_where_it_stopped(env, tmp_path, fake_lo
         "playing": 0,
         "trained": [4, 4, 0],
         "values": [[1.0, 1.0], [2.0, 2.0], []],
+        "guard_values": [],
     }
 
 
@@ -2837,3 +2838,43 @@ def test_growth_can_follow_the_training_loss(env, tmp_path, fake_loop):
     assert [c.evaluator.tag for c in of_kind(calls, "collect")] == [0.0] * 3 + [1.0] * 2
     assert output.growth is not None
     assert (output.growth.playing, output.growth.trained) == (2, (2, 4, 2))
+
+
+def test_growth_on_the_loss_with_a_guard_waits_for_both(env, tmp_path, fake_loop):
+    # every network's training loss is 0 (the fake's), so the loss alone would hand over at the
+    # minimum epochs; the guard, each tester's probe_error, holds n1 back until it's ahead there
+    # too, after epoch 5 (see SCRIPTS)
+    monitor = FakeMonitor()
+    trainer, _ = growth_trainer(
+        env,
+        tmp_path,
+        SCRIPTS,
+        growth_kwargs={"metric": "loss", "guard": "probe_error"},
+        monitor=monitor,
+        save_state_at=[4],
+    )
+    fake_loop(trainer)
+
+    output = trainer.train_loop(seed=0, num_epochs=7)
+
+    assert logged(monitor, "growth_switch") == {5: 1}
+    assert logged(monitor, "growth_guard_gap") == {
+        1: pytest.approx(1.0),
+        2: pytest.approx(1.0),
+        3: pytest.approx(1.0),
+        4: pytest.approx(0.25),
+        5: pytest.approx(-0.5),
+    }
+    assert output.growth is not None and output.growth.playing == 1
+    # the guard's windows are saved, and a branch of the run takes them back
+    meta = read_state_meta(state_path(str(tmp_path), 4))
+    assert meta["growth"]["guard_values"] == [[1.0, 1.0], [2.0, 2.0], []]
+    branch, _ = growth_trainer(
+        env,
+        tmp_path / "branch",
+        SCRIPTS,
+        growth_kwargs={"metric": "loss", "guard": "probe_error"},
+    )
+    start = branch.branch(state_path(str(tmp_path), 4))
+    assert start.growth is not None
+    assert start.growth.guard_values == ((1.0, 1.0), (2.0, 2.0), ())

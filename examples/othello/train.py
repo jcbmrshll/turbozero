@@ -256,6 +256,24 @@ def main():
         "below the playing network's",
     )
     parser.add_argument(
+        "--grow-margin",
+        type=float,
+        default=0.0,
+        metavar="FRACTION",
+        help="with --grow, the lead the next network needs to take over: its mean --grow-metric "
+        "lower than the playing one's by this fraction of it, e.g. 0.01 for 1%%, so that two "
+        "networks in lockstep don't switch (default 0: at or below)",
+    )
+    parser.add_argument(
+        "--grow-guard",
+        default=None,
+        choices=["engine_value_mse", "engine_exp_regret"],
+        help="with --grow, a second metric the next network must be no worse on over "
+        "--grow-window epochs, e.g. engine_value_mse on positions neither network trains on, "
+        "when --grow-metric is the training loss, which a bigger network can lower by "
+        "memorising the buffer (needs --engine-eval-every 1)",
+    )
+    parser.add_argument(
         "--grow-window",
         type=int,
         default=10,
@@ -831,22 +849,32 @@ def main():
         or args.grow_manual
         or any(
             getattr(args, k) != parser.get_default(k)
-            for k in ("grow_metric", "grow_window", "grow_min_epochs")
+            for k in (
+                "grow_metric",
+                "grow_window",
+                "grow_min_epochs",
+                "grow_margin",
+                "grow_guard",
+            )
         )
     ):
         parser.error(
-            "--grow-metric, --grow-window, --grow-min-epochs, --grow-switch-at and "
-            "--grow-manual go with --grow"
+            "--grow-metric, --grow-window, --grow-min-epochs, --grow-margin, --grow-guard, "
+            "--grow-switch-at and --grow-manual go with --grow"
         )
+    if not 0 <= args.grow_margin < 1:
+        parser.error("--grow-margin is a fraction in [0, 1)")
     if args.grow_manual and args.grow_switch_at is not None:
         parser.error("--grow-manual and --grow-switch-at are different rules: pass one")
     # the engine set's metrics need it every epoch; the training loss is logged every epoch
     engine_rule = (
-        args.grow and args.grow_switch_at is None and args.grow_metric != "loss"
+        args.grow
+        and args.grow_switch_at is None
+        and (args.grow_metric != "loss" or args.grow_guard is not None)
     )
     if engine_rule and args.engine_eval_every != 1:
         parser.error(
-            f"--grow's rule needs {args.grow_metric} every epoch: --engine-eval-every 1"
+            "--grow's rule needs the engine set every epoch: --engine-eval-every 1"
         )
     if args.take_over and (args.branch_from is None or not args.grow):
         parser.error("--take-over goes with --branch-from and --grow")
@@ -912,9 +940,7 @@ def main():
             f"--lr-plateau-metric {args.lr_plateau_metric} needs an engine-labelled set"
         )
     if engine_set is None and engine_rule:
-        parser.error(
-            f"--grow's rule needs an engine-labelled set, for {args.grow_metric}"
-        )
+        parser.error("--grow's rule needs an engine-labelled set")
     ckpt_dir = args.ckpt_dir or tempfile.mkdtemp(prefix="turbozero-othello-")
     monitor = (
         Monitor(args.monitor, project="othello", name=args.name, notes=args.notes)
@@ -1028,6 +1054,8 @@ def main():
                 min_epochs=args.grow_min_epochs,
                 switch_at=args.grow_switch_at or (),
                 manual=args.grow_manual,
+                margin=args.grow_margin,
+                guard=args.grow_guard,
             )
         except ValueError as e:
             parser.error(f"--grow: {e}")
