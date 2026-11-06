@@ -41,7 +41,7 @@ def config(tmp_path, **kwargs):
             "search": Search(63),
             "worktree": str(tmp_path / "frozen"),
             "queue_cwd": str(tmp_path / "task"),
-            "train_args": ["--lr-final", "1e-3"],
+            "train_args": ["--seed", "1"],
             # 2 epochs of 128 moves
             "buffer": 256,
             "trunk_turnovers": 1.0,
@@ -100,6 +100,9 @@ def test_bad_searches_are_refused(kwargs):
     [
         ({"train_args": ["--sims", "64"]}, "sets these itself"),
         ({"train_args": ["--epochs=5"]}, "sets these itself"),
+        ({"train_args": ["--lr", "1e-3"]}, "sets these itself"),
+        ({"train_args": ["--lr-plateau"]}, "sets these itself"),
+        ({"lr": 0}, "positive"),
         ({"games": 401}, "even"),
         ({"nets": [SMALL, "resnet:2x32,heads=pooled"]}, "must differ"),
         ({"trunk_turnovers": 0}, "positive"),
@@ -346,7 +349,10 @@ def test_a_period_branches_on_the_search_and_keeps_the_winner(tmp_path):
     assert "--branch-from" not in trunk and trunk[trunk.index("--sims") + 1] == "63"
     assert trunk[trunk.index("--epochs") + 1] == "2"
     assert ["--grow", BIG] == trunk[2:4] and "--grow-manual" in trunk
-    assert trunk[-2:] == ["--lr-final", "1e-3"]
+    assert trunk[-2:] == ["--seed", "1"]
+    # a constant learning rate, 5e-4 unless the config says otherwise
+    lr = trunk.index("--lr")
+    assert trunk[lr : lr + 4] == ["--lr", "0.0005", "--lr-final", "0.0005"]
     # both branches go on from its state, at equal benchmarked time
     stay, double = args["p000-stay"], args["p000-double"]
     trunk_state = str(run_dir / "p000-trunk" / "state-2.npz")

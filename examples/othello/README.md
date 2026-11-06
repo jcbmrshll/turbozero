@@ -434,10 +434,11 @@ time is those times its evaluations and steps. Flat costs (moving the games, wri
 buffer, compiling) aren't counted. The losing branch counts in what the run spent (`spent`), not
 in the line of states it kept (`kept`). Decisions, with their series, go to `decisions.jsonl`.
 
-The config is JSON: the networks, smallest first, the search to start with (`full`, or with
-playout cap randomization `full`, `fast`, `full_probability` and `cycles`, train.py's
-`--selfplay-cycles`), train.py's other arguments, and the steps' frozen worktree (with
-`./install.sh`'s CUDA environment) and the slick task's worktree to queue from. See
+The learning rate (`lr`, 5e-4) is constant through the run, as KataGo held its until its final
+net's last days. The config is JSON: the networks, smallest first, the search to start with
+(`full`, or with playout cap randomization `full`, `fast`, `full_probability` and `cycles`,
+train.py's `--selfplay-cycles`), train.py's other arguments, and the steps' frozen worktree
+(with `./install.sh`'s CUDA environment) and the slick task's worktree to queue from. See
 `controller.Config` for the rest.
 
 ```json
@@ -448,7 +449,7 @@ playout cap randomization `full`, `fast`, `full_probability` and `cycles`, train
   "search": {"full": 127, "fast": 31, "full_probability": 0.25, "cycles": 8320},
   "buffer": 256,
   "window": {"c": 256},
-  "train_args": ["--lr-final", "1e-3"],
+  "lr": 5e-4,
   "worktree": "~/worktrees/turbozero/grow1-frozen",
   "queue_cwd": "~/worktrees/turbozero/<the task's worktree>"
 }

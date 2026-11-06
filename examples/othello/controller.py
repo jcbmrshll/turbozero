@@ -77,6 +77,10 @@ OWN_ARGS = (
     "--selfplay-cycles",
     "--advance-every",
     "--buffer",
+    "--lr",
+    "--lr-final",
+    "--lr-drops",
+    "--lr-plateau",
     "--train-steps",
     "--train-batch",
     "--epochs",
@@ -246,8 +250,10 @@ class Config:
         search: the search to start with (see `Search`)
         worktree: the frozen worktree the steps run in, with a CUDA environment (./install.sh)
         queue_cwd: the slick task's worktree, where `slick queue` queues the steps
-        train_args: train.py's other arguments, e.g. ["--lr-final", "1e-3"] for a constant
-            learning rate. Not those the controller sets (`OWN_ARGS`)
+        train_args: train.py's other arguments, e.g. ["--seed", "1"]. Not those the controller
+            sets (`OWN_ARGS`)
+        lr: the learning rate, constant through the run, as KataGo held its (train.py --lr and
+            --lr-final)
         buffer: train.py --buffer, positions kept per environment: the replay window, or with
             `window` the one to start with (its `c`)
         window: (optional) grow the replay window by the positions stored so far (see
@@ -286,6 +292,7 @@ class Config:
     worktree: str
     queue_cwd: str
     train_args: list[str] = field(default_factory=list)
+    lr: float = 5e-4
     buffer: int = 1125
     window: Window | None = None
     train_steps: int = 256
@@ -318,6 +325,8 @@ class Config:
         own = [a for a in self.train_args if a.split("=")[0] in OWN_ARGS]
         if own:
             raise ValueError(f"the controller sets these itself: {own}")
+        if self.lr <= 0:
+            raise ValueError(f"the learning rate must be positive, got {self.lr}")
         if self.trunk_turnovers <= 0 or self.branch_turnovers <= 0:
             raise ValueError("trunk_turnovers and branch_turnovers must be positive")
         if self.games < 2 or self.games % 2:
@@ -938,6 +947,11 @@ class Controller:
         args += search.train_args()
         directory = self.dir / step["name"]
         args += [
+            # constant: a cosine from it to itself
+            "--lr",
+            f"{config.lr:g}",
+            "--lr-final",
+            f"{config.lr:g}",
             "--buffer",
             str(step["buffer"]),
             "--train-steps",
