@@ -1134,10 +1134,10 @@ class Controller:
         )
 
     def estimate(self, step: dict) -> int:
-        """Minutes a step should hold the GPU: its benchmarked compute, with half again for what
-        the benchmark leaves out, and startup."""
+        """Minutes a step should hold the GPU: its compute by the cost model (see `Costs`), and
+        startup."""
         if step["kind"] == "train":
-            return max(5, round(1.5 * step["compute"]["seconds"] / 60 + 3))
+            return max(5, round(step["compute"]["seconds"] / 60 + 3))
         if step["kind"] == "bench":
             return 5
         return 20
