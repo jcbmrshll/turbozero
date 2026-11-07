@@ -2147,8 +2147,8 @@ class Trainer:
         return averages, tuple(info["averaged"])
 
     def test_state_templates(self, train_states: Sequence[Any]) -> tuple[list, ...]:
-        """The shapes of every network's testers' states, from the networks' train states (or
-        their shapes)."""
+        """The shapes of the networks' testers' states, from their train states (or their
+        shapes): the first networks', as many as `train_states` has."""
         return tuple(
             jax.eval_shape(
                 lambda params, testers=learner.testers: [
@@ -2156,7 +2156,9 @@ class Trainer:
                 ],
                 self.extract_model_params_fn(ts),
             )
-            for learner, ts in zip(self.learners, train_states, strict=True)
+            for learner, ts in zip(
+                self.learners[: len(train_states)], train_states, strict=True
+            )
         )
 
     def resume(self, path: str | None = None) -> TrainLoopOutput:
@@ -2225,6 +2227,10 @@ class Trainer:
         `resize_replay_buffer`). A branch logs to a monitor run of its own, whose config records
         the state as its parent, and leaves the saved run's directory as it is.
 
+        With `growth`, the trainer's networks may go on past the saved run's (the run grows into
+        a bigger one than it was set up with): those start from scratch, at their own weights,
+        as a network that hasn't joined a run yet is. One can't take over in the branch.
+
         Args:
             path: the saved state (see `save_state`), or a directory to take the newest from
             take_over: (with `growth`) the next network plays from the branch's first epoch, and
@@ -2252,9 +2258,22 @@ class Trainer:
                     "positions: a branch of it needs the same"
                 )
             growth = None
+            # the networks the saved run has: the trainer's first ones (see the docstring)
+            saved_networks = 1
             if self.growth is not None:
                 growth = saved_growth(meta["growth"])
+                saved_networks = len(growth.trained)
+                if saved_networks > len(self.learners):
+                    raise ValueError(
+                        f"{path} was saved with {saved_networks} networks, this run has "
+                        f"{len(self.learners)}: a branch can add networks, not drop them"
+                    )
                 if take_over:
+                    if growth.playing + 1 == saved_networks < len(self.learners):
+                        raise ValueError(
+                            f"{self.learners[growth.playing].name} is the saved run's last "
+                            "network: a network the branch adds can't take over from it"
+                        )
                     growth = self.growth.take_over(growth)
             elif take_over:
                 raise ValueError("only a run with growth has a network to take over")
@@ -2263,7 +2282,7 @@ class Trainer:
             evaluator = self.learners[playing].schedule.at(max(epoch - 1, 0))
             train_templates = tuple(
                 jax.eval_shape(partial(self.init_train_state, i))
-                for i in range(len(self.learners))
+                for i in range(saved_networks)
             )
             train_states = self._load_part(saved, meta, "train_states", train_templates)
             collection_state, kept_search = self._branch_collection_state(
@@ -2277,6 +2296,32 @@ class Trainer:
             )
             averages, averaged = self._load_averages(saved, meta, train_templates)
             key = _to_device(saved["key"])
+        added = range(saved_networks, len(self.learners))
+        if added:
+            assert growth is not None
+            fresh = tuple(self.init_train_state(i) for i in added)
+            train_states = (*train_states, *fresh)
+            test_states = (
+                *test_states,
+                *(
+                    [
+                        tester.init(params=self.extract_model_params_fn(ts))
+                        for tester in self.learners[i].testers
+                    ]
+                    for i, ts in zip(added, fresh, strict=True)
+                ),
+            )
+            if averages:
+                averages = (*averages, *(self.fresh_averages(ts) for ts in fresh))
+                averaged = (*averaged, *(0 for _ in added))
+            growth = replace(
+                growth,
+                trained=(*growth.trained, *(0 for _ in added)),
+                values=(*growth.values, *(() for _ in added)),
+                guard_values=(*growth.guard_values, *(() for _ in added))
+                if growth.guard_values
+                else (),
+            )
         resized = ""
         if self.memory_buffer.capacity != meta["buffer_capacity"]:
             collection_state = self.resize_replay_buffer(
@@ -2303,7 +2348,7 @@ class Trainer:
             if take_over:
                 # its own rule starts, at the rate it has trained at (as when the rule switches)
                 progress[playing] = LRPlateauProgress()
-            lr_plateau = tuple(progress)
+            lr_plateau = (*progress, *(None for _ in added))
         self.parent = {
             "path": os.path.abspath(path),
             "epoch": epoch,
@@ -2314,8 +2359,9 @@ class Trainer:
         }
         whose = f", {self.learners[playing].name} playing" if take_over else ""
         search = "its search's states kept" if kept_search else "new search states"
+        new = "".join(f", {self.learners[i].name} added" for i in added)
         print(
-            f"branching from {path}: {epoch} epochs done{whose}, {search}{resized}",
+            f"branching from {path}: {epoch} epochs done{whose}, {search}{resized}{new}",
             flush=True,
         )
         return TrainLoopOutput(

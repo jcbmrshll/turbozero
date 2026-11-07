@@ -2388,10 +2388,10 @@ def hidden_size(params):
     return params.hidden.weight.shape[0]
 
 
-def growth_trainer(env, ckpt_dir, scripts, growth_kwargs=None, **kwargs):
-    """A trainer whose MLP (n0, hidden width 8) grows into n1 (width 12) and n2 (width 16):
-    network i's self-play is TaggedEvaluator(i), its tests' TaggedEvaluator(10 + i), and its
-    tester a ScriptedTester of `scripts[i]`."""
+def growth_trainer(env, ckpt_dir, scripts, growth_kwargs=None, grown=(1, 2), **kwargs):
+    """A trainer whose MLP (n0, hidden width 8) grows into n1 (width 12) and n2 (width 16), or
+    those of `grown`: network i's self-play is TaggedEvaluator(i), its tests'
+    TaggedEvaluator(10 + i), and its tester a ScriptedTester of `scripts[i]`."""
     testers = [ScriptedTester(script) for script in scripts]
     learners = [
         Learner(
@@ -2401,7 +2401,7 @@ def growth_trainer(env, ckpt_dir, scripts, growth_kwargs=None, **kwargs):
             evaluator_test=TaggedEvaluator(10.0 + i),
             testers=[testers[i]],
         )
-        for i in (1, 2)
+        for i in grown
     ]
     growth = Growth(
         first="n0",
@@ -2776,6 +2776,87 @@ def test_a_manual_rule_reports_and_a_branch_hands_self_play_over(
     assert "n1 playing, new search states" in capsys.readouterr().out
 
 
+def test_a_branch_can_add_networks_past_the_saved_runs(
+    env, tmp_path, fake_loop, capsys
+):
+    # the trunk grows n0 into n1 only; its branch is set up to go on into n2
+    trunk, _ = growth_trainer(
+        env,
+        tmp_path / "trunk",
+        SCRIPTS,
+        growth_kwargs={"manual": True},
+        grown=(1,),
+        save_state_at=[6],
+        averages=(2,),
+    )
+    fake_loop(trunk)
+    saved = trunk.train_loop(seed=0, num_epochs=6)
+    branch, _ = growth_trainer(
+        env,
+        tmp_path / "branch",
+        SCRIPTS,
+        growth_kwargs={"manual": True},
+        averages=(2,),
+    )
+    calls = fake_loop(branch)
+
+    start = branch.branch(str(tmp_path / "trunk"), take_over=True)
+
+    assert "n1 playing, new search states, n2 added" in capsys.readouterr().out
+    # n0 and n1 as the trunk left them; n2 at its own weights, as one that hasn't joined yet
+    assert start.growth is not None
+    assert (start.growth.playing, start.growth.trained) == (1, (6, 6, 0))
+    assert leaves_equal(start.train_states[:2], saved.train_states)
+    assert leaves_equal(start.train_states[2], branch.init_train_state(2))
+    assert leaves_equal(start.averages[:2], saved.averages)
+    assert leaves_equal(
+        start.averages[2], branch.fresh_averages(branch.init_train_state(2))
+    )
+    assert start.averaged == (*saved.averaged, 0)
+    assert len(start.test_states) == 3
+    # n1 plays, and n2 trains beside it from the branch's first epoch
+    output = branch.train_loop(seed=0, num_epochs=9, initial_state=start)
+    assert [c.evaluator.tag for c in of_kind(calls, "collect")] == [1.0] * 3
+    assert [(c.epoch, c.learner) for c in of_kind(calls, "train")] == [
+        (e, i) for e in (6, 7, 8) for i in (1, 2)
+    ]
+    assert output.growth is not None
+    assert output.growth.trained == (6, 9, 3)
+
+
+def test_a_network_added_after_the_last_waits_beside_it(env, tmp_path, fake_loop):
+    # n1, the trunk's last network, plays from epoch 1
+    trunk, _ = growth_trainer(
+        env,
+        tmp_path / "trunk",
+        SCRIPTS,
+        growth_kwargs={"switch_at": (1,)},
+        grown=(1,),
+        save_state_at=[3],
+    )
+    fake_loop(trunk)
+    saved = trunk.train_loop(seed=0, num_epochs=3)
+    assert saved.growth is not None and saved.growth.playing == 1
+    branch, _ = growth_trainer(
+        env, tmp_path / "branch", SCRIPTS, growth_kwargs={"manual": True}
+    )
+    calls = fake_loop(branch)
+
+    # n2 can't take over from it untrained; without taking over, it starts training
+    with pytest.raises(ValueError, match="a network the branch adds can't take over"):
+        branch.branch(str(tmp_path / "trunk"), take_over=True)
+    output = branch.train_loop(
+        seed=0, num_epochs=5, initial_state=branch.branch(str(tmp_path / "trunk"))
+    )
+
+    assert [c.evaluator.tag for c in of_kind(calls, "collect")] == [1.0] * 2
+    assert [(c.epoch, c.learner) for c in of_kind(calls, "train")] == [
+        (e, i) for e in (3, 4) for i in (1, 2)
+    ]
+    assert output.growth is not None
+    assert output.growth.trained == (*saved.growth.trained[:1], 5, 2)
+
+
 def test_a_branch_must_fit_the_saved_run(env, tmp_path, fake_loop):
     trunk = make_trainer(env, tmp_path / "trunk", save_state_at=[1])
     fake_loop(trunk)
@@ -2801,6 +2882,10 @@ def test_a_branch_must_fit_the_saved_run(env, tmp_path, fake_loop):
     last.train_loop(seed=0, num_epochs=3)
     with pytest.raises(ValueError, match="n2 is the last network"):
         last.branch(str(tmp_path / "b4"), take_over=True)
+    # a branch can go on into more networks than the saved run's, not fewer
+    fewer, _ = growth_trainer(env, tmp_path / "b5", SCRIPTS, grown=(1,))
+    with pytest.raises(ValueError, match="can add networks, not drop them"):
+        fewer.branch(str(tmp_path / "b4"))
 
 
 def test_a_branch_takes_its_trainers_buffer_capacity(env, tmp_path, fake_loop, capsys):

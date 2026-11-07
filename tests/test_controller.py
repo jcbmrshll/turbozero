@@ -216,6 +216,12 @@ def test_players_tells_who_played_when_from_the_networks_training():
     ]
     # without growth, one network
     assert controller.players(None, {"growth": None}, 0, 4) == [[0, 0, 4]]
+    # a take-over trunk in which a network the step added (the run grew past its last) waits:
+    # 1 plays throughout, 0 for none of it (as in any take-over branch)
+    assert controller.players(meta(0, [10, 10]), meta(1, [10, 14, 4]), 10, 14) == [
+        [0, 10, 10],
+        [1, 10, 14],
+    ]
 
 
 # whole periods, with fakes

@@ -626,11 +626,9 @@ def players(start: dict | None, end: dict, first: int, last: int) -> list[list[i
         return [[0, first, last]]
     growth = end["growth"]
     before = start["growth"]["playing"] if start is not None else 0
-    trained = (
-        start["growth"]["trained"]
-        if start is not None
-        else [0] * len(growth["trained"])
-    )
+    # a network the step added (config.nets grew since `start`) hadn't trained before it
+    trained = start["growth"]["trained"] if start is not None else []
+    trained = [*trained, *[0] * (len(growth["trained"]) - len(trained))]
     done = [e - s for e, s in zip(growth["trained"], trained, strict=True)]
     spans, begin, joined = [], first, {before: first, before + 1: first}
     for net in range(before, growth["playing"]):

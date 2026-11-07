@@ -385,7 +385,10 @@ plays. `--grow-train-retired` keeps the networks that played before training on 
 rather than `--train-steps`, e.g. what its own play would afford for the same compute. With
 `--grow-manual`, nothing takes over by itself: the run logs `growth_caught_up` (1 once
 the rule would switch), saved states record it too, and the next network takes over in a branch
-of the run, with `--branch-from` and `--take-over` (see the run controller below).
+of the run, with `--branch-from` and `--take-over` (see the run controller below). A branch can
+also grow past the networks the run started with: `--grow` networks after the saved state's
+last start from scratch, as one that hasn't joined a run yet does, so a run whose last network
+plays can go on into a bigger one.
 
 Each network's checkpoints go to `--ckpt-dir/<its size>`, e.g. `runs/grow/2x32` and `runs/grow/4x64`.
 Saved states hold every network, in `--ckpt-dir`. Each network's metrics are logged as
