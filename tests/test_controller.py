@@ -139,6 +139,12 @@ def test_the_waiting_network_trains_the_steps_its_own_play_would_afford(tmp_path
     assert controller.waiting_steps(c, Search(63), 1, COSTS) is None
     # a deeper search makes the bigger network's self-play cost more: fewer steps
     assert controller.waiting_steps(c, Search(127), 0, COSTS) == 148
+    # where the next network's own epochs would cost less than the playing one's with it
+    # waiting (its forward pass as cheap here), it trains the playing one's steps, no more
+    cheap = controller.Costs({**BENCH, BIG: {**BENCH[BIG], "forward_ms": 1.0}})
+    # (own + t is over 4x64's own epoch, 8.192 + t: its share would be over 1)
+    assert controller.waiting_steps(c, Search(63), 0, cheap) == 256
+    assert controller.regime_seconds(c, Search(63), 0, cheap) == pytest.approx(own + t)
 
 
 def test_an_epochs_compute_is_its_networks_evaluations_and_steps(tmp_path):

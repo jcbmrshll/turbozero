@@ -502,7 +502,8 @@ def regime_seconds(config: Config, search: Search, playing: int, costs: Costs) -
     """GPU seconds of an epoch while network `playing` plays at `search`: its self-play and
     training, and the training of the next network waiting beside it, at the steps
     `waiting_steps` gives it. Solved from the last network back: with E this cost, the waiting
-    network takes E / E_next of the steps, so E = own + (E / E_next) * T_next."""
+    network takes E / E_next of the steps, so E = own + (E / E_next) * T_next; or all of them,
+    its most, where that share would be over 1 (own + T_next >= E_next), so E = own + T_next."""
     nets = config.nets
 
     def train(i: int) -> float:
@@ -514,7 +515,10 @@ def regime_seconds(config: Config, search: Search, playing: int, costs: Costs) -
     if playing + 1 >= len(nets):
         return own
     after = regime_seconds(config, search, playing + 1, costs)
-    return own / (1 - train(playing + 1) / after)
+    waiting = train(playing + 1)
+    if own + waiting >= after:
+        return own + waiting
+    return own / (1 - waiting / after)
 
 
 def waiting_steps(
@@ -525,13 +529,15 @@ def waiting_steps(
     times the ratio of the two regimes' epoch costs (`regime_seconds`, each with its own
     waiting network). So when the period's test plays it against the one playing, it has
     trained about what the run would have spent on it as the one playing, on that one's games:
-    the bigger network must beat the smaller one's training at about equal compute."""
+    the bigger network must beat the smaller one's training at about equal compute. At most
+    `config.train_steps`, the playing one's: where the next network's own epochs would cost
+    less (e.g. the last, with no network of its own waiting), it doesn't train more."""
     if playing + 1 >= len(config.nets):
         return None
     share = regime_seconds(config, search, playing, costs) / regime_seconds(
         config, search, playing + 1, costs
     )
-    return max(1, round(config.train_steps * share))
+    return max(1, min(config.train_steps, round(config.train_steps * share)))
 
 
 def selfplay_overhead(
