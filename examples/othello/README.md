@@ -480,7 +480,9 @@ states has stored per environment, n, by the replay-window task's rule: n until 
 `c (1 + beta ((n / c)^alpha - 1) / alpha)` (KataGo's shape, `alpha` 0.75, `beta` 0.075, which
 reaches about 1125 at an 8x128 run's 30M positions). A step starts with the buffer resized once
 the target is 25% past its capacity. With playout cap randomization n counts the positions
-stored. Periods are in turnovers of the buffer, so they lengthen as it grows.
+stored. Periods are in turnovers of the buffer, so they lengthen as it grows, and as the
+networks do; `trunk_hours` caps a trunk at that many GPU hours by the cost model, so the
+tests come about as often throughout.
 
 Compute is counted in network evaluations (self-play's positions evaluated, the samples each
 network trains on) and in GPU time: the first step times each network's forward pass at

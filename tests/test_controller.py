@@ -109,6 +109,7 @@ def test_bad_searches_are_refused(kwargs):
         ({"games": 401}, "even"),
         ({"nets": [SMALL, "resnet:2x32,heads=pooled"]}, "must differ"),
         ({"trunk_turnovers": 0}, "positive"),
+        ({"trunk_hours": 0.0}, "positive"),
         ({"margin_se": -1.0}, "negative"),
         ({"average_epochs": 0.5}, "at least 1"),
         ({"selfplay_average": True}, "needs average_epochs"),
@@ -371,6 +372,26 @@ def decisions(run_dir):
         json.loads(line)
         for line in (run_dir / "decisions.jsonl").read_text().splitlines()
     ]
+
+
+def test_trunk_hours_caps_a_trunk_at_its_modelled_gpu_time(tmp_path):
+    def trunk(**kwargs):
+        ctl = Controller.init(
+            tmp_path / str(len(list(tmp_path.iterdir()))),
+            config(tmp_path, trunk_turnovers=12.0, **kwargs),
+            queue=FakeQueue(),
+            runner=FakeRunner(),
+            league=FakeLeague(lambda a, b: 0.0),
+        )
+        ctl.data["bench"] = BENCH
+        step = ctl.train_step("p000-trunk", ctl.head, Search(63), None)
+        return step["last_epoch"] - step["first_epoch"]
+
+    epoch = controller.epoch_compute(config(tmp_path), Search(63), 0, COSTS)["seconds"]
+    # 12 turnovers of 2 epochs; 5.5 epochs' worth of hours affords 5; more hours, the turnovers
+    assert trunk() == 24
+    assert trunk(trunk_hours=5.5 * epoch / 3600) == 5
+    assert trunk(trunk_hours=100 * epoch / 3600) == 24
 
 
 def test_a_period_branches_on_the_search_and_keeps_the_winner(tmp_path):

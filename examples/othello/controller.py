@@ -5,8 +5,8 @@ games between its networks in the Elo league (see README.md, "The run controller
 Every period:
 
 1. trunk: the run trains on at its current settings, `trunk_turnovers` turnovers of its replay
-   buffer, the next network training beside the one playing, on its games. No network takes
-   over during a trunk (--grow-manual).
+   buffer (or with `trunk_hours`, fewer if those would take longer), the next network training
+   beside the one playing, on its games. No network takes over during a trunk (--grow-manual).
 2. size: if there's a next network, it plays the one playing, both as they trained in the
    trunk, with their weights averaged over the last `average_epochs` epochs (train.py
    --average-epochs). If it scores `margin_se` standard errors (of its series) or more, the run
@@ -286,6 +286,9 @@ class Config:
         train_steps: train.py --train-steps, training steps an epoch
         train_batch: train.py --train-batch
         trunk_turnovers: a period's trunk, in turnovers of the replay buffer at its search
+        trunk_hours: (optional) the longest a trunk takes, in GPU hours by the cost model (see
+            `Costs`): it trains the fewer epochs of `trunk_turnovers`' and these hours', so
+            periods don't grow longer as the window and the networks do
         branch_turnovers: the `double` branch's length, in turnovers of its replay buffer
         games: games a series (even: both colours of each opening)
         play_sims: the league's search for the series, iterations a move
@@ -341,6 +344,7 @@ class Config:
     train_steps: int = 256
     train_batch: int = 4096
     trunk_turnovers: float = 4.0
+    trunk_hours: float | None = None
     branch_turnovers: float = 1.0
     games: int = 400
     play_sims: int = 128
@@ -380,6 +384,8 @@ class Config:
             )
         if self.trunk_turnovers <= 0 or self.branch_turnovers <= 0:
             raise ValueError("trunk_turnovers and branch_turnovers must be positive")
+        if self.trunk_hours is not None and self.trunk_hours <= 0:
+            raise ValueError(f"trunk_hours must be positive, got {self.trunk_hours}")
         if self.margin_se < 0:
             raise ValueError(f"margin_se can't be negative, got {self.margin_se}")
         if self.average_epochs is not None and self.average_epochs < 1:
@@ -1624,6 +1630,7 @@ class Controller:
         what it costs with the head's network playing throughout."""
         playing = head.playing
         capacity = self.capacity(head)
+        epoch = epoch_compute(self.config, search, playing, self.costs)
         if epochs is None:
             epochs = max(
                 1,
@@ -1631,9 +1638,14 @@ class Controller:
                     self.config.trunk_turnovers * turnover_epochs(capacity, search)
                 ),
             )
-        compute = scaled(
-            epoch_compute(self.config, search, playing, self.costs), epochs
-        )
+            if self.config.trunk_hours is not None:
+                epochs = min(
+                    epochs,
+                    max(
+                        1, math.floor(self.config.trunk_hours * 3600 / epoch["seconds"])
+                    ),
+                )
+        compute = scaled(epoch, epochs)
         what = {None: "trunk", "stay": "stay branch", "double": "double branch"}[branch]
         return {
             "name": name,
