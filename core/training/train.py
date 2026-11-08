@@ -275,6 +275,13 @@ def saved_growth(saved: dict) -> GrowthProgress:
     )
 
 
+def saved_network_names(meta: dict) -> list[str]:
+    """The names of a saved growth run's networks, in order (its own first), from a state's
+    metadata (see `Trainer.save_state`)."""
+    growth = meta["config"]["growth"]
+    return [growth["first"], *(learner["name"] for learner in growth["learners"])]
+
+
 def read_state_meta(path: str) -> dict:
     """The metadata of a saved state (see `Trainer.save_state`): the epochs done, the run's
     configuration, its monitor run and parent, and what each array is."""
@@ -2444,7 +2451,11 @@ class Trainer:
         return state, keep
 
     def fork_state(
-        self, path: str, key: jax.Array, replay_buffers: bool = True
+        self,
+        path: str,
+        key: jax.Array,
+        replay_buffers: bool = True,
+        into: int = 0,
     ) -> tuple[CollectionState, TrainState]:
         """The states a run forked from a saved state (see `train_loop`'s `fork_from`) starts with.
 
@@ -2459,12 +2470,15 @@ class Trainer:
 
         The number of environments, network and optimizer must match the saved run's. A run
         with `growth` forks from a run without: the saved network is the Trainer's own, and
-        those it grows into start from scratch.
+        those it grows into start from scratch. From a run with growth, the network forked is
+        the saved run's of the same name as network `into` (see `train_loop`'s `fork_into`).
 
         Args:
             path: the saved state (see `save_state`)
             key: rng, for the games
             replay_buffers: load the replay buffers (default), or start with empty ones
+            into: the network (an index into the Trainer's, the Trainer's own 0) the saved one
+                forks into; its self-play's games start the collection state
 
         Returns:
             Tuple[CollectionState, TrainState]: the collection state and train state
@@ -2472,22 +2486,38 @@ class Trainer:
         Raises:
             ValueError: if the saved state doesn't fit this trainer
         """
+        template = jax.eval_shape(partial(self.init_train_state, into))
         with np.load(path) as saved:
             meta = self._check_meta(path, json.loads(str(saved["meta"])))
             if meta["growth"] is not None:
-                raise ValueError(
-                    f"{path} was saved by a run with growth: forks start from a run without"
+                names = saved_network_names(meta)
+                name = self.learners[into].name
+                if name not in names:
+                    raise ValueError(
+                        f"{path} has no network {name} to fork (it has {', '.join(names)})"
+                    )
+                train_state = self._load_network(
+                    saved, meta, "train_states", names.index(name), template
                 )
-            (train_state,) = self._load_part(
-                saved, meta, "train_states", (jax.eval_shape(self.init_train_state),)
-            )
+            else:
+                if into != 0:
+                    raise ValueError(
+                        f"{path} has one network: it forks into the Trainer's own"
+                    )
+                (train_state,) = self._load_part(
+                    saved, meta, "train_states", (template,)
+                )
             train_state = replace(
                 train_state,
                 opt_state=restart_schedules(train_state.opt_state),
                 step=jnp.zeros_like(train_state.step),
             )
+            evaluator = self.learners[into].schedule.at(0)
             if not replay_buffers:
-                return self.init_collection_state(key, self.batch_size), train_state
+                return (
+                    self.init_collection_state(key, self.batch_size, evaluator),
+                    train_state,
+                )
             self._check_sizes(path, meta)
             index = {
                 leaf_path: i
@@ -2532,7 +2562,7 @@ class Trainer:
                         (self.batch_size, self.tree_buffer.capacity), dtype=jnp.int32
                     )
         env_state, metadata, eval_state = self.init_games(
-            key, self.batch_size, self.collection_schedule.at(0)
+            key, self.batch_size, evaluator
         )
         collection_state = CollectionState(
             eval_state=eval_state,
@@ -2551,6 +2581,24 @@ class Trainer:
         )
         return collection_state, train_state
 
+    def fork_averages(self, path: str, into: int) -> tuple[tuple[Any, ...], int] | None:
+        """The weight averages of the network a fork takes from a saved growth run's state (see
+        `fork_state`), and the epochs in them, if it saved this trainer's horizons; else None,
+        and the fork starts them at the network's weights."""
+        meta = read_state_meta(path)
+        info = meta.get("averages")
+        if meta["growth"] is None or not self.averages or info is None:
+            return None
+        if info["horizons"] != list(self.averages):
+            return None
+        index = saved_network_names(meta).index(self.learners[into].name)
+        params = jax.eval_shape(partial(self.init_train_state, into)).params
+        with np.load(path) as saved:
+            averages = self._load_network(
+                saved, meta, "averages", index, tuple(params for _ in self.averages)
+            )
+        return averages, int(info["averaged"][index])
+
     def _check_meta(self, path: str, meta: dict) -> dict:
         if meta.get("format") != STATE_FORMAT:
             raise ValueError(
@@ -2566,6 +2614,27 @@ class Trainer:
                 f"{path} was saved with {meta['num_envs']} self-play environments, this run "
                 f"has {self.batch_size}: they must be the same"
             )
+
+    def _load_network(
+        self, saved: Any, meta: dict, part: str, index: int, template: Any
+    ) -> Any:
+        """One network's part of a saved state whose part holds every network's (e.g. a growth
+        run's `train_states`): network `index`'s arrays, checked against `template`'s."""
+        prefix = f"[{index}]"
+        chosen = [
+            (i, leaf_path[len(prefix) :], tuple(shape), dtype)
+            for i, (leaf_path, shape, dtype) in enumerate(meta["leaves"][part])
+            if leaf_path.startswith((prefix + ".", prefix + "["))
+        ]
+        expected = _describe(template)
+        if [c[1:] for c in chosen] != expected:
+            raise ValueError(
+                f"the saved network {index}'s {part.replace('_', ' ')} don't match this run's"
+            )
+        return jax.tree.unflatten(
+            jax.tree.structure(template),
+            [_to_device(saved[f"{part}.{i}"]) for i, _, _, _ in chosen],
+        )
 
     def _load_part(self, saved: Any, meta: dict, part: str, template: Any) -> Any:
         """Loads part of a saved state (see `save_state`) into new device arrays, checking each
@@ -2915,6 +2984,7 @@ class Trainer:
         initial_state: TrainLoopOutput | None = None,
         fork_from: str | None = None,
         fork_replay_buffers: bool = True,
+        fork_into: str | None = None,
     ) -> TrainLoopOutput:
         """Runs the training loop for `num_epochs` epochs. Mostly configured by the Trainer's attributes.
 
@@ -2947,11 +3017,20 @@ class Trainer:
                 `parent`. Not with `initial_state`.
             fork_replay_buffers: with `fork_from`, start with its replay buffers (default), or with
                 empty ones
+            fork_into: (with `fork_from` and `growth`) the name of the network the saved one of
+                the same name (from a growth run's state too) forks into, with its weight
+                averages: it plays from the run's start, those before it are retired (training
+                with `train_retired`), the next waits, and the rest start from scratch.
+                Without, the saved network forks into the Trainer's own, which plays
 
         Returns:
             TrainLoopOutput: contains train_state, collection_state, test_states, cur_epoch after
                 training loop, and the rng to continue it with
         """
+        if fork_into is not None and (fork_from is None or self.growth is None):
+            raise ValueError(
+                "fork_into is for a run with growth forked from a saved state"
+            )
         if fork_from is not None:
             if initial_state is not None:
                 raise ValueError("pass initial_state or fork_from, not both")
@@ -2989,6 +3068,7 @@ class Trainer:
                 initial_state,
                 fork_from,
                 fork_replay_buffers,
+                fork_into,
             )
         except BaseException as e:
             if self.monitor is not None:
@@ -3022,6 +3102,7 @@ class Trainer:
         initial_state: TrainLoopOutput | None,
         fork_from: str | None = None,
         fork_replay_buffers: bool = True,
+        fork_into: str | None = None,
     ) -> TrainLoopOutput:
         started = time.perf_counter()
         # init rng
@@ -3029,6 +3110,8 @@ class Trainer:
         # an exact continuation picks up where the run stopped, without a warmup
         exact = initial_state is not None and initial_state.key is not None
         num_learners = len(self.learners)
+        # the network a fork goes into (see `train_loop`'s `fork_into`)
+        into = 0
 
         # initialize states
         if initial_state:
@@ -3054,8 +3137,18 @@ class Trainer:
             cur_epoch = 0
             lr_progress = [None] * num_learners
             growth = self.growth.start() if self.growth is not None else None
+            # the network the run starts playing with: the Trainer's own, or `fork_into`
+            if fork_into is not None:
+                names = [learner.name for learner in self.learners]
+                if fork_into not in names:
+                    raise ValueError(
+                        f"fork_into: no network {fork_into} (this run has {', '.join(names)})"
+                    )
+                into = names.index(fork_into)
+                assert growth is not None
+                growth = replace(growth, playing=into)
             seconds = 0.0
-            evaluator = self.learners[0].schedule.at(0)
+            evaluator = self.learners[into].schedule.at(0)
             init_key, key = jax.random.split(key)
             if fork_from is None:
                 # initialize collection state
@@ -3063,14 +3156,15 @@ class Trainer:
                     init_key, self.batch_size, evaluator
                 )
                 # initialize train state
-                own = self.init_train_state()
+                forked = self.init_train_state()
             else:
                 self.set_activity(f"loading {fork_from}", echo=True)
-                collection_state, own = self.fork_state(
-                    fork_from, init_key, fork_replay_buffers
+                collection_state, forked = self.fork_state(
+                    fork_from, init_key, fork_replay_buffers, into
                 )
-            train_states = [own] + [
-                self.init_train_state(i) for i in range(1, num_learners)
+            train_states = [
+                forked if i == into else self.init_train_state(i)
+                for i in range(num_learners)
             ]
             # initialize tester states
             tester_states = [
@@ -3081,13 +3175,18 @@ class Trainer:
                 for learner, ts in zip(self.learners, train_states, strict=True)
             ]
 
-        # weight averages: the saved state's, or started at the networks' weights
+        # weight averages: the saved state's, or started at the networks' weights (a fork's
+        # network goes on with its saved ones, if any)
         if initial_state is not None and initial_state.averages:
             averages = list(initial_state.averages)
             averaged = list(initial_state.averaged)
         else:
             averages = [self.fresh_averages(ts) for ts in train_states]
             averaged = [0] * num_learners
+            if fork_from is not None and fork_into is not None:
+                saved_averages = self.fork_averages(fork_from, into)
+                if saved_averages is not None:
+                    averages[into], averaged[into] = saved_averages
 
         def playing_now() -> int:
             return growth.playing if growth is not None else 0

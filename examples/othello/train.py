@@ -777,6 +777,15 @@ def main():
         "differ (each environment's newest entries are kept)",
     )
     parser.add_argument(
+        "--fork-into",
+        default=None,
+        metavar="SIZE",
+        help="with --init-from and --grow: the network (by size, e.g. 12x144) the saved run's "
+        "network of that size forks into (from a --grow run's state too), with its weight "
+        "averages; it plays from the start, the ones before it are retired (training beside it "
+        "with --grow-train-retired), the next waits, and the rest start from scratch",
+    )
+    parser.add_argument(
         "--init-without-buffers",
         action="store_true",
         help="with --init-from, start with empty replay buffers instead",
@@ -822,6 +831,8 @@ def main():
         parser.error("--resume needs the run's --ckpt-dir")
     if args.init_without_buffers and args.init_from is None:
         parser.error("--init-without-buffers needs --init-from")
+    if args.fork_into is not None and (args.init_from is None or not args.grow):
+        parser.error("--fork-into needs --init-from and --grow")
     if args.grow_train_steps is not None and (
         not args.grow or args.grow_train_steps < 1
     ):
@@ -1199,6 +1210,7 @@ def main():
                     "resume",
                     "init_from",
                     "init_without_buffers",
+                    "fork_into",
                     "branch_from",
                     "take_over",
                     "notes",
@@ -1223,6 +1235,7 @@ def main():
         initial_state=initial_state,
         fork_from=args.init_from,
         fork_replay_buffers=not args.init_without_buffers,
+        fork_into=args.fork_into,
     )
     for spec, net_dir in zip([args.net, *args.grow], trainer.ckpt_dirs, strict=True):
         export_last(net_dir, spec)
