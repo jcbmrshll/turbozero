@@ -581,6 +581,16 @@ def main():
         "MAX the learning rate is scaled down instead. Best with --optimizer sgd",
     )
     parser.add_argument(
+        "--noise-measure",
+        type=int,
+        default=None,
+        metavar="K",
+        help="every epoch, measure the noise scale at the self-play weight average (or the "
+        "first of --average-epochs) from K micro-batches, logged as gns_avg_*: the weights "
+        "training moves read far low (their jitter's pull inflates |G|^2). Default 64 with "
+        "--noise-batch and --average-epochs, which the rule then follows; else 0 (off)",
+    )
+    parser.add_argument(
         "--noise-batch-min",
         type=int,
         default=None,
@@ -1225,6 +1235,9 @@ def main():
         advance_every=args.advance_every,
         grad_accum_steps=args.grad_accum,
         batch_size_rule=noise_batch,
+        noise_measure=args.noise_measure
+        if args.noise_measure is not None
+        else (64 if noise_batch is not None and args.average_epochs else 0),
         nn=network,
         nn_state=network_state,
         loss_fn=partial(az_default_loss_fn, value_target_q=args.value_target_q),

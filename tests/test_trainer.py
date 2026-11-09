@@ -3419,3 +3419,35 @@ def test_the_batch_size_rule_must_fit_the_micro_batches(env, tmp_path):
             grad_accum_steps=1,
             batch_size_rule=NOISE_BATCH,
         )
+
+
+def test_the_noise_scale_is_measured_at_a_weight_average(env, tmp_path):
+    trainer = make_trainer(env, tmp_path, train_batch_size=4, grad_accum_steps=2)
+    output = trainer.train_loop(seed=0, num_epochs=1)
+    params = output.train_state.params
+
+    tr_sigma, grad_sq = trainer.noise_scale_at(
+        jax.random.PRNGKey(0),
+        output.collection_state.buffer_state,
+        output.train_state,
+        params,
+        num_micro=4,
+    )
+
+    assert np.isfinite(tr_sigma) and np.isfinite(grad_sq) and tr_sigma >= 0
+
+
+def test_the_batch_rule_follows_the_averages_noise_scale(env, tmp_path):
+    trainer = noise_batch_trainer(env, tmp_path)
+    progress = NOISE_BATCH.start()
+    metrics = {
+        "gns_tr_sigma": jnp.array(1.0),
+        "gns_grad_sq": jnp.array(1.0),
+        "gns_avg_tr_sigma": jnp.array(16.0),
+        "gns_avg_grad_sq": jnp.array(1.0),
+    }
+
+    progress, logged_metrics = trainer.follow_batch_size_rule(progress, metrics)
+
+    assert float(logged_metrics["batch_noise_scale"]) == 16.0
+    assert progress.batch == 8

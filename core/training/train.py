@@ -36,6 +36,7 @@ from core.training.lr_plateau import LRPlateau, LRPlateauProgress, LRPlateauStat
 from core.training.noise_scale import (
     NoiseBatchProgress,
     NoiseBatchSize,
+    noise_scale_estimates,
     noise_scale_metrics,
 )
 from core.training.resignation import Resignation, ResignState
@@ -590,6 +591,7 @@ class Trainer:
         nn_state: eqx.nn.State | None = None,
         grad_accum_steps: int = 1,
         batch_size_rule: NoiseBatchSize | None = None,
+        noise_measure: int = 0,
         evaluator_test: Evaluator | None = None,
         test_env_init_fn: EnvInitFn | None = None,
         exploration: Exploration | None = None,
@@ -835,6 +837,8 @@ class Trainer:
                 f"train_batch_size / grad_accum_steps ({self.micro_batch_size})"
             )
         self.batch_size_rule = batch_size_rule
+        # micro-batches to measure the noise scale on at a weight average, every epoch
+        self.noise_measure = noise_measure
         if lr_plateau is not None and train_steps_per_epoch < 1:
             raise ValueError("lr_plateau needs training steps, to measure the loss")
         if waiting_train_steps is not None and (
@@ -1802,6 +1806,54 @@ class Trainer:
             )
 
         return add_tree_positions
+
+    @partial(jax.jit, static_argnums=(0,), static_argnames=("num_micro", "learner"))
+    def noise_scale_at(
+        self,
+        key: jax.Array,
+        buffer_state: ReplayBufferState,
+        train_state: TrainState,
+        params: Any,
+        num_micro: int,
+        learner: int = 0,
+    ) -> tuple[jax.Array, jax.Array]:
+        """tr(Sigma) and |G|^2 at `params` (e.g. a weight average, where the jitter's pull back
+        to the centre doesn't inflate |G|^2; see core.training.noise_scale), from the gradients
+        of `num_micro` micro-batches sampled from the replay buffer as training samples them."""
+        mask = self.memory_buffer.sample_mask(buffer_state)
+        nn_static = eqx.filter(
+            self.learners[learner].nn, eqx.is_inexact_array, inverse=True
+        )
+        nn = eqx.combine(params, nn_static)
+        grad_fn = eqx.filter_value_and_grad(self.loss_fn, has_aux=True)
+
+        def one(total: Any, k: jax.Array) -> tuple[Any, jax.Array]:
+            sample_key, transform_key = jax.random.split(k)
+            indices = jnp.unravel_index(
+                self.memory_buffer.sample_indices(
+                    sample_key, mask, self.micro_batch_size
+                ),
+                mask.shape,
+            )
+            batch = jax.tree.map(lambda x: x[indices], buffer_state.buffer)
+            batch = transform_randomly(transform_key, batch, self.transform_fns)
+            _, grads = grad_fn(nn, train_state.nn_state, batch)
+            grads = jax.tree.map(lambda g: g.astype(jnp.float32), grads)
+            return jax.tree.map(jnp.add, total, grads), jnp.square(
+                optax.tree.norm(grads)
+            )
+
+        zeros = jax.tree.map(lambda p: jnp.zeros(p.shape, jnp.float32), params)
+        total, micro_sq = jax.lax.scan(one, zeros, jax.random.split(key, num_micro))
+        batch_sq = jnp.square(
+            optax.tree.norm(jax.tree.map(lambda t: t / num_micro, total))
+        )
+        return noise_scale_estimates(
+            micro_sq.mean(),
+            batch_sq,
+            self.micro_batch_size,
+            num_micro * self.micro_batch_size,
+        )
 
     def train_steps(
         self,
@@ -3086,8 +3138,10 @@ class Trainer:
         if "gns_tr_sigma" not in metrics:
             # no steps this epoch
             return progress, out
+        # at a weight average if measured there, else at the weights training moves
+        at = "gns_avg_" if "gns_avg_grad_sq" in metrics else "gns_"
         progress = rule.after_epoch(
-            progress, float(metrics["gns_tr_sigma"]), float(metrics["gns_grad_sq"])
+            progress, float(metrics[at + "tr_sigma"]), float(metrics[at + "grad_sq"])
         )
         noise_scale = rule.noise_scale(progress)
         if noise_scale is not None:
@@ -3493,6 +3547,25 @@ class Trainer:
                     for average, horizon in zip(averages[i], self.averages, strict=True)
                 )
                 averaged[i] += 1
+                if self.noise_measure and self.averages:
+                    horizon = self.selfplay_average or self.averages[0]
+                    measure_key, key = jax.random.split(key)
+                    tr_sigma, grad_sq = self.noise_scale_at(
+                        measure_key,
+                        collection_state.buffer_state,
+                        train_states[i],
+                        averages[i][self.averages.index(horizon)],
+                        num_micro=self.noise_measure,
+                        learner=i,
+                    )
+                    train_metrics[i] = {
+                        **train_metrics[i],
+                        "gns_avg_tr_sigma": tr_sigma,
+                        "gns_avg_grad_sq": grad_sq,
+                        "gns_avg_noise_scale": jnp.where(
+                            grad_sq > 0, tr_sigma / grad_sq, jnp.inf
+                        ),
+                    }
                 if rule is not None and progress is not None:
                     noise_batch[i], rule_metrics = self.follow_batch_size_rule(
                         progress, train_metrics[i]
