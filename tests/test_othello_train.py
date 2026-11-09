@@ -364,6 +364,47 @@ def test_weight_averages_reach_the_trainer(monkeypatch):
     assert built.value.kwargs["average_warmup"] == 5.0
 
 
+def test_sgd_takes_its_momentum_and_its_own_weight_decay(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, "--optimizer", "sgd", "--lr", "0.2", "--momentum", "0.8")
+    state = built.value.kwargs["optimizer"].init({"w": jnp.zeros((2, 2))})
+    hyperparams = {k: float(v) for k, v in state.hyperparams.items()}
+    assert hyperparams == pytest.approx(
+        {"learning_rate": 0.2, "momentum": 0.8, "weight_decay": train.SGD_WEIGHT_DECAY}
+    )
+
+
+def test_adamw_keeps_its_weight_decay(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch)
+    state = built.value.kwargs["optimizer"].init({"w": jnp.zeros((2, 2))})
+    assert float(state.hyperparams["weight_decay"]) == train.WEIGHT_DECAY
+    assert built.value.kwargs["batch_size_rule"] is None
+
+
+def test_noise_batch_starts_at_the_train_batch_in_its_micro_batches(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(
+            monkeypatch,
+            "--train-batch",
+            "4096",
+            "--grad-accum",
+            "4",
+            "--noise-batch",
+            "65536",
+            "--noise-batch-factor",
+            "2",
+        )
+    rule = built.value.kwargs["batch_size_rule"]
+    assert (rule.start_batch, rule.min_batch, rule.max_batch, rule.micro_batch) == (
+        4096,
+        2048,
+        65536,
+        1024,
+    )
+    assert (rule.factor, rule.decay) == (2.0, 0.5)
+
+
 @pytest.mark.parametrize(
     "options",
     [
@@ -421,3 +462,18 @@ def test_retired_networks_training_reaches_the_trainer(monkeypatch):
 def test_retired_networks_training_needs_grow(monkeypatch):
     with pytest.raises(SystemExit):
         run_main(monkeypatch, "--grow-train-retired")
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ("--decoupled-decay",),
+        # one micro-batch can't measure the noise
+        ("--noise-batch", "65536"),
+        ("--grad-accum", "4", "--noise-batch", "6000"),
+        ("--noise-batch-min", "2048"),
+    ],
+)
+def test_bad_optimizer_and_noise_batch_options_are_refused(monkeypatch, options):
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, *options)
