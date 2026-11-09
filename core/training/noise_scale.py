@@ -15,9 +15,15 @@ mean squared norm |g_b|^2 and the batch gradient's |g_B|^2, McCandlish's unbiase
 Each step's estimates are noisy (|G|^2 can come out negative), so they're averaged over steps
 before the ratio is taken.
 
-Measured at the weights training moves, the noise scale is an underestimate when the weights
-jitter: a snapshot sits off the centre of where they wander, and its gradient mostly points back,
-a pull that adds to |G|^2 and shrinks as the jitter does.
+At the weights training moves, though, |G|^2 is mostly something else: the weights jitter around
+where they're heading, and each snapshot's gradient points back to that centre. On a 4x32 Othello
+net late in training this pull made |G|^2 about 20 times what it was at the weights averaged over
+4 epochs, and the noise scale about 17 times smaller (300 against 5083). So the noise scale that
+matters, at the centre, is measured from the mean of an epoch's T batch gradients instead: to first
+order it's the gradient at the epoch's mean weights, where the pull mostly cancels, and its
+squared norm is |G|^2 plus the noise of a mean of T B samples, so
+    |G|^2 = |mean of the batch gradients|^2 - tr(Sigma) / (T B)
+with tr(Sigma) from the micro-batches as above (the jitter barely changes it).
 """
 
 import math
@@ -52,21 +58,37 @@ def noise_scale_estimates(
 
 
 def noise_scale_metrics(
-    micro_sq: jax.Array, batch_sq: jax.Array, micro_batch: int, batch: int
+    micro_sq: jax.Array,
+    batch_sq: jax.Array,
+    micro_batch: int,
+    batch: int,
+    epoch_sq: jax.Array,
+    steps: int,
 ) -> dict[str, jax.Array]:
-    """An epoch's noise scale from its steps' mean |g_b|^2 and |g_B|^2 (see
-    `noise_scale_estimates`):
-    - `gns_tr_sigma`, `gns_grad_sq`: the estimates of tr(Sigma) and |G|^2
-    - `gns_noise_scale`: their ratio, B_noise (infinite if |G|^2 came out at or below 0)
-    - `gns_signal_share`: B / (B + B_noise), the share of a step at this batch that is signal
+    """An epoch's noise scale (see the module's docstring), from its `steps` steps' mean |g_b|^2
+    and |g_B|^2, and `epoch_sq`, the squared norm of the mean of their batch gradients:
+    - `gns_tr_sigma`: the estimate of tr(Sigma), from the micro-batches
+    - `gns_grad_sq`, `gns_noise_scale`: |G|^2 at the weights the steps were at, from the
+      micro-batches, and tr(Sigma) over it (low while the weights jitter)
+    - `gns_epoch_grad_sq`, `gns_epoch_noise_scale`: |G|^2 from the mean of the steps' gradients,
+      about the gradient at the epoch's mean weights, and tr(Sigma) over it: the noise scale
+    - `gns_signal_share`: B / (B + the noise scale), the share of a step at this batch that is
+      signal
+    Noise scales are infinite where their |G|^2 came out at or below 0.
     """
     tr_sigma, grad_sq = noise_scale_estimates(micro_sq, batch_sq, micro_batch, batch)
-    noise_scale = jnp.where(grad_sq > 0, tr_sigma / grad_sq, jnp.inf)
+    epoch_grad_sq = epoch_sq - tr_sigma / (steps * batch)
+
+    def ratio(g: jax.Array) -> jax.Array:
+        return jnp.where(g > 0, tr_sigma / g, jnp.inf)
+
     return {
         "gns_tr_sigma": tr_sigma,
         "gns_grad_sq": grad_sq,
-        "gns_noise_scale": noise_scale,
-        "gns_signal_share": batch / (batch + noise_scale),
+        "gns_noise_scale": ratio(grad_sq),
+        "gns_epoch_grad_sq": epoch_grad_sq,
+        "gns_epoch_noise_scale": ratio(epoch_grad_sq),
+        "gns_signal_share": batch / (batch + ratio(epoch_grad_sq)),
     }
 
 
@@ -97,8 +119,9 @@ class NoiseBatchSize:
     signal per step. Past `max_batch` the learning rate takes over: the update is scaled by
     `max_batch` over the batch the rule wanted.
 
-    The noise scale is measured from each step's micro-batches (see `noise_scale_metrics`), so
-    every batch must have at least two. Its estimates are averaged over epochs, exponentially, the
+    The noise scale is measured from each step's micro-batches and the mean of an epoch's
+    gradients (see `noise_scale_metrics`: `gns_tr_sigma` and `gns_epoch_grad_sq`), so every batch
+    must have at least two micro-batches. Its estimates are averaged over epochs, exponentially, the
     newest epoch's weight `1 - decay`.
 
     Attributes:
