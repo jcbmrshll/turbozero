@@ -446,7 +446,7 @@ def fake_loop(monkeypatch):
             metrics = {"loss": jnp.array(0.0)}
             if noise_scale is not None:
                 metrics["gns_tr_sigma"] = jnp.array(float(noise_scale(epoch)))
-                metrics["gns_epoch_grad_sq"] = jnp.array(1.0)
+                metrics["gns_grad_sq"] = jnp.array(1.0)
             return collection_state, result, metrics
 
         monkeypatch.setattr(trainer, "collect_steps", collect_steps)
@@ -3324,13 +3324,7 @@ def test_train_steps_logs_the_noise_scale_at_the_batch_size_it_is_given(env, tmp
     )
 
     assert np.isfinite(metrics["gns_tr_sigma"]) and metrics["gns_tr_sigma"] > 0
-    assert {
-        "gns_grad_sq",
-        "gns_noise_scale",
-        "gns_epoch_grad_sq",
-        "gns_epoch_noise_scale",
-        "gns_signal_share",
-    } <= set(metrics)
+    assert {"gns_grad_sq", "gns_noise_scale", "gns_signal_share"} <= set(metrics)
     with pytest.raises(ValueError, match="multiple of the micro-batch size"):
         trainer.train_steps(
             jax.random.PRNGKey(0),

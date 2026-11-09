@@ -1474,21 +1474,6 @@ class Trainer:
         learner: int = 0,
         lr_scale: jax.Array | None = None,
     ) -> tuple[TrainState, dict]:
-        """Make a single training step (see `step_with_grads`).
-
-        Returns:
-            Tuple[TrainState, dict]: updated TrainState and metrics
-        """
-        ts, metrics, _ = self.step_with_grads(ts, batch, learner, lr_scale)
-        return ts, metrics
-
-    def step_with_grads(
-        self,
-        ts: TrainState,
-        batch: BaseExperience,
-        learner: int = 0,
-        lr_scale: jax.Array | None = None,
-    ) -> tuple[TrainState, dict, Any]:
         """Make a single training step, on micro-batches of `micro_batch_size` samples (see
         `grad_accum_steps`): as many as the minibatch holds.
 
@@ -1500,10 +1485,9 @@ class Trainer:
                 `batch_size_rule`)
 
         Returns:
-            Tuple[TrainState, dict, Any]: updated TrainState; metrics, with 2 or more
-                micro-batches `gns_micro_sq` and `gns_batch_sq`, their gradients' mean squared norm
-                and their mean's (see `core.training.noise_scale.noise_scale_metrics`); and the
-                step's gradients
+            Tuple[TrainState, dict]: updated TrainState and metrics; with 2 or more micro-batches,
+                `gns_micro_sq` and `gns_batch_sq`, their gradients' mean squared norm and their
+                mean's (see `core.training.noise_scale.noise_scale_metrics`)
         """
         # calculate loss, get gradients
         nn_static = eqx.filter(
@@ -1545,7 +1529,7 @@ class Trainer:
             **gns,
             **injected_hyperparams(opt_state, scheduled_only=True),
         }
-        return ts, metrics, grads
+        return ts, metrics
 
     def accumulate_grads(
         self,
@@ -1656,13 +1640,10 @@ class Trainer:
             else None
         )
 
-        # with micro-batches, the sum of the steps' gradients, for the noise scale's |G|^2
-        measure = batch_size // self.micro_batch_size >= 2
-
         def step(
-            carry: tuple[jax.Array, TrainState, Any], _
-        ) -> tuple[tuple[jax.Array, TrainState, Any], dict]:
-            key, ts, grad_sum = carry
+            carry: tuple[jax.Array, TrainState], _
+        ) -> tuple[tuple[jax.Array, TrainState], dict]:
+            key, ts = carry
             step_key, key = jax.random.split(key)
             # sample from replay memory
             indices = jnp.unravel_index(
@@ -1676,34 +1657,20 @@ class Trainer:
             transform_key, key = jax.random.split(key)
             batch = transform_randomly(transform_key, batch, self.transform_fns)
             # make training step
-            ts, metrics, grads = self.step_with_grads(ts, batch, learner, lr_scale)
-            if measure:
-                grad_sum = jax.tree.map(
-                    lambda s, g: s + g.astype(jnp.float32), grad_sum, grads
-                )
-            return (key, ts, grad_sum), metrics
+            ts, metrics = self.train_step(ts, batch, learner, lr_scale)
+            return (key, ts), metrics
 
-        grad_sum = (
-            jax.tree.map(lambda p: jnp.zeros(p.shape, jnp.float32), train_state.params)
-            if measure
-            else None
-        )
-        (_, train_state, grad_sum), metrics = jax.lax.scan(
-            step, (key, train_state, grad_sum), length=num_steps
+        (_, train_state), metrics = jax.lax.scan(
+            step, (key, train_state), length=num_steps
         )
         metrics = reduce_step_metrics(metrics)
-        if measure:
-            epoch_sq = jnp.square(
-                optax.tree.norm(jax.tree.map(lambda g: g / num_steps, grad_sum))
-            )
+        if "gns_micro_sq" in metrics:
             metrics.update(
                 noise_scale_metrics(
                     metrics.pop("gns_micro_sq"),
                     metrics.pop("gns_batch_sq"),
                     self.micro_batch_size,
                     batch_size,
-                    epoch_sq,
-                    num_steps,
                 )
             )
         return train_state, metrics
@@ -3120,9 +3087,7 @@ class Trainer:
             # no steps this epoch
             return progress, out
         progress = rule.after_epoch(
-            progress,
-            float(metrics["gns_tr_sigma"]),
-            float(metrics["gns_epoch_grad_sq"]),
+            progress, float(metrics["gns_tr_sigma"]), float(metrics["gns_grad_sq"])
         )
         noise_scale = rule.noise_scale(progress)
         if noise_scale is not None:

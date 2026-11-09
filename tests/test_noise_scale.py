@@ -40,49 +40,17 @@ def test_the_estimators_need_a_batch_bigger_than_its_micro_batches():
 
 
 def test_metrics_give_the_noise_scale_and_the_signal_share():
-    # tr(Sigma) 16 x (1.5 - 1) = 8; |G|^2 from the micro-batches (16 - 12) / 8 = 0.5, and from
-    # the epoch's mean gradient 0.5 + 8 / (2 x 16) - 8 / 32 = 0.5 as well: noise scale 16
-    half = noise_scale_metrics(
-        jnp.array(1.5), jnp.array(1.0), 8, 16, jnp.array(0.75), 2
-    )
-    assert float(half["gns_tr_sigma"]) == pytest.approx(8.0)
-    assert float(half["gns_noise_scale"]) == pytest.approx(16.0)
-    assert float(half["gns_epoch_grad_sq"]) == pytest.approx(0.5)
-    assert float(half["gns_epoch_noise_scale"]) == pytest.approx(16.0)
-    assert float(half["gns_signal_share"]) == pytest.approx(0.5)
-
-    # all noise: no gradient left in the epoch's mean
-    noise = noise_scale_metrics(
-        jnp.array(2.0), jnp.array(1.0), 8, 16, jnp.array(0.25), 4
-    )
-    assert math.isinf(noise["gns_epoch_noise_scale"])
+    # tr(Sigma) 8 x 16 / (16 - 8) x (2 - 1) = 16, |G|^2 (16 x 1 - 8 x 2) / 8 = 0: all noise
+    noise = noise_scale_metrics(jnp.array(2.0), jnp.array(1.0), 8, 16)
+    assert float(noise["gns_tr_sigma"]) == pytest.approx(16.0)
+    assert float(noise["gns_grad_sq"]) == pytest.approx(0.0)
+    assert math.isinf(noise["gns_noise_scale"])
     assert float(noise["gns_signal_share"]) == 0.0
 
-
-def test_the_epochs_mean_gradient_sees_through_the_jitters_pull():
-    # each step's weights sit off the centre, and their gradient points back: a pull that changes
-    # from step to step, as big as the true gradient times 3
-    dim, b, n, steps = 16, 8, 4, 512
-    keys = jax.random.split(jax.random.PRNGKey(0), 2)
-    true_grad = jnp.full(dim, 0.1)
-    pull = 0.3 * 4 * jax.random.normal(keys[0], (steps, 1, 1, dim))
-    samples = true_grad + pull + jax.random.normal(keys[1], (steps, n, b, dim))
-    micro = samples.mean(axis=2)
-    batch_grads = micro.mean(axis=1)
-
-    metrics = noise_scale_metrics(
-        jnp.square(micro).sum(-1).mean(),
-        jnp.square(batch_grads).sum(-1).mean(),
-        b,
-        n * b,
-        jnp.square(batch_grads.mean(axis=0)).sum(),
-        steps,
-    )
-
-    # tr(Sigma) = 16, |G|^2 = 0.16: a noise scale of 100
-    assert float(metrics["gns_tr_sigma"]) == pytest.approx(16.0, rel=0.05)
-    assert float(metrics["gns_noise_scale"]) < 10
-    assert float(metrics["gns_epoch_noise_scale"]) == pytest.approx(100.0, rel=0.3)
+    # tr(Sigma) 16 x (1.5 - 1) = 8, |G|^2 (16 - 12) / 8 = 0.5: noise scale 16, half of 16 signal
+    half = noise_scale_metrics(jnp.array(1.5), jnp.array(1.0), 8, 16)
+    assert float(half["gns_noise_scale"]) == pytest.approx(16.0)
+    assert float(half["gns_signal_share"]) == pytest.approx(0.5)
 
 
 # the batch size rule
