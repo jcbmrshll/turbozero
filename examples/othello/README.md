@@ -768,8 +768,9 @@ Against engines the gain is smaller than against the same net. At 10 s a game, 4
 4 threads a side, the 700-minute 8x128 scored 35.5% against Edax with the engine and native network
 (1 leaf a thread) and 31.5% with the batch of 16, on the same 100 games' openings and colours: +4.0
 ± 3.8 points, about +31 ± 30 Elo. With random symmetry it scored 37.5%, and against Egaroucid 41%.
-Edax spent 0.03 s a game on the last 23 empty squares, which it plays perfectly; the net spent
-1.6 s there.
+Edax spent 0.03 s a game on the last 23 empty squares, the net 1.6 s, but the games were decided
+earlier: solved exactly, perfect play from 24 empties would have scored 36% instead of 34% (100
+games), and from 28, 37.5%. The net gives up about 5 discs from 24 empties, and rarely the result.
 
 Below AVX2 the library builds without the native network, and `Engine` runs OpenVINO.
 
