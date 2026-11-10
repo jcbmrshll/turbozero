@@ -764,6 +764,13 @@ The native network costs nothing per core to run a leaf at a time, so the choice
 alone: 1 a thread for 8x128; small nets at high visits want 2-4. It matched bf16 at
 equal visits: -3 ± 12 on 4x64 and on 8x128 with channel norm, 400 games each.
 
+Against engines the gain is smaller than against the same net. At 10 s a game, 4 physical cores and
+4 threads a side, the 700-minute 8x128 scored 35.5% against Edax with the engine and native network
+(1 leaf a thread) and 31.5% with the batch of 16, on the same 100 games' openings and colours: +4.0
+± 3.8 points, about +31 ± 30 Elo. With random symmetry it scored 37.5%, and against Egaroucid 41%.
+Edax spent 0.03 s a game on the last 23 empty squares, which it plays perfectly; the net spent
+1.6 s there.
+
 Below AVX2 the library builds without the native network, and `Engine` runs OpenVINO.
 
 ## Credits
