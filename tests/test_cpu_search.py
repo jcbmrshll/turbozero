@@ -642,7 +642,7 @@ def test_an_engine_of_one_worker_searches_as_a_batch_of_one(tiny_model):
         for action in (19, 18, 26):
             search.play(action)
     reference.run(300, openvino_eval(tiny_model, 1, "f32"))
-    Engine(tiny_model, 1, 1).search(native, visits=300)
+    Engine.openvino(tiny_model, 1, 1).search(native, visits=300)
     assert np.array_equal(native.visits(), reference.visits())
     assert native.total_visits() == reference.total_visits() == 300
 
@@ -651,7 +651,7 @@ def test_an_engine_of_one_worker_searches_as_a_batch_of_one(tiny_model):
 def test_workers_visit_exactly_and_leave_nothing_in_flight(tiny_model, mode):
     from cpu_search import Engine, Search, SearchSettings
 
-    engine = Engine(tiny_model, 3, 4)
+    engine = Engine.openvino(tiny_model, 3, 4)
     search = Search(SearchSettings(batch=4, virtual_loss=mode))
     leaves = engine.search(search, visits=500)
     assert search.total_visits() == 500
@@ -671,7 +671,7 @@ def test_a_timed_search_stops_at_its_time(tiny_model):
 
     from cpu_search import Engine, Search, SearchSettings
 
-    engine = Engine(tiny_model, 2, 2)
+    engine = Engine.openvino(tiny_model, 2, 2)
     search = Search(SearchSettings(batch=2, virtual_loss="visit"))
     start = time.perf_counter()
     engine.search(search, seconds=0.05)
@@ -691,7 +691,7 @@ def test_a_solved_tree_stops_its_search_early(tiny_model):
             break
         search.play(int(rng.choice(np.flatnonzero(search.legal()))))
     assert not search.terminated()
-    Engine(tiny_model, 2, 2).search(search, seconds=5.0, stop_ended=64)
+    Engine.openvino(tiny_model, 2, 2).search(search, seconds=5.0, stop_ended=64)
     # far fewer than 5 s of visits
     assert search.total_visits() < 100_000
 
@@ -702,9 +702,105 @@ def test_an_engine_player_plays_a_game_through_the_clock_driver(tiny_model):
     from cpu_search import Engine, SearchSettings
     from xot import XOT_PATH, load_xot
 
-    engine = Engine(tiny_model, 2, 2)
+    engine = Engine.openvino(tiny_model, 2, 2)
     black = NetPlayer(SearchSettings(batch=2, virtual_loss="visit"), engine, seed=1)
     white = NetPlayer(SearchSettings(batch=1), fake_eval)
     game = play_game(black, white, load_xot(XOT_PATH)[0], 1.0)
     assert game.flagged is None
     assert max(game.seconds) < 1.1
+
+
+def native_supported() -> bool:
+    from cpu_search import LIB
+
+    return bool(LIB.net_supported())
+
+
+def random_network(spec: str, seed: int = 1):
+    """A network of `spec` in inference mode, every weight nonzero and normalizations not the
+    identity, with its state."""
+    import equinox as eqx
+    from game import make_network
+
+    network, state = make_network(spec)
+    rng = np.random.default_rng(seed)
+    params, static = eqx.partition(network, eqx.is_inexact_array)
+    params = jax.tree.map(
+        lambda x: (
+            x
+            + (0.3 if x.ndim == 1 else 0.05) * rng.normal(size=x.shape).astype(x.dtype)
+        ),
+        params,
+    )
+    return eqx.nn.inference_mode(eqx.combine(params, static)), state
+
+
+NATIVE_SPECS = [
+    "resnet:2x32,pool_every=2,heads=pooled,pool_channels=16,head_channels=16",
+    "resnet:3x64,pool_every=2,heads=pooled,pool_channels=16,norm=channel,layout=pre",
+    "resnet:2x48,pool_every=1,heads=pooled,pool_channels=16,head_channels=16,layout=pre",
+]
+
+
+@pytest.mark.parametrize("spec", NATIVE_SPECS)
+def test_the_native_networks_layers_compute_the_network(spec):
+    import cpu_net
+    from cpu_search import ort_eval, ort_session
+    from export_onnx import to_onnx
+
+    # against the exported graph, which `test_export_matches_the_network` checks against the network
+    model, state = random_network(spec)
+    x = (np.random.default_rng(0).random((16, 2, 8, 8)) < 0.3).astype(np.float32)
+    logits, values = ort_eval(
+        ort_session(to_onnx(model, state).SerializeToString(), 1)
+    )(x)
+    got_logits, got_values = cpu_net.float_forward(cpu_net.extract(model, state), x)
+    np.testing.assert_allclose(got_logits, logits, atol=1e-5)
+    np.testing.assert_allclose(got_values, values, atol=1e-5)
+
+
+@pytest.mark.parametrize("spec", NATIVE_SPECS)
+def test_the_native_network_computes_its_quantized_layers(spec, tmp_path):
+    import cpu_net
+
+    if not native_supported():
+        pytest.skip("needs AVX-512 VNNI")
+    program = cpu_net.extract(*random_network(spec))
+    x = (np.random.default_rng(0).random((48, 2, 8, 8)) < 0.3).astype(np.float32)
+    quantized = cpu_net.quantize(program, x)
+    # saved and loaded as play loads it
+    cpu_net.save(tmp_path / "net.npz", program, quantized)
+    program, quantized = cpu_net.load(tmp_path / "net.npz")
+    want_logits, want_values = cpu_net.int8_forward(program, quantized, x)
+    network = cpu_net.NativeNet(program, quantized)
+    for threads in (1, 3):
+        logits, values = network.forward(x, threads)
+        # float sums in another order can round an activation to the next step, rarely
+        np.testing.assert_allclose(logits, want_logits, atol=2e-2)
+        np.testing.assert_allclose(values, want_values, atol=2e-2)
+        assert np.abs(logits - want_logits).mean() < 1e-3
+    # and quantized, it stays close to the float network
+    float_logits, _ = cpu_net.float_forward(program, x)
+    assert np.abs(logits - float_logits).mean() < 0.05
+
+
+def test_an_engine_of_the_native_network_searches_as_a_batch_of_one():
+    import cpu_net
+    from cpu_search import Engine, Search
+
+    if not native_supported():
+        pytest.skip("needs AVX-512 VNNI")
+    program = cpu_net.extract(*random_network(NATIVE_SPECS[1]))
+    x = (np.random.default_rng(0).random((48, 2, 8, 8)) < 0.3).astype(np.float32)
+    network = cpu_net.NativeNet(program, cpu_net.quantize(program, x))
+    reference, native = Search(), Search()
+    for search in (reference, native):
+        for action in (19, 18, 26):
+            search.play(action)
+    reference.run(300, network.forward)
+    Engine.native(network, 1, 1).search(native, visits=300)
+    assert np.array_equal(native.visits(), reference.visits())
+    # and with workers in parallel, every visit is made
+    parallel = Search()
+    Engine.native(network, 3, 2).search(parallel, visits=400)
+    assert parallel.total_visits() == 400

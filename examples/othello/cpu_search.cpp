@@ -10,11 +10,14 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <openvino/openvino.hpp>
 #include <string>
 #include <thread>
 #include <vector>
+
+#include "cpu_net.h"
 
 namespace {
 
@@ -622,14 +625,19 @@ int search_symmetric_action(int action, int symmetry) { return SYMMETRIC_ACTIONS
 // traversals apart, as a batch's are. Python only starts a move's search and reads its result.
 struct Worker {
     std::vector<float> observations;  // (batch, 2, 8, 8)
-    // a request for each number of leaves, 1 to batch, their input `observations`
+    // a request for each number of leaves, 1 to batch, their input `observations`, with OpenVINO
     std::vector<ov::InferRequest> requests;
+    // or the native network's buffers, and its outputs
+    std::unique_ptr<net::Scratch> scratch;
+    std::vector<float> logits, values;
     Batch batch;
 };
 
 struct Engine {
     ov::Core core;
     std::vector<ov::CompiledModel> models;
+    // the native network, if it has one rather than OpenVINO's
+    const net::Net* network = nullptr;
     std::vector<Worker> workers;
     int batch;
     long calls = 0;
@@ -678,6 +686,22 @@ Engine* engine_new(const char* model_path, const char* precision, int threads, i
     }
 }
 
+// An engine of the native network `n` (see `cpu_net.h`), which must outlive it.
+Engine* engine_new_net(const net::Net* n, int threads, int batch) {
+    if (!NET_NATIVE) return nullptr;
+    Engine* engine = new Engine();
+    engine->network = n;
+    engine->batch = batch;
+    engine->workers.resize(threads);
+    for (Worker& w : engine->workers) {
+        w.observations.assign((size_t)batch * 128, 0.0f);
+        w.scratch = std::make_unique<net::Scratch>(*n);
+        w.logits.assign((size_t)batch * 65, 0.0f);
+        w.values.assign(batch, 0.0f);
+    }
+    return engine;
+}
+
 void engine_free(Engine* engine) { delete engine; }
 
 // Searches `s`'s tree with all the engine's workers: `visits` visits, or with none, until `seconds`
@@ -720,12 +744,21 @@ long engine_search(Engine* engine, Search* s, int visits, double seconds, int st
                 continue;
             }
             held.unlock();
-            ov::InferRequest& request = w.requests[n - 1];
             auto t0 = clock::now();
-            request.infer();
+            const float *logits, *values;
+            if (engine->network) {
+                for (int i = 0; i < n; i++)
+                    net::forward(*engine->network, *w.scratch, w.observations.data() + (size_t)i * 128,
+                                 w.logits.data() + (size_t)i * 65, w.values.data() + i);
+                logits = w.logits.data();
+                values = w.values.data();
+            } else {
+                ov::InferRequest& request = w.requests[n - 1];
+                request.infer();
+                logits = request.get_output_tensor(0).data<float>();
+                values = request.get_output_tensor(1).data<float>();
+            }
             inferring += std::chrono::duration<double>(clock::now() - t0).count();
-            const float* logits = request.get_output_tensor(0).data<float>();
-            const float* values = request.get_output_tensor(1).data<float>();
             held.lock();
             apply(*s, w.batch, logits, values);
             generation++;
@@ -751,5 +784,110 @@ void engine_stats(const Engine* engine, double* out) {
     out[0] = (double)engine->calls;
     out[1] = (double)engine->leaves;
     out[2] = engine->infer_seconds;
+}
+
+// whether this build has the native network (see `cpu_net.h`)
+int net_supported() { return NET_NATIVE; }
+
+// The native network, built a part at a time by `cpu_net.py`.
+net::Net* net_new(int channels, int pre, int head_channels) {
+    net::Net* n = new net::Net();
+    n->channels = channels;
+    n->pre = pre != 0;
+    n->head_channels = head_channels;
+    return n;
+}
+
+void net_free(net::Net* n) { delete n; }
+
+void net_add_block(net::Net* n, int pool_channels) {
+    n->blocks.emplace_back();
+    n->blocks.back().pool_channels = pool_channels;
+}
+
+// A convolution: "stem", or a block's "conv1" or "conv2". `q`, (cout, cin, k, k), its weights; `scale`
+// and `bias`, of each output, what its integer sums are multiplied by and then added to; `in_scale`
+// and `zero_point`, how its input is quantized: round(x / in_scale) + zero_point.
+int net_set_conv(net::Net* n, const char* where, int block, int cin, int cout, int k, const int8_t* q,
+                 const float* scale, const float* bias, float in_scale, int zero_point) {
+    std::string name(where);
+    net::Conv* c = name == "stem" ? &n->stem
+                   : name == "conv1" ? &n->blocks.at(block).conv1
+                   : name == "conv2" ? &n->blocks.at(block).conv2
+                                     : nullptr;
+    if (!c || cin % 4 || cout % 16 || (k != 1 && k != 3)) return -1;
+    c->cin = cin;
+    c->cout = cout;
+    c->k = k;
+    net::pack(*c, q);
+    c->scale.assign(scale, scale + cout);
+    c->bias.assign(bias, bias + cout);
+    c->inv_in_scale = 1.0f / in_scale;
+    c->zero_point = zero_point;
+    return 0;
+}
+
+// A normalization (see `net::Norm`): "stem", "final", a block's "norm1" or "norm2", or the heads'
+// "policy", "pool" or "value".
+int net_set_norm(net::Net* n, const char* where, int block, int type, int channels, const float* a,
+                 const float* c, float eps) {
+    std::string name(where);
+    net::Norm* norm = name == "stem"     ? &n->stem_norm
+                      : name == "final"  ? &n->final_norm
+                      : name == "norm1"  ? &n->blocks.at(block).norm1
+                      : name == "norm2"  ? &n->blocks.at(block).norm2
+                      : name == "policy" ? &n->policy_norm
+                      : name == "pool"   ? &n->pool_norm
+                      : name == "value"  ? &n->value_norm
+                                         : nullptr;
+    if (!norm) return -1;
+    norm->type = type;
+    norm->channels = channels;
+    if (type != net::NORM_NONE) {
+        norm->a.assign(a, a + channels);
+        norm->c.assign(c, c + channels);
+    }
+    norm->eps = eps;
+    return 0;
+}
+
+// A linear layer, `w` (out, in): a block's "pool", or the heads' "pool", "pass", "value_hidden" or
+// "value_out".
+int net_set_linear(net::Net* n, const char* where, int block, int in, int out, const float* w, const float* b) {
+    std::string name(where);
+    net::Linear* l = block >= 0 && name == "pool" ? &n->blocks.at(block).pool
+                     : name == "pool"             ? &n->pool_linear
+                     : name == "pass"             ? &n->pass_linear
+                     : name == "value_hidden"     ? &n->value_hidden
+                     : name == "value_out"        ? &n->value_out
+                                                  : nullptr;
+    if (!l) return -1;
+    l->in = in;
+    l->out = out;
+    l->w.assign(w, w + (size_t)in * out);
+    l->b.assign(b, b + out);
+    return 0;
+}
+
+// The heads' three 1x1 convolutions, `w` (channels, 3 * head_channels) and `b`, and the policy's
+// last, `square_w` (head_channels).
+void net_set_heads(net::Net* n, const float* w, const float* b, const float* square_w) {
+    int h3 = 3 * n->head_channels;
+    n->head_w.assign(w, w + (size_t)n->channels * h3);
+    n->head_b.assign(b, b + h3);
+    n->square_w.assign(square_w, square_w + n->head_channels);
+}
+
+// `count` positions, (count, 2, 8, 8), to (count, 65) logits and (count) values, split over `threads`.
+void net_forward(const net::Net* n, int count, const float* obs, float* logits, float* values, int threads) {
+    auto part = [&](int t) {
+        net::Scratch scratch(*n);
+        for (int i = t; i < count; i += threads)
+            net::forward(*n, scratch, obs + (size_t)i * 128, logits + (size_t)i * 65, values + i);
+    };
+    std::vector<std::thread> others;
+    for (int t = 1; t < threads; t++) others.emplace_back(part, t);
+    part(0);
+    for (auto& t : others) t.join();
 }
 }

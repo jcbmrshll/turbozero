@@ -254,8 +254,13 @@ def model_and_precision(name: str, arm: str) -> tuple[bytes | str, str]:
 
 
 def make_eval(name: str, backend: str, cores: int) -> Eval:
-    """The network `name` on `backend`: "ort", ONNX Runtime; else an arm of `model_and_precision`,
-    a stream to a core, or e.g. "bf16-s1", on that many streams."""
+    """The network `name` on `backend`: "ort", ONNX Runtime; "native", `cpu_net.py`'s; else an arm
+    of `model_and_precision`, a stream to a core, or e.g. "bf16-s1", on that many streams."""
+    if backend == "native":
+        from cpu_net import load_native
+
+        network = load_native(name)
+        return lambda x: network.forward(x, cores)
     if backend == "ort":
         path, net = network_path(name)
         model = export_checkpoint(path, net).SerializeToString()
@@ -266,15 +271,20 @@ def make_eval(name: str, backend: str, cores: int) -> Eval:
 
 
 def make_engine(name: str, backend: str, cores: int, batch: int) -> Engine:
-    """The network `name` on `backend`, an arm of `model_and_precision`, as an `Engine` of a worker to
-    each of `cores`, each evaluating up to `batch` leaves at a time."""
+    """The network `name` on `backend`, "native" (see `cpu_net.py`) or an arm of
+    `model_and_precision`, as an `Engine` of a worker to each of `cores`, each evaluating up to
+    `batch` leaves at a time."""
+    if backend == "native":
+        from cpu_net import load_native
+
+        return Engine.native(load_native(name), cores, batch)
     model, precision = model_and_precision(name, backend)
     if isinstance(model, str):
-        return Engine(model, cores, batch, precision)
+        return Engine.openvino(model, cores, batch, precision)
     with tempfile.NamedTemporaryFile(suffix=".onnx") as f:
         f.write(model)
         f.flush()
-        return Engine(f.name, cores, batch, precision)
+        return Engine.openvino(f.name, cores, batch, precision)
 
 
 def match(args: argparse.Namespace) -> None:

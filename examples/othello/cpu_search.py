@@ -22,6 +22,8 @@ from pathlib import Path
 import numpy as np
 
 SOURCE = Path(__file__).parent / "cpu_search.cpp"
+# what it includes of its own
+HEADERS = [Path(__file__).parent / "cpu_net.h"]
 CACHE_DIR = Path(
     os.environ.get("TURBOZERO_CACHE", Path.home() / ".cache" / "turbozero" / "othello")
 )
@@ -47,7 +49,9 @@ def library_path() -> Path:
     """The compiled search, built for this machine, named after its source and the OpenVINO it
     links."""
     include, openvino = openvino_paths()
-    source = SOURCE.read_bytes() + str(openvino).encode()
+    source = (
+        b"".join(p.read_bytes() for p in [SOURCE, *HEADERS]) + str(openvino).encode()
+    )
     digest = hashlib.sha256(source).hexdigest()[:16]
     path = CACHE_DIR / "cpu-search" / f"cpu_search_{digest}.so"
     if not path.exists():
@@ -70,6 +74,7 @@ def load_library() -> ctypes.CDLL:
     ints = np.ctypeslib.ndpointer(np.int32, flags="C_CONTIGUOUS")
     u64 = ctypes.POINTER(ctypes.c_uint64)
     c_int = ctypes.POINTER(ctypes.c_int)
+    floats = ctypes.POINTER(ctypes.c_float)
     signatures = {
         "search_new": (
             Search,
@@ -108,7 +113,36 @@ def load_library() -> ctypes.CDLL:
             ctypes.c_void_p,
             [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int],
         ),
+        "engine_new_net": (
+            ctypes.c_void_p,
+            [ctypes.c_void_p, ctypes.c_int, ctypes.c_int],
+        ),
         "engine_free": (None, [ctypes.c_void_p]),
+        "net_supported": (ctypes.c_int, []),
+        "net_new": (ctypes.c_void_p, [ctypes.c_int, ctypes.c_int, ctypes.c_int]),
+        "net_free": (None, [ctypes.c_void_p]),
+        "net_add_block": (None, [ctypes.c_void_p, ctypes.c_int]),
+        "net_set_conv": (
+            ctypes.c_int,
+            [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+            + [ctypes.c_int, ctypes.POINTER(ctypes.c_int8), floats, floats]
+            + [ctypes.c_float, ctypes.c_int],
+        ),
+        "net_set_norm": (
+            ctypes.c_int,
+            [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+            + [floats, floats, ctypes.c_float],
+        ),
+        "net_set_linear": (
+            ctypes.c_int,
+            [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+            + [floats, floats],
+        ),
+        "net_set_heads": (None, [ctypes.c_void_p, floats, floats, floats]),
+        "net_forward": (
+            None,
+            [ctypes.c_void_p, ctypes.c_int, floats, floats, floats, ctypes.c_int],
+        ),
         "engine_search": (
             ctypes.c_long,
             [ctypes.c_void_p, Search, ctypes.c_int, ctypes.c_double, ctypes.c_int],
@@ -277,17 +311,34 @@ class Search:
 class Engine:
     """A network on `threads` cores, searching one tree at a time with a worker thread to a core
     (see `engine_search` in `cpu_search.cpp`): each collects up to `batch` leaves, evaluates them on
-    its own core while the others go on, and backs them up, all in C++. `model` is a saved
-    OpenVINO model or ONNX graph's path, computing what isn't quantized in `precision`."""
+    its own core while the others go on, and backs them up, all in C++. Made by `openvino` or
+    `native`."""
 
-    def __init__(self, model: str, threads: int, batch: int, precision: str = "f32"):
+    def __init__(self, handle: int, threads: int, batch: int, network=None):
+        self.handle = handle
         self.threads = threads
         self.batch = batch
-        self.handle = LIB.engine_new(
-            str(model).encode(), precision.encode(), threads, batch
-        )
-        if not self.handle:
+        # what the engine's C++ evaluates with, which must outlive it
+        self.network = network
+
+    @classmethod
+    def openvino(
+        cls, model: str, threads: int, batch: int, precision: str = "f32"
+    ) -> "Engine":
+        """`model`, a saved OpenVINO model or ONNX graph's path, compiled by OpenVINO for each
+        worker and number of leaves, computing what isn't quantized in `precision`."""
+        handle = LIB.engine_new(str(model).encode(), precision.encode(), threads, batch)
+        if not handle:
             raise RuntimeError(f"couldn't compile {model}")
+        return cls(handle, threads, batch)
+
+    @classmethod
+    def native(cls, network, threads: int, batch: int) -> "Engine":
+        """A `cpu_net.NativeNet`, its workers each evaluating their leaves one at a time."""
+        handle = LIB.engine_new_net(network.handle, threads, batch)
+        if not handle:
+            raise RuntimeError("the native network needs AVX-512 VNNI")
+        return cls(handle, threads, batch, network)
 
     def __del__(self) -> None:
         if getattr(self, "handle", None):
