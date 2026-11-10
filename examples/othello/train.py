@@ -74,6 +74,7 @@ from engine_set import EngineSet
 from engines import ENGINES
 from game import (
     DEFAULT_NET,
+    SGD_WEIGHT_DECAY,
     SYMMETRY_TRANSFORM_FNS,
     TRAVERSAL_STEPS,
     WEIGHT_DECAY,
@@ -108,6 +109,7 @@ from core.testing.tester import BaseTester
 from core.training.exploration import Exploration
 from core.training.growth import Growth, Learner
 from core.training.loss_fns import az_default_loss_fn
+from core.training.lr_drop import LRDrop
 from core.training.lr_plateau import LRPlateau
 from core.training.resignation import Resignation
 from core.training.schedule import EvaluatorSchedule, parse_schedule
@@ -146,6 +148,17 @@ def lr_drops(text: str) -> list[tuple[float, float]]:
     if fractions != sorted(set(fractions)) or not 0 < fractions[0] <= fractions[-1] < 1:
         raise argparse.ArgumentTypeError(f"{text!r}: fractions rise, between 0 and 1")
     return drops
+
+
+def lr_drop_spec(text: str) -> LRDrop:
+    """Parses --lr-drop: EPOCHS:FACTOR."""
+    try:
+        epochs, factor = text.split(":")
+        return LRDrop(int(epochs), float(factor))
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} isn't EPOCHS:FACTOR, epochs at least 0 and a factor in (0, 1]"
+        ) from e
 
 
 # the rates --lr-plateau drops to from --lr's 1e-3, as --lr-drops' do. On the training losses of
@@ -538,10 +551,62 @@ def main():
         "(--vs-engine-last's games are then not played)",
     )
     parser.add_argument(
+        "--optimizer",
+        choices=["adamw", "sgd"],
+        default="adamw",
+        help="AdamW, or SGD with --momentum, as AlphaZero and KataGo trained (they used L2 "
+        "weight decay, a rate about 0.2-0.25 at batch 4096 and momentum 0.9). Under SGD a "
+        "batch's size trades against the learning rate linearly",
+    )
+    parser.add_argument(
+        "--momentum",
+        type=float,
+        default=0.9,
+        help="with --optimizer sgd, the momentum",
+    )
+    parser.add_argument(
         "--weight-decay",
         type=float,
-        default=WEIGHT_DECAY,
-        help="AdamW's weight decay, of the network's weights (not its biases or BatchNorm)",
+        default=None,
+        help="weight decay of the network's weights (not its biases or normalization layers): "
+        f"AdamW's (default {WEIGHT_DECAY}), or with --optimizer sgd, w times this added to the "
+        f"gradient, an L2 penalty of half this (default {SGD_WEIGHT_DECAY}; AlphaZero's penalty "
+        "1e-4 is 2e-4 here)",
+    )
+    parser.add_argument(
+        "--decoupled-decay",
+        action="store_true",
+        help="with --optimizer sgd, apply weight decay to the step after momentum, as AdamW "
+        "does, instead of adding it to the gradient (L2)",
+    )
+    parser.add_argument(
+        "--lr-drop",
+        type=lr_drop_spec,
+        default=None,
+        metavar="EPOCHS:FACTOR",
+        help="scale the playing network's learning rate by FACTOR once it has played self-play "
+        "for EPOCHS epochs (with --grow, each network counts its own, from taking over; a "
+        "network waiting to take over trains at the full rate), e.g. 150:0.1",
+    )
+    parser.add_argument(
+        "--noise-measure",
+        type=int,
+        default=0,
+        metavar="K",
+        help="every epoch, measure each training network's gradient noise scale at its weight "
+        "average (--selfplay-average's, else the first of --average-epochs) from K "
+        "micro-batches, logged as gns_avg_*: K 64 adds about 6%% to training. For watching; "
+        "nothing follows it",
+    )
+    parser.add_argument(
+        "--fresh-positions",
+        type=int,
+        default=None,
+        metavar="N",
+        help="every epoch, score the playing network on N of the positions its self-play just "
+        "stored, before it trains on them: its raw weights' and its self-play average's policy "
+        "KL and value loss (fresh_*), and the raw weights' excess (fresh_*_gap), what the "
+        "step's jitter costs on new data. Default 16 micro-batches; 0 for none",
     )
     parser.add_argument(
         "--inference-dtype",
@@ -829,6 +894,22 @@ def main():
     args = parser.parse_args()
     if args.resume and args.ckpt_dir is None:
         parser.error("--resume needs the run's --ckpt-dir")
+    if args.optimizer != "sgd" and args.decoupled_decay:
+        parser.error("--decoupled-decay goes with --optimizer sgd")
+    if args.weight_decay is None:
+        args.weight_decay = (
+            SGD_WEIGHT_DECAY if args.optimizer == "sgd" else WEIGHT_DECAY
+        )
+    micro = args.train_batch // args.grad_accum
+    if args.fresh_positions is None:
+        args.fresh_positions = 16 * micro
+    if args.fresh_positions < 0 or args.fresh_positions % micro:
+        parser.error(
+            f"--fresh-positions must be a multiple of the micro-batch ({micro}, --train-batch / "
+            "--grad-accum)"
+        )
+    if args.noise_measure < 0:
+        parser.error("--noise-measure must be at least 0")
     if args.init_without_buffers and args.init_from is None:
         parser.error("--init-without-buffers needs --init-from")
     if args.fork_into is not None and (args.init_from is None or not args.grow):
@@ -1146,6 +1227,9 @@ def main():
         train_steps_per_epoch=args.train_steps,
         advance_every=args.advance_every,
         grad_accum_steps=args.grad_accum,
+        lr_drop=args.lr_drop,
+        noise_measure=args.noise_measure,
+        fresh_positions=args.fresh_positions,
         nn=network,
         nn_state=network_state,
         loss_fn=partial(az_default_loss_fn, value_target_q=args.value_target_q),
@@ -1157,6 +1241,9 @@ def main():
             args.weight_decay,
             args.lr_drops or (DEFAULT_LR_DROPS if args.lr_final is None else ()),
             lr_plateau=lr_plateau,
+            sgd=args.optimizer == "sgd",
+            momentum=args.momentum,
+            decoupled=args.decoupled_decay,
         ),
         lr_plateau=lr_plateau,
         lr_plateau_metric=args.lr_plateau_metric,

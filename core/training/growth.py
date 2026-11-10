@@ -53,12 +53,15 @@ class GrowthProgress:
         values: the newest `Growth.window` values of the switch metric each learner logged
             since it started training, one tuple per learner
         guard_values: the same, of `Growth.guard`'s metric (empty without a guard)
+        played: epochs each learner has played self-play, one per learner (what a learning
+            rate drop counts, see `core.training.lr_drop.LRDrop`)
     """
 
     playing: int = 0
     trained: tuple[int, ...] = ()
     values: tuple[tuple[float, ...], ...] = ()
     guard_values: tuple[tuple[float, ...], ...] = ()
+    played: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -175,7 +178,9 @@ class Growth:
     def start(self) -> GrowthProgress:
         """The progress of a run that hasn't trained yet."""
         n = len(self.learners) + 1
-        return GrowthProgress(0, (0,) * n, ((),) * n, ((),) * n if self.guard else ())
+        return GrowthProgress(
+            0, (0,) * n, ((),) * n, ((),) * n if self.guard else (), (0,) * n
+        )
 
     def training(self, progress: GrowthProgress) -> tuple[int, ...]:
         """The learners that train: the one playing, and the next, if there is one."""
@@ -217,8 +222,10 @@ class Growth:
                 kept[i] = (*kept[i], float(values[i]))[-self.window :]
             if self.guard is not None and guard_values and i in guard_values:
                 guarded[i] = (*guarded[i], float(guard_values[i]))[-self.window :]
+        played = list(progress.played or (0,) * len(trained))
+        played[progress.playing] += 1
         after = GrowthProgress(
-            progress.playing, tuple(trained), tuple(kept), tuple(guarded)
+            progress.playing, tuple(trained), tuple(kept), tuple(guarded), tuple(played)
         )
         gap = self.gap(after)
         caught_up = self.caught_up(after)

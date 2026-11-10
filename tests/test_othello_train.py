@@ -364,6 +364,45 @@ def test_weight_averages_reach_the_trainer(monkeypatch):
     assert built.value.kwargs["average_warmup"] == 5.0
 
 
+def test_sgd_takes_its_momentum_and_its_own_weight_decay(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, "--optimizer", "sgd", "--lr", "0.2", "--momentum", "0.8")
+    state = built.value.kwargs["optimizer"].init({"w": jnp.zeros((2, 2))})
+    hyperparams = {k: float(v) for k, v in state.hyperparams.items()}
+    assert hyperparams == pytest.approx(
+        {"learning_rate": 0.2, "momentum": 0.8, "weight_decay": train.SGD_WEIGHT_DECAY}
+    )
+
+
+def test_adamw_keeps_its_weight_decay(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch)
+    state = built.value.kwargs["optimizer"].init({"w": jnp.zeros((2, 2))})
+    assert float(state.hyperparams["weight_decay"]) == train.WEIGHT_DECAY
+    assert built.value.kwargs["lr_drop"] is None
+    assert built.value.kwargs["noise_measure"] == 0
+    # 16 micro-batches of --train-batch / --grad-accum
+    assert built.value.kwargs["fresh_positions"] == 16 * 4096
+
+
+def test_lr_drop_and_the_noise_metrics_reach_the_trainer(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(
+            monkeypatch,
+            "--lr-drop",
+            "150:0.1",
+            "--grad-accum",
+            "4",
+            "--noise-measure",
+            "64",
+            "--fresh-positions",
+            "8192",
+        )
+    kwargs = built.value.kwargs
+    assert (kwargs["lr_drop"].after_epochs, kwargs["lr_drop"].factor) == (150, 0.1)
+    assert (kwargs["noise_measure"], kwargs["fresh_positions"]) == (64, 8192)
+
+
 @pytest.mark.parametrize(
     "options",
     [
@@ -421,3 +460,19 @@ def test_retired_networks_training_reaches_the_trainer(monkeypatch):
 def test_retired_networks_training_needs_grow(monkeypatch):
     with pytest.raises(SystemExit):
         run_main(monkeypatch, "--grow-train-retired")
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ("--decoupled-decay",),
+        ("--lr-drop", "150"),
+        ("--lr-drop", "150:2"),
+        ("--lr-drop", "-1:0.1"),
+        ("--grad-accum", "4", "--fresh-positions", "1000"),
+        ("--noise-measure", "-1"),
+    ],
+)
+def test_bad_optimizer_drop_and_noise_options_are_refused(monkeypatch, options):
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, *options)

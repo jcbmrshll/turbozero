@@ -32,7 +32,9 @@ from core.pytree import where_tree
 from core.testing.tester import BaseTester, TestState
 from core.training.exploration import Exploration
 from core.training.growth import Growth, GrowthProgress, Learner
+from core.training.lr_drop import LRDrop
 from core.training.lr_plateau import LRPlateau, LRPlateauProgress, LRPlateauState
+from core.training.noise_scale import noise_scale_estimates, noise_scale_metrics
 from core.training.resignation import Resignation, ResignState
 from core.training.schedule import EvaluatorSchedule, describe
 from core.training.tree_positions import (
@@ -272,6 +274,8 @@ def saved_growth(saved: dict) -> GrowthProgress:
         tuple(saved["trained"]),
         tuple(tuple(v) for v in saved["values"]),
         tuple(tuple(v) for v in saved["guard_values"]),
+        # a state saved before networks counted their epochs playing: none counted
+        tuple(saved.get("played") or (0,) * len(saved["trained"])),
     )
 
 
@@ -357,6 +361,32 @@ def weight_decay_mask(params: Any) -> Any:
     and with `optax.inject_hyperparams`, which takes a callable argument for a schedule unless it's
     static: `optax.inject_hyperparams(optax.adamw, static_args=("mask",))`."""
     return jax.tree.map(lambda x: x.ndim >= 2, params)
+
+
+def sgdw(
+    learning_rate: optax.ScalarOrSchedule,
+    momentum: float = 0.9,
+    weight_decay: float = 0.0,
+    decoupled: bool = False,
+    mask: Any = None,
+) -> optax.GradientTransformation:
+    """SGD with (heavy-ball) momentum and weight decay, as AlphaZero and KataGo trained: each step
+    the momentum buffer m <- momentum * m + gradient, and the weights w <- w - learning_rate * m.
+
+    The decay adds `weight_decay * w` to what's applied: with `decoupled` False (L2, AlphaZero's
+    and KataGo's), to the gradient before momentum, as the gradient of an L2 penalty
+    `weight_decay / 2 * |w|^2` in the loss would; with `decoupled`, to the step after momentum
+    (w <- w - learning_rate * (m + weight_decay * w)), as AdamW's decay is.
+
+    For `optax.inject_hyperparams`, with `mask` and `decoupled` static, e.g.
+    `optax.inject_hyperparams(sgdw, static_args=("mask", "decoupled"))(learning_rate=0.2,
+    momentum=0.9, weight_decay=1e-4, mask=weight_decay_mask)`."""
+    decay = optax.add_decayed_weights(weight_decay, mask)
+    trace = optax.trace(decay=momentum)
+    return optax.chain(
+        *((trace, decay) if decoupled else (decay, trace)),
+        optax.scale_by_learning_rate(learning_rate),
+    )
 
 
 def update_size_metrics(params: Any, updates: Any) -> dict:
@@ -553,6 +583,9 @@ class Trainer:
         testers: Sequence[BaseTester],
         nn_state: eqx.nn.State | None = None,
         grad_accum_steps: int = 1,
+        lr_drop: LRDrop | None = None,
+        noise_measure: int = 0,
+        fresh_positions: int = 0,
         evaluator_test: Evaluator | None = None,
         test_env_init_fn: EnvInitFn | None = None,
         exploration: Exploration | None = None,
@@ -614,7 +647,21 @@ class Trainer:
                 with its own statistics, and its running statistics are updated once per step, with the
                 mean of the micro-batches' updates (for BatchNorm's running mean, that's the
                 minibatch's; its running variance misses the variance between micro-batches' means).
-                Default 1: no accumulation.
+                Default 1: no accumulation. With 2 or more, training logs the gradient noise scale
+                from the micro-batches' gradients (see `core.training.noise_scale`), as `gns_*`.
+            lr_drop: (optional) drop each network's learning rate once it has played self-play for
+                a number of epochs (see `core.training.lr_drop.LRDrop`), by scaling its updates;
+                a network waiting to take over trains at the full rate. It logs `lr_scale`.
+            noise_measure: (optional) every epoch, measure each training network's gradient noise
+                scale at its weight average (with `averages`; the self-play one's horizon, else
+                the first) from this many micro-batches, logged as `gns_avg_*`: for watching,
+                nothing follows it (see `noise_scale_at`)
+            fresh_positions: (optional) every epoch, score the playing network on this many of the
+                positions its self-play just stored (finished games only, sampled with
+                replacement), before it trains on them: its raw weights' and, with `averages`, its
+                self-play average's policy KL and value loss, logged as `fresh_*`, and the raw
+                weights' excess over the average's, `fresh_*_gap`: how much the step's jitter
+                costs on new data (see `fresh_position_metrics`). A multiple of the micro-batch
             evaluator_test: (optional) evaluator to use during testing. If not provided, `evaluator` is used
                 (required with a schedule of several evaluators).
             test_env_init_fn: (optional) environment initialization function for test episodes, e.g. to test from
@@ -779,6 +826,16 @@ class Trainer:
                 f"{train_batch_size}, got {grad_accum_steps}"
             )
         self.grad_accum_steps = grad_accum_steps
+        self.micro_batch_size = train_batch_size // grad_accum_steps
+        self.lr_drop = lr_drop
+        if fresh_positions % self.micro_batch_size:
+            raise ValueError(
+                f"fresh_positions ({fresh_positions}) must be a multiple of the micro-batch "
+                f"({self.micro_batch_size})"
+            )
+        self.fresh_positions = fresh_positions
+        # micro-batches to measure the noise scale on at a weight average, every epoch
+        self.noise_measure = noise_measure
         if lr_plateau is not None and train_steps_per_epoch < 1:
             raise ValueError("lr_plateau needs training steps, to measure the loss")
         if waiting_train_steps is not None and (
@@ -966,6 +1023,11 @@ class Trainer:
             **(
                 {"grad_accum_steps": self.grad_accum_steps}
                 if self.grad_accum_steps > 1
+                else {}
+            ),
+            **(
+                {"lr_drop": self.lr_drop.get_config()}
+                if self.lr_drop is not None
                 else {}
             ),
             "evaluator_train": evaluator_train.__class__.__name__,
@@ -1407,17 +1469,26 @@ class Trainer:
         return jax.vmap(collect_env)(key, state)
 
     def train_step(
-        self, ts: TrainState, batch: BaseExperience, learner: int = 0
+        self,
+        ts: TrainState,
+        batch: BaseExperience,
+        learner: int = 0,
+        lr_scale: jax.Array | None = None,
     ) -> tuple[TrainState, dict]:
-        """Make a single training step.
+        """Make a single training step, on micro-batches of `micro_batch_size` samples (see
+        `grad_accum_steps`): as many as the minibatch holds.
 
         Args:
             ts: TrainState
-            batch: minibatch of experiences
+            batch: minibatch of experiences, a multiple of `micro_batch_size` samples
             learner: (optional) with `growth`, the index of the network `ts` is (`nn` is 0)
+            lr_scale: (optional) scales the optimizer's update, as a learning rate would (see
+                `lr_drop`)
 
         Returns:
-            Tuple[TrainState, dict]: updated TrainState and metrics
+            Tuple[TrainState, dict]: updated TrainState and metrics; with 2 or more micro-batches,
+                `gns_micro_sq` and `gns_batch_sq`, their gradients' mean squared norm and their
+                mean's (see `core.training.noise_scale.noise_scale_metrics`)
         """
         # calculate loss, get gradients
         nn_static = eqx.filter(
@@ -1425,16 +1496,23 @@ class Trainer:
         )
         nn = eqx.combine(ts.params, nn_static)
         grad_fn = eqx.filter_value_and_grad(self.loss_fn, has_aux=True)
-        if self.grad_accum_steps == 1:
+        num_micro = jax.tree.leaves(batch)[0].shape[0] // self.micro_batch_size
+        gns: dict[str, jax.Array] = {}
+        if num_micro == 1:
             (loss, (metrics, nn_state)), grads = grad_fn(nn, ts.nn_state, batch)
         else:
-            loss, metrics, nn_state, grads = self.accumulate_grads(
-                grad_fn, nn, ts.params, ts.nn_state, batch
+            loss, metrics, nn_state, grads, micro_sq = self.accumulate_grads(
+                grad_fn, nn, ts.params, ts.nn_state, batch, num_micro
             )
+            gns["gns_micro_sq"] = micro_sq
         # apply gradients
         updates, opt_state = self.optimizer.update(grads, ts.opt_state, ts.params)
+        if lr_scale is not None:
+            updates = jax.tree.map(lambda u: u * lr_scale.astype(u.dtype), updates)
         update_size = update_size_metrics(ts.params, updates)
         grad_norm = optax.tree.norm(grads).astype(jnp.float32)
+        if gns:
+            gns["gns_batch_sq"] = jnp.square(grad_norm)
         ts = replace(
             ts,
             params=optax.apply_updates(ts.params, updates),
@@ -1449,6 +1527,7 @@ class Trainer:
             "loss": loss,
             "grad_norm": grad_norm,
             "nonfinite_steps": ~(jnp.isfinite(loss) & jnp.isfinite(grad_norm)),
+            **gns,
             **injected_hyperparams(opt_state, scheduled_only=True),
         }
         return ts, metrics
@@ -1460,8 +1539,9 @@ class Trainer:
         params: Any,
         nn_state: eqx.nn.State | None,
         batch: BaseExperience,
-    ) -> tuple[jax.Array, dict, eqx.nn.State | None, Any]:
-        """Computes the loss and gradients of a minibatch in `grad_accum_steps` micro-batches, one after
+        n: int,
+    ) -> tuple[jax.Array, dict, eqx.nn.State | None, Any, jax.Array]:
+        """Computes the loss and gradients of a minibatch in `n` micro-batches, one after
         another in a `jax.lax.scan` (see `grad_accum_steps` in `__init__`).
 
         Args:
@@ -1470,13 +1550,13 @@ class Trainer:
             params: its parameters, which its gradients have the structure of
             nn_state: state of the neural network, which each micro-batch starts from
             batch: minibatch of experiences
+            n: the number of micro-batches, which must divide the minibatch's size
 
         Returns:
-            Tuple[jax.Array, dict, Optional[eqx.nn.State], Any]: the micro-batches' mean loss, mean
-                metrics, mean state (taking the last of non-float leaves, e.g. step counters), and
-                mean gradients
+            Tuple[jax.Array, dict, Optional[eqx.nn.State], Any, jax.Array]: the micro-batches' mean
+                loss, mean metrics, mean state (taking the last of non-float leaves, e.g. step
+                counters), mean gradients, and their gradients' mean squared norm
         """
-        n = self.grad_accum_steps
         # micro-batch i is samples i, i + n, i + 2n, ...
         micro_batches = jax.tree.map(
             lambda x: x.reshape(x.shape[0] // n, n, *x.shape[1:]).swapaxes(0, 1),
@@ -1488,9 +1568,10 @@ class Trainer:
                 nn, nn_state, micro_batch
             )
             grads = jax.tree.map(jnp.add, grads, micro_grads)
-            return grads, (loss, metrics, new_state)
+            micro_sq = jnp.square(optax.tree.norm(micro_grads).astype(jnp.float32))
+            return grads, (loss, metrics, new_state, micro_sq)
 
-        grads, (losses, metrics, states) = jax.lax.scan(
+        grads, (losses, metrics, states, micro_sq) = jax.lax.scan(
             micro_step, jax.tree.map(jnp.zeros_like, params), micro_batches
         )
         nn_state = jax.tree.map(
@@ -1502,9 +1583,10 @@ class Trainer:
             jax.tree.map(jnp.mean, metrics),
             nn_state,
             jax.tree.map(lambda g: g / n, grads),
+            micro_sq.mean(),
         )
 
-    @partial(jax.jit, static_argnums=(0, 4), static_argnames=("learner",))
+    @partial(jax.jit, static_argnums=(0, 4), static_argnames=("learner", "batch_size"))
     def train_epoch(
         self,
         key: jax.Array,
@@ -1515,6 +1597,8 @@ class Trainer:
         tree_mask: jax.Array | None = None,
         num_tree: jax.Array | None = None,
         learner: int = 0,
+        batch_size: int | None = None,
+        lr_scale: jax.Array | None = None,
     ) -> tuple[TrainState, dict]:
         """Performs `num_steps` training steps, compiled into a single `jax.lax.scan`.
 
@@ -1534,14 +1618,23 @@ class Trainer:
             num_tree: number of tree positions in each minibatch, a traced value so that changing it
                 doesn't recompile. With none to sample, it must be 0.
             learner: (optional) with `growth`, the index of the network `train_state` is
+            batch_size: (optional) samples per step, a multiple of `micro_batch_size`
+                (default `train_batch_size`)
+            lr_scale: (optional) scales every step's update, as a learning rate would
 
         Returns:
-            Tuple[TrainState, dict]: updated training state and metrics (mean across steps)
+            Tuple[TrainState, dict]: updated training state and metrics (mean across steps), with
+                2 or more micro-batches a step, the noise scale's (see
+                `core.training.noise_scale.noise_scale_metrics`)
         """
+        if batch_size is None:
+            batch_size = self.train_batch_size
         # the buffer doesn't change while training, so find which entries can be sampled once per epoch
         mask = self.memory_buffer.sample_mask(buffer_state)
         add_tree_positions = (
-            self.tree_position_sampler(tree_buffer_state, tree_mask, num_tree)
+            self.tree_position_sampler(
+                tree_buffer_state, tree_mask, num_tree, batch_size
+            )
             if tree_buffer_state is not None
             and tree_mask is not None
             and num_tree is not None
@@ -1555,9 +1648,7 @@ class Trainer:
             step_key, key = jax.random.split(key)
             # sample from replay memory
             indices = jnp.unravel_index(
-                self.memory_buffer.sample_indices(
-                    step_key, mask, self.train_batch_size
-                ),
+                self.memory_buffer.sample_indices(step_key, mask, batch_size),
                 mask.shape,
             )
             batch = jax.tree.map(lambda x: x[indices], buffer_state.buffer)
@@ -1567,13 +1658,23 @@ class Trainer:
             transform_key, key = jax.random.split(key)
             batch = transform_randomly(transform_key, batch, self.transform_fns)
             # make training step
-            ts, metrics = self.train_step(ts, batch, learner)
+            ts, metrics = self.train_step(ts, batch, learner, lr_scale)
             return (key, ts), metrics
 
         (_, train_state), metrics = jax.lax.scan(
             step, (key, train_state), length=num_steps
         )
-        return train_state, reduce_step_metrics(metrics)
+        metrics = reduce_step_metrics(metrics)
+        if "gns_micro_sq" in metrics:
+            metrics.update(
+                noise_scale_metrics(
+                    metrics.pop("gns_micro_sq"),
+                    metrics.pop("gns_batch_sq"),
+                    self.micro_batch_size,
+                    batch_size,
+                )
+            )
+        return train_state, metrics
 
     def resize_replay_buffer(
         self,
@@ -1666,6 +1767,7 @@ class Trainer:
         tree_buffer_state: ReplayBufferState,
         mask: jax.Array,
         num_tree: jax.Array,
+        batch_size: int,
     ) -> Callable[[jax.Array, BaseExperience], BaseExperience]:
         """Makes a function that puts tree positions (see `tree_positions`) into a minibatch: it
         replaces the first `num_tree` samples of a minibatch with ones sampled from the tree position
@@ -1676,6 +1778,7 @@ class Trainer:
                 the function is used
             mask: the tree positions to sample from (see `tree_sample_mask`)
             num_tree: number of tree positions per minibatch; with none in `mask`, it must be 0
+            batch_size: samples per minibatch
 
         Returns:
             Callable[[jax.Array, BaseExperience], BaseExperience]: (rng, minibatch) -> minibatch
@@ -1684,13 +1787,11 @@ class Trainer:
         tree_buffer = self.tree_buffer
         # with nothing to sample, sample anything: `num_tree` is 0, so none of it is used
         mask = mask | ~mask.any()
-        is_tree = jnp.arange(self.train_batch_size) < num_tree
+        is_tree = jnp.arange(batch_size) < num_tree
 
         def add_tree_positions(key: jax.Array, batch: BaseExperience) -> BaseExperience:
             indices = jnp.unravel_index(
-                tree_buffer.sample_indices(
-                    key, mask, self.train_batch_size, replace=True
-                ),
+                tree_buffer.sample_indices(key, mask, batch_size, replace=True),
                 mask.shape,
             )
             return jax.tree.map(
@@ -1703,6 +1804,176 @@ class Trainer:
 
         return add_tree_positions
 
+    def noise_scale_at(
+        self,
+        key: jax.Array,
+        buffer_state: ReplayBufferState,
+        train_state: TrainState,
+        params: Any,
+        num_micro: int,
+        learner: int = 0,
+    ) -> tuple[jax.Array, jax.Array]:
+        """tr(Sigma) and |G|^2 at `params` (e.g. a weight average, where the jitter's pull back
+        to the centre doesn't inflate |G|^2; see core.training.noise_scale), from the gradients
+        of `num_micro` micro-batches sampled from the replay buffer as training samples them.
+
+        In chunks of up to 16 micro-batches: each chunk's samples are gathered by one compiled
+        function and their gradients summed by another, so neither holds more than a chunk."""
+        mask = self.memory_buffer.sample_mask(buffer_state)
+        chunk = min(16, num_micro)
+        total, micro_sq = None, jnp.zeros((), jnp.float32)
+        for start in range(0, num_micro, chunk):
+            n = min(chunk, num_micro - start)
+            gather_key, grad_key, key = jax.random.split(key, 3)
+            batches = self._noise_gather(gather_key, buffer_state, mask, n)
+            sums, sq = self._noise_grads(
+                grad_key, train_state.nn_state, params, batches, learner=learner
+            )
+            total = sums if total is None else jax.tree.map(jnp.add, total, sums)
+            micro_sq = micro_sq + sq
+        assert total is not None
+        batch_sq = jnp.square(
+            optax.tree.norm(jax.tree.map(lambda t: t / num_micro, total))
+        )
+        return noise_scale_estimates(
+            micro_sq / num_micro,
+            batch_sq,
+            self.micro_batch_size,
+            num_micro * self.micro_batch_size,
+        )
+
+    @partial(jax.jit, static_argnums=(0, 4))
+    def _noise_gather(
+        self, key: jax.Array, buffer_state: ReplayBufferState, mask: jax.Array, n: int
+    ) -> BaseExperience:
+        """`n` micro-batches sampled from the replay buffer, stacked."""
+        indices = jnp.unravel_index(
+            self.memory_buffer.sample_indices(key, mask, n * self.micro_batch_size),
+            mask.shape,
+        )
+        return jax.tree.map(
+            lambda x: x[indices].reshape(n, self.micro_batch_size, *x.shape[2:]),
+            buffer_state.buffer,
+        )
+
+    @partial(jax.jit, static_argnums=(0,), static_argnames=("learner",))
+    def _noise_grads(
+        self,
+        key: jax.Array,
+        nn_state: eqx.nn.State | None,
+        params: Any,
+        batches: BaseExperience,
+        learner: int = 0,
+    ) -> tuple[Any, jax.Array]:
+        """The sum of the micro-batches' gradients at `params`, and of their squared norms."""
+        nn_static = eqx.filter(
+            self.learners[learner].nn, eqx.is_inexact_array, inverse=True
+        )
+        nn = eqx.combine(params, nn_static)
+        grad_fn = eqx.filter_value_and_grad(self.loss_fn, has_aux=True)
+
+        def one(carry: tuple[Any, jax.Array], xs: tuple) -> tuple[tuple, None]:
+            batch, k = xs
+            batch = transform_randomly(k, batch, self.transform_fns)
+            _, grads = grad_fn(nn, nn_state, batch)
+            grads = jax.tree.map(lambda g: g.astype(jnp.float32), grads)
+            return (
+                jax.tree.map(jnp.add, carry[0], grads),
+                carry[1] + jnp.square(optax.tree.norm(grads)),
+            ), None
+
+        n = jax.tree.leaves(batches)[0].shape[0]
+        zeros = jax.tree.map(lambda p: jnp.zeros(p.shape, jnp.float32), params)
+        (sums, sq), _ = jax.lax.scan(
+            one,
+            (zeros, jnp.zeros((), jnp.float32)),
+            (batches, jax.random.split(key, n)),
+        )
+        return sums, sq
+
+    def fresh_position_metrics(
+        self,
+        key: jax.Array,
+        buffer_state: ReplayBufferState,
+        start_idx: jax.Array,
+        weights: dict[str, Any],
+        nn_state: eqx.nn.State | None,
+        learner: int = 0,
+    ) -> dict[str, jax.Array]:
+        """The policy KL and value loss of each of `weights` (by name) on `fresh_positions`
+        positions sampled from those stored since the replay buffer's write indices were
+        `start_idx` (of finished games), as `fresh_policy_kl_<name>` and `fresh_value_loss_<name>`;
+        with both `raw` and `avg`, also the raw weights' excess over the average's,
+        `fresh_policy_kl_gap` and `fresh_value_loss_gap`. Empty if none of them has finished."""
+        mask = self._fresh_mask(buffer_state, start_idx)
+        if not bool(mask.any()):
+            return {}
+        n = self.fresh_positions // self.micro_batch_size
+        batches = self._gather_masked(key, buffer_state, mask, n)
+        out: dict[str, jax.Array] = {}
+        for name, params in weights.items():
+            kl, value = self._fresh_losses(params, nn_state, batches, learner=learner)
+            out[f"fresh_policy_kl_{name}"] = kl
+            out[f"fresh_value_loss_{name}"] = value
+        if "raw" in weights and "avg" in weights:
+            for metric in ("policy_kl", "value_loss"):
+                out[f"fresh_{metric}_gap"] = (
+                    out[f"fresh_{metric}_raw"] - out[f"fresh_{metric}_avg"]
+                )
+        return out
+
+    @partial(jax.jit, static_argnums=(0,))
+    def _fresh_mask(
+        self, buffer_state: ReplayBufferState, start_idx: jax.Array
+    ) -> jax.Array:
+        """The buffer entries written since its write indices were `start_idx` (at most one
+        turnover of each environment's buffer), of finished games."""
+        capacity = buffer_state.populated.shape[1]
+        written = (buffer_state.next_idx - start_idx) % capacity
+        since = (jnp.arange(capacity)[None, :] - start_idx[:, None]) % capacity
+        return (
+            (since < written[:, None])
+            & buffer_state.populated
+            & buffer_state.has_reward
+        )
+
+    @partial(jax.jit, static_argnums=(0, 4))
+    def _gather_masked(
+        self, key: jax.Array, buffer_state: ReplayBufferState, mask: jax.Array, n: int
+    ) -> BaseExperience:
+        """`n` micro-batches sampled with replacement from the entries `mask` marks, stacked."""
+        indices = jnp.unravel_index(
+            self.memory_buffer.sample_indices(
+                key, mask, n * self.micro_batch_size, replace=True
+            ),
+            mask.shape,
+        )
+        return jax.tree.map(
+            lambda x: x[indices].reshape(n, self.micro_batch_size, *x.shape[2:]),
+            buffer_state.buffer,
+        )
+
+    @partial(jax.jit, static_argnums=(0,), static_argnames=("learner",))
+    def _fresh_losses(
+        self,
+        params: Any,
+        nn_state: eqx.nn.State | None,
+        batches: BaseExperience,
+        learner: int = 0,
+    ) -> tuple[jax.Array, jax.Array]:
+        """The mean policy KL and value loss of the network with `params` over the micro-batches."""
+        nn_static = eqx.filter(
+            self.learners[learner].nn, eqx.is_inexact_array, inverse=True
+        )
+        nn = eqx.combine(params, nn_static)
+
+        def one(_, batch: BaseExperience) -> tuple[None, tuple[jax.Array, jax.Array]]:
+            _, (metrics, _) = self.loss_fn(nn, nn_state, batch)
+            return None, (metrics["policy_kl"], metrics["value_loss"])
+
+        _, (kl, value) = jax.lax.scan(one, None, batches)
+        return kl.mean(), value.mean()
+
     def train_steps(
         self,
         key: jax.Array,
@@ -1711,6 +1982,8 @@ class Trainer:
         num_steps: int,
         epoch: int = 0,
         learner: int = 0,
+        batch_size: int | None = None,
+        lr_scale: float | None = None,
     ) -> tuple[CollectionState, TrainState, dict]:
         """Performs `num_steps` training steps.
 
@@ -1727,6 +2000,9 @@ class Trainer:
             num_steps: number of training steps to perform
             epoch: the current epoch, which sets the share of tree positions (see `TreePositions.ratio_at`)
             learner: (optional) with `growth`, the index of the network `train_state` is
+            batch_size: (optional) samples per step, a multiple of `micro_batch_size` (default
+                `train_batch_size`)
+            lr_scale: (optional) scales every step's update, as a learning rate would
 
         Returns:
             Tuple[CollectionState, TrainState, dict]:
@@ -1739,10 +2015,16 @@ class Trainer:
         """
         if num_steps == 0:
             return collection_state, train_state, {}
+        if batch_size is None:
+            batch_size = self.train_batch_size
+        if batch_size % self.micro_batch_size:
+            raise ValueError(
+                f"batch_size ({batch_size}) must be a multiple of the micro-batch size "
+                f"({self.micro_batch_size})"
+            )
+        scale = None if lr_scale is None else jnp.asarray(lr_scale, dtype=jnp.float32)
         # the buffer doesn't change while training, so checking once covers every step
-        self.memory_buffer.check_can_sample(
-            collection_state.buffer_state, self.train_batch_size
-        )
+        self.memory_buffer.check_can_sample(collection_state.buffer_state, batch_size)
         if self.tree_positions is None:
             train_state, metrics = self.train_epoch(
                 key,
@@ -1750,13 +2032,13 @@ class Trainer:
                 train_state,
                 num_steps,
                 learner=learner,
+                batch_size=batch_size,
+                lr_scale=scale,
             )
             return collection_state, train_state, metrics
         tree_mask = self.tree_sample_mask(collection_state)
         num_tree = (
-            self.tree_positions.batch_count(epoch, self.train_batch_size)
-            if tree_mask.any()
-            else 0
+            self.tree_positions.batch_count(epoch, batch_size) if tree_mask.any() else 0
         )
         train_state, metrics = self.train_epoch(
             key,
@@ -1767,10 +2049,12 @@ class Trainer:
             tree_mask=tree_mask,
             num_tree=jnp.array(num_tree, dtype=jnp.int32),
             learner=learner,
+            batch_size=batch_size,
+            lr_scale=scale,
         )
         metrics = {
             **metrics,
-            "tree_batch_fraction": jnp.array(num_tree / self.train_batch_size),
+            "tree_batch_fraction": jnp.array(num_tree / batch_size),
             "tree_buffer_samples": tree_mask.sum(),
         }
         return collection_state, train_state, metrics
@@ -2328,6 +2612,7 @@ class Trainer:
                 guard_values=(*growth.guard_values, *(() for _ in added))
                 if growth.guard_values
                 else (),
+                played=(*growth.played, *(0 for _ in added)),
             )
         resized = ""
         if self.memory_buffer.capacity != meta["buffer_capacity"]:
@@ -3254,6 +3539,11 @@ class Trainer:
             # only the counts outlive the state donated to self-play: keeping the whole state
             # would keep a second copy of the replay buffers
             before = CollectionStats.of(collection_state)
+            fresh_from = (
+                jnp.copy(collection_state.buffer_state.next_idx)
+                if self.fresh_positions
+                else None
+            )
             self.set_activity(f"epoch {cur_epoch}: self-play")
             collection_state = self.collect_steps(
                 collect_keys,
@@ -3278,6 +3568,22 @@ class Trainer:
             )
             moves = (collection_state.moves - before.moves).sum()
             collection_metrics["cycles_per_move"] = cycles / jnp.maximum(moves, 1)
+            # the playing network on the positions it just stored, before it trains on them
+            fresh_metrics: dict[str, jax.Array] = {}
+            if fresh_from is not None:
+                fresh_key, key = jax.random.split(key)
+                weights = {"raw": train_states[playing].params}
+                if self.averages:
+                    horizon = self.selfplay_average or self.averages[0]
+                    weights["avg"] = averages[playing][self.averages.index(horizon)]
+                fresh_metrics = self.fresh_position_metrics(
+                    fresh_key,
+                    collection_state.buffer_state,
+                    fresh_from,
+                    weights,
+                    train_states[playing].nn_state,
+                    learner=playing,
+                )
             # train every network that trains, on the same replay buffer
             train_metrics: dict[int, dict] = {}
             train_seconds: dict[int, float] = {}
@@ -3285,6 +3591,11 @@ class Trainer:
                 train_started = time.perf_counter()
                 self.set_activity(named(i, f"epoch {cur_epoch}: training"))
                 train_key, key = jax.random.split(key)
+                # epochs it has played before this one (without growth, the run's)
+                played = growth.played[i] if growth is not None else cur_epoch
+                lr_scale = (
+                    self.lr_drop.scale(played) if self.lr_drop is not None else None
+                )
                 collection_state, train_states[i], train_metrics[i] = self.train_steps(
                     train_key,
                     collection_state,
@@ -3292,7 +3603,13 @@ class Trainer:
                     self.steps_of(i, playing),
                     epoch=cur_epoch,
                     learner=i,
+                    lr_scale=lr_scale,
                 )
+                if lr_scale is not None:
+                    train_metrics[i] = {
+                        **train_metrics[i],
+                        "lr_scale": jnp.array(lr_scale, dtype=jnp.float32),
+                    }
                 jax.block_until_ready(train_states[i])
                 train_seconds[i] = time.perf_counter() - train_started
                 # its weight averages take in the epoch's weights
@@ -3307,6 +3624,27 @@ class Trainer:
                     for average, horizon in zip(averages[i], self.averages, strict=True)
                 )
                 averaged[i] += 1
+                if self.noise_measure and self.averages:
+                    horizon = self.selfplay_average or self.averages[0]
+                    measure_key, key = jax.random.split(key)
+                    tr_sigma, grad_sq = self.noise_scale_at(
+                        measure_key,
+                        collection_state.buffer_state,
+                        train_states[i],
+                        averages[i][self.averages.index(horizon)],
+                        num_micro=self.noise_measure,
+                        learner=i,
+                    )
+                    train_metrics[i] = {
+                        **train_metrics[i],
+                        "gns_avg_tr_sigma": tr_sigma,
+                        "gns_avg_grad_sq": grad_sq,
+                        "gns_avg_noise_scale": jnp.where(
+                            grad_sq > 0, tr_sigma / grad_sq, jnp.inf
+                        ),
+                    }
+            if fresh_metrics:
+                train_metrics[playing] = {**train_metrics[playing], **fresh_metrics}
             # the learning rate rule follows the network playing
             stop = False
             watch_loss = self.lr_plateau_metric == "loss"
