@@ -128,9 +128,10 @@ def parse_step(text: str, home: str) -> Step:
         raise ValueError(f"a step needs a --ckpt-dir: {text!r}")
     if "--resume" in argv:
         raise ValueError("no --resume: a job resumes its steps itself")
-    init_from = flag(argv, "--init-from")
-    if init_from is not None and not re.fullmatch(STATE, Path(init_from).name):
-        raise ValueError(f"--init-from names a state-<EPOCH>.npz: {init_from}")
+    for name in ("--init-from", "--branch-from"):
+        path = flag(argv, name)
+        if path is not None and not re.fullmatch(STATE, Path(path).name):
+            raise ValueError(f"{name} names a state-<EPOCH>.npz: {path}")
     for name in UNSUPPORTED:
         if flag(argv, name) is not None:
             raise ValueError(

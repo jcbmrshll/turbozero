@@ -1807,7 +1807,6 @@ class Trainer:
 
         return add_tree_positions
 
-    @partial(jax.jit, static_argnums=(0,), static_argnames=("num_micro", "learner"))
     def noise_scale_at(
         self,
         key: jax.Array,
@@ -1819,41 +1818,81 @@ class Trainer:
     ) -> tuple[jax.Array, jax.Array]:
         """tr(Sigma) and |G|^2 at `params` (e.g. a weight average, where the jitter's pull back
         to the centre doesn't inflate |G|^2; see core.training.noise_scale), from the gradients
-        of `num_micro` micro-batches sampled from the replay buffer as training samples them."""
+        of `num_micro` micro-batches sampled from the replay buffer as training samples them.
+
+        In chunks of up to 16 micro-batches: each chunk's samples are gathered by one compiled
+        function and their gradients summed by another, so neither holds more than a chunk."""
         mask = self.memory_buffer.sample_mask(buffer_state)
+        chunk = min(16, num_micro)
+        total, micro_sq = None, jnp.zeros((), jnp.float32)
+        for start in range(0, num_micro, chunk):
+            n = min(chunk, num_micro - start)
+            gather_key, grad_key, key = jax.random.split(key, 3)
+            batches = self._noise_gather(gather_key, buffer_state, mask, n)
+            sums, sq = self._noise_grads(
+                grad_key, train_state.nn_state, params, batches, learner=learner
+            )
+            total = sums if total is None else jax.tree.map(jnp.add, total, sums)
+            micro_sq = micro_sq + sq
+        assert total is not None
+        batch_sq = jnp.square(
+            optax.tree.norm(jax.tree.map(lambda t: t / num_micro, total))
+        )
+        return noise_scale_estimates(
+            micro_sq / num_micro,
+            batch_sq,
+            self.micro_batch_size,
+            num_micro * self.micro_batch_size,
+        )
+
+    @partial(jax.jit, static_argnums=(0, 4))
+    def _noise_gather(
+        self, key: jax.Array, buffer_state: ReplayBufferState, mask: jax.Array, n: int
+    ) -> BaseExperience:
+        """`n` micro-batches sampled from the replay buffer, stacked."""
+        indices = jnp.unravel_index(
+            self.memory_buffer.sample_indices(key, mask, n * self.micro_batch_size),
+            mask.shape,
+        )
+        return jax.tree.map(
+            lambda x: x[indices].reshape(n, self.micro_batch_size, *x.shape[2:]),
+            buffer_state.buffer,
+        )
+
+    @partial(jax.jit, static_argnums=(0,), static_argnames=("learner",))
+    def _noise_grads(
+        self,
+        key: jax.Array,
+        nn_state: eqx.nn.State | None,
+        params: Any,
+        batches: BaseExperience,
+        learner: int = 0,
+    ) -> tuple[Any, jax.Array]:
+        """The sum of the micro-batches' gradients at `params`, and of their squared norms."""
         nn_static = eqx.filter(
             self.learners[learner].nn, eqx.is_inexact_array, inverse=True
         )
         nn = eqx.combine(params, nn_static)
         grad_fn = eqx.filter_value_and_grad(self.loss_fn, has_aux=True)
 
-        def one(total: Any, k: jax.Array) -> tuple[Any, jax.Array]:
-            sample_key, transform_key = jax.random.split(k)
-            indices = jnp.unravel_index(
-                self.memory_buffer.sample_indices(
-                    sample_key, mask, self.micro_batch_size
-                ),
-                mask.shape,
-            )
-            batch = jax.tree.map(lambda x: x[indices], buffer_state.buffer)
-            batch = transform_randomly(transform_key, batch, self.transform_fns)
-            _, grads = grad_fn(nn, train_state.nn_state, batch)
+        def one(carry: tuple[Any, jax.Array], xs: tuple) -> tuple[tuple, None]:
+            batch, k = xs
+            batch = transform_randomly(k, batch, self.transform_fns)
+            _, grads = grad_fn(nn, nn_state, batch)
             grads = jax.tree.map(lambda g: g.astype(jnp.float32), grads)
-            return jax.tree.map(jnp.add, total, grads), jnp.square(
-                optax.tree.norm(grads)
-            )
+            return (
+                jax.tree.map(jnp.add, carry[0], grads),
+                carry[1] + jnp.square(optax.tree.norm(grads)),
+            ), None
 
+        n = jax.tree.leaves(batches)[0].shape[0]
         zeros = jax.tree.map(lambda p: jnp.zeros(p.shape, jnp.float32), params)
-        total, micro_sq = jax.lax.scan(one, zeros, jax.random.split(key, num_micro))
-        batch_sq = jnp.square(
-            optax.tree.norm(jax.tree.map(lambda t: t / num_micro, total))
+        (sums, sq), _ = jax.lax.scan(
+            one,
+            (zeros, jnp.zeros((), jnp.float32)),
+            (batches, jax.random.split(key, n)),
         )
-        return noise_scale_estimates(
-            micro_sq.mean(),
-            batch_sq,
-            self.micro_batch_size,
-            num_micro * self.micro_batch_size,
-        )
+        return sums, sq
 
     def train_steps(
         self,

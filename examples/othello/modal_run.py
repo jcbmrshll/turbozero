@@ -338,6 +338,7 @@ class Runner:
         argv = with_monitor(step.argv, self.seaglass_url)
         if resume:
             argv = without_flag(argv, "--init-from", takes_value=True)
+            argv = without_flag(argv, "--branch-from", takes_value=True)
             argv = without_flag(argv, "--init-without-buffers", takes_value=False)
             argv = [*argv, "--resume"]
         if flag(step.argv, "--save-state-every") is None:
@@ -365,6 +366,7 @@ class Runner:
         os.makedirs(step.ckpt_dir, exist_ok=True)
         os.makedirs(os.path.dirname(step.log), exist_ok=True)
         ensure_input(self.store, job, flag(step.argv, "--init-from"))
+        ensure_input(self.store, job, flag(step.argv, "--branch-from"))
         ensure_input(self.store, job, flag(step.argv, "--engine-set"))
         resume = restore_step(self.store, job, self.name, index, step)
         if not resume:
