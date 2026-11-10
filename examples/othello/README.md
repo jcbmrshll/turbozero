@@ -750,12 +750,18 @@ games each (standard errors over the openings' pairs of games):
 | Engine, native network, 1 leaf a thread, reuse; against the batch of 16, no reuse | 6x96 | +141 ± 19 |
 | The same | 4x64 | +215 ± 21 |
 
-How many leaves to keep in flight depends on the visits a move. At equal visits, 8 threads against
-the batch of 16, with the native network on both sides: at 1000 visits on 8x128, 1 leaf a thread
-+9 ± 11 (400 games); at 4000 on 4x64, 1 a thread -31 ± 12, 2 -9 ± 12 and 4 +13 ± 14 (300 each).
-With OpenVINO's engine, 4 a thread lost 23 ± 13 to 2 at 1000 visits on 8x128, and 8 lost 37 ± 17 to
-2 at 4000 on 4x64. The native network costs nothing per core to run a leaf at a time, so the choice is
-search quality alone: about 1 a thread at 1000 visits, 2-4 from a few thousand. It matched bf16 at
+Leaves in flight cost a little search quality, and how much depends on the net and the visits. At
+equal visits, 8 threads against the batch of 16, the native network on both sides, 300-400 games each:
+
+| Leaves a thread | 1 | 2 | 4 |
+|---|---|---|---|
+| 8x128, 1000 visits | +9 ± 11 | -10 ± 13 | |
+| 8x128, 4000 | +9 ± 9 | +5 ± 12 | -9 ± 11 |
+| 6x96, 4000 | -13 ± 12 | -6 ± 12 | -22 ± 11 |
+| 4x64, 4000 | -31 ± 12 | -9 ± 12 | +13 ± 14 |
+
+The native network costs nothing per core to run a leaf at a time, so the choice is search quality
+alone: 1 a thread for 8x128; small nets at high visits want 2-4. It matched bf16 at
 equal visits: -3 ± 12 on 4x64 and on 8x128 with channel norm, 400 games each.
 
 Below AVX2 the library builds without the native network, and `Engine` runs OpenVINO.
