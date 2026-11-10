@@ -34,9 +34,20 @@ VIRTUAL_LOSS = {"loss": VL_LOSS, "visit": VL_VISIT, "draw": VL_DRAW}
 Eval = Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]]
 
 
+def openvino_paths() -> tuple[Path, Path]:
+    """OpenVINO's headers and its runtime library, from the installed Python package."""
+    import openvino
+
+    root = Path(openvino.__file__).parent
+    (library,) = (root / "libs").glob("libopenvino.so.*")
+    return root / "include", library
+
+
 def library_path() -> Path:
-    """The compiled search, built for this machine, named after its source."""
-    source = SOURCE.read_bytes()
+    """The compiled search, built for this machine, named after its source and the OpenVINO it
+    links."""
+    include, openvino = openvino_paths()
+    source = SOURCE.read_bytes() + str(openvino).encode()
     digest = hashlib.sha256(source).hexdigest()[:16]
     path = CACHE_DIR / "cpu-search" / f"cpu_search_{digest}.so"
     if not path.exists():
@@ -45,7 +56,8 @@ def library_path() -> Path:
         partial = path.with_suffix(f".{os.getpid()}.tmp")
         subprocess.run(
             ["g++", "-std=c++17", "-O3", "-march=native", "-shared", "-fPIC"]
-            + [str(SOURCE), "-o", str(partial)],
+            + [str(SOURCE), "-o", str(partial), f"-I{include}", str(openvino)]
+            + [f"-Wl,-rpath,{openvino.parent}", "-lpthread"],
             check=True,
         )
         partial.replace(path)
@@ -90,6 +102,16 @@ def load_library() -> ctypes.CDLL:
         "search_num_nodes": (ctypes.c_long, [Search]),
         "search_symmetric_bits": (ctypes.c_uint64, [ctypes.c_uint64, ctypes.c_int]),
         "search_symmetric_action": (ctypes.c_int, [ctypes.c_int, ctypes.c_int]),
+        "engine_new": (
+            ctypes.c_void_p,
+            [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int],
+        ),
+        "engine_free": (None, [ctypes.c_void_p]),
+        "engine_search": (
+            ctypes.c_long,
+            [ctypes.c_void_p, Search, ctypes.c_int, ctypes.c_double, ctypes.c_int],
+        ),
+        "engine_stats": (None, [ctypes.c_void_p, ctypes.POINTER(ctypes.c_double)]),
     }
     for name, (restype, argtypes) in signatures.items():
         fn = getattr(lib, name)
@@ -236,6 +258,45 @@ class Search:
 
     def num_nodes(self) -> int:
         return LIB.search_num_nodes(self.handle)
+
+
+class Engine:
+    """A network on `threads` cores, searching one tree at a time with a worker thread to a core
+    (see `engine_search` in `cpu_search.cpp`): each collects up to `batch` leaves, evaluates them on
+    its own core while the others go on, and backs them up, all in C++. `model` is a saved
+    OpenVINO model or ONNX graph's path, computing what isn't quantized in `precision`."""
+
+    def __init__(self, model: str, threads: int, batch: int, precision: str = "f32"):
+        self.threads = threads
+        self.batch = batch
+        self.handle = LIB.engine_new(
+            str(model).encode(), precision.encode(), threads, batch
+        )
+        if not self.handle:
+            raise RuntimeError(f"couldn't compile {model}")
+
+    def __del__(self) -> None:
+        if getattr(self, "handle", None):
+            LIB.engine_free(self.handle)
+
+    def search(
+        self,
+        search: "Search",
+        visits: int = 0,
+        seconds: float = 0.0,
+        stop_ended: int = 0,
+    ) -> int:
+        """`visits` visits of `search`'s tree, or with none, as many as `seconds` allow; stopping
+        early once `stop_ended` traversals in a row end the game. Returns the leaves evaluated."""
+        return LIB.engine_search(
+            self.handle, search.handle, visits, seconds, stop_ended
+        )
+
+    def stats(self) -> dict[str, float]:
+        """Calls of the network, leaves and seconds inferring summed over workers, so far."""
+        out = (ctypes.c_double * 3)()
+        LIB.engine_stats(self.handle, out)
+        return {"calls": out[0], "leaves": out[1], "infer_seconds": out[2]}
 
 
 def compile_model(model: bytes | str, precision: str, cores: int, streams: int, core):

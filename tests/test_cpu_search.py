@@ -572,3 +572,100 @@ def test_a_net_player_passes_when_the_game_does():
     player.move(color, 0.01)
     me, opp, _, _ = player.search.position()
     assert (me | opp).bit_count() == 4 + sum(m != PASS for m in moves) + 1
+
+
+@pytest.fixture(scope="module")
+def tiny_model(tmp_path_factory):
+    """A small random network's ONNX graph, on disk, as an `Engine` reads it."""
+    import equinox as eqx
+    from export_onnx import to_onnx
+    from game import make_network
+
+    network, state = make_network(
+        "resnet:2x8,pool_every=2,heads=pooled,pool_channels=4,head_channels=4"
+    )
+    params, static = eqx.partition(network, eqx.is_inexact_array)
+    rng = np.random.default_rng(2)
+    params = jax.tree.map(
+        lambda x: x + 0.3 * rng.normal(size=x.shape).astype(x.dtype), params
+    )
+    model = eqx.nn.inference_mode(eqx.combine(params, static))
+    path = tmp_path_factory.mktemp("engine") / "tiny.onnx"
+    path.write_bytes(to_onnx(model, state).SerializeToString())
+    return str(path)
+
+
+def test_an_engine_of_one_worker_searches_as_a_batch_of_one(tiny_model):
+    from cpu_search import Engine, Search, openvino_eval
+
+    reference, native = Search(), Search()
+    for search in (reference, native):
+        for action in (19, 18, 26):
+            search.play(action)
+    reference.run(300, openvino_eval(tiny_model, 1, "f32"))
+    Engine(tiny_model, 1, 1).search(native, visits=300)
+    assert np.array_equal(native.visits(), reference.visits())
+    assert native.total_visits() == reference.total_visits() == 300
+
+
+@pytest.mark.parametrize("mode", ["loss", "visit"])
+def test_workers_visit_exactly_and_leave_nothing_in_flight(tiny_model, mode):
+    from cpu_search import Engine, Search, SearchSettings
+
+    engine = Engine(tiny_model, 3, 4)
+    search = Search(SearchSettings(batch=4, virtual_loss=mode))
+    leaves = engine.search(search, visits=500)
+    assert search.total_visits() == 500
+    assert search.visits().sum() == 499
+    assert 0 < leaves <= 500
+    # the tree carries on as a sequential search would see it
+    search.play(search.best_action())
+    before = search.total_visits()
+    engine.search(search, visits=100)
+    assert search.total_visits() == before + 100
+    stats = engine.stats()
+    assert stats["calls"] > 0 and stats["leaves"] >= leaves
+
+
+def test_a_timed_search_stops_at_its_time(tiny_model):
+    import time
+
+    from cpu_search import Engine, Search, SearchSettings
+
+    engine = Engine(tiny_model, 2, 2)
+    search = Search(SearchSettings(batch=2, virtual_loss="visit"))
+    start = time.perf_counter()
+    engine.search(search, seconds=0.05)
+    assert 0.05 <= time.perf_counter() - start < 0.5
+    assert search.total_visits() > 10
+
+
+def test_a_solved_tree_stops_its_search_early(tiny_model):
+    from cpu_search import Engine, Search, SearchSettings
+
+    # a random game to a few empty squares: the whole tree below is soon all games' ends
+    rng = np.random.default_rng(3)
+    search = Search(SearchSettings(batch=2, virtual_loss="visit"))
+    while True:
+        me, opp, _, _ = search.position()
+        if 64 - (me | opp).bit_count() <= 4 or search.terminated():
+            break
+        search.play(int(rng.choice(np.flatnonzero(search.legal()))))
+    assert not search.terminated()
+    Engine(tiny_model, 2, 2).search(search, seconds=5.0, stop_ended=64)
+    # far fewer than 5 s of visits
+    assert search.total_visits() < 100_000
+
+
+def test_an_engine_player_plays_a_game_through_the_clock_driver(tiny_model):
+    from clock_match import play_game
+    from cpu_match import NetPlayer
+    from cpu_search import Engine, SearchSettings
+    from xot import XOT_PATH, load_xot
+
+    engine = Engine(tiny_model, 2, 2)
+    black = NetPlayer(SearchSettings(batch=2, virtual_loss="visit"), engine, seed=1)
+    white = NetPlayer(SearchSettings(batch=1), fake_eval)
+    game = play_game(black, white, load_xot(XOT_PATH)[0], 1.0)
+    assert game.flagged is None
+    assert max(game.seconds) < 1.1

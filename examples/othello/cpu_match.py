@@ -14,6 +14,7 @@ the search does. `clock_match.py` plays on a clock, with a `NetPlayer` as "net:"
 import argparse
 import json
 import os
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,7 @@ import numpy as np
 from bench_cpu_backends import network_path
 from cpu_search import (
     PASS,
+    Engine,
     Eval,
     Search,
     SearchSettings,
@@ -262,6 +264,18 @@ def make_eval(name: str, backend: str, cores: int) -> Eval:
     return openvino_eval(model, cores, precision, int(streams) if streams else None)
 
 
+def make_engine(name: str, backend: str, cores: int, batch: int) -> Engine:
+    """The network `name` on `backend`, an arm of `model_and_precision`, as an `Engine` of a worker to
+    each of `cores`, each evaluating up to `batch` leaves at a time."""
+    model, precision = model_and_precision(name, backend)
+    if isinstance(model, str):
+        return Engine(model, cores, batch, precision)
+    with tempfile.NamedTemporaryFile(suffix=".onnx") as f:
+        f.write(model)
+        f.flush()
+        return Engine(f.name, cores, batch, precision)
+
+
 def match(args: argparse.Namespace) -> None:
     a = Player.parse(args.a, args.net, args.backend)
     b = Player.parse(args.b, args.net, args.backend)
@@ -324,10 +338,14 @@ def move_budget(seconds_left: float, empties: int, taper: int = 0) -> float:
 
 class NetPlayer:
     """Our side of a game on a per-game clock (`clock_match.Player`): a `Search` with its own
-    tree."""
+    tree, searched a batch at a time through `evaluate`, or by an `Engine`'s workers."""
 
     def __init__(
-        self, settings: SearchSettings, evaluate: Eval, taper: int = 0, seed: int = 0
+        self,
+        settings: SearchSettings,
+        evaluate: Eval | Engine,
+        taper: int = 0,
+        seed: int = 0,
     ):
         self.search = Search(settings, seed)
         self.evaluate = evaluate
@@ -356,7 +374,12 @@ class NetPlayer:
             me, opp, _, _ = self.search.position()
             empties = 64 - (me | opp).bit_count()
             seconds = move_budget(seconds_left, empties, self.taper)
-            timed_move(self.search, seconds, self.batch, self.evaluate)
+            if isinstance(self.evaluate, Engine):
+                self.evaluate.search(
+                    self.search, seconds=seconds, stop_ended=ENDED_VISITS
+                )
+            else:
+                timed_move(self.search, seconds, self.batch, self.evaluate)
             action = self.search.best_action()
         self.search.play(action)
         return action
