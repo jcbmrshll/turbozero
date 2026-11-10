@@ -76,9 +76,8 @@ struct Net {
     Norm stem_norm;
     std::vector<Block> blocks;
     Norm final_norm;
-    // the heads' three 1x1 convolutions in one, (channels, 3 * head_channels): policy, its pooled
-    // part, value; in float
-    std::vector<float> head_w, head_b;
+    // the heads' three 1x1 convolutions in one, to 3 * head_channels: policy, its pooled part, value
+    Conv head;
     Norm policy_norm, pool_norm, value_norm;
     Linear pool_linear, pass_linear, value_hidden, value_out;
     std::vector<float> square_w;  // (head_channels)
@@ -258,35 +257,6 @@ inline void add_rows(float* x, int stride, const float* b, int cols, bool relu_a
         }
 }
 
-// (64, cin) by (cin, cols) plus (cols), into (64, cols), float; cols a multiple of 16, up to 128
-template <int BLOCKS>
-inline void gemm_blocks(const float* x, int cin, const float* w, int cols, const float* b, float* out, int o) {
-    for (int s0 = 0; s0 < SQUARES; s0 += 4) {
-        __m512 acc[4][BLOCKS];
-        for (int r = 0; r < BLOCKS; r++) {
-            __m512 bias = _mm512_loadu_ps(b + o + 16 * r);
-            for (int i = 0; i < 4; i++) acc[i][r] = bias;
-        }
-        for (int c = 0; c < cin; c++) {
-            __m512 v[4];
-            for (int i = 0; i < 4; i++) v[i] = _mm512_set1_ps(x[(s0 + i) * cin + c]);
-            for (int r = 0; r < BLOCKS; r++) {
-                __m512 wv = _mm512_loadu_ps(w + (size_t)c * cols + o + 16 * r);
-                for (int i = 0; i < 4; i++) acc[i][r] = _mm512_fmadd_ps(v[i], wv, acc[i][r]);
-            }
-        }
-        for (int i = 0; i < 4; i++)
-            for (int r = 0; r < BLOCKS; r++) _mm512_storeu_ps(out + (s0 + i) * cols + o + 16 * r, acc[i][r]);
-    }
-}
-
-inline void gemm(const float* x, int cin, const float* w, int cols, const float* b, float* out) {
-    int o = 0;
-    for (; o + 96 <= cols; o += 96) gemm_blocks<6>(x, cin, w, cols, b, out, o);
-    for (; o + 32 <= cols; o += 32) gemm_blocks<2>(x, cin, w, cols, b, out, o);
-    for (; o < cols; o += 16) gemm_blocks<1>(x, cin, w, cols, b, out, o);
-}
-
 // One position: `obs`, (2, 8, 8) channels-first, the mover's discs then the opponent's, to (65)
 // policy logits and a value.
 inline void forward(const Net& n, Scratch& s, const float* obs, float* logits, float* value) {
@@ -342,10 +312,11 @@ inline void forward(const Net& n, Scratch& s, const float* obs, float* logits, f
     }
     if (n.pre) normalize(n.final_norm, x, C, true);
 
-    // the heads, in float: the three 1x1 convolutions at once
+    // the heads: the three 1x1 convolutions at once, then in float
     const int H = n.head_channels, H3 = 3 * H;
     float* h = s.h.data();
-    gemm(x, C, n.head_w.data(), H3, n.head_b.data(), h);
+    quantize(n.head, x, C, s.padded.data());
+    convolve(n.head, s.padded.data(), h, H3);
     // each part's normalization, of its own channels
     auto part = [&](const Norm& norm, int first, bool relu_after) {
         for (int sq = 0; sq < SQUARES; sq++) normalize_square(norm, h + sq * H3 + first, H, relu_after);

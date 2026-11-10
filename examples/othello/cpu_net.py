@@ -7,7 +7,8 @@ OpenVINO.
 
 Each convolution of the trunk takes 8-bit inputs, scaled for the whole tensor by the minimum and
 maximum seen in calibration (with a zero point when the minimum is below 0), and 8-bit weights
-scaled for each output channel, as `quantize.py`'s best OpenVINO model does. The heads stay in float.
+scaled for each output channel, as `quantize.py`'s best OpenVINO model does; and so do the heads'
+first convolutions. The rest of the heads stays in float.
 A normalization of each square's channels runs in the convolution's float epilogue, where OpenVINO
 runs it as several ops of its own.
 
@@ -271,7 +272,7 @@ def forward(
     if p.pre:
         x = normalize(p.final_norm, x, relu=True)
     h = p.head_channels
-    heads = conv2d(x, p.head.w) + p.head.b
+    heads = apply("head", p.head, x)
     policy = normalize(p.policy_norm, heads[..., :h])
     pooled = board_pool(normalize(p.pool_norm, heads[..., h : 2 * h], relu=True))
     policy = np.maximum(policy + dense(p.pool_linear, pooled)[:, None, None, :], 0)
@@ -367,10 +368,10 @@ def quantize_conv(
 
 
 def quantize(p: Program, positions: np.ndarray) -> dict[str, QuantizedConv]:
-    """The trunk's convolutions quantized, by name, their inputs' ranges from `positions`, (n, 2, 8,
+    """The convolutions quantized, by name, their inputs' ranges from `positions`, (n, 2, 8,
     8) observations (best the leaves of the network's own searches)."""
     ranges = input_ranges(p, positions)
-    convs = {"stem": p.stem}
+    convs = {"stem": p.stem, "head": p.head}
     for i, b in enumerate(p.blocks):
         convs[f"{i}.conv1"] = b.conv1
         convs[f"{i}.conv2"] = b.conv2
@@ -393,13 +394,17 @@ def int8_forward(p: Program, q: dict[str, QuantizedConv], observations: np.ndarr
         if x.shape[-1] % 4:
             x = np.pad(x, ((0, 0), (0, 0), (0, 0), (0, -x.shape[-1] % 4)))
         u = np.clip(np.rint(x * qc.inverse) + qc.zero_point, 0, 255)
+        k = qc.q.shape[-1]
+        edge = k // 2
         padded = np.pad(
-            u, ((0, 0), (1, 1), (1, 1), (0, 0)), constant_values=qc.zero_point
+            u,
+            ((0, 0), (edge, edge), (edge, edge), (0, 0)),
+            constant_values=qc.zero_point,
         )
         acc = np.zeros(x.shape[:3] + (len(qc.q),), np.int64)
         w = qc.q.astype(np.int64)
-        for dy in range(3):
-            for dx in range(3):
+        for dy in range(k):
+            for dx in range(k):
                 acc += (
                     padded[:, dy : dy + 8, dx : dx + 8].astype(np.int64)
                     @ w[:, :, dy, dx].T
@@ -598,9 +603,8 @@ class NativeNet:
         linear("pass", -1, p.pass_linear)
         linear("value_hidden", -1, p.value_hidden)
         linear("value_out", -1, p.value_out)
-        LIB.net_set_heads(
-            self.handle, ptr(p.head.w[:, :, 0, 0].T), ptr(p.head.b), ptr(p.square_w)
-        )
+        conv("head", 0, q["head"])
+        LIB.net_set_heads(self.handle, ptr(p.square_w))
 
     def __del__(self) -> None:
         if getattr(self, "handle", None):

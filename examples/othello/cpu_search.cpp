@@ -805,13 +805,15 @@ void net_add_block(net::Net* n, int pool_channels) {
     n->blocks.back().pool_channels = pool_channels;
 }
 
-// A convolution: "stem", or a block's "conv1" or "conv2". `q`, (cout, cin, k, k), its weights; `scale`
+// A convolution: "stem", "head" (the heads' three 1x1 convolutions in one), or a block's "conv1" or
+// "conv2". `q`, (cout, cin, k, k), its weights; `scale`
 // and `bias`, of each output, what its integer sums are multiplied by and then added to; `inverse`,
 // of each input channel, and `zero_point`, how its input is quantized: round(x * inverse) + zero_point.
 int net_set_conv(net::Net* n, const char* where, int block, int cin, int cout, int k, const int8_t* q,
                  const float* scale, const float* bias, const float* inverse, int zero_point) {
     std::string name(where);
-    net::Conv* c = name == "stem" ? &n->stem
+    net::Conv* c = name == "stem"    ? &n->stem
+                   : name == "head" ? &n->head
                    : name == "conv1" ? &n->blocks.at(block).conv1
                    : name == "conv2" ? &n->blocks.at(block).conv2
                                      : nullptr;
@@ -869,14 +871,8 @@ int net_set_linear(net::Net* n, const char* where, int block, int in, int out, c
     return 0;
 }
 
-// The heads' three 1x1 convolutions, `w` (channels, 3 * head_channels) and `b`, and the policy's
-// last, `square_w` (head_channels).
-void net_set_heads(net::Net* n, const float* w, const float* b, const float* square_w) {
-    int h3 = 3 * n->head_channels;
-    n->head_w.assign(w, w + (size_t)n->channels * h3);
-    n->head_b.assign(b, b + h3);
-    n->square_w.assign(square_w, square_w + n->head_channels);
-}
+// The policy's last 1x1 convolution, `square_w` (head_channels).
+void net_set_heads(net::Net* n, const float* square_w) { n->square_w.assign(square_w, square_w + n->head_channels); }
 
 // `count` positions, (count, 2, 8, 8), to (count, 65) logits and (count) values, split over `threads`.
 void net_forward(const net::Net* n, int count, const float* obs, float* logits, float* values, int threads) {
