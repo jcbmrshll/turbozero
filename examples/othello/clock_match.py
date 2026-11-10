@@ -22,7 +22,7 @@ import math
 import os
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Protocol
 
@@ -134,12 +134,14 @@ class Game:
         seconds: each side's time used, black's then white's
         move_seconds: the time of each move searched, as (empties, black?, seconds)
         flagged: who ran out of time first, "b" or "w", if anyone did
+        moves: every move, the opening's first, as squares (bit 0 is a1); passes aren't moves
     """
 
     margin: int = 0
     seconds: list[float] = field(default_factory=lambda: [0.0, 0.0])
     move_seconds: list[tuple[int, bool, float]] = field(default_factory=list)
     flagged: str | None = None
+    moves: list[int] = field(default_factory=list)
 
 
 def play_game(
@@ -153,6 +155,7 @@ def play_game(
     for move in opening:
         color = board.color
         board.play(int(move))
+        game.moves.append(int(move))
         for player in players:
             player.play(color, int(move))
     while board.legal():
@@ -167,6 +170,7 @@ def play_game(
         if game.flagged is None and game.seconds[side] > seconds + GRACE:
             game.flagged = color
         board.play(move)
+        game.moves.append(int(move))
         players[not side].play(color, move)
     game.margin = board.margin()
     return game
@@ -319,6 +323,12 @@ def main() -> None:
     parser.add_argument("--openings", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--results", type=Path, default=None)
+    parser.add_argument(
+        "--games",
+        type=Path,
+        default=None,
+        help="where each game is written, a line each",
+    )
     args = parser.parse_args()
 
     pool = load_xot(XOT_PATH)
@@ -326,6 +336,10 @@ def main() -> None:
     openings = pool[rng.choice(len(pool), size=args.openings, replace=False)]
 
     def report(games: list[Game], a_black: list[bool]) -> None:
+        if args.games is not None:
+            game = games[-1]
+            with open(args.games, "a") as f:
+                f.write(json.dumps({"a_black": a_black[-1], **asdict(game)}) + "\n")
         if len(games) % 20 == 0:
             print(json.dumps(summarize(games, a_black, args.seconds)), flush=True)
 
