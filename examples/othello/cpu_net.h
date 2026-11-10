@@ -109,6 +109,9 @@ inline int32_t load_u32(const uint8_t* p) {
 }
 
 // One output row of a convolution, `RO` blocks of 16 outputs from `o`, for the 8 squares of row `y`.
+// The tile is the board's row by two blocks: 16 sums, 8 broadcast inputs and 2 weight vectors, 26 of
+// AVX-512's 32 registers, each weight used 8 times. It follows from the instruction set, not from
+// any one CPU's caches or timings.
 template <int K, int RO>
 inline void conv_row(const Conv& c, const int8_t* w, const uint8_t* in, int y, int o, float* out, int out_stride) {
     const int c4n = c.cin / 4;

@@ -13,7 +13,8 @@ Othello model and against two strong open-source Othello engines,
 | `engines.py` | Edax and Egaroucid, each driven over GTP, and what their searches made of each position, from their logs |
 | `setup_edax.sh`, `setup_egaroucid.sh` | Build the engines for `vs_engine.py` and `clock_match.py` |
 | `clock_match.py` | Games on a real clock, one at a time on the same cores, each side at its best settings |
-| `cpu_search.py`, `cpu_search.cpp` | A single game's MCTS for playing on CPU: a tree in C++, leaves evaluated in batches by OpenVINO or ONNX Runtime |
+| `cpu_search.py`, `cpu_search.cpp` | A single game's MCTS for playing on CPU: a tree in C++, its leaves evaluated in batches by OpenVINO or ONNX Runtime, or searched by a thread to a core (`Engine`) |
+| `cpu_net.py`, `cpu_net.h` | A network's int8 forward pass in C++ (AVX-512 VNNI), for `Engine`: no OpenVINO, closer to the float network |
 | `cpu_match.py` | Games between two such players at fixed visits a move, and their speed in evals a second |
 | `export_onnx.py` | Exports a checkpoint's network to ONNX |
 | `bench_cpu_backends.py` | Evals a second by CPU backend and batch, each checked against JAX's outputs |
@@ -695,6 +696,48 @@ from XOT openings, 1000 visits a move, or 4 s a side:
 At a batch of 1 it's no faster (0.94-0.99x). The gain is OpenVINO's int8 kernels on AVX512_VNNI: on
 ONNX Runtime int8 only matched bf16, and a CPU without VNNI will differ. The 4x64 net's outputs follow
 bf16's least closely, and it hasn't played.
+
+### The engine and the native network
+
+`clock_match.py`'s `engine=1` searches with a thread to a core, all in C++ (`cpu_search.Engine`): each
+collects its own few leaves, evaluates them on its own core while the others carry on, and backs them
+up, the tree shared under a lock. The batch above waits on its slowest stream, and goes through Python,
+at every step; here the network's time is 90-97% of the search's. `backend=native` evaluates with
+`cpu_net.py`'s network, our own int8 convolutions (AVX-512 VNNI) with float between them, a leaf at a
+time, so each thread needs only one leaf in flight. Build it once a network, calibrated as `quantize.py`
+is:
+
+```
+uv run examples/othello/cpu_net.py --net 8x128-128s-8p-w1125-274m --positions LEAVES/calibration.npy
+taskset -c 16-23 uv run examples/othello/clock_match.py --seconds 4 --openings 100 --b edax:threads=8 \
+    --a net:net=8x128-128s-8p-w1125-274m,engine=1,backend=native,batch=1,virtual_loss=visit,taper=24
+```
+
+A leaf whose position the game's searches have already evaluated, reached by another order of moves,
+takes that evaluation from the tree rather than the network's (`reuse`, on by default): 14-17% of
+leaves at 1000-4000 visits, about 27% under 10 empties. Without random symmetry the search is
+otherwise the same.
+
+The native network's convolutions take each input channel's own scale, folded into the weights
+(SmoothQuant, alpha 0.75), then the tensor's, from the minimum and maximum seen in calibration; their
+float epilogues normalize each square's channels where OpenVINO runs separate ops. Against the float
+network on 2000 search leaves (value's mean error, its 99th percentile, top move):
+
+| Network | Native | OpenVINO int8 |
+|---|---|---|
+| 8x128 | 0.010 / 0.052 / 97.9% | 0.043 / 0.191 / 96.6% |
+| 4x64 | 0.017 / 0.095 / 96.7% | 0.079 / 0.323 / 91.1% |
+| 8x128, channel norm | 0.024 / 0.116 / 95.2% | 0.078 / 0.352 / 86.7% |
+| 4x64, channel norm | 0.024 / 0.094 / 92.8% | 0.058 / 0.223 / 80.2% |
+
+Evals a second on one core, the native network a leaf at a time against OpenVINO int8's best batch:
+8x128 3908 against 4060 at 4; 4x64 26362 against 24840; 8x128 with channel norm 3548 against 3345;
+4x64 with channel norm 21970 against 16170. Channel norm costs OpenVINO int8 19-37% over BatchNorm,
+the native network 9-17%.
+
+ENGINE_RESULTS
+
+It needs AVX-512 F, BW and VNNI; elsewhere the library builds without it, and `Engine` runs OpenVINO.
 
 ## Credits
 

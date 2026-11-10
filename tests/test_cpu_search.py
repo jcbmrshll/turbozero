@@ -806,3 +806,18 @@ def test_an_engine_of_the_native_network_searches_as_a_batch_of_one():
     parallel = Search()
     Engine.native(network, 3, 2).search(parallel, visits=400)
     assert parallel.total_visits() == 400
+
+
+def test_the_search_is_built_for_a_standard_x86_level(monkeypatch):
+    import cpu_search
+
+    avx512 = {"avx512f", "avx512bw", "avx512vl", "avx512dq", "avx512cd", "avx512_vnni"}
+    for flags, level in [
+        (avx512 | {"avx2", "bmi2", "fma", "movbe"}, "-march=x86-64-v4"),
+        ({"avx2", "bmi2", "fma", "movbe", "avx512f"}, "-march=x86-64-v3"),
+        (set(), "-march=x86-64-v2"),
+    ]:
+        monkeypatch.setattr(cpu_search, "cpu_flags", lambda flags=flags: flags)
+        target = cpu_search.target_flags()
+        assert target[0] == level
+        assert not any("native" in flag for flag in target)

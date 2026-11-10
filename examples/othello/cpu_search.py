@@ -45,12 +45,45 @@ def openvino_paths() -> tuple[Path, Path]:
     return root / "include", library
 
 
+def cpu_flags() -> set[str]:
+    """The CPU's feature flags, as Linux lists them."""
+    try:
+        text = Path("/proc/cpuinfo").read_text()
+    except OSError:
+        return set()
+    for line in text.splitlines():
+        if line.startswith("flags"):
+            return set(line.split(":", 1)[1].split())
+    return set()
+
+
+def target_flags() -> list[str]:
+    """What the search is compiled for: a standard x86-64 level, not this CPU's own model, as engines
+    ship builds for. x86-64-v4 (AVX-512) with VNNI, where the CPU has them, builds the native network
+    (`cpu_net.h`); else x86-64-v3 (AVX2), or v2."""
+    flags = cpu_flags()
+    if {
+        "avx512f",
+        "avx512bw",
+        "avx512vl",
+        "avx512dq",
+        "avx512cd",
+        "avx512_vnni",
+    } <= flags:
+        return ["-march=x86-64-v4", "-mavx512vnni", "-mtune=generic"]
+    if {"avx2", "bmi2", "fma", "movbe"} <= flags:
+        return ["-march=x86-64-v3", "-mtune=generic"]
+    return ["-march=x86-64-v2", "-mtune=generic"]
+
+
 def library_path() -> Path:
-    """The compiled search, built for this machine, named after its source and the OpenVINO it
-    links."""
+    """The compiled search, built for this machine's x86-64 level, named after its source, its
+    target and the OpenVINO it links."""
     include, openvino = openvino_paths()
+    target = target_flags()
     source = (
-        b"".join(p.read_bytes() for p in [SOURCE, *HEADERS]) + str(openvino).encode()
+        b"".join(p.read_bytes() for p in [SOURCE, *HEADERS])
+        + str([openvino, target]).encode()
     )
     digest = hashlib.sha256(source).hexdigest()[:16]
     path = CACHE_DIR / "cpu-search" / f"cpu_search_{digest}.so"
@@ -59,7 +92,7 @@ def library_path() -> Path:
         # named per process: several may be compiling at once
         partial = path.with_suffix(f".{os.getpid()}.tmp")
         subprocess.run(
-            ["g++", "-std=c++17", "-O3", "-march=native", "-shared", "-fPIC"]
+            ["g++", "-std=c++17", "-O3", *target, "-shared", "-fPIC"]
             + [str(SOURCE), "-o", str(partial), f"-I{include}", str(openvino)]
             + [f"-Wl,-rpath,{openvino.parent}", "-lpthread"],
             check=True,
