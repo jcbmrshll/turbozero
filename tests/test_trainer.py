@@ -2887,15 +2887,56 @@ def test_a_fork_puts_a_saved_growth_runs_network_in_play(env, tmp_path, fake_loo
         (e, i) for e in (0, 1) for i in (0, 1, 2)
     ]
     assert output.growth is not None and output.growth.playing == 1
-    # a network the saved run hasn't, or a run without growth, can't be forked into
+    # a network the saved run hasn't can't be forked, nor one into a network of another shape
     with pytest.raises(ValueError, match="no network n2 to fork"):
         fork.fork_state(path, jax.random.PRNGKey(0), into=2)
     with pytest.raises(ValueError, match="fork_into: no network n9"):
         fork.train_loop(seed=0, num_epochs=1, fork_from=path, fork_into="n9")
-    with pytest.raises(ValueError, match="for a run with growth"):
+    with pytest.raises(ValueError, match="don't match this run's"):
         make_trainer(env, tmp_path / "plain").train_loop(
             seed=0, num_epochs=1, fork_from=path, fork_into="n1"
         )
+
+
+def test_a_run_without_growth_forks_one_network_of_a_growth_run(
+    env, tmp_path, fake_loop
+):
+    # the trunk grows n0 into n1, which plays from epoch 1
+    trunk, _ = growth_trainer(
+        env,
+        tmp_path / "trunk",
+        SCRIPTS,
+        growth_kwargs={"switch_at": (1,)},
+        grown=(1,),
+        save_state_at=[3],
+        averages=(2,),
+    )
+    fake_loop(trunk)
+    saved = trunk.train_loop(seed=0, num_epochs=3)
+    path = state_path(str(tmp_path / "trunk"), 3)
+    # n1 trained alone: a run without growth whose network has n1's shape
+    alone = make_trainer(
+        env,
+        tmp_path / "alone",
+        network=(MLP(2, env.num_actions, key=jax.random.PRNGKey(1), hidden=12), None),
+        averages=(2,),
+    )
+    calls = fake_loop(alone)
+
+    _, forked = alone.fork_state(path, jax.random.PRNGKey(0), name="n1")
+    output = alone.train_loop(seed=0, num_epochs=2, fork_from=path, fork_into="n1")
+
+    # n1 as the trunk left it, with its averages; only it trains
+    assert leaves_equal(forked.params, saved.train_states[1].params)
+    averages = alone.fork_averages(path, 0, "n1")
+    assert averages is not None
+    assert leaves_equal(averages[0], saved.averages[1]) and averages[1] == 3
+    assert [c.learner for c in of_kind(calls, "train")] == [0, 0]
+    assert output.growth is None
+    with pytest.raises(ValueError, match="no network n2 to fork"):
+        alone.fork_state(path, jax.random.PRNGKey(0), name="n2")
+    with pytest.raises(ValueError, match="fork_into is for a run forked"):
+        alone.train_loop(seed=0, num_epochs=1, fork_into="n1")
 
 
 def test_a_network_added_after_the_last_waits_beside_it(env, tmp_path, fake_loop):

@@ -845,10 +845,11 @@ def main():
         "--fork-into",
         default=None,
         metavar="SIZE",
-        help="with --init-from and --grow: the network (by size, e.g. 12x144) the saved run's "
-        "network of that size forks into (from a --grow run's state too), with its weight "
-        "averages; it plays from the start, the ones before it are retired (training beside it "
-        "with --grow-train-retired), the next waits, and the rest start from scratch",
+        help="with --init-from: the saved run's network to fork, by size (e.g. 8x128), from a "
+        "--grow run's state too, with its weight averages. With --grow, it forks into this "
+        "run's network of that size, which plays from the start; the ones before it are retired "
+        "(training beside it with --grow-train-retired), the next waits, and the rest start from "
+        "scratch. Without --grow, it is this run's --net, trained alone",
     )
     parser.add_argument(
         "--init-without-buffers",
@@ -912,8 +913,8 @@ def main():
         parser.error("--noise-measure must be at least 0")
     if args.init_without_buffers and args.init_from is None:
         parser.error("--init-without-buffers needs --init-from")
-    if args.fork_into is not None and (args.init_from is None or not args.grow):
-        parser.error("--fork-into needs --init-from and --grow")
+    if args.fork_into is not None and args.init_from is None:
+        parser.error("--fork-into needs --init-from")
     if args.grow_train_steps is not None and (
         not args.grow or args.grow_train_steps < 1
     ):
