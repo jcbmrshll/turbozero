@@ -244,17 +244,18 @@ def summarize(games: list[Game], a_black: list[bool], seconds: float) -> dict:
 
 def net_player(options: dict[str, str]) -> Callable[[], Player]:
     """What builds a network's player, which all games share a network for. Its `options` are
-    `cpu_match.Player.parse`'s, with `net`, `taper` (see `cpu_match.move_budget`), and `engine=1`
+    `cpu_match.Player.parse`'s, with `net`, `taper` (see `cpu_match.move_budget`), `engine=1`
     to search with a worker thread to a core (`cpu_search.Engine`), `batch` then the leaves each
-    evaluates at a time."""
+    evaluates at a time, and `threads`, the cores used, by default all it may run on. With
+    `visits`, it searches so many a move, ignoring the clock."""
     from cpu_match import NetPlayer, make_engine, make_eval
     from cpu_match import Player as NetSpec
 
     options = dict(options)
     native = bool(int(options.pop("engine", 0)))
+    cores = int(options.pop("threads", len(os.sched_getaffinity(0))))
     fields = ",".join(f"{k}={v}" for k, v in options.items())
     spec = NetSpec.parse(f"visits=0,{fields}", options["net"], "bf16")
-    cores = len(os.sched_getaffinity(0))
     evaluate = (
         make_engine(spec.net, spec.backend, cores, spec.settings.batch)
         if native
@@ -263,7 +264,9 @@ def net_player(options: dict[str, str]) -> Callable[[], Player]:
     taper = int(options.get("taper", 0))
     # a seed to a game, for its draws of symmetries
     seeds = itertools.count()
-    return lambda: NetPlayer(spec.settings, evaluate, taper, next(seeds))
+    return lambda: NetPlayer(
+        spec.settings, evaluate, taper, next(seeds), spec.visits
+    )
 
 
 def make_player(spec: str, seconds: int) -> Callable[[], Player]:

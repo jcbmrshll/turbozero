@@ -171,6 +171,60 @@ struct Node {
     int32_t first_edge;
     int32_t num_edges;  // 0 until it's been evaluated
     float w;            // for the player to move
+    float value;        // the network's, once it's been evaluated
+};
+
+// The nodes evaluated so far, by position: a leaf whose position the game's searches have evaluated
+// before, reached by another order of moves, takes that evaluation instead of the network's
+// (Leela Chess Zero's cache of network evaluations, here the tree itself). Open addressing.
+struct Evaluated {
+    struct Slot {
+        uint64_t me, opp;
+        int32_t node;  // -1 for an empty slot
+    };
+    std::vector<Slot> slots = std::vector<Slot>(1024, Slot{0, 0, -1});
+    size_t used = 0;
+
+    static uint64_t hash(uint64_t me, uint64_t opp) {
+        uint64_t z = me ^ (opp * 0x9e3779b97f4a7c15ULL) ^ (opp >> 29);
+        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+        return z ^ (z >> 31);
+    }
+
+    int32_t find(uint64_t me, uint64_t opp) const {
+        size_t mask = slots.size() - 1;
+        for (size_t i = hash(me, opp) & mask;; i = (i + 1) & mask) {
+            const Slot& slot = slots[i];
+            if (slot.node < 0) return -1;
+            if (slot.me == me && slot.opp == opp) return slot.node;
+        }
+    }
+
+    void insert(uint64_t me, uint64_t opp, int32_t node) {
+        if (2 * (used + 1) > slots.size()) {
+            std::vector<Slot> old(slots.size() * 2, Slot{0, 0, -1});
+            old.swap(slots);
+            used = 0;
+            for (const Slot& slot : old)
+                if (slot.node >= 0) insert(slot.me, slot.opp, slot.node);
+        }
+        size_t mask = slots.size() - 1;
+        for (size_t i = hash(me, opp) & mask;; i = (i + 1) & mask) {
+            Slot& slot = slots[i];
+            if (slot.node < 0) {
+                slot = Slot{me, opp, node};
+                used++;
+                return;
+            }
+            if (slot.me == me && slot.opp == opp) return;
+        }
+    }
+
+    void clear() {
+        slots.assign(1024, Slot{0, 0, -1});
+        used = 0;
+    }
 };
 
 struct PathStep {
@@ -195,14 +249,19 @@ struct Search {
     float c_init;
     int max_collisions;
     bool random_symmetry;
+    // whether a leaf may take an evaluation of its position from elsewhere in the tree
+    bool reuse;
     uint64_t rng;  // splitmix64's state
     int32_t root;
     int remaining;
     std::vector<Node> nodes;
     std::vector<Edge> edges;
     Batch batch;
+    Evaluated evaluated;
     int collisions_total;
     int visits_total;
+    // leaves that took an evaluation from the tree
+    long reused_total;
     // traversals in a row that ended the game, with no leaf between
     int ended_in_a_row;
 };
@@ -284,6 +343,25 @@ inline int draw_symmetry(Search& s) {
 }
 
 
+// Expands a leaf from the evaluation of a node of the same position, if there's one. Its edges list the
+// same legal moves in the same order.
+bool reuse_evaluation(Search& s, int32_t index) {
+    const Position& p = s.nodes[index].position;
+    int32_t source = s.evaluated.find(p.me, p.opp);
+    if (source < 0) return false;
+    int first = (int)s.edges.size();
+    int from = s.nodes[source].first_edge, count = s.nodes[source].num_edges;
+    for (int i = 0; i < count; i++) {
+        const Edge& e = s.edges[from + i];
+        s.edges.push_back(Edge{e.prior, 0, 0, 0, -1, e.action});
+    }
+    Node& node = s.nodes[index];
+    node.first_edge = first;
+    node.num_edges = count;
+    node.value = s.nodes[source].value;
+    return true;
+}
+
 // `search_collect`'s traversals, their paths kept in `b` until `apply`
 int collect(Search& s, Batch& b, int batch, float* out) {
     b.paths.clear();
@@ -323,6 +401,11 @@ int collect(Search& s, Batch& b, int batch, float* out) {
             back_up(s, b.path.data(), (int)b.path.size(), s.nodes[index].position.reward, false);
             visits++;
             s.ended_in_a_row++;
+        } else if (outcome == LEAF && s.reuse && reuse_evaluation(s, index)) {
+            back_up(s, b.path.data(), (int)b.path.size(), s.nodes[index].value, false);
+            visits++;
+            s.reused_total++;
+            s.ended_in_a_row = 0;
         } else if (outcome == LEAF) {
             fly(s, b.path, 1);
             b.paths.insert(b.paths.end(), b.path.begin(), b.path.end());
@@ -380,6 +463,8 @@ void apply(Search& s, Batch& b, const float* logits, const float* values) {
         for (size_t e = first; e < s.edges.size(); e++) s.edges[e].prior /= total;
         s.nodes[index].first_edge = first;
         s.nodes[index].num_edges = (int32_t)s.edges.size() - first;
+        s.nodes[index].value = values[i];
+        s.evaluated.insert(p.me, p.opp, index);
         back_up(s, b.paths.data() + start, end - start, values[i], true);
         start = end;
     }
@@ -393,19 +478,22 @@ void apply(Search& s, Batch& b, const float* logits, const float* values) {
 
 extern "C" {
 
-Search* search_new(int mode, float weight, float c_init, int max_collisions, int random_symmetry, uint64_t seed) {
+Search* search_new(int mode, float weight, float c_init, int max_collisions, int random_symmetry, int reuse,
+                   uint64_t seed) {
     Search* s = new Search();
     s->mode = mode;
     s->weight = weight;
     s->c_init = c_init;
     s->max_collisions = max_collisions;
     s->random_symmetry = random_symmetry != 0;
+    s->reuse = reuse != 0;
     s->rng = seed;
     s->root = -1;
     s->remaining = 0;
     s->collisions_total = 0;
     s->visits_total = 0;
     s->ended_in_a_row = 0;
+    s->reused_total = 0;
     return s;
 }
 
@@ -415,6 +503,7 @@ void search_free(Search* s) { delete s; }
 void search_reset(Search* s) {
     s->nodes.clear();
     s->edges.clear();
+    s->evaluated.clear();
     Position p{};
     p.me = (1ULL << 28) | (1ULL << 35);
     p.opp = (1ULL << 27) | (1ULL << 36);
@@ -509,6 +598,9 @@ float search_reward(const Search* s) { return s->nodes[s->root].position.reward;
 long search_collisions(const Search* s) { return s->collisions_total; }
 
 long search_total_visits(const Search* s) { return s->visits_total; }
+
+// leaves that took an evaluation from the tree rather than the network
+long search_reused(const Search* s) { return s->reused_total; }
 
 long search_num_nodes(const Search* s) { return (long)s->nodes.size(); }
 

@@ -71,6 +71,7 @@ class Player:
             if "max_collisions" in fields
             else None,
             random_symmetry=bool(int(fields.pop("random_symmetry", 0))),
+            reuse=bool(int(fields.pop("reuse", 1))),
         )
         return cls(net, backend, visits, settings)
 
@@ -346,10 +347,13 @@ class NetPlayer:
         evaluate: Eval | Engine,
         taper: int = 0,
         seed: int = 0,
+        visits: int = 0,
     ):
+        """`visits`, if any, a move, ignoring the clock."""
         self.search = Search(settings, seed)
         self.evaluate = evaluate
         self.taper = taper
+        self.visits = visits
         self.batch = np.empty((settings.batch, 2, 8, 8), np.float32)
         self.to_move = "b"
 
@@ -376,8 +380,13 @@ class NetPlayer:
             seconds = move_budget(seconds_left, empties, self.taper)
             if isinstance(self.evaluate, Engine):
                 self.evaluate.search(
-                    self.search, seconds=seconds, stop_ended=ENDED_VISITS
+                    self.search,
+                    visits=self.visits,
+                    seconds=seconds,
+                    stop_ended=0 if self.visits else ENDED_VISITS,
                 )
+            elif self.visits:
+                self.search.run(self.visits, self.evaluate)
             else:
                 timed_move(self.search, seconds, self.batch, self.evaluate)
             action = self.search.best_action()

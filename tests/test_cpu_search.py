@@ -118,6 +118,45 @@ def test_a_batch_of_one_visits_as_core_does():
     assert np.array_equal(search.visits(), core_visits(sims, moves))
 
 
+def test_reused_evaluations_search_as_core_does():
+    from cpu_search import Search, SearchSettings
+
+    # deep enough that the searches below reach positions by more than one order of moves
+    moves = [37, 45, 53, 38, 46, 54, 55, 20, 21, 47]
+    sims = 400
+    searches = {}
+    for reuse in (True, False):
+        search = Search(SearchSettings(reuse=reuse))
+        for action in moves:
+            search.play(action)
+        search.run(sims + 1, fake_eval)
+        searches[reuse] = search
+    assert searches[True].reused() > 0
+    assert searches[False].reused() == 0
+    assert np.array_equal(searches[True].visits(), core_visits(sims, moves))
+    assert np.array_equal(searches[False].visits(), searches[True].visits())
+
+
+def test_a_game_searched_a_leaf_at_a_time_evaluates_no_position_twice():
+    from cpu_search import Search
+
+    seen = set()
+
+    def recording(x):
+        for row in x:
+            key = row.tobytes()
+            assert key not in seen
+            seen.add(key)
+        return fake_eval(x)
+
+    search = Search()
+    while not search.terminated() and search.total_visits() < 6000:
+        search.run(300, recording)
+        search.play(search.best_action())
+    assert search.reused() > 0
+    assert len(seen) + search.reused() <= search.total_visits()
+
+
 @pytest.mark.parametrize("mode", ["loss", "draw", "visit"])
 def test_batches_keep_the_tree_consistent(mode):
     from cpu_search import Search, SearchSettings

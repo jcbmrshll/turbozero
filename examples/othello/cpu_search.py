@@ -79,6 +79,7 @@ def load_library() -> ctypes.CDLL:
                 ctypes.c_float,
                 ctypes.c_int,
                 ctypes.c_int,
+                ctypes.c_int,
                 ctypes.c_uint64,
             ],
         ),
@@ -100,6 +101,7 @@ def load_library() -> ctypes.CDLL:
         "search_collisions": (ctypes.c_long, [Search]),
         "search_total_visits": (ctypes.c_long, [Search]),
         "search_num_nodes": (ctypes.c_long, [Search]),
+        "search_reused": (ctypes.c_long, [Search]),
         "search_symmetric_bits": (ctypes.c_uint64, [ctypes.c_uint64, ctypes.c_int]),
         "search_symmetric_action": (ctypes.c_int, [ctypes.c_int, ctypes.c_int]),
         "engine_new": (
@@ -137,6 +139,11 @@ class SearchSettings:
             stops short; None for the batch's size
         random_symmetry: show the network each leaf in a random one of the board's 8 symmetries,
             drawn from the search's seed
+        reuse: give a leaf whose position the game's searches have evaluated before, reached by
+            another order of moves, that evaluation rather than the network's (Leela Chess Zero's
+            cache of evaluations, here the tree itself): about 14-17% of leaves at 1000-4000
+            visits, more near the end. Without `random_symmetry` the search is the same, only
+            cheaper.
     """
 
     batch: int = 1
@@ -145,6 +152,7 @@ class SearchSettings:
     c_init: float = 1.25
     max_collisions: int | None = None
     random_symmetry: bool = False
+    reuse: bool = True
 
 
 class Search:
@@ -161,6 +169,7 @@ class Search:
             settings.c_init,
             settings.batch if collisions is None else collisions,
             settings.random_symmetry,
+            settings.reuse,
             seed,
         )
         LIB.search_reset(self.handle)
@@ -258,6 +267,11 @@ class Search:
 
     def num_nodes(self) -> int:
         return LIB.search_num_nodes(self.handle)
+
+    def reused(self) -> int:
+        """Leaves that took an evaluation from elsewhere in the tree, of the same position reached
+        by another order of moves, rather than the network's."""
+        return LIB.search_reused(self.handle)
 
 
 class Engine:
