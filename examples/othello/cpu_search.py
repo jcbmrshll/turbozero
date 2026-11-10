@@ -57,23 +57,28 @@ def cpu_flags() -> set[str]:
     return set()
 
 
+LEVELS = {
+    "v4": ["-march=x86-64-v4", "-mavx512vnni", "-mtune=generic"],
+    "v3": ["-march=x86-64-v3", "-mtune=generic"],
+    "v2": ["-march=x86-64-v2", "-mtune=generic"],
+}
+AVX512 = {"avx512f", "avx512bw", "avx512vl", "avx512dq", "avx512cd", "avx512_vnni"}
+
+
 def target_flags() -> list[str]:
     """What the search is compiled for: a standard x86-64 level, not this CPU's own model, as engines
-    ship builds for. x86-64-v4 (AVX-512) with VNNI, where the CPU has them, builds the native network
-    (`cpu_net.h`); else x86-64-v3 (AVX2), or v2."""
+    ship builds for. x86-64-v4 (AVX-512) with VNNI where the CPU has them, else x86-64-v3 (AVX2), or
+    v2, which has no native network (`cpu_net.h`). $TURBOZERO_X86_LEVEL ("v4", "v3", "v2") picks one,
+    e.g. to play as an AVX2 build would."""
+    level = os.environ.get("TURBOZERO_X86_LEVEL")
+    if level:
+        return LEVELS[level]
     flags = cpu_flags()
-    if {
-        "avx512f",
-        "avx512bw",
-        "avx512vl",
-        "avx512dq",
-        "avx512cd",
-        "avx512_vnni",
-    } <= flags:
-        return ["-march=x86-64-v4", "-mavx512vnni", "-mtune=generic"]
+    if AVX512 <= flags:
+        return LEVELS["v4"]
     if {"avx2", "bmi2", "fma", "movbe"} <= flags:
-        return ["-march=x86-64-v3", "-mtune=generic"]
-    return ["-march=x86-64-v2", "-mtune=generic"]
+        return LEVELS["v3"]
+    return LEVELS["v2"]
 
 
 def library_path() -> Path:
@@ -92,7 +97,7 @@ def library_path() -> Path:
         # named per process: several may be compiling at once
         partial = path.with_suffix(f".{os.getpid()}.tmp")
         subprocess.run(
-            ["g++", "-std=c++17", "-O3", *target, "-shared", "-fPIC"]
+            ["g++", "-std=c++17", "-O3", *target, "-fopenmp-simd", "-shared", "-fPIC"]
             + [str(SOURCE), "-o", str(partial), f"-I{include}", str(openvino)]
             + [f"-Wl,-rpath,{openvino.parent}", "-lpthread"],
             check=True,
@@ -370,7 +375,7 @@ class Engine:
         """A `cpu_net.NativeNet`, its workers each evaluating their leaves one at a time."""
         handle = LIB.engine_new_net(network.handle, threads, batch)
         if not handle:
-            raise RuntimeError("the native network needs AVX-512 VNNI")
+            raise RuntimeError("the native network needs AVX2 or AVX-512 VNNI")
         return cls(handle, threads, batch, network)
 
     def __del__(self) -> None:
