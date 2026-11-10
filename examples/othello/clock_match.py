@@ -264,9 +264,7 @@ def net_player(options: dict[str, str]) -> Callable[[], Player]:
     taper = int(options.get("taper", 0))
     # a seed to a game, for its draws of symmetries
     seeds = itertools.count()
-    return lambda: NetPlayer(
-        spec.settings, evaluate, taper, next(seeds), spec.visits
-    )
+    return lambda: NetPlayer(spec.settings, evaluate, taper, next(seeds), spec.visits)
 
 
 def make_player(spec: str, seconds: int) -> Callable[[], Player]:
