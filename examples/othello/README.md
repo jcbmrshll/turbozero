@@ -703,8 +703,11 @@ bf16's least closely, and it hasn't played.
 collects its own few leaves, evaluates them on its own core while the others carry on, and backs them
 up, the tree shared under a lock. The batch above waits on its slowest stream, and goes through Python,
 at every step; here the network's time is 90-97% of the search's. `backend=native` evaluates with
-`cpu_net.py`'s network, our own int8 convolutions (AVX-512 VNNI) with float between them, a leaf at a
-time, so each thread needs only one leaf in flight. Build it once a network, calibrated as `quantize.py`
+`cpu_net.py`'s network, our own int8 convolutions with float between them, a leaf at a time, so each
+thread needs only one leaf in flight. The library is built for a standard x86-64 level, as engines
+ship builds for: AVX-512 with VNNI (x86-64-v4) where the CPU has them, else AVX2 (x86-64-v3), whose
+kernel sums exactly what VNNI does at about a quarter of the speed; `TURBOZERO_X86_LEVEL=v3` plays as
+an AVX2 build would. Build it once a network, calibrated as `quantize.py`
 is:
 
 ```
@@ -735,9 +738,27 @@ Evals a second on one core, the native network a leaf at a time against OpenVINO
 4x64 with channel norm 21970 against 16170. Channel norm costs OpenVINO int8 19-37% over BatchNorm,
 the native network 9-17%.
 
-ENGINE_RESULTS
+On a 4 s clock, 4 physical cores (both sides the same 4 threads), XOT openings with both colours, 200
+games each (standard errors over the openings' pairs of games):
 
-It needs AVX-512 F, BW and VNNI; elsewhere the library builds without it, and `Engine` runs OpenVINO.
+| Player a against player b | Network | Elo for a |
+|---|---|---|
+| Engine, OpenVINO int8, 2 leaves a thread, reuse; against the batch of 16, no reuse | 8x128 | +133 ± 18 |
+| The same engine, reuse against none | 8x128 | +44 ± 14 |
+| Engine with the native network, 1 leaf a thread; against OpenVINO's engine, 2 a thread | 8x128 | -2 ± 17 |
+| The same | 8x128, channel norm | +31 ± 20 |
+| Engine, native network, 1 leaf a thread, reuse; against the batch of 16, no reuse | 6x96 | +141 ± 19 |
+| The same | 4x64 | +215 ± 21 |
+
+How many leaves to keep in flight depends on the visits a move. At equal visits, 8 threads against
+the batch of 16, with the native network on both sides: at 1000 visits on 8x128, 1 leaf a thread
++9 ± 11 (400 games); at 4000 on 4x64, 1 a thread -31 ± 12, 2 -9 ± 12 and 4 +13 ± 14 (300 each).
+With OpenVINO's engine, 4 a thread lost 23 ± 13 to 2 at 1000 visits on 8x128, and 8 lost 37 ± 17 to
+2 at 4000 on 4x64. The native network costs nothing per core to run a leaf at a time, so the choice is
+search quality alone: about 1 a thread at 1000 visits, 2-4 from a few thousand. It matched bf16 at
+equal visits: -3 ± 12 on 4x64 and on 8x128 with channel norm, 400 games each.
+
+Below AVX2 the library builds without the native network, and `Engine` runs OpenVINO.
 
 ## Credits
 
