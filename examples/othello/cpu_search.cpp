@@ -806,10 +806,10 @@ void net_add_block(net::Net* n, int pool_channels) {
 }
 
 // A convolution: "stem", or a block's "conv1" or "conv2". `q`, (cout, cin, k, k), its weights; `scale`
-// and `bias`, of each output, what its integer sums are multiplied by and then added to; `in_scale`
-// and `zero_point`, how its input is quantized: round(x / in_scale) + zero_point.
+// and `bias`, of each output, what its integer sums are multiplied by and then added to; `inverse`,
+// of each input channel, and `zero_point`, how its input is quantized: round(x * inverse) + zero_point.
 int net_set_conv(net::Net* n, const char* where, int block, int cin, int cout, int k, const int8_t* q,
-                 const float* scale, const float* bias, float in_scale, int zero_point) {
+                 const float* scale, const float* bias, const float* inverse, int zero_point) {
     std::string name(where);
     net::Conv* c = name == "stem" ? &n->stem
                    : name == "conv1" ? &n->blocks.at(block).conv1
@@ -822,7 +822,7 @@ int net_set_conv(net::Net* n, const char* where, int block, int cin, int cout, i
     net::pack(*c, q);
     c->scale.assign(scale, scale + cout);
     c->bias.assign(bias, bias + cout);
-    c->inv_in_scale = 1.0f / in_scale;
+    c->inverse.assign(inverse, inverse + cin);
     c->zero_point = zero_point;
     return 0;
 }

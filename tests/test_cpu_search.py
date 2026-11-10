@@ -738,7 +738,9 @@ def random_network(spec: str, seed: int = 1):
 NATIVE_SPECS = [
     "resnet:2x32,pool_every=2,heads=pooled,pool_channels=16,head_channels=16",
     "resnet:3x64,pool_every=2,heads=pooled,pool_channels=16,norm=channel,layout=pre",
-    "resnet:2x48,pool_every=1,heads=pooled,pool_channels=16,head_channels=16,layout=pre",
+    # pooled channels leaving a number of others that is no multiple of 16
+    "resnet:2x48,pool_every=1,heads=pooled,pool_channels=8,head_channels=16,layout=pre",
+    "resnet:2x48,pool_every=2,heads=pooled,pool_channels=24,head_channels=16",
 ]
 
 

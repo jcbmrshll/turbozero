@@ -40,7 +40,7 @@ struct Conv {
     // [cout / 32][k * k][cin / 4][2][16 outputs][4 inputs], the last 16 outputs alone if cout / 16 is odd
     std::vector<int8_t> packed;
     std::vector<float> scale, bias;  // of each output: acc * scale + bias
-    float inv_in_scale = 1;
+    std::vector<float> inverse;  // of each input channel: its quantization is round(x * inverse) + zero_point
     int zero_point = 0;
 };
 
@@ -98,6 +98,11 @@ struct Scratch {
 };
 
 #if NET_NATIVE
+// the first `n` lanes (all 16 when n >= 16), the rest zero
+inline __mmask16 lanes(int n) { return n >= 16 ? (__mmask16)0xffff : (__mmask16)((1u << n) - 1); }
+inline __m512 load(const float* p, int n) { return _mm512_maskz_loadu_ps(lanes(n), p); }
+inline void store(float* p, __m512 v, int n) { _mm512_mask_storeu_ps(p, lanes(n), v); }
+
 inline int32_t load_u32(const uint8_t* p) {
     int32_t v;
     std::memcpy(&v, p, 4);
@@ -159,46 +164,48 @@ inline void convolve(const Conv& c, const uint8_t* in, float* out, int out_strid
 inline void quantize(const Conv& c, const float* x, int stride, uint8_t* padded) {
     const int channels = c.cin;
     std::memset(padded, c.zero_point, (size_t)PADDED * channels);
-    __m512 inv = _mm512_set1_ps(c.inv_in_scale);
     __m512i zp = _mm512_set1_epi32(c.zero_point);
     __m512i lo = _mm512_setzero_si512(), hi = _mm512_set1_epi32(255);
     for (int s = 0; s < SQUARES; s++) {
         const float* v = x + s * stride;
         uint8_t* q = padded + ((s / 8 + 1) * 10 + s % 8 + 1) * channels;
         for (int ch = 0; ch < channels; ch += 16) {
-            __m512i i = _mm512_add_epi32(_mm512_cvtps_epi32(_mm512_mul_ps(_mm512_loadu_ps(v + ch), inv)), zp);
+            int n = channels - ch;
+            __m512 inv = load(c.inverse.data() + ch, n);
+            __m512i i = _mm512_add_epi32(_mm512_cvtps_epi32(_mm512_mul_ps(load(v + ch, n), inv)), zp);
             i = _mm512_min_epi32(_mm512_max_epi32(i, lo), hi);
-            _mm_storeu_si128((__m128i*)(q + ch), _mm512_cvtepi32_epi8(i));
+            _mm_mask_storeu_epi8(q + ch, lanes(n), _mm512_cvtepi32_epi8(i));
         }
     }
 }
 
-// `n` of `ch` values (a multiple of 16) at `v`, in place, then a ReLU if `relu`
+// `n` of `ch` values at `v`, in place, then a ReLU if `relu`
 inline void normalize_square(const Norm& n, float* v, int ch, bool relu) {
     const __m512 zero = _mm512_setzero_ps();
     if (n.type == NORM_CHANNEL) {
         __m512 sum = zero;
-        for (int i = 0; i < ch; i += 16) sum = _mm512_add_ps(sum, _mm512_loadu_ps(v + i));
+        for (int i = 0; i < ch; i += 16) sum = _mm512_add_ps(sum, load(v + i, ch - i));
         __m512 mean = _mm512_set1_ps(_mm512_reduce_add_ps(sum) / ch);
         __m512 sq = zero;
         for (int i = 0; i < ch; i += 16) {
-            __m512 d = _mm512_sub_ps(_mm512_loadu_ps(v + i), mean);
+            __m512 d = _mm512_maskz_sub_ps(lanes(ch - i), load(v + i, ch - i), mean);
             sq = _mm512_fmadd_ps(d, d, sq);
         }
         __m512 rstd = _mm512_set1_ps(1.0f / std::sqrt(_mm512_reduce_add_ps(sq) / ch + n.eps));
         for (int i = 0; i < ch; i += 16) {
-            __m512 d = _mm512_mul_ps(_mm512_sub_ps(_mm512_loadu_ps(v + i), mean), rstd);
-            __m512 out = _mm512_fmadd_ps(d, _mm512_loadu_ps(n.a.data() + i), _mm512_loadu_ps(n.c.data() + i));
-            _mm512_storeu_ps(v + i, relu ? _mm512_max_ps(out, zero) : out);
+            int m = ch - i;
+            __m512 d = _mm512_mul_ps(_mm512_sub_ps(load(v + i, m), mean), rstd);
+            __m512 out = _mm512_fmadd_ps(d, load(n.a.data() + i, m), load(n.c.data() + i, m));
+            store(v + i, relu ? _mm512_max_ps(out, zero) : out, m);
         }
     } else if (n.type == NORM_AFFINE) {
         for (int i = 0; i < ch; i += 16) {
-            __m512 out = _mm512_fmadd_ps(_mm512_loadu_ps(v + i), _mm512_loadu_ps(n.a.data() + i),
-                                         _mm512_loadu_ps(n.c.data() + i));
-            _mm512_storeu_ps(v + i, relu ? _mm512_max_ps(out, zero) : out);
+            int m = ch - i;
+            __m512 out = _mm512_fmadd_ps(load(v + i, m), load(n.a.data() + i, m), load(n.c.data() + i, m));
+            store(v + i, relu ? _mm512_max_ps(out, zero) : out, m);
         }
     } else if (relu) {
-        for (int i = 0; i < ch; i += 16) _mm512_storeu_ps(v + i, _mm512_max_ps(_mm512_loadu_ps(v + i), zero));
+        for (int i = 0; i < ch; i += 16) store(v + i, _mm512_max_ps(load(v + i, ch - i), zero), ch - i);
     }
 }
 
@@ -208,18 +215,18 @@ inline void normalize(const Norm& n, float* x, int stride, bool relu) {
     for (int s = 0; s < SQUARES; s++) normalize_square(n, x + s * stride, n.channels ? n.channels : stride, relu);
 }
 
-// each of `count` channels from `first`'s mean and maximum over the board, (2 * count); count a
-// multiple of 16
+// each of `count` channels from `first`'s mean and maximum over the board, (2 * count)
 inline void board_pool(const float* x, int stride, int first, int count, float* out) {
     for (int i = 0; i < count; i += 16) {
+        int m = count - i;
         __m512 sum = _mm512_setzero_ps(), most = _mm512_set1_ps(-INFINITY);
         for (int s = 0; s < SQUARES; s++) {
-            __m512 v = _mm512_loadu_ps(x + s * stride + first + i);
+            __m512 v = load(x + s * stride + first + i, m);
             sum = _mm512_add_ps(sum, v);
             most = _mm512_max_ps(most, v);
         }
-        _mm512_storeu_ps(out + i, _mm512_mul_ps(sum, _mm512_set1_ps(1.0f / SQUARES)));
-        _mm512_storeu_ps(out + count + i, most);
+        store(out + i, _mm512_mul_ps(sum, _mm512_set1_ps(1.0f / SQUARES)), m);
+        store(out + count + i, most, m);
     }
 }
 
@@ -240,13 +247,14 @@ inline void relu(float* x, int count) {
 }
 
 // `b`, (cols), added to each of the 64 squares' first `cols` of `x`, (64, stride), then a ReLU if
-// `relu_after`; cols a multiple of 16
+// `relu_after`
 inline void add_rows(float* x, int stride, const float* b, int cols, bool relu_after) {
     const __m512 zero = _mm512_setzero_ps();
     for (int s = 0; s < SQUARES; s++)
         for (int i = 0; i < cols; i += 16) {
-            __m512 v = _mm512_add_ps(_mm512_loadu_ps(x + s * stride + i), _mm512_loadu_ps(b + i));
-            _mm512_storeu_ps(x + s * stride + i, relu_after ? _mm512_max_ps(v, zero) : v);
+            int m = cols - i;
+            __m512 v = _mm512_add_ps(load(x + s * stride + i, m), load(b + i, m));
+            store(x + s * stride + i, relu_after ? _mm512_max_ps(v, zero) : v, m);
         }
 }
 
