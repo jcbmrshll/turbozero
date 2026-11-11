@@ -12,6 +12,7 @@ import itertools
 import os
 import warnings
 from dataclasses import dataclass, replace
+from functools import partial
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -29,25 +30,33 @@ from core.evaluators.evaluation_fns import make_nn_eval_fn
 from core.evaluators.evaluator import EvalOutput, Evaluator
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.mcts.mcts import MCTS
-from core.memory.replay_memory import BaseExperience, EpisodeReplayBuffer
+from core.memory.replay_memory import (
+    BaseExperience,
+    EpisodeReplayBuffer,
+    buffer_capacity,
+)
 from core.monitoring import DECLARED
 from core.networks.azresnet import batch_norm
 from core.networks.utils import apply_nn
 from core.testing.tester import BaseTester
 from core.testing.two_player_tester import TwoPlayerTester
+from core.training.endgame_solve import EndgameSolve, Solved
 from core.training.growth import Growth, GrowthProgress, Learner
 from core.training.loss_fns import az_default_loss_fn
+from core.training.lr_drop import LRDrop
 from core.training.lr_plateau import LRPlateau, LRPlateauProgress
 from core.training.schedule import EvaluatorSchedule, describe
 from core.training.train import (
     CollectionStats,
     Trainer,
     TrainLoopOutput,
+    average_share,
     checkpoint_epochs,
     extract_params,
     lr_plateau_states,
     read_state_meta,
     reduce_step_metrics,
+    saved_growth,
     state_epochs,
     state_path,
 )
@@ -381,15 +390,16 @@ def fake_loop(monkeypatch):
     """`fake_loop(trainer)` replaces `trainer`'s self-play and training with fakes that return at
     once, so its training loop compiles nothing. Self-play counts an episode for every environment
     and the moves it was asked for; training counts a step and adds 1 to every param, and reports
-    a loss of 0.
+    a loss of 0, and with `noise_scale` (a function of the epoch) the noise scale's estimates, a
+    gradient's squared norm of 1 and a tr(Sigma) of the noise scale.
 
     Returns the calls, in order, as namespaces with the arguments they got: self-play's are
     `kind="collect"`, with `key`, `state`, `params`, `num_steps` and `evaluator`; training's
-    `kind="train"`, with `key`, `state` (the collection state), `epoch` and `result`, the train
-    state it returned.
+    `kind="train"`, with `key`, `state` (the collection state), `epoch`, `num_steps`,
+    `batch_size`, `lr_scale` and `result`, the train state it returned.
     """
 
-    def install(trainer):
+    def install(trainer, noise_scale=None):
         calls = []
 
         def collect_steps(key, state, params, num_steps, *, evaluator=None):
@@ -408,8 +418,15 @@ def fake_loop(monkeypatch):
             )
 
         def train_steps(
-            key, collection_state, train_state, num_steps, epoch=0, learner=0
-        ):  # pylint: disable=unused-argument
+            key,
+            collection_state,
+            train_state,
+            num_steps,
+            epoch=0,
+            learner=0,
+            batch_size=None,
+            lr_scale=None,
+        ):
             result = replace(
                 train_state,
                 params=jax.tree.map(lambda x: x + 1, train_state.params),
@@ -420,12 +437,19 @@ def fake_loop(monkeypatch):
                     kind="train",
                     key=key,
                     state=collection_state,
+                    num_steps=num_steps,
                     epoch=epoch,
                     learner=learner,
+                    batch_size=batch_size,
+                    lr_scale=lr_scale,
                     result=result,
                 )
             )
-            return collection_state, result, {"loss": jnp.array(0.0)}
+            metrics = {"loss": jnp.array(0.0)}
+            if noise_scale is not None:
+                metrics["gns_tr_sigma"] = jnp.array(float(noise_scale(epoch)))
+                metrics["gns_grad_sq"] = jnp.array(1.0)
+            return collection_state, result, metrics
 
         monkeypatch.setattr(trainer, "collect_steps", collect_steps)
         monkeypatch.setattr(trainer, "train_steps", train_steps)
@@ -1221,9 +1245,9 @@ def falling_loss(fake_loop, trainer):
     calls = fake_loop(trainer)
     train_steps = trainer.train_steps
 
-    def with_loss(key, collection_state, train_state, num_steps, epoch=0, learner=0):
+    def with_loss(key, collection_state, train_state, num_steps, epoch=0, **kwargs):
         collection_state, train_state, _ = train_steps(
-            key, collection_state, train_state, num_steps, epoch, learner
+            key, collection_state, train_state, num_steps, epoch, **kwargs
         )
         return collection_state, train_state, {"loss": jnp.float32(1 / (epoch + 1))}
 
@@ -1883,7 +1907,7 @@ def test_tree_position_sampler_fills_the_first_places(env, tmp_path):
 
     for num_tree, expected in [(3, [7, 7, 7, 0]), (0, [0, 0, 0, 0])]:
         add = trainer.tree_position_sampler(
-            tree_state, tree_buffer.sample_mask(tree_state), jnp.array(num_tree)
+            tree_state, tree_buffer.sample_mask(tree_state), jnp.array(num_tree), 4
         )
         mixed = add(jax.random.PRNGKey(0), batch)
         np.testing.assert_array_equal(mixed.search_value, expected)
@@ -1891,7 +1915,7 @@ def test_tree_position_sampler_fills_the_first_places(env, tmp_path):
     # with no tree positions to sample (and so none asked for), the batch is left as it was
     empty = tree_buffer.init(2, template)
     mixed = trainer.tree_position_sampler(
-        empty, tree_buffer.sample_mask(empty), jnp.array(0)
+        empty, tree_buffer.sample_mask(empty), jnp.array(0), 4
     )(jax.random.PRNGKey(0), batch)
     assert jax.tree.all(jax.tree.map(np.array_equal, mixed, batch))
 
@@ -2018,7 +2042,10 @@ def test_grad_accum_matches_one_minibatch_without_batch_norm(env, tmp_path):
 
     assert not leaves_equal(whole.params, make().init_train_state().params)
     assert_trees_close(accumulated, whole)
-    assert_trees_close(accumulated_metrics, whole_metrics)
+    # and the micro-batches' gradients' norms, for the noise scale
+    for a, w in zip(accumulated_metrics, whole_metrics, strict=True):
+        assert set(a) - set(w) == {"gns_micro_sq", "gns_batch_sq"}
+        assert_trees_close({k: a[k] for k in w}, w)
 
 
 def test_train_step_reports_the_scheduled_hyperparameters_it_used(env, tmp_path):
@@ -2091,8 +2118,8 @@ REAL_PLATEAU = LRPlateau((1e-3, 1e-4), window=3, threshold=1e9, min_epochs=3)
 def real(env, tmp_path_factory):
     """A Trainer with AlphaZero self-play whose search grows from 2 to 3 iterations at epoch 2, a
     network with BatchNorm, gradient accumulation, tree positions with a data transform, a
-    TwoPlayerTester, a learning rate that drops after epoch 2 (on a plateau, of any loss), and a
-    (fake) monitor. It saves its state after 2 epochs."""
+    TwoPlayerTester, a learning rate that drops after epoch 2 (on a plateau, of any loss), weight
+    averages over 2 epochs, and a (fake) monitor. It saves its state after 2 epochs."""
     network = eqx.nn.make_with_state(NormMLP)(
         2, env.num_actions, key=jax.random.PRNGKey(0)
     )
@@ -2113,6 +2140,7 @@ def real(env, tmp_path_factory):
         save_state_at=[2],
         optimizer=optax.inject_hyperparams(optax.adam)(learning_rate=REAL_PLATEAU),
         lr_plateau=REAL_PLATEAU,
+        averages=(2,),
     )
 
 
@@ -2381,10 +2409,10 @@ def hidden_size(params):
     return params.hidden.weight.shape[0]
 
 
-def growth_trainer(env, ckpt_dir, scripts, growth_kwargs=None, **kwargs):
-    """A trainer whose MLP (n0, hidden width 8) grows into n1 (width 12) and n2 (width 16):
-    network i's self-play is TaggedEvaluator(i), its tests' TaggedEvaluator(10 + i), and its
-    tester a ScriptedTester of `scripts[i]`."""
+def growth_trainer(env, ckpt_dir, scripts, growth_kwargs=None, grown=(1, 2), **kwargs):
+    """A trainer whose MLP (n0, hidden width 8) grows into n1 (width 12) and n2 (width 16), or
+    those of `grown`: network i's self-play is TaggedEvaluator(i), its tests'
+    TaggedEvaluator(10 + i), and its tester a ScriptedTester of `scripts[i]`."""
     testers = [ScriptedTester(script) for script in scripts]
     learners = [
         Learner(
@@ -2394,13 +2422,17 @@ def growth_trainer(env, ckpt_dir, scripts, growth_kwargs=None, **kwargs):
             evaluator_test=TaggedEvaluator(10.0 + i),
             testers=[testers[i]],
         )
-        for i in (1, 2)
+        for i in grown
     ]
     growth = Growth(
         first="n0",
         learners=learners,
-        metric="probe_error",
-        **{"window": 2, "min_epochs": 2, **(growth_kwargs or {})},
+        **{
+            "metric": "probe_error",
+            "window": 2,
+            "min_epochs": 2,
+            **(growth_kwargs or {}),
+        },
     )
     trainer = make_trainer(
         env,
@@ -2453,7 +2485,7 @@ def test_growth_hands_self_play_to_the_next_network(env, tmp_path, fake_loop, ca
     assert trainer.ckpt_dirs == tuple(str(tmp_path / n) for n in ("n0", "n1", "n2"))
     # the state: every network's
     assert output.growth == GrowthProgress(
-        1, (6, 9, 3), ((1.0, 1.0), (0.5, 0.5), (9.0, 9.0))
+        1, (6, 9, 3), ((1.0, 1.0), (0.5, 0.5), (9.0, 9.0)), played=(6, 3, 0)
     )
     assert output.playing == 1 and hidden_size(output.train_state) == 12
     assert [int(ts.step) for ts in output.train_states] == [6, 9, 3]
@@ -2486,6 +2518,12 @@ def test_growth_hands_self_play_to_the_next_network(env, tmp_path, fake_loop, ca
         assert logged[e]["train_seconds"] == pytest.approx(
             sum(logged[e][f"{n}/train_seconds"] for n in names)
         )
+        # in network evaluations: STEPS one-cycle moves in 2 environments; 1 step of 4 samples
+        # for each network that trains
+        assert logged[e]["selfplay_evals"] == STEPS * 2
+        assert logged[e][f"{names[0]}/selfplay_evals"] == STEPS * 2
+        assert logged[e]["train_samples"] == 2 * 4
+        assert all(logged[e][f"{n}/train_samples"] == 4 for n in names)
     assert logged[8]["run_seconds"] >= logged[3]["run_seconds"]
     undescribed = {
         name
@@ -2576,6 +2614,8 @@ def test_a_resumed_growth_run_carries_on_where_it_stopped(env, tmp_path, fake_lo
         "playing": 0,
         "trained": [4, 4, 0],
         "values": [[1.0, 1.0], [2.0, 2.0], []],
+        "guard_values": [],
+        "played": [4, 0, 0],
     }
 
 
@@ -2592,12 +2632,13 @@ def test_a_growth_run_forks_from_a_run_without(env, tmp_path, fake_loop):
     # and a run with growth can't be continued without it, nor forked from
     saving, _ = growth_trainer(env, tmp_path / "saving", SCRIPTS, save_state_at=[1])
     fake_loop(saving)
-    saving.train_loop(seed=0, num_epochs=1)
+    grown = saving.train_loop(seed=0, num_epochs=1)
     grown_path = state_path(str(tmp_path / "saving"), 1)
     with pytest.raises(ValueError, match="saved by a run with growth"):
         make_trainer(env, tmp_path / "other").load_state(grown_path)
-    with pytest.raises(ValueError, match="forks start from a run without"):
-        trainer.fork_state(grown_path, jax.random.PRNGKey(0))
+    # a fork of a growth run takes its network of the same name: the Trainer's own's, n0
+    _, forked = trainer.fork_state(grown_path, jax.random.PRNGKey(0))
+    assert leaves_equal(forked.params, grown.train_states[0].params)
 
 
 def test_a_real_growth_run_trains_each_network(env, tmp_path):
@@ -2614,4 +2655,1123 @@ def test_a_real_growth_run_trains_each_network(env, tmp_path):
         assert leaves_equal(
             trainer.load_train_state_from_checkpoint(d, last, i),
             output.train_states[i],
+        )
+
+
+# branches: a saved run going on in another directory, with other self-play settings
+
+
+def test_a_branch_with_the_runs_own_settings_carries_on_exactly(
+    env, tmp_path, fake_loop
+):
+    straight, _ = growth_trainer(env, tmp_path / "straight", SCRIPTS)
+    straight_calls = fake_loop(straight)
+    expected = straight.train_loop(seed=0, num_epochs=9)
+    trunk, _ = growth_trainer(env, tmp_path / "trunk", SCRIPTS, save_state_at=[4])
+    fake_loop(trunk)
+    trunk.train_loop(seed=0, num_epochs=4)
+
+    monitor = FakeMonitor()
+    branch, _ = growth_trainer(env, tmp_path / "branch", SCRIPTS, monitor=monitor)
+    calls = fake_loop(branch)
+    # the seed is the run's rng's, whatever is passed
+    output = branch.train_loop(
+        seed=1, num_epochs=9, initial_state=branch.branch(str(tmp_path / "trunk"))
+    )
+
+    # the run goes on as if it hadn't stopped: the same switch, networks and keys
+    assert output.growth == expected.growth
+    assert leaves_equal(output.train_states, expected.train_states)
+    assert len(calls) == 15
+    for call, straight_call in zip(calls, straight_calls[-15:], strict=True):
+        assert call.kind == straight_call.kind
+        np.testing.assert_array_equal(call.key, straight_call.key)
+    # in its own directory and monitor run, which records where it branched from
+    assert [checkpoint_epochs(d) for d in branch.ckpt_dirs] == [
+        [4, 5],
+        [4, 5, 6, 7, 8],
+        [6, 7, 8],
+    ]
+    assert checkpoint_epochs(str(tmp_path / "trunk" / "n0")) == [0, 1, 2, 3]
+    assert monitor.started[0]["parent"] == {
+        "path": os.path.abspath(state_path(str(tmp_path / "trunk"), 4)),
+        "epoch": 4,
+        "branch": True,
+        "take_over": False,
+        "monitor_run": None,
+        "parent": None,
+    }
+
+
+def saved_mid_move(trainer):
+    """Saves a state of `trainer`'s run after 2 epochs, with 6 entries in its replay buffer and
+    every environment's move one search cycle in. Returns its path."""
+    state = trainer.init_collection_state(jax.random.PRNGKey(0), trainer.batch_size)
+    state = replace(
+        state,
+        buffer_state=written(state.buffer_state, 6),
+        moves=jnp.full_like(state.moves, 6),
+        search_cycles=jnp.ones_like(state.search_cycles),
+    )
+    return trainer.save_state(
+        TrainLoopOutput(
+            collection_state=state,
+            train_states=(trained_state(trainer),),
+            test_states=([],),
+            cur_epoch=2,
+            key=jax.random.PRNGKey(5),
+        )
+    )
+
+
+@pytest.mark.parametrize("bigger", [False, True])
+def test_a_branch_keeps_the_search_states_only_if_they_fit_its_search(
+    env, tmp_path, fake_loop, bigger, capsys
+):
+    small, big = tiny_mcts(env, 2, 4), tiny_mcts(env, 6, 8)
+    path = saved_mid_move(make_trainer(env, tmp_path / "trunk", evaluator=small))
+    search = big if bigger else small
+    branch = make_trainer(env, tmp_path / "branch", evaluator=search)
+    calls = fake_loop(branch)
+
+    start = branch.branch(path)
+
+    # a bigger search starts new trees, its moves in progress searched again from the start
+    assert capacity(start.collection_state) == (8 if bigger else 4)
+    np.testing.assert_array_equal(
+        start.collection_state.search_cycles, np.full(2, 0 if bigger else 1)
+    )
+    assert ("new search states" in capsys.readouterr().out) == bigger
+    # the rest of the run as it was saved
+    assert start.cur_epoch == 2
+    assert int(start.collection_state.moves[0]) == 6
+    np.testing.assert_array_equal(
+        start.collection_state.buffer_state.populated[:, :6], True
+    )
+    assert leaves_equal(start.train_states, (trained_state(branch),))
+    branch.train_loop(seed=0, num_epochs=4, initial_state=start)
+    # epochs 2 and 3 with its own search, no warmup
+    assert [c.evaluator for c in of_kind(calls, "collect")] == [search] * 2
+    assert [t.epoch for t in of_kind(calls, "train")] == [2, 3]
+    assert checkpoint_epochs(str(tmp_path / "branch")) == [2, 3]
+
+
+def solving_trainer(env, ckpt_dir, **kwargs):
+    """A trainer with exact endgame labels: games stop at their 2nd move, and draw."""
+    return make_trainer(
+        env,
+        ckpt_dir,
+        endgame_solve=EndgameSolve(
+            stop_fn=lambda state: state.step >= 2,
+            solve_fn=lambda positions: np.zeros((len(positions.step), 2)),
+            slots=2,
+        ),
+        **kwargs,
+    )
+
+
+def test_games_waiting_for_solves_are_solved_during_self_play_and_labelled_after(
+    env, tmp_path, fake_loop, monkeypatch
+):
+    monitor = FakeMonitor()
+    trainer = solving_trainer(env, tmp_path, monitor=monitor)
+    calls = fake_loop(trainer)
+    fake_collect = trainer.collect_steps
+    solved = []
+
+    def collect_steps(key, state, params, num_steps, *, evaluator=None):
+        # every call stops a game, and finishes one to train on
+        state = fake_collect(key, state, params, num_steps, evaluator=evaluator)
+        return replace(
+            state,
+            pending=replace(state.pending, added=state.pending.added + 1),
+            buffer_state=written(state.buffer_state, 1),
+        )
+
+    def solve_waiting(pending):
+        # on the solver's thread
+        solved.append(np.array(pending.added))
+        return Solved(
+            np.ones((2, 2, 2), np.float32),
+            np.array([1, 0], np.int32),
+            np.ones((1, 2), np.float32),
+            np.array([True]),
+            0.5,
+        )
+
+    def label_solved(state, results, counts):
+        calls.append(SimpleNamespace(kind="label", counts=np.asarray(counts)))
+        return state
+
+    monkeypatch.setattr(trainer, "collect_steps", collect_steps)
+    monkeypatch.setattr(trainer, "solve_waiting", solve_waiting)
+    monkeypatch.setattr(trainer, "label_solved", label_solved)
+
+    trainer.train_loop(seed=0, num_epochs=2)
+
+    # the warmup's games solve through epoch 0's self-play; each epoch's from the end of its
+    # self-play, through training, to the end of the next's...
+    np.testing.assert_array_equal(solved, [[1, 1], [2, 2], [3, 3]])
+    # ...and labels them after it, before training
+    assert [c.kind for c in calls] == ["collect"] + ["collect", "label", "train"] * 2
+    for c in of_kind(calls, "label"):
+        np.testing.assert_array_equal(c.counts, [1, 0])
+    assert logged(monitor, "solve_games") == {0: 1.0, 1: 1.0}
+    assert logged(monitor, "solve_seconds") == {0: 0.5, 1: 0.5}
+    assert logged(monitor, "solve_draw") == {0: 0.0, 1: 0.0}
+
+
+def test_with_nothing_to_train_on_the_games_just_stopped_are_solved_at_once(
+    env, tmp_path, fake_loop, monkeypatch
+):
+    monitor = FakeMonitor()
+    trainer = solving_trainer(env, tmp_path, monitor=monitor, warmup_steps=0)
+    fake_loop(trainer)
+    fake_collect = trainer.collect_steps
+    solved = []
+
+    def collect_steps(key, state, params, num_steps, *, evaluator=None):
+        # a call with steps stops a game
+        state = fake_collect(key, state, params, num_steps, evaluator=evaluator)
+        stopped = int(num_steps > 0)
+        return replace(
+            state, pending=replace(state.pending, added=state.pending.added + stopped)
+        )
+
+    def solve_waiting(pending):
+        solved.append(np.array(pending.added))
+        counts = np.asarray(pending.added - pending.labelled)
+        games = np.zeros((counts.sum(), 2), np.float32)
+        whole = np.ones(len(games), bool)
+        return Solved(np.zeros((2, 2, 2), np.float32), counts, games, whole, 0.5)
+
+    def label_solved(state, results, counts):
+        # the games labelled are trained on
+        return replace(
+            state,
+            pending=replace(state.pending, labelled=state.pending.labelled + counts),
+            buffer_state=written(state.buffer_state, 1),
+        )
+
+    monkeypatch.setattr(trainer, "collect_steps", collect_steps)
+    monkeypatch.setattr(trainer, "solve_waiting", solve_waiting)
+    monkeypatch.setattr(trainer, "label_solved", label_solved)
+
+    trainer.train_loop(seed=0, num_epochs=2)
+
+    # epoch 0: none waiting during its self-play, then the games it stopped, at once; epoch 1:
+    # none left over, then its own, for epoch 2
+    np.testing.assert_array_equal(solved, [[0, 0], [1, 1], [1, 1], [2, 2]])
+    assert logged(monitor, "solve_games") == {0: 2.0, 1: 0.0}
+    # both of epoch 0's solves, 0.5 s each by the fake
+    assert logged(monitor, "solve_seconds")[0] == 1.0
+
+
+def test_a_saved_state_keeps_its_games_waiting_for_solves(env, tmp_path):
+    trainer = solving_trainer(env, tmp_path)
+    state = trainer.init_collection_state(jax.random.PRNGKey(0), trainer.batch_size)
+    assert state.pending is not None
+    pending = replace(
+        state.pending,
+        added=jnp.array([2, 1], dtype=jnp.int32),
+        entry_solve=state.pending.entry_solve.at[:, :3].set(0),
+    )
+    output = TrainLoopOutput(
+        collection_state=replace(state, pending=pending),
+        train_states=(trained_state(trainer),),
+        test_states=([],),
+        cur_epoch=2,
+        key=jax.random.PRNGKey(5),
+    )
+    saved = snapshot(pending)
+
+    loaded = trainer.load_state(trainer.save_state(output))
+
+    assert leaves_equal(loaded.collection_state.pending, saved)
+
+
+def test_a_branch_from_a_run_without_solves_has_none_waiting(env, tmp_path, fake_loop):
+    path = saved_mid_move(make_trainer(env, tmp_path / "trunk"))
+    branch = solving_trainer(env, tmp_path / "branch")
+    fake_loop(branch)
+
+    start = branch.branch(path)
+
+    pending = start.collection_state.pending
+    assert pending is not None
+    np.testing.assert_array_equal(pending.added, [0, 0])
+    np.testing.assert_array_equal(pending.entry_solve, np.full((2, 8), -1))
+    np.testing.assert_array_equal(
+        start.collection_state.buffer_state.populated[:, :6], True
+    )
+
+
+def test_a_manual_rule_reports_and_a_branch_hands_self_play_over(
+    env, tmp_path, fake_loop, capsys
+):
+    monitor = FakeMonitor()
+    trunk, _ = growth_trainer(
+        env,
+        tmp_path / "trunk",
+        SCRIPTS,
+        growth_kwargs={"manual": True},
+        save_state_at=[6],
+        monitor=monitor,
+    )
+    trunk_calls = fake_loop(trunk)
+    trunk.train_loop(seed=0, num_epochs=6)
+
+    # nothing takes over by itself; the rule reports n1 caught up after epoch 5, and the saved
+    # state records it, for a controller to read
+    assert {c.evaluator.tag for c in of_kind(trunk_calls, "collect")} == {0.0}
+    assert logged(monitor, "growth_caught_up") == {1: 0, 2: 0, 3: 0, 4: 0, 5: 1}
+    assert not logged(monitor, "growth_switch")
+    assert read_state_meta(state_path(str(tmp_path / "trunk"), 6))["growth_caught_up"]
+
+    branch, _ = growth_trainer(
+        env, tmp_path / "branch", SCRIPTS, growth_kwargs={"manual": True}
+    )
+    calls = fake_loop(branch)
+    output = branch.train_loop(
+        seed=0,
+        num_epochs=9,
+        initial_state=branch.branch(str(tmp_path / "trunk"), take_over=True),
+    )
+
+    # n1 plays from the branch's first epoch, and n2 trains beside it
+    assert [c.evaluator.tag for c in of_kind(calls, "collect")] == [1.0] * 3
+    assert [(c.epoch, c.learner) for c in of_kind(calls, "train")] == [
+        (e, i) for e in (6, 7, 8) for i in (1, 2)
+    ]
+    assert output.growth is not None
+    assert (output.growth.playing, output.growth.trained) == (1, (6, 9, 3))
+    # its search starts anew, as when the next takes over in a run: the trees are n0's
+    assert "n1 playing, new search states" in capsys.readouterr().out
+
+
+def test_a_branch_can_add_networks_past_the_saved_runs(
+    env, tmp_path, fake_loop, capsys
+):
+    # the trunk grows n0 into n1 only; its branch is set up to go on into n2
+    trunk, _ = growth_trainer(
+        env,
+        tmp_path / "trunk",
+        SCRIPTS,
+        growth_kwargs={"manual": True},
+        grown=(1,),
+        save_state_at=[6],
+        averages=(2,),
+    )
+    fake_loop(trunk)
+    saved = trunk.train_loop(seed=0, num_epochs=6)
+    branch, _ = growth_trainer(
+        env,
+        tmp_path / "branch",
+        SCRIPTS,
+        growth_kwargs={"manual": True},
+        averages=(2,),
+    )
+    calls = fake_loop(branch)
+
+    start = branch.branch(str(tmp_path / "trunk"), take_over=True)
+
+    assert "n1 playing, new search states, n2 added" in capsys.readouterr().out
+    # n0 and n1 as the trunk left them; n2 at its own weights, as one that hasn't joined yet
+    assert start.growth is not None
+    assert (start.growth.playing, start.growth.trained) == (1, (6, 6, 0))
+    assert leaves_equal(start.train_states[:2], saved.train_states)
+    assert leaves_equal(start.train_states[2], branch.init_train_state(2))
+    assert leaves_equal(start.averages[:2], saved.averages)
+    assert leaves_equal(
+        start.averages[2], branch.fresh_averages(branch.init_train_state(2))
+    )
+    assert start.averaged == (*saved.averaged, 0)
+    assert len(start.test_states) == 3
+    # n1 plays, and n2 trains beside it from the branch's first epoch
+    output = branch.train_loop(seed=0, num_epochs=9, initial_state=start)
+    assert [c.evaluator.tag for c in of_kind(calls, "collect")] == [1.0] * 3
+    assert [(c.epoch, c.learner) for c in of_kind(calls, "train")] == [
+        (e, i) for e in (6, 7, 8) for i in (1, 2)
+    ]
+    assert output.growth is not None
+    assert output.growth.trained == (6, 9, 3)
+
+
+def test_a_fork_puts_a_saved_growth_runs_network_in_play(env, tmp_path, fake_loop):
+    # the trunk grows n0 into n1, which plays from epoch 1
+    trunk, _ = growth_trainer(
+        env,
+        tmp_path / "trunk",
+        SCRIPTS,
+        growth_kwargs={"switch_at": (1,)},
+        grown=(1,),
+        save_state_at=[3],
+        averages=(2,),
+    )
+    fake_loop(trunk)
+    saved = trunk.train_loop(seed=0, num_epochs=3)
+    path = state_path(str(tmp_path / "trunk"), 3)
+    # a new run of n0, n1 and n2 forks n1 from it: n1 plays from the start, n0 starts from
+    # scratch and trains beside it as retired networks do, and n2 waits
+    fork, _ = growth_trainer(
+        env,
+        tmp_path / "fork",
+        SCRIPTS,
+        growth_kwargs={"manual": True},
+        train_retired=True,
+        averages=(2,),
+    )
+    calls = fake_loop(fork)
+
+    _, forked = fork.fork_state(path, jax.random.PRNGKey(0), into=1)
+    output = fork.train_loop(seed=0, num_epochs=2, fork_from=path, fork_into="n1")
+
+    # n1 as the trunk left it, its step count back at 0; its averages go on with it
+    assert leaves_equal(forked.params, saved.train_states[1].params)
+    assert int(forked.step) == 0
+    averages = fork.fork_averages(path, 1)
+    assert averages is not None
+    assert leaves_equal(averages[0], saved.averages[1]) and averages[1] == 3
+    # n1's search plays throughout, the warmup's games too
+    assert {c.evaluator.tag for c in of_kind(calls, "collect")} == {1.0}
+    assert [(c.epoch, c.learner) for c in of_kind(calls, "train")] == [
+        (e, i) for e in (0, 1) for i in (0, 1, 2)
+    ]
+    assert output.growth is not None and output.growth.playing == 1
+    # a network the saved run hasn't can't be forked, nor one into a network of another shape
+    with pytest.raises(ValueError, match="no network n2 to fork"):
+        fork.fork_state(path, jax.random.PRNGKey(0), into=2)
+    with pytest.raises(ValueError, match="fork_into: no network n9"):
+        fork.train_loop(seed=0, num_epochs=1, fork_from=path, fork_into="n9")
+    with pytest.raises(ValueError, match="don't match this run's"):
+        make_trainer(env, tmp_path / "plain").train_loop(
+            seed=0, num_epochs=1, fork_from=path, fork_into="n1"
+        )
+
+
+def test_a_warm_start_takes_a_network_from_another_saved_state(
+    env, tmp_path, fake_loop
+):
+    # the trunk grows n0 into n1, which plays from epoch 1 with n2 training beside it
+    trunk, _ = growth_trainer(
+        env,
+        tmp_path / "trunk",
+        SCRIPTS,
+        growth_kwargs={"switch_at": (1, 9)},
+        save_state_at=[2, 3],
+        averages=(2,),
+    )
+    fake_loop(trunk)
+    saved = trunk.train_loop(seed=0, num_epochs=3)
+    at_3 = state_path(str(tmp_path / "trunk"), 3)
+    at_2 = trunk.load_state(state_path(str(tmp_path / "trunk"), 2))
+    _, plain_path = save_a_state(make_trainer(env, tmp_path / "plain"))
+    plain = make_trainer(env, tmp_path / "plain").load_state(plain_path)
+    # a new run forks n1 from epoch 3 to play, and starts n2 from epoch 2's n2 and n0 from a run
+    # without growth's one network
+    monitor = FakeMonitor()
+    fork, _ = growth_trainer(
+        env,
+        tmp_path / "fork",
+        SCRIPTS,
+        growth_kwargs={"manual": True},
+        averages=(2,),
+        monitor=monitor,
+    )
+    fake_loop(fork)
+
+    output = fork.train_loop(
+        seed=0,
+        num_epochs=0,
+        fork_from=at_3,
+        fork_into="n1",
+        warm_start=[("n2", str(tmp_path / "trunk")), ("n0", plain_path)],
+    )
+
+    # each network as its state left it (a directory's newest state: epoch 3's), its step count
+    # and schedules back at 0
+    at_3_state = trunk.load_state(at_3)
+    n0, n1, n2 = output.train_states
+    assert leaves_equal(n1.params, saved.train_states[1].params)
+    assert leaves_equal(n2.params, at_3_state.train_states[2].params)
+    assert leaves_equal(
+        n2.opt_state,
+        train_module.restart_schedules(at_3_state.train_states[2].opt_state),
+    )
+    assert leaves_equal(n0.params, plain.train_states[0].params)
+    assert [int(ts.step) for ts in output.train_states] == [0, 0, 0]
+    # a growth run's network brings its weight averages; one without growth's start at its weights
+    assert leaves_equal(output.averages[2], at_3_state.averages[2])
+    assert leaves_equal(output.averages[0], (n0.params,))
+    assert output.averaged == (0, saved.averaged[1], at_3_state.averaged[2])
+    assert monitor.started[0]["warm_start"] == [
+        {
+            "network": "n2",
+            "path": os.path.abspath(at_3),
+            "epoch": 3,
+            "monitor_run": None,
+        },
+        {
+            "network": "n0",
+            "path": os.path.abspath(plain_path),
+            "epoch": read_state_meta(plain_path)["epoch"],
+            "monitor_run": None,
+        },
+    ]
+    # epoch 2's state, named, is epoch 2's network
+    warmed = fork.warm_state(state_path(str(tmp_path / "trunk"), 2), 2)
+    assert leaves_equal(warmed.params, at_2.train_states[2].params)
+    # only new runs with growth, and names of this run's networks, each once, but the fork's
+    with pytest.raises(ValueError, match="warm_start: no network n9"):
+        fork.train_loop(seed=0, num_epochs=1, warm_start=[("n9", at_3)])
+    with pytest.raises(ValueError, match="more than once"):
+        fork.train_loop(seed=0, num_epochs=1, warm_start=[("n2", at_3), ("n2", at_3)])
+    with pytest.raises(ValueError, match="n1 is the network the run forks into"):
+        fork.train_loop(
+            seed=0,
+            num_epochs=1,
+            fork_from=at_3,
+            fork_into="n1",
+            warm_start=[("n1", at_3)],
+        )
+    with pytest.raises(ValueError, match="a new run"):
+        fork.train_loop(
+            seed=0, num_epochs=1, initial_state=at_2, warm_start=[("n2", at_3)]
+        )
+    with pytest.raises(ValueError, match="a run with growth"):
+        make_trainer(env, tmp_path / "other").train_loop(
+            seed=0, num_epochs=1, warm_start=[("n0", at_3)]
+        )
+    # nor a network the state hasn't, or one of another shape
+    with pytest.raises(ValueError, match="no network n7 to start from"):
+        fork.warm_state(at_3, 2, "n7")
+    with pytest.raises(ValueError, match="this run's"):
+        fork.warm_state(plain_path, 2)
+
+
+def test_a_run_without_growth_forks_one_network_of_a_growth_run(
+    env, tmp_path, fake_loop
+):
+    # the trunk grows n0 into n1, which plays from epoch 1
+    trunk, _ = growth_trainer(
+        env,
+        tmp_path / "trunk",
+        SCRIPTS,
+        growth_kwargs={"switch_at": (1,)},
+        grown=(1,),
+        save_state_at=[3],
+        averages=(2,),
+    )
+    fake_loop(trunk)
+    saved = trunk.train_loop(seed=0, num_epochs=3)
+    path = state_path(str(tmp_path / "trunk"), 3)
+    # n1 trained alone: a run without growth whose network has n1's shape
+    alone = make_trainer(
+        env,
+        tmp_path / "alone",
+        network=(MLP(2, env.num_actions, key=jax.random.PRNGKey(1), hidden=12), None),
+        averages=(2,),
+    )
+    calls = fake_loop(alone)
+
+    _, forked = alone.fork_state(path, jax.random.PRNGKey(0), name="n1")
+    output = alone.train_loop(seed=0, num_epochs=2, fork_from=path, fork_into="n1")
+
+    # n1 as the trunk left it, with its averages; only it trains
+    assert leaves_equal(forked.params, saved.train_states[1].params)
+    averages = alone.fork_averages(path, 0, "n1")
+    assert averages is not None
+    assert leaves_equal(averages[0], saved.averages[1]) and averages[1] == 3
+    assert [c.learner for c in of_kind(calls, "train")] == [0, 0]
+    assert output.growth is None
+    with pytest.raises(ValueError, match="no network n2 to fork"):
+        alone.fork_state(path, jax.random.PRNGKey(0), name="n2")
+    with pytest.raises(ValueError, match="fork_into is for a run forked"):
+        alone.train_loop(seed=0, num_epochs=1, fork_into="n1")
+
+
+def test_a_network_added_after_the_last_waits_beside_it(env, tmp_path, fake_loop):
+    # n1, the trunk's last network, plays from epoch 1
+    trunk, _ = growth_trainer(
+        env,
+        tmp_path / "trunk",
+        SCRIPTS,
+        growth_kwargs={"switch_at": (1,)},
+        grown=(1,),
+        save_state_at=[3],
+    )
+    fake_loop(trunk)
+    saved = trunk.train_loop(seed=0, num_epochs=3)
+    assert saved.growth is not None and saved.growth.playing == 1
+    branch, _ = growth_trainer(
+        env, tmp_path / "branch", SCRIPTS, growth_kwargs={"manual": True}
+    )
+    calls = fake_loop(branch)
+
+    # n2 can't take over from it untrained; without taking over, it starts training
+    with pytest.raises(ValueError, match="a network the branch adds can't take over"):
+        branch.branch(str(tmp_path / "trunk"), take_over=True)
+    output = branch.train_loop(
+        seed=0, num_epochs=5, initial_state=branch.branch(str(tmp_path / "trunk"))
+    )
+
+    assert [c.evaluator.tag for c in of_kind(calls, "collect")] == [1.0] * 2
+    assert [(c.epoch, c.learner) for c in of_kind(calls, "train")] == [
+        (e, i) for e in (3, 4) for i in (1, 2)
+    ]
+    assert output.growth is not None
+    assert output.growth.trained == (*saved.growth.trained[:1], 5, 2)
+
+
+def test_a_branch_must_fit_the_saved_run(env, tmp_path, fake_loop):
+    trunk = make_trainer(env, tmp_path / "trunk", save_state_at=[1])
+    fake_loop(trunk)
+    trunk.train_loop(seed=0, num_epochs=1)
+    path = str(tmp_path / "trunk")
+
+    with pytest.raises(ValueError, match="saved without tree positions"):
+        tree_trainer(env, tmp_path / "b1").branch(path)
+    with pytest.raises(ValueError, match="only a run with growth"):
+        make_trainer(env, tmp_path / "b2").branch(path, take_over=True)
+    grown, _ = growth_trainer(env, tmp_path / "b3", SCRIPTS)
+    with pytest.raises(ValueError, match="saved by a run without growth"):
+        grown.branch(path)
+    # the last network has none to hand over to
+    last, _ = growth_trainer(
+        env,
+        tmp_path / "b4",
+        SCRIPTS,
+        growth_kwargs={"switch_at": (1, 2)},
+        save_state_at=[3],
+    )
+    fake_loop(last)
+    last.train_loop(seed=0, num_epochs=3)
+    with pytest.raises(ValueError, match="n2 is the last network"):
+        last.branch(str(tmp_path / "b4"), take_over=True)
+    # a branch can go on into more networks than the saved run's, not fewer
+    fewer, _ = growth_trainer(env, tmp_path / "b5", SCRIPTS, grown=(1,))
+    with pytest.raises(ValueError, match="can add networks, not drop them"):
+        fewer.branch(str(tmp_path / "b4"))
+
+
+def test_a_branch_takes_its_trainers_buffer_capacity(env, tmp_path, fake_loop, capsys):
+    path = saved_mid_move(make_trainer(env, tmp_path / "trunk"))
+    branch = make_trainer(
+        env,
+        tmp_path / "branch",
+        memory_buffer=EpisodeReplayBuffer(capacity=4),
+        save_state_at=[3],
+    )
+    fake_loop(branch)
+
+    start = branch.branch(path)
+
+    # each environment keeps its newest entries, as many as fit
+    state = start.collection_state.buffer_state
+    assert buffer_capacity(state) == 4
+    sampleable, (buffer,) = by_age(state)
+    assert sampleable.all()
+    np.testing.assert_array_equal(buffer.search_value[0], [5, 4, 3, 2])
+    assert "replay buffer resized from 8 to 4" in capsys.readouterr().out
+    # its saved states hold the new capacity, so a retried branch resumes at it
+    branch.train_loop(seed=0, num_epochs=3, initial_state=start)
+    assert (
+        read_state_meta(state_path(str(tmp_path / "branch"), 3))["buffer_capacity"] == 4
+    )
+
+
+def test_growth_can_follow_the_training_loss(env, tmp_path, fake_loop):
+    # KataGo's rule: the training loss on the data both train on. The fake trains every network
+    # to a loss of 0, so each catches up as soon as it has its minimum epochs and a full window:
+    # n1 after epoch 1, and n2, which starts then, after epoch 3
+    trainer, _ = growth_trainer(
+        env, tmp_path, SCRIPTS, growth_kwargs={"metric": "loss"}
+    )
+    calls = fake_loop(trainer)
+
+    output = trainer.train_loop(seed=0, num_epochs=4)
+
+    assert [c.evaluator.tag for c in of_kind(calls, "collect")] == [0.0] * 3 + [1.0] * 2
+    assert output.growth is not None
+    assert (output.growth.playing, output.growth.trained) == (2, (2, 4, 2))
+
+
+def test_growth_on_the_loss_with_a_guard_waits_for_both(env, tmp_path, fake_loop):
+    # every network's training loss is 0 (the fake's), so the loss alone would hand over at the
+    # minimum epochs; the guard, each tester's probe_error, holds n1 back until it's ahead there
+    # too, after epoch 5 (see SCRIPTS)
+    monitor = FakeMonitor()
+    trainer, _ = growth_trainer(
+        env,
+        tmp_path,
+        SCRIPTS,
+        growth_kwargs={"metric": "loss", "guard": "probe_error"},
+        monitor=monitor,
+        save_state_at=[4],
+    )
+    fake_loop(trainer)
+
+    output = trainer.train_loop(seed=0, num_epochs=7)
+
+    assert logged(monitor, "growth_switch") == {5: 1}
+    assert logged(monitor, "growth_guard_gap") == {
+        1: pytest.approx(1.0),
+        2: pytest.approx(1.0),
+        3: pytest.approx(1.0),
+        4: pytest.approx(0.25),
+        5: pytest.approx(-0.5),
+    }
+    assert output.growth is not None and output.growth.playing == 1
+    # the guard's windows are saved, and a branch of the run takes them back
+    meta = read_state_meta(state_path(str(tmp_path), 4))
+    assert meta["growth"]["guard_values"] == [[1.0, 1.0], [2.0, 2.0], []]
+    branch, _ = growth_trainer(
+        env,
+        tmp_path / "branch",
+        SCRIPTS,
+        growth_kwargs={"metric": "loss", "guard": "probe_error"},
+    )
+    start = branch.branch(state_path(str(tmp_path), 4))
+    assert start.growth is not None
+    assert start.growth.guard_values == ((1.0, 1.0), (2.0, 2.0), ())
+
+
+# weight averages
+
+
+class StatelessTester(FakeTester):
+    stateless = True
+
+
+def offset_from(params, initial):
+    """The one amount every weight of `params` is above `initial`'s (as `fake_loop` trains)."""
+    gaps = np.concatenate(
+        [
+            (np.asarray(p, np.float64) - np.asarray(q, np.float64)).ravel()
+            for p, q in zip(
+                jax.tree.leaves(params), jax.tree.leaves(initial), strict=True
+            )
+        ]
+    )
+    np.testing.assert_allclose(gaps, gaps[0], atol=1e-5)
+    return float(gaps[0])
+
+
+def test_an_averages_horizon_grows_by_an_epoch_every_warmup_epochs_up_to_its_own():
+    # from the newest weights alone: a horizon of 1, 1.5 after 5 epochs, 4 after 30
+    assert [average_share(n, 4, 10) for n in (0, 5, 10, 20, 30, 100)] == pytest.approx(
+        [1, 1 / 1.5, 1 / 2, 1 / 3, 1 / 4, 1 / 4]
+    )
+    assert [average_share(n, 1, 10) for n in range(3)] == [1, 1, 1]
+
+
+def test_a_warmup_of_one_makes_an_average_the_mean_until_its_horizon():
+    assert [average_share(n, 4, 1) for n in range(6)] == pytest.approx(
+        [1, 1 / 2, 1 / 3, 1 / 4, 1 / 4, 1 / 4]
+    )
+    assert average_share(9, 2.5, 1) == pytest.approx(0.4)
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"averages": (0.5,)}, "at least 1 epoch"),
+        ({"averages": (2, 2)}, "distinct"),
+        ({"averages": (2,), "selfplay_average": 4}, "one of averages"),
+        ({"selfplay_average": 2}, "one of averages"),
+        ({"averages": (2,), "average_warmup": 0}, "average_warmup must be positive"),
+    ],
+)
+def test_averages_are_distinct_horizons_and_self_play_plays_one_of_them(
+    env, tmp_path, kwargs, match
+):
+    with pytest.raises(ValueError, match=match):
+        make_trainer(env, tmp_path, **kwargs)
+
+
+def test_averages_follow_each_epochs_weights_and_are_checkpointed_and_scored(
+    env, tmp_path, fake_loop
+):
+    stateless, stateful = StatelessTester(name="positions"), FakeTester()
+    monitor = FakeMonitor()
+    trainer = make_trainer(
+        env,
+        tmp_path,
+        averages=(1, 4),
+        average_warmup=1,
+        testers=[stateless, stateful],
+        monitor=monitor,
+        max_checkpoints=10,
+    )
+    fake_loop(trainer)
+    initial = trainer.init_train_state().params
+
+    output = trainer.train_loop(seed=0, num_epochs=5)
+
+    # training adds 1 to every weight an epoch: with a warmup of 1, the 4-epoch average is the
+    # mean of the epochs so far, then moves a quarter of the way to each epoch's weights
+    for epoch, expected in enumerate([1, 1.5, 2, 2.5, 3.125]):
+        raw, avg1, avg4 = (
+            trainer.load_train_state_from_checkpoint(str(d), epoch).params
+            for d in (tmp_path, tmp_path / "avg1", tmp_path / "avg4")
+        )
+        assert offset_from(raw, initial) == pytest.approx(epoch + 1)
+        assert leaves_equal(avg1, raw)
+        assert offset_from(avg4, initial) == pytest.approx(expected)
+    assert output.averaged == (5,)
+    assert offset_from(output.averages[0][1], initial) == pytest.approx(3.125)
+    # the stateless tester also scores both averages, after the network; the other only it
+    assert len(stateless.calls) == 3 * 5 and len(stateful.calls) == 5
+    assert [
+        offset_from(c.params[0], initial) for c in stateless.calls[-3:]
+    ] == pytest.approx([5, 5, 3.125])
+    assert {"outcome", "avg1/outcome", "avg4/outcome"} <= monitor.by_epoch()[4].keys()
+
+
+def test_averages_leave_the_run_as_it_was(env, tmp_path, fake_loop):
+    runs = []
+    for averages in ((), (2, 8)):
+        trainer = make_trainer(
+            env,
+            tmp_path / str(len(averages)),
+            averages=averages,
+            testers=[StatelessTester()],
+        )
+        calls = fake_loop(trainer)
+        trainer.train_loop(seed=0, num_epochs=3)
+        runs.append(calls)
+
+    without, with_averages = runs
+    assert [c.kind for c in without] == [c.kind for c in with_averages]
+    for a, b in zip(without, with_averages, strict=True):
+        assert np.array_equal(a.key, b.key)
+        if a.kind == "collect":
+            assert leaves_equal(a.params[0], b.params[0])
+
+
+def test_self_play_can_play_an_average(env, tmp_path, fake_loop):
+    trainer = make_trainer(
+        env, tmp_path, averages=(2,), selfplay_average=2, average_warmup=1
+    )
+    calls = fake_loop(trainer)
+    initial = trainer.init_train_state().params
+
+    trainer.train_loop(seed=0, num_epochs=4)
+
+    # warmup and epoch 0 play the initial weights, then the 2-epoch average of those trained:
+    # 1, (1 + 2) / 2, then 1.5 / 2 + 3 / 2
+    assert [
+        offset_from(c.params[0], initial) for c in of_kind(calls, "collect")
+    ] == pytest.approx([0, 0, 1, 1.5, 2.25])
+
+
+def test_a_branch_of_a_state_without_averages_starts_them_at_its_weights(
+    env, tmp_path, fake_loop, capsys
+):
+    plain = make_trainer(env, tmp_path / "plain", save_state_at=[2])
+    fake_loop(plain)
+    plain.train_loop(seed=0, num_epochs=2)
+    averaging = make_trainer(env, tmp_path / "branch", averages=(2,), average_warmup=1)
+    fake_loop(averaging)
+    initial = averaging.init_train_state().params
+
+    start = averaging.branch(state_path(str(tmp_path / "plain"), 2))
+    assert start.averages == ()
+    assert "start at its networks' weights" in capsys.readouterr().out
+    averaging.train_loop(seed=0, num_epochs=4, initial_state=start)
+
+    # the weights after epoch 2, then the mean of epochs 2 and 3
+    for epoch, expected in ((2, 3), (3, 3.5)):
+        average = averaging.load_train_state_from_checkpoint(
+            str(tmp_path / "branch" / "avg2"), epoch
+        ).params
+        assert offset_from(average, initial) == pytest.approx(expected)
+
+
+def test_the_waiting_network_takes_its_own_training_steps(env, tmp_path, fake_loop):
+    monitor = FakeMonitor()
+    trainer, _ = growth_trainer(
+        env,
+        tmp_path,
+        SCRIPTS,
+        growth_kwargs={"manual": True},
+        train_steps_per_epoch=4,
+        waiting_train_steps=3,
+        monitor=monitor,
+    )
+    calls = fake_loop(trainer)
+
+    trainer.train_loop(seed=0, num_epochs=2)
+
+    assert [(c.learner, c.num_steps) for c in of_kind(calls, "train")] == [
+        (0, 4),
+        (1, 3),
+    ] * 2
+    logged = monitor.by_epoch()[1]
+    batch = trainer.train_batch_size
+    assert logged["n0/train_samples"] == 4 * batch
+    assert logged["n1/train_samples"] == 3 * batch
+    assert logged["train_samples"] == 7 * batch
+    assert trainer.get_config()["waiting_train_steps"] == 3
+
+
+def test_waiting_train_steps_need_growth(env, tmp_path):
+    with pytest.raises(ValueError, match="with growth"):
+        make_trainer(env, tmp_path, waiting_train_steps=2)
+
+
+def test_retired_networks_keep_training_unless_a_run_turns_it_off(
+    env, tmp_path, fake_loop
+):
+    def trainer(ckpt_dir, train_retired):
+        made, _ = growth_trainer(
+            env,
+            tmp_path / ckpt_dir,
+            SCRIPTS,
+            growth_kwargs={"manual": True},
+            train_steps_per_epoch=4,
+            waiting_train_steps=3,
+            train_retired=train_retired,
+            save_state_at=[2, 3],
+        )
+        return made, fake_loop(made)
+
+    trunk, _ = trainer("trunk", True)
+    trunk.train_loop(seed=0, num_epochs=2)
+    # n1 takes over: n0, retired, trains as many steps as n1 plays with, n2 its own
+    on, calls = trainer("on", True)
+    output = on.train_loop(
+        seed=0,
+        num_epochs=3,
+        initial_state=on.branch(str(tmp_path / "trunk"), take_over=True),
+    )
+    assert [(c.learner, c.num_steps) for c in of_kind(calls, "train")] == [
+        (0, 4),
+        (1, 4),
+        (2, 3),
+    ]
+    # the growth rule counts only playing and waiting
+    assert output.growth is not None and output.growth.trained == (2, 3, 1)
+    # a run from its state without it: only the one playing and the next train
+    off, calls = trainer("off", False)
+    off.train_loop(seed=0, num_epochs=4, initial_state=off.branch(str(tmp_path / "on")))
+    assert [(c.learner, c.num_steps) for c in of_kind(calls, "train")] == [
+        (1, 4),
+        (2, 3),
+    ]
+
+
+def test_train_retired_needs_growth(env, tmp_path):
+    with pytest.raises(ValueError, match="with growth"):
+        make_trainer(env, tmp_path, train_retired=True)
+
+
+# the gradient noise scale and the batch size rule
+
+
+def test_train_step_takes_as_many_micro_batches_as_the_batch_holds(env, tmp_path):
+    batch = random_batch(env, jax.random.PRNGKey(0), size=16)
+
+    def step(**kwargs):
+        trainer = make_trainer(env, tmp_path, optimizer=optax.sgd(0.1), **kwargs)
+        return jax.jit(trainer.train_step)(trainer.init_train_state(), batch)
+
+    whole, whole_metrics = step(train_batch_size=16)
+    # micro-batches of 4: 4 of them in a batch of 16, whatever train_batch_size says
+    accumulated, metrics = step(train_batch_size=8, grad_accum_steps=2)
+
+    assert_trees_close(accumulated, whole)
+    assert "gns_micro_sq" not in whole_metrics
+    # the micro-batches' gradients' mean squared norm is at least their mean's
+    assert float(metrics["gns_micro_sq"]) >= float(metrics["gns_batch_sq"]) > 0
+    np.testing.assert_allclose(
+        metrics["gns_batch_sq"], jnp.square(metrics["grad_norm"]), rtol=1e-5
+    )
+
+
+def test_lr_scale_scales_the_update_as_the_learning_rate_would(env, tmp_path):
+    batch = random_batch(env, jax.random.PRNGKey(0))
+
+    def step(lr, lr_scale=None):
+        trainer = make_trainer(
+            env, tmp_path, train_batch_size=8, optimizer=optax.sgd(lr, momentum=0.9)
+        )
+        ts = trainer.init_train_state()
+        train_step = jax.jit(partial(trainer.train_step, lr_scale=lr_scale))
+        for _ in range(2):
+            ts, _ = train_step(ts, batch)
+        return ts
+
+    assert_trees_close(step(0.1, jnp.float32(0.25)), step(0.025))
+
+
+def test_train_steps_logs_the_noise_scale_at_the_batch_size_it_is_given(env, tmp_path):
+    trainer = make_trainer(env, tmp_path, train_batch_size=4, grad_accum_steps=2)
+    output = trainer.train_loop(seed=0, num_epochs=1)
+
+    _, _, metrics = trainer.train_steps(
+        jax.random.PRNGKey(0),
+        output.collection_state,
+        output.train_state,
+        2,
+        batch_size=8,
+    )
+
+    assert np.isfinite(metrics["gns_tr_sigma"]) and metrics["gns_tr_sigma"] > 0
+    assert {"gns_grad_sq", "gns_noise_scale", "gns_signal_share"} <= set(metrics)
+    with pytest.raises(ValueError, match="multiple of the micro-batch size"):
+        trainer.train_steps(
+            jax.random.PRNGKey(0),
+            output.collection_state,
+            output.train_state,
+            1,
+            batch_size=5,
+        )
+
+
+def test_the_noise_scale_is_measured_at_a_weight_average(env, tmp_path):
+    trainer = make_trainer(env, tmp_path, train_batch_size=4, grad_accum_steps=2)
+    output = trainer.train_loop(seed=0, num_epochs=1)
+    params = output.train_state.params
+
+    tr_sigma, grad_sq = trainer.noise_scale_at(
+        jax.random.PRNGKey(0),
+        output.collection_state.buffer_state,
+        output.train_state,
+        params,
+        num_micro=4,
+    )
+
+    assert np.isfinite(tr_sigma) and np.isfinite(grad_sq) and tr_sigma >= 0
+
+
+# the learning rate drop
+
+
+def test_the_playing_network_cools_once_it_has_played_its_epochs(
+    env, tmp_path, fake_loop
+):
+    monitor = FakeMonitor()
+    trainer = make_trainer(env, tmp_path, lr_drop=LRDrop(2, 0.1), monitor=monitor)
+    calls = fake_loop(trainer)
+
+    trainer.train_loop(seed=0, num_epochs=4)
+
+    assert [c.lr_scale for c in of_kind(calls, "train")] == [1.0, 1.0, 0.1, 0.1]
+    assert logged(monitor, "lr_scale") == {
+        0: 1.0,
+        1: 1.0,
+        2: pytest.approx(0.1),
+        3: pytest.approx(0.1),
+    }
+    assert trainer.get_config()["lr_drop"] == {"after_epochs": 2, "factor": 0.1}
+
+
+def test_without_a_drop_training_is_unscaled(env, tmp_path, fake_loop):
+    trainer = make_trainer(env, tmp_path)
+    calls = fake_loop(trainer)
+
+    trainer.train_loop(seed=0, num_epochs=2)
+
+    assert [c.lr_scale for c in of_kind(calls, "train")] == [None, None]
+
+
+def test_with_growth_each_network_counts_its_own_epochs_playing(
+    env, tmp_path, fake_loop
+):
+    trainer, _ = growth_trainer(env, tmp_path, SCRIPTS, lr_drop=LRDrop(3, 0.5))
+    calls = fake_loop(trainer)
+
+    output = trainer.train_loop(seed=0, num_epochs=9)
+
+    # n0 plays epochs 0-5 and cools after 3; n1 waits at the full rate, then plays from epoch 6
+    # (counting from 0, so warm again), with n2 waiting
+    scales = [(c.learner, c.lr_scale) for c in of_kind(calls, "train")]
+    assert scales == [
+        *((0, 1.0), (1, 1.0)) * 3,
+        *((0, 0.5), (1, 1.0)) * 3,
+        *((1, 1.0), (2, 1.0)) * 3,
+    ]
+    assert output.growth is not None and output.growth.played == (6, 3, 0)
+
+
+def test_epochs_played_are_saved_with_the_state(env, tmp_path, fake_loop):
+    saving, _ = growth_trainer(env, tmp_path / "saving", SCRIPTS, save_state_at=[7])
+    fake_loop(saving)
+    saving.train_loop(seed=0, num_epochs=7)
+    meta = read_state_meta(state_path(str(tmp_path / "saving"), 7))
+
+    assert meta["growth"]["played"] == [6, 1, 0]
+    assert saved_growth(meta["growth"]).played == (6, 1, 0)
+    # a state saved before networks counted them: none counted
+    del meta["growth"]["played"]
+    assert saved_growth(meta["growth"]).played == (0, 0, 0)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"after_epochs": -1, "factor": 0.1},
+        {"after_epochs": 1, "factor": 0.0},
+        {"after_epochs": 1, "factor": 1.5},
+    ],
+)
+def test_bad_drops_are_refused(kwargs):
+    with pytest.raises(ValueError):
+        LRDrop(**kwargs)
+
+
+# the playing network on fresh positions
+
+
+def test_fresh_positions_are_those_stored_since_the_write_indices(env, tmp_path):
+    trainer = make_trainer(env, tmp_path)
+    state = trainer.memory_buffer.init(
+        2, random_batch(env, jax.random.PRNGKey(0), size=1)
+    )
+    capacity = state.populated.shape[1]
+    state = replace(
+        state,
+        next_idx=jnp.array([3, 1]),
+        populated=jnp.ones_like(state.populated),
+        # env 0's newest position's game hasn't finished
+        has_reward=jnp.ones_like(state.has_reward).at[0, 2].set(False),
+    )
+
+    # env 0 wrote slots 1 and 2 since its index was 1; env 1 wrapped round from capacity - 1
+    mask = trainer._fresh_mask(state, jnp.array([1, capacity - 1]))
+
+    assert np.flatnonzero(mask[0]).tolist() == [1]
+    assert np.flatnonzero(mask[1]).tolist() == [0, capacity - 1]
+
+
+def test_the_playing_network_is_scored_on_its_fresh_positions(env, tmp_path):
+    monitor = FakeMonitor()
+    trainer = make_trainer(
+        env,
+        tmp_path,
+        train_batch_size=4,
+        grad_accum_steps=2,
+        fresh_positions=4,
+        averages=(2,),
+        selfplay_average=2,
+        monitor=monitor,
+    )
+
+    trainer.train_loop(seed=0, num_epochs=2)
+
+    # epoch 0's positions finish only by its end (warmup's are older): epoch 1 scores them
+    for name in ("policy_kl", "value_loss"):
+        raw = logged(monitor, f"fresh_{name}_raw")
+        avg = logged(monitor, f"fresh_{name}_avg")
+        gap = logged(monitor, f"fresh_{name}_gap")
+        assert set(raw) == set(avg) == set(gap) and raw
+        for epoch in raw:
+            assert gap[epoch] == pytest.approx(raw[epoch] - avg[epoch], abs=1e-6)
+
+
+def test_fresh_positions_must_fill_micro_batches(env, tmp_path):
+    with pytest.raises(ValueError, match="multiple of the micro-batch"):
+        make_trainer(
+            env, tmp_path, train_batch_size=4, grad_accum_steps=2, fresh_positions=3
         )

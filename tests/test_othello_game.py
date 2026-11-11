@@ -6,6 +6,7 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "examples" / "othello"))
@@ -13,10 +14,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "examples" / "othello"))
 from game import (
     PASS,
     SYMMETRY_TRANSFORM_FNS,
+    WEIGHT_DECAY,
     env,
     load_checkpoint,
     make_network,
     make_optimizer,
+    weight_decay_mask,
 )
 
 from core.memory.replay_memory import BaseExperience
@@ -141,3 +144,33 @@ def test_lr_drops_hold_then_step():
     assert rates[0] == pytest.approx(1e-3) and rates[69] == pytest.approx(1e-3)
     assert rates[70] == pytest.approx(1e-4) and rates[89] == pytest.approx(1e-4)
     assert rates[90] == pytest.approx(1e-5) and rates[99] == pytest.approx(1e-5)
+
+
+def test_constant_rate_is_the_cosine_to_itself_and_its_program_ignores_run_length():
+    # a run in steps (controller.py) compiles each step's training once into the persistent
+    # compilation cache only if the program doesn't depend on --epochs; the updates, and the
+    # optimizer state's structure (saved states load), are a cosine from the rate to itself's
+    params = {"w": jnp.linspace(-1.0, 1.0, 12).reshape(3, 4), "b": jnp.ones(3)}
+    grads = jax.tree.map(lambda x: jnp.sin(3 * x) + 0.1, params)
+
+    def run(optimizer):
+        update = jax.jit(optimizer.update)
+        state: Any = optimizer.init(params)
+        p = params
+        for _ in range(3):
+            updates, state = update(grads, state, p)
+            p = optax.apply_updates(p, updates)
+        return p, state, update.lower(grads, optimizer.init(params), p).as_text()
+
+    constant = [run(make_optimizer(steps, 5e-4, 5e-4)) for steps in (100, 200)]
+    cosine = optax.inject_hyperparams(optax.adamw, static_args=("mask",))(
+        learning_rate=optax.cosine_decay_schedule(5e-4, decay_steps=100, alpha=1.0),
+        weight_decay=WEIGHT_DECAY,
+        mask=weight_decay_mask,
+    )
+    expected, expected_state, _ = run(cosine)
+    assert constant[0][2] == constant[1][2]
+    for p, state, _ in constant:
+        assert jax.tree.structure(state) == jax.tree.structure(expected_state)
+        for a, b in zip(jax.tree.leaves(p), jax.tree.leaves(expected), strict=True):
+            np.testing.assert_array_equal(a, b)

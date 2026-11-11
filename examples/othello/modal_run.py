@@ -30,6 +30,7 @@ from modal_spec import (
     flag,
     job_key,
     state_epochs_requested,
+    warm_start_paths,
     with_monitor,
     without_flag,
 )
@@ -337,8 +338,11 @@ class Runner:
     def _command(self, step: Step, resume: bool) -> list[str]:
         argv = with_monitor(step.argv, self.seaglass_url)
         if resume:
+            # how the run started: its state has all that now
             argv = without_flag(argv, "--init-from", takes_value=True)
             argv = without_flag(argv, "--init-without-buffers", takes_value=False)
+            argv = without_flag(argv, "--fork-into", takes_value=True)
+            argv = without_flag(argv, "--warm-start", takes_value=True)
             argv = [*argv, "--resume"]
         if flag(step.argv, "--save-state-every") is None:
             argv = [*argv, "--save-state-every", str(self.job.resume_every)]
@@ -366,6 +370,8 @@ class Runner:
         os.makedirs(os.path.dirname(step.log), exist_ok=True)
         ensure_input(self.store, job, flag(step.argv, "--init-from"))
         ensure_input(self.store, job, flag(step.argv, "--engine-set"))
+        for path in warm_start_paths(step.argv):
+            ensure_input(self.store, job, path)
         resume = restore_step(self.store, job, self.name, index, step)
         if not resume:
             self._crash_runs(done.get("runs", []))
@@ -377,6 +383,8 @@ class Runner:
             "PYTHONUNBUFFERED": "1",
             "SEAGLASS_TAGS": job.tags,
             "SEAGLASS_URL": self.seaglass_url,
+            # the image's jax is the CUDA build, whose plugin fails to start without a GPU
+            **({"JAX_PLATFORMS": "cpu"} if job.gpu == "CPU" else {}),
         }
         self.step_now = (index, step)
         self._write_record(index, step)

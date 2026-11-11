@@ -9,8 +9,8 @@ from pathlib import Path
 import pytest
 from example_modules import load_example
 
-modal_run, modal_spec, modal_store, modal_sync = load_example(
-    "othello", "modal_run", "modal_spec", "modal_store", "modal_sync"
+modal_jobs, modal_run, modal_spec, modal_store, modal_sync = load_example(
+    "othello", "modal_jobs", "modal_run", "modal_spec", "modal_store", "modal_sync"
 )
 
 # as train.py: rolling checkpoints, keep-every, states, --resume, a run that continues
@@ -27,6 +27,8 @@ p.add_argument("--save-state-at", default="")
 p.add_argument("--save-state-every", type=int)
 p.add_argument("--init-from")
 p.add_argument("--init-without-buffers", action="store_true")
+p.add_argument("--fork-into")
+p.add_argument("--warm-start", action="append", default=[])
 p.add_argument("--resume", action="store_true")
 p.add_argument("--monitor", nargs="?", const="")
 p.add_argument("--name")
@@ -45,6 +47,12 @@ if args.resume:
     print(f"resuming from {start}", flush=True)
 if args.init_from:
     assert Path(args.init_from).exists()
+if args.fork_into and not args.init_from:
+    sys.exit("--fork-into needs --init-from")
+if args.warm_start and args.resume:
+    sys.exit("--warm-start is for a new run")
+for spec in args.warm_start:
+    assert Path(spec.partition("=")[2]).exists()
 at = {int(e) for e in args.save_state_at.split(",") if e}
 monitor = None
 if args.monitor is not None:
@@ -339,6 +347,47 @@ def test_a_preempted_job_goes_on_from_its_state_on_a_new_machine(scene):
     t = next(m for m in metas if m["name"] == "t")
     assert t["status"] == "finished"
     assert t["step"] == 11
+
+
+def test_a_forked_step_takes_its_states_and_resumes_without_them(scene):
+    # states of runs here, which the launch uploads
+    trunk = f"{scene.home}/.cache/turbozero/c/trunk/state-20.npz"
+    other = f"{scene.home}/.cache/turbozero/c/other/state-5.npz"
+    for path in (trunk, other):
+        scene.store.put_bytes(path.replace(f"{scene.home}/", "files/"), b"{}")
+    job = scene.job(
+        step(
+            "t",
+            f"--epochs 12 --keep-every 5 --die-at 8 --init-from {trunk} --fork-into 8x128 "
+            "--warm-start 4x64=~/.cache/turbozero/c/other/state-5.npz",
+        ),
+        name="p",
+        resume_every=5,
+    )
+    assert modal_jobs.inputs_to_upload(job)[1:] == [trunk, other]
+    with pytest.raises(RuntimeError, match="lost"):
+        scene.runner("p").run()
+    died = scene.root / "c" / "t.died"
+    keep = died.read_text()
+    scene.wipe_container()
+    died.parent.mkdir(parents=True)
+    died.write_text(keep)
+
+    # the new machine goes on from the step's state, without how the step started
+    assert scene.runner("p").run() == "done"
+    assert "resuming from 5" in (scene.root / "l" / "t.log").read_text()
+
+
+@pytest.mark.parametrize(
+    "warm_start", ["4x64=~/.cache/turbozero/c/x", "4x64=/tmp/state-1.npz"]
+)
+def test_parse_step_refuses_a_warm_start_it_cant_bring(warm_start):
+    with pytest.raises(ValueError, match="state-<EPOCH>|wouldn't come back"):
+        modal_spec.parse_step(
+            f"examples/othello/train.py --warm-start {warm_start} "
+            "--ckpt-dir ~/.cache/turbozero/c > ~/.cache/turbozero/l",
+            "/h",
+        )
 
 
 def test_a_step_interrupted_before_its_first_state_starts_over(scene):

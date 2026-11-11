@@ -2,7 +2,7 @@
 self-play over to bigger ones in turn (see `Growth`), as KataGo and Leela Zero grew theirs."""
 
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import equinox as eqx
 import jax
@@ -52,11 +52,16 @@ class GrowthProgress:
         trained: epochs each learner has trained, one per learner
         values: the newest `Growth.window` values of the switch metric each learner logged
             since it started training, one tuple per learner
+        guard_values: the same, of `Growth.guard`'s metric (empty without a guard)
+        played: epochs each learner has played self-play, one per learner (what a learning
+            rate drop counts, see `core.training.lr_drop.LRDrop`)
     """
 
     playing: int = 0
     trained: tuple[int, ...] = ()
     values: tuple[tuple[float, ...], ...] = ()
+    guard_values: tuple[tuple[float, ...], ...] = ()
+    played: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -68,11 +73,18 @@ class SwitchCheck:
         switched: whether self-play moves to the next learner from the next epoch
         gap: the next learner's mean metric over the window minus the playing one's (negative
             once the next is better), None until both have a full window
+        caught_up: whether the next learner has caught up: trained its minimum epochs, with a
+            gap at or below 0 (at or below minus `margin` of the playing one's mean, with a
+            margin) and no worse on the guard (what the rule switches on, and all a `manual` rule
+            reports)
+        guard_gap: as `gap`, of the guard's metric (None without a guard)
     """
 
     progress: GrowthProgress
     switched: bool
     gap: float | None
+    caught_up: bool = False
+    guard_gap: float | None = None
 
 
 @dataclass(frozen=True)
@@ -83,10 +95,16 @@ class Growth:
     without playing (off-policy). When the next takes over, the one that played stops, and the
     one after starts training from scratch on the buffer as it is.
 
-    The next takes over when its `metric` (a metric its testers log every epoch, lower being
-    better, e.g. a `ScoredPositionsTester`'s "engine_value_mse" on fixed positions: a fair test
-    of a network that doesn't play), averaged over the last `window` epochs, is at or below the
-    playing network's, once it has trained `min_epochs` epochs. Or, with `switch_at`, after
+    The next takes over when its `metric` (a metric its testers or its training log every epoch,
+    lower being better: e.g. a `ScoredPositionsTester`'s "engine_value_mse" on fixed positions,
+    a fair test of a network that doesn't play, or the training "loss" on the data both train
+    on, which KataGo compared), averaged over the last `window` epochs, is at or below the
+    playing network's, once it has trained `min_epochs` epochs. With a `margin`, it must lead:
+    its mean lower than the playing one's by `margin` of it (e.g. 0.01, 1%), so that two
+    networks in lockstep don't switch. With a `guard`, it must also be no worse on a second
+    metric over the window, e.g. "engine_value_mse" on positions neither trains on, when the
+    switch metric is the training loss, which a bigger network can lower by memorising the
+    buffer. Or, with `switch_at`, after
     fixed numbers of epochs regardless. Either way it takes over when the playing network's
     learning rate rule (the Trainer's `lr_plateau`) would stop the run: a network done
     learning has nothing more to give.
@@ -94,14 +112,22 @@ class Growth:
     A network that waits trains at the learning rate's first value (an `lr_plateau` rule only
     moves the playing network's), and follows the rule from its first rate once it plays.
 
+    With `manual`, nothing switches by itself: the rule only reports when the next has caught up
+    (`SwitchCheck.caught_up`), and the next takes over when a saved state of the run is branched
+    with `take_over` (see `Trainer.branch`), e.g. by a controller that first plays the two.
+
     Attributes:
         first: the name of the Trainer's own network (see `Learner.name`)
         learners: the networks to grow into, in order
-        metric: what the rule compares, a metric every learner's testers log every epoch
+        metric: what the rule compares, a metric every learner's testers or training log
+            every epoch
         window: epochs the metric is averaged over
         min_epochs: epochs the next learner trains before it can take over
         switch_at: (optional) instead of the rule, the numbers of epochs done after which each
             of `learners` takes over, in increasing order, one per learner
+        manual: (optional) the rule reports, and switches only on a branch's `take_over`
+        margin: (optional) the lead the next needs, a fraction of the playing one's mean metric
+        guard: (optional) a second metric the next must be no worse on, logged every epoch
     """
 
     first: str
@@ -110,6 +136,9 @@ class Growth:
     window: int = 10
     min_epochs: int = 10
     switch_at: Sequence[int] = field(default=())
+    manual: bool = False
+    margin: float = 0.0
+    guard: str | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "learners", tuple(self.learners))
@@ -134,6 +163,12 @@ class Growth:
                 f"switch_at needs one increasing, positive number of epochs per network to grow "
                 f"into ({len(self.learners)}), got {list(self.switch_at)}"
             )
+        if self.manual and self.switch_at:
+            raise ValueError("a manual rule doesn't switch at fixed epochs: pass one")
+        if not 0 <= self.margin < 1:
+            raise ValueError(f"the margin is a fraction in [0, 1), got {self.margin}")
+        if self.guard is not None and self.guard == self.metric:
+            raise ValueError(f"the guard must be another metric than {self.metric!r}")
 
     @property
     def names(self) -> tuple[str, ...]:
@@ -143,7 +178,9 @@ class Growth:
     def start(self) -> GrowthProgress:
         """The progress of a run that hasn't trained yet."""
         n = len(self.learners) + 1
-        return GrowthProgress(0, (0,) * n, ((),) * n)
+        return GrowthProgress(
+            0, (0,) * n, ((),) * n, ((),) * n if self.guard else (), (0,) * n
+        )
 
     def training(self, progress: GrowthProgress) -> tuple[int, ...]:
         """The learners that train: the one playing, and the next, if there is one."""
@@ -159,6 +196,7 @@ class Growth:
         epochs_done: int,
         values: dict[int, float],
         rule_done: bool = False,
+        guard_values: dict[int, float] | None = None,
     ) -> SwitchCheck:
         """Applies the rule after an epoch.
 
@@ -168,38 +206,89 @@ class Growth:
             values: the switch metric each learner that trained logged this epoch, by index
                 (may be empty with `switch_at`)
             rule_done: whether the playing learner's learning rate rule would stop the run
+            guard_values: (with a `guard`) its metric, as `values`
 
         Returns:
             SwitchCheck: the progress after the epoch, and whether self-play moves on
         """
         trained = list(progress.trained)
         kept = list(progress.values)
+        guarded: list[tuple[float, ...]] = list(progress.guard_values)
+        if self.guard is not None and not guarded:
+            guarded = [()] * len(trained)
         for i in self.training(progress):
             trained[i] += 1
             if i in values:
                 kept[i] = (*kept[i], float(values[i]))[-self.window :]
-        playing, following = progress.playing, progress.playing + 1
-        gap = None
-        if following <= len(self.learners) and all(
-            len(kept[i]) == self.window for i in (playing, following)
-        ):
-            gap = float(np.mean(kept[following]) - np.mean(kept[playing]))
+            if self.guard is not None and guard_values and i in guard_values:
+                guarded[i] = (*guarded[i], float(guard_values[i]))[-self.window :]
+        played = list(progress.played or (0,) * len(trained))
+        played[progress.playing] += 1
+        after = GrowthProgress(
+            progress.playing, tuple(trained), tuple(kept), tuple(guarded), tuple(played)
+        )
+        gap = self.gap(after)
+        caught_up = self.caught_up(after)
+        following = progress.playing + 1
         switched = False
-        if following <= len(self.learners):
+        if following <= len(self.learners) and not self.manual:
             if rule_done:
                 switched = True
             elif self.switch_at:
                 switched = epochs_done >= self.switch_at[following - 1]
             else:
-                switched = (
-                    trained[following] >= self.min_epochs
-                    and gap is not None
-                    and gap <= 0
-                )
-        progress = GrowthProgress(
-            playing + 1 if switched else playing, tuple(trained), tuple(kept)
+                switched = caught_up
+        # both gaps between the networks the epoch compared, before any switch
+        guard_gap = (
+            self._gap(after.guard_values, after.playing)
+            if self.guard is not None
+            else None
         )
-        return SwitchCheck(progress, switched, gap)
+        if switched:
+            after = self.take_over(after)
+        return SwitchCheck(after, switched, gap, caught_up, guard_gap)
+
+    def _gap(
+        self, windows: tuple[tuple[float, ...], ...], playing: int
+    ) -> float | None:
+        following = playing + 1
+        if following > len(self.learners) or any(
+            len(windows[i]) < self.window for i in (playing, following)
+        ):
+            return None
+        return float(np.mean(windows[following]) - np.mean(windows[playing]))
+
+    def gap(self, progress: GrowthProgress) -> float | None:
+        """The next learner's mean metric over the last `window` epochs minus the playing one's,
+        None if the last one plays or either hasn't a full window yet."""
+        return self._gap(progress.values, progress.playing)
+
+    def caught_up(self, progress: GrowthProgress) -> bool:
+        """Whether the next learner has caught up with the one playing: trained `min_epochs`,
+        its mean metric over the window lower than the playing one's by at least `margin` of
+        it (at or below it, without one), and with a `guard`, no worse on the guard's."""
+        gap = self.gap(progress)
+        if gap is None or progress.trained[progress.playing + 1] < self.min_epochs:
+            return False
+        lead = self.margin * abs(float(np.mean(progress.values[progress.playing])))
+        if gap > -lead:
+            return False
+        if self.guard is None:
+            return True
+        guard_gap = self._gap(progress.guard_values, progress.playing)
+        return guard_gap is not None and guard_gap <= 0
+
+    def take_over(self, progress: GrowthProgress) -> GrowthProgress:
+        """The progress once the next learner plays (and the one after starts training).
+
+        Raises:
+            ValueError: if the last learner already plays
+        """
+        if progress.playing + 1 > len(self.learners):
+            raise ValueError(
+                f"{self.names[progress.playing]} is the last network: none takes over from it"
+            )
+        return replace(progress, playing=progress.playing + 1)
 
     def get_config(self) -> dict:
         return {
@@ -224,4 +313,7 @@ class Growth:
             "window": self.window,
             "min_epochs": self.min_epochs,
             "switch_at": list(self.switch_at) or None,
+            "manual": self.manual,
+            "margin": self.margin,
+            "guard": self.guard,
         }
