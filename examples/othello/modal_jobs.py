@@ -33,7 +33,14 @@ from pathlib import Path
 from typing import Any
 
 from modal_run import engine_set_path
-from modal_spec import GPU_PER_SECOND, Job, flag, job_key, parse_step
+from modal_spec import (
+    GPU_PER_SECOND,
+    Job,
+    flag,
+    job_key,
+    parse_step,
+    warm_start_paths,
+)
 from modal_store import GcsStore, Store, get_json, put_json
 from modal_sync import TERMINAL, Sync, jobs_in
 
@@ -98,8 +105,8 @@ def inputs_to_upload(job: Job) -> list[str]:
     out = [engine_set_path(job.home)]
     made = {step.ckpt_dir for step in job.steps}
     for step in job.steps:
-        for name in ("--init-from", "--engine-set"):
-            path = flag(step.argv, name)
+        paths = [flag(step.argv, name) for name in ("--init-from", "--engine-set")]
+        for path in [*paths, *warm_start_paths(step.argv)]:
             if path is not None and os.path.dirname(path) not in made:
                 out.append(path)
     return out

@@ -44,6 +44,17 @@ def flag(argv: list[str], name: str) -> str | None:
     return None
 
 
+def warm_start_paths(argv: list[str]) -> list[str]:
+    """The saved states `argv`'s --warm-start flags (SIZE=PATH, each) start networks from."""
+    out = []
+    for i, arg in enumerate(argv):
+        if arg == "--warm-start" and i + 1 < len(argv):
+            out.append(argv[i + 1].partition("=")[2])
+        elif arg.startswith("--warm-start="):
+            out.append(arg.split("=", 1)[1].partition("=")[2])
+    return out
+
+
 def without_flag(argv: list[str], name: str, takes_value: bool) -> list[str]:
     """`argv` without `name`, and its value if it takes one."""
     out, i = [], 0
@@ -131,13 +142,22 @@ def parse_step(text: str, home: str) -> Step:
     init_from = flag(argv, "--init-from")
     if init_from is not None and not re.fullmatch(STATE, Path(init_from).name):
         raise ValueError(f"--init-from names a state-<EPOCH>.npz: {init_from}")
+    for path in warm_start_paths(argv):
+        if not re.fullmatch(STATE, Path(path).name):
+            raise ValueError(f"--warm-start names a state-<EPOCH>.npz: {path}")
     for name in UNSUPPORTED:
         if flag(argv, name) is not None:
             raise ValueError(
                 f"{name}: the Modal image has no Edax; the Elo league measures strength here"
             )
     root = Path(home) / ".cache" / "turbozero"
-    for path in (ckpt_dir, log, flag(argv, "--init-from"), flag(argv, "--engine-set")):
+    for path in (
+        ckpt_dir,
+        log,
+        flag(argv, "--init-from"),
+        flag(argv, "--engine-set"),
+        *warm_start_paths(argv),
+    ):
         if path is not None and not Path(path).is_relative_to(root):
             raise ValueError(f"{path} isn't under {root}: it wouldn't come back here")
     return Step(argv, log)
