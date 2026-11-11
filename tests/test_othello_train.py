@@ -190,6 +190,43 @@ def test_without_playout_cap_every_search_is_full(monkeypatch):
     assert built.value.kwargs["advance_every"] is None
 
 
+def test_a_learned_stop_reaches_self_play_with_the_advance_interval(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(
+            monkeypatch,
+            "--sims",
+            "63",
+            "--playout-cap",
+            "0.25:15",
+            "--advance-every",
+            "8",
+            "--learned-stop",
+            "fast-greedy",
+            "--learned-stop-budget",
+            "6",
+        )
+    rule = built.value.kwargs["evaluator"].at(0).learned_stop
+    assert (rule.searches, rule.budget, rule.interval, rule.label_probability) == (
+        "fast-greedy",
+        6.0,
+        8,
+        0.1,
+    )
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ("--learned-stop", "fast", "--learned-stop-budget", "6"),
+        ("--playout-cap", "0.25:15", "--learned-stop", "fast"),
+        ("--learned-stop-budget", "6"),
+    ],
+)
+def test_bad_learned_stop_options_are_refused(monkeypatch, options):
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, *options)
+
+
 def test_smart_pruning_reaches_self_play_only(monkeypatch):
     with pytest.raises(BuiltTrainer) as built:
         run_main(

@@ -787,6 +787,23 @@ def test_self_play_switches_evaluators_on_schedule(env, tmp_path, fake_loop):
     )
 
 
+class Adapting(TaggedEvaluator):
+    """A `TaggedEvaluator` that counts the epochs it adapted to in its state."""
+
+    def adapt(self, state, key):
+        return state + 1, {"adapted": float(state[0, 0]) + 1}
+
+
+def test_the_evaluator_adapts_to_each_epochs_self_play(env, tmp_path):
+    monitor = FakeMonitor()
+    trainer = make_trainer(env, tmp_path, evaluator=Adapting(0.0), monitor=monitor)
+
+    out = trainer.train_loop(seed=0, num_epochs=3)
+
+    assert [monitor.by_epoch()[e]["adapted"] for e in range(3)] == [1, 2, 3]
+    assert float(out.collection_state.eval_state[0, 0]) == 3
+
+
 @pytest.mark.parametrize("with_key", [True, False])
 def test_a_continued_run_follows_the_schedule_from_where_it_stopped(
     env, tmp_path, fake_loop, with_key

@@ -1130,7 +1130,10 @@ class Trainer:
         return replace(
             state,
             eval_state=evaluator.start_search(
-                evaluate_key, state.eval_state, active=starting
+                evaluate_key,
+                state.eval_state,
+                active=starting,
+                greedy=self.greedy(state),
             ),
             move_key=move_key,
         )
@@ -1320,15 +1323,18 @@ class Trainer:
             resign_state=resign_state,
         )
 
+    def greedy(self, state: CollectionState) -> jax.Array:
+        """Whether the move in progress is played greedily (see `Exploration.greedy`)."""
+        if self.exploration is None:
+            return jnp.array(False)
+        return self.exploration.greedy(state.metadata)
+
     def search_done(self, state: CollectionState, evaluator: Evaluator) -> jax.Array:
         """Whether the search for the move in progress is done (see `Evaluator.search_done`),
-        told whether the move is played greedily (see `Exploration.greedy`)."""
-        greedy = (
-            self.exploration.greedy(state.metadata)
-            if self.exploration is not None
-            else False
+        told whether the move is played greedily."""
+        return evaluator.search_done(
+            state.eval_state, state.search_cycles, self.greedy(state)
         )
-        return evaluator.search_done(state.eval_state, state.search_cycles, greedy)
 
     def count_searches(
         self,
@@ -3632,9 +3638,16 @@ class Trainer:
                 self.collection_steps_per_epoch,
                 evaluator=evaluator,
             )
+            # what the evaluator learns from the epoch's searches (e.g. a learned stop rule),
+            # with a key of its own: the loop's keys are as they'd be without it
+            eval_state, adapted = evaluator.adapt(
+                collection_state.eval_state, jax.random.fold_in(collect_key, 1)
+            )
+            collection_state = replace(collection_state, eval_state=eval_state)
             collection_metrics = {
                 **self.collection_metrics(before, collection_state),
                 **search_metrics(searches),
+                **adapted,
             }
             # self-play's time includes measuring its data, so that training's is its own
             jax.block_until_ready((collection_state, collection_metrics))

@@ -97,6 +97,7 @@ from core.evaluators.evaluation_fns import (
     make_nn_eval_fn_no_params_callable,
 )
 from core.evaluators.mcts.action_selection import PUCTSelector
+from core.evaluators.mcts.learned_stop import LearnedStop
 from core.evaluators.mcts.mcts import MCTS, PlayoutCap, SmartPruning
 from core.evaluators.mcts.policy_targets import CompletedQ, VisitCounts
 from core.evaluators.random_evaluator import RandomEvaluator
@@ -420,6 +421,32 @@ def main():
         metavar="ITERATIONS",
         help="with --smart-pruning all, the fewest iterations a search stored for training "
         "takes before the rule may end it, so that the root's noise steers some of its visits",
+    )
+    parser.add_argument(
+        "--learned-stop",
+        choices=SmartPruning.SEARCHES,
+        default=None,
+        help="a learned stop rule for self-play searches (core/evaluators/mcts/learned_stop.py): "
+        "a small network fit each epoch to what searching on would still gain on the move, "
+        "labelled by --learned-stop-labels of the searches it applies to, which run their whole "
+        "budget; it stops a search once its prediction is below a threshold set each epoch so "
+        "that those searches take --learned-stop-budget cycles on average. Applies to searches "
+        "as --smart-pruning's choices, and with it a search stops when either rule does. Checks "
+        "every --advance-every cycles. Off by default",
+    )
+    parser.add_argument(
+        "--learned-stop-budget",
+        type=float,
+        default=None,
+        metavar="CYCLES",
+        help="with --learned-stop, the mean cycles of the searches it applies to",
+    )
+    parser.add_argument(
+        "--learned-stop-labels",
+        type=float,
+        default=0.1,
+        metavar="P",
+        help="with --learned-stop, the share of the searches it applies to that label it",
     )
     parser.add_argument(
         "--selfplay-cycles",
@@ -1009,6 +1036,19 @@ def main():
         parser.error(
             "--smart-pruning-factor and --smart-pruning-min-full go with --smart-pruning"
         )
+    if args.learned_stop is not None:
+        if args.learned_stop != "all" and args.playout_cap is None:
+            parser.error(f"--learned-stop {args.learned_stop} needs --playout-cap")
+        if args.learned_stop_budget is None or args.advance_every is None:
+            parser.error(
+                "--learned-stop needs --learned-stop-budget and --advance-every"
+            )
+        if not 0 < args.learned_stop_labels < 1:
+            parser.error("--learned-stop-labels is a share, in (0, 1)")
+    elif args.learned_stop_budget is not None or args.learned_stop_labels != 0.1:
+        parser.error(
+            "--learned-stop-budget and --learned-stop-labels go with --learned-stop"
+        )
     collection_steps = 128
     if args.selfplay_cycles is not None:
         if args.sims_schedule is not None:
@@ -1123,6 +1163,14 @@ def main():
                             args.smart_pruning_min_full,
                         )
                         if args.smart_pruning is not None
+                        else None,
+                        learned_stop=LearnedStop(
+                            args.learned_stop,
+                            args.learned_stop_budget,
+                            interval=args.advance_every,
+                            label_probability=args.learned_stop_labels,
+                        )
+                        if args.learned_stop is not None
                         else None,
                     ),
                 )

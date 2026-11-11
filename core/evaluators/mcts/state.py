@@ -52,12 +52,15 @@ class MCTSTree(Tree[MCTSNode]):
             when the search starts (see `MCTS.start_search`)
         fast: () with a `PlayoutCap`, whether the search is a fast one, drawn when it starts (see
             `MCTS.start_search`); False without
+        stopper: with a `LearnedStop`, its state (see
+            `core.evaluators.mcts.learned_stop.StopperState`); None without
     """
 
     root_logits: jax.Array
     root_value: jax.Array
     root_noise: jax.Array
     fast: jax.Array
+    stopper: Any = None
 
 
 def init_mcts_tree(

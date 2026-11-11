@@ -7,7 +7,9 @@ import jax.numpy as jnp
 from jax.typing import ArrayLike
 
 from core.evaluators.evaluator import Evaluator
+from core.evaluators.mcts import learned_stop
 from core.evaluators.mcts.action_selection import MCTSActionSelector
+from core.evaluators.mcts.learned_stop import LearnedStop
 from core.evaluators.mcts.policy_targets import PolicyTarget, VisitCounts
 from core.evaluators.mcts.state import (
     Leaf,
@@ -126,6 +128,7 @@ class MCTS(Evaluator):
         traversal_steps: int = 1,
         playout_cap: PlayoutCap | None = None,
         smart_pruning: SmartPruning | None = None,
+        learned_stop: LearnedStop | None = None,
     ):
         """Initializes an MCTS evaluator.
 
@@ -166,6 +169,10 @@ class MCTS(Evaluator):
                 `count_reused_visits`, a fast search stops at `fast_iterations + 1` root visits
             smart_pruning: (optional) stop some searches once their most visited move is
                 settled, see `SmartPruning`. Its "fast" choices need a `playout_cap`
+            learned_stop: (optional) stop some searches once a network fit during self-play
+                predicts that searching on would gain little, see `LearnedStop`; with
+                `smart_pruning`, a search stops when either does. Its "fast" choices need a
+                `playout_cap`
         """
         if traversal_steps < 1:
             raise ValueError(
@@ -200,9 +207,18 @@ class MCTS(Evaluator):
                 "smart pruning's min_full_iterations must be at most num_iterations "
                 f"({num_iterations}), got {smart_pruning.min_full_iterations}"
             )
+        if (
+            learned_stop is not None
+            and learned_stop.searches != "all"
+            and playout_cap is None
+        ):
+            raise ValueError(
+                f"a learned stop of {learned_stop.searches!r} searches needs a playout_cap"
+            )
         super().__init__(discount=discount)
         self.playout_cap = playout_cap
         self.smart_pruning = smart_pruning
+        self.learned_stop = learned_stop
         self.count_reused_visits = count_reused_visits
         self.min_iterations = min_iterations
         self.eval_fn = eval_fn
@@ -235,6 +251,9 @@ class MCTS(Evaluator):
             else None,
             "smart_pruning": self.smart_pruning.get_config()
             if self.smart_pruning is not None
+            else None,
+            "learned_stop": self.learned_stop.get_config()
+            if self.learned_stop is not None
             else None,
         }
 
@@ -283,6 +302,7 @@ class MCTS(Evaluator):
                 not self.count_reused_visits
                 and self.playout_cap is None
                 and self.smart_pruning is None
+                and self.learned_stop is None
             ):
                 return iterate(k, state), None
             # after the root's evaluation and `i` iterations, as `search_cycle` counts them
@@ -334,9 +354,30 @@ class MCTS(Evaluator):
         if self.count_reused_visits:
             visited = state.data.n[state.ROOT_INDEX] > iterations
             done = done | (visited & (cycles >= 1 + self.min_iterations))
+        stop = jnp.array(False)
         if self.smart_pruning is not None:
-            done = done | self.pruned(state, cycles, greedy)
-        return done
+            stop = self.pruned(state, cycles, greedy)
+        if self.learned_stop is not None:
+            stopper = state.stopper
+            features = learned_stop.root_features(
+                state, cycles, iterations, self.discount
+            )
+            gain = learned_stop.predict(stopper.params, features)
+            stop = stop | (stopper.applies & (cycles >= 1) & (gain < stopper.threshold))
+            # a search labelling the rule runs to its end
+            stop = stop & ~(stopper.label & stopper.applies)
+        return done | stop
+
+    def applies(
+        self, searches: str, state: MCTSTree, greedy: ArrayLike = False
+    ) -> jax.Array:
+        """Whether a stop rule of `searches` (see `SmartPruning`) applies to the search in
+        `state`, whose move is played greedily or not."""
+        if searches == "all":
+            return jnp.array(True)
+        if searches == "fast-greedy" and self.temperature != 0:
+            return state.fast & jnp.asarray(greedy)
+        return state.fast
 
     def pruned(
         self, state: MCTSTree, cycles: ArrayLike, greedy: ArrayLike = False
@@ -353,12 +394,9 @@ class MCTS(Evaluator):
         top, runner_up = jax.lax.top_k(visits, 2)[0]
         left = self.iterations(state) - (cycles - 1)
         settled = rule.factor * (top - runner_up) > left
+        applies = self.applies(rule.searches, state, greedy)
         if rule.searches == "all":
             applies = ~self.trains_on(state) | (cycles - 1 >= rule.min_full_iterations)
-        else:
-            applies = state.fast
-            if rule.searches == "fast-greedy" and self.temperature != 0:
-                applies = applies & greedy
         return settled & applies & (cycles >= 1)
 
     def search_stats(self, state: MCTSTree, cycles: jax.Array) -> dict[str, jax.Array]:
@@ -383,18 +421,47 @@ class MCTS(Evaluator):
         return ~state.fast
 
     def start_search(
-        self, key: jax.Array, state: MCTSTree, active: ArrayLike = True
+        self,
+        key: jax.Array,
+        state: MCTSTree,
+        active: ArrayLike = True,
+        greedy: ArrayLike = False,
     ) -> MCTSTree:
         """Draws the root's noise (see `root_noise`) for the search for a move with key `key`, as
         `evaluate` does first: a search a cycle at a time draws it once, rather than in every
         cycle (under vmap, the root's update is computed in every cycle, see `search_cycle`).
-        With a `playout_cap`, also draws whether the search is a fast one.
+        With a `playout_cap`, also draws whether the search is a fast one; with a
+        `learned_stop`, whether the search labels it.
 
         Args: see `Evaluator.start_search`.
 
         Returns:
-            MCTSTree: the tree, with its `root_noise` (and `fast`)
+            MCTSTree: the tree, with its `root_noise` (and `fast`, and its stop rule's state)
         """
+        state = self._start_search(key, state, active)
+        if self.learned_stop is None:
+            return state
+        # the 5th key of the split (see `_start_search`)
+        label_key = jax.random.split(key, 5)[4]
+        label = jax.random.bernoulli(label_key, self.learned_stop.label_probability)
+        stopper = state.stopper
+        applies = self.applies(self.learned_stop.searches, state, greedy)
+        active = jnp.asarray(active)
+        return replace(
+            state,
+            stopper=replace(
+                stopper,
+                label=jnp.where(active, label, stopper.label),
+                greedy=jnp.where(active, jnp.asarray(greedy), stopper.greedy),
+                applies=jnp.where(active, applies, stopper.applies),
+                recorded=stopper.recorded & ~active,
+            ),
+        )
+
+    def _start_search(
+        self, key: jax.Array, state: MCTSTree, active: ArrayLike = True
+    ) -> MCTSTree:
+        """`start_search`'s root noise and playout cap's draw."""
         # the 4th key of the split: the first 3 are those `evaluate` splits off (the split's i-th
         # key doesn't depend on how many it makes)
         root_key, _, _, cap_key = jax.random.split(key, 4)
@@ -470,7 +537,7 @@ class MCTS(Evaluator):
         state = self.expand(
             expand_key, state, leaf, policy_logits, value, write=~at_root
         )
-        return self.expand_root(
+        state = self.expand_root(
             root_key,
             state,
             env_state,
@@ -479,6 +546,7 @@ class MCTS(Evaluator):
             value,
             write=at_root,
         )
+        return self.record_check(state, cycle + 1)
 
     def search_output(
         self,
@@ -1006,9 +1074,99 @@ class MCTS(Evaluator):
         Returns:
             MCTSTree: the tree for the next move
         """
+        if self.learned_stop is not None:
+            state = self.label_checks(state, active)
         return state.get_subtree(
             action, reset=jnp.logical_or(reset, not self.persist_tree), active=active
         )
+
+    def checks(self) -> int:
+        """With a `learned_stop`, the most checks a search it applies to makes."""
+        assert self.learned_stop is not None
+        cap = self.num_iterations
+        if self.learned_stop.searches != "all":
+            assert self.playout_cap is not None
+            cap = self.playout_cap.fast_iterations
+        return (cap + 1) // self.learned_stop.interval
+
+    def record_check(self, state: MCTSTree, cycles: ArrayLike) -> MCTSTree:
+        """With a `learned_stop`, the root's statistics after the search's `cycles`-th cycle, if
+        it's one of the rule's checks (every `interval`) and the search labels the rule."""
+        rule = self.learned_stop
+        if rule is None:
+            return state
+        stopper = state.stopper
+        cycles = jnp.asarray(cycles)
+        index = cycles // rule.interval - 1
+        at = (cycles % rule.interval == 0) & (index >= 0) & (index < self.checks())
+        at = at & stopper.label & stopper.applies
+        index = jnp.clip(index, 0, self.checks() - 1)
+        features = learned_stop.root_features(
+            state, cycles, self.iterations(state), self.discount
+        )
+        pruned = (
+            self.pruned(state, cycles, stopper.greedy)
+            if self.smart_pruning is not None
+            else jnp.array(False)
+        )
+
+        def put(array, value):
+            return array.at[index].set(jnp.where(at, value, array[index]))
+
+        return replace(
+            state,
+            stopper=replace(
+                stopper,
+                features=put(stopper.features, features),
+                top=put(stopper.top, learned_stop.most_visited(state)),
+                pruned=put(stopper.pruned, pruned),
+                recorded=put(stopper.recorded, True),
+            ),
+        )
+
+    def label_checks(self, state: MCTSTree, active: ArrayLike) -> MCTSTree:
+        """With a `learned_stop`, the search in `state` done (if `active`): if it labels the
+        rule, its checks before its end become examples (see `learned_stop.write_examples`)."""
+        assert self.learned_stop is not None
+        stopper = state.stopper
+        end = self.iterations(state) + 1
+        check_cycles = (jnp.arange(self.checks()) + 1) * self.learned_stop.interval
+        valid = (
+            stopper.recorded
+            & (check_cycles < end)
+            & stopper.label
+            & stopper.applies
+            & jnp.asarray(active)
+        )
+        gain = learned_stop.gains(state, stopper.top, self.discount)
+        return replace(
+            state, stopper=learned_stop.write_examples(stopper, gain, valid, end)
+        )
+
+    def adapt(self, state: MCTSTree, key: jax.Array) -> tuple[MCTSTree, dict]:
+        """With a `learned_stop`, fits its network to the searches that labelled it since the
+        last fit, sets its threshold, and starts collecting anew (see
+        `learned_stop.fit_and_calibrate`). Without, nothing.
+
+        Args: see `Evaluator.adapt`.
+        """
+        if self.learned_stop is None:
+            return state, {}
+        stopper = state.stopper
+        params, threshold, metrics = learned_stop.fit_and_calibrate(
+            key, self.learned_stop, stopper
+        )
+        envs = stopper.ex_count.shape
+        stopper = replace(
+            stopper,
+            params=jax.tree.map(
+                lambda x: jnp.broadcast_to(x, envs + x.shape).copy(), params
+            ),
+            threshold=jnp.full(envs, threshold, dtype=jnp.float32),
+            ex_count=jnp.zeros_like(stopper.ex_count),
+            ex_valid=jnp.zeros_like(stopper.ex_valid),
+        )
+        return replace(state, stopper=stopper), metrics
 
     def init(self, template_embedding: Any, *args, **kwargs) -> MCTSTree:  # pylint: disable=arguments-differ
         """Initializes the internal state of the MCTS evaluator.
@@ -1020,7 +1178,7 @@ class MCTS(Evaluator):
         Returns:
             MCTSTree: initialized MCTSTree
         """
-        return init_mcts_tree(
+        tree = init_mcts_tree(
             self.max_nodes,
             self.branching_factor,
             self.new_node(
@@ -1029,4 +1187,9 @@ class MCTS(Evaluator):
                 embedding=template_embedding,
                 terminated=False,
             ),
+        )
+        if self.learned_stop is None:
+            return tree
+        return replace(
+            tree, stopper=learned_stop.init_stopper(self.learned_stop, self.checks())
         )

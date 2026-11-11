@@ -103,6 +103,19 @@ class Evaluator:
         """
         return jnp.array(True)
 
+    def adapt(self, state: Any, key: jax.Array) -> tuple[Any, dict[str, Any]]:  # pylint: disable=unused-argument
+        """What the evaluator learns from an epoch's self-play, between epochs: e.g. a learned
+        stop rule's fit to the searches it labelled. Nothing by default.
+
+        Args:
+            state: The internal state of the Evaluator, of every environment.
+            key: rng
+
+        Returns:
+            Tuple[pytree, dict[str, Any]]: the states, and what to log
+        """
+        return state, {}
+
     def search_stats(self, state: Any, cycles: jax.Array) -> dict[str, jax.Array]:
         """What self-play counts about a search that is done, each summed over an epoch's
         searches (see `core.training.train.Trainer.collect_steps`): its `cycles`.
@@ -130,7 +143,13 @@ class Evaluator:
         """
         return jnp.array(True)
 
-    def start_search(self, key: jax.Array, state: Any, active: ArrayLike = True) -> Any:  # pylint: disable=unused-argument
+    def start_search(  # pylint: disable=unused-argument
+        self,
+        key: jax.Array,
+        state: Any,
+        active: ArrayLike = True,
+        greedy: ArrayLike = False,
+    ) -> Any:
         """What a search does once before its cycles, rather than in each (under vmap, all of a
         cycle is computed in every cycle): nothing.
 
@@ -138,6 +157,7 @@ class Evaluator:
             key: rng, the move's (as `evaluate`'s)
             state: The internal state of the Evaluator.
             active: (optional) whether a search starts; if not, `state` as it is
+            greedy: (optional) whether its move is played greedily (see `search_done`)
 
         Returns:
             pytree: The updated internal state of the Evaluator.
