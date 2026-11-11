@@ -37,6 +37,8 @@ constexpr int SMALL = 4;
 constexpr int TABLE_MIN = 8;
 // empties at or above which children's bounds in the table are looked at before searching them
 constexpr int ETC_MIN = 10;
+// room for any position's moves, one to an empty square at most
+constexpr int MAX_MOVES = 64;
 
 constexpr u64 NOT_A = 0xfefefefefefefefeULL;  // no square in column a
 constexpr u64 NOT_H = 0x7f7f7f7f7f7f7f7fULL;  // no square in column h
@@ -444,7 +446,7 @@ int search_middle(Context& c, u64 P, u64 O, int alpha, int beta, int n) {
     }
     int bound = stability_bound(P, O, alpha);
     if (bound != INF) return bound;
-    Move list[32];
+    Move list[MAX_MOVES];
     int count_ = list_moves(c, P, O, legal, list);
     int best = -INF;
     for (int i = 0; i < count_; i++) {
@@ -474,7 +476,7 @@ int search_deep(Context& c, u64 P, u64 O, int alpha, int beta, int n) {
         if (found.upper <= alpha) return found.upper;
         if (found.lower == found.upper) return found.lower;
     }
-    Move list[32];
+    Move list[MAX_MOVES];
     int count_ = list_moves(c, P, O, legal, list);
     for (int i = 0; i < count_; i++) {
         if (list[i].sq == found.move) {
@@ -573,7 +575,7 @@ Result solve_root(Context& c, u64 P, u64 O, int alpha, int beta) {
     Result out;
     if (no_move(c, P, O, alpha, beta, out)) return out;
     int n = empties(P, O);
-    Move list[32];
+    Move list[MAX_MOVES];
     int count_ = root_moves(c, P, O, list);
     int best = -INF, best_move = list[0].sq;
     for (int i = 0; i < count_; i++) {
@@ -605,7 +607,7 @@ Result solve_root_parallel(std::vector<Context>& contexts, u64 P, u64 O, int alp
     Result out;
     if (no_move(c0, P, O, alpha, beta, out)) return out;
     int n = empties(P, O);
-    Move list[32];
+    Move list[MAX_MOVES];
     int count_ = root_moves(c0, P, O, list);
     int threads = (int)contexts.size();
     // the threads stop on a flag of each phase's: set by a result that settles the phase, or by the
