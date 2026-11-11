@@ -283,9 +283,14 @@ about 33 a game from an XOT opening), so the solver needs
 use; on Modal, `--cpu 8`). `solve_wait_seconds` shows how long self-play waited for it,
 and `solve_games`, `solve_draw` and `solve_missed` count the games.
 
-Stopped games never produce positions with fewer than N empty squares, which test games
-and the Elo league's GPU players still reach. `--solve-share P` stops only a fraction P of
-games and plays the rest to the end, so that training still sees those positions.
+Stopped games never produce positions with fewer than N empty squares, though searches from
+just above N still reach them, and their leaves there are valued by the network.
+`--solve-play-past MEAN` plays each game on past N, ending before each further move with
+probability 1 / (1 + MEAN): MEAN moves on average, a geometric number. Positions up to N keep the
+solved result at N; each position stored past N is solved on its own and gets its own exact
+result. Solves below N are cheap (24 ms at 18 empties, a few below that), so at MEAN 3.5 the
+solver's time goes up about 15% a game. `solve_positions` counts every solve. `--solve-share P`
+stops only a fraction P of games and plays the rest to the end, unsolved.
 
 ### Policy target from the search
 

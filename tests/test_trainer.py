@@ -2795,6 +2795,7 @@ def test_games_waiting_for_solves_are_solved_during_self_play_and_labelled_after
             np.ones((2, 2, 2), np.float32),
             np.array([1, 0], np.int32),
             np.ones((1, 2), np.float32),
+            np.array([True]),
             0.5,
         )
 
@@ -2840,7 +2841,8 @@ def test_with_nothing_to_train_on_the_games_just_stopped_are_solved_at_once(
         solved.append(np.array(pending.added))
         counts = np.asarray(pending.added - pending.labelled)
         games = np.zeros((counts.sum(), 2), np.float32)
-        return Solved(np.zeros((2, 2, 2), np.float32), counts, games, 0.5)
+        whole = np.ones(len(games), bool)
+        return Solved(np.zeros((2, 2, 2), np.float32), counts, games, whole, 0.5)
 
     def label_solved(state, results, counts):
         # the games labelled are trained on
@@ -2870,7 +2872,7 @@ def test_a_saved_state_keeps_its_games_waiting_for_solves(env, tmp_path):
     pending = replace(
         state.pending,
         added=jnp.array([2, 1], dtype=jnp.int32),
-        entry_game=state.pending.entry_game.at[:, :3].set(0),
+        entry_solve=state.pending.entry_solve.at[:, :3].set(0),
     )
     output = TrainLoopOutput(
         collection_state=replace(state, pending=pending),
@@ -2896,7 +2898,7 @@ def test_a_branch_from_a_run_without_solves_has_none_waiting(env, tmp_path, fake
     pending = start.collection_state.pending
     assert pending is not None
     np.testing.assert_array_equal(pending.added, [0, 0])
-    np.testing.assert_array_equal(pending.entry_game, np.full((2, 8), -1))
+    np.testing.assert_array_equal(pending.entry_solve, np.full((2, 8), -1))
     np.testing.assert_array_equal(
         start.collection_state.buffer_state.populated[:, :6], True
     )

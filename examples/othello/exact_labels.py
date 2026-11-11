@@ -1,6 +1,8 @@
 """Exact endgame labels for Othello self-play (train.py's --solve-empties, see
-core/training/endgame_solve.py): a game stops once its position has `empties` or fewer empty
-squares, and an exact solver's result for that position becomes every position's value target.
+core/training/endgame_solve.py): a game's solve point is its first position with `empties` or
+fewer empty squares, and an exact solver's result for it becomes the value target of every
+position before it; with --solve-play-past, the game plays on a few moves, each position stored
+past the solve point getting its own solved result.
 
 Solvers:
 - `native`: endgame.py's C++ solver, a win/draw/loss solve (only the result's sign is needed),
@@ -9,6 +11,7 @@ Solvers:
   builds it; Modal's training image doesn't). For prototyping.
 """
 
+import math
 import os
 import re
 import subprocess
@@ -122,12 +125,17 @@ def make_solve_fn(solver: str, threads: int) -> Callable[[Any], np.ndarray]:
     return solve
 
 
-def solve_slots(cycles: int, advance_every: int, empties: int) -> int:
+def solve_slots(
+    cycles: int, advance_every: int, empties: int, play_past: float = 0.0
+) -> int:
     """`EndgameSolve.slots` for self-play of `cycles` search cycles an epoch, playing moves every
-    `advance_every` cycles, stopping games at `empties`: two epochs of the most games that can
-    stop, each at least as long as from an XOT opening (52 empty squares) to the stop."""
+    `advance_every` cycles, with solve points at `empties` and `play_past` moves past them on
+    average: two epochs of solves for the most games that can reach their solve points, each at
+    least as long as from an XOT opening (52 empty squares), each with a solve there and room for
+    twice its mean moves past it (each stored and solved, at most)."""
     moves = -(-cycles // advance_every)
-    return 2 * -(-moves // max(52 - empties, 1)) + 2
+    games = -(-moves // max(52 - empties, 1))
+    return 2 * math.ceil(games * (1 + 2 * play_past)) + 2
 
 
 def default_threads() -> int:

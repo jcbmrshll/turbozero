@@ -478,6 +478,16 @@ def main():
         "to the end, so that training still sees positions past N",
     )
     parser.add_argument(
+        "--solve-play-past",
+        type=float,
+        default=0.0,
+        metavar="MEAN",
+        help="with --solve-empties, games play on past N empty squares, ending before each "
+        "further move with probability 1 / (1 + MEAN): MEAN moves on average. Each position "
+        "stored past N is solved and labelled on its own, so the network still trains on "
+        "positions just past N, which searches from above N reach. Default 0: games stop at N",
+    )
+    parser.add_argument(
         "--solver",
         choices=SOLVERS,
         default="native",
@@ -1053,6 +1063,8 @@ def main():
             parser.error("--solve-empties doesn't go with --resign")
     if not 0 <= args.solve_share <= 1:
         parser.error("--solve-share must be between 0 and 1")
+    if args.solve_play_past < 0:
+        parser.error("--solve-play-past must be at least 0")
     if args.dirichlet_alpha <= 0:
         parser.error("--dirichlet-alpha must be positive")
     if not 0 <= args.dirichlet_epsilon <= 1:
@@ -1296,8 +1308,10 @@ def main():
                 max(collection_steps * e.search_cycles() for e in stages),
                 args.advance_every or min(e.search_cycles() for e in stages),
                 args.solve_empties,
+                args.solve_play_past,
             ),
             share=args.solve_share,
+            play_past=args.solve_play_past,
         )
 
     # each epoch collects `collection_steps_per_epoch` self-play steps' compute (see
