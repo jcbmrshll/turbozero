@@ -396,7 +396,8 @@ class NetPlayer:
             from endgame import Solver
 
             self.solver = Solver(solving.threads)
-        # moves solved, and solves given up, in this game
+        # positions solved (lost ones included, whose moves are searched), and solves given up,
+        # in this game
         self.solved = 0
         self.gave_up = 0
 
@@ -423,9 +424,9 @@ class NetPlayer:
         if solved is None:
             self.gave_up += 1
             return None
+        self.solved += 1
         if not solving.exact and solved.margin < 0:
             return None
-        self.solved += 1
         return solved.move
 
     def move(self, color: str, seconds_left: float) -> int:
