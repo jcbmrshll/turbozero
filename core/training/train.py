@@ -3831,6 +3831,9 @@ class Trainer:
         )
         # exact endgame labels' solver, on a thread of its own
         solver = ThreadPoolExecutor(1) if self.endgame_solve is not None else None
+        # the solve in progress, if any: of the positions waiting at the end of the last
+        # self-play, for after the next
+        solving = None
         if not exact:
             # warmup
             # populate replay buffer with initial self-play games
@@ -3865,9 +3868,10 @@ class Trainer:
                 if self.fresh_positions
                 else None
             )
-            # the games waiting for exact solves are solved on the host during self-play
-            solving = None
-            if solver is not None:
+            # the positions waiting for exact solves are solved on the host from the end of one
+            # epoch's self-play to the end of the next's, through training and tests: those of a
+            # new or resumed run's start, during its first self-play
+            if solver is not None and solving is None:
                 assert collection_state.pending is not None
                 solving = solver.submit(
                     self.solve_waiting,
@@ -3882,25 +3886,29 @@ class Trainer:
                 evaluator=evaluator,
             )
             solve_metrics: dict[str, jax.Array] = {}
-            if solving is not None:
+            if solver is not None and solving is not None:
                 jax.block_until_ready(collection_state)
                 waited = time.perf_counter()
                 self.set_activity(f"epoch {cur_epoch}: waiting for solves")
                 solved = [solving.result()]
                 waited = time.perf_counter() - waited
                 collection_state = self.label_solved_games(collection_state, solved[0])
+                # this epoch's positions start solving now
+                assert collection_state.pending is not None
+                solving = solver.submit(
+                    self.solve_waiting,
+                    jax.tree.map(np.asarray, collection_state.pending),
+                )
                 if not self.memory_buffer.sample_mask(
                     collection_state.buffer_state
                 ).any():
                     # nothing to train on yet (e.g. a new run's first epoch, whose games all
-                    # stopped): the games stopped this epoch are solved now
+                    # stopped): they're labelled once solved
                     self.set_activity(f"epoch {cur_epoch}: solving")
-                    solved.append(
-                        self.solve_waiting(
-                            jax.tree.map(np.asarray, collection_state.pending)
-                        )
-                    )
-                    waited += solved[-1].seconds
+                    started_waiting = time.perf_counter()
+                    solved.append(solving.result())
+                    solving = None
+                    waited += time.perf_counter() - started_waiting
                     collection_state = self.label_solved_games(
                         collection_state, solved[-1]
                     )

@@ -5,9 +5,9 @@ of the result its players went on to get. The game stops there, or plays on a fe
 position stored past the solve point getting its own solved result. Self-play skips the searches
 for the rest of the game, and the labels lose the noise of its endgame mistakes.
 
-The solver runs on the host, a batch at a time, while the device plays: the solves waiting at
-the end of an epoch are solved during the next epoch's self-play, and their positions are
-labelled after it (see `Trainer._train_loop`). Until then, the positions are in the replay
+The solver runs on the host, a batch at a time, while the device trains and plays: the solves
+waiting at the end of an epoch's self-play are solved through its training and the next epoch's
+self-play, and their positions are labelled after it (see `Trainer._train_loop`). Until then, the positions are in the replay
 buffer, unpopulated so that training doesn't sample them, and the positions to solve are kept in
 an environment's `PendingSolves`.
 """

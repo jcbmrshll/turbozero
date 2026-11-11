@@ -274,8 +274,8 @@ differs from the exact one at 16-20 empties in 17% of games, mostly a win or los
 as a draw or the reverse.
 
 The solver (`--solver native`, endgame.py, a win/draw/loss solve; `edax` for comparison)
-runs on the CPU while the GPU plays. Games stopped in an epoch are solved during the next
-epoch's self-play and trained on from then. A new run's first epoch solves them at once,
+runs on the CPU while the GPU trains and plays. Games stopped in an epoch's self-play are solved
+through its training and the next epoch's self-play, and trained on from then. A new run's first epoch solves them at once,
 since it has nothing else to train on. At N = 20, a solve averages about 80 ms a core on
 F2's positions, and an epoch at F2's settings should stop about 4,600 games (152,000 moves at
 about 33 a game from an XOT opening), so the solver needs

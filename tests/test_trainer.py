@@ -2809,8 +2809,9 @@ def test_games_waiting_for_solves_are_solved_during_self_play_and_labelled_after
 
     trainer.train_loop(seed=0, num_epochs=2)
 
-    # each epoch solves the games waiting before its self-play (the warmup's, then epoch 0's)...
-    np.testing.assert_array_equal(solved, [[1, 1], [2, 2]])
+    # the warmup's games solve through epoch 0's self-play; each epoch's from the end of its
+    # self-play, through training, to the end of the next's...
+    np.testing.assert_array_equal(solved, [[1, 1], [2, 2], [3, 3]])
     # ...and labels them after it, before training
     assert [c.kind for c in calls] == ["collect"] + ["collect", "label", "train"] * 2
     for c in of_kind(calls, "label"):
@@ -2859,10 +2860,11 @@ def test_with_nothing_to_train_on_the_games_just_stopped_are_solved_at_once(
     trainer.train_loop(seed=0, num_epochs=2)
 
     # epoch 0: none waiting during its self-play, then the games it stopped, at once; epoch 1:
-    # the games it stopped wait for epoch 2
-    np.testing.assert_array_equal(solved, [[0, 0], [1, 1], [1, 1]])
+    # none left over, then its own, for epoch 2
+    np.testing.assert_array_equal(solved, [[0, 0], [1, 1], [1, 1], [2, 2]])
     assert logged(monitor, "solve_games") == {0: 2.0, 1: 0.0}
-    assert logged(monitor, "solve_wait_seconds")[0] >= 0.5
+    # both of epoch 0's solves, 0.5 s each by the fake
+    assert logged(monitor, "solve_seconds")[0] == 1.0
 
 
 def test_a_saved_state_keeps_its_games_waiting_for_solves(env, tmp_path):
