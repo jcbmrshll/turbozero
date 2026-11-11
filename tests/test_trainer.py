@@ -3022,7 +3022,11 @@ def test_a_run_from_a_saved_state_takes_its_own_weight_decay_and_momentum(
     new = sgd_optimizer(0.1, 0.5)
     if start == "warm_start":
         trainer, _ = growth_trainer(
-            env, tmp_path / "new", SCRIPTS, growth_kwargs={"manual": True}, optimizer=new
+            env,
+            tmp_path / "new",
+            SCRIPTS,
+            growth_kwargs={"manual": True},
+            optimizer=new,
         )
     else:
         # a resumed run is in the saved run's directory
