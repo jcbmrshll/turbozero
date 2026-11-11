@@ -716,6 +716,28 @@ def native_supported() -> bool:
     return bool(LIB.net_supported())
 
 
+def native_levels() -> list[str]:
+    """The x86-64 levels with a native network that this CPU runs."""
+    import native_target
+
+    return [level for level in native_target.levels() if level != "v2"]
+
+
+_LIBRARIES = {}
+
+
+def library(level: str, monkeypatch):
+    """The compiled search for `level` (`native_target.LEVELS`), whatever this CPU's own."""
+    from cpu_search import load_library
+
+    if level not in native_levels():
+        pytest.skip(f"this CPU doesn't run x86-64 level {level}")
+    if level not in _LIBRARIES:
+        monkeypatch.setenv("TURBOZERO_X86_LEVEL", level)
+        _LIBRARIES[level] = load_library()
+    return _LIBRARIES[level]
+
+
 def random_network(spec: str, seed: int = 1):
     """A network of `spec` in inference mode, every weight nonzero and normalizations not the
     identity, with its state."""
@@ -761,12 +783,15 @@ def test_the_native_networks_layers_compute_the_network(spec):
     np.testing.assert_allclose(got_values, values, atol=1e-5)
 
 
+# each convolution kernel: AVX-512 VNNI's, and AVX2's Winograd with and without AVX-VNNI
+@pytest.mark.parametrize("level", ["v4", "v3-vnni", "v3"])
 @pytest.mark.parametrize("spec", NATIVE_SPECS)
-def test_the_native_network_computes_its_quantized_layers(spec, tmp_path):
+def test_the_native_network_computes_its_quantized_layers(
+    spec, level, tmp_path, monkeypatch
+):
     import cpu_net
 
-    if not native_supported():
-        pytest.skip("needs AVX-512 VNNI")
+    lib = library(level, monkeypatch)
     program = cpu_net.extract(*random_network(spec))
     x = (np.random.default_rng(0).random((48, 2, 8, 8)) < 0.3).astype(np.float32)
     quantized = cpu_net.quantize(program, x)
@@ -774,7 +799,7 @@ def test_the_native_network_computes_its_quantized_layers(spec, tmp_path):
     cpu_net.save(tmp_path / "net.npz", program, quantized)
     program, quantized = cpu_net.load(tmp_path / "net.npz")
     want_logits, want_values = cpu_net.int8_forward(program, quantized, x)
-    network = cpu_net.NativeNet(program, quantized)
+    network = cpu_net.NativeNet(program, quantized, lib)
     for threads in (1, 3):
         logits, values = network.forward(x, threads)
         # float sums in another order can round an activation to the next step, rarely
@@ -786,12 +811,27 @@ def test_the_native_network_computes_its_quantized_layers(spec, tmp_path):
     assert np.abs(logits - float_logits).mean() < 0.05
 
 
+@pytest.mark.parametrize("spec", NATIVE_SPECS)
+def test_avx_vnni_sums_as_avx2_does(spec, monkeypatch):
+    import cpu_net
+
+    # the same integers, multiplied and added in one instruction or two, and the same float code
+    libs = [library(level, monkeypatch) for level in ("v3-vnni", "v3")]
+    program = cpu_net.extract(*random_network(spec))
+    x = (np.random.default_rng(0).random((48, 2, 8, 8)) < 0.3).astype(np.float32)
+    quantized = cpu_net.quantize(program, x)
+    (logits, values), (want_logits, want_values) = [
+        cpu_net.NativeNet(program, quantized, lib).forward(x) for lib in libs
+    ]
+    assert np.array_equal(logits, want_logits) and np.array_equal(values, want_values)
+
+
 def test_an_engine_of_the_native_network_searches_as_a_batch_of_one():
     import cpu_net
     from cpu_search import Engine, Search
 
     if not native_supported():
-        pytest.skip("needs AVX-512 VNNI")
+        pytest.skip("needs AVX2")
     program = cpu_net.extract(*random_network(NATIVE_SPECS[1]))
     x = (np.random.default_rng(0).random((48, 2, 8, 8)) < 0.3).astype(np.float32)
     network = cpu_net.NativeNet(program, cpu_net.quantize(program, x))
@@ -814,11 +854,13 @@ def test_the_search_is_built_for_a_standard_x86_level(monkeypatch):
     monkeypatch.delenv("TURBOZERO_X86_LEVEL", raising=False)
     avx512 = {"avx512f", "avx512bw", "avx512vl", "avx512dq", "avx512cd", "avx512_vnni"}
     for flags, level in [
-        (avx512 | {"avx2", "bmi2", "fma", "movbe"}, "-march=x86-64-v4"),
-        ({"avx2", "bmi2", "fma", "movbe", "avx512f"}, "-march=x86-64-v3"),
-        (set(), "-march=x86-64-v2"),
+        (avx512 | {"avx2", "bmi2", "fma", "movbe", "avx_vnni"}, "v4"),
+        ({"avx2", "bmi2", "fma", "movbe", "avx_vnni"}, "v3-vnni"),
+        ({"avx2", "bmi2", "fma", "movbe", "avx512f"}, "v3"),
+        (set(), "v2"),
     ]:
         monkeypatch.setattr(native_target, "cpu_flags", lambda flags=flags: flags)
         target = native_target.target_flags()
-        assert target[0] == level
+        assert target == native_target.LEVELS[level]
+        assert target[0].startswith("-march=x86-64-")
         assert not any("native" in flag for flag in target)
