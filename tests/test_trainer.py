@@ -2620,6 +2620,31 @@ def test_a_resumed_growth_run_carries_on_where_it_stopped(env, tmp_path, fake_lo
     }
 
 
+def test_a_fork_takes_a_run_without_growths_weight_averages(env, tmp_path, fake_loop):
+    # a run without growth, with averages, saved after 3 epochs
+    plain = make_trainer(env, tmp_path / "plain", averages=(2,), save_state_at=[3])
+    fake_loop(plain)
+    saved = plain.train_loop(seed=0, num_epochs=3)
+    path = state_path(str(tmp_path / "plain"), 3)
+
+    # forked alone, and into a growth run's first network, it goes on with them
+    alone = make_trainer(env, tmp_path / "alone", averages=(2,))
+    fake_loop(alone)
+    forked = alone.train_loop(seed=0, num_epochs=0, fork_from=path)
+    grown, _ = growth_trainer(env, tmp_path / "grown", SCRIPTS, averages=(2,))
+    fake_loop(grown)
+    into = grown.train_loop(seed=0, num_epochs=0, fork_from=path, fork_into="n0")
+
+    for output in (forked, into):
+        assert leaves_equal(output.averages[0], saved.averages[0])
+        assert output.averaged[0] == saved.averaged[0] == 3
+    # the growth run's other networks start theirs at their own weights
+    assert into.averaged[1:] == (0, 0)
+    # a fork whose trainer averages over other horizons starts them anew
+    other = make_trainer(env, tmp_path / "other", averages=(4,))
+    assert other.fork_averages(path, 0) is None
+
+
 def test_a_growth_run_forks_from_a_run_without(env, tmp_path, fake_loop):
     saved, path = save_a_state(make_trainer(env, tmp_path / "plain"))
     trainer, _ = growth_trainer(env, tmp_path / "grown", SCRIPTS)

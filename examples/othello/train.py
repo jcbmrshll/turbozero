@@ -892,7 +892,7 @@ def main():
         help="fork a new run from a saved state (state-<EPOCH>.npz, or a --ckpt-dir to take "
         "the newest from): it starts at epoch 0, with its own schedules, games and seed, "
         "from the saved network, optimizer state (the learning rate decaying anew from "
-        "--lr) and replay buffers. Needs the same --net; --buffer may "
+        "--lr), weight averages and replay buffers. Needs the same --net; --buffer may "
         "differ (each environment's newest entries are kept)",
     )
     parser.add_argument(
@@ -900,7 +900,7 @@ def main():
         default=None,
         metavar="SIZE",
         help="with --init-from: the saved run's network to fork, by size (e.g. 8x128), from a "
-        "--grow run's state too, with its weight averages. With --grow, it forks into this "
+        "--grow run's state too. With --grow, it forks into this "
         "run's network of that size, which plays from the start; the ones before it are retired "
         "(training beside it with --grow-train-retired), the next waits, and the rest start from "
         "scratch. Without --grow, it is this run's --net, trained alone",
@@ -914,7 +914,7 @@ def main():
         help="with --grow, in a new run: this run's network of that size (e.g. 4x64) starts from "
         "a saved state's (state-<EPOCH>.npz, or a --ckpt-dir to take the newest from; a --grow "
         "run's network of that size, or a run's one network) instead of from scratch, with its "
-        "optimizer state (the learning rate decaying anew) and a --grow run's weight averages, "
+        "optimizer state (the learning rate decaying anew) and weight averages, "
         "e.g. a student beside a teacher forked with --init-from and --fork-into. Repeatable; "
         "not the network --init-from forks into",
     )

@@ -3162,22 +3162,24 @@ class Trainer:
     def fork_averages(
         self, path: str, into: int, name: str | None = None
     ) -> tuple[tuple[Any, ...], int] | None:
-        """The weight averages of the network a fork takes from a saved growth run's state (see
-        `fork_state`: network `name`, by default network `into`'s name), and the epochs in
-        them, if it saved this trainer's horizons; else None, and the fork starts them at the
-        network's weights."""
+        """The weight averages of the network a fork takes from a saved state (see `fork_state`):
+        a growth run's network `name` (by default network `into`'s name), or a run without
+        growth's one network; and the epochs in them. None if the state has no averages over
+        this trainer's horizons, and the fork starts them at the network's weights."""
         meta = read_state_meta(path)
         info = meta.get("averages")
-        if meta["growth"] is None or not self.averages or info is None:
+        if not self.averages or info is None or info["horizons"] != list(self.averages):
             return None
-        if info["horizons"] != list(self.averages):
-            return None
-        index = saved_network_names(meta).index(name or self.learners[into].name)
-        params = jax.eval_shape(partial(self.init_train_state, into)).params
+        template = tuple(
+            jax.eval_shape(partial(self.init_train_state, into)).params
+            for _ in self.averages
+        )
         with np.load(path) as saved:
-            averages = self._load_network(
-                saved, meta, "averages", index, tuple(params for _ in self.averages)
-            )
+            if meta["growth"] is None:
+                (averages,) = self._load_part(saved, meta, "averages", (template,))
+                return averages, int(info["averaged"][0])
+            index = saved_network_names(meta).index(name or self.learners[into].name)
+            averages = self._load_network(saved, meta, "averages", index, template)
         return averages, int(info["averaged"][index])
 
     def _check_meta(self, path: str, meta: dict) -> dict:
@@ -3615,13 +3617,13 @@ class Trainer:
             fork_from: (optional) a saved state (see `save_state`), or a directory to take the
                 newest from, to fork a new run from. It's a run from scratch at epoch 0 (with its
                 own schedules, rng, games and testers), except that it starts with the saved
-                network and optimizer state (its learning rate schedule starting over), and its
-                replay buffers (see `fork_state`). The monitor run's config records it as
-                `parent`. Not with `initial_state`.
+                network, optimizer state (its learning rate schedule starting over) and weight
+                averages (see `fork_averages`), and its replay buffers (see `fork_state`). The
+                monitor run's config records it as `parent`. Not with `initial_state`.
             fork_replay_buffers: with `fork_from`, start with its replay buffers (default), or with
                 empty ones
             fork_into: (with `fork_from`) the name of the saved network to fork, from a growth
-                run's state too, with its weight averages. With `growth`, it forks into this
+                run's state too. With `growth`, it forks into this
                 run's network of that name: it plays from the run's start, those before it are
                 retired (training with `train_retired`), the next waits, and the rest start
                 from scratch. Without growth, it forks into the Trainer's own network (one
@@ -3631,7 +3633,7 @@ class Trainer:
                 directory to take the newest from: the network of that name starts from the saved
                 state's network of the same name (or its only one) instead of from scratch, with
                 its optimizer state, its step count and schedules back at 0 (see `warm_state`),
-                and from a growth run's state its weight averages (see `fork_averages`), e.g. a
+                and its weight averages (see `fork_averages`), e.g. a
                 student trained beside a forked teacher. Not the network a fork goes into
 
         Returns:
@@ -3839,7 +3841,7 @@ class Trainer:
         else:
             averages = [self.fresh_averages(ts) for ts in train_states]
             averaged = [0] * num_learners
-            if fork_from is not None and fork_into is not None:
+            if fork_from is not None:
                 saved_averages = self.fork_averages(fork_from, into, fork_into)
                 if saved_averages is not None:
                     averages[into], averaged[into] = saved_averages
