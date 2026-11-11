@@ -14,7 +14,7 @@ Othello model and against two strong open-source Othello engines,
 | `setup_edax.sh`, `setup_egaroucid.sh` | Build the engines for `vs_engine.py` and `clock_match.py` |
 | `clock_match.py` | Games on a real clock, one at a time on the same cores, each side at its best settings |
 | `cpu_search.py`, `cpu_search.cpp` | A single game's MCTS for playing on CPU: a tree in C++, its leaves evaluated in batches by OpenVINO or ONNX Runtime, or searched by a thread to a core (`Engine`) |
-| `cpu_net.py`, `cpu_net.h` | A network's int8 forward pass in C++ (AVX-512 VNNI), for `Engine`: no OpenVINO, closer to the float network |
+| `cpu_net.py`, `cpu_net.h` | A network's int8 forward pass in C++ (AVX-512 VNNI or AVX2), for `Engine`: no OpenVINO, closer to the float network |
 | `cpu_match.py` | Games between two such players at fixed visits a move, and their speed in evals a second |
 | `endgame.py`, `endgame.cpp` | The endgame solved exactly in C++, for a player (`solve=N`) and in batches for labels |
 | `export_onnx.py` | Exports a checkpoint's network to ONNX |
@@ -897,10 +897,14 @@ up, the tree shared under a lock. The batch above waits on its slowest stream, a
 at every step; here the network's time is 90-97% of the search's. `backend=native` evaluates with
 `cpu_net.py`'s network, our own int8 convolutions with float between them, a leaf at a time, so each
 thread needs only one leaf in flight. The library is built for a standard x86-64 level, as engines
-ship builds for: AVX-512 with VNNI (x86-64-v4) where the CPU has them, else AVX2 (x86-64-v3), whose
-kernel sums exactly what VNNI does at about a quarter of the speed; `TURBOZERO_X86_LEVEL=v3` plays as
-an AVX2 build would. Build it once a network, calibrated as `quantize.py`
-is:
+ship builds for: AVX-512 with VNNI (x86-64-v4) where the CPU has them, else AVX2 (x86-64-v3), with
+AVX-VNNI where the CPU has it (Intel's client chips from Alder Lake, which lack AVX-512).
+`TURBOZERO_X86_LEVEL` (`v4`, `v3-vnni`, `v3`) picks one, e.g. to play as an AVX2 build would. AVX2's
+3x3 convolutions run Winograd's F(2x2, 3x3) in integers: each 2x2 tile's 4x4 input patch and the
+weights are transformed into values that fit 16 bits, multiplied in pairs summed into 32 bits, and
+transformed back, which gives exactly VNNI's sums in 16 products where the direct convolution takes
+36. On one Zen 5 core, evals a second: 8x128 1729 (VNNI 3615, a direct 16-bit kernel 933); 4x64 11618
+(22264, 6650). Build it once a network, calibrated as `quantize.py` is:
 
 ```
 uv run examples/othello/cpu_net.py --net 8x128-128s-8p-w1125-274m --positions LEAVES/calibration.npy
