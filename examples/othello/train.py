@@ -611,12 +611,13 @@ def main():
     parser.add_argument(
         "--fresh-positions",
         type=int,
-        default=None,
+        default=0,
         metavar="N",
         help="every epoch, score the playing network on N of the positions its self-play just "
         "stored, before it trains on them: its raw weights' and its self-play average's policy "
         "KL and value loss (fresh_*), and the raw weights' excess (fresh_*_gap), what the "
-        "step's jitter costs on new data. Default 16 micro-batches; 0 for none",
+        "step's jitter costs on new data. N a multiple of the micro-batch (--train-batch / "
+        "--grad-accum), e.g. 16 of them. For watching; nothing follows it. Default 0, none",
     )
     parser.add_argument(
         "--inference-dtype",
@@ -925,8 +926,6 @@ def main():
             SGD_WEIGHT_DECAY if args.optimizer == "sgd" else WEIGHT_DECAY
         )
     micro = args.train_batch // args.grad_accum
-    if args.fresh_positions is None:
-        args.fresh_positions = 16 * micro
     if args.fresh_positions < 0 or args.fresh_positions % micro:
         parser.error(
             f"--fresh-positions must be a multiple of the micro-batch ({micro}, --train-batch / "
