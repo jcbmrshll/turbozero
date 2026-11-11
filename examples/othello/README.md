@@ -260,6 +260,31 @@ The run's page shows, each epoch, the tree positions stored (`tree_positions`, a
 training could sample (`tree_buffer_samples`), and the share of each training batch they
 made up (`tree_batch_fraction`).
 
+### Exact endgame labels
+
+`--solve-empties N` stops each self-play game once its position has N or fewer empty
+squares. That position is searched and stored like any other, and an exact solver's result
+for it (win, draw or loss for the player to move) becomes every position's value target,
+instead of the result the game would have had if played out. Self-play skips the searches
+for the last N moves and plays more games in the same compute. The labels lose the noise of
+endgame mistakes: in F2 e440's self-play (the 8x128 at 511/127 sims), the played result
+differs from the exact one at 16-20 empties in 17% of games, mostly a win or loss played
+as a draw or the reverse.
+
+The solver (`--solver native`, endgame.py, a win/draw/loss solve; `edax` for comparison)
+runs on the CPU while the GPU plays. Games stopped in an epoch are solved during the next
+epoch's self-play and trained on from then. A new run's first epoch solves them at once,
+since it has nothing else to train on. At N = 20, a solve averages about 80 ms a core on
+F2's positions, and an epoch at F2's settings should stop about 4,600 games (152,000 moves at
+about 33 a game from an XOT opening), so the solver needs
+3-4 cores to keep up with a 5080 (`--solve-threads`, default every core the process may
+use; on Modal, `--cpu 8`). `solve_wait_seconds` shows how long self-play waited for it,
+and `solve_games`, `solve_draw` and `solve_missed` count the games.
+
+Stopped games never produce positions with fewer than N empty squares, which test games
+and the Elo league's GPU players still reach. `--solve-share P` stops only a fraction P of
+games and plays the rest to the end, so that training still sees those positions.
+
 ### Policy target from the search
 
 By default the network learns each played position's policy from the search's visit
