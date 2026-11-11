@@ -383,6 +383,8 @@ class Runner:
             "PYTHONUNBUFFERED": "1",
             "SEAGLASS_TAGS": job.tags,
             "SEAGLASS_URL": self.seaglass_url,
+            # the image's jax is the CUDA build, whose plugin fails to start without a GPU
+            **({"JAX_PLATFORMS": "cpu"} if job.gpu == "CPU" else {}),
         }
         self.step_now = (index, step)
         self._write_record(index, step)
