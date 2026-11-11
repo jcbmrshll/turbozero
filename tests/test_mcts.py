@@ -13,7 +13,7 @@ import pytest
 
 from core.evaluators.alphazero import AlphaZero
 from core.evaluators.mcts.action_selection import MCTSActionSelector, PUCTSelector
-from core.evaluators.mcts.mcts import MCTS, PlayoutCap
+from core.evaluators.mcts.mcts import MCTS, PlayoutCap, SmartPruning
 from core.evaluators.mcts.policy_targets import CompletedQ
 from core.evaluators.mcts.weighted_mcts import WeightedMCTS, WeightedMCTSNode
 
@@ -1269,3 +1269,108 @@ def test_mean_iterations_mixes_full_and_fast_searches():
 def test_a_playout_cap_must_be_a_probability_and_fewer_iterations(cap):
     with pytest.raises(ValueError, match="playout cap"):
         make_mcts(num_iterations=5, playout_cap=cap)
+
+
+# smart pruning (STOP)
+
+# a root with 9 visits, its children along actions 0 and 1 visited 6 and 2 times: a lead of 4
+LEAD_OF_4 = [(None, None, 9, 0.0), (0, 0, 6, 0.0), (0, 1, 2, 0.0)]
+
+
+def pruned(searches, factor=1.0, min_full_iterations=0, **kwargs):
+    return capped(
+        num_iterations=10,
+        fast_iterations=8,
+        smart_pruning=SmartPruning(searches, factor, min_full_iterations),
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize("factor, done_from", [(1.0, 6), (2.0, 2)])
+def test_smart_pruning_stops_once_the_lead_exceeds_the_iterations_left(
+    env, factor, done_from
+):
+    # a fast search of 8 iterations has 8 - (c - 1) left after c cycles: the lead of 4 exceeds
+    # them from cycle 6, and twice it from cycle 2 (the root's evaluation first, either way)
+    search = pruned("fast", factor)
+    tree = replace(build_tree(search, env, LEAD_OF_4), fast=jnp.array(True))
+
+    done = [bool(search.search_done(tree, jnp.array(c))) for c in range(10)]
+
+    assert done == [c >= done_from for c in range(10)]
+
+
+@pytest.mark.parametrize(
+    "searches, min_full, fast, greedy, stops",
+    [
+        ("fast-greedy", 0, True, True, True),
+        ("fast-greedy", 0, True, False, False),
+        ("fast-greedy", 0, False, True, False),
+        ("fast", 0, True, False, True),
+        ("fast", 0, False, True, False),
+        ("all", 0, False, False, True),
+        ("all", 8, False, False, False),
+        ("all", 8, True, False, True),
+    ],
+)
+def test_smart_pruning_applies_to_its_searches_only(
+    env, searches, min_full, fast, greedy, stops
+):
+    # after 8 cycles, the lead of 4 exceeds a fast search's 1 iteration left and a full one's 3
+    search = pruned(searches, min_full_iterations=min_full)
+    tree = replace(build_tree(search, env, LEAD_OF_4), fast=jnp.array(fast))
+
+    assert bool(search.search_done(tree, jnp.array(8), greedy)) == stops
+
+
+def test_at_temperature_zero_every_move_is_greedy(env):
+    search = pruned("fast-greedy", temperature=0.0)
+    tree = replace(build_tree(search, env, LEAD_OF_4), fast=jnp.array(True))
+
+    assert bool(search.search_done(tree, jnp.array(8)))
+
+
+def test_smart_pruning_needs_its_searches():
+    with pytest.raises(ValueError, match="one of"):
+        SmartPruning("greedy")
+    with pytest.raises(ValueError, match="positive"):
+        SmartPruning("all", factor=0.0)
+    with pytest.raises(ValueError, match="playout_cap"):
+        make_mcts(num_iterations=4, smart_pruning=SmartPruning("fast"))
+    with pytest.raises(ValueError, match="min_full_iterations"):
+        make_mcts(num_iterations=4, smart_pruning=SmartPruning("all", 1.0, 5))
+
+
+@pytest.mark.parametrize("moves", [WIN_MOVES, MIDGAME_MOVES])
+def test_smart_pruning_at_factor_1_plays_the_whole_searchs_move(
+    make_search, ttt, moves
+):
+    whole = make_search()
+    stopped = make_search(smart_pruning=SmartPruning("all"))
+    keys = jax.random.split(jax.random.PRNGKey(0), 8)
+
+    iterations = []
+    for key in keys:
+        out, _ = run_search(whole, key, moves, ttt)
+        out_stopped, _ = run_search(stopped, key, moves, ttt)
+        assert out_stopped.action == out.action
+        iterations.append(int(root(out_stopped.eval_state).n) - 1)
+
+    assert max(iterations) <= 32
+    if moves == WIN_MOVES:
+        # the winning move pulls ahead: searches stop early
+        assert max(iterations) < 32
+
+
+def test_search_stats_count_the_visits_a_root_inherited(env):
+    # 9 visits after 3 cycles: 7 inherited, then 2 iterations
+    search = pruned("fast")
+    tree = build_tree(search, env, LEAD_OF_4)
+    fast = replace(tree, fast=jnp.array(True))
+
+    stats = {k: float(v) for k, v in search.search_stats(fast, jnp.array(3)).items()}
+    full = search.search_stats(tree, jnp.array(11))
+
+    assert stats == {"cycles": 3.0, "stopped": 1.0, "inherited_visits": 7.0}
+    # a full search of 10 iterations that ran them all
+    assert float(full["stopped"]) == 0.0

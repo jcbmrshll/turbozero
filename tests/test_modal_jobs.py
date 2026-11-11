@@ -25,9 +25,12 @@ p.add_argument("--ckpt-dir")
 p.add_argument("--keep-every", type=int)
 p.add_argument("--save-state-at", default="")
 p.add_argument("--save-state-every", type=int)
-p.add_argument("--init-from")
+# as train.py's: a run starts one way
+init = p.add_mutually_exclusive_group()
+init.add_argument("--init-from")
+init.add_argument("--branch-from")
+init.add_argument("--resume", action="store_true")
 p.add_argument("--init-without-buffers", action="store_true")
-p.add_argument("--resume", action="store_true")
 p.add_argument("--monitor", nargs="?", const="")
 p.add_argument("--name")
 p.add_argument("--notes")
@@ -43,8 +46,10 @@ if args.resume:
     start = states[-1]
     run_id = json.loads((ckpt / f"state-{start}.npz").read_text())["run"]
     print(f"resuming from {start}", flush=True)
-if args.init_from:
-    assert Path(args.init_from).exists()
+for start_from in (args.init_from, args.branch_from):
+    if start_from:
+        assert Path(start_from).exists()
+        print(f"starting from {Path(start_from).read_text()}", flush=True)
 at = {int(e) for e in args.save_state_at.split(",") if e}
 monitor = None
 if args.monitor is not None:
@@ -221,6 +226,14 @@ def test_parse_step_takes_a_local_command():
             "examples/othello/train.py --init-from ~/.cache/turbozero/dir --ckpt-dir ~/.cache/turbozero/c > ~/.cache/turbozero/l",
             "state-<EPOCH>",
         ),
+        (
+            "examples/othello/train.py --branch-from ~/.cache/turbozero/dir --ckpt-dir ~/.cache/turbozero/c > ~/.cache/turbozero/l",
+            "state-<EPOCH>",
+        ),
+        (
+            "examples/othello/train.py --branch-from /tmp/state-4.npz --ckpt-dir ~/.cache/turbozero/c > ~/.cache/turbozero/l",
+            "wouldn't come back",
+        ),
     ],
 )  # fmt: skip
 def test_parse_step_refuses_what_wouldnt_work(text, says):
@@ -339,6 +352,45 @@ def test_a_preempted_job_goes_on_from_its_state_on_a_new_machine(scene):
     t = next(m for m in metas if m["name"] == "t")
     assert t["status"] == "finished"
     assert t["step"] == 11
+
+
+def test_a_branch_reads_its_state_from_the_bucket_and_resumes_from_its_own(scene):
+    # as `launch` uploads it: under the path it has here
+    start = scene.home / ".cache" / "turbozero" / "start" / "state-4.npz"
+    scene.store.put_bytes("files/" + str(start.relative_to(scene.home)), b"epoch 4")
+    scene.job(
+        step("b", f"--epochs 12 --keep-every 5 --die-at 8 --branch-from {start}"),
+        name="p",
+        resume_every=5,
+    )
+    with pytest.raises(RuntimeError, match="lost"):
+        scene.runner("p").run()
+    died = (scene.root / "c" / "b.died").read_text()
+    scene.wipe_container()
+    (scene.root / "c").mkdir(parents=True)
+    (scene.root / "c" / "b.died").write_text(died)
+
+    assert scene.runner("p").run() == "done"
+
+    log = (scene.root / "l" / "b.log").read_text()
+    assert "starting from epoch 4" in log
+    # the second attempt goes on from the step's own state, not the one it branched from
+    assert "resuming from 5" in log
+
+
+def test_a_jobs_inputs_include_the_states_it_branches_from(scene):
+    (modal_jobs,) = load_example("othello", "modal_jobs")
+    home = scene.home
+    job = scene.job(
+        step("t", "--epochs 12 --save-state-at 10"),
+        step("b", f"--branch-from {home}/.cache/turbozero/start/state-4.npz"),
+        step("f", f"--init-from {home}/.cache/turbozero/c/t/state-10.npz"),
+    )
+
+    assert modal_jobs.inputs_to_upload(job) == [
+        modal_run.engine_set_path(str(home)),
+        f"{home}/.cache/turbozero/start/state-4.npz",
+    ]
 
 
 def test_a_step_interrupted_before_its_first_state_starts_over(scene):

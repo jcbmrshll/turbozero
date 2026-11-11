@@ -97,7 +97,7 @@ from core.evaluators.evaluation_fns import (
     make_nn_eval_fn_no_params_callable,
 )
 from core.evaluators.mcts.action_selection import PUCTSelector
-from core.evaluators.mcts.mcts import MCTS, PlayoutCap
+from core.evaluators.mcts.mcts import MCTS, PlayoutCap, SmartPruning
 from core.evaluators.mcts.policy_targets import CompletedQ, VisitCounts
 from core.evaluators.random_evaluator import RandomEvaluator
 from core.memory.replay_memory import EpisodeReplayBuffer
@@ -394,6 +394,32 @@ def main():
         "iterations with probability P, and otherwise with FAST, without the root's noise; "
         "only the --sims searches' positions are stored for training, e.g. 0.25:43. Size "
         "--buffer by the share stored, and see --selfplay-cycles and --advance-every",
+    )
+    parser.add_argument(
+        "--smart-pruning",
+        choices=SmartPruning.SEARCHES,
+        default=None,
+        help="STOP, Lc0's smart pruning: end a self-play search once --smart-pruning-factor x "
+        "(visits of the root's most visited move - the runner-up's) exceeds the iterations it "
+        "has left, in fast-greedy: --playout-cap's fast searches of moves played greedily "
+        "(after --sampling-moves); fast: every fast search; all: every search, those stored "
+        "for training too (after --smart-pruning-min-full iterations). Off by default. Use a "
+        "small --advance-every, or a stopped search waits for its move to be played",
+    )
+    parser.add_argument(
+        "--smart-pruning-factor",
+        type=float,
+        default=1.0,
+        help="with --smart-pruning, how readily it stops, higher sooner: at 1 (the default) "
+        "the most visited move can no longer change",
+    )
+    parser.add_argument(
+        "--smart-pruning-min-full",
+        type=int,
+        default=0,
+        metavar="ITERATIONS",
+        help="with --smart-pruning all, the fewest iterations a search stored for training "
+        "takes before the rule may end it, so that the root's noise steers some of its visits",
     )
     parser.add_argument(
         "--selfplay-cycles",
@@ -972,6 +998,17 @@ def main():
             parser.error("--playout-cap goes with --sims, not --sims-schedule")
         if args.playout_cap.fast_iterations >= args.sims:
             parser.error("--playout-cap's fast sims must be fewer than --sims")
+    if args.smart_pruning is not None:
+        if args.smart_pruning != "all" and args.playout_cap is None:
+            parser.error(f"--smart-pruning {args.smart_pruning} needs --playout-cap")
+        if args.smart_pruning_factor <= 0:
+            parser.error("--smart-pruning-factor must be positive")
+        if args.smart_pruning_min_full < 0:
+            parser.error("--smart-pruning-min-full can't be negative")
+    elif args.smart_pruning_factor != 1.0 or args.smart_pruning_min_full:
+        parser.error(
+            "--smart-pruning-factor and --smart-pruning-min-full go with --smart-pruning"
+        )
     collection_steps = 128
     if args.selfplay_cycles is not None:
         if args.sims_schedule is not None:
@@ -1080,6 +1117,13 @@ def main():
                         if args.policy_target == "completed-q"
                         else VisitCounts(),
                         playout_cap=args.playout_cap,
+                        smart_pruning=SmartPruning(
+                            args.smart_pruning,
+                            args.smart_pruning_factor,
+                            args.smart_pruning_min_full,
+                        )
+                        if args.smart_pruning is not None
+                        else None,
                     ),
                 )
                 for epoch, sims in args.sims_schedule or [(0, args.sims)]

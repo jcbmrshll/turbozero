@@ -85,17 +85,37 @@ class Evaluator:
         """The most cycles a move's search takes: self-play's unit of compute."""
         return 1
 
-    def search_done(self, state: Any, cycles: jax.Array) -> jax.Array:  # pylint: disable=unused-argument
+    def search_done(  # pylint: disable=unused-argument
+        self, state: Any, cycles: jax.Array, greedy: ArrayLike = False
+    ) -> jax.Array:
         """Whether the search in `state`, which has run `cycles` cycles, is done.
 
         Args:
             state: The internal state of the Evaluator.
             cycles: the cycles the search has run so far
+            greedy: (optional) whether the move is played greedily, the action with the highest
+                policy weight, whatever the rest of the search's output (e.g. self-play's moves
+                after its sampled ones, see `core.training.exploration.Exploration`): a search
+                may then stop once that action can't change
 
         Returns:
             jax.Array: whether to stop searching and play a move
         """
         return jnp.array(True)
+
+    def search_stats(self, state: Any, cycles: jax.Array) -> dict[str, jax.Array]:
+        """What self-play counts about a search that is done, each summed over an epoch's
+        searches (see `core.training.train.Trainer.collect_steps`): its `cycles`.
+
+        Args:
+            state: The internal state of the Evaluator, after the search.
+            cycles: the cycles the search ran
+
+        Returns:
+            dict[str, jax.Array]: each count, by name
+        """
+        del state
+        return {"cycles": jnp.asarray(cycles, dtype=jnp.float32)}
 
     def trains_on(self, state: Any) -> jax.Array:  # pylint: disable=unused-argument
         """Whether the search in `state` makes a training position (self-play stores its

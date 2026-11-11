@@ -48,6 +48,60 @@ class PlayoutCap:
         }
 
 
+@dataclass(frozen=True)
+class SmartPruning:
+    """STOP (Baier and Winands 2016), Leela Chess Zero's smart pruning: a search stops once
+    `factor` times the lead in visits of the root's most visited child over the runner-up
+    exceeds the iterations the search has left. The visits counted include those the root kept
+    from earlier searches (see `MCTS`'s `persist_tree`). At `factor` 1 the most visited child
+    can't change, so the move is the one the whole search would play greedily (most visits),
+    only its visit distribution differs; above 1, it stops sooner and the move may differ.
+
+    It applies to some searches only (`searches`):
+    - "fast-greedy": fast searches (see `PlayoutCap`) whose moves are played greedily (see
+      `Evaluator.search_done`'s `greedy`, or the MCTS's temperature 0): neither their visit
+      distribution nor their move's sampling then matters, only the move and the subtree the
+      next search keeps
+    - "fast": every fast search, whose moves may be sampled from its visits
+    - "all": every search, those that make training positions included
+
+    Attributes:
+        searches: which searches it applies to, see above
+        factor: how readily it stops, higher sooner; 1 never changes a greedy move
+        min_full_iterations: the fewest iterations a search that makes a training position takes
+            before the rule may stop it, so that the root's noise (e.g. AlphaZero's) steers some
+            of its visits
+    """
+
+    searches: str
+    factor: float = 1.0
+    min_full_iterations: int = 0
+
+    SEARCHES = ("fast-greedy", "fast", "all")
+
+    def __post_init__(self):
+        if self.searches not in self.SEARCHES:
+            raise ValueError(
+                f"smart pruning's searches must be one of {self.SEARCHES}, got {self.searches!r}"
+            )
+        if self.factor <= 0:
+            raise ValueError(
+                f"smart pruning's factor must be positive, got {self.factor}"
+            )
+        if self.min_full_iterations < 0:
+            raise ValueError(
+                "smart pruning's min_full_iterations can't be negative, got "
+                f"{self.min_full_iterations}"
+            )
+
+    def get_config(self) -> dict:
+        return {
+            "searches": self.searches,
+            "factor": self.factor,
+            "min_full_iterations": self.min_full_iterations,
+        }
+
+
 class MCTS(Evaluator):
     """Batched implementation of Monte Carlo Tree Search (MCTS).
 
@@ -71,6 +125,7 @@ class MCTS(Evaluator):
         policy_target: PolicyTarget | None = None,
         traversal_steps: int = 1,
         playout_cap: PlayoutCap | None = None,
+        smart_pruning: SmartPruning | None = None,
     ):
         """Initializes an MCTS evaluator.
 
@@ -109,6 +164,8 @@ class MCTS(Evaluator):
             playout_cap: (optional) search each move in full (`num_iterations` iterations) only
                 some of the time, and otherwise with fewer, see `PlayoutCap`. With
                 `count_reused_visits`, a fast search stops at `fast_iterations + 1` root visits
+            smart_pruning: (optional) stop some searches once their most visited move is
+                settled, see `SmartPruning`. Its "fast" choices need a `playout_cap`
         """
         if traversal_steps < 1:
             raise ValueError(
@@ -127,8 +184,25 @@ class MCTS(Evaluator):
                 "a playout cap's full_probability must be in (0, 1] and its fast_iterations "
                 f"between 1 and num_iterations ({num_iterations}) - 1, got {playout_cap}"
             )
+        if (
+            smart_pruning is not None
+            and smart_pruning.searches != "all"
+            and playout_cap is None
+        ):
+            raise ValueError(
+                f"smart pruning of {smart_pruning.searches!r} searches needs a playout_cap"
+            )
+        if (
+            smart_pruning is not None
+            and smart_pruning.min_full_iterations > num_iterations
+        ):
+            raise ValueError(
+                "smart pruning's min_full_iterations must be at most num_iterations "
+                f"({num_iterations}), got {smart_pruning.min_full_iterations}"
+            )
         super().__init__(discount=discount)
         self.playout_cap = playout_cap
+        self.smart_pruning = smart_pruning
         self.count_reused_visits = count_reused_visits
         self.min_iterations = min_iterations
         self.eval_fn = eval_fn
@@ -159,6 +233,9 @@ class MCTS(Evaluator):
             "playout_cap": self.playout_cap.get_config()
             if self.playout_cap is not None
             else None,
+            "smart_pruning": self.smart_pruning.get_config()
+            if self.smart_pruning is not None
+            else None,
         }
 
     def evaluate(
@@ -172,7 +249,7 @@ class MCTS(Evaluator):
         **kwargs,
     ) -> MCTSOutput:
         """Performs `self.num_iterations` MCTS iterations on an `MCTSTree` (fewer with
-        `count_reused_visits`, see `search_done`).
+        `count_reused_visits`, a `playout_cap` or `smart_pruning`, see `search_done`).
 
         Samples an action to take from the root node after search is completed.
 
@@ -202,7 +279,11 @@ class MCTS(Evaluator):
             state: MCTSTree, i_key: tuple[jax.Array, jax.Array]
         ) -> tuple[MCTSTree, None]:
             i, k = i_key
-            if not self.count_reused_visits and self.playout_cap is None:
+            if (
+                not self.count_reused_visits
+                and self.playout_cap is None
+                and self.smart_pruning is None
+            ):
                 return iterate(k, state), None
             # after the root's evaluation and `i` iterations, as `search_cycle` counts them
             return iterate(k, state, write=~self.search_done(state, i + 1)), None
@@ -241,16 +322,60 @@ class MCTS(Evaluator):
             state.fast, self.playout_cap.fast_iterations, self.num_iterations
         )
 
-    def search_done(self, state: MCTSTree, cycles: jax.Array) -> jax.Array:
+    def search_done(
+        self, state: MCTSTree, cycles: jax.Array, greedy: ArrayLike = False
+    ) -> jax.Array:
         """Done after the root's evaluation and its `iterations`; with `count_reused_visits`,
         also once the root has `iterations + 1` visits, after its evaluation and
-        `min_iterations` iterations."""
+        `min_iterations` iterations; with `smart_pruning`, also once it stops the search (see
+        `pruned`). At temperature 0, every move is played greedily."""
         iterations = self.iterations(state)
         done = cycles >= iterations + 1
-        if not self.count_reused_visits:
-            return done
-        visited = state.data.n[state.ROOT_INDEX] > iterations
-        return done | (visited & (cycles >= 1 + self.min_iterations))
+        if self.count_reused_visits:
+            visited = state.data.n[state.ROOT_INDEX] > iterations
+            done = done | (visited & (cycles >= 1 + self.min_iterations))
+        if self.smart_pruning is not None:
+            done = done | self.pruned(state, cycles, greedy)
+        return done
+
+    def pruned(
+        self, state: MCTSTree, cycles: ArrayLike, greedy: ArrayLike = False
+    ) -> jax.Array:
+        """Whether `smart_pruning` stops the search in `state` after `cycles` cycles: once the
+        root is evaluated, if the rule applies to the search (see `SmartPruning`) and the lead
+        of its most visited child over the runner-up, times the rule's factor, exceeds the
+        iterations it has left. A search that makes a training position takes the rule's
+        `min_full_iterations` first."""
+        rule = self.smart_pruning
+        assert rule is not None
+        cycles = jnp.asarray(cycles)
+        visits = state.get_child_data("n", state.ROOT_INDEX)
+        top, runner_up = jax.lax.top_k(visits, 2)[0]
+        left = self.iterations(state) - (cycles - 1)
+        settled = rule.factor * (top - runner_up) > left
+        if rule.searches == "all":
+            applies = ~self.trains_on(state) | (cycles - 1 >= rule.min_full_iterations)
+        else:
+            applies = state.fast
+            if rule.searches == "fast-greedy" and self.temperature != 0:
+                applies = applies & greedy
+        return settled & applies & (cycles >= 1)
+
+    def search_stats(self, state: MCTSTree, cycles: jax.Array) -> dict[str, jax.Array]:
+        """Besides its `cycles` (see `Evaluator.search_stats`): `stopped`, 1 if the search
+        stopped before its `iterations` were up (e.g. by `smart_pruning`); and
+        `inherited_visits`, the visits its root had from earlier searches as it started (see
+        `persist_tree`; a root searched from scratch counts 1, its own evaluation)."""
+        cycles = jnp.asarray(cycles)
+        root_visits = state.data.n[state.ROOT_INDEX]
+        return {
+            "cycles": cycles.astype(jnp.float32),
+            "stopped": (cycles < self.iterations(state) + 1).astype(jnp.float32),
+            # every cycle after the root's evaluation visits the root once
+            "inherited_visits": jnp.maximum(root_visits - (cycles - 1), 0).astype(
+                jnp.float32
+            ),
+        }
 
     def trains_on(self, state: MCTSTree) -> jax.Array:
         """Whether the search in `state` makes a training position: unless it's a fast one

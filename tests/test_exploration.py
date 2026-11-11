@@ -87,6 +87,15 @@ def test_num_sampling_moves_plays_the_evaluators_move_then_the_best(step, expect
     assert (actions == expected).all()
 
 
+@pytest.mark.parametrize("step", [0, 2, 3, 10])
+def test_greedy_says_whether_the_move_is_played_greedily(step):
+    metadata = step_metadata([1, 1, 1], step=step)
+
+    assert bool(Exploration(num_sampling_moves=3).greedy(metadata)) == (step >= 3)
+    # the evaluator's own move, whatever it is
+    assert not bool(Exploration().greedy(metadata))
+
+
 def test_greedy_moves_break_ties_at_random_among_legal_moves():
     # move 3 has the most weight but is illegal; moves 0 and 2 tie
     output = eval_output(1, [0.4, 0.1, 0.4, 0.9])

@@ -152,7 +152,10 @@ def main():
         args.advance_every = 5
 
     trainer, params = make_trainer(args)
-    collect = trainer.collect_steps
+
+    def collect(*args):
+        return trainer.collect_steps(*args)[0]
+
     key = jax.random.PRNGKey(args.seed)
     init_key, key = jax.random.split(key)
     state = trainer.init_collection_state(init_key, args.envs)

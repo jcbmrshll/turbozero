@@ -190,6 +190,50 @@ def test_without_playout_cap_every_search_is_full(monkeypatch):
     assert built.value.kwargs["advance_every"] is None
 
 
+def test_smart_pruning_reaches_self_play_only(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(
+            monkeypatch,
+            "--sims",
+            "63",
+            "--playout-cap",
+            "0.25:21",
+            "--smart-pruning",
+            "all",
+            "--smart-pruning-factor",
+            "1.5",
+            "--smart-pruning-min-full",
+            "16",
+        )
+    evaluator = built.value.kwargs["evaluator"].at(0)
+    assert evaluator.smart_pruning == train.SmartPruning("all", 1.5, 16)
+    assert built.value.kwargs["evaluator_test"].smart_pruning is None
+
+
+def test_without_smart_pruning_no_search_stops_early(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, "--sims", "63", "--playout-cap", "0.25:21")
+    assert built.value.kwargs["evaluator"].at(0).smart_pruning is None
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        # fast searches without a playout cap
+        ("--smart-pruning", "fast"),
+        ("--smart-pruning", "fast-greedy"),
+        ("--smart-pruning", "all", "--smart-pruning-factor", "0"),
+        ("--smart-pruning", "all", "--smart-pruning-min-full", "-1"),
+        # the rule's settings without it
+        ("--smart-pruning-factor", "2"),
+        ("--smart-pruning-min-full", "8"),
+    ],
+)
+def test_bad_smart_pruning_options_are_refused(monkeypatch, options):
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, *options)
+
+
 def test_grow_builds_a_network_to_grow_into_with_its_own_search_and_tests(
     monkeypatch, tmp_path
 ):

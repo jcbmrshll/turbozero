@@ -186,6 +186,24 @@ class TrainLoopOutput:
         return self.train_states[self.playing]
 
 
+def search_metrics(counts: dict[str, jax.Array]) -> dict[str, jax.Array]:
+    """What an epoch's self-play logs about its searches, from their counts (see
+    `Trainer.count_searches`): for the searches that make training positions (`full_`) and
+    the others (`fast_`), if there were any, their number (`<kind>_searches`) and the mean of
+    each of their `Evaluator.search_stats` (`<kind>_search_<name>`)."""
+    metrics = {}
+    for kind in ("full", "fast"):
+        searches = counts.get(f"{kind}_searches", 0)
+        if searches == 0:
+            continue
+        metrics[f"{kind}_searches"] = searches
+        prefix = f"{kind}_"
+        for name, total in counts.items():
+            if name.startswith(prefix) and name != f"{kind}_searches":
+                metrics[f"{kind}_search_{name[len(prefix) :]}"] = total / searches
+    return metrics
+
+
 def extract_params(state: TrainState) -> Any:
     """Extracts model parameters from TrainState.
 
@@ -1178,7 +1196,7 @@ class Trainer:
         """
         if evaluator is None:
             evaluator = self.collection_schedule.at(0)
-        done = evaluator.search_done(state.eval_state, state.search_cycles)
+        done = self.search_done(state, evaluator)
         # the moves whose positions are trained on (see `Evaluator.trains_on`); the others are
         # played, and count towards their game's length and outcome, without being stored
         stored = done & evaluator.trains_on(state.eval_state)
@@ -1302,6 +1320,49 @@ class Trainer:
             resign_state=resign_state,
         )
 
+    def search_done(self, state: CollectionState, evaluator: Evaluator) -> jax.Array:
+        """Whether the search for the move in progress is done (see `Evaluator.search_done`),
+        told whether the move is played greedily (see `Exploration.greedy`)."""
+        greedy = (
+            self.exploration.greedy(state.metadata)
+            if self.exploration is not None
+            else False
+        )
+        return evaluator.search_done(state.eval_state, state.search_cycles, greedy)
+
+    def count_searches(
+        self,
+        counts: dict[str, jax.Array],
+        state: CollectionState,
+        evaluator: Evaluator,
+    ) -> dict[str, jax.Array]:
+        """Adds the searches that are done in `state` to `counts`, those that make a training
+        position (see `Evaluator.trains_on`) under `full_`, the others under `fast_`: their
+        number, `<kind>_searches`, and each of their `Evaluator.search_stats`, summed.
+
+        Args:
+            counts: the counts so far, of one environment; empty to start them
+            state: the collection state of one environment, before `advance`
+            evaluator: the self-play evaluator, whose states `state` holds
+
+        Returns:
+            dict[str, jax.Array]: the counts with the searches added
+        """
+        done = self.search_done(state, evaluator)
+        trains = evaluator.trains_on(state.eval_state)
+        stats = {
+            "searches": jnp.float32(1),
+            **evaluator.search_stats(state.eval_state, state.search_cycles),
+        }
+        added = {}
+        for kind, which in (("full", trains), ("fast", ~trains)):
+            for name, value in stats.items():
+                added[f"{kind}_{name}"] = jnp.where(done & which, value, 0.0)
+        return {
+            name: counts.get(name, jnp.float32(0)) + value
+            for name, value in added.items()
+        }
+
     def collect(
         self,
         key: jax.Array,
@@ -1394,7 +1455,7 @@ class Trainer:
         num_steps: int,
         *,
         evaluator: Evaluator | None = None,
-    ) -> CollectionState:
+    ) -> tuple[CollectionState, dict[str, jax.Array]]:
         """Collects self-play data for the compute of `num_steps` moves in every environment: as
         many cycles as `num_steps` moves' searches take at most (see `Evaluator.search_cycles`).
 
@@ -1416,20 +1477,28 @@ class Trainer:
                 provided, the first in the schedule.
 
         Returns:
-            CollectionState: updated collection state
+            Tuple[CollectionState, dict[str, jax.Array]]: updated collection state, and the
+                searches whose moves were played, counted over every environment (see
+                `count_searches`)
         """
         if evaluator is None:
             evaluator = self.collection_schedule.at(0)
         num_cycles = num_steps * evaluator.search_cycles()
-        if num_cycles == 0:
-            return state
         advance_every = (
             evaluator.search_cycles()
             if self.advance_every is None
             else self.advance_every
         )
 
-        def collect_env(key: jax.Array, state: CollectionState) -> CollectionState:
+        def collect_env(
+            key: jax.Array, state: CollectionState
+        ) -> tuple[CollectionState, dict[str, jax.Array]]:
+            counts = jax.tree.map(
+                lambda x: jnp.zeros(x.shape, x.dtype),
+                jax.eval_shape(lambda s: self.count_searches({}, s, evaluator), state),
+            )
+            if num_cycles == 0:
+                return state, counts
             # the i-th move to start in this call gets the i-th key
             keys = jax.random.split(key, num_cycles)
 
@@ -1448,25 +1517,29 @@ class Trainer:
                 return state, started + starting
 
             def chunk(
-                _: jax.Array, carry: tuple[CollectionState, jax.Array]
-            ) -> tuple[CollectionState, jax.Array]:
-                state, started = search(carry, advance_every)
-                return self.advance(state, params, evaluator), started
+                _: jax.Array,
+                carry: tuple[CollectionState, jax.Array, dict[str, jax.Array]],
+            ) -> tuple[CollectionState, jax.Array, dict[str, jax.Array]]:
+                state, started, counts = carry
+                state, started = search((state, started), advance_every)
+                counts = self.count_searches(counts, state, evaluator)
+                return self.advance(state, params, evaluator), started, counts
 
             # every `advance_every` cycles, the moves whose searches are done are played: loops
             # within a loop rather than a lax.cond every cycle, through which XLA would copy the
             # whole state (the trees and the replay buffers)
-            carry = jax.lax.fori_loop(
+            state, started, counts = jax.lax.fori_loop(
                 0,
                 num_cycles // advance_every,
                 chunk,
-                (state, jnp.array(0, dtype=jnp.int32)),
+                (state, jnp.array(0, dtype=jnp.int32), counts),
             )
             if num_cycles % advance_every:
-                carry = search(carry, num_cycles % advance_every)
-            return carry[0]
+                state, started = search((state, started), num_cycles % advance_every)
+            return state, counts
 
-        return jax.vmap(collect_env)(key, state)
+        state, counts = jax.vmap(collect_env)(key, state)
+        return state, {name: value.sum() for name, value in counts.items()}
 
     def train_step(
         self,
@@ -3524,7 +3597,7 @@ class Trainer:
                 self.set_activity(f"warmup self-play ({self.warmup_steps} steps)")
             collect_key, key = jax.random.split(key)
             collect_keys = jax.random.split(collect_key, self.batch_size)
-            collection_state = self.collect_steps(
+            collection_state, _ = self.collect_steps(
                 collect_keys,
                 collection_state,
                 params,
@@ -3552,14 +3625,17 @@ class Trainer:
                 else None
             )
             self.set_activity(f"epoch {cur_epoch}: self-play")
-            collection_state = self.collect_steps(
+            collection_state, searches = self.collect_steps(
                 collect_keys,
                 collection_state,
                 params,
                 self.collection_steps_per_epoch,
                 evaluator=evaluator,
             )
-            collection_metrics = self.collection_metrics(before, collection_state)
+            collection_metrics = {
+                **self.collection_metrics(before, collection_state),
+                **search_metrics(searches),
+            }
             # self-play's time includes measuring its data, so that training's is its own
             jax.block_until_ready((collection_state, collection_metrics))
             selfplay_seconds = time.perf_counter() - epoch_started

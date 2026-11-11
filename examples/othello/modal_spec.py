@@ -32,6 +32,8 @@ CORE_PER_SECOND = 0.0000131
 GIB_PER_SECOND = 0.00000222
 # in-run games need Edax, which the image doesn't build
 UNSUPPORTED = ("--vs-engine-every", "--vs-engine-last")
+# the flags naming a file of this machine a step reads: a state to fork or branch from, a set
+INPUT_FLAGS = ("--init-from", "--branch-from", "--engine-set")
 
 
 def flag(argv: list[str], name: str) -> str | None:
@@ -128,16 +130,17 @@ def parse_step(text: str, home: str) -> Step:
         raise ValueError(f"a step needs a --ckpt-dir: {text!r}")
     if "--resume" in argv:
         raise ValueError("no --resume: a job resumes its steps itself")
-    init_from = flag(argv, "--init-from")
-    if init_from is not None and not re.fullmatch(STATE, Path(init_from).name):
-        raise ValueError(f"--init-from names a state-<EPOCH>.npz: {init_from}")
+    for name in ("--init-from", "--branch-from"):
+        state = flag(argv, name)
+        if state is not None and not re.fullmatch(STATE, Path(state).name):
+            raise ValueError(f"{name} names a state-<EPOCH>.npz: {state}")
     for name in UNSUPPORTED:
         if flag(argv, name) is not None:
             raise ValueError(
                 f"{name}: the Modal image has no Edax; the Elo league measures strength here"
             )
     root = Path(home) / ".cache" / "turbozero"
-    for path in (ckpt_dir, log, flag(argv, "--init-from"), flag(argv, "--engine-set")):
+    for path in (ckpt_dir, log, *(flag(argv, name) for name in INPUT_FLAGS)):
         if path is not None and not Path(path).is_relative_to(root):
             raise ValueError(f"{path} isn't under {root}: it wouldn't come back here")
     return Step(argv, log)

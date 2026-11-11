@@ -40,6 +40,7 @@ from core.networks.azresnet import batch_norm
 from core.networks.utils import apply_nn
 from core.testing.tester import BaseTester
 from core.testing.two_player_tester import TwoPlayerTester
+from core.training.exploration import Exploration
 from core.training.growth import Growth, GrowthProgress, Learner
 from core.training.loss_fns import az_default_loss_fn
 from core.training.lr_drop import LRDrop
@@ -56,6 +57,7 @@ from core.training.train import (
     read_state_meta,
     reduce_step_metrics,
     saved_growth,
+    search_metrics,
     state_epochs,
     state_path,
 )
@@ -414,7 +416,7 @@ def fake_loop(monkeypatch):
             )
             return replace(
                 state, episodes=state.episodes + 1, moves=state.moves + num_steps
-            )
+            ), {}
 
         def train_steps(
             key,
@@ -1196,7 +1198,7 @@ def test_self_play_and_training_carry_on_in_a_resized_buffer(env, tmp_path):
     def collect(state, num_steps, seed):
         keys = jax.random.split(jax.random.PRNGKey(seed), trainer.batch_size)
         before = CollectionStats.of(state)
-        state = trainer.collect_steps(keys, state, train_state.params, num_steps)
+        state, _ = trainer.collect_steps(keys, state, train_state.params, num_steps)
         return state, trainer.collection_metrics(before, state)
 
     def sampleable(state):
@@ -1543,7 +1545,7 @@ def test_collect_steps_runs_the_evaluator_it_is_given(env, tmp_path):
     keys = jax.random.split(jax.random.PRNGKey(1), trainer.batch_size)
 
     for evaluator in (first, second):
-        state = trainer.collect_steps(keys, state, params, 1, evaluator=evaluator)
+        state, _ = trainer.collect_steps(keys, state, params, 1, evaluator=evaluator)
 
     np.testing.assert_array_equal(
         state.buffer_state.buffer.search_value[:, :2], [[1.0, 2.0], [1.0, 2.0]]
@@ -1579,7 +1581,7 @@ class BudgetEvaluator(Evaluator):
     def search_cycles(self):
         return 3
 
-    def search_done(self, state, cycles):
+    def search_done(self, state, cycles, greedy=False):
         return cycles >= state.budget
 
     def search_cycle(self, key, state, cycle, *args, **kwargs):
@@ -1627,7 +1629,7 @@ def test_each_environment_plays_its_move_when_its_search_is_done(
     keys = jax.random.split(jax.random.PRNGKey(1), trainer.batch_size)
 
     # 2 moves of the longest search: 6 cycles
-    state = trainer.collect_steps(keys, state, None, 2)
+    state, _ = trainer.collect_steps(keys, state, None, 2)
 
     np.testing.assert_array_equal(state.moves, moves)
     np.testing.assert_array_equal(state.search_cycles, in_progress)
@@ -1653,7 +1655,7 @@ def test_each_move_starting_in_a_call_takes_the_calls_next_key(env, tmp_path):
     trainer, state = budget_collection(env, tmp_path, [1, 3], advance_every=1)
     keys = jax.random.split(jax.random.PRNGKey(1), trainer.batch_size)
 
-    state = trainer.collect_steps(keys, state, None, 2)
+    state, _ = trainer.collect_steps(keys, state, None, 2)
 
     # of the 6 cycles' keys, the first's 6th move took the 6th, and the second's 2nd the 2nd
     np.testing.assert_array_equal(state.move_key[0], jax.random.split(keys[0], 6)[5])
@@ -1707,7 +1709,7 @@ def test_collect_stores_only_the_moves_the_evaluator_trains_on(env, tmp_path):
     keys = jax.random.split(jax.random.PRNGKey(1), trainer.batch_size)
 
     # two whole games of 3 moves, and a move of a third
-    state = trainer.collect_steps(keys, state, None, 7)
+    state, _ = trainer.collect_steps(keys, state, None, 7)
 
     np.testing.assert_array_equal(state.moves, [7, 7])
     np.testing.assert_array_equal(state.episodes, [2, 2])
@@ -1725,6 +1727,65 @@ def test_collect_stores_only_the_moves_the_evaluator_trains_on(env, tmp_path):
     )
 
 
+def test_collect_steps_counts_the_searches_it_played_by_whether_they_train(
+    env, tmp_path
+):
+    trainer = make_trainer(env, tmp_path, evaluator=EveryOtherMove())
+    state = trainer.init_collection_state(jax.random.PRNGKey(0), trainer.batch_size)
+    keys = jax.random.split(jax.random.PRNGKey(1), trainer.batch_size)
+
+    # plies 0, 1, 2, 0, 1, 2, 0 in each of the 2 environments: 5 stored, a cycle each
+    state, counts = trainer.collect_steps(keys, state, None, 7)
+
+    assert {k: float(v) for k, v in search_metrics(counts).items()} == {
+        "full_searches": 10.0,
+        "full_search_cycles": 1.0,
+        "fast_searches": 4.0,
+        "fast_search_cycles": 1.0,
+    }
+    assert int(state.buffer_state.next_idx.sum()) == 10
+
+
+def test_search_metrics_leave_out_a_kind_without_searches():
+    counts = {
+        "full_searches": jnp.float32(4),
+        "full_cycles": jnp.float32(10),
+        "fast_searches": jnp.float32(0),
+        "fast_cycles": jnp.float32(0),
+    }
+
+    assert search_metrics(counts) == {"full_searches": 4, "full_search_cycles": 2.5}
+
+
+class GreedyStops(BudgetEvaluator):
+    """A `BudgetEvaluator` whose search stops after a cycle for a move played greedily."""
+
+    def search_done(self, state, cycles, greedy: Any = False):
+        return (cycles >= state.budget) | (greedy & (cycles >= 1))
+
+
+def test_a_search_is_told_whether_its_move_is_played_greedily(env, tmp_path):
+    # the first move of each 3-move game is sampled, the others played greedily
+    trainer = make_trainer(
+        env,
+        tmp_path,
+        evaluator=GreedyStops(),
+        advance_every=1,
+        exploration=Exploration(num_sampling_moves=1),
+    )
+    state = trainer.init_collection_state(jax.random.PRNGKey(0), trainer.batch_size)
+    keys = jax.random.split(jax.random.PRNGKey(1), trainer.batch_size)
+
+    # 6 cycles: 3 for the sampled move, 1 for each greedy one, then 1 of the next game's first
+    state, _ = trainer.collect_steps(keys, state, None, 2)
+
+    np.testing.assert_array_equal(state.moves, [3, 3])
+    np.testing.assert_array_equal(state.search_cycles, [1, 1])
+    np.testing.assert_array_equal(
+        state.buffer_state.buffer.search_value[:, :3], [[3, 1, 1]] * 2
+    )
+
+
 def test_collect_stores_each_position_once(env, tmp_path):
     trainer = tree_trainer(
         env,
@@ -1735,7 +1796,7 @@ def test_collect_stores_each_position_once(env, tmp_path):
     state = trainer.init_collection_state(jax.random.PRNGKey(0), trainer.batch_size)
     keys = jax.random.split(jax.random.PRNGKey(1), trainer.batch_size)
 
-    state = trainer.collect_steps(keys, state, None, 6)
+    state, _ = trainer.collect_steps(keys, state, None, 6)
 
     # the 6 moves' played positions, of two finished games of 3 moves, without transformed copies
     np.testing.assert_array_equal(state.moves, [6, 6])
@@ -2283,7 +2344,7 @@ def test_collection_updates_the_collection_state_in_place(real):
         assert analysis.alias_size_in_bytes == state_bytes
 
     stats = CollectionStats.of(state)
-    new_state = real.collect_steps(keys, state, params, STEPS, evaluator=evaluator)
+    new_state, _ = real.collect_steps(keys, state, params, STEPS, evaluator=evaluator)
 
     assert all(x.is_deleted() for x in jax.tree.leaves(state))
     assert not any(x.is_deleted() for x in jax.tree.leaves(new_state))

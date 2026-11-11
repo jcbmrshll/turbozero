@@ -22,9 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from modal_spec import (
-    STATE as STATE_PATTERN,
-)
-from modal_spec import (
+    INPUT_FLAGS,
     Job,
     Step,
     flag,
@@ -32,6 +30,9 @@ from modal_spec import (
     state_epochs_requested,
     with_monitor,
     without_flag,
+)
+from modal_spec import (
+    STATE as STATE_PATTERN,
 )
 from modal_store import GcsStore, Store, get_json, put_json
 
@@ -337,8 +338,11 @@ class Runner:
     def _command(self, step: Step, resume: bool) -> list[str]:
         argv = with_monitor(step.argv, self.seaglass_url)
         if resume:
+            # the step's own state takes the place of the one it started from
             argv = without_flag(argv, "--init-from", takes_value=True)
             argv = without_flag(argv, "--init-without-buffers", takes_value=False)
+            argv = without_flag(argv, "--branch-from", takes_value=True)
+            argv = without_flag(argv, "--take-over", takes_value=False)
             argv = [*argv, "--resume"]
         if flag(step.argv, "--save-state-every") is None:
             argv = [*argv, "--save-state-every", str(self.job.resume_every)]
@@ -364,8 +368,8 @@ class Runner:
             return "done"
         os.makedirs(step.ckpt_dir, exist_ok=True)
         os.makedirs(os.path.dirname(step.log), exist_ok=True)
-        ensure_input(self.store, job, flag(step.argv, "--init-from"))
-        ensure_input(self.store, job, flag(step.argv, "--engine-set"))
+        for name in INPUT_FLAGS:
+            ensure_input(self.store, job, flag(step.argv, name))
         resume = restore_step(self.store, job, self.name, index, step)
         if not resume:
             self._crash_runs(done.get("runs", []))

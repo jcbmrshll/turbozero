@@ -68,6 +68,20 @@ class Exploration:
         explore = jax.random.uniform(explore_key) < self.random_move_prob
         return jnp.where(explore, random_action, action)
 
+    def greedy(self, metadata: StepMetadata) -> jax.Array:
+        """Whether the move is played greedily, the action with the highest policy weight
+        (unless it's a random one, see `random_move_prob`): after the `num_sampling_moves`.
+
+        Args:
+            metadata: metadata of the current environment state (see `choose_action`)
+
+        Returns:
+            jax.Array: whether it is
+        """
+        if self.num_sampling_moves is None:
+            return jnp.array(False)
+        return metadata.step >= self.num_sampling_moves
+
     def get_config(self) -> dict:
         """Returns the configuration of the exploration settings. Used for logging."""
         return {
