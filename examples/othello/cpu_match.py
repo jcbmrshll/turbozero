@@ -14,6 +14,7 @@ the search does. `clock_match.py` plays on a clock, with a `NetPlayer` as "net:"
 import argparse
 import json
 import os
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,7 @@ import numpy as np
 from bench_cpu_backends import network_path
 from cpu_search import (
     PASS,
+    Engine,
     Eval,
     Search,
     SearchSettings,
@@ -69,6 +71,7 @@ class Player:
             if "max_collisions" in fields
             else None,
             random_symmetry=bool(int(fields.pop("random_symmetry", 0))),
+            reuse=bool(int(fields.pop("reuse", 1))),
         )
         return cls(net, backend, visits, settings)
 
@@ -251,8 +254,13 @@ def model_and_precision(name: str, arm: str) -> tuple[bytes | str, str]:
 
 
 def make_eval(name: str, backend: str, cores: int) -> Eval:
-    """The network `name` on `backend`: "ort", ONNX Runtime; else an arm of `model_and_precision`,
-    a stream to a core, or e.g. "bf16-s1", on that many streams."""
+    """The network `name` on `backend`: "ort", ONNX Runtime; "native", `cpu_net.py`'s; else an arm
+    of `model_and_precision`, a stream to a core, or e.g. "bf16-s1", on that many streams."""
+    if backend == "native":
+        from cpu_net import load_native
+
+        network = load_native(name)
+        return lambda x: network.forward(x, cores)
     if backend == "ort":
         path, net = network_path(name)
         model = export_checkpoint(path, net).SerializeToString()
@@ -260,6 +268,23 @@ def make_eval(name: str, backend: str, cores: int) -> Eval:
     arm, _, streams = backend.partition("-s")
     model, precision = model_and_precision(name, arm)
     return openvino_eval(model, cores, precision, int(streams) if streams else None)
+
+
+def make_engine(name: str, backend: str, cores: int, batch: int) -> Engine:
+    """The network `name` on `backend`, "native" (see `cpu_net.py`) or an arm of
+    `model_and_precision`, as an `Engine` of a worker to each of `cores`, each evaluating up to
+    `batch` leaves at a time."""
+    if backend == "native":
+        from cpu_net import load_native
+
+        return Engine.native(load_native(name), cores, batch)
+    model, precision = model_and_precision(name, backend)
+    if isinstance(model, str):
+        return Engine.openvino(model, cores, batch, precision)
+    with tempfile.NamedTemporaryFile(suffix=".onnx") as f:
+        f.write(model)
+        f.flush()
+        return Engine.openvino(f.name, cores, batch, precision)
 
 
 def match(args: argparse.Namespace) -> None:
@@ -324,14 +349,21 @@ def move_budget(seconds_left: float, empties: int, taper: int = 0) -> float:
 
 class NetPlayer:
     """Our side of a game on a per-game clock (`clock_match.Player`): a `Search` with its own
-    tree."""
+    tree, searched a batch at a time through `evaluate`, or by an `Engine`'s workers."""
 
     def __init__(
-        self, settings: SearchSettings, evaluate: Eval, taper: int = 0, seed: int = 0
+        self,
+        settings: SearchSettings,
+        evaluate: Eval | Engine,
+        taper: int = 0,
+        seed: int = 0,
+        visits: int = 0,
     ):
+        """`visits`, if any, a move, ignoring the clock."""
         self.search = Search(settings, seed)
         self.evaluate = evaluate
         self.taper = taper
+        self.visits = visits
         self.batch = np.empty((settings.batch, 2, 8, 8), np.float32)
         self.to_move = "b"
 
@@ -356,7 +388,17 @@ class NetPlayer:
             me, opp, _, _ = self.search.position()
             empties = 64 - (me | opp).bit_count()
             seconds = move_budget(seconds_left, empties, self.taper)
-            timed_move(self.search, seconds, self.batch, self.evaluate)
+            if isinstance(self.evaluate, Engine):
+                self.evaluate.search(
+                    self.search,
+                    visits=self.visits,
+                    seconds=seconds,
+                    stop_ended=0 if self.visits else ENDED_VISITS,
+                )
+            elif self.visits:
+                self.search.run(self.visits, self.evaluate)
+            else:
+                timed_move(self.search, seconds, self.batch, self.evaluate)
             action = self.search.best_action()
         self.search.play(action)
         return action

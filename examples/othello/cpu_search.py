@@ -22,6 +22,8 @@ from pathlib import Path
 import numpy as np
 
 SOURCE = Path(__file__).parent / "cpu_search.cpp"
+# what it includes of its own
+HEADERS = [Path(__file__).parent / "cpu_net.h"]
 CACHE_DIR = Path(
     os.environ.get("TURBOZERO_CACHE", Path.home() / ".cache" / "turbozero" / "othello")
 )
@@ -34,9 +36,60 @@ VIRTUAL_LOSS = {"loss": VL_LOSS, "visit": VL_VISIT, "draw": VL_DRAW}
 Eval = Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]]
 
 
+def openvino_paths() -> tuple[Path, Path]:
+    """OpenVINO's headers and its runtime library, from the installed Python package."""
+    import openvino
+
+    root = Path(openvino.__file__).parent
+    (library,) = (root / "libs").glob("libopenvino.so.*")
+    return root / "include", library
+
+
+def cpu_flags() -> set[str]:
+    """The CPU's feature flags, as Linux lists them."""
+    try:
+        text = Path("/proc/cpuinfo").read_text()
+    except OSError:
+        return set()
+    for line in text.splitlines():
+        if line.startswith("flags"):
+            return set(line.split(":", 1)[1].split())
+    return set()
+
+
+LEVELS = {
+    "v4": ["-march=x86-64-v4", "-mavx512vnni", "-mtune=generic"],
+    "v3": ["-march=x86-64-v3", "-mtune=generic"],
+    "v2": ["-march=x86-64-v2", "-mtune=generic"],
+}
+AVX512 = {"avx512f", "avx512bw", "avx512vl", "avx512dq", "avx512cd", "avx512_vnni"}
+
+
+def target_flags() -> list[str]:
+    """What the search is compiled for: a standard x86-64 level, not this CPU's own model, as engines
+    ship builds for. x86-64-v4 (AVX-512) with VNNI where the CPU has them, else x86-64-v3 (AVX2), or
+    v2, which has no native network (`cpu_net.h`). $TURBOZERO_X86_LEVEL ("v4", "v3", "v2") picks one,
+    e.g. to play as an AVX2 build would."""
+    level = os.environ.get("TURBOZERO_X86_LEVEL")
+    if level:
+        return LEVELS[level]
+    flags = cpu_flags()
+    if AVX512 <= flags:
+        return LEVELS["v4"]
+    if {"avx2", "bmi2", "fma", "movbe"} <= flags:
+        return LEVELS["v3"]
+    return LEVELS["v2"]
+
+
 def library_path() -> Path:
-    """The compiled search, built for this machine, named after its source."""
-    source = SOURCE.read_bytes()
+    """The compiled search, built for this machine's x86-64 level, named after its source, its
+    target and the OpenVINO it links."""
+    include, openvino = openvino_paths()
+    target = target_flags()
+    source = (
+        b"".join(p.read_bytes() for p in [SOURCE, *HEADERS])
+        + str([openvino, target]).encode()
+    )
     digest = hashlib.sha256(source).hexdigest()[:16]
     path = CACHE_DIR / "cpu-search" / f"cpu_search_{digest}.so"
     if not path.exists():
@@ -44,8 +97,9 @@ def library_path() -> Path:
         # named per process: several may be compiling at once
         partial = path.with_suffix(f".{os.getpid()}.tmp")
         subprocess.run(
-            ["g++", "-std=c++17", "-O3", "-march=native", "-shared", "-fPIC"]
-            + [str(SOURCE), "-o", str(partial)],
+            ["g++", "-std=c++17", "-O3", *target, "-fopenmp-simd", "-shared", "-fPIC"]
+            + [str(SOURCE), "-o", str(partial), f"-I{include}", str(openvino)]
+            + [f"-Wl,-rpath,{openvino.parent}", "-lpthread"],
             check=True,
         )
         partial.replace(path)
@@ -58,6 +112,7 @@ def load_library() -> ctypes.CDLL:
     ints = np.ctypeslib.ndpointer(np.int32, flags="C_CONTIGUOUS")
     u64 = ctypes.POINTER(ctypes.c_uint64)
     c_int = ctypes.POINTER(ctypes.c_int)
+    floats = ctypes.POINTER(ctypes.c_float)
     signatures = {
         "search_new": (
             Search,
@@ -65,6 +120,7 @@ def load_library() -> ctypes.CDLL:
                 ctypes.c_int,
                 ctypes.c_float,
                 ctypes.c_float,
+                ctypes.c_int,
                 ctypes.c_int,
                 ctypes.c_int,
                 ctypes.c_uint64,
@@ -88,8 +144,48 @@ def load_library() -> ctypes.CDLL:
         "search_collisions": (ctypes.c_long, [Search]),
         "search_total_visits": (ctypes.c_long, [Search]),
         "search_num_nodes": (ctypes.c_long, [Search]),
+        "search_reused": (ctypes.c_long, [Search]),
         "search_symmetric_bits": (ctypes.c_uint64, [ctypes.c_uint64, ctypes.c_int]),
         "search_symmetric_action": (ctypes.c_int, [ctypes.c_int, ctypes.c_int]),
+        "engine_new": (
+            ctypes.c_void_p,
+            [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int],
+        ),
+        "engine_new_net": (
+            ctypes.c_void_p,
+            [ctypes.c_void_p, ctypes.c_int, ctypes.c_int],
+        ),
+        "engine_free": (None, [ctypes.c_void_p]),
+        "net_supported": (ctypes.c_int, []),
+        "net_new": (ctypes.c_void_p, [ctypes.c_int, ctypes.c_int, ctypes.c_int]),
+        "net_free": (None, [ctypes.c_void_p]),
+        "net_add_block": (None, [ctypes.c_void_p, ctypes.c_int]),
+        "net_set_conv": (
+            ctypes.c_int,
+            [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+            + [ctypes.c_int, ctypes.POINTER(ctypes.c_int8), floats, floats]
+            + [floats, ctypes.c_int],
+        ),
+        "net_set_norm": (
+            ctypes.c_int,
+            [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+            + [floats, floats, ctypes.c_float],
+        ),
+        "net_set_linear": (
+            ctypes.c_int,
+            [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+            + [floats, floats],
+        ),
+        "net_set_heads": (None, [ctypes.c_void_p, floats]),
+        "net_forward": (
+            None,
+            [ctypes.c_void_p, ctypes.c_int, floats, floats, floats, ctypes.c_int],
+        ),
+        "engine_search": (
+            ctypes.c_long,
+            [ctypes.c_void_p, Search, ctypes.c_int, ctypes.c_double, ctypes.c_int],
+        ),
+        "engine_stats": (None, [ctypes.c_void_p, ctypes.POINTER(ctypes.c_double)]),
     }
     for name, (restype, argtypes) in signatures.items():
         fn = getattr(lib, name)
@@ -115,6 +211,11 @@ class SearchSettings:
             stops short; None for the batch's size
         random_symmetry: show the network each leaf in a random one of the board's 8 symmetries,
             drawn from the search's seed
+        reuse: give a leaf whose position the game's searches have evaluated before, reached by
+            another order of moves, that evaluation rather than the network's (Leela Chess Zero's
+            cache of evaluations, here the tree itself): about 14-17% of leaves at 1000-4000
+            visits, more near the end. Without `random_symmetry` the search is the same, only
+            cheaper.
     """
 
     batch: int = 1
@@ -123,6 +224,7 @@ class SearchSettings:
     c_init: float = 1.25
     max_collisions: int | None = None
     random_symmetry: bool = False
+    reuse: bool = True
 
 
 class Search:
@@ -139,6 +241,7 @@ class Search:
             settings.c_init,
             settings.batch if collisions is None else collisions,
             settings.random_symmetry,
+            settings.reuse,
             seed,
         )
         LIB.search_reset(self.handle)
@@ -236,6 +339,67 @@ class Search:
 
     def num_nodes(self) -> int:
         return LIB.search_num_nodes(self.handle)
+
+    def reused(self) -> int:
+        """Leaves that took an evaluation from elsewhere in the tree, of the same position reached
+        by another order of moves, rather than the network's."""
+        return LIB.search_reused(self.handle)
+
+
+class Engine:
+    """A network on `threads` cores, searching one tree at a time with a worker thread to a core
+    (see `engine_search` in `cpu_search.cpp`): each collects up to `batch` leaves, evaluates them on
+    its own core while the others go on, and backs them up, all in C++. Made by `openvino` or
+    `native`."""
+
+    def __init__(self, handle: int, threads: int, batch: int, network=None):
+        self.handle = handle
+        self.threads = threads
+        self.batch = batch
+        # what the engine's C++ evaluates with, which must outlive it
+        self.network = network
+
+    @classmethod
+    def openvino(
+        cls, model: str, threads: int, batch: int, precision: str = "f32"
+    ) -> "Engine":
+        """`model`, a saved OpenVINO model or ONNX graph's path, compiled by OpenVINO for each
+        worker and number of leaves, computing what isn't quantized in `precision`."""
+        handle = LIB.engine_new(str(model).encode(), precision.encode(), threads, batch)
+        if not handle:
+            raise RuntimeError(f"couldn't compile {model}")
+        return cls(handle, threads, batch)
+
+    @classmethod
+    def native(cls, network, threads: int, batch: int) -> "Engine":
+        """A `cpu_net.NativeNet`, its workers each evaluating their leaves one at a time."""
+        handle = LIB.engine_new_net(network.handle, threads, batch)
+        if not handle:
+            raise RuntimeError("the native network needs AVX2 or AVX-512 VNNI")
+        return cls(handle, threads, batch, network)
+
+    def __del__(self) -> None:
+        if getattr(self, "handle", None):
+            LIB.engine_free(self.handle)
+
+    def search(
+        self,
+        search: "Search",
+        visits: int = 0,
+        seconds: float = 0.0,
+        stop_ended: int = 0,
+    ) -> int:
+        """`visits` visits of `search`'s tree, or with none, as many as `seconds` allow; stopping
+        early once `stop_ended` traversals in a row end the game. Returns the leaves evaluated."""
+        return LIB.engine_search(
+            self.handle, search.handle, visits, seconds, stop_ended
+        )
+
+    def stats(self) -> dict[str, float]:
+        """Calls of the network, leaves and seconds inferring summed over workers, so far."""
+        out = (ctypes.c_double * 3)()
+        LIB.engine_stats(self.handle, out)
+        return {"calls": out[0], "leaves": out[1], "infer_seconds": out[2]}
 
 
 def compile_model(model: bytes | str, precision: str, cores: int, streams: int, core):

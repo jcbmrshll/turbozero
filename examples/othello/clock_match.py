@@ -22,7 +22,7 @@ import math
 import os
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Protocol
 
@@ -134,12 +134,14 @@ class Game:
         seconds: each side's time used, black's then white's
         move_seconds: the time of each move searched, as (empties, black?, seconds)
         flagged: who ran out of time first, "b" or "w", if anyone did
+        moves: every move, the opening's first, as squares (bit 0 is a1); passes aren't moves
     """
 
     margin: int = 0
     seconds: list[float] = field(default_factory=lambda: [0.0, 0.0])
     move_seconds: list[tuple[int, bool, float]] = field(default_factory=list)
     flagged: str | None = None
+    moves: list[int] = field(default_factory=list)
 
 
 def play_game(
@@ -153,6 +155,7 @@ def play_game(
     for move in opening:
         color = board.color
         board.play(int(move))
+        game.moves.append(int(move))
         for player in players:
             player.play(color, int(move))
     while board.legal():
@@ -167,6 +170,7 @@ def play_game(
         if game.flagged is None and game.seconds[side] > seconds + GRACE:
             game.flagged = color
         board.play(move)
+        game.moves.append(int(move))
         players[not side].play(color, move)
     game.margin = board.margin()
     return game
@@ -244,17 +248,27 @@ def summarize(games: list[Game], a_black: list[bool], seconds: float) -> dict:
 
 def net_player(options: dict[str, str]) -> Callable[[], Player]:
     """What builds a network's player, which all games share a network for. Its `options` are
-    `cpu_match.Player.parse`'s, with `net`, and `taper` (see `cpu_match.move_budget`)."""
-    from cpu_match import NetPlayer, make_eval
+    `cpu_match.Player.parse`'s, with `net`, `taper` (see `cpu_match.move_budget`), `engine=1`
+    to search with a worker thread to a core (`cpu_search.Engine`), `batch` then the leaves each
+    evaluates at a time, and `threads`, the cores used, by default all it may run on. With
+    `visits`, it searches so many a move, ignoring the clock."""
+    from cpu_match import NetPlayer, make_engine, make_eval
     from cpu_match import Player as NetSpec
 
+    options = dict(options)
+    native = bool(int(options.pop("engine", 0)))
+    cores = int(options.pop("threads", len(os.sched_getaffinity(0))))
     fields = ",".join(f"{k}={v}" for k, v in options.items())
     spec = NetSpec.parse(f"visits=0,{fields}", options["net"], "bf16")
-    evaluate = make_eval(spec.net, spec.backend, len(os.sched_getaffinity(0)))
+    evaluate = (
+        make_engine(spec.net, spec.backend, cores, spec.settings.batch)
+        if native
+        else make_eval(spec.net, spec.backend, cores)
+    )
     taper = int(options.get("taper", 0))
     # a seed to a game, for its draws of symmetries
     seeds = itertools.count()
-    return lambda: NetPlayer(spec.settings, evaluate, taper, next(seeds))
+    return lambda: NetPlayer(spec.settings, evaluate, taper, next(seeds), spec.visits)
 
 
 def make_player(spec: str, seconds: int) -> Callable[[], Player]:
@@ -309,6 +323,12 @@ def main() -> None:
     parser.add_argument("--openings", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--results", type=Path, default=None)
+    parser.add_argument(
+        "--games",
+        type=Path,
+        default=None,
+        help="where each game is written, a line each",
+    )
     args = parser.parse_args()
 
     pool = load_xot(XOT_PATH)
@@ -316,6 +336,10 @@ def main() -> None:
     openings = pool[rng.choice(len(pool), size=args.openings, replace=False)]
 
     def report(games: list[Game], a_black: list[bool]) -> None:
+        if args.games is not None:
+            game = games[-1]
+            with open(args.games, "a") as f:
+                f.write(json.dumps({"a_black": a_black[-1], **asdict(game)}) + "\n")
         if len(games) % 20 == 0:
             print(json.dumps(summarize(games, a_black, args.seconds)), flush=True)
 
