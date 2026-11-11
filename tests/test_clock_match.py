@@ -241,3 +241,13 @@ def test_a_summary_counts_results_and_writes_as_json():
     assert summary["board_losses"] == 2
     assert summary["margins"] == [4, -2, 0, -6]
     json.dumps(summary)
+
+
+def test_a_game_records_its_moves_from_the_opening(clock):
+    game, _ = play_with(clock, 1000)
+    board = Board()
+    for move in game.moves:
+        board.play(move)
+    assert not board.legal()
+    assert board.margin() == game.margin
+    assert len(game.moves) == (board.discs[0] | board.discs[1]).bit_count() - 4

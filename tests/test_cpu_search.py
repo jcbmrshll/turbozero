@@ -118,6 +118,45 @@ def test_a_batch_of_one_visits_as_core_does():
     assert np.array_equal(search.visits(), core_visits(sims, moves))
 
 
+def test_reused_evaluations_search_as_core_does():
+    from cpu_search import Search, SearchSettings
+
+    # deep enough that the searches below reach positions by more than one order of moves
+    moves = [37, 45, 53, 38, 46, 54, 55, 20, 21, 47]
+    sims = 400
+    searches = {}
+    for reuse in (True, False):
+        search = Search(SearchSettings(reuse=reuse))
+        for action in moves:
+            search.play(action)
+        search.run(sims + 1, fake_eval)
+        searches[reuse] = search
+    assert searches[True].reused() > 0
+    assert searches[False].reused() == 0
+    assert np.array_equal(searches[True].visits(), core_visits(sims, moves))
+    assert np.array_equal(searches[False].visits(), searches[True].visits())
+
+
+def test_a_game_searched_a_leaf_at_a_time_evaluates_no_position_twice():
+    from cpu_search import Search
+
+    seen = set()
+
+    def recording(x):
+        for row in x:
+            key = row.tobytes()
+            assert key not in seen
+            seen.add(key)
+        return fake_eval(x)
+
+    search = Search()
+    while not search.terminated() and search.total_visits() < 6000:
+        search.run(300, recording)
+        search.play(search.best_action())
+    assert search.reused() > 0
+    assert len(seen) + search.reused() <= search.total_visits()
+
+
 @pytest.mark.parametrize("mode", ["loss", "draw", "visit"])
 def test_batches_keep_the_tree_consistent(mode):
     from cpu_search import Search, SearchSettings
@@ -572,3 +611,214 @@ def test_a_net_player_passes_when_the_game_does():
     player.move(color, 0.01)
     me, opp, _, _ = player.search.position()
     assert (me | opp).bit_count() == 4 + sum(m != PASS for m in moves) + 1
+
+
+@pytest.fixture(scope="module")
+def tiny_model(tmp_path_factory):
+    """A small random network's ONNX graph, on disk, as an `Engine` reads it."""
+    import equinox as eqx
+    from export_onnx import to_onnx
+    from game import make_network
+
+    network, state = make_network(
+        "resnet:2x8,pool_every=2,heads=pooled,pool_channels=4,head_channels=4"
+    )
+    params, static = eqx.partition(network, eqx.is_inexact_array)
+    rng = np.random.default_rng(2)
+    params = jax.tree.map(
+        lambda x: x + 0.3 * rng.normal(size=x.shape).astype(x.dtype), params
+    )
+    model = eqx.nn.inference_mode(eqx.combine(params, static))
+    path = tmp_path_factory.mktemp("engine") / "tiny.onnx"
+    path.write_bytes(to_onnx(model, state).SerializeToString())
+    return str(path)
+
+
+def test_an_engine_of_one_worker_searches_as_a_batch_of_one(tiny_model):
+    from cpu_search import Engine, Search, openvino_eval
+
+    reference, native = Search(), Search()
+    for search in (reference, native):
+        for action in (19, 18, 26):
+            search.play(action)
+    reference.run(300, openvino_eval(tiny_model, 1, "f32"))
+    Engine.openvino(tiny_model, 1, 1).search(native, visits=300)
+    assert np.array_equal(native.visits(), reference.visits())
+    assert native.total_visits() == reference.total_visits() == 300
+
+
+@pytest.mark.parametrize("mode", ["loss", "visit"])
+def test_workers_visit_exactly_and_leave_nothing_in_flight(tiny_model, mode):
+    from cpu_search import Engine, Search, SearchSettings
+
+    engine = Engine.openvino(tiny_model, 3, 4)
+    search = Search(SearchSettings(batch=4, virtual_loss=mode))
+    leaves = engine.search(search, visits=500)
+    assert search.total_visits() == 500
+    assert search.visits().sum() == 499
+    assert 0 < leaves <= 500
+    # the tree carries on as a sequential search would see it
+    search.play(search.best_action())
+    before = search.total_visits()
+    engine.search(search, visits=100)
+    assert search.total_visits() == before + 100
+    stats = engine.stats()
+    assert stats["calls"] > 0 and stats["leaves"] >= leaves
+
+
+def test_a_timed_search_stops_at_its_time(tiny_model):
+    import time
+
+    from cpu_search import Engine, Search, SearchSettings
+
+    engine = Engine.openvino(tiny_model, 2, 2)
+    search = Search(SearchSettings(batch=2, virtual_loss="visit"))
+    start = time.perf_counter()
+    engine.search(search, seconds=0.05)
+    assert 0.05 <= time.perf_counter() - start < 0.5
+    assert search.total_visits() > 10
+
+
+def test_a_solved_tree_stops_its_search_early(tiny_model):
+    from cpu_search import Engine, Search, SearchSettings
+
+    # a random game to a few empty squares: the whole tree below is soon all games' ends
+    rng = np.random.default_rng(3)
+    search = Search(SearchSettings(batch=2, virtual_loss="visit"))
+    while True:
+        me, opp, _, _ = search.position()
+        if 64 - (me | opp).bit_count() <= 4 or search.terminated():
+            break
+        search.play(int(rng.choice(np.flatnonzero(search.legal()))))
+    assert not search.terminated()
+    Engine.openvino(tiny_model, 2, 2).search(search, seconds=5.0, stop_ended=64)
+    # far fewer than 5 s of visits
+    assert search.total_visits() < 100_000
+
+
+def test_an_engine_player_plays_a_game_through_the_clock_driver(tiny_model):
+    from clock_match import play_game
+    from cpu_match import NetPlayer
+    from cpu_search import Engine, SearchSettings
+    from xot import XOT_PATH, load_xot
+
+    engine = Engine.openvino(tiny_model, 2, 2)
+    black = NetPlayer(SearchSettings(batch=2, virtual_loss="visit"), engine, seed=1)
+    white = NetPlayer(SearchSettings(batch=1), fake_eval)
+    game = play_game(black, white, load_xot(XOT_PATH)[0], 1.0)
+    assert game.flagged is None
+    assert max(game.seconds) < 1.1
+
+
+def native_supported() -> bool:
+    from cpu_search import LIB
+
+    return bool(LIB.net_supported())
+
+
+def random_network(spec: str, seed: int = 1):
+    """A network of `spec` in inference mode, every weight nonzero and normalizations not the
+    identity, with its state."""
+    import equinox as eqx
+    from game import make_network
+
+    network, state = make_network(spec)
+    rng = np.random.default_rng(seed)
+    params, static = eqx.partition(network, eqx.is_inexact_array)
+    params = jax.tree.map(
+        lambda x: (
+            x
+            + (0.3 if x.ndim == 1 else 0.05) * rng.normal(size=x.shape).astype(x.dtype)
+        ),
+        params,
+    )
+    return eqx.nn.inference_mode(eqx.combine(params, static)), state
+
+
+NATIVE_SPECS = [
+    "resnet:2x32,pool_every=2,heads=pooled,pool_channels=16,head_channels=16",
+    "resnet:3x64,pool_every=2,heads=pooled,pool_channels=16,norm=channel,layout=pre",
+    # pooled channels leaving a number of others that is no multiple of 16
+    "resnet:2x48,pool_every=1,heads=pooled,pool_channels=8,head_channels=16,layout=pre",
+    "resnet:2x48,pool_every=2,heads=pooled,pool_channels=24,head_channels=16",
+]
+
+
+@pytest.mark.parametrize("spec", NATIVE_SPECS)
+def test_the_native_networks_layers_compute_the_network(spec):
+    import cpu_net
+    from cpu_search import ort_eval, ort_session
+    from export_onnx import to_onnx
+
+    # against the exported graph, which `test_export_matches_the_network` checks against the network
+    model, state = random_network(spec)
+    x = (np.random.default_rng(0).random((16, 2, 8, 8)) < 0.3).astype(np.float32)
+    logits, values = ort_eval(
+        ort_session(to_onnx(model, state).SerializeToString(), 1)
+    )(x)
+    got_logits, got_values = cpu_net.float_forward(cpu_net.extract(model, state), x)
+    np.testing.assert_allclose(got_logits, logits, atol=1e-5)
+    np.testing.assert_allclose(got_values, values, atol=1e-5)
+
+
+@pytest.mark.parametrize("spec", NATIVE_SPECS)
+def test_the_native_network_computes_its_quantized_layers(spec, tmp_path):
+    import cpu_net
+
+    if not native_supported():
+        pytest.skip("needs AVX-512 VNNI")
+    program = cpu_net.extract(*random_network(spec))
+    x = (np.random.default_rng(0).random((48, 2, 8, 8)) < 0.3).astype(np.float32)
+    quantized = cpu_net.quantize(program, x)
+    # saved and loaded as play loads it
+    cpu_net.save(tmp_path / "net.npz", program, quantized)
+    program, quantized = cpu_net.load(tmp_path / "net.npz")
+    want_logits, want_values = cpu_net.int8_forward(program, quantized, x)
+    network = cpu_net.NativeNet(program, quantized)
+    for threads in (1, 3):
+        logits, values = network.forward(x, threads)
+        # float sums in another order can round an activation to the next step, rarely
+        np.testing.assert_allclose(logits, want_logits, atol=2e-2)
+        np.testing.assert_allclose(values, want_values, atol=2e-2)
+        assert np.abs(logits - want_logits).mean() < 1e-3
+    # and quantized, it stays close to the float network
+    float_logits, _ = cpu_net.float_forward(program, x)
+    assert np.abs(logits - float_logits).mean() < 0.05
+
+
+def test_an_engine_of_the_native_network_searches_as_a_batch_of_one():
+    import cpu_net
+    from cpu_search import Engine, Search
+
+    if not native_supported():
+        pytest.skip("needs AVX-512 VNNI")
+    program = cpu_net.extract(*random_network(NATIVE_SPECS[1]))
+    x = (np.random.default_rng(0).random((48, 2, 8, 8)) < 0.3).astype(np.float32)
+    network = cpu_net.NativeNet(program, cpu_net.quantize(program, x))
+    reference, native = Search(), Search()
+    for search in (reference, native):
+        for action in (19, 18, 26):
+            search.play(action)
+    reference.run(300, network.forward)
+    Engine.native(network, 1, 1).search(native, visits=300)
+    assert np.array_equal(native.visits(), reference.visits())
+    # and with workers in parallel, every visit is made
+    parallel = Search()
+    Engine.native(network, 3, 2).search(parallel, visits=400)
+    assert parallel.total_visits() == 400
+
+
+def test_the_search_is_built_for_a_standard_x86_level(monkeypatch):
+    import native_target
+
+    monkeypatch.delenv("TURBOZERO_X86_LEVEL", raising=False)
+    avx512 = {"avx512f", "avx512bw", "avx512vl", "avx512dq", "avx512cd", "avx512_vnni"}
+    for flags, level in [
+        (avx512 | {"avx2", "bmi2", "fma", "movbe"}, "-march=x86-64-v4"),
+        ({"avx2", "bmi2", "fma", "movbe", "avx512f"}, "-march=x86-64-v3"),
+        (set(), "-march=x86-64-v2"),
+    ]:
+        monkeypatch.setattr(native_target, "cpu_flags", lambda flags=flags: flags)
+        target = native_target.target_flags()
+        assert target[0] == level
+        assert not any("native" in flag for flag in target)
