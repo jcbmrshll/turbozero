@@ -899,7 +899,7 @@ at every step; here the network's time is 90-97% of the search's. `backend=nativ
 thread needs only one leaf in flight. The library is built for a standard x86-64 level, as engines
 ship builds for: AVX-512 with VNNI (x86-64-v4) where the CPU has them, else AVX2 (x86-64-v3), with
 AVX-VNNI where the CPU has it (Intel's client chips from Alder Lake, which lack AVX-512).
-`TURBOZERO_X86_LEVEL` (`v4`, `v3-vnni`, `v3`) picks one, e.g. to play as an AVX2 build would. AVX2's
+`TURBOZERO_CPU_LEVEL` (`v4`, `v3-vnni`, `v3`) picks one, e.g. to play as an AVX2 build would. AVX2's
 3x3 convolutions run Winograd's F(2x2, 3x3) in integers: each 2x2 tile's 4x4 input patch and the
 weights are transformed into values that fit 16 bits, multiplied in pairs summed into 32 bits, and
 transformed back, which gives exactly VNNI's sums in 16 products where the direct convolution takes

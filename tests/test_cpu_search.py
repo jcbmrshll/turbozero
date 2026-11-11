@@ -717,10 +717,10 @@ def native_supported() -> bool:
 
 
 def native_levels() -> list[str]:
-    """The x86-64 levels with a native network that this CPU runs."""
+    """The levels with a native network that this CPU runs."""
     import native_target
 
-    return [level for level in native_target.levels() if level != "v2"]
+    return [level for level in native_target.levels() if level not in ("v2", "arm")]
 
 
 _LIBRARIES = {}
@@ -731,9 +731,9 @@ def library(level: str, monkeypatch):
     from cpu_search import load_library
 
     if level not in native_levels():
-        pytest.skip(f"this CPU doesn't run x86-64 level {level}")
+        pytest.skip(f"this CPU doesn't run level {level}")
     if level not in _LIBRARIES:
-        monkeypatch.setenv("TURBOZERO_X86_LEVEL", level)
+        monkeypatch.setenv("TURBOZERO_CPU_LEVEL", level)
         _LIBRARIES[level] = load_library()
     return _LIBRARIES[level]
 
@@ -783,8 +783,8 @@ def test_the_native_networks_layers_compute_the_network(spec):
     np.testing.assert_allclose(got_values, values, atol=1e-5)
 
 
-# each convolution kernel: AVX-512 VNNI's, and AVX2's Winograd with and without AVX-VNNI
-@pytest.mark.parametrize("level", ["v4", "v3-vnni", "v3"])
+# each convolution kernel: AVX-512 VNNI's, AVX2's Winograd with and without AVX-VNNI, and NEON's
+@pytest.mark.parametrize("level", ["v4", "v3-vnni", "v3", "arm-dotprod"])
 @pytest.mark.parametrize("spec", NATIVE_SPECS)
 def test_the_native_network_computes_its_quantized_layers(
     spec, level, tmp_path, monkeypatch
@@ -831,7 +831,7 @@ def test_an_engine_of_the_native_network_searches_as_a_batch_of_one():
     from cpu_search import Engine, Search
 
     if not native_supported():
-        pytest.skip("needs AVX2")
+        pytest.skip("needs AVX2 or NEON's dot product")
     program = cpu_net.extract(*random_network(NATIVE_SPECS[1]))
     x = (np.random.default_rng(0).random((48, 2, 8, 8)) < 0.3).astype(np.float32)
     network = cpu_net.NativeNet(program, cpu_net.quantize(program, x))
@@ -848,19 +848,22 @@ def test_an_engine_of_the_native_network_searches_as_a_batch_of_one():
     assert parallel.total_visits() == 400
 
 
-def test_the_search_is_built_for_a_standard_x86_level(monkeypatch):
+def test_the_search_is_built_for_a_standard_level(monkeypatch):
     import native_target
 
-    monkeypatch.delenv("TURBOZERO_X86_LEVEL", raising=False)
+    monkeypatch.delenv("TURBOZERO_CPU_LEVEL", raising=False)
     avx512 = {"avx512f", "avx512bw", "avx512vl", "avx512dq", "avx512cd", "avx512_vnni"}
-    for flags, level in [
-        (avx512 | {"avx2", "bmi2", "fma", "movbe", "avx_vnni"}, "v4"),
-        ({"avx2", "bmi2", "fma", "movbe", "avx_vnni"}, "v3-vnni"),
-        ({"avx2", "bmi2", "fma", "movbe", "avx512f"}, "v3"),
-        (set(), "v2"),
+    for architecture, flags, level in [
+        ("x86", avx512 | {"avx2", "bmi2", "fma", "movbe", "avx_vnni"}, "v4"),
+        ("x86", {"avx2", "bmi2", "fma", "movbe", "avx_vnni"}, "v3-vnni"),
+        ("x86", {"avx2", "bmi2", "fma", "movbe", "avx512f"}, "v3"),
+        ("x86", set(), "v2"),
+        ("arm", {"fp", "asimd", "asimddp", "i8mm"}, "arm-dotprod"),
+        ("arm", {"fp", "asimd"}, "arm"),
     ]:
+        monkeypatch.setattr(native_target, "architecture", lambda a=architecture: a)
         monkeypatch.setattr(native_target, "cpu_flags", lambda flags=flags: flags)
         target = native_target.target_flags()
         assert target == native_target.LEVELS[level]
-        assert target[0].startswith("-march=x86-64-")
+        assert target[0].startswith("-march=")
         assert not any("native" in flag for flag in target)

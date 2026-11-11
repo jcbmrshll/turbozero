@@ -9,22 +9,28 @@
 // global pooling then take in float. A normalization of each square's channels (ConvNeXt's LayerNorm)
 // costs about what a ReLU does here, where OpenVINO runs it as separate ops.
 //
-// The convolutions come in two kernels, for the x86-64 levels engines ship builds for: AVX-512 with VNNI
-// (x86-64-v4), 4 products a lane an instruction, and AVX2 (x86-64-v3), the 8-bit values widened to 16
-// bits, 2 products a lane, which sums exactly what VNNI does. The float parts are plain loops the
-// compiler vectorizes for either. Below AVX2 the library builds without the network.
+// The convolutions come in three kernels, for the levels engines ship builds for: AVX-512 with VNNI
+// (x86-64-v4), 4 products a lane an instruction; AVX2 (x86-64-v3), Winograd's F(2x2, 3x3) in 16-bit
+// integers; and ARM's NEON with the dot product (ARMv8.2, Apple's M1 on), 4 products a lane. All three
+// sum exactly the same integers. Elsewhere the library builds without the network.
 #pragma once
 
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
 #define NET_ISA 2
 #elif defined(__AVX2__) && defined(__FMA__)
 #define NET_ISA 1
+#elif defined(__aarch64__) && defined(__ARM_FEATURE_DOTPROD)
+#define NET_ISA 3
 #else
 #define NET_ISA 0
 #endif
 #define NET_NATIVE (NET_ISA > 0)
 
+#if defined(__x86_64__)
 #include <immintrin.h>
+#elif defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -41,12 +47,16 @@ constexpr int SQUARES = 64;
 // the input of a 3x3 convolution: the board with a border of a square all round
 constexpr int PADDED = 100;
 
-// a convolution's quantized input: 8 bits for VNNI, widened to 16 for AVX2
+// a convolution's quantized input: 8 bits for VNNI, widened to 16 for AVX2, and for NEON, whose dot
+// product takes signed bytes, less 128, which `Conv::offset` adds back
 #if NET_ISA == 2
 using Activation = uint8_t;
+#elif NET_ISA == 3
+using Activation = int8_t;
 #else
 using Activation = int16_t;
 #endif
+constexpr int ACTIVATION_SHIFT = NET_ISA == 3 ? 128 : 0;
 
 struct Conv {
     int cin = 0, cout = 0, k = 3;
@@ -54,6 +64,7 @@ struct Conv {
     std::vector<int8_t> packed;
     std::vector<int16_t> packed16;
     std::vector<float> scale, bias;  // of each output: acc * scale + bias
+    std::vector<int32_t> offset;  // NEON: 128 times each output's weights' sum
     std::vector<float> inverse;  // of each input channel: its quantization is round(x * inverse) + zero_point
     int zero_point = 0;
 };
@@ -104,7 +115,8 @@ struct Scratch {
     std::vector<int16_t> winograd;  // (16, 16 tiles, max channels): AVX2's transformed input
     explicit Scratch(const Net& n) {
         int c = std::max(n.channels, 4);
-        padded.assign((size_t)PADDED * c, 0);
+        // and room for NEON's loads of 16 channels past the last square's
+        padded.assign((size_t)PADDED * c + 16, 0);
         winograd.assign((size_t)16 * 16 * c, 0);
         x.assign((size_t)SQUARES * c, 0);
         y.assign((size_t)SQUARES * c, 0);
@@ -174,7 +186,7 @@ inline void convolve(const Conv& c, Scratch& s, float* out, int out_stride) {
         }
     }
 }
-#else
+#elif NET_ISA == 1
 // AVX2: 3x3 convolutions by Winograd's F(2x2, 3x3) in integers, the 1x1 directly. Each 2x2 tile of
 // outputs comes from its 4x4 patch of the padded input: the patch is transformed (B^T d B: sums and
 // differences, values within +-1020), multiplied value by value with the weights transformed (G g G^T,
@@ -315,6 +327,53 @@ inline void convolve(const Conv& c, Scratch& s, float* out, int out_stride) {
         winograd_output(c, m, 16 * g, out, out_stride);
     }
 }
+#else
+// NEON with the dot product: the board's row of 8 squares by 8 outputs, 16 sums, 8 squares' inputs of 16
+// channels and 2 weight vectors, 26 of its 32 registers, each weight used 8 times. An sdot multiplies 4
+// outputs' weights for 4 channels by one square's 4 channels, picked from its vector by lane.
+template <int K>
+inline void conv_row(const Conv& c, const int8_t* w, const int8_t* in, int y, int o, float* out, int out_stride) {
+    const int c4n = c.cin / 4;
+    int32x4_t acc[8][2];
+    for (int i = 0; i < 8; i++) acc[i][0] = acc[i][1] = vdupq_n_s32(0);
+    for (int t = 0; t < K * K; t++) {
+        int dy = K == 3 ? t / 3 : 1, dx = K == 3 ? t % 3 : 1;
+        const int8_t* row = in + ((y + dy) * 10 + dx) * c.cin;
+        const int8_t* wt = w + (size_t)t * c4n * 32;
+        for (int c4 = 0; c4 < c4n; c4 += 4) {
+            int8x16_t a[8];
+            for (int i = 0; i < 8; i++) a[i] = vld1q_s8(row + i * c.cin + 4 * c4);
+            // the lane must be a constant; channels come in fours, so the last group may be short
+#define NET_LANE(L)                                                                  \
+            if (c4 + L < c4n) {                                                      \
+                int8x16_t w0 = vld1q_s8(wt + (c4 + L) * 32), w1 = vld1q_s8(wt + (c4 + L) * 32 + 16); \
+                for (int i = 0; i < 8; i++) {                                        \
+                    acc[i][0] = vdotq_laneq_s32(acc[i][0], w0, a[i], L);             \
+                    acc[i][1] = vdotq_laneq_s32(acc[i][1], w1, a[i], L);             \
+                }                                                                    \
+            }
+            NET_LANE(0) NET_LANE(1) NET_LANE(2) NET_LANE(3)
+#undef NET_LANE
+        }
+    }
+    for (int r = 0; r < 2; r++) {
+        int32x4_t offset = vld1q_s32(c.offset.data() + o + 4 * r);
+        float32x4_t m = vld1q_f32(c.scale.data() + o + 4 * r), b = vld1q_f32(c.bias.data() + o + 4 * r);
+        for (int i = 0; i < 8; i++)
+            vst1q_f32(out + (y * 8 + i) * out_stride + o + 4 * r,
+                      vfmaq_f32(b, vcvtq_f32_s32(vaddq_s32(acc[i][r], offset)), m));
+    }
+}
+
+inline void convolve(const Conv& c, Scratch& s, float* out, int out_stride) {
+    const Activation* in = s.padded.data();
+    const size_t group = (size_t)c.k * c.k * (c.cin / 4) * 32;
+    for (int g = 0; g < c.cout / 8; g++)
+        for (int y = 0; y < 8; y++) {
+            if (c.k == 3) conv_row<3>(c, c.packed.data() + g * group, in, y, 8 * g, out, out_stride);
+            else conv_row<1>(c, c.packed.data() + g * group, in, y, 8 * g, out, out_stride);
+        }
+}
 #endif
 
 #if NET_ISA == 2
@@ -432,8 +491,9 @@ inline void residual(float* x, const float* y, int count, bool relu_after) {
 }
 
 #else
-// AVX2: the quantization and normalizations by hand, 8 lanes, as AVX-512's above; the rest plain loops,
-// which the compiler vectorizes
+#if NET_ISA == 1
+// AVX2: the quantization and normalizations by hand, 8 lanes, as AVX-512's above; the rest, and NEON's,
+// plain loops, which the compiler vectorizes
 // the first `n` of 8 lanes (all when n >= 8)
 inline __m256i lanes8(int n) {
     return _mm256_cmpgt_epi32(_mm256_set1_epi32(n), _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
@@ -503,6 +563,59 @@ inline void normalize_square(const Norm& n, float* v, int ch, bool relu) {
         for (int i = 0; i < ch; i += 8) store8(v + i, _mm256_max_ps(load8(v + i, ch - i), zero), ch - i);
     }
 }
+
+#else
+// the first `c.cin` channels of `x`, (64, stride), quantized into `padded` for `c`, its border the zero
+// point
+inline void quantize(const Conv& c, const float* x, int stride, Activation* padded) {
+    const int channels = c.cin;
+    std::fill(padded, padded + (size_t)PADDED * channels, (Activation)(c.zero_point - ACTIVATION_SHIFT));
+    const float* inverse = c.inverse.data();
+    const float zp = (float)c.zero_point;
+    // adding and taking away 1.5 * 2^23 rounds to the nearest integer, ties to even, as `rint` does
+    const float round = 12582912.0f;
+    for (int s = 0; s < SQUARES; s++) {
+        const float* v = x + s * stride;
+        Activation* q = padded + ((s / 8 + 1) * 10 + s % 8 + 1) * channels;
+#pragma omp simd
+        for (int i = 0; i < channels; i++) {
+            float t = std::min(std::max(v[i] * inverse[i], -zp - 1.0f), 256.0f - zp);
+            q[i] = (Activation)(std::min(std::max((t + round) - round + zp, 0.0f), 255.0f) - ACTIVATION_SHIFT);
+        }
+    }
+}
+
+// `n` of `ch` values at `v`, in place, then a ReLU if `relu`
+inline void normalize_square(const Norm& n, float* v, int ch, bool relu) {
+    const float* a = n.a.data();
+    const float* c = n.c.data();
+    if (n.type == NORM_CHANNEL) {
+        float sum = 0;
+#pragma omp simd reduction(+ : sum)
+        for (int i = 0; i < ch; i++) sum += v[i];
+        const float mean = sum / ch;
+        float sq = 0;
+#pragma omp simd reduction(+ : sq)
+        for (int i = 0; i < ch; i++) sq += (v[i] - mean) * (v[i] - mean);
+        const float rstd = 1.0f / std::sqrt(sq / ch + n.eps);
+#pragma omp simd
+        for (int i = 0; i < ch; i++) {
+            float out = (v[i] - mean) * rstd * a[i] + c[i];
+            v[i] = relu ? std::max(out, 0.0f) : out;
+        }
+    } else if (n.type == NORM_AFFINE) {
+#pragma omp simd
+        for (int i = 0; i < ch; i++) {
+            float out = v[i] * a[i] + c[i];
+            v[i] = relu ? std::max(out, 0.0f) : out;
+        }
+    } else if (relu) {
+#pragma omp simd
+        for (int i = 0; i < ch; i++) v[i] = std::max(v[i], 0.0f);
+    }
+}
+
+#endif
 
 // `n` of each square's first `n.channels` of `x`, (64, stride), in place, then a ReLU if `relu`
 inline void normalize(const Norm& n, float* x, int stride, bool relu) {
@@ -575,10 +688,11 @@ inline void forward(const Net& n, Scratch& s, const float* obs, float* logits, f
     float* x = s.x.data();
     float* y = s.y.data();
     // the stem's input, its 2 planes padded to 4 channels
-    std::fill(s.padded.begin(), s.padded.begin() + (size_t)PADDED * 4, (Activation)0);
+    std::fill(s.padded.begin(), s.padded.begin() + (size_t)PADDED * 4, (Activation)-ACTIVATION_SHIFT);
     for (int sq = 0; sq < SQUARES; sq++)
         for (int p = 0; p < 2; p++)
-            s.padded[((sq / 8 + 1) * 10 + sq % 8 + 1) * 4 + p] = obs[p * SQUARES + sq] > 0.5f ? 1 : 0;
+            s.padded[((sq / 8 + 1) * 10 + sq % 8 + 1) * 4 + p] =
+                (Activation)((obs[p * SQUARES + sq] > 0.5f ? 1 : 0) - ACTIVATION_SHIFT);
     convolve(n.stem, s, x, C);
     if (!n.pre) normalize(n.stem_norm, x, C, true);
     for (const Block& b : n.blocks) {
@@ -648,16 +762,30 @@ inline void forward(const Net& n, Scratch& s, const float* obs, float* logits, f
 
 #else
 inline void forward(const Net&, Scratch&, const float*, float*, float*) {
-    throw std::runtime_error("the native network needs AVX2 or AVX-512 VNNI");
+    throw std::runtime_error("the native network needs AVX2, AVX-512 VNNI or NEON's dot product");
 }
 #endif
 
 // Packs `q`, (cout, cin, k, k) signed 8-bit weights, for `convolve`: for VNNI, [cout / 32][k * k]
 // [cin / 4][2][16 outputs][4 inputs], the last 16 outputs alone if cout / 16 is odd; for AVX2, in 16
 // bits, [cout / 16][cin / 2][2][8 outputs][2 inputs] for 1x1, and for 3x3 the same of each of the 16
-// transformed values, [cout / 16][16][cin / 2][2][8][2], 2G g 2G^T.
+// transformed values, [cout / 16][16][cin / 2][2][8][2], 2G g 2G^T; for NEON, [cout / 8][k * k][cin / 4]
+// [8 outputs][4 inputs].
 inline void pack(Conv& c, const int8_t* q) {
     const int c4n = c.cin / 4, taps = c.k * c.k;
+#if NET_ISA == 3
+    c.packed.assign((size_t)c.cout * c.cin * taps, 0);
+    size_t at8 = 0;
+    for (int g = 0; g < c.cout / 8; g++)
+        for (int t = 0; t < taps; t++)
+            for (int c4 = 0; c4 < c4n; c4++)
+                for (int o = 0; o < 8; o++)
+                    for (int k = 0; k < 4; k++) c.packed[at8++] = q[((size_t)(8 * g + o) * c.cin + 4 * c4 + k) * taps + t];
+    c.offset.assign(c.cout, 0);
+    for (int o = 0; o < c.cout; o++)
+        for (size_t i = 0; i < (size_t)c.cin * taps; i++) c.offset[o] += ACTIVATION_SHIFT * q[(size_t)o * c.cin * taps + i];
+    return;
+#endif
 #if NET_ISA == 1
     // G of F(2x2, 3x3), doubled
     static const int G[4][3] = {{2, 0, 0}, {1, 1, 1}, {1, -1, 1}, {0, 0, 2}};

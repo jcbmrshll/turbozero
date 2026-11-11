@@ -42,12 +42,16 @@ def openvino_paths() -> tuple[Path, Path]:
     import openvino
 
     root = Path(openvino.__file__).parent
-    (library,) = (root / "libs").glob("libopenvino.so.*")
+    # libopenvino.so.<version> on Linux, libopenvino.<version>.dylib on macOS
+    (library,) = [
+        *(root / "libs").glob("libopenvino.so.*"),
+        *(root / "libs").glob("libopenvino.*.dylib"),
+    ]
     return root / "include", library
 
 
 def library_path() -> Path:
-    """The compiled search, built for this machine's x86-64 level, named after its source, its
+    """The compiled search, built for this machine's level (`native_target`), named after its source, its
     target and the OpenVINO it links."""
     include, openvino = openvino_paths()
     target = target_flags()
