@@ -10,6 +10,7 @@ import fnmatch
 import gc
 import itertools
 import os
+import re
 import warnings
 from dataclasses import dataclass, replace
 from functools import partial
@@ -23,13 +24,14 @@ import numpy as np
 import optax
 import pytest
 from seaglass import Arrays, Monitor
+from test_mcts import outer_loop_bodies
 
 import core.training.train as train_module
 from core.evaluators.alphazero import AlphaZero
 from core.evaluators.evaluation_fns import make_nn_eval_fn
 from core.evaluators.evaluator import EvalOutput, Evaluator
 from core.evaluators.mcts.action_selection import PUCTSelector
-from core.evaluators.mcts.mcts import MCTS
+from core.evaluators.mcts.mcts import MCTS, PlayoutCap
 from core.memory.replay_memory import (
     BaseExperience,
     EpisodeReplayBuffer,
@@ -1677,6 +1679,71 @@ def test_each_move_starting_in_a_call_takes_the_calls_next_key(env, tmp_path):
     # of the 6 cycles' keys, the first's 6th move took the 6th, and the second's 2nd the 2nd
     np.testing.assert_array_equal(state.move_key[0], jax.random.split(keys[0], 6)[5])
     np.testing.assert_array_equal(state.move_key[1], jax.random.split(keys[1], 6)[1])
+
+
+def uneven_search_collection(env, tmp_path, advance_every=1, **kwargs):
+    """A trainer whose MCTS self-play searches take 2 or 4 cycles (a playout cap), in trees of
+    10 nodes, and plays the moves of those done every `advance_every` cycles; and its
+    collection state of 5 environments."""
+    evaluator = tiny_mcts(
+        env, num_iterations=3, max_nodes=10, playout_cap=PlayoutCap(0.5, 1)
+    )
+    trainer = make_trainer(
+        env,
+        tmp_path,
+        evaluator=evaluator,
+        batch_size=5,
+        advance_every=advance_every,
+        **kwargs,
+    )
+    return trainer, trainer.init_collection_state(jax.random.PRNGKey(0), 5)
+
+
+@pytest.mark.parametrize("moves_at_once", [1, 2, 5])
+def test_self_play_moves_on_only_the_trees_of_the_moves_played_as_advance_does(
+    env, tmp_path, moves_at_once
+):
+    # `collect_steps` moves the trees on outside the vmap, those of the environments that played
+    # `moves_at_once` at a time: as every environment's `collect` does, a cycle at a time
+    trainer, state = uneven_search_collection(
+        env, tmp_path, moves_at_once=moves_at_once
+    )
+    keys = jax.random.split(jax.random.PRNGKey(1), 5)
+
+    # `collect_steps` donates the state it's given
+    collected, _ = trainer.collect_steps(keys, jax.tree.map(jnp.copy, state), None, 3)
+
+    cycles = 3 * trainer.collection_schedule.at(0).search_cycles()
+    move_keys = jax.vmap(lambda k: jax.random.split(k, cycles))(keys)
+    collect = jax.jit(jax.vmap(lambda k, s: trainer.collect(k, s, None)))
+    started = np.zeros(5, dtype=int)
+    for _ in range(cycles):
+        starting = np.asarray(state.search_cycles == 0)
+        state = collect(move_keys[np.arange(5), started], state)
+        started += starting
+    assert 0 < int(collected.moves.sum()) and int(collected.episodes.sum()) > 0
+    jax.tree.map(np.testing.assert_array_equal, collected, state)
+
+
+def test_playing_moves_reads_and_writes_only_the_trees_of_the_moves_played(
+    env, tmp_path
+):
+    # in the loop of search cycles and plays, a pass over every tree (e.g. moving them all on,
+    # under vmap) shows as an instruction writing a whole array of the trees' nodes; outside the
+    # loops within it (the cycles', and moving on the played trees a few at a time). (Every 2
+    # cycles: a loop of 1 cycle would be inlined.)
+    trainer, state = uneven_search_collection(env, tmp_path, advance_every=2)
+    keys = jax.random.split(jax.random.PRNGKey(1), 5)
+
+    hlo = trainer.collect_steps.lower(trainer, keys, state, None, 3).compile().as_text()
+
+    assert hlo is not None
+    # the loop of cycles and plays: the outer loop with loops within it
+    (body,) = [b for b in outer_loop_bodies(hlo) if " while(" in b]
+    # [environments, nodes, ...]: the edge map, priors, embeddings
+    whole = re.compile(r"= \w+\[5,10,\S* ([\w-]+)\(")
+    writes = [m.group(1) for m in whole.finditer(body)]
+    assert writes and set(writes) <= {"get-tuple-element", "tuple", "bitcast"}
 
 
 @jax.tree_util.register_dataclass

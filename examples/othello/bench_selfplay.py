@@ -35,7 +35,7 @@ from xot import load_xot, make_xot_init_fn
 from core.evaluators.alphazero import AlphaZero
 from core.evaluators.evaluation_fns import make_nn_eval_fn
 from core.evaluators.mcts.action_selection import PUCTSelector
-from core.evaluators.mcts.mcts import MCTS, PlayoutCap
+from core.evaluators.mcts.mcts import MCTS, PlayoutCap, SmartPruning
 from core.memory.replay_memory import EpisodeReplayBuffer
 from core.training.loss_fns import az_default_loss_fn
 from core.training.train import Trainer
@@ -55,7 +55,7 @@ def make_trainer(args) -> tuple[Trainer, tuple]:
         num_iterations=args.sims,
         max_nodes=args.sims + args.min_iterations + args.advance_every
         if args.count_reused_visits
-        else 2 * args.sims,
+        else int(args.tree_factor * args.sims),
         branching_factor=env.num_actions,
         action_selector=PUCTSelector(),
         temperature=1.0,
@@ -63,6 +63,9 @@ def make_trainer(args) -> tuple[Trainer, tuple]:
         min_iterations=args.min_iterations,
         traversal_steps=args.traversal_steps,
         playout_cap=PlayoutCap(*args.playout_cap) if args.playout_cap else None,
+        smart_pruning=SmartPruning(args.smart_pruning)
+        if args.smart_pruning is not None
+        else None,
     )
     trainer = Trainer(
         batch_size=args.envs,
@@ -75,8 +78,10 @@ def make_trainer(args) -> tuple[Trainer, tuple]:
         loss_fn=az_default_loss_fn,
         optimizer=make_optimizer(1),
         evaluator=evaluator,
-        # room for every step's position, and no more
-        memory_buffer=EpisodeReplayBuffer(capacity=args.warmup + args.steps),
+        # by default room for every step's position, and no more
+        memory_buffer=EpisodeReplayBuffer(
+            capacity=args.buffer or args.warmup + args.steps
+        ),
         max_episode_steps=80,
         env_step_fn=step_fn,
         env_init_fn=make_xot_init_fn(load_xot(), 0.0),
@@ -84,6 +89,7 @@ def make_trainer(args) -> tuple[Trainer, tuple]:
         testers=[],
         data_transform_fns=SYMMETRY_TRANSFORM_FNS,
         advance_every=args.advance_every,
+        **({"moves_at_once": args.moves_at_once} if args.moves_at_once else {}),
         ckpt_dir="/tmp/turbozero-bench-selfplay",
     )
     return trainer, params
@@ -129,6 +135,32 @@ def main():
         default=None,
         metavar="P:FAST",
         help="as train.py's: --sims with probability P, else FAST iterations",
+    )
+    parser.add_argument(
+        "--smart-pruning",
+        choices=SmartPruning.SEARCHES,
+        default=None,
+        help="as train.py's (at factor 1): STOP on these searches",
+    )
+    parser.add_argument(
+        "--tree-factor",
+        type=float,
+        default=4.0,
+        help="as train.py's: search tree capacity, in nodes per MCTS iteration",
+    )
+    parser.add_argument(
+        "--buffer",
+        type=int,
+        default=None,
+        help="replay buffer positions per environment, as train.py's --buffer; by default "
+        "room for the steps played (--warmup + --steps)",
+    )
+    parser.add_argument(
+        "--moves-at-once",
+        type=int,
+        default=None,
+        help="the trainer's moves_at_once: search trees moved on at a time when moves are "
+        "played (by default the trainer's)",
     )
     parser.add_argument("--ckpt", default=None, help="checkpoint to play with")
     parser.add_argument(
