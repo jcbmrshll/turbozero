@@ -28,7 +28,7 @@ from core.memory.replay_memory import (
     buffer_capacity,
     transform_randomly,
 )
-from core.pytree import where_tree
+from core.pytree import map_where, where_tree
 from core.testing.tester import BaseTester, TestState
 from core.training.exploration import Exploration
 from core.training.growth import Growth, GrowthProgress, Learner
@@ -612,6 +612,7 @@ class Trainer:
         data_transform_fns: Sequence[DataTransformFn] = (),
         tree_positions: TreePositions | None = None,
         advance_every: int | None = None,
+        moves_at_once: int = 32,
         extract_model_params_fn: ExtractModelParamsFn = extract_params,
         monitor: "Monitor | None" = None,
         ckpt_dir: str = "/tmp/turbozero_checkpoints",
@@ -705,13 +706,19 @@ class Trainer:
                 self-play (see `tree_sample_mask`). Needs MCTS self-play evaluators.
             advance_every: (optional) self-play plays the moves whose searches are done every this many
                 cycles (see `collect_steps`). Playing a move is computed for every environment,
-                whether its search is done or not (under vmap, a select), so checking less often
-                costs less; a search done in between goes on until the check, at most
+                whether its search is done or not (under vmap, a select), all but moving the
+                search trees on, which is done for the moves played only (see `moves_at_once`):
+                checking less often costs a little less; a search done in between goes on until
+                the check, at most
                 `advance_every - 1` cycles more. By default, every evaluator's `search_cycles`: with
                 searches of a fixed length, a check as each is done, as if every environment searched
                 and played in step. With searches of varying lengths (e.g. MCTS's
                 `count_reused_visits`), a few cycles balance the two: about
                 sqrt(2 * mean search cycles * cost of a check / cost of a cycle).
+            moves_at_once: (optional) when self-play plays moves, the evaluator's states (e.g. the
+                search trees) of the environments that played move on this many at a time (see
+                `core.pytree.map_where`); the others' aren't touched. Each time costs a loop trip,
+                and this many environments' work however few are left. Doesn't change the results.
             extract_model_params_fn: (optional) function to extract model parameters from TrainState
             monitor: (optional) `seaglass.Monitor` to log metrics and test episodes to (see a tester's `episode_fn`),
                 e.g. `core.monitoring.Monitor`, whose runs are drawn with turbozero's views
@@ -816,6 +823,9 @@ class Trainer:
         if advance_every is not None and advance_every < 1:
             raise ValueError(f"advance_every must be positive, got {advance_every}")
         self.advance_every = advance_every
+        if moves_at_once < 1:
+            raise ValueError(f"moves_at_once must be positive, got {moves_at_once}")
+        self.moves_at_once = moves_at_once
         self.exploration = exploration
         self.resignation = resignation
         self.episode_metrics_fn = episode_metrics_fn
@@ -1179,10 +1189,44 @@ class Trainer:
         params: Any,
         evaluator: Evaluator | None = None,
     ) -> CollectionState:
-        """Plays the move whose search is done, if it is (see `Evaluator.search_done`).
+        """Plays the move whose search is done, if it is (see `Evaluator.search_done`): see
+        `play_moves`, then the evaluator's state moves on to the next move's (see
+        `Evaluator.next_state`).
+
+        If the search isn't done, the state is left as it is. Under vmap, where that differs
+        across environments, both are computed: `collect_steps` moves the evaluator's states of
+        the environments that played on its own instead.
+
+        Args:
+            state: current collection state
+            params: model parameters
+            evaluator: (optional) the self-play evaluator, whose states `state` holds. If not
+                provided, the first in the schedule.
+
+        Returns:
+            CollectionState: updated collection state
+        """
+        if evaluator is None:
+            evaluator = self.collection_schedule.at(0)
+        state, (done, action, ended) = self.play_moves(state, params, evaluator)
+        return replace(
+            state,
+            eval_state=evaluator.next_state(
+                state.eval_state, action, ended, active=done
+            ),
+        )
+
+    def play_moves(
+        self,
+        state: CollectionState,
+        params: Any,
+        evaluator: Evaluator | None = None,
+    ) -> tuple[CollectionState, tuple[jax.Array, jax.Array, jax.Array]]:
+        """Plays the move whose search is done, if it is (see `Evaluator.search_done`), all but
+        moving the evaluator's state on (see `advance`):
 
         - Stores experience in replay buffer, if the evaluator `trains_on` the search.
-        - Resets environment/evaluator if episode is terminated.
+        - Resets the environment if the episode is terminated.
 
         If the search isn't done, the state is left as it is. Under vmap, where that differs
         across environments, both are computed, but the replay buffers are only written where a
@@ -1195,7 +1239,10 @@ class Trainer:
                 provided, the first in the schedule.
 
         Returns:
-            CollectionState: updated collection state
+            tuple[CollectionState, tuple[jax.Array, jax.Array, jax.Array]]: updated collection
+                state, its evaluator's state as the search left it; and for
+                `Evaluator.next_state`, whether a move was played, the move, and whether the
+                episode ended
         """
         if evaluator is None:
             evaluator = self.collection_schedule.at(0)
@@ -1241,6 +1288,7 @@ class Trainer:
             else None,
             active=done,
             end=resigned,
+            step_evaluator=False,
         )
         terminated, truncated = done & terminated, done & truncated
         resign_state = state.resign_state
@@ -1305,12 +1353,12 @@ class Trainer:
                 tree_key, state, searched_eval_state, reused, evaluator, valid=stored
             )
         # return new collection state
-        return replace(
+        state = replace(
             state,
-            # `step_with_output` moved it on only if done; if not, it's as `search_output` left
-            # it, which is as the search did (an evaluator whose `search_output` does the search,
-            # see `Evaluator.search_cycle`, is done every cycle)
-            eval_state=eval_output.eval_state,
+            # as `search_output` left it, which is as the search did (an evaluator whose
+            # `search_output` does the search, see `Evaluator.search_cycle`, is done every
+            # cycle)
+            eval_state=searched_eval_state,
             env_state=where_tree(done, new_env_state, state.env_state),
             buffer_state=buffer_state,
             metadata=where_tree(done, new_metadata, state.metadata),
@@ -1322,6 +1370,8 @@ class Trainer:
             search_cycles=jnp.where(done, 0, state.search_cycles),
             resign_state=resign_state,
         )
+        # `terminated` counts a resignation
+        return state, (done, eval_output.action, terminated | truncated)
 
     def greedy(self, state: CollectionState) -> jax.Array:
         """Whether the move in progress is played greedily (see `Exploration.greedy`)."""
@@ -1467,7 +1517,8 @@ class Trainer:
 
         Each cycle, every environment runs a cycle of its move's search (`search`); every
         `advance_every` cycles (see `Trainer`), those whose search is done play their moves
-        (`advance`). With searches that all take the same cycles, from environments that start
+        (`advance`, its evaluator's states moved on only for the moves played, `moves_at_once`
+        at a time). With searches that all take the same cycles, from environments that start
         together, and the default `advance_every`, that's `num_steps` moves in each, as many
         cycles apart.
 
@@ -1496,55 +1547,79 @@ class Trainer:
             else self.advance_every
         )
 
-        def collect_env(
-            key: jax.Array, state: CollectionState
-        ) -> tuple[CollectionState, dict[str, jax.Array]]:
-            counts = jax.tree.map(
-                lambda x: jnp.zeros(x.shape, x.dtype),
-                jax.eval_shape(lambda s: self.count_searches({}, s, evaluator), state),
+        batch = key.shape[0]
+        counts = jax.tree.map(
+            lambda x: jnp.zeros(x.shape, x.dtype),
+            jax.eval_shape(
+                jax.vmap(lambda s: self.count_searches({}, s, evaluator)), state
+            ),
+        )
+        if num_cycles == 0:
+            return state, {name: value.sum() for name, value in counts.items()}
+        # in each environment, the i-th move to start in this call gets the i-th key
+        keys = jax.vmap(lambda k: jax.random.split(k, num_cycles))(key)
+
+        def search_env(
+            keys: jax.Array, state: CollectionState, started: jax.Array, num: int
+        ) -> tuple[CollectionState, jax.Array]:
+            """`num` cycles of search in an environment, without playing any move: they only
+            write the trees, in place. Moves start only in the first (after an `advance`, or
+            at the call's start), so their searches start before it, rather than in every
+            cycle."""
+            starting = state.search_cycles == 0
+            state = self.start_searches(keys[started], state, evaluator)
+            state = jax.lax.fori_loop(
+                0, num, lambda _, s: self.search(s, params, evaluator), state
             )
-            if num_cycles == 0:
-                return state, counts
-            # the i-th move to start in this call gets the i-th key
-            keys = jax.random.split(key, num_cycles)
+            return state, started + starting
 
-            def search(
-                carry: tuple[CollectionState, jax.Array], num: int
-            ) -> tuple[CollectionState, jax.Array]:
-                """`num` cycles of search, without playing any move: they only write the
-                trees, in place. Moves start only in the first (after an `advance`, or at the
-                call's start), so their searches start before it, rather than in every cycle."""
-                state, started = carry
-                starting = state.search_cycles == 0
-                state = self.start_searches(keys[started], state, evaluator)
-                state = jax.lax.fori_loop(
-                    0, num, lambda _, s: self.search(s, params, evaluator), state
-                )
-                return state, started + starting
+        def search(
+            state: CollectionState, started: jax.Array, num: int
+        ) -> tuple[CollectionState, jax.Array]:
+            return jax.vmap(partial(search_env, num=num))(keys, state, started)
 
-            def chunk(
-                _: jax.Array,
-                carry: tuple[CollectionState, jax.Array, dict[str, jax.Array]],
-            ) -> tuple[CollectionState, jax.Array, dict[str, jax.Array]]:
-                state, started, counts = carry
-                state, started = search((state, started), advance_every)
-                counts = self.count_searches(counts, state, evaluator)
-                return self.advance(state, params, evaluator), started, counts
-
-            # every `advance_every` cycles, the moves whose searches are done are played: loops
-            # within a loop rather than a lax.cond every cycle, through which XLA would copy the
-            # whole state (the trees and the replay buffers)
-            state, started, counts = jax.lax.fori_loop(
-                0,
-                num_cycles // advance_every,
-                chunk,
-                (state, jnp.array(0, dtype=jnp.int32), counts),
+        def chunk(
+            _: jax.Array,
+            carry: tuple[CollectionState, jax.Array, dict[str, jax.Array]],
+        ) -> tuple[CollectionState, jax.Array, dict[str, jax.Array]]:
+            state, started, counts = carry
+            state, started = search(state, started, advance_every)
+            counts = jax.vmap(lambda c, s: self.count_searches(c, s, evaluator))(
+                counts, state
             )
-            if num_cycles % advance_every:
-                state, started = search((state, started), num_cycles % advance_every)
-            return state, counts
+            state, (done, action, ended) = jax.vmap(
+                lambda s: self.play_moves(s, params, evaluator)
+            )(state)
+            # everything read from the evaluator's states (to count the searches and play the
+            # moves), then they move on in place: the barrier makes the loop that writes them
+            # depend on every read. XLA otherwise copies the arrays read to keep them for reads
+            # it doesn't order first (see `Tree.set_child`)
+            state, counts, (done, action, ended) = jax.lax.optimization_barrier(
+                (state, counts, (done, action, ended))
+            )
+            # the evaluator's states (e.g. the search trees) move on only where a move was
+            # played (see `advance`): under vmap, every one would be read and written
+            eval_state = map_where(
+                evaluator.next_state,
+                done,
+                state.eval_state,
+                action,
+                ended,
+                size=self.moves_at_once,
+            )
+            return replace(state, eval_state=eval_state), started, counts
 
-        state, counts = jax.vmap(collect_env)(key, state)
+        # every `advance_every` cycles, the moves whose searches are done are played: loops
+        # within a loop rather than a lax.cond every cycle, through which XLA would copy the
+        # whole state (the trees and the replay buffers)
+        state, started, counts = jax.lax.fori_loop(
+            0,
+            num_cycles // advance_every,
+            chunk,
+            (state, jnp.zeros(batch, dtype=jnp.int32), counts),
+        )
+        if num_cycles % advance_every:
+            state, started = search(state, started, num_cycles % advance_every)
         return state, {name: value.sum() for name, value in counts.items()}
 
     def train_step(

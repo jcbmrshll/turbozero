@@ -135,6 +135,7 @@ def step_with_output(
     choose_action: ChooseActionFn | None = None,
     active: ArrayLike = True,
     end: ArrayLike = False,
+    step_evaluator: bool = True,
 ) -> tuple[EvalOutput, Any, StepMetadata, jax.Array, jax.Array, jax.Array, Any]:
     """`search_and_step` after its evaluation: steps the environment and evaluator with the
     evaluator's `output` for `env_state`.
@@ -148,6 +149,8 @@ def step_with_output(
         end: (optional) ends the episode before its move, e.g. on a resignation: the
             environment and evaluator are reset (with `reset`) as if it had terminated, and
             `terminated` and `truncated` are False. The caller scores it.
+        step_evaluator: (optional) if not, the evaluator's state stays as `output` left it, for
+            the caller to move on (with `Evaluator.next_state`)
         others: see `step_env_and_evaluator`.
 
     Returns:
@@ -170,7 +173,9 @@ def step_with_output(
     # reset the environment and evaluator state if the episode ended
     # else, update the evaluator state
     rewards = env_state_metadata.rewards
-    if reset:
+    if not step_evaluator:
+        eval_state = output.eval_state
+    elif reset:
         eval_state = evaluator.next_state(
             output.eval_state, output.action, ended, active=active
         )

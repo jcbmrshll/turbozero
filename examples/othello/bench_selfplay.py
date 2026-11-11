@@ -89,6 +89,7 @@ def make_trainer(args) -> tuple[Trainer, tuple]:
         testers=[],
         data_transform_fns=SYMMETRY_TRANSFORM_FNS,
         advance_every=args.advance_every,
+        **({"moves_at_once": args.moves_at_once} if args.moves_at_once else {}),
         ckpt_dir="/tmp/turbozero-bench-selfplay",
     )
     return trainer, params
@@ -153,6 +154,13 @@ def main():
         default=None,
         help="replay buffer positions per environment, as train.py's --buffer; by default "
         "room for the steps played (--warmup + --steps)",
+    )
+    parser.add_argument(
+        "--moves-at-once",
+        type=int,
+        default=None,
+        help="the trainer's moves_at_once: search trees moved on at a time when moves are "
+        "played (by default the trainer's)",
     )
     parser.add_argument("--ckpt", default=None, help="checkpoint to play with")
     parser.add_argument(
