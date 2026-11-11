@@ -16,6 +16,7 @@ Othello model and against two strong open-source Othello engines,
 | `cpu_search.py`, `cpu_search.cpp` | A single game's MCTS for playing on CPU: a tree in C++, its leaves evaluated in batches by OpenVINO or ONNX Runtime, or searched by a thread to a core (`Engine`) |
 | `cpu_net.py`, `cpu_net.h` | A network's int8 forward pass in C++ (AVX-512 VNNI), for `Engine`: no OpenVINO, closer to the float network |
 | `cpu_match.py` | Games between two such players at fixed visits a move, and their speed in evals a second |
+| `endgame.py`, `endgame.cpp` | The endgame solved exactly in C++, for a player (`solve=N`) and in batches for labels |
 | `export_onnx.py` | Exports a checkpoint's network to ONNX |
 | `bench_cpu_backends.py` | Evals a second by CPU backend and batch, each checked against JAX's outputs |
 | `quantize.py`, `fidelity.py`, `bench_quantized.py` | Quantizes a network to int8 for playing on CPU, and measures its outputs and speed against bf16 |
@@ -773,6 +774,30 @@ earlier: solved exactly, perfect play from 24 empties would have scored 36% inst
 games), and from 28, 37.5%. The net gives up about 5 discs from 24 empties, and rarely the result.
 
 Below AVX2 the library builds without the native network, and `Engine` runs OpenVINO.
+
+### Solving the endgame
+
+With `solve=N`, a `net:` player solves positions with N or fewer empty squares exactly instead of
+searching them (`endgame.py`), on the same threads, its time charged to the clock:
+
+```bash
+taskset -c 16-23 uv run examples/othello/clock_match.py --seconds 10 --openings 100 --b edax:threads=8 \
+    --a net:net=8x128-128s-8p-w1125-274m,engine=1,backend=native,batch=1,virtual_loss=visit,solve=20
+```
+
+By default it solves for a win, a draw or a loss, about ten times faster than the margin
+(`solve_exact=1`) and all a result needs: it plays a winning or drawing move, and a lost position is
+searched as usual, the network's best try against a fallible opponent. A solve may take a quarter
+of the clock left (`solve_share`), else it gives up and the move is searched; once one succeeds the
+moves after it take milliseconds, its transposition table kept from move to move. `solve_batch`
+solves many positions at once, a thread to each, for training labels.
+
+The solver is alpha-beta over bitboards: the last four empties tried in place, odd quadrants
+first; above them moves ordered fastest first (fewest replies), principal variation search, cuts by
+the opponent's stable discs, and from 8 empties a transposition table, which from 10 is looked at
+for each child's bound before searching it. Its exact scores match Edax's `-solve` (tests run the
+comparison where Edax is built). On one core it visits about three times Edax's nodes for an exact
+solve at 18-20 empties, at a similar rate a node; Edax narrows its window with its evaluation first.
 
 ## Credits
 

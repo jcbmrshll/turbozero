@@ -809,7 +809,7 @@ def test_an_engine_of_the_native_network_searches_as_a_batch_of_one():
 
 
 def test_the_search_is_built_for_a_standard_x86_level(monkeypatch):
-    import cpu_search
+    import native_target
 
     monkeypatch.delenv("TURBOZERO_X86_LEVEL", raising=False)
     avx512 = {"avx512f", "avx512bw", "avx512vl", "avx512dq", "avx512cd", "avx512_vnni"}
@@ -818,7 +818,7 @@ def test_the_search_is_built_for_a_standard_x86_level(monkeypatch):
         ({"avx2", "bmi2", "fma", "movbe", "avx512f"}, "-march=x86-64-v3"),
         (set(), "-march=x86-64-v2"),
     ]:
-        monkeypatch.setattr(cpu_search, "cpu_flags", lambda flags=flags: flags)
-        target = cpu_search.target_flags()
+        monkeypatch.setattr(native_target, "cpu_flags", lambda flags=flags: flags)
+        target = native_target.target_flags()
         assert target[0] == level
         assert not any("native" in flag for flag in target)

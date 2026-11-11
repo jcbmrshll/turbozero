@@ -347,9 +347,31 @@ def move_budget(seconds_left: float, empties: int, taper: int = 0) -> float:
     return 0.95 * seconds_left * weight(empties) / max(total, 1e-9)
 
 
+@dataclass(frozen=True)
+class Solving:
+    """When a player solves the endgame rather than searching it (see `endgame.py`).
+
+    Attributes:
+        empties: positions with this many empty squares or fewer are solved
+        exact: solve for the best final margin; else, about ten times faster, only for a win, a
+            draw or a loss, which is all a game's result needs: a position solved as lost is
+            then searched as usual, the network's best try against a fallible opponent
+        share: of the clock left, what a solve may take before it gives up and the move is
+            searched with what's left; a solve that succeeds leaves the game's later moves
+            almost nothing to do. Ignored at fixed visits, where a solve takes what it takes
+        threads: the solver's, by default one
+    """
+
+    empties: int
+    exact: bool = False
+    share: float = 0.25
+    threads: int = 1
+
+
 class NetPlayer:
     """Our side of a game on a per-game clock (`clock_match.Player`): a `Search` with its own
-    tree, searched a batch at a time through `evaluate`, or by an `Engine`'s workers."""
+    tree, searched a batch at a time through `evaluate`, or by an `Engine`'s workers; with
+    `solving`, the endgame solved instead."""
 
     def __init__(
         self,
@@ -358,6 +380,7 @@ class NetPlayer:
         taper: int = 0,
         seed: int = 0,
         visits: int = 0,
+        solving: Solving | None = None,
     ):
         """`visits`, if any, a move, ignoring the clock."""
         self.search = Search(settings, seed)
@@ -366,6 +389,16 @@ class NetPlayer:
         self.visits = visits
         self.batch = np.empty((settings.batch, 2, 8, 8), np.float32)
         self.to_move = "b"
+        self.solving = solving
+        # the game's solver, its table kept from one move to the next
+        self.solver = None
+        if solving is not None:
+            from endgame import Solver
+
+            self.solver = Solver(solving.threads)
+        # moves solved, and solves given up, in this game
+        self.solved = 0
+        self.gave_up = 0
 
     def sync(self, color: str) -> None:
         """Passes for the other color if `color` moves out of turn: the game passes for a player
@@ -379,15 +412,36 @@ class NetPlayer:
         self.sync(color)
         self.search.play(move)
 
+    def solve(self, me: int, opp: int, seconds_left: float) -> int | None:
+        """The move the endgame's solution plays, if it's solved in time (and with `exact` off,
+        isn't lost)."""
+        solving = self.solving
+        assert solving is not None and self.solver is not None
+        # a solve at fixed visits has no deadline; one with no time left, the least of one
+        seconds = 0.0 if self.visits else max(solving.share * seconds_left, 1e-3)
+        solved = self.solver.solve(me, opp, seconds, solving.exact)
+        if solved is None:
+            self.gave_up += 1
+            return None
+        if not solving.exact and solved.margin < 0:
+            return None
+        self.solved += 1
+        return solved.move
+
     def move(self, color: str, seconds_left: float) -> int:
         """Our move, which it also plays. A position with one legal move takes no time."""
         self.sync(color)
+        me, opp, _, _ = self.search.position()
+        empties = 64 - (me | opp).bit_count()
+        action = None
         if self.search.num_legal() == 1:
             action = self.search.first_legal()
-        else:
-            me, opp, _, _ = self.search.position()
-            empties = 64 - (me | opp).bit_count()
-            seconds = move_budget(seconds_left, empties, self.taper)
+        elif self.solving is not None and empties <= self.solving.empties:
+            start = time.perf_counter()
+            action = self.solve(me, opp, seconds_left)
+            seconds_left -= time.perf_counter() - start
+        if action is None:
+            seconds = move_budget(max(seconds_left, 0.0), empties, self.taper)
             if isinstance(self.evaluate, Engine):
                 self.evaluate.search(
                     self.search,
