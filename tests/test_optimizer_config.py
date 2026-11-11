@@ -16,6 +16,8 @@ from core.training.train import (
     describe_fn,
     injected_hyperparams,
     restart_schedules,
+    sgdw,
+    with_hyperparams,
 )
 
 PARAMS = {"w": jnp.ones(3)}
@@ -77,6 +79,28 @@ def test_injected_hyperparams():
     assert np.isclose(everything["b1"], 0.8)
     # nested in another transform
     assert set(injected_hyperparams((optax.EmptyState(), state))) == set(everything)
+
+
+def test_with_hyperparams_sets_what_the_next_update_uses():
+    def sgd(weight_decay):
+        return optax.inject_hyperparams(sgdw, static_args=("mask", "decoupled"))(
+            learning_rate=optax.linear_schedule(1.0, 0.5, 10),
+            momentum=0.0,
+            weight_decay=weight_decay,
+        )
+
+    state = run(sgd(0.5), 2)
+
+    changed: Any = with_hyperparams(state, {"weight_decay": 0.1, "missing": 3.0})
+
+    assert float(changed.hyperparams["weight_decay"]) == pytest.approx(0.1)
+    assert changed.hyperparams["weight_decay"].dtype == state.hyperparams["weight_decay"].dtype
+    assert set(changed.hyperparams) == set(state.hyperparams)
+    # the restored optimizer's next update decays at the new rate: a zero gradient's update is
+    # -learning rate * weight decay * w (the schedule's third rate, 0.9)
+    zeros = {"w": jnp.zeros(3)}
+    updates, _ = sgd(0.5).update(zeros, changed, PARAMS)
+    np.testing.assert_allclose(updates["w"], -0.9 * 0.1 * np.ones(3), rtol=1e-6)
 
 
 def test_injected_hyperparams_without_injection():

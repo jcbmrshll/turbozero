@@ -4,7 +4,7 @@ import os
 import re
 import time
 import zipfile
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from typing import TYPE_CHECKING, Any
@@ -514,6 +514,30 @@ def injected_hyperparams(
     return hyperparams
 
 
+def with_hyperparams(opt_state: Any, hyperparams: Mapping[str, Any]) -> Any:
+    """`opt_state` with its `optax.inject_hyperparams` optimizers' hyperparameters named in
+    `hyperparams` set to those values, each in its array's dtype.
+
+    An injected optimizer keeps its hyperparameters in its state, and computes only the scheduled
+    ones (e.g. a decaying learning rate) again each update: a restored state would go on with
+    its saved values of the others (e.g. weight decay, momentum), whatever the new run's
+    optimizer was built with (see `Trainer`, which sets them to its own)."""
+
+    def set_values(x: Any) -> Any:
+        if not _is_injected(x):
+            return x
+        return x._replace(
+            hyperparams={
+                name: jnp.asarray(hyperparams[name], dtype=jnp.asarray(value).dtype)
+                if name in hyperparams
+                else value
+                for name, value in x.hyperparams.items()
+            }
+        )
+
+    return jax.tree.map(set_values, opt_state, is_leaf=_is_injected)
+
+
 def _is_lr_plateau(x: Any) -> bool:
     return isinstance(x, LRPlateauState)
 
@@ -776,6 +800,14 @@ class Trainer:
             name: _to_config(value)
             for name, value in injected_hyperparams(init_opt_state).items()
         }
+        # those no schedule computes: a saved optimizer state's would stay (see
+        # `with_hyperparams`), so a run starting from one takes these
+        scheduled = injected_hyperparams(init_opt_state, scheduled_only=True)
+        self.fixed_hyperparams = {
+            name: value
+            for name, value in injected_hyperparams(init_opt_state).items()
+            if name not in scheduled
+        }
         if (lr_plateau is not None) != bool(lr_plateau_states(init_opt_state)):
             raise ValueError(
                 "pass lr_plateau with an optimizer whose learning rate it is, and only then"
@@ -951,6 +983,21 @@ class Trainer:
             opt_state=self.optimizer.init(params),
             step=jnp.array(0, dtype=jnp.int32),
         )
+
+    def with_fixed_hyperparams(self, train_state: TrainState, name: str) -> TrainState:
+        """`train_state` with its optimizer state's unscheduled hyperparameters (e.g. weight
+        decay, momentum) this trainer's own (see `with_hyperparams`), saying which of them
+        change, e.g. from a saved state's. `name` names the network in that message."""
+        before = injected_hyperparams(train_state.opt_state)
+        opt_state = with_hyperparams(train_state.opt_state, self.fixed_hyperparams)
+        changed = [
+            f"{k} {_to_config(before[k])} -> {_to_config(v)}"
+            for k, v in injected_hyperparams(opt_state).items()
+            if k in self.fixed_hyperparams and _to_config(before[k]) != _to_config(v)
+        ]
+        if changed:
+            print(f"{name}: the optimizer's {', '.join(changed)}", flush=True)
+        return replace(train_state, opt_state=opt_state)
 
     def steps_of(self, learner: int, playing: int) -> int:
         """The training steps an epoch of a network that trains: the one waiting's
@@ -3325,6 +3372,10 @@ class Trainer:
         Saves a checkpoint of the train state every epoch, and the whole training state after the
         epochs set by `save_state_at` and `save_state_every` (see `save_state`).
 
+        A network whose optimizer state comes from a saved state (`initial_state`, `fork_from`,
+        `warm_start`) trains with this trainer's injected hyperparameters, e.g. its weight decay
+        and momentum, not those it was saved with (see `with_hyperparams`).
+
         Args:
             seed: rng seed (int)
             num_epochs: number of epochs to run the training loop for, in all: a continued run
@@ -3552,6 +3603,11 @@ class Trainer:
                 ]
                 for learner, ts in zip(self.learners, train_states, strict=True)
             ]
+
+        # a saved optimizer state (resumed, branched, forked or warm started) takes this
+        # trainer's fixed hyperparameters, e.g. a new weight decay or momentum
+        for i, ts in enumerate(train_states):
+            train_states[i] = self.with_fixed_hyperparams(ts, self.learners[i].name)
 
         # weight averages: the saved state's, or started at the networks' weights (a fork's
         # network goes on with its saved ones, if any)

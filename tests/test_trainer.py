@@ -52,6 +52,7 @@ from core.training.train import (
     average_share,
     checkpoint_epochs,
     extract_params,
+    injected_hyperparams,
     lr_plateau_states,
     read_state_meta,
     reduce_step_metrics,
@@ -2996,6 +2997,53 @@ def test_a_warm_start_takes_a_network_from_another_saved_state(
         fork.warm_state(at_3, 2, "n7")
     with pytest.raises(ValueError, match="this run's"):
         fork.warm_state(plain_path, 2)
+
+
+def sgd_optimizer(weight_decay, momentum):
+    return optax.inject_hyperparams(
+        train_module.sgdw, static_args=("mask", "decoupled")
+    )(
+        learning_rate=optax.constant_schedule(0.1),
+        momentum=momentum,
+        weight_decay=weight_decay,
+        mask=train_module.weight_decay_mask,
+    )
+
+
+@pytest.mark.parametrize("start", ["resume", "branch", "fork", "warm_start"])
+def test_a_run_from_a_saved_state_takes_its_own_weight_decay_and_momentum(
+    env, tmp_path, fake_loop, capsys, start
+):
+    # the saved run's optimizer injects weight decay 0.5 and momentum 0.9, which its optimizer
+    # state holds
+    _, path = save_a_state(
+        make_trainer(env, tmp_path / "saved", optimizer=sgd_optimizer(0.5, 0.9))
+    )
+    new = sgd_optimizer(0.1, 0.5)
+    if start == "warm_start":
+        trainer, _ = growth_trainer(
+            env, tmp_path / "new", SCRIPTS, growth_kwargs={"manual": True}, optimizer=new
+        )
+    else:
+        # a resumed run is in the saved run's directory
+        ckpt_dir = tmp_path / ("saved" if start == "resume" else "new")
+        trainer = make_trainer(env, ckpt_dir, optimizer=new)
+    fake_loop(trainer)
+    kwargs: dict[str, Any] = {
+        "resume": lambda: {"initial_state": trainer.resume(), "num_epochs": 2},
+        "branch": lambda: {"initial_state": trainer.branch(path), "num_epochs": 2},
+        "fork": lambda: {"fork_from": path, "num_epochs": 0},
+        "warm_start": lambda: {"warm_start": [("n0", path)], "num_epochs": 0},
+    }[start]()
+
+    output = trainer.train_loop(seed=0, **kwargs)
+
+    # the new run's values, not the saved state's, which the next update uses (see
+    # `with_hyperparams`), and it says so
+    hyperparams = injected_hyperparams(output.train_states[0].opt_state)
+    assert float(hyperparams["weight_decay"]) == pytest.approx(0.1)
+    assert float(hyperparams["momentum"]) == pytest.approx(0.5)
+    assert "momentum 0.9 -> 0.5, weight_decay 0.5 -> 0.1" in capsys.readouterr().out
 
 
 def test_a_run_without_growth_forks_one_network_of_a_growth_run(
