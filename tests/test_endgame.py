@@ -302,14 +302,15 @@ def test_a_net_player_plays_its_endgame_solved(exact):
 
     n = 14
     opening = load_xot(XOT_PATH)[3]
+    # at fixed visits, and so the same game whatever the machine's load
     black = NetPlayer(
         SearchSettings(batch=2),
         fake_eval,
+        visits=32,
         solving=Solving(empties=n, exact=exact, threads=2),
     )
-    white = NetPlayer(SearchSettings(batch=2), fake_eval, seed=1)
-    game = play_game(black, white, opening, 1.0)
-    assert game.flagged is None
+    white = NetPlayer(SearchSettings(batch=2), fake_eval, seed=1, visits=32)
+    game = play_game(black, white, opening, 3600.0)
     assert black.solved > 0 and black.gave_up == 0
     # black did no worse than the solution where it first solved: white can only give more away
     b = Board()
