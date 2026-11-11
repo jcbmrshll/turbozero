@@ -4015,9 +4015,10 @@ class Trainer:
                 train_key, key = jax.random.split(key)
                 # epochs it has played before this one (without growth, the run's)
                 played = growth.played[i] if growth is not None else cur_epoch
-                lr_scale = (
-                    self.lr_drop.scale(played) if self.lr_drop is not None else None
-                )
+                # its learning rate: its own multiple of the optimizer's, and the drop's
+                drop = self.lr_drop.scale(played) if self.lr_drop is not None else None
+                own = self.learners[i].lr_scale
+                lr_scale = None if drop is None and own == 1.0 else (drop or 1.0) * own
                 collection_state, train_states[i], train_metrics[i] = self.train_steps(
                     train_key,
                     collection_state,

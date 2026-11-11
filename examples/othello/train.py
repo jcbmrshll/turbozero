@@ -334,6 +334,14 @@ def main():
         "which each network takes over, e.g. 80 (one per --grow)",
     )
     parser.add_argument(
+        "--grow-lr",
+        type=float,
+        default=None,
+        metavar="LR",
+        help="the --grow networks' learning rate, where --lr is the first network's (their "
+        "schedules are --lr's, scaled by --grow-lr / --lr); default --lr",
+    )
+    parser.add_argument(
         "--grow-manual",
         action="store_true",
         help="with --grow, nothing takes over by itself: the rule only logs when the next "
@@ -990,6 +998,8 @@ def main():
         parser.error("--grow-train-steps is a positive number of steps, with --grow")
     if args.grow_train_retired and not args.grow:
         parser.error("--grow-train-retired is for a run with --grow")
+    if args.grow_lr is not None and (not args.grow or args.grow_lr <= 0):
+        parser.error("--grow-lr is a positive learning rate, with --grow")
     if any(h < 1 for h in args.average_epochs) or len(set(args.average_epochs)) != len(
         args.average_epochs
     ):
@@ -1274,6 +1284,7 @@ def main():
                         make_nn_eval_fn(grown, state_to_nn_input)
                     ),
                     testers=make_testers(grown, os.path.join(ckpt_dir, net_name(spec))),
+                    lr_scale=1.0 if args.grow_lr is None else args.grow_lr / args.lr,
                 )
             )
         try:

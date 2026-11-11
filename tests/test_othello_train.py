@@ -229,6 +229,23 @@ def test_grow_builds_a_network_to_grow_into_with_its_own_search_and_tests(
     assert own is not theirs and theirs.name == own.name == "engine"
 
 
+def test_grow_lr_scales_the_grown_networks_rate(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(
+            monkeypatch,
+            "--grow",
+            "resnet:2x8",
+            "--grow-switch-at",
+            "80",
+            "--lr",
+            "1e-5",
+            "--grow-lr",
+            "5e-5",
+        )
+    (grown,) = built.value.kwargs["growth"].learners
+    assert grown.lr_scale == pytest.approx(5.0)
+
+
 def test_grow_can_switch_at_fixed_epochs_without_the_engine_set(monkeypatch):
     with pytest.raises(BuiltTrainer) as built:
         run_main(monkeypatch, "--grow", "resnet:2x8", "--grow-switch-at", "80")
@@ -282,6 +299,9 @@ def test_bad_playout_cap_options_are_refused(monkeypatch, options):
             "no-such-set.npz",
         ),
         ("--grow", "resnet:2x8", "--grow-manual", "--grow-switch-at", "80"),
+        # a learning rate for the grown networks: with --grow, positive
+        ("--grow-lr", "5e-5"),
+        ("--grow", "resnet:2x8", "--grow-switch-at", "80", "--grow-lr", "0"),
         # taking over needs a branch of a run with growth
         ("--grow", "resnet:2x8", "--grow-switch-at", "80", "--take-over"),
         ("--branch-from", "runs/trunk", "--take-over"),

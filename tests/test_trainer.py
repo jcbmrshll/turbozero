@@ -2410,7 +2410,9 @@ def hidden_size(params):
     return params.hidden.weight.shape[0]
 
 
-def growth_trainer(env, ckpt_dir, scripts, growth_kwargs=None, grown=(1, 2), **kwargs):
+def growth_trainer(
+    env, ckpt_dir, scripts, growth_kwargs=None, grown=(1, 2), lr_scales=None, **kwargs
+):
     """A trainer whose MLP (n0, hidden width 8) grows into n1 (width 12) and n2 (width 16), or
     those of `grown`: network i's self-play is TaggedEvaluator(i), its tests'
     TaggedEvaluator(10 + i), and its tester a ScriptedTester of `scripts[i]`."""
@@ -2422,6 +2424,7 @@ def growth_trainer(env, ckpt_dir, scripts, growth_kwargs=None, grown=(1, 2), **k
             evaluator=TaggedEvaluator(float(i)),
             evaluator_test=TaggedEvaluator(10.0 + i),
             testers=[testers[i]],
+            lr_scale=(lr_scales or {}).get(i, 1.0),
         )
         for i in grown
     ]
@@ -3770,6 +3773,30 @@ def test_with_growth_each_network_counts_its_own_epochs_playing(
         *((1, 1.0), (2, 1.0)) * 3,
     ]
     assert output.growth is not None and output.growth.played == (6, 3, 0)
+
+
+def test_networks_train_at_their_own_learning_rates(env, tmp_path, fake_loop):
+    # n1 at 5x the optimizer's rate, the others at its rate; a drop multiplies a network's own
+    trainer, _ = growth_trainer(
+        env, tmp_path, SCRIPTS, lr_scales={1: 5.0}, lr_drop=LRDrop(3, 0.5)
+    )
+    calls = fake_loop(trainer)
+
+    trainer.train_loop(seed=0, num_epochs=9)
+
+    assert [(c.learner, c.lr_scale) for c in of_kind(calls, "train")] == [
+        *((0, 1.0), (1, 5.0)) * 3,
+        *((0, 0.5), (1, 5.0)) * 3,
+        *((1, 5.0), (2, 1.0)) * 3,
+    ]
+    # without a drop, only the network with a rate of its own scales its updates
+    plain, _ = growth_trainer(env, tmp_path / "plain", SCRIPTS, lr_scales={1: 5.0})
+    calls = fake_loop(plain)
+    plain.train_loop(seed=0, num_epochs=2)
+    assert [(c.learner, c.lr_scale) for c in of_kind(calls, "train")] == [
+        (0, None),
+        (1, 5.0),
+    ] * 2
 
 
 def test_epochs_played_are_saved_with_the_state(env, tmp_path, fake_loop):
