@@ -658,9 +658,10 @@ Result solve_root_parallel(std::vector<Context>& contexts, u64 P, u64 O, int alp
                         a = std::max(alpha, best);
                     }
                     int v = -search(c, m.P, m.O, -a - 1, -a, n - 1);
-                    if (v <= a) continue;
                     // better than the best when it started: by how much
-                    if (v < beta) v = -search(c, m.P, m.O, -beta, -(v - 1), n - 1);
+                    if (v > a && v < beta) v = -search(c, m.P, m.O, -beta, -(v - 1), n - 1);
+                    // a move that fails low counts too: with every move below alpha, the root's bound is
+                    // the highest of theirs
                     std::lock_guard<std::mutex> held(lock);
                     if (v > best) {
                         best = v;

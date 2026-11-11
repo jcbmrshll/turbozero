@@ -5,6 +5,7 @@ import re
 import time
 import zipfile
 from collections.abc import Callable, Collection, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from typing import TYPE_CHECKING, Any
@@ -30,6 +31,7 @@ from core.memory.replay_memory import (
 )
 from core.pytree import where_tree
 from core.testing.tester import BaseTester, TestState
+from core.training.endgame_solve import EndgameSolve, PendingSolves, Solved
 from core.training.exploration import Exploration
 from core.training.growth import Growth, GrowthProgress, Learner
 from core.training.lr_drop import LRDrop
@@ -82,6 +84,8 @@ class CollectionState:
             before it was written (see `Trainer.tree_sample_mask`), None without tree positions
         resign_state: each environment's resignation state (see `Trainer`'s `resignation`), None
             without resignation
+        pending: each environment's positions waiting for exact solves (see `Trainer`'s
+            `endgame_solve`), None without
     """
 
     eval_state: Any
@@ -98,6 +102,7 @@ class CollectionState:
     tree_buffer_state: ReplayBufferState | None = None
     tree_written_at: jax.Array | None = None
     resign_state: ResignState | None = None
+    pending: PendingSolves | None = None
 
 
 @dataclass(frozen=True)
@@ -112,6 +117,8 @@ class CollectionStats:
         tree_visits: their visit counts, summed
         episode_metrics: sums over the terminated episodes of each episode metric
         resign_state: the resignation state's counters, None without resignation
+        solve_missed: with exact endgame labels, the solves that found every slot full, per
+            environment (see `PendingSolves.missed`); else None
     """
 
     episodes: jax.Array
@@ -120,6 +127,7 @@ class CollectionStats:
     tree_visits: jax.Array
     episode_metrics: dict[str, jax.Array]
     resign_state: ResignState | None = None
+    solve_missed: jax.Array | None = None
 
     @classmethod
     def of(cls, state: CollectionState) -> "CollectionStats":
@@ -132,6 +140,9 @@ class CollectionStats:
             tree_visits=jnp.copy(state.tree_visits),
             episode_metrics={k: jnp.copy(v) for k, v in state.episode_metrics.items()},
             resign_state=jax.tree.map(jnp.copy, state.resign_state),
+            solve_missed=jnp.copy(state.pending.missed)
+            if state.pending is not None
+            else None,
         )
 
 
@@ -565,6 +576,25 @@ def with_rate_index(opt_state: Any, rate_index: int) -> Any:
     )
 
 
+def solve_summary(solved: Sequence[Solved], waited: float) -> dict[str, jax.Array]:
+    """An epoch's metrics of exact endgame labels (see `Trainer.collection_metrics`), from its
+    solves and the seconds self-play waited for them."""
+    whole = np.concatenate(
+        [s.solves[s.whole] for s in solved if len(s.solves)] or [np.zeros((0, 0))]
+    )
+    return {
+        "solve_games": jnp.asarray(len(whole)),
+        "solve_positions": jnp.asarray(sum(len(s.solves) for s in solved)),
+        "solve_seconds": jnp.asarray(sum(s.seconds for s in solved)),
+        "solve_wait_seconds": jnp.asarray(waited),
+        **(
+            {"solve_draw": jnp.asarray((whole == 0).all(-1).mean())}
+            if len(whole)
+            else {}
+        ),
+    }
+
+
 def describe_fn(fn: Callable) -> dict:
     """`fn`'s name and keyword arguments, with their defaults and any `functools.partial` sets.
     Used for logging."""
@@ -614,6 +644,7 @@ class Trainer:
         test_env_init_fn: EnvInitFn | None = None,
         exploration: Exploration | None = None,
         resignation: Resignation | None = None,
+        endgame_solve: EndgameSolve | None = None,
         episode_metrics_fn: Callable[[jax.Array], dict[str, jax.Array]] | None = None,
         data_transform_fns: Sequence[DataTransformFn] = (),
         tree_positions: TreePositions | None = None,
@@ -696,6 +727,12 @@ class Trainer:
             resignation: (optional) self-play's players resign lost games (see core.training.resignation),
                 ending them early as losses. Two-player zero-sum games only. Resigned games count as
                 terminated episodes. If not provided, every game is played to the end.
+            endgame_solve: (optional) exact endgame labels (see core.training.endgame_solve): once a
+                self-play game reaches a position an exact solver solves, on the host while self-play
+                goes on, every position of the game before it gets its solved result as the value
+                target; the game stops there, or plays on a few moves, each position stored past it
+                solved on its own. Positions solved in an epoch are labelled after the next epoch's
+                self-play, so training samples them from then on. Not with `resignation`.
             episode_metrics_fn: (optional) metrics of a finished episode to track, from its final rewards (one per
                 player) to a dict of scalars, e.g. `lambda rewards: {"draw": (rewards == 0).all()}`. Each is logged
                 every epoch as `episode_<name>`, its mean over the episodes that terminated that epoch (truncated
@@ -832,6 +869,9 @@ class Trainer:
         self.advance_every = advance_every
         self.exploration = exploration
         self.resignation = resignation
+        if endgame_solve is not None and resignation is not None:
+            raise ValueError("endgame_solve doesn't go with resignation")
+        self.endgame_solve = endgame_solve
         self.episode_metrics_fn = episode_metrics_fn
         if tree_positions is not None and not all(
             isinstance(e, MCTS) for _, e in self.collection_schedule.stages
@@ -1094,6 +1134,11 @@ class Trainer:
                 if self.resignation is not None
                 else {}
             ),
+            **(
+                {"endgame_solve": self.endgame_solve.get_config()}
+                if self.endgame_solve is not None
+                else {}
+            ),
             "episode_metrics_fn": getattr(self.episode_metrics_fn, "__name__", None)
             if self.episode_metrics_fn is not None
             else None,
@@ -1244,6 +1289,15 @@ class Trainer:
             if self.resignation is not None and state.resign_state is not None
             else jnp.array(False)
         )
+        # exact endgame labels: a game ending for its solves ends before its move, as a resigned
+        # one does
+        solve_move = None
+        stopped = jnp.array(False)
+        if self.endgame_solve is not None and state.pending is not None:
+            solve_move = self.endgame_solve.move(
+                jax.random.fold_in(key, 3), state.pending, state.env_state, done, stored
+            )
+            stopped = solve_move.end
         # step environment and evaluator
         (
             eval_output,
@@ -1266,7 +1320,7 @@ class Trainer:
             if self.exploration is not None
             else None,
             active=done,
-            end=resigned,
+            end=resigned | stopped,
         )
         terminated, truncated = done & terminated, done & truncated
         resign_state = state.resign_state
@@ -1295,6 +1349,7 @@ class Trainer:
             terminated = terminated | resigned
 
         # store experience in replay buffer
+        written = state.buffer_state.next_idx
         buffer_state = self.memory_buffer.add_experience(
             state=state.buffer_state,
             experience=BaseExperience(
@@ -1307,6 +1362,37 @@ class Trainer:
             ),
             valid=stored,
         )
+        pending = state.pending
+        # the games that count as episodes now: with exact endgame labels, a game past its solve
+        # point counted when that was labelled
+        counted = terminated
+        if (
+            self.endgame_solve is not None
+            and pending is not None
+            and solve_move is not None
+        ):
+            counted = terminated & ~pending.past
+            # an entry written over is no longer a waiting solve's
+            pending = replace(
+                pending,
+                entry_solve=pending.entry_solve.at[
+                    jnp.where(stored, written, buffer_capacity(buffer_state))
+                ].set(-1, mode="drop"),
+            )
+            # a solved position's entries wait in the buffer for its result (before a game that
+            # ends with this move assigns its own result to them)
+            buffer_state, entries = self.memory_buffer.set_aside(
+                buffer_state, solve_move.solve
+            )
+            buffer_state = where_tree(
+                solve_move.drop, self.memory_buffer.truncate(buffer_state), buffer_state
+            )
+            pending = self.endgame_solve.add(
+                pending, state.env_state, entries, solve_move
+            )
+            pending = self.endgame_solve.next_game(
+                jax.random.fold_in(key, 2), pending, terminated | truncated | stopped
+            )
         # assign rewards to buffer if episode is terminated
         buffer_state = where_tree(
             terminated,
@@ -1321,7 +1407,7 @@ class Trainer:
         if tree_key is not None:
             # the tree the next search reuses: the played move's subtree, unless the episode ended
             reused = jnp.where(
-                terminated | truncated,
+                terminated | truncated | stopped,
                 searched_eval_state.NULL_INDEX,
                 searched_eval_state.edge_map[
                     searched_eval_state.ROOT_INDEX, eval_output.action
@@ -1340,13 +1426,14 @@ class Trainer:
             env_state=where_tree(done, new_env_state, state.env_state),
             buffer_state=buffer_state,
             metadata=where_tree(done, new_metadata, state.metadata),
-            episodes=state.episodes + terminated,
+            episodes=state.episodes + counted,
             moves=state.moves + done,
             episode_metrics=self.add_episode_metrics(
-                state.episode_metrics, rewards, terminated
+                state.episode_metrics, rewards, counted
             ),
             search_cycles=jnp.where(done, 0, state.search_cycles),
             resign_state=resign_state,
+            pending=pending,
         )
 
     def collect(
@@ -1514,6 +1601,74 @@ class Trainer:
             return carry[0]
 
         return jax.vmap(collect_env)(key, state)
+
+    @partial(jax.jit, static_argnums=(0,), donate_argnames=("state",))
+    def label_solved(
+        self, state: CollectionState, results: jax.Array, counts: jax.Array
+    ) -> CollectionState:
+        """Labels the games waiting for exact solves with their results (see `endgame_solve`):
+        every stored position of each game gets its game's result, and training can sample it.
+        They count as episodes that terminated, in `episode_metrics_fn`'s metrics too.
+
+        Args:
+            state: collection state, donated (see `collect_steps`)
+            results: (environments, slots, players) the results, by slot, from
+                `EndgameSolve.solve`
+            counts: (environments,) how many of each environment's oldest waiting games to label
+
+        Returns:
+            CollectionState: updated collection state
+        """
+        assert self.endgame_solve is not None and state.pending is not None
+        endgame_solve = self.endgame_solve
+
+        def label(
+            state: CollectionState, results: jax.Array, count: jax.Array
+        ) -> CollectionState:
+            assert state.pending is not None
+            pending, reward, populated, games = endgame_solve.label(
+                state.pending,
+                state.buffer_state.buffer.reward,
+                state.buffer_state.populated,
+                results,
+                count,
+            )
+            zeros = {name: jnp.zeros((), jnp.float32) for name in state.episode_metrics}
+            added = jax.vmap(lambda r, t: self.add_episode_metrics(zeros, r, t))(
+                results, games
+            )
+            return replace(
+                state,
+                pending=pending,
+                buffer_state=replace(
+                    state.buffer_state,
+                    buffer=replace(state.buffer_state.buffer, reward=reward),
+                    populated=populated,
+                ),
+                episodes=state.episodes + games.sum(),
+                episode_metrics={
+                    name: total + added[name].sum()
+                    for name, total in state.episode_metrics.items()
+                },
+            )
+
+        return jax.vmap(label)(state, results, counts)
+
+    def label_solved_games(
+        self, state: CollectionState, solved: Solved
+    ) -> CollectionState:
+        """`label_solved` with a solve's results, if it solved anything."""
+        if not len(solved.solves):
+            return state
+        return self.label_solved(
+            state, jnp.asarray(solved.results), jnp.asarray(solved.counts)
+        )
+
+    def solve_waiting(self, pending: PendingSolves) -> Solved:
+        """On the host: solves the games waiting for exact solves, in `pending` copied to the
+        host (see `EndgameSolve.solve`)."""
+        assert self.endgame_solve is not None
+        return self.endgame_solve.solve(pending)
 
     def train_step(
         self,
@@ -1736,7 +1891,7 @@ class Trainer:
         Each environment keeps its newest entries, as many as fit (see
         `EpisodeReplayBuffer.resized`): shrinking drops the oldest, and growing leaves room that
         self-play fills, but can't bring back positions dropped before. Games in progress carry
-        on, entries and all.
+        on, entries and all, and so do games waiting for exact solves (see `endgame_solve`).
 
         With tree positions (see `tree_positions`), their buffer is resized too, by default by the
         same factor (rounded up), so that it still holds the replay buffer's span of self-play,
@@ -1765,10 +1920,24 @@ class Trainer:
                 f"capacities must be positive, got {capacity} and {tree_capacity}"
             )
         old_capacity = buffer_capacity(state.buffer_state)
-        buffer_state, _ = EpisodeReplayBuffer(capacity).resized(
-            jax.tree.map(_to_host, state.buffer_state)
+        # with exact endgame labels, which waiting game each entry is: + 1, for the places left
+        # empty to be none (-1)
+        entry_games = (
+            [_to_host(state.pending.entry_solve) + 1]
+            if state.pending is not None
+            else []
+        )
+        buffer_state, entry_games = EpisodeReplayBuffer(capacity).resized(
+            jax.tree.map(_to_host, state.buffer_state), *entry_games
         )
         resized = replace(state, buffer_state=jax.tree.map(_to_device, buffer_state))
+        if state.pending is not None:
+            resized = replace(
+                resized,
+                pending=replace(
+                    state.pending, entry_solve=_to_device(entry_games[0] - 1)
+                ),
+            )
         if state.tree_buffer_state is None or state.tree_written_at is None:
             if tree_capacity is not None:
                 raise ValueError("tree_capacity needs tree positions")
@@ -2131,6 +2300,11 @@ class Trainer:
                   resignation; `resign_calibration_games`, the calibration games that ended;
                   `resign_calibration_below`, the fraction of them in which a player's value fell to
                   the threshold; and `resign_false`, the fraction of those that player didn't lose
+                - with `endgame_solve`: `solve_missed`, the solves that found every slot full
+                  (the training loop adds `solve_games`, the games labelled at their solve points,
+                  `solve_draw`, the fraction of them drawn, `solve_positions`, every position
+                  solved, `solve_seconds`, the solve's time, and `solve_wait_seconds`, how long
+                  self-play waited for it after it was done)
                 - with `tree_positions`: `tree_positions` stored in between,
                   `tree_positions_per_move`, and their `tree_mean_visits`
         """
@@ -2167,6 +2341,8 @@ class Trainer:
             metrics["resign_false"] = resign_change("calibration_false") / jnp.maximum(
                 calibration_below, 1
             )
+        if after.pending is not None and before.solve_missed is not None:
+            metrics["solve_missed"] = (after.pending.missed - before.solve_missed).sum()
         if self.tree_positions is not None:
             positions = (after.tree_positions - before.tree_positions).sum()
             visits = (after.tree_visits - before.tree_visits).sum()
@@ -2722,7 +2898,8 @@ class Trainer:
         """A saved collection state, for `evaluator`, at its saved capacities: with
         `keep_search`, the saved search states if they have its states' shapes, else new ones,
         with the moves in progress searched again (see `branch`). Returns it, and whether the
-        saved search states were kept."""
+        saved search states were kept. With `endgame_solve`, the saved pending solves if they
+        have this run's shapes, else none waiting (any the saved state had are dropped)."""
         template = jax.eval_shape(
             lambda: self.init_collection_state(
                 jax.random.PRNGKey(0),
@@ -2742,8 +2919,14 @@ class Trainer:
         def searching(leaf_path: str) -> bool:
             return leaf_path.startswith(".eval_state")
 
+        def solving(leaf_path: str) -> bool:
+            return leaf_path.startswith(".pending")
+
         keep = keep_search and [d for d in described if searching(d[0])] == [
             e for e in expected if searching(e[0])
+        ]
+        keep_pending = [d for d in described if solving(d[0])] == [
+            e for e in expected if solving(e[0])
         ]
         mismatched = [
             f"  {leaf_path}: saved "
@@ -2755,6 +2938,7 @@ class Trainer:
             + f", this run's {shape} {dtype}"
             for leaf_path, shape, dtype in expected
             if not searching(leaf_path)
+            and not solving(leaf_path)
             and (
                 leaf_path not in index
                 or described[index[leaf_path]] != (leaf_path, shape, dtype)
@@ -2771,12 +2955,30 @@ class Trainer:
             else iter(jax.tree.leaves(self.init_eval_state(evaluator, self.batch_size)))
         )
         leaves = [
-            _to_device(saved[f"collection_state.{index[leaf_path]}"])
+            jnp.zeros(shape, dtype)  # replaced below
+            if solving(leaf_path) and not keep_pending
+            else _to_device(saved[f"collection_state.{index[leaf_path]}"])
             if keep or not searching(leaf_path)
             else next(fresh)  # pyright: ignore[reportArgumentType]
-            for leaf_path, _, _ in expected
+            for leaf_path, shape, dtype in expected
         ]
         state = jax.tree.unflatten(jax.tree.structure(template), leaves)
+        if not keep_pending:
+            if any(solving(d[0]) for d in described):
+                print(
+                    "branch: the saved games waiting for solves don't fit this run's, so "
+                    "they're dropped",
+                    flush=True,
+                )
+            state = replace(
+                state,
+                pending=self.init_pending(
+                    jax.random.PRNGKey(meta["epoch"]),
+                    self.batch_size,
+                    state.env_state,
+                    meta["buffer_capacity"],
+                ),
+            )
         if not keep:
             # the moves in progress start their searches again
             state = replace(state, search_cycles=jnp.zeros_like(state.search_cycles))
@@ -2914,6 +3116,9 @@ class Trainer:
             **self.init_moves(key, self.batch_size),
             **stats,
             resign_state=self.init_resign_state(key, self.batch_size),
+            pending=self.init_pending(
+                key, self.batch_size, env_state, buffer_capacity(buffer_state)
+            ),
         )
         return collection_state, train_state
 
@@ -3215,6 +3420,23 @@ class Trainer:
             if tree_buffer is not None
             else None,
             resign_state=self.init_resign_state(key, batch_size),
+            pending=self.init_pending(
+                key, batch_size, env_state, memory_buffer.capacity
+            ),
+        )
+
+    def init_pending(
+        self, key: jax.Array, batch_size: int, env_state: Any, capacity: int
+    ) -> PendingSolves | None:
+        """`CollectionState`'s pending solves, with nothing waiting, for environments whose games
+        are `env_state` (one per environment) and a replay buffer of `capacity`; None without
+        `endgame_solve`."""
+        if self.endgame_solve is None:
+            return None
+        endgame_solve = self.endgame_solve
+        keys = jax.random.split(jax.random.fold_in(key, 2), batch_size)
+        return jax.vmap(lambda k, e: endgame_solve.init(k, e, capacity))(
+            keys, env_state
         )
 
     def init_resign_state(self, key: jax.Array, batch_size: int) -> ResignState | None:
@@ -3663,6 +3885,11 @@ class Trainer:
         params = self.selfplay_params(
             train_states[playing_now()], averages[playing_now()]
         )
+        # exact endgame labels' solver, on a thread of its own
+        solver = ThreadPoolExecutor(1) if self.endgame_solve is not None else None
+        # the solve in progress, if any: of the positions waiting at the end of the last
+        # self-play, for after the next
+        solving = None
         if not exact:
             # warmup
             # populate replay buffer with initial self-play games
@@ -3697,6 +3924,15 @@ class Trainer:
                 if self.fresh_positions
                 else None
             )
+            # the positions waiting for exact solves are solved on the host from the end of one
+            # epoch's self-play to the end of the next's, through training and tests: those of a
+            # new or resumed run's start, during its first self-play
+            if solver is not None and solving is None:
+                assert collection_state.pending is not None
+                solving = solver.submit(
+                    self.solve_waiting,
+                    jax.tree.map(np.asarray, collection_state.pending),
+                )
             self.set_activity(f"epoch {cur_epoch}: self-play")
             collection_state = self.collect_steps(
                 collect_keys,
@@ -3705,7 +3941,38 @@ class Trainer:
                 self.collection_steps_per_epoch,
                 evaluator=evaluator,
             )
-            collection_metrics = self.collection_metrics(before, collection_state)
+            solve_metrics: dict[str, jax.Array] = {}
+            if solver is not None and solving is not None:
+                jax.block_until_ready(collection_state)
+                waited = time.perf_counter()
+                self.set_activity(f"epoch {cur_epoch}: waiting for solves")
+                solved = [solving.result()]
+                waited = time.perf_counter() - waited
+                collection_state = self.label_solved_games(collection_state, solved[0])
+                # this epoch's positions start solving now
+                assert collection_state.pending is not None
+                solving = solver.submit(
+                    self.solve_waiting,
+                    jax.tree.map(np.asarray, collection_state.pending),
+                )
+                if not self.memory_buffer.sample_mask(
+                    collection_state.buffer_state
+                ).any():
+                    # nothing to train on yet (e.g. a new run's first epoch, whose games all
+                    # stopped): they're labelled once solved
+                    self.set_activity(f"epoch {cur_epoch}: solving")
+                    started_waiting = time.perf_counter()
+                    solved.append(solving.result())
+                    solving = None
+                    waited += time.perf_counter() - started_waiting
+                    collection_state = self.label_solved_games(
+                        collection_state, solved[-1]
+                    )
+                solve_metrics = solve_summary(solved, waited)
+            collection_metrics = {
+                **self.collection_metrics(before, collection_state),
+                **solve_metrics,
+            }
             # self-play's time includes measuring its data, so that training's is its own
             jax.block_until_ready((collection_state, collection_metrics))
             selfplay_seconds = time.perf_counter() - epoch_started
@@ -4009,5 +4276,7 @@ class Trainer:
             if stop:
                 break
 
+        if solver is not None:
+            solver.shutdown()
         # return state so that training can be continued!
         return state_now()

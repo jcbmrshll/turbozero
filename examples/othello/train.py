@@ -72,6 +72,7 @@ import pgx
 from engine_set import DEFAULT_PATH as DEFAULT_ENGINE_SET
 from engine_set import EngineSet
 from engines import ENGINES
+from exact_labels import SOLVERS, default_threads, make_solve_fn, solve_slots, stops_at
 from game import (
     DEFAULT_NET,
     SGD_WEIGHT_DECAY,
@@ -106,6 +107,7 @@ from core.monitoring.episodes import pgx_two_player_episode
 from core.testing.ladder import LadderTester, Rung
 from core.testing.scored_positions import ScoredPositionsTester
 from core.testing.tester import BaseTester
+from core.training.endgame_solve import EndgameSolve
 from core.training.exploration import Exploration
 from core.training.growth import Growth, Learner
 from core.training.loss_fns import az_default_loss_fn
@@ -457,6 +459,47 @@ def main():
         default=0.1,
         help="with --resign, the fraction of games played to the end anyway, to measure how "
         "often resigning would have been wrong (logged as resign_false)",
+    )
+    parser.add_argument(
+        "--solve-empties",
+        type=int,
+        default=None,
+        metavar="N",
+        help="exact endgame labels: self-play's games stop at N or fewer empty squares, and "
+        "an exact solver's result for that position is every position's value target (see "
+        "exact_labels.py). A game stopped in an epoch is solved during the next epoch's "
+        "self-play and trained on from then. Default: games are played to the end",
+    )
+    parser.add_argument(
+        "--solve-share",
+        type=float,
+        default=1.0,
+        help="with --solve-empties, the fraction of games that stop; the others are played "
+        "to the end, so that training still sees positions past N",
+    )
+    parser.add_argument(
+        "--solve-play-past",
+        type=float,
+        default=0.0,
+        metavar="MEAN",
+        help="with --solve-empties, games play on past N empty squares, ending before each "
+        "further move with probability 1 / (1 + MEAN): MEAN moves on average. Each position "
+        "stored past N is solved and labelled on its own, so the network still trains on "
+        "positions just past N, which searches from above N reach. Default 0: games stop at N",
+    )
+    parser.add_argument(
+        "--solver",
+        choices=SOLVERS,
+        default="native",
+        help="with --solve-empties, the exact solver: native (endgame.py) or edax (needs "
+        "setup_edax.sh, not on Modal)",
+    )
+    parser.add_argument(
+        "--solve-threads",
+        type=int,
+        default=None,
+        help="with --solve-empties, the solver's cores (default: every core this process "
+        "may run on; it runs while self-play does, which mostly waits on the GPU)",
     )
     parser.add_argument(
         "--train-batch",
@@ -1012,6 +1055,15 @@ def main():
         parser.error("--resign must be in (0, 1]")
     if not 0 <= args.resign_calibration <= 1:
         parser.error("--resign-calibration must be between 0 and 1")
+    if args.solve_empties is not None:
+        if not 0 <= args.solve_empties < 60:
+            parser.error("--solve-empties must be in [0, 60)")
+        if args.resign is not None:
+            parser.error("--solve-empties doesn't go with --resign")
+    if not 0 <= args.solve_share <= 1:
+        parser.error("--solve-share must be between 0 and 1")
+    if args.solve_play_past < 0:
+        parser.error("--solve-play-past must be at least 0")
     if args.dirichlet_alpha <= 0:
         parser.error("--dirichlet-alpha must be positive")
     if not 0 <= args.dirichlet_epsilon <= 1:
@@ -1243,6 +1295,24 @@ def main():
         os.path.join(ckpt_dir, net_name(args.net)) if args.grow else ckpt_dir,
     )
 
+    endgame_solve = None
+    if args.solve_empties is not None:
+        stages = [e for _, e in evaluator.stages]
+        endgame_solve = EndgameSolve(
+            stop_fn=stops_at(args.solve_empties),
+            solve_fn=make_solve_fn(
+                args.solver, args.solve_threads or default_threads()
+            ),
+            slots=solve_slots(
+                max(collection_steps * e.search_cycles() for e in stages),
+                args.advance_every or min(e.search_cycles() for e in stages),
+                args.solve_empties,
+                args.solve_play_past,
+            ),
+            share=args.solve_share,
+            play_past=args.solve_play_past,
+        )
+
     # each epoch collects `collection_steps_per_epoch` self-play steps' compute (see
     # --selfplay-cycles) in each of `batch_size` environments, then takes
     # `train_steps_per_epoch` training steps
@@ -1312,6 +1382,7 @@ def main():
         resignation=Resignation(args.resign, args.resign_calibration)
         if args.resign is not None
         else None,
+        endgame_solve=endgame_solve,
         save_state_at=args.save_state_at,
         save_state_every=args.save_state_every,
         # every argument but how the run starts (a fork or branch records its parent)

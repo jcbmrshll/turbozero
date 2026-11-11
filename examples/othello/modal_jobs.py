@@ -171,7 +171,8 @@ def spawn(job: Job, store: Store) -> None:
     here = Path(__file__).parent
     image = (
         modal.Image.debian_slim(python_version="3.12")
-        .apt_install("git")
+        # g++ builds the endgame solver (endgame.py) on first use
+        .apt_install("git", "g++")
         .pip_install("uv", "google-cloud-storage")
         .run_commands(
             f"git clone {REPO_URL} /src",
