@@ -31,7 +31,7 @@ from core.memory.replay_memory import (
 )
 from core.pytree import where_tree
 from core.testing.tester import BaseTester, TestState
-from core.training.endgame_solve import EndgameSolve, PendingSolves
+from core.training.endgame_solve import EndgameSolve, PendingSolves, Solved
 from core.training.exploration import Exploration
 from core.training.growth import Growth, GrowthProgress, Learner
 from core.training.lr_drop import LRDrop
@@ -550,6 +550,24 @@ def with_rate_index(opt_state: Any, rate_index: int) -> Any:
         opt_state,
         is_leaf=_is_lr_plateau,
     )
+
+
+def solve_summary(solved: Sequence[Solved], waited: float) -> dict[str, jax.Array]:
+    """An epoch's metrics of exact endgame labels (see `Trainer.collection_metrics`), from its
+    solves and the seconds self-play waited for them."""
+    games = np.concatenate(
+        [s.games for s in solved if len(s.games)] or [np.zeros((0, 0))]
+    )
+    return {
+        "solve_games": jnp.asarray(len(games)),
+        "solve_seconds": jnp.asarray(sum(s.seconds for s in solved)),
+        "solve_wait_seconds": jnp.asarray(waited),
+        **(
+            {"solve_draw": jnp.asarray((games == 0).all(-1).mean())}
+            if len(games)
+            else {}
+        ),
+    }
 
 
 def describe_fn(fn: Callable) -> dict:
@@ -1571,16 +1589,21 @@ class Trainer:
 
         return jax.vmap(label)(state, results, counts)
 
-    def solve_waiting(
-        self, pending: PendingSolves
-    ) -> tuple[np.ndarray | None, np.ndarray, float]:
-        """On the host: solves the games waiting for exact solves (see `EndgameSolve.solve`), in
-        `pending` copied to the host. Returns the results, the games' counts, and the seconds the
-        solve took."""
+    def label_solved_games(
+        self, state: CollectionState, solved: Solved
+    ) -> CollectionState:
+        """`label_solved` with a solve's results, if it solved any game."""
+        if not len(solved.games):
+            return state
+        return self.label_solved(
+            state, jnp.asarray(solved.results), jnp.asarray(solved.counts)
+        )
+
+    def solve_waiting(self, pending: PendingSolves) -> Solved:
+        """On the host: solves the games waiting for exact solves, in `pending` copied to the
+        host (see `EndgameSolve.solve`)."""
         assert self.endgame_solve is not None
-        started = time.perf_counter()
-        results, counts = self.endgame_solve.solve(pending)
-        return results, counts, time.perf_counter() - started
+        return self.endgame_solve.solve(pending)
 
     def train_step(
         self,
@@ -3845,20 +3868,25 @@ class Trainer:
                 jax.block_until_ready(collection_state)
                 waited = time.perf_counter()
                 self.set_activity(f"epoch {cur_epoch}: waiting for solves")
-                results, counts, solve_seconds = solving.result()
-                solve_metrics = {
-                    "solve_games": jnp.asarray(counts.sum()),
-                    "solve_seconds": jnp.asarray(solve_seconds),
-                    "solve_wait_seconds": jnp.asarray(time.perf_counter() - waited),
-                }
-                if results is not None:
-                    collection_state = self.label_solved(
-                        collection_state, jnp.asarray(results), jnp.asarray(counts)
+                solved = [solving.result()]
+                waited = time.perf_counter() - waited
+                collection_state = self.label_solved_games(collection_state, solved[0])
+                if not self.memory_buffer.sample_mask(
+                    collection_state.buffer_state
+                ).any():
+                    # nothing to train on yet (e.g. a new run's first epoch, whose games all
+                    # stopped): the games stopped this epoch are solved now
+                    self.set_activity(f"epoch {cur_epoch}: solving")
+                    solved.append(
+                        self.solve_waiting(
+                            jax.tree.map(np.asarray, collection_state.pending)
+                        )
                     )
-                    slots = np.arange(results.shape[1]) < counts[:, None]
-                    solve_metrics["solve_draw"] = jnp.asarray(
-                        (results[slots] == 0).all(-1).mean()
+                    waited += solved[-1].seconds
+                    collection_state = self.label_solved_games(
+                        collection_state, solved[-1]
                     )
+                solve_metrics = solve_summary(solved, waited)
             collection_metrics = {
                 **self.collection_metrics(before, collection_state),
                 **solve_metrics,

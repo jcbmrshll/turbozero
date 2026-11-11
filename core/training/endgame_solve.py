@@ -11,6 +11,7 @@ buffer, unpopulated so that training doesn't sample them, and its stopped positi
 environment's `PendingSolves`.
 """
 
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any
@@ -43,6 +44,25 @@ class PendingSolves:
     entry_game: jax.Array
     stops: jax.Array
     missed: jax.Array
+
+
+@dataclass(frozen=True)
+class Solved:
+    """Games solved on the host (see `EndgameSolve.solve`).
+
+    Attributes:
+        results: (environments, slots, players) the results, by the slots the games are in (zeros
+            in the others)
+        counts: (environments,) how many games each environment had waiting: its oldest, those
+            `EndgameSolve.label` labels with these results
+        games: (games, players) the results, a game at a time
+        seconds: the solve's wall time
+    """
+
+    results: np.ndarray
+    counts: np.ndarray
+    games: np.ndarray
+    seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -177,24 +197,21 @@ class EndgameSolve:
         positions = jax.tree.map(lambda x: np.asarray(x)[env, slot], pending.positions)
         return positions, env, slot
 
-    def solve(self, pending: PendingSolves) -> tuple[np.ndarray | None, np.ndarray]:
-        """On the host: solves every environment's waiting games (see `waiting`).
-
-        Returns:
-            Tuple[np.ndarray | None, np.ndarray]: (environments, slots, players) the results, by
-                the slots the games are in (zeros in the others), None if no game was waiting;
-                and (environments,) how many games each had waiting, to `label` along with them
-        """
+    def solve(self, pending: PendingSolves) -> Solved:
+        """On the host: solves every environment's waiting games (see `waiting`)."""
+        started = time.perf_counter()
         positions, env, slot = self.waiting(pending)
-        counts = (np.asarray(pending.added) - np.asarray(pending.labelled)).astype(
-            np.int32
+        counts = np.asarray(pending.added) - np.asarray(pending.labelled)
+        games = (
+            np.asarray(self.solve_fn(positions), dtype=np.float32)
+            if len(env)
+            else np.zeros((0, 0), np.float32)
         )
-        if not len(env):
-            return None, counts
-        solved = np.asarray(self.solve_fn(positions), dtype=np.float32)
-        results = np.zeros((len(counts), self.slots, solved.shape[-1]), np.float32)
-        results[env, slot] = solved
-        return results, counts
+        results = np.zeros((len(counts), self.slots, games.shape[-1]), np.float32)
+        results[env, slot] = games
+        return Solved(
+            results, counts.astype(np.int32), games, time.perf_counter() - started
+        )
 
     def label(
         self,

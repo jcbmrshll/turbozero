@@ -5,7 +5,6 @@ Uses `make_fixed_length_env` (see conftest), whose games end after exactly `leng
 fake solver: the player to move at the stopped position wins."""
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -52,10 +51,8 @@ def sampleable(state):
 def solve_and_label(trainer, state):
     """Solves the games waiting in `state`, then labels them, as the training loop does (with no
     self-play in between)."""
-    results, counts = trainer.endgame_solve.solve(
-        jax.tree.map(np.asarray, state.pending)
-    )
-    return trainer.label_solved(state, jnp.asarray(results), jnp.asarray(counts))
+    solved = trainer.endgame_solve.solve(jax.tree.map(np.asarray, state.pending))
+    return trainer.label_solved_games(state, solved)
 
 
 def test_a_game_stops_before_its_move_and_waits_for_its_result(
@@ -109,7 +106,7 @@ def test_only_the_games_solved_are_labelled(
     )
     state = collect(2 * (STOP + 1))
 
-    state = trainer.label_solved(state, *map(jnp.asarray, solved))
+    state = trainer.label_solved_games(state, solved)
 
     np.testing.assert_array_equal(sampleable(state), np.arange(STOP + 1))
     np.testing.assert_array_equal(state.pending.labelled, [1])
@@ -117,6 +114,26 @@ def test_only_the_games_solved_are_labelled(
     # the second still waits, and is labelled next time
     state = solve_and_label(trainer, state)
     np.testing.assert_array_equal(sampleable(state), np.arange(2 * (STOP + 1)))
+
+
+def test_a_solve_reports_each_games_result_from_the_oldest(
+    fixed_length_env, make_collector, scripted, tmp_path
+):
+    env = fixed_length_env(length=LENGTH)
+    collect = collector(make_collector, env, scripted, tmp_path, slots=2)
+    trainer = collect.trainer
+    state = solve_and_label(trainer, collect(STOP + 1))
+    # the 2nd and 3rd games stop, the 3rd in slot 0 again
+    state = collect.step(jax.random.split(jax.random.PRNGKey(9), 1), state)
+    for i in range(2 * (STOP + 1) - 1):
+        state = collect.step(jax.random.split(jax.random.PRNGKey(10 + i), 1), state)
+
+    solved = trainer.endgame_solve.solve(jax.tree.map(np.asarray, state.pending))
+
+    np.testing.assert_array_equal(solved.counts, [2])
+    np.testing.assert_array_equal(solved.games, [[-1.0, 1.0]] * 2)
+    # by slot: the 2nd game's in slot 1, the 3rd's in slot 0
+    np.testing.assert_array_equal(solved.results[0], [[-1.0, 1.0]] * 2)
 
 
 def test_a_game_finding_every_slot_full_plays_on(
@@ -161,7 +178,7 @@ def test_a_waiting_game_written_over_is_not_labelled(
     # 5 games of 4 positions in a buffer of 16: the 5th writes over the 1st
     state = collect(5 * (STOP + 1))
 
-    state = trainer.label_solved(state, *map(jnp.asarray, solved))
+    state = trainer.label_solved_games(state, solved)
 
     assert len(sampleable(state)) == 0
     np.testing.assert_array_equal(state.pending.entry_game[0, : STOP + 1], 4)

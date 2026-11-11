@@ -40,7 +40,7 @@ from core.networks.azresnet import batch_norm
 from core.networks.utils import apply_nn
 from core.testing.tester import BaseTester
 from core.testing.two_player_tester import TwoPlayerTester
-from core.training.endgame_solve import EndgameSolve
+from core.training.endgame_solve import EndgameSolve, Solved
 from core.training.growth import Growth, GrowthProgress, Learner
 from core.training.loss_fns import az_default_loss_fn
 from core.training.lr_drop import LRDrop
@@ -2780,16 +2780,23 @@ def test_games_waiting_for_solves_are_solved_during_self_play_and_labelled_after
     solved = []
 
     def collect_steps(key, state, params, num_steps, *, evaluator=None):
-        # every call stops a game
+        # every call stops a game, and finishes one to train on
         state = fake_collect(key, state, params, num_steps, evaluator=evaluator)
         return replace(
-            state, pending=replace(state.pending, added=state.pending.added + 1)
+            state,
+            pending=replace(state.pending, added=state.pending.added + 1),
+            buffer_state=written(state.buffer_state, 1),
         )
 
     def solve_waiting(pending):
         # on the solver's thread
         solved.append(np.array(pending.added))
-        return np.ones((2, 2, 2), np.float32), np.array([1, 0], np.int32), 0.5
+        return Solved(
+            np.ones((2, 2, 2), np.float32),
+            np.array([1, 0], np.int32),
+            np.ones((1, 2), np.float32),
+            0.5,
+        )
 
     def label_solved(state, results, counts):
         calls.append(SimpleNamespace(kind="label", counts=np.asarray(counts)))
@@ -2810,6 +2817,50 @@ def test_games_waiting_for_solves_are_solved_during_self_play_and_labelled_after
     assert logged(monitor, "solve_games") == {0: 1.0, 1: 1.0}
     assert logged(monitor, "solve_seconds") == {0: 0.5, 1: 0.5}
     assert logged(monitor, "solve_draw") == {0: 0.0, 1: 0.0}
+
+
+def test_with_nothing_to_train_on_the_games_just_stopped_are_solved_at_once(
+    env, tmp_path, fake_loop, monkeypatch
+):
+    monitor = FakeMonitor()
+    trainer = solving_trainer(env, tmp_path, monitor=monitor, warmup_steps=0)
+    fake_loop(trainer)
+    fake_collect = trainer.collect_steps
+    solved = []
+
+    def collect_steps(key, state, params, num_steps, *, evaluator=None):
+        # a call with steps stops a game
+        state = fake_collect(key, state, params, num_steps, evaluator=evaluator)
+        stopped = int(num_steps > 0)
+        return replace(
+            state, pending=replace(state.pending, added=state.pending.added + stopped)
+        )
+
+    def solve_waiting(pending):
+        solved.append(np.array(pending.added))
+        counts = np.asarray(pending.added - pending.labelled)
+        games = np.zeros((counts.sum(), 2), np.float32)
+        return Solved(np.zeros((2, 2, 2), np.float32), counts, games, 0.5)
+
+    def label_solved(state, results, counts):
+        # the games labelled are trained on
+        return replace(
+            state,
+            pending=replace(state.pending, labelled=state.pending.labelled + counts),
+            buffer_state=written(state.buffer_state, 1),
+        )
+
+    monkeypatch.setattr(trainer, "collect_steps", collect_steps)
+    monkeypatch.setattr(trainer, "solve_waiting", solve_waiting)
+    monkeypatch.setattr(trainer, "label_solved", label_solved)
+
+    trainer.train_loop(seed=0, num_epochs=2)
+
+    # epoch 0: none waiting during its self-play, then the games it stopped, at once; epoch 1:
+    # the games it stopped wait for epoch 2
+    np.testing.assert_array_equal(solved, [[0, 0], [1, 1], [1, 1]])
+    assert logged(monitor, "solve_games") == {0: 2.0, 1: 0.0}
+    assert logged(monitor, "solve_wait_seconds")[0] >= 0.5
 
 
 def test_a_saved_state_keeps_its_games_waiting_for_solves(env, tmp_path):
