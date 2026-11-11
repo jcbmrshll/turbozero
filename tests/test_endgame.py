@@ -234,6 +234,38 @@ def test_threads_agree_and_a_solve_gives_up_at_its_deadline():
     assert Solver().solve(*random_positions([40], 1, seed=4)[0], seconds=1e-3) is None
 
 
+def test_a_loss_solved_in_sign_bounds_its_margin_on_any_threads():
+    """With every root move failing low, the root's bound is the highest of the moves': never below
+    the true margin, on one thread or several. Kept in the table, it mustn't mislead a later exact
+    solve of a position two moves above it."""
+    from endgame import LIB, Solver
+
+    # (a position, a lost position two moves below it): those whose lost one came back from 4
+    # threads below its margin (-28 for -14, -10 for -2, -10 for -4) and the one above it then wrong
+    pinned = [
+        ((0x808098C8FC5989, 0xFC7C7E2737030616), (0x68483C5989, 0xFCFCFE97B7C38616)),
+        ((0x78CECF4FAECF8B6, 0x23110905130709), (0x79CFCF0F8ECF8B6, 0x23010F07130709)),
+        (
+            (0x3F3C14A854050F00, 0x80C1EA562B7AB03E),
+            (0x3F3E162A16070F00, 0x80C1E8D4E978B03E),
+        ),
+    ]
+    for above, lost in pinned:
+        margin = LIB.endgame_minimax(*lost)
+        assert margin < 0
+        for threads in (1, 2, 4):
+            solver = Solver(threads=threads)
+            solved = solver.solve(*lost, exact=False)
+            assert solved is not None and margin <= solved.margin < 0
+            solved = solver.solve(*above)
+            assert solved is not None and solved.margin == LIB.endgame_minimax(*above)
+    for me, opp in random_positions([9, 10], 60, seed=7):
+        margin = LIB.endgame_minimax(me, opp)
+        if margin < 0:
+            solved = Solver(threads=4).solve(me, opp, exact=False)
+            assert solved is not None and margin <= solved.margin < 0
+
+
 def test_a_batch_checks_its_positions():
     from endgame import solve_batch
 
