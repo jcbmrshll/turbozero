@@ -40,6 +40,7 @@ from core.networks.azresnet import batch_norm
 from core.networks.utils import apply_nn
 from core.testing.tester import BaseTester
 from core.testing.two_player_tester import TwoPlayerTester
+from core.training.endgame_solve import EndgameSolve
 from core.training.growth import Growth, GrowthProgress, Learner
 from core.training.loss_fns import az_default_loss_fn
 from core.training.lr_drop import LRDrop
@@ -2753,6 +2754,101 @@ def test_a_branch_keeps_the_search_states_only_if_they_fit_its_search(
     assert [c.evaluator for c in of_kind(calls, "collect")] == [search] * 2
     assert [t.epoch for t in of_kind(calls, "train")] == [2, 3]
     assert checkpoint_epochs(str(tmp_path / "branch")) == [2, 3]
+
+
+def solving_trainer(env, ckpt_dir, **kwargs):
+    """A trainer with exact endgame labels: games stop at their 2nd move, and draw."""
+    return make_trainer(
+        env,
+        ckpt_dir,
+        endgame_solve=EndgameSolve(
+            stop_fn=lambda state: state.step >= 2,
+            solve_fn=lambda positions: np.zeros((len(positions.step), 2)),
+            slots=2,
+        ),
+        **kwargs,
+    )
+
+
+def test_games_waiting_for_solves_are_solved_during_self_play_and_labelled_after(
+    env, tmp_path, fake_loop, monkeypatch
+):
+    monitor = FakeMonitor()
+    trainer = solving_trainer(env, tmp_path, monitor=monitor)
+    calls = fake_loop(trainer)
+    fake_collect = trainer.collect_steps
+    solved = []
+
+    def collect_steps(key, state, params, num_steps, *, evaluator=None):
+        # every call stops a game
+        state = fake_collect(key, state, params, num_steps, evaluator=evaluator)
+        return replace(
+            state, pending=replace(state.pending, added=state.pending.added + 1)
+        )
+
+    def solve_waiting(pending):
+        # on the solver's thread
+        solved.append(np.array(pending.added))
+        return np.ones((2, 2, 2), np.float32), np.array([1, 0], np.int32), 0.5
+
+    def label_solved(state, results, counts):
+        calls.append(SimpleNamespace(kind="label", counts=np.asarray(counts)))
+        return state
+
+    monkeypatch.setattr(trainer, "collect_steps", collect_steps)
+    monkeypatch.setattr(trainer, "solve_waiting", solve_waiting)
+    monkeypatch.setattr(trainer, "label_solved", label_solved)
+
+    trainer.train_loop(seed=0, num_epochs=2)
+
+    # each epoch solves the games waiting before its self-play (the warmup's, then epoch 0's)...
+    np.testing.assert_array_equal(solved, [[1, 1], [2, 2]])
+    # ...and labels them after it, before training
+    assert [c.kind for c in calls] == ["collect"] + ["collect", "label", "train"] * 2
+    for c in of_kind(calls, "label"):
+        np.testing.assert_array_equal(c.counts, [1, 0])
+    assert logged(monitor, "solve_games") == {0: 1.0, 1: 1.0}
+    assert logged(monitor, "solve_seconds") == {0: 0.5, 1: 0.5}
+    assert logged(monitor, "solve_draw") == {0: 0.0, 1: 0.0}
+
+
+def test_a_saved_state_keeps_its_games_waiting_for_solves(env, tmp_path):
+    trainer = solving_trainer(env, tmp_path)
+    state = trainer.init_collection_state(jax.random.PRNGKey(0), trainer.batch_size)
+    assert state.pending is not None
+    pending = replace(
+        state.pending,
+        added=jnp.array([2, 1], dtype=jnp.int32),
+        entry_game=state.pending.entry_game.at[:, :3].set(0),
+    )
+    output = TrainLoopOutput(
+        collection_state=replace(state, pending=pending),
+        train_states=(trained_state(trainer),),
+        test_states=([],),
+        cur_epoch=2,
+        key=jax.random.PRNGKey(5),
+    )
+    saved = snapshot(pending)
+
+    loaded = trainer.load_state(trainer.save_state(output))
+
+    assert leaves_equal(loaded.collection_state.pending, saved)
+
+
+def test_a_branch_from_a_run_without_solves_has_none_waiting(env, tmp_path, fake_loop):
+    path = saved_mid_move(make_trainer(env, tmp_path / "trunk"))
+    branch = solving_trainer(env, tmp_path / "branch")
+    fake_loop(branch)
+
+    start = branch.branch(path)
+
+    pending = start.collection_state.pending
+    assert pending is not None
+    np.testing.assert_array_equal(pending.added, [0, 0])
+    np.testing.assert_array_equal(pending.entry_game, np.full((2, 8), -1))
+    np.testing.assert_array_equal(
+        start.collection_state.buffer_state.populated[:, :6], True
+    )
 
 
 def test_a_manual_rule_reports_and_a_branch_hands_self_play_over(
