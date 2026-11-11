@@ -265,8 +265,264 @@ def test_bad_playout_cap_options_are_refused(monkeypatch, options):
         ("--grow", "resnet:2x8", "--grow-switch-at", "80,90"),
         # the same size twice
         ("--grow", "resnet:1x4,heads=pooled", "--grow-switch-at", "80"),
+        # a manual rule without --grow, or with fixed epochs
+        ("--grow-manual",),
+        # a margin or guard without --grow; a margin out of range; a guard without the set
+        ("--grow-margin", "0.01"),
+        ("--grow-guard", "engine_value_mse"),
+        ("--grow", "resnet:2x8", "--grow-metric", "loss", "--grow-margin", "1.5"),
+        (
+            "--grow",
+            "resnet:2x8",
+            "--grow-metric",
+            "loss",
+            "--grow-guard",
+            "engine_value_mse",
+            "--engine-set",
+            "no-such-set.npz",
+        ),
+        ("--grow", "resnet:2x8", "--grow-manual", "--grow-switch-at", "80"),
+        # taking over needs a branch of a run with growth
+        ("--grow", "resnet:2x8", "--grow-switch-at", "80", "--take-over"),
+        ("--branch-from", "runs/trunk", "--take-over"),
+        # a branch continues a run: it isn't also a fork or a resumed run
+        ("--branch-from", "runs/trunk", "--resume", "--ckpt-dir", "runs/b"),
+        ("--branch-from", "runs/trunk", "--init-from", "runs/trunk"),
+        # a warm start: of a network of a new run with growth, as SIZE=PATH
+        ("--warm-start", "1x4=runs/a/state-1.npz"),
+        ("--grow", "resnet:2x8", "--grow-switch-at", "80", "--warm-start", "2x8"),
+        (
+            "--grow",
+            "resnet:2x8",
+            "--grow-switch-at",
+            "80",
+            "--warm-start",
+            "2x8=runs/a/state-1.npz",
+            "--resume",
+        ),
     ],
 )
 def test_bad_grow_options_are_refused(monkeypatch, options):
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, *options)
+
+
+def test_warm_starts_reach_the_training_loop(monkeypatch):
+    built, loops = [], []
+
+    class Trainer:
+        def __init__(self, **kwargs):
+            built.append(kwargs)
+            self.ckpt_dirs = ("a", "b")
+
+        def train_loop(self, **kwargs):
+            loops.append(kwargs)
+
+    monkeypatch.setattr(train, "Trainer", Trainer)
+    monkeypatch.setattr(train, "export_last", lambda net_dir, spec: None)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train.py",
+            "--net",
+            "resnet:1x4",
+            "--engine-eval-every",
+            "0",
+            "--grow",
+            "resnet:2x8",
+            "--grow-switch-at",
+            "80",
+            "--warm-start",
+            "2x8=runs/a/state-1.npz",
+            "--warm-start",
+            "1x4=runs/b",
+        ],
+    )
+    train.main()
+    assert loops[0]["warm_start"] == [("2x8", "runs/a/state-1.npz"), ("1x4", "runs/b")]
+    # the trainer records them itself, with the states they came from
+    assert "warm_start" not in built[0]["extra_config"]["args"]
+
+
+def test_a_manual_rule_reaches_growth(monkeypatch, tmp_path):
+    from test_engine_set import tiny_set
+
+    tiny_set(np.random.default_rng(0)).save(tmp_path / "set.npz")
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(
+            monkeypatch,
+            "--grow",
+            "resnet:2x8",
+            "--grow-manual",
+            "--engine-eval-every",
+            "1",
+            "--engine-set",
+            str(tmp_path / "set.npz"),
+        )
+    assert built.value.kwargs["growth"].manual
+
+
+def test_growth_on_the_training_loss_needs_no_engine_set(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, "--grow", "resnet:2x8", "--grow-metric", "loss")
+    assert built.value.kwargs["growth"].metric == "loss"
+
+
+def test_a_margin_and_guard_reach_growth(monkeypatch, tmp_path):
+    from test_engine_set import tiny_set
+
+    tiny_set(np.random.default_rng(0)).save(tmp_path / "set.npz")
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(
+            monkeypatch,
+            "--grow",
+            "resnet:2x8",
+            "--grow-metric",
+            "loss",
+            "--grow-margin",
+            "0.01",
+            "--grow-guard",
+            "engine_value_mse",
+            "--engine-eval-every",
+            "1",
+            "--engine-set",
+            str(tmp_path / "set.npz"),
+        )
+    growth = built.value.kwargs["growth"]
+    assert (growth.metric, growth.margin, growth.guard) == (
+        "loss",
+        0.01,
+        "engine_value_mse",
+    )
+
+
+def test_weight_averages_reach_the_trainer(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(
+            monkeypatch,
+            "--average-epochs",
+            "2",
+            "8",
+            "--selfplay-average",
+            "8",
+            "--average-warmup",
+            "5",
+        )
+    assert built.value.kwargs["averages"] == [2.0, 8.0]
+    assert built.value.kwargs["selfplay_average"] == 8.0
+    assert built.value.kwargs["average_warmup"] == 5.0
+
+
+def test_sgd_takes_its_momentum_and_its_own_weight_decay(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, "--optimizer", "sgd", "--lr", "0.2", "--momentum", "0.8")
+    state = built.value.kwargs["optimizer"].init({"w": jnp.zeros((2, 2))})
+    hyperparams = {k: float(v) for k, v in state.hyperparams.items()}
+    assert hyperparams == pytest.approx(
+        {"learning_rate": 0.2, "momentum": 0.8, "weight_decay": train.SGD_WEIGHT_DECAY}
+    )
+
+
+def test_adamw_keeps_its_weight_decay(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch)
+    state = built.value.kwargs["optimizer"].init({"w": jnp.zeros((2, 2))})
+    assert float(state.hyperparams["weight_decay"]) == train.WEIGHT_DECAY
+    assert built.value.kwargs["lr_drop"] is None
+    assert built.value.kwargs["noise_measure"] == 0
+    # 16 micro-batches of --train-batch / --grad-accum
+    assert built.value.kwargs["fresh_positions"] == 16 * 4096
+
+
+def test_lr_drop_and_the_noise_metrics_reach_the_trainer(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(
+            monkeypatch,
+            "--lr-drop",
+            "150:0.1",
+            "--grad-accum",
+            "4",
+            "--noise-measure",
+            "64",
+            "--fresh-positions",
+            "8192",
+        )
+    kwargs = built.value.kwargs
+    assert (kwargs["lr_drop"].after_epochs, kwargs["lr_drop"].factor) == (150, 0.1)
+    assert (kwargs["noise_measure"], kwargs["fresh_positions"]) == (64, 8192)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ("--average-epochs", "0.5"),
+        ("--average-epochs", "2", "2"),
+        ("--average-epochs", "2", "--selfplay-average", "4"),
+        ("--selfplay-average", "2"),
+        ("--average-epochs", "2", "--average-warmup", "0"),
+    ],
+)
+def test_bad_average_options_are_refused(monkeypatch, options):
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, *options)
+
+
+def test_the_waiting_networks_training_steps_reach_the_trainer(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(
+            monkeypatch,
+            "--grow",
+            "resnet:2x8",
+            "--grow-switch-at",
+            "80",
+            "--grow-train-steps",
+            "3",
+        )
+    assert built.value.kwargs["waiting_train_steps"] == 3
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ("--grow-train-steps", "3"),
+        ("--grow", "resnet:2x8", "--grow-switch-at", "80", "--grow-train-steps", "0"),
+    ],
+)
+def test_bad_waiting_train_steps_are_refused(monkeypatch, options):
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, *options)
+
+
+def test_retired_networks_training_reaches_the_trainer(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(
+            monkeypatch,
+            "--grow",
+            "resnet:2x8",
+            "--grow-switch-at",
+            "80",
+            "--grow-train-retired",
+        )
+    assert built.value.kwargs["train_retired"] is True
+
+
+def test_retired_networks_training_needs_grow(monkeypatch):
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, "--grow-train-retired")
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ("--decoupled-decay",),
+        ("--lr-drop", "150"),
+        ("--lr-drop", "150:2"),
+        ("--lr-drop", "-1:0.1"),
+        ("--grad-accum", "4", "--fresh-positions", "1000"),
+        ("--noise-measure", "-1"),
+    ],
+)
+def test_bad_optimizer_drop_and_noise_options_are_refused(monkeypatch, options):
     with pytest.raises(SystemExit):
         run_main(monkeypatch, *options)

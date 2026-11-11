@@ -22,7 +22,14 @@ class BaseTester:
     in some cases against one or more opponents.
 
     A Tester may maintain its own internal state.
+
+    Attributes:
+        stateless: its `run` leaves its state as it was and plays no games, so the trainer also
+            runs it on other weights of the network (e.g. its weight averages, see `Trainer`'s
+            `averages`) with the same state
     """
+
+    stateless: bool = False
 
     def __init__(
         self,

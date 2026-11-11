@@ -243,6 +243,38 @@ class EpisodeReplayBuffer:
             populated=jnp.where(~state.has_reward, False, state.populated),
         )
 
+    def set_aside(
+        self, state: ReplayBufferState, valid: ArrayLike = True
+    ) -> tuple[ReplayBufferState, jax.Array]:
+        """Ends the current episode without a reward, for one to be assigned to its entries later
+        (e.g. by an exact solver, see `core.training.endgame_solve`): they stay where they are,
+        unpopulated, so that they can't be sampled until the caller populates them along with
+        their reward, and the next episode starts after them. Unlike `truncate`'s, they're only
+        overwritten once the buffer comes round to them again.
+
+        Args:
+            state: replay buffer state
+            valid: (optional) whether to: if not, the buffer is left as it is (and no entries are
+                returned). Cheaper under vmap than a lax.cond, which would select between two whole
+                buffers
+
+        Returns:
+            Tuple[ReplayBufferState, jax.Array]: the updated state, and (capacity,) the episode's
+                entries
+        """
+        entries = state.populated & ~state.has_reward & valid
+        return (
+            replace(
+                state,
+                episode_start_idx=jnp.where(
+                    valid, state.next_idx, state.episode_start_idx
+                ),
+                has_reward=state.has_reward | valid,
+                populated=state.populated & ~entries,
+            ),
+            entries,
+        )
+
     def resized(
         self, state: ReplayBufferState, *entry_data: np.ndarray
     ) -> tuple[ReplayBufferState, list[np.ndarray]]:
