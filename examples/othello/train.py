@@ -74,6 +74,7 @@ from engine_set import EngineSet
 from engines import ENGINES
 from game import (
     DEFAULT_NET,
+    SGD_WEIGHT_DECAY,
     SYMMETRY_TRANSFORM_FNS,
     TRAVERSAL_STEPS,
     WEIGHT_DECAY,
@@ -109,6 +110,7 @@ from core.training.exploration import Exploration
 from core.training.growth import Growth, Learner
 from core.training.loss_fns import az_default_loss_fn
 from core.training.lr_plateau import LRPlateau
+from core.training.noise_scale import NoiseBatchSize
 from core.training.resignation import Resignation
 from core.training.schedule import EvaluatorSchedule, parse_schedule
 from core.training.train import Trainer
@@ -497,10 +499,64 @@ def main():
         "(--vs-engine-last's games are then not played)",
     )
     parser.add_argument(
+        "--optimizer",
+        choices=["adamw", "sgd"],
+        default="adamw",
+        help="AdamW, or SGD with --momentum, as AlphaZero and KataGo trained (they used L2 "
+        "weight decay, a rate about 0.2-0.25 at batch 4096 and momentum 0.9). Under SGD a "
+        "batch's size trades against the learning rate linearly, which --noise-batch relies on",
+    )
+    parser.add_argument(
+        "--momentum",
+        type=float,
+        default=0.9,
+        help="with --optimizer sgd, the momentum",
+    )
+    parser.add_argument(
         "--weight-decay",
         type=float,
-        default=WEIGHT_DECAY,
-        help="AdamW's weight decay, of the network's weights (not its biases or BatchNorm)",
+        default=None,
+        help="weight decay of the network's weights (not its biases or normalization layers): "
+        f"AdamW's (default {WEIGHT_DECAY}), or with --optimizer sgd, w times this added to the "
+        f"gradient, an L2 penalty of half this (default {SGD_WEIGHT_DECAY}; AlphaZero's penalty "
+        "1e-4 is 2e-4 here)",
+    )
+    parser.add_argument(
+        "--decoupled-decay",
+        action="store_true",
+        help="with --optimizer sgd, apply weight decay to the step after momentum, as AdamW "
+        "does, instead of adding it to the gradient (L2)",
+    )
+    parser.add_argument(
+        "--noise-batch",
+        type=int,
+        default=None,
+        metavar="MAX",
+        help="set the training batch size every epoch from the gradient noise scale measured "
+        "in training, up to MAX samples, starting at --train-batch (see "
+        "core/training/noise_scale.py): the nearest power of 2 times the micro-batch "
+        "(--train-batch / --grad-accum, at least 2 of them) to --noise-batch-factor noise "
+        "scales, keeping the samples an epoch trains on at --train-batch x --train-steps. Past "
+        "MAX the learning rate is scaled down instead. Best with --optimizer sgd",
+    )
+    parser.add_argument(
+        "--noise-batch-min",
+        type=int,
+        default=None,
+        help="with --noise-batch, the smallest batch (default 2 micro-batches)",
+    )
+    parser.add_argument(
+        "--noise-batch-factor",
+        type=float,
+        default=1.0,
+        help="with --noise-batch, the batch size in noise scales (at 1 a step is half signal)",
+    )
+    parser.add_argument(
+        "--noise-batch-decay",
+        type=float,
+        default=0.5,
+        help="with --noise-batch, how slowly the rule's average of the noise scale's estimates "
+        "follows each epoch's: the newest epoch weighs 1 minus this",
     )
     parser.add_argument(
         "--inference-dtype",
@@ -735,6 +791,28 @@ def main():
     args = parser.parse_args()
     if args.resume and args.ckpt_dir is None:
         parser.error("--resume needs the run's --ckpt-dir")
+    if args.optimizer != "sgd" and args.decoupled_decay:
+        parser.error("--decoupled-decay goes with --optimizer sgd")
+    if args.weight_decay is None:
+        args.weight_decay = (
+            SGD_WEIGHT_DECAY if args.optimizer == "sgd" else WEIGHT_DECAY
+        )
+    noise_batch = None
+    if args.noise_batch is not None:
+        micro = args.train_batch // args.grad_accum
+        try:
+            noise_batch = NoiseBatchSize(
+                start_batch=args.train_batch,
+                min_batch=args.noise_batch_min or 2 * micro,
+                max_batch=args.noise_batch,
+                micro_batch=micro,
+                factor=args.noise_batch_factor,
+                decay=args.noise_batch_decay,
+            )
+        except ValueError as e:
+            parser.error(f"--noise-batch: {e}")
+    elif args.noise_batch_min is not None:
+        parser.error("--noise-batch-min goes with --noise-batch")
     if args.init_without_buffers and args.init_from is None:
         parser.error("--init-without-buffers needs --init-from")
     if sum(x is not None for x in (args.lr_final, args.lr_drops, args.lr_plateau)) > 1:
@@ -1012,6 +1090,7 @@ def main():
         train_steps_per_epoch=args.train_steps,
         advance_every=args.advance_every,
         grad_accum_steps=args.grad_accum,
+        batch_size_rule=noise_batch,
         nn=network,
         nn_state=network_state,
         loss_fn=partial(az_default_loss_fn, value_target_q=args.value_target_q),
@@ -1023,6 +1102,9 @@ def main():
             args.weight_decay,
             args.lr_drops or (DEFAULT_LR_DROPS if args.lr_final is None else ()),
             lr_plateau=lr_plateau,
+            sgd=args.optimizer == "sgd",
+            momentum=args.momentum,
+            decoupled=args.decoupled_decay,
         ),
         lr_plateau=lr_plateau,
         lr_plateau_metric=args.lr_plateau_metric,

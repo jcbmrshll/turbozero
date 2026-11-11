@@ -12,6 +12,7 @@ import itertools
 import os
 import warnings
 from dataclasses import dataclass, replace
+from functools import partial
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -38,6 +39,7 @@ from core.testing.two_player_tester import TwoPlayerTester
 from core.training.growth import Growth, GrowthProgress, Learner
 from core.training.loss_fns import az_default_loss_fn
 from core.training.lr_plateau import LRPlateau, LRPlateauProgress
+from core.training.noise_scale import NoiseBatchProgress, NoiseBatchSize
 from core.training.schedule import EvaluatorSchedule, describe
 from core.training.train import (
     CollectionStats,
@@ -381,15 +383,16 @@ def fake_loop(monkeypatch):
     """`fake_loop(trainer)` replaces `trainer`'s self-play and training with fakes that return at
     once, so its training loop compiles nothing. Self-play counts an episode for every environment
     and the moves it was asked for; training counts a step and adds 1 to every param, and reports
-    a loss of 0.
+    a loss of 0, and with `noise_scale` (a function of the epoch) the noise scale's estimates, a
+    gradient's squared norm of 1 and a tr(Sigma) of the noise scale.
 
     Returns the calls, in order, as namespaces with the arguments they got: self-play's are
     `kind="collect"`, with `key`, `state`, `params`, `num_steps` and `evaluator`; training's
-    `kind="train"`, with `key`, `state` (the collection state), `epoch` and `result`, the train
-    state it returned.
+    `kind="train"`, with `key`, `state` (the collection state), `epoch`, `num_steps`,
+    `batch_size`, `lr_scale` and `result`, the train state it returned.
     """
 
-    def install(trainer):
+    def install(trainer, noise_scale=None):
         calls = []
 
         def collect_steps(key, state, params, num_steps, *, evaluator=None):
@@ -408,8 +411,15 @@ def fake_loop(monkeypatch):
             )
 
         def train_steps(
-            key, collection_state, train_state, num_steps, epoch=0, learner=0
-        ):  # pylint: disable=unused-argument
+            key,
+            collection_state,
+            train_state,
+            num_steps,
+            epoch=0,
+            learner=0,
+            batch_size=None,
+            lr_scale=None,
+        ):
             result = replace(
                 train_state,
                 params=jax.tree.map(lambda x: x + 1, train_state.params),
@@ -422,10 +432,17 @@ def fake_loop(monkeypatch):
                     state=collection_state,
                     epoch=epoch,
                     learner=learner,
+                    num_steps=num_steps,
+                    batch_size=batch_size,
+                    lr_scale=lr_scale,
                     result=result,
                 )
             )
-            return collection_state, result, {"loss": jnp.array(0.0)}
+            metrics = {"loss": jnp.array(0.0)}
+            if noise_scale is not None:
+                metrics["gns_tr_sigma"] = jnp.array(float(noise_scale(epoch)))
+                metrics["gns_grad_sq"] = jnp.array(1.0)
+            return collection_state, result, metrics
 
         monkeypatch.setattr(trainer, "collect_steps", collect_steps)
         monkeypatch.setattr(trainer, "train_steps", train_steps)
@@ -1221,9 +1238,9 @@ def falling_loss(fake_loop, trainer):
     calls = fake_loop(trainer)
     train_steps = trainer.train_steps
 
-    def with_loss(key, collection_state, train_state, num_steps, epoch=0, learner=0):
+    def with_loss(key, collection_state, train_state, num_steps, epoch=0, **kwargs):
         collection_state, train_state, _ = train_steps(
-            key, collection_state, train_state, num_steps, epoch, learner
+            key, collection_state, train_state, num_steps, epoch, **kwargs
         )
         return collection_state, train_state, {"loss": jnp.float32(1 / (epoch + 1))}
 
@@ -1883,7 +1900,7 @@ def test_tree_position_sampler_fills_the_first_places(env, tmp_path):
 
     for num_tree, expected in [(3, [7, 7, 7, 0]), (0, [0, 0, 0, 0])]:
         add = trainer.tree_position_sampler(
-            tree_state, tree_buffer.sample_mask(tree_state), jnp.array(num_tree)
+            tree_state, tree_buffer.sample_mask(tree_state), jnp.array(num_tree), 4
         )
         mixed = add(jax.random.PRNGKey(0), batch)
         np.testing.assert_array_equal(mixed.search_value, expected)
@@ -1891,7 +1908,7 @@ def test_tree_position_sampler_fills_the_first_places(env, tmp_path):
     # with no tree positions to sample (and so none asked for), the batch is left as it was
     empty = tree_buffer.init(2, template)
     mixed = trainer.tree_position_sampler(
-        empty, tree_buffer.sample_mask(empty), jnp.array(0)
+        empty, tree_buffer.sample_mask(empty), jnp.array(0), 4
     )(jax.random.PRNGKey(0), batch)
     assert jax.tree.all(jax.tree.map(np.array_equal, mixed, batch))
 
@@ -2018,7 +2035,10 @@ def test_grad_accum_matches_one_minibatch_without_batch_norm(env, tmp_path):
 
     assert not leaves_equal(whole.params, make().init_train_state().params)
     assert_trees_close(accumulated, whole)
-    assert_trees_close(accumulated_metrics, whole_metrics)
+    # and the micro-batches' gradients' norms, for the noise scale
+    for a, w in zip(accumulated_metrics, whole_metrics, strict=True):
+        assert set(a) - set(w) == {"gns_micro_sq", "gns_batch_sq"}
+        assert_trees_close({k: a[k] for k in w}, w)
 
 
 def test_train_step_reports_the_scheduled_hyperparameters_it_used(env, tmp_path):
@@ -2614,4 +2634,153 @@ def test_a_real_growth_run_trains_each_network(env, tmp_path):
         assert leaves_equal(
             trainer.load_train_state_from_checkpoint(d, last, i),
             output.train_states[i],
+        )
+
+
+# the gradient noise scale and the batch size rule
+
+
+def test_train_step_takes_as_many_micro_batches_as_the_batch_holds(env, tmp_path):
+    batch = random_batch(env, jax.random.PRNGKey(0), size=16)
+
+    def step(**kwargs):
+        trainer = make_trainer(env, tmp_path, optimizer=optax.sgd(0.1), **kwargs)
+        return jax.jit(trainer.train_step)(trainer.init_train_state(), batch)
+
+    whole, whole_metrics = step(train_batch_size=16)
+    # micro-batches of 4: 4 of them in a batch of 16, whatever train_batch_size says
+    accumulated, metrics = step(train_batch_size=8, grad_accum_steps=2)
+
+    assert_trees_close(accumulated, whole)
+    assert "gns_micro_sq" not in whole_metrics
+    # the micro-batches' gradients' mean squared norm is at least their mean's
+    assert float(metrics["gns_micro_sq"]) >= float(metrics["gns_batch_sq"]) > 0
+    np.testing.assert_allclose(
+        metrics["gns_batch_sq"], jnp.square(metrics["grad_norm"]), rtol=1e-5
+    )
+
+
+def test_lr_scale_scales_the_update_as_the_learning_rate_would(env, tmp_path):
+    batch = random_batch(env, jax.random.PRNGKey(0))
+
+    def step(lr, lr_scale=None):
+        trainer = make_trainer(
+            env, tmp_path, train_batch_size=8, optimizer=optax.sgd(lr, momentum=0.9)
+        )
+        ts = trainer.init_train_state()
+        train_step = jax.jit(partial(trainer.train_step, lr_scale=lr_scale))
+        for _ in range(2):
+            ts, _ = train_step(ts, batch)
+        return ts
+
+    assert_trees_close(step(0.1, jnp.float32(0.25)), step(0.025))
+
+
+def test_train_steps_logs_the_noise_scale_at_the_batch_size_it_is_given(env, tmp_path):
+    trainer = make_trainer(env, tmp_path, train_batch_size=4, grad_accum_steps=2)
+    output = trainer.train_loop(seed=0, num_epochs=1)
+
+    _, _, metrics = trainer.train_steps(
+        jax.random.PRNGKey(0),
+        output.collection_state,
+        output.train_state,
+        2,
+        batch_size=8,
+    )
+
+    assert np.isfinite(metrics["gns_tr_sigma"]) and metrics["gns_tr_sigma"] > 0
+    assert {"gns_grad_sq", "gns_noise_scale", "gns_signal_share"} <= set(metrics)
+    with pytest.raises(ValueError, match="multiple of the micro-batch size"):
+        trainer.train_steps(
+            jax.random.PRNGKey(0),
+            output.collection_state,
+            output.train_state,
+            1,
+            batch_size=5,
+        )
+
+
+# micro-batches of 2; epochs train on 4 x 4 = 16 samples
+NOISE_BATCH = NoiseBatchSize(
+    start_batch=4, min_batch=4, max_batch=8, micro_batch=2, decay=0.0
+)
+# the fake training's noise scale by epoch: wanting 16 (capped at 8, the rate halved), then 2
+# (one halving back, to the minimum)
+NOISE_SCALES = {0: 16.0, 1: 2.0, 2: 2.0, 3: 8.0}
+
+
+def noise_batch_trainer(env, ckpt_dir, **kwargs):
+    return make_trainer(
+        env,
+        ckpt_dir,
+        train_batch_size=4,
+        grad_accum_steps=2,
+        train_steps_per_epoch=4,
+        batch_size_rule=NOISE_BATCH,
+        **kwargs,
+    )
+
+
+def test_the_batch_size_follows_the_noise_scale(env, tmp_path, fake_loop):
+    monitor = FakeMonitor()
+    trainer = noise_batch_trainer(env, tmp_path, monitor=monitor)
+    calls = fake_loop(trainer, noise_scale=NOISE_SCALES.__getitem__)
+
+    output = trainer.train_loop(seed=0, num_epochs=4)
+
+    trained = of_kind(calls, "train")
+    assert [(c.batch_size, c.num_steps, c.lr_scale) for c in trained] == [
+        (4, 4, 1.0),
+        (8, 2, 0.5),
+        (4, 4, 1.0),
+        (4, 4, 1.0),
+    ]
+    assert logged(monitor, "train_batch") == {0: 4, 1: 8, 2: 4, 3: 4}
+    assert logged(monitor, "lr_scale") == {0: 1.0, 1: 0.5, 2: 1.0, 3: 1.0}
+    assert logged(monitor, "batch_noise_scale") == NOISE_SCALES
+    assert output.noise_batch == (NoiseBatchProgress(8.0, 1.0, 8, 1.0),)
+    assert trainer.get_config()["batch_size_rule"] == NOISE_BATCH.get_config()
+
+
+def test_a_resumed_run_carries_on_with_the_batch_size_rule(env, tmp_path, fake_loop):
+    straight = noise_batch_trainer(env, tmp_path / "straight")
+    straight_calls = fake_loop(straight, noise_scale=NOISE_SCALES.__getitem__)
+    expected = straight.train_loop(seed=0, num_epochs=4)
+    stopped = noise_batch_trainer(env, tmp_path / "stopped", save_state_at=[2])
+    fake_loop(stopped, noise_scale=NOISE_SCALES.__getitem__)
+    stopped.train_loop(seed=0, num_epochs=2)
+
+    resumed = noise_batch_trainer(env, tmp_path / "stopped")
+    calls = fake_loop(resumed, noise_scale=NOISE_SCALES.__getitem__)
+    output = resumed.train_loop(seed=0, num_epochs=4, initial_state=resumed.resume())
+
+    assert read_state_meta(state_path(str(tmp_path / "stopped"), 2))["noise_batch"] == [
+        {"tr_sigma": 2.0, "grad_sq": 1.0, "batch": 4, "lr_scale": 1.0}
+    ]
+    assert [c.batch_size for c in of_kind(calls, "train")] == [
+        c.batch_size for c in of_kind(straight_calls, "train")[2:]
+    ]
+    assert output.noise_batch == expected.noise_batch
+    # a run without the rule can't be continued with it
+    plain = make_trainer(
+        env,
+        tmp_path / "plain",
+        train_batch_size=4,
+        grad_accum_steps=2,
+        save_state_at=[1],
+    )
+    fake_loop(plain)
+    plain.train_loop(seed=0, num_epochs=1)
+    with pytest.raises(ValueError, match="without batch_size_rule"):
+        noise_batch_trainer(env, tmp_path / "plain").resume()
+
+
+def test_the_batch_size_rule_must_fit_the_micro_batches(env, tmp_path):
+    with pytest.raises(ValueError, match="micro_batch"):
+        make_trainer(
+            env,
+            tmp_path,
+            train_batch_size=4,
+            grad_accum_steps=1,
+            batch_size_rule=NOISE_BATCH,
         )

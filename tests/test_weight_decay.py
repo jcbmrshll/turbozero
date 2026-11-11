@@ -1,11 +1,14 @@
+from typing import cast
+
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import pytest
 
 from core.networks.azresnet import AZResnet, AZResnetConfig
-from core.training.train import update_size_metrics, weight_decay_mask
+from core.training.train import sgdw, update_size_metrics, weight_decay_mask
 
 
 def resnet_params():
@@ -84,3 +87,44 @@ def test_update_size_is_the_step_relative_to_the_decayed_weights():
     # the bias isn't decayed, so it counts for neither: ||conv|| = 6, ||its update|| = 0.6
     np.testing.assert_allclose(metrics["weight_norm"], 6.0, rtol=1e-6)
     np.testing.assert_allclose(metrics["update_ratio"], 0.1, rtol=1e-6)
+
+
+def sgd_steps(decoupled, grads, params, steps=2):
+    """`params` after `steps` steps of `sgdw` (lr 0.1, momentum 0.5, decay 0.2) on `grads`."""
+    optimizer = optax.inject_hyperparams(sgdw, static_args=("mask", "decoupled"))(
+        learning_rate=0.1,
+        momentum=0.5,
+        weight_decay=0.2,
+        decoupled=decoupled,
+        mask=weight_decay_mask,
+    )
+    state = optimizer.init(params)
+    for _ in range(steps):
+        updates, state = optimizer.update(grads, state, params)
+        params = optax.apply_updates(params, updates)
+    return params
+
+
+@pytest.mark.parametrize("decoupled", [False, True])
+def test_sgd_decays_the_masked_params_with_momentum(decoupled):
+    params = {"w": jnp.full((2, 2), 1.0), "b": jnp.full((2,), 1.0)}
+    grads = {"w": jnp.full((2, 2), 0.5), "b": jnp.full((2,), 0.5)}
+
+    stepped = cast(dict, sgd_steps(decoupled, grads, params))
+
+    # by hand: m <- 0.5 m + g (+ 0.2 w for L2); w <- w - 0.1 (m (+ 0.2 w decoupled))
+    def by_hand(w, decayed):
+        m = 0.0
+        for _ in range(2):
+            if decoupled:
+                m = 0.5 * m + 0.5
+                w = w - 0.1 * (m + (0.2 * w if decayed else 0.0))
+            else:
+                m = 0.5 * m + 0.5 + (0.2 * w if decayed else 0.0)
+                w = w - 0.1 * m
+        return w
+
+    np.testing.assert_allclose(stepped["w"], by_hand(1.0, True), rtol=1e-6)
+    # the bias isn't decayed: both kinds just follow the gradient
+    np.testing.assert_allclose(stepped["b"], by_hand(1.0, False), rtol=1e-6)
+    assert by_hand(1.0, True) != by_hand(1.0, False)

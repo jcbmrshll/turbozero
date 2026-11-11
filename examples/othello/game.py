@@ -22,7 +22,12 @@ from core.memory.replay_memory import BaseExperience
 from core.networks.spec import make_network as build_network
 from core.networks.spec import network_config
 from core.training.lr_plateau import LRPlateau
-from core.training.train import checkpoint_epochs, checkpoint_path, weight_decay_mask
+from core.training.train import (
+    checkpoint_epochs,
+    checkpoint_path,
+    sgdw,
+    weight_decay_mask,
+)
 from core.types import StepMetadata
 
 # vectorized environments pair well with batched AlphaZero; pgx has many more:
@@ -131,6 +136,9 @@ SYMMETRY_TRANSFORM_FNS = [
 # of 1e-4 in the loss, which training used before, came to about this under Adam on the
 # convolutions (from 0.3 to 0.8, Adam's normalization making it uneven between weights)
 WEIGHT_DECAY = 0.5
+# SGD's L2 weight decay, added to the gradient as w times this: AlphaZero's penalty 1e-4 |w|^2
+# would be 2e-4, KataGo's 3e-5 6e-5
+SGD_WEIGHT_DECAY = 1e-4
 
 # steps down the tree an MCTS traversal takes between checks for its leaf (see
 # MCTS.traversal_steps): the fastest on GPU of 1, 2, 4, 8 and 16, with 1024 games of 64 to 256
@@ -178,8 +186,12 @@ def make_optimizer(
     weight_decay: float = WEIGHT_DECAY,
     lr_drops: Sequence[tuple[float, float]] = (),
     lr_plateau: LRPlateau | None = None,
+    sgd: bool = False,
+    momentum: float = 0.9,
+    decoupled: bool = False,
 ) -> optax.GradientTransformation:
-    """AdamW, with the learning rate decaying from `lr` to `lr_final` over
+    """AdamW, or with `sgd` SGD with `momentum` (see `core.training.train.sgdw`: its weight decay
+    L2 or, with `decoupled`, AdamW's kind), with the learning rate decaying from `lr` to `lr_final` over
     `total_steps` training steps, along a cosine, or with `lr_drops`, held at `lr` and then
     dropping in steps: each (fraction of `total_steps`, the learning rate from there on), or
     with `lr_plateau`, its rates, dropping when training stops improving (the trainer's
@@ -201,8 +213,17 @@ def make_optimizer(
                 )
             },
         )
+    learning_rate = schedule if lr_plateau is None else lr_plateau
+    if sgd:
+        return optax.inject_hyperparams(sgdw, static_args=("mask", "decoupled"))(
+            learning_rate=learning_rate,
+            momentum=momentum,
+            weight_decay=weight_decay,
+            decoupled=decoupled,
+            mask=weight_decay_mask,
+        )
     return optax.inject_hyperparams(optax.adamw, static_args=("mask",))(
-        learning_rate=schedule if lr_plateau is None else lr_plateau,
+        learning_rate=learning_rate,
         weight_decay=weight_decay,
         mask=weight_decay_mask,
     )
