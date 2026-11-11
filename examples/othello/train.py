@@ -150,6 +150,16 @@ def lr_drops(text: str) -> list[tuple[float, float]]:
     return drops
 
 
+def warm_start_spec(text: str) -> tuple[str, str]:
+    """Parses --warm-start: SIZE=PATH."""
+    size, sep, path = text.partition("=")
+    if not (size and sep and path):
+        raise argparse.ArgumentTypeError(
+            f"{text!r} isn't SIZE=PATH, e.g. 4x64=run/state-100.npz"
+        )
+    return size, path
+
+
 def lr_drop_spec(text: str) -> LRDrop:
     """Parses --lr-drop: EPOCHS:FACTOR."""
     try:
@@ -852,6 +862,19 @@ def main():
         "scratch. Without --grow, it is this run's --net, trained alone",
     )
     parser.add_argument(
+        "--warm-start",
+        type=warm_start_spec,
+        action="append",
+        default=[],
+        metavar="SIZE=PATH",
+        help="with --grow, in a new run: this run's network of that size (e.g. 4x64) starts from "
+        "a saved state's (state-<EPOCH>.npz, or a --ckpt-dir to take the newest from; a --grow "
+        "run's network of that size, or a run's one network) instead of from scratch, with its "
+        "optimizer state (the learning rate decaying anew) and a --grow run's weight averages, "
+        "e.g. a student beside a teacher forked with --init-from and --fork-into. Repeatable; "
+        "not the network --init-from forks into",
+    )
+    parser.add_argument(
         "--init-without-buffers",
         action="store_true",
         help="with --init-from, start with empty replay buffers instead",
@@ -915,6 +938,10 @@ def main():
         parser.error("--init-without-buffers needs --init-from")
     if args.fork_into is not None and args.init_from is None:
         parser.error("--fork-into needs --init-from")
+    if args.warm_start and not args.grow:
+        parser.error("--warm-start is for a run with --grow")
+    if args.warm_start and (args.resume or args.branch_from is not None):
+        parser.error("--warm-start is for a new run, not --resume or --branch-from")
     if args.grow_train_steps is not None and (
         not args.grow or args.grow_train_steps < 1
     ):
@@ -1299,6 +1326,7 @@ def main():
                     "init_from",
                     "init_without_buffers",
                     "fork_into",
+                    "warm_start",
                     "branch_from",
                     "take_over",
                     "notes",
@@ -1324,6 +1352,7 @@ def main():
         fork_from=args.init_from,
         fork_replay_buffers=not args.init_without_buffers,
         fork_into=args.fork_into,
+        warm_start=args.warm_start,
     )
     for spec, net_dir in zip([args.net, *args.grow], trainer.ckpt_dirs, strict=True):
         export_last(net_dir, spec)

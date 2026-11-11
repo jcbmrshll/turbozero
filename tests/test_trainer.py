@@ -2898,6 +2898,106 @@ def test_a_fork_puts_a_saved_growth_runs_network_in_play(env, tmp_path, fake_loo
         )
 
 
+def test_a_warm_start_takes_a_network_from_another_saved_state(
+    env, tmp_path, fake_loop
+):
+    # the trunk grows n0 into n1, which plays from epoch 1 with n2 training beside it
+    trunk, _ = growth_trainer(
+        env,
+        tmp_path / "trunk",
+        SCRIPTS,
+        growth_kwargs={"switch_at": (1, 9)},
+        save_state_at=[2, 3],
+        averages=(2,),
+    )
+    fake_loop(trunk)
+    saved = trunk.train_loop(seed=0, num_epochs=3)
+    at_3 = state_path(str(tmp_path / "trunk"), 3)
+    at_2 = trunk.load_state(state_path(str(tmp_path / "trunk"), 2))
+    _, plain_path = save_a_state(make_trainer(env, tmp_path / "plain"))
+    plain = make_trainer(env, tmp_path / "plain").load_state(plain_path)
+    # a new run forks n1 from epoch 3 to play, and starts n2 from epoch 2's n2 and n0 from a run
+    # without growth's one network
+    monitor = FakeMonitor()
+    fork, _ = growth_trainer(
+        env,
+        tmp_path / "fork",
+        SCRIPTS,
+        growth_kwargs={"manual": True},
+        averages=(2,),
+        monitor=monitor,
+    )
+    fake_loop(fork)
+
+    output = fork.train_loop(
+        seed=0,
+        num_epochs=0,
+        fork_from=at_3,
+        fork_into="n1",
+        warm_start=[("n2", str(tmp_path / "trunk")), ("n0", plain_path)],
+    )
+
+    # each network as its state left it (a directory's newest state: epoch 3's), its step count
+    # and schedules back at 0
+    at_3_state = trunk.load_state(at_3)
+    n0, n1, n2 = output.train_states
+    assert leaves_equal(n1.params, saved.train_states[1].params)
+    assert leaves_equal(n2.params, at_3_state.train_states[2].params)
+    assert leaves_equal(
+        n2.opt_state,
+        train_module.restart_schedules(at_3_state.train_states[2].opt_state),
+    )
+    assert leaves_equal(n0.params, plain.train_states[0].params)
+    assert [int(ts.step) for ts in output.train_states] == [0, 0, 0]
+    # a growth run's network brings its weight averages; one without growth's start at its weights
+    assert leaves_equal(output.averages[2], at_3_state.averages[2])
+    assert leaves_equal(output.averages[0], (n0.params,))
+    assert output.averaged == (0, saved.averaged[1], at_3_state.averaged[2])
+    assert monitor.started[0]["warm_start"] == [
+        {
+            "network": "n2",
+            "path": os.path.abspath(at_3),
+            "epoch": 3,
+            "monitor_run": None,
+        },
+        {
+            "network": "n0",
+            "path": os.path.abspath(plain_path),
+            "epoch": read_state_meta(plain_path)["epoch"],
+            "monitor_run": None,
+        },
+    ]
+    # epoch 2's state, named, is epoch 2's network
+    warmed = fork.warm_state(state_path(str(tmp_path / "trunk"), 2), 2)
+    assert leaves_equal(warmed.params, at_2.train_states[2].params)
+    # only new runs with growth, and names of this run's networks, each once, but the fork's
+    with pytest.raises(ValueError, match="warm_start: no network n9"):
+        fork.train_loop(seed=0, num_epochs=1, warm_start=[("n9", at_3)])
+    with pytest.raises(ValueError, match="more than once"):
+        fork.train_loop(seed=0, num_epochs=1, warm_start=[("n2", at_3), ("n2", at_3)])
+    with pytest.raises(ValueError, match="n1 is the network the run forks into"):
+        fork.train_loop(
+            seed=0,
+            num_epochs=1,
+            fork_from=at_3,
+            fork_into="n1",
+            warm_start=[("n1", at_3)],
+        )
+    with pytest.raises(ValueError, match="a new run"):
+        fork.train_loop(
+            seed=0, num_epochs=1, initial_state=at_2, warm_start=[("n2", at_3)]
+        )
+    with pytest.raises(ValueError, match="a run with growth"):
+        make_trainer(env, tmp_path / "other").train_loop(
+            seed=0, num_epochs=1, warm_start=[("n0", at_3)]
+        )
+    # nor a network the state hasn't, or one of another shape
+    with pytest.raises(ValueError, match="no network n7 to start from"):
+        fork.warm_state(at_3, 2, "n7")
+    with pytest.raises(ValueError, match="this run's"):
+        fork.warm_state(plain_path, 2)
+
+
 def test_a_run_without_growth_forks_one_network_of_a_growth_run(
     env, tmp_path, fake_loop
 ):

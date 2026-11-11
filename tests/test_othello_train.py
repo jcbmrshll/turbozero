@@ -288,11 +288,61 @@ def test_bad_playout_cap_options_are_refused(monkeypatch, options):
         # a branch continues a run: it isn't also a fork or a resumed run
         ("--branch-from", "runs/trunk", "--resume", "--ckpt-dir", "runs/b"),
         ("--branch-from", "runs/trunk", "--init-from", "runs/trunk"),
+        # a warm start: of a network of a new run with growth, as SIZE=PATH
+        ("--warm-start", "1x4=runs/a/state-1.npz"),
+        ("--grow", "resnet:2x8", "--grow-switch-at", "80", "--warm-start", "2x8"),
+        (
+            "--grow",
+            "resnet:2x8",
+            "--grow-switch-at",
+            "80",
+            "--warm-start",
+            "2x8=runs/a/state-1.npz",
+            "--resume",
+        ),
     ],
 )
 def test_bad_grow_options_are_refused(monkeypatch, options):
     with pytest.raises(SystemExit):
         run_main(monkeypatch, *options)
+
+
+def test_warm_starts_reach_the_training_loop(monkeypatch):
+    built, loops = [], []
+
+    class Trainer:
+        def __init__(self, **kwargs):
+            built.append(kwargs)
+            self.ckpt_dirs = ("a", "b")
+
+        def train_loop(self, **kwargs):
+            loops.append(kwargs)
+
+    monkeypatch.setattr(train, "Trainer", Trainer)
+    monkeypatch.setattr(train, "export_last", lambda net_dir, spec: None)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train.py",
+            "--net",
+            "resnet:1x4",
+            "--engine-eval-every",
+            "0",
+            "--grow",
+            "resnet:2x8",
+            "--grow-switch-at",
+            "80",
+            "--warm-start",
+            "2x8=runs/a/state-1.npz",
+            "--warm-start",
+            "1x4=runs/b",
+        ],
+    )
+    train.main()
+    assert loops[0]["warm_start"] == [("2x8", "runs/a/state-1.npz"), ("1x4", "runs/b")]
+    # the trainer records them itself, with the states they came from
+    assert "warm_start" not in built[0]["extra_config"]["args"]
 
 
 def test_a_manual_rule_reaches_growth(monkeypatch, tmp_path):

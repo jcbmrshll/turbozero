@@ -2870,6 +2870,43 @@ class Trainer:
         )
         return collection_state, train_state
 
+    def warm_state(
+        self, path: str, learner: int, name: str | None = None
+    ) -> TrainState:
+        """The train state a network of a new run starts from with a warm start (see
+        `train_loop`'s `warm_start`): a saved state's network, its weights and optimizer state,
+        with the step count and the learning rate schedules back at 0, as a fork's are (see
+        `fork_state`). From a growth run's state, the network named `name` (by default network
+        `learner`'s name); from a run without growth, its one network. Its shapes must be
+        network `learner`'s.
+
+        Raises:
+            ValueError: if the saved state has no such network, or it doesn't fit
+        """
+        template = jax.eval_shape(partial(self.init_train_state, learner))
+        with np.load(path) as saved:
+            meta = self._check_meta(path, json.loads(str(saved["meta"])))
+            if meta["growth"] is not None:
+                names = saved_network_names(meta)
+                name = name or self.learners[learner].name
+                if name not in names:
+                    raise ValueError(
+                        f"{path} has no network {name} to start from (it has "
+                        f"{', '.join(names)})"
+                    )
+                train_state = self._load_network(
+                    saved, meta, "train_states", names.index(name), template
+                )
+            else:
+                (train_state,) = self._load_part(
+                    saved, meta, "train_states", (template,)
+                )
+        return replace(
+            train_state,
+            opt_state=restart_schedules(train_state.opt_state),
+            step=jnp.zeros_like(train_state.step),
+        )
+
     def fork_averages(
         self, path: str, into: int, name: str | None = None
     ) -> tuple[tuple[Any, ...], int] | None:
@@ -3277,6 +3314,7 @@ class Trainer:
         fork_from: str | None = None,
         fork_replay_buffers: bool = True,
         fork_into: str | None = None,
+        warm_start: Sequence[tuple[str, str]] = (),
     ) -> TrainLoopOutput:
         """Runs the training loop for `num_epochs` epochs. Mostly configured by the Trainer's attributes.
 
@@ -3316,6 +3354,12 @@ class Trainer:
                 from scratch. Without growth, it forks into the Trainer's own network (one
                 network of a growth run trained on alone). Without `fork_into`, the saved
                 network forks into the Trainer's own, which plays
+            warm_start: (with growth, for a new run) (name, saved state) pairs, a state or a
+                directory to take the newest from: the network of that name starts from the saved
+                state's network of the same name (or its only one) instead of from scratch, with
+                its optimizer state, its step count and schedules back at 0 (see `warm_state`),
+                and from a growth run's state its weight averages (see `fork_averages`), e.g. a
+                student trained beside a forked teacher. Not the network a fork goes into
 
         Returns:
             TrainLoopOutput: contains train_state, collection_state, test_states, cur_epoch after
@@ -3323,6 +3367,37 @@ class Trainer:
         """
         if fork_into is not None and fork_from is None:
             raise ValueError("fork_into is for a run forked from a saved state")
+        if warm_start and self.growth is None:
+            raise ValueError("warm_start names networks of a run with growth")
+        if warm_start and initial_state is not None:
+            raise ValueError(
+                "warm_start is for a new run, not one continued from a state"
+            )
+        names = [learner.name for learner in self.learners]
+        warmed = [name for name, _ in warm_start]
+        for name in warmed:
+            if name not in names:
+                raise ValueError(
+                    f"warm_start: no network {name} (this run has {', '.join(names)})"
+                )
+        if len(set(warmed)) != len(warmed):
+            raise ValueError("warm_start names a network more than once")
+        if fork_from is not None and (fork_into or names[0]) in warmed:
+            raise ValueError(
+                f"warm_start: {fork_into or names[0]} is the network the run forks into"
+            )
+        warm_start = [(name, latest_state_path(path)) for name, path in warm_start]
+        warm_records = []
+        for name, path in warm_start:
+            meta = read_state_meta(path)
+            warm_records.append(
+                {
+                    "network": name,
+                    "path": os.path.abspath(path),
+                    "epoch": meta["epoch"],
+                    "monitor_run": meta["monitor_run"],
+                }
+            )
         if fork_from is not None:
             if initial_state is not None:
                 raise ValueError("pass initial_state or fork_from, not both")
@@ -3347,6 +3422,7 @@ class Trainer:
                         "eval_every": eval_every,
                     },
                     **({"parent": self.parent} if self.parent is not None else {}),
+                    **({"warm_start": warm_records} if warm_records else {}),
                     **self.extra_config,
                 },
                 # the last epoch
@@ -3361,6 +3437,7 @@ class Trainer:
                 fork_from,
                 fork_replay_buffers,
                 fork_into,
+                warm_start,
             )
         except BaseException as e:
             if self.monitor is not None:
@@ -3395,6 +3472,7 @@ class Trainer:
         fork_from: str | None = None,
         fork_replay_buffers: bool = True,
         fork_into: str | None = None,
+        warm_start: Sequence[tuple[str, str]] = (),
     ) -> TrainLoopOutput:
         started = time.perf_counter()
         # init rng
@@ -3404,6 +3482,8 @@ class Trainer:
         num_learners = len(self.learners)
         # the network a fork goes into (see `train_loop`'s `fork_into`)
         into = 0
+        # the networks a warm start takes from saved states: (index, name, path)
+        warm: list[tuple[int, str, str]] = []
 
         # initialize states
         if initial_state:
@@ -3458,6 +3538,12 @@ class Trainer:
                 forked if i == into else self.init_train_state(i)
                 for i in range(num_learners)
             ]
+            names = [learner.name for learner in self.learners]
+            for name, path in warm_start:
+                index = names.index(name)
+                self.set_activity(f"loading {name} from {path}", echo=True)
+                train_states[index] = self.warm_state(path, index, name)
+                warm.append((index, name, path))
             # initialize tester states
             tester_states = [
                 [
@@ -3479,6 +3565,10 @@ class Trainer:
                 saved_averages = self.fork_averages(fork_from, into, fork_into)
                 if saved_averages is not None:
                     averages[into], averaged[into] = saved_averages
+            for index, name, path in warm:
+                saved_averages = self.fork_averages(path, index, name)
+                if saved_averages is not None:
+                    averages[index], averaged[index] = saved_averages
 
         def playing_now() -> int:
             return growth.playing if growth is not None else 0
