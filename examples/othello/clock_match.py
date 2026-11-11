@@ -5,7 +5,8 @@ sides on the same cores and nothing else on those cores or their SMT siblings.
     taskset -c 0-5,12-13 uv run examples/othello/clock_match.py \
         --a edax:threads=8 --b egaroucid:threads=8 --seconds 10 --openings 100
 
-A player is `net:net=NAME,batch=16,...` (a network of the league's store, see `cpu_match.py`), or
+A player is `net:net=NAME,batch=16,...` (a network of the league's store, see `cpu_match.py`; with
+`solve=20`, it solves positions with 20 or fewer empties, see `net_player`), or
 `name:key=value,...`: `edax` or `egaroucid`, with `threads`, `dir` (where the
 engine is built), `level` (play at this level, ignoring the clock, its book off) and `args`
 (more of the engine's own options, separated by spaces). Each opening is played with both
@@ -251,13 +252,23 @@ def net_player(options: dict[str, str]) -> Callable[[], Player]:
     `cpu_match.Player.parse`'s, with `net`, `taper` (see `cpu_match.move_budget`), `engine=1`
     to search with a worker thread to a core (`cpu_search.Engine`), `batch` then the leaves each
     evaluates at a time, and `threads`, the cores used, by default all it may run on. With
-    `visits`, it searches so many a move, ignoring the clock."""
-    from cpu_match import NetPlayer, make_engine, make_eval
+    `visits`, it searches so many a move, ignoring the clock. With `solve=N`, positions with N or
+    fewer empties are solved on the same cores (see `cpu_match.Solving`), `solve_exact=1` for the
+    best margin, `solve_share` what of the clock left a solve may take."""
+    from cpu_match import NetPlayer, Solving, make_engine, make_eval
     from cpu_match import Player as NetSpec
 
     options = dict(options)
     native = bool(int(options.pop("engine", 0)))
     cores = int(options.pop("threads", len(os.sched_getaffinity(0))))
+    solving = None
+    if "solve" in options:
+        solving = Solving(
+            empties=int(options.pop("solve")),
+            exact=bool(int(options.pop("solve_exact", 0))),
+            share=float(options.pop("solve_share", Solving.share)),
+            threads=cores,
+        )
     fields = ",".join(f"{k}={v}" for k, v in options.items())
     spec = NetSpec.parse(f"visits=0,{fields}", options["net"], "bf16")
     evaluate = (
@@ -268,7 +279,9 @@ def net_player(options: dict[str, str]) -> Callable[[], Player]:
     taper = int(options.get("taper", 0))
     # a seed to a game, for its draws of symmetries
     seeds = itertools.count()
-    return lambda: NetPlayer(spec.settings, evaluate, taper, next(seeds), spec.visits)
+    return lambda: NetPlayer(
+        spec.settings, evaluate, taper, next(seeds), spec.visits, solving
+    )
 
 
 def make_player(spec: str, seconds: int) -> Callable[[], Player]:
