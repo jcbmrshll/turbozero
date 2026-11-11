@@ -453,6 +453,13 @@ its scores on the engine-labelled set, `avg<H>/engine_*`. Saved states keep them
 without them starts them at its weights. `--selfplay-average 4` has self-play play with the
 4-epoch average instead of the current weights.
 
+What the jitter costs can be watched, off by default: `--fresh-positions N` scores the playing
+network every epoch on N of the positions its self-play just stored, before it trains on them,
+its raw weights and its self-play average: their policy KL and value loss (`fresh_*`), and the
+raw weights' excess (`fresh_*_gap`). N is a multiple of the micro-batch (`--train-batch` /
+`--grad-accum`), e.g. 16 of them. It draws its samples from the run's rng, so a run with it
+plays other games than the same run without.
+
 ### The run controller
 
 `controller.py` runs a long growing run in steps, each its own entry in slick's GPU queue, so

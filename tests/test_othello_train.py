@@ -430,9 +430,9 @@ def test_adamw_keeps_its_weight_decay(monkeypatch):
     state = built.value.kwargs["optimizer"].init({"w": jnp.zeros((2, 2))})
     assert float(state.hyperparams["weight_decay"]) == train.WEIGHT_DECAY
     assert built.value.kwargs["lr_drop"] is None
+    # measurements that cost compute are off unless asked for
     assert built.value.kwargs["noise_measure"] == 0
-    # 16 micro-batches of --train-batch / --grad-accum
-    assert built.value.kwargs["fresh_positions"] == 16 * 4096
+    assert built.value.kwargs["fresh_positions"] == 0
 
 
 def test_lr_drop_and_the_noise_metrics_reach_the_trainer(monkeypatch):
