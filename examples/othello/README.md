@@ -13,6 +13,7 @@ Othello model and against two strong open-source Othello engines,
 | `engines.py` | Edax and Egaroucid, each driven over GTP, and what their searches made of each position, from their logs |
 | `setup_edax.sh`, `setup_egaroucid.sh` | Build the engines for `vs_engine.py` and `clock_match.py` |
 | `clock_match.py` | Games on a real clock, one at a time on the same cores, each side at its best settings |
+| `gcp_cpu_jobs.py`, `gcp_cpu_runner.py` | Commands on Google Cloud Spot VMs of one CPU model (8 Zen 5 cores, AVX-512 VNNI), for timed games |
 | `cpu_search.py`, `cpu_search.cpp` | A single game's MCTS for playing on CPU: a tree in C++, its leaves evaluated in batches by OpenVINO or ONNX Runtime, or searched by a thread to a core (`Engine`) |
 | `cpu_net.py`, `cpu_net.h` | A network's int8 forward pass in C++ (AVX-512 VNNI), for `Engine`: no OpenVINO, closer to the float network |
 | `cpu_match.py` | Games between two such players at fixed visits a move, and their speed in evals a second |
@@ -740,6 +741,45 @@ To evaluate a checkpoint after training, `vs_engine.py` logs to its run with `--
 uv run examples/othello/vs_engine.py runs/othello/49.eqx --levels 8 --sims 1000 --openings 256 \
     --stop-below -1 --monitor --run ID
 ```
+
+### On Google Cloud CPUs
+
+Timed games need the same CPU every time, and Modal's are a mix (some AMD Zen 3 without AVX-512,
+where the native network runs its AVX2 kernel at about a quarter of the speed). `gcp_cpu_jobs.py`
+runs commands on Spot VMs of one model: `n4d-highcpu-16` with one thread a core, 8 physical cores
+of AMD Turin (EPYC 9B45, Zen 5, AVX-512 VNNI), the same generation as razorback's 9900X3D but at a
+lower clock (4.1 GHz at most).
+
+```sh
+uv run examples/othello/gcp_cpu_jobs.py setup --project PROJECT        # once; the bucket is modal_jobs.py's
+uv run examples/othello/gcp_cpu_jobs.py run --name check-1 --jobs jobs.json --out results.jsonl \
+    --vms 2 --files quantized/4x64-...-native.npz
+uv run examples/othello/gcp_cpu_jobs.py follow check-1                 # lines jobs add to their outputs
+uv run examples/othello/gcp_cpu_jobs.py list
+uv run examples/othello/gcp_cpu_jobs.py cleanup                        # every job's VMs
+```
+
+`jobs.json` is a list of `{"name": ..., "cmd": [...], "outputs": [...]}`: each command runs in
+`examples/othello` with the environment's python first on `PATH`, and the last line of JSON it
+prints is its result. Files named in `outputs` (e.g. a `clock_match.py --games` file) go to the
+bucket every 20 seconds while the job runs, which `follow` prints line by line, and come back
+beside `--out`, in `OUT-files/SLOT/NAME/`, when it ends. The jobs are dealt out over the VMs; with
+`--each`, every VM runs every job, to compare VMs. A VM takes this checkout's files as they are
+(new and uncommitted ones too), the engines' builds and each `--files` path under
+`~/.cache/turbozero/othello`, waits for its CPUs to go idle (Ubuntu's own startup work skewed a
+first timed job by 11%), runs its jobs, sending each result to the bucket as it ends, and deletes
+itself. A preempted VM is replaced, the replacement skipping what's done; `run` again with the
+same `--name` continues a job cut short. Every VM is deleted after `--hours` whatever it's doing,
+and `run` deletes any left when it ends.
+
+The first VM of a `uv.lock` builds the environment (g++ from Ubuntu's mirror, uv, the venv from
+PyPI: 3-13 minutes) and leaves it in the bucket; VMs after it start from that, ready about 40
+seconds after their startup script begins (a minute or so after they're created).
+
+Two VMs playing the same games agreed within 1-4% on each game's time where both played the same
+moves. The engines took about 1.45x their time on razorback's CPUs 16-23 (1.24-1.7x by level),
+Egaroucid a little more than Edax, so these VMs need their own timings rather than razorback's
+scaled.
 
 ### Against Edax's scores of fixed positions
 

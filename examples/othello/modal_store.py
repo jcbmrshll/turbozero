@@ -34,13 +34,17 @@ def _download_aside(download: Any, path: str) -> None:
 
 
 class GcsStore:
-    """A Google Cloud Storage bucket, with a service account's key as JSON."""
+    """A Google Cloud Storage bucket, with a service account's key as JSON, or with no key the
+    machine's own account (a Compute Engine VM's)."""
 
-    def __init__(self, bucket: str, key_json: str):
+    def __init__(self, bucket: str, key_json: str | None):
         from google.cloud import storage
 
-        info = json.loads(key_json)
-        self.client = storage.Client.from_service_account_info(info)
+        if key_json is None:
+            self.client = storage.Client()
+        else:
+            info = json.loads(key_json)
+            self.client = storage.Client.from_service_account_info(info)
         self.bucket = self.client.bucket(bucket)
 
     def put_file(self, key: str, path: str) -> None:
