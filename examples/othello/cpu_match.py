@@ -412,6 +412,12 @@ class NetPlayer:
         self.sync(color)
         self.search.play(move)
 
+    def set_position(self, black: int, white: int, color: str) -> None:
+        """Starts the game from a position given whole (see `engines.Board.at`)."""
+        me, opp = (black, white) if color == "b" else (white, black)
+        self.search.set_position(me, opp)
+        self.to_move = color
+
     def solve(self, me: int, opp: int, seconds_left: float) -> int | None:
         """The move the endgame's solution plays, if it's solved in time (and with `exact` off,
         isn't lost)."""

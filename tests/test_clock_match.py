@@ -10,9 +10,18 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "examples" / "othello"))
 
-from clock_match import GRACE, Board, Game, flips, play_game, points, summarize
-from engines import ClockedEdax, ClockedEgaroucid, Edax, Egaroucid
+from clock_match import (
+    GRACE,
+    Game,
+    pair_summary,
+    play_game,
+    play_match,
+    points,
+    summarize,
+)
+from engines import Board, ClockedEdax, ClockedEgaroucid, Edax, Egaroucid, flips
 from game import action
+from ggs import Clock, Start, disc_result
 
 
 def moves(line):
@@ -29,6 +38,9 @@ class FirstLegal:
         self.board = Board()
         self.told = []
         self.seconds_left = []
+
+    def set_position(self, black, white, color):
+        self.board = Board.at(black, white, color)
 
     def play(self, color, move):
         self.told.append((color, move))
@@ -94,7 +106,7 @@ def test_the_board_passes_for_a_player_with_no_move():
 
 def test_each_side_is_charged_only_its_own_moves_and_told_its_clock(clock):
     black, white = FirstLegal(clock, 0.5), FirstLegal(clock, 0.25)
-    game = play_game(black, white, moves("f5d6"), seconds=100)
+    game = play_game(black, white, moves("f5d6"), 100)
     assert game.flagged is None
     assert game.seconds == [
         0.5 * len(black.seconds_left),
@@ -110,7 +122,7 @@ def test_each_side_is_charged_only_its_own_moves_and_told_its_clock(clock):
 
 
 def test_who_runs_out_of_time_first_is_flagged_and_the_game_is_played_out(clock):
-    game = play_game(FirstLegal(clock, 1), FirstLegal(clock, 3), (), seconds=4)
+    game = play_game(FirstLegal(clock, 1), FirstLegal(clock, 3), (), 4)
     assert game.flagged == "w"
     assert 64 - game.move_seconds[-1][0] >= 50
 
@@ -123,20 +135,11 @@ def test_passing_the_clock_by_less_than_the_grace_is_no_loss(clock):
 
 
 @pytest.mark.parametrize(
-    "margin, flagged, a_black, expected",
-    [
-        (10, None, True, 1),
-        (10, None, False, 0),
-        (0, None, True, 0.5),
-        (10, "b", True, 0),
-        (10, "b", False, 1),
-        (-10, "w", True, 1),
-    ],
+    "result, a_black, expected",
+    [(10, True, 1), (10, False, 0), (0, True, 0.5), (-2, True, 0), (-2, False, 1)],
 )
-def test_points_are_for_player_a_and_a_flag_beats_the_board(
-    margin, flagged, a_black, expected
-):
-    assert points(margin, flagged, a_black) == expected
+def test_points_are_for_player_a(result, a_black, expected):
+    assert points(result, a_black) == expected
 
 
 def test_summary_is_for_player_a_whichever_color():
@@ -144,15 +147,18 @@ def test_summary_is_for_player_a_whichever_color():
         Game(margin=4, seconds=[1, 3], move_seconds=[(40, True, 1), (39, False, 3)]),
         Game(
             margin=4,
+            result=-2,
             seconds=[2, 4],
             move_seconds=[(20, True, 2), (19, False, 4)],
             flagged="b",
         ),
     ]
-    summary = summarize(games, [True, False], seconds=5)
+    games[0].result = 4
+    summary = summarize(games, [True, False], 5)
     assert summary["score"] == 1
     assert summary["board_score"] == 0.5
     assert summary["flags"] == {"a": 0, "b": 1}
+    assert summary["clock_changed"] == 1
     assert summary["a"]["seconds_a_game"] == 2.5
     assert summary["b"]["seconds_a_game"] == 2.5
     assert summary["a"]["phases"] == {"mid_34+": 0.5, "late_24-33": 0, "end_0-23": 2}
@@ -226,13 +232,15 @@ def test_clocked_egaroucid_reads_its_move_past_prompts_and_noise():
     engine: Any = ClockedEgaroucid.__new__(ClockedEgaroucid)
     script = Script(["> > \n", "> f5\n"])
     engine.process = script
+    engine.level = None
+    engine.expected = {"b": 3.0, "w": 3.0}
     engine.play("b", action("c4"))
     assert engine.move("w", 3.0) == action("f5")
     assert script.sent == ["play c4", "go"]
 
 
 def test_a_summary_counts_results_and_writes_as_json():
-    games = [Game(margin=4), Game(margin=-2), Game(margin=0), Game(margin=6)]
+    games = [Game(margin=m, result=m) for m in (4, -2, 0, 6)]
     for game in games:
         game.move_seconds.append((40, True, 0.1))
         game.move_seconds.append((39, False, 0.1))
@@ -251,3 +259,116 @@ def test_a_game_records_its_moves_from_the_opening(clock):
     assert not board.legal()
     assert board.margin() == game.margin
     assert len(game.moves) == (board.discs[0] | board.discs[1]).bit_count() - 4
+
+
+# a 14-disc start of GGS's archive, black to move
+GGS_START = Start.parse(
+    "8 -------- -------- --*O-*-- ---***-- --**OO-- --O**O-- -------- -------- *"
+)
+
+
+def test_a_game_from_a_start_tells_both_players_its_board(clock):
+    black, white = FirstLegal(clock, 0), FirstLegal(clock, 0)
+    game = play_game(black, white, (), 100, GGS_START)
+    assert game.start == GGS_START.text()
+    board = GGS_START.board()
+    for move in game.moves:
+        board.play(move)
+    assert not board.legal()
+    assert black.board.discs == white.board.discs == board.discs
+    assert len(game.moves) == (board.discs[0] | board.discs[1]).bit_count() - 14
+
+
+def test_a_soft_timeout_on_a_ggs_clock_is_the_least_loss_and_the_game_goes_on(clock):
+    # black takes a second a move, past its 3 s, but well within its extension
+    game = play_game(FirstLegal(clock, 1), FirstLegal(clock, 0), (), Clock(3, 0, 100))
+    assert game.flagged == "b" and game.hard is None
+    board = Board()
+    for move in game.moves:
+        board.play(move)
+    assert not board.legal()
+    assert game.result == min(disc_result(board), -2)
+
+
+def test_a_hard_timeout_ends_the_game_as_the_greatest_loss(clock):
+    game = play_game(FirstLegal(clock, 0), FirstLegal(clock, 1), (), Clock(3, 0, 2))
+    assert (game.flagged, game.hard) == ("w", "w")
+    assert game.result == 64
+    # white's 3 s and 2 s of extension last 5 of its moves; it ran out on its 6th
+    assert sum(1 for _, black, _ in game.move_seconds if not black) == 6
+
+
+def test_players_are_told_their_extension_after_a_soft_timeout(clock):
+    black = FirstLegal(clock, 2)
+    play_game(black, FirstLegal(clock, 0), (), Clock(3, 0, 10))
+    assert black.seconds_left[:4] == [3, 1, 9, 7]
+
+
+def test_pairs_are_scored_by_points_and_by_summed_discs():
+    # a pair a wins 1-1 on points but by discs; one it wins 2-0; one it loses 0-2; one even
+    results = [(10, -2), (4, 6), (-2, -8), (0, 0)]
+    games, a_black = [], []
+    for first, second in results:
+        # a is black in a pair's first game, white in its second (results are black's)
+        games += [Game(result=first), Game(result=-second)]
+        a_black += [True, False]
+    pairs = pair_summary(games, a_black)
+    assert (pairs["split"], pairs["won"], pairs["lost"]) == (2, 1, 1)
+    assert (pairs["ggs_won"], pairs["ggs_drawn"], pairs["ggs_lost"]) == (2, 1, 1)
+    assert pairs["disc_sums"] == [8, 10, -10, 0]
+    assert pairs["disc_sum"] == 2
+    assert pairs["disc_sum_ci95"][0] < 2 < pairs["disc_sum_ci95"][1]
+    assert pairs["decisive_elo"] == 0
+    assert pairs["game_elo"] == 0
+
+
+def test_a_match_plays_each_start_with_both_colors_also_in_parallel():
+    def player():
+        return FirstLegal([0.0], 0)
+
+    openings = [((), GGS_START), (moves("f5d6"), None)]
+    for parallel in (None, (player, player)):
+        games, a_black = play_match(player, player, openings, 100, parallel=parallel)
+        assert a_black == [True, False, True, False]
+        assert [g.start for g in games] == [GGS_START.text()] * 2 + [None] * 2
+        # first-legal players play the same game whatever the colors
+        assert games[0].moves == games[1].moves
+
+
+@pytest.mark.skipif(not Edax.installed(Edax.default_dir()), reason="Edax isn't built")
+def test_edax_takes_a_board_and_plays_from_it():
+    for start in (GGS_START, Start(GGS_START.black, GGS_START.white, "w").playable()):
+        engine = ClockedEdax(Edax.default_dir(), 10, 1)
+        try:
+            engine.set_position(start.black, start.white, start.color)
+            assert engine.engine.position() == (start.black, start.white, start.color)
+            assert engine.move(start.color, 1.0) in start.board().legal()
+        finally:
+            engine.close()
+
+
+@pytest.mark.skipif(
+    not Egaroucid.installed(Egaroucid.default_dir()), reason="Egaroucid isn't built"
+)
+def test_egaroucid_takes_a_board_and_plays_from_it():
+    start = GGS_START
+    engine = ClockedEgaroucid(Egaroucid.default_dir(), 10, 1, show_board=True)
+    try:
+        engine.set_position(start.black, start.white, start.color)
+        assert engine.position() == (start.black, start.white, start.color)
+        assert engine.move(start.color, 10.0) in start.board().legal()
+    finally:
+        engine.close()
+
+
+def test_egaroucid_is_told_the_clock_only_when_time_is_added():
+    engine: Any = ClockedEgaroucid.__new__(ClockedEgaroucid)
+    script = Script(["> f5\n", "> e6\n", "> c4\n"])
+    engine.process = script
+    engine.level = None
+    engine.expected = {"b": 60.0, "w": 60.0}
+    engine.set_position(GGS_START.black, GGS_START.white, "b")
+    engine.move("b", 59.5)
+    engine.move("b", 125.4)
+    assert script.sent[0] == f"setboard {GGS_START.text().replace('*', 'X')[:-1]}X"
+    assert script.sent[1:] == ["go", "settime B 125", "go"]

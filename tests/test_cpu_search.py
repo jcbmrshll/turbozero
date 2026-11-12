@@ -822,3 +822,30 @@ def test_the_search_is_built_for_a_standard_x86_level(monkeypatch):
         target = native_target.target_flags()
         assert target[0] == level
         assert not any("native" in flag for flag in target)
+
+
+def test_a_net_player_takes_a_board_and_plays_from_it():
+    from clock_match import play_game
+    from cpu_match import NetPlayer
+    from cpu_search import SearchSettings
+    from ggs import Start
+
+    start = Start.parse(
+        "8 -------- -------- --*O-*-- ---***-- --**OO-- --O**O-- -------- -------- O"
+    ).playable()
+    for color in ("b", "w"):
+        player = NetPlayer(SearchSettings(batch=2), fake_eval)
+        player.set_position(start.black, start.white, color)
+        me, opp = (
+            (start.black, start.white) if color == "b" else (start.white, start.black)
+        )
+        assert player.search.position() == (me, opp, False, False)
+    black = NetPlayer(SearchSettings(batch=2), fake_eval, seed=1)
+    white = NetPlayer(SearchSettings(batch=1), fake_eval)
+    game = play_game(black, white, (), 1.0, start)
+    assert game.flagged is None and game.start == start.text()
+    # every move was legal from the start (the referee would have raised), to the end
+    board = start.board()
+    for move in game.moves:
+        board.play(move)
+    assert not board.legal()

@@ -1,4 +1,4 @@
-"""endgame.py's solver: its rules against clock_match's referee, hand positions, plain minimax, and
+"""endgame.py's solver: its rules against the referee's (engines.Board), hand positions, plain minimax, and
 Edax's own solver where Edax is built; and a network's player solving its endgame."""
 
 import os
@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "examples" / "othello"))
 
 pytestmark = pytest.mark.skipif(shutil.which("g++") is None, reason="needs g++")
 
-from clock_match import Board, flips
+from engines import Board, flips
 from xot import XOT_PATH, load_xot
 
 
