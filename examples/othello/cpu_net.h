@@ -565,56 +565,73 @@ inline void normalize_square(const Norm& n, float* v, int ch, bool relu) {
 }
 
 #else
-// the first `c.cin` channels of `x`, (64, stride), quantized into `padded` for `c`, its border the zero
-// point
+// NEON: the quantization and normalizations by hand, 4 lanes (GCC leaves the plain loops scalar)
+// the first `channels` (a multiple of 4) of `x`, (64, stride), quantized into `padded` for `c`, less 128
+// for the signed dot product, its border the zero point
 inline void quantize(const Conv& c, const float* x, int stride, Activation* padded) {
     const int channels = c.cin;
     std::fill(padded, padded + (size_t)PADDED * channels, (Activation)(c.zero_point - ACTIVATION_SHIFT));
-    const float* inverse = c.inverse.data();
-    const float zp = (float)c.zero_point;
-    // adding and taking away 1.5 * 2^23 rounds to the nearest integer, ties to even, as `rint` does
-    const float round = 12582912.0f;
+    const float32x4_t low = vdupq_n_f32(-c.zero_point - 1.0f), high = vdupq_n_f32(256.0f - c.zero_point);
+    const int32x4_t zp = vdupq_n_s32(c.zero_point - ACTIVATION_SHIFT);
+    const int32x4_t lo = vdupq_n_s32(-ACTIVATION_SHIFT), hi = vdupq_n_s32(255 - ACTIVATION_SHIFT);
+    auto step = [&](const float* v, const float* inv) {
+        float32x4_t t = vminq_f32(vmaxq_f32(vmulq_f32(vld1q_f32(v), vld1q_f32(inv)), low), high);
+        // rounded to the nearest, ties to even, as `rint`
+        int32x4_t i = vaddq_s32(vcvtnq_s32_f32(t), zp);
+        return vmovn_s32(vminq_s32(vmaxq_s32(i, lo), hi));
+    };
     for (int s = 0; s < SQUARES; s++) {
         const float* v = x + s * stride;
         Activation* q = padded + ((s / 8 + 1) * 10 + s % 8 + 1) * channels;
-#pragma omp simd
-        for (int i = 0; i < channels; i++) {
-            float t = std::min(std::max(v[i] * inverse[i], -zp - 1.0f), 256.0f - zp);
-            q[i] = (Activation)(std::min(std::max((t + round) - round + zp, 0.0f), 255.0f) - ACTIVATION_SHIFT);
+        int ch = 0;
+        for (; ch + 8 <= channels; ch += 8) {
+            int16x8_t h = vcombine_s16(step(v + ch, c.inverse.data() + ch), step(v + ch + 4, c.inverse.data() + ch + 4));
+            vst1_s8(q + ch, vmovn_s16(h));
+        }
+        if (ch < channels) {
+            int8x8_t b = vmovn_s16(vcombine_s16(step(v + ch, c.inverse.data() + ch), vdup_n_s16(0)));
+            vst1_lane_s32((int32_t*)(q + ch), vreinterpret_s32_s8(b), 0);
         }
     }
 }
 
 // `n` of `ch` values at `v`, in place, then a ReLU if `relu`
 inline void normalize_square(const Norm& n, float* v, int ch, bool relu) {
+    const float32x4_t zero = vdupq_n_f32(0);
     const float* a = n.a.data();
     const float* c = n.c.data();
+    const int whole = ch & ~3;
+    float mean = 0, rstd = 1;
     if (n.type == NORM_CHANNEL) {
-        float sum = 0;
-#pragma omp simd reduction(+ : sum)
-        for (int i = 0; i < ch; i++) sum += v[i];
-        const float mean = sum / ch;
-        float sq = 0;
-#pragma omp simd reduction(+ : sq)
-        for (int i = 0; i < ch; i++) sq += (v[i] - mean) * (v[i] - mean);
-        const float rstd = 1.0f / std::sqrt(sq / ch + n.eps);
-#pragma omp simd
-        for (int i = 0; i < ch; i++) {
-            float out = (v[i] - mean) * rstd * a[i] + c[i];
-            v[i] = relu ? std::max(out, 0.0f) : out;
+        float32x4_t sum = zero;
+        for (int i = 0; i < whole; i += 4) sum = vaddq_f32(sum, vld1q_f32(v + i));
+        float total = vaddvq_f32(sum);
+        for (int i = whole; i < ch; i++) total += v[i];
+        mean = total / ch;
+        float32x4_t sq = zero, m = vdupq_n_f32(mean);
+        for (int i = 0; i < whole; i += 4) {
+            float32x4_t d = vsubq_f32(vld1q_f32(v + i), m);
+            sq = vfmaq_f32(sq, d, d);
         }
-    } else if (n.type == NORM_AFFINE) {
-#pragma omp simd
-        for (int i = 0; i < ch; i++) {
-            float out = v[i] * a[i] + c[i];
-            v[i] = relu ? std::max(out, 0.0f) : out;
-        }
-    } else if (relu) {
-#pragma omp simd
-        for (int i = 0; i < ch; i++) v[i] = std::max(v[i], 0.0f);
+        float squares = vaddvq_f32(sq);
+        for (int i = whole; i < ch; i++) squares += (v[i] - mean) * (v[i] - mean);
+        rstd = 1.0f / std::sqrt(squares / ch + n.eps);
+    }
+    if (n.type == NORM_NONE && !relu) return;
+    const float32x4_t m = vdupq_n_f32(mean), r = vdupq_n_f32(rstd);
+    for (int i = 0; i < whole; i += 4) {
+        float32x4_t x = vld1q_f32(v + i);
+        if (n.type == NORM_CHANNEL) x = vfmaq_f32(vld1q_f32(c + i), vmulq_f32(vsubq_f32(x, m), r), vld1q_f32(a + i));
+        else if (n.type == NORM_AFFINE) x = vfmaq_f32(vld1q_f32(c + i), x, vld1q_f32(a + i));
+        vst1q_f32(v + i, relu ? vmaxq_f32(x, zero) : x);
+    }
+    for (int i = whole; i < ch; i++) {
+        float x = v[i];
+        if (n.type == NORM_CHANNEL) x = (x - mean) * rstd * a[i] + c[i];
+        else if (n.type == NORM_AFFINE) x = x * a[i] + c[i];
+        v[i] = relu ? std::max(x, 0.0f) : x;
     }
 }
-
 #endif
 
 // `n` of each square's first `n.channels` of `x`, (64, stride), in place, then a ReLU if `relu`
