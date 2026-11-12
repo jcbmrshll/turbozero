@@ -27,16 +27,23 @@ cd "$EGAROUCID_DIR"
 git fetch --quiet --depth 1 origin "$EGAROUCID_COMMIT"
 git checkout --quiet FETCH_HEAD
 
-case "$CXX" in
-    *clang*) EXTRA= ;;
-    *) EXTRA=-mfpmath=both ;;
-esac
 # the build instructions from https://www.egaroucid.nyanyan.dev/en/console/, with its option
-# for a CPU with AVX-512 and the one for AMD's where those apply
-if grep -q avx512vl /proc/cpuinfo; then EXTRA="$EXTRA -DHAS_AVX512"; fi
-if grep -q AuthenticAMD /proc/cpuinfo; then EXTRA="$EXTRA -DHAS_AMD_PROCESSOR"; fi
+# for a CPU with AVX-512 and the one for AMD's where those apply; its SIMD code is x86's, so on ARM
+# (Apple's M chips, Graviton, Axion) its generic build with its ARM option
+case "$(uname -m)" in
+    aarch64 | arm64) TARGET=-mcpu=native EXTRA="-DHAS_NO_AVX2 -DHAS_ARM_PROCESSOR" ;;
+    *)
+        TARGET="-mtune=native -march=native"
+        case "$CXX" in
+            *clang*) EXTRA= ;;
+            *) EXTRA=-mfpmath=both ;;
+        esac
+        if grep -q avx512vl /proc/cpuinfo; then EXTRA="$EXTRA -DHAS_AVX512"; fi
+        if grep -q AuthenticAMD /proc/cpuinfo; then EXTRA="$EXTRA -DHAS_AMD_PROCESSOR"; fi
+        ;;
+esac
 "$CXX" -O2 src/Egaroucid_for_Console.cpp -o bin/Egaroucid_for_Console.out \
-    -mtune=native -march=native $EXTRA -pthread -std=c++20 >build.log 2>&1 \
+    $TARGET $EXTRA -pthread -std=c++20 >build.log 2>&1 \
     || { cat build.log >&2; echo "setup_egaroucid.sh: build failed (log above)" >&2; exit 1; }
 
 echo "Egaroucid is in $EGAROUCID_DIR (binary bin/Egaroucid_for_Console.out, weights bin/resources)"
