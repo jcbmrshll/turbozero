@@ -296,10 +296,11 @@ def pair_summary(games: list[Game], a_black: list[bool]) -> dict:
         return {"pairs": 0}
     sums_, scores_ = np.array(sums, float), np.array(scores) / 2
     won, lost = int(np.sum(scores_ > 0.5)), int(np.sum(scores_ < 0.5))
-    spread = float(np.std(sums_, ddof=1)) / math.sqrt(n) if n > 1 else math.inf
-    score_spread = float(np.std(scores_, ddof=1)) / math.sqrt(n) if n > 1 else math.inf
+    # intervals need two pairs, and the decisive pairs' one a decisive pair: None without
+    spread = float(np.std(sums_, ddof=1)) / math.sqrt(n) if n > 1 else None
+    score_spread = float(np.std(scores_, ddof=1)) / math.sqrt(n) if n > 1 else None
     low, high = wilson(won, won + lost)
-    score = float(scores_.mean())
+    score, mean = float(scores_.mean()), float(sums_.mean())
     return {
         "pairs": n,
         "split": n - won - lost,
@@ -308,15 +309,18 @@ def pair_summary(games: list[Game], a_black: list[bool]) -> dict:
         "ggs_won": int(np.sum(sums_ > 0)),
         "ggs_drawn": int(np.sum(sums_ == 0)),
         "ggs_lost": int(np.sum(sums_ < 0)),
-        "disc_sum": round(float(sums_.mean()), 2),
-        "disc_sum_ci95": [
-            round(float(sums_.mean()) - Z95 * spread, 2),
-            round(float(sums_.mean()) + Z95 * spread, 2),
-        ],
-        "decisive_elo": round(elo(won / max(won + lost, 1)), 1) if won + lost else None,
-        "decisive_elo_ci95": [round(elo(low), 1), round(elo(high), 1)],
+        "disc_sum": round(mean, 2),
+        "disc_sum_ci95": None
+        if spread is None
+        else [round(mean - Z95 * spread, 2), round(mean + Z95 * spread, 2)],
+        "decisive_elo": round(elo(won / (won + lost)), 1) if won + lost else None,
+        "decisive_elo_ci95": [round(elo(low), 1), round(elo(high), 1)]
+        if won + lost
+        else None,
         "game_elo": round(elo(score), 1),
-        "game_elo_ci95": [
+        "game_elo_ci95": None
+        if score_spread is None
+        else [
             round(elo(score - Z95 * score_spread), 1),
             round(elo(score + Z95 * score_spread), 1),
         ],

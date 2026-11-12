@@ -418,3 +418,10 @@ def test_a_pass_is_a_step_of_its_own_and_asks_no_player():
     assert not white.seconds_left
     run.step()
     assert run.game.moves == [action("d1"), action("a3")]
+
+
+def test_a_single_pair_has_no_intervals_and_writes_as_strict_json():
+    pairs = pair_summary([Game(result=4), Game(result=4)], [True, False])
+    assert pairs["disc_sum_ci95"] is None and pairs["game_elo_ci95"] is None
+    assert pairs["decisive_elo"] is None and pairs["decisive_elo_ci95"] is None
+    json.dumps(pairs, allow_nan=False)
