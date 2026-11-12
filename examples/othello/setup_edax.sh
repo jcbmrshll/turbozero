@@ -7,7 +7,8 @@
 #     examples/othello/setup_edax.sh            # with AVX-512 (ARCH=x86-64-v4)
 #     ARCH=x86-64-v3 examples/othello/setup_edax.sh
 #
-# Needs git, make, gcc, curl and 7z (p7zip-full on Ubuntu).
+# Needs git, make, gcc, curl and, to unpack the weights unless data/eval.dat is there, 7z (p7zip-full
+# on Ubuntu).
 set -eu
 
 EDAX_COMMIT=8a2b3ea5f5d4d9028a1310304670724f0cfb322d
@@ -25,7 +26,7 @@ case "$(uname -s)" in
     *) OS=linux BINARY=lEdax ;;
 esac
 
-for tool in git make curl 7z gcc; do
+for tool in git make curl gcc; do
     command -v "$tool" >/dev/null 2>&1 || { echo "setup_edax.sh: needs $tool" >&2; exit 1; }
 done
 
@@ -44,6 +45,7 @@ mkdir -p bin
 cp "bin/$BINARY-$ARCH" bin/edax
 
 if [ ! -f data/eval.dat ]; then
+    command -v 7z >/dev/null 2>&1 || { echo "setup_edax.sh: needs 7z" >&2; exit 1; }
     curl -sSL -o eval.7z "$EVAL_URL"
     echo "$EVAL_SHA256  eval.7z" | { sha256sum -c --quiet 2>/dev/null || shasum -a 256 -c --quiet; }
     7z x -y eval.7z >/dev/null
