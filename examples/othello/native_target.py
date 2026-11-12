@@ -12,7 +12,10 @@ LEVELS = {
     "v3-vnni": ["-march=x86-64-v3", "-mavxvnni", "-mtune=generic"],
     "v3": ["-march=x86-64-v3", "-mtune=generic"],
     "v2": ["-march=x86-64-v2", "-mtune=generic"],
-    # ARMv8.2 with the dot product: Apple's M1 on, AWS Graviton 2 on, Google's Axion
+    # ARMv8.2 with the dot product and the 8-bit matrix multiply: Apple's M2 on, AWS Graviton 3 on,
+    # Google's Axion
+    "arm-i8mm": ["-march=armv8.2-a+dotprod+i8mm"],
+    # ARMv8.2 with the dot product: Apple's M1 on, AWS Graviton 2 on
     "arm-dotprod": ["-march=armv8.2-a+dotprod"],
     "arm": ["-march=armv8-a"],
 }
@@ -32,7 +35,7 @@ NEEDS = {
         "v3": V3,
         "v2": set(),
     },
-    "arm": {"arm-dotprod": {"asimddp"}, "arm": set()},
+    "arm": {"arm-i8mm": {"asimddp", "i8mm"}, "arm-dotprod": {"asimddp"}, "arm": set()},
 }
 
 
@@ -50,13 +53,18 @@ def cpu_flags() -> set[str]:
         if line.startswith(("flags", "Features")):
             return set(line.split(":", 1)[1].split())
     if platform.system() == "Darwin":
-        out = subprocess.run(
-            ["sysctl", "-n", "hw.optional.arm.FEAT_DotProd"],
-            capture_output=True,
-            text=True,
-            check=False,
-        ).stdout.strip()
-        return {"asimddp"} if out == "1" else set()
+        names = {"asimddp": "FEAT_DotProd", "i8mm": "FEAT_I8MM"}
+        found = set()
+        for flag, name in names.items():
+            out = subprocess.run(
+                ["sysctl", "-n", f"hw.optional.arm.{name}"],
+                capture_output=True,
+                text=True,
+                check=False,
+            ).stdout.strip()
+            if out == "1":
+                found.add(flag)
+        return found
     return set()
 
 
@@ -68,7 +76,8 @@ def levels() -> list[str]:
 
 def target_flags() -> list[str]:
     """The fastest level the CPU runs: on x86, x86-64-v4 (AVX-512) with VNNI, x86-64-v3 (AVX2) with
-    AVX-VNNI, x86-64-v3, or v2; on ARM, ARMv8.2 with the dot product, or ARMv8. The last of each has
+    AVX-VNNI, x86-64-v3, or v2; on ARM, ARMv8.2 with the dot product and i8mm, with the dot product,
+    or ARMv8. The last of each has
     no native network (`cpu_net.h`). $TURBOZERO_CPU_LEVEL (one of `LEVELS`) picks one, e.g. to play
     as an AVX2 build would."""
     level = os.environ.get("TURBOZERO_CPU_LEVEL")

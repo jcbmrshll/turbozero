@@ -783,8 +783,9 @@ def test_the_native_networks_layers_compute_the_network(spec):
     np.testing.assert_allclose(got_values, values, atol=1e-5)
 
 
-# each convolution kernel: AVX-512 VNNI's, AVX2's Winograd with and without AVX-VNNI, and NEON's
-@pytest.mark.parametrize("level", ["v4", "v3-vnni", "v3", "arm-dotprod"])
+# each convolution kernel: AVX-512 VNNI's, AVX2's Winograd with and without AVX-VNNI, and NEON's with
+# i8mm and with the dot product alone
+@pytest.mark.parametrize("level", ["v4", "v3-vnni", "v3", "arm-i8mm", "arm-dotprod"])
 @pytest.mark.parametrize("spec", NATIVE_SPECS)
 def test_the_native_network_computes_its_quantized_layers(
     spec, level, tmp_path, monkeypatch
@@ -858,7 +859,8 @@ def test_the_search_is_built_for_a_standard_level(monkeypatch):
         ("x86", {"avx2", "bmi2", "fma", "movbe", "avx_vnni"}, "v3-vnni"),
         ("x86", {"avx2", "bmi2", "fma", "movbe", "avx512f"}, "v3"),
         ("x86", set(), "v2"),
-        ("arm", {"fp", "asimd", "asimddp", "i8mm"}, "arm-dotprod"),
+        ("arm", {"fp", "asimd", "asimddp", "i8mm"}, "arm-i8mm"),
+        ("arm", {"fp", "asimd", "asimddp"}, "arm-dotprod"),
         ("arm", {"fp", "asimd"}, "arm"),
     ]:
         monkeypatch.setattr(native_target, "architecture", lambda a=architecture: a)

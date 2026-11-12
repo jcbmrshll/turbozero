@@ -113,11 +113,14 @@ struct Scratch {
     std::vector<Activation> padded;  // (100, max channels), a convolution's input
     std::vector<float> x, y, h;   // (64, max channels): the trunk, a block's middle, the heads
     std::vector<int16_t> winograd;  // (16, 16 tiles, max channels): AVX2's transformed input
+    // i8mm: the padded input in pairs of neighbouring squares, from even and from odd columns
+    std::vector<int8_t> pairs;
     explicit Scratch(const Net& n) {
         int c = std::max(n.channels, 4);
         // and room for NEON's loads of 16 channels past the last square's
         padded.assign((size_t)PADDED * c + 16, 0);
         winograd.assign((size_t)16 * 16 * c, 0);
+        pairs.assign((size_t)10 * 9 * 16 * ((c + 7) / 8), 0);  // 10 rows of 9 pairs, by eights of channels
         x.assign((size_t)SQUARES * c, 0);
         y.assign((size_t)SQUARES * c, 0);
         h.assign((size_t)SQUARES * std::max(c, 3 * n.head_channels), 0);
@@ -326,6 +329,91 @@ inline void convolve(const Conv& c, Scratch& s, float* out, int out_stride) {
             winograd_multiply(v + (size_t)p * TILES * c.cin, w + p * chunk, c.cin, m + p * TILES * 16);
         winograd_output(c, m, 16 * g, out, out_stride);
     }
+}
+#elif NET_ISA == 3 && defined(__ARM_FEATURE_MATMUL_INT8)
+// NEON with i8mm (ARMv8.6; Apple's M2 on, Graviton 3 on, Axion): smmla multiplies a 2x8 block of
+// inputs, two neighbouring squares' 8 channels, by a 2x8 block of weights, two outputs' 8 channels,
+// into a 2x2 block of sums, twice sdot's products an instruction. The input is laid out in such pairs
+// first, from even columns and from odd, since a tap's column shift moves the pairs. The tile is a row's
+// 4 pairs by 4 pairs of outputs: 16 sums, 4 input and 4 weight vectors.
+
+// channels in eights, the last padded with zeros
+inline int eights(int cin) { return (cin + 7) / 8; }
+
+// `in`, the padded input, (100, cin), to (10 rows, 5 pairs from even columns then 4 from odd, eights,
+// 2 squares, 8 channels)
+inline void pair_up(const int8_t* in, int cin, int8_t* out) {
+    const int e = eights(cin);
+    if (cin % 8) std::memset(out, 0, (size_t)10 * 9 * e * 16);
+    for (int y = 0; y < 10; y++)
+        for (int k = 0; k < 9; k++) {
+            int x = k < 5 ? 2 * k : 2 * (k - 5) + 1;
+            int8_t* o = out + ((size_t)y * 9 + k) * e * 16;
+            const int8_t* left = in + (y * 10 + x) * cin;
+            const int8_t* right = left + cin;
+            if (cin % 8 == 0) {
+                for (int j = 0; j < e; j++) {
+                    vst1_s8(o + j * 16, vld1_s8(left + j * 8));
+                    vst1_s8(o + j * 16 + 8, vld1_s8(right + j * 8));
+                }
+            } else {
+                for (int ch = 0; ch < cin; ch++) {
+                    o[(ch / 8) * 16 + ch % 8] = left[ch];
+                    o[(ch / 8) * 16 + 8 + ch % 8] = right[ch];
+                }
+            }
+        }
+}
+
+template <int K>
+inline void conv_row(const Conv& c, const int8_t* w, const int8_t* pairs, int y, int o, float* out, int out_stride) {
+    const int e = eights(c.cin);
+    int32x4_t acc[4][4];
+    for (int i = 0; i < 4; i++)
+        for (int r = 0; r < 4; r++) acc[i][r] = vdupq_n_s32(0);
+    for (int t = 0; t < K * K; t++) {
+        int dy = K == 3 ? t / 3 : 1, dx = K == 3 ? t % 3 : 1;
+        // pairs from column dx: even columns' pair dx / 2 on, or odd columns' from the first
+        const int first = dx % 2 == 0 ? dx / 2 : 5;
+        const int8_t* row = pairs + ((size_t)(y + dy) * 9 + first) * e * 16;
+        const int8_t* wt = w + (size_t)t * e * 64;
+        for (int k = 0; k < e; k++) {
+            int8x16_t a[4], b[4];
+            for (int i = 0; i < 4; i++) a[i] = vld1q_s8(row + ((size_t)i * e + k) * 16);
+            for (int r = 0; r < 4; r++) b[r] = vld1q_s8(wt + k * 64 + r * 16);
+            for (int i = 0; i < 4; i++)
+                for (int r = 0; r < 4; r++) acc[i][r] = vmmlaq_s32(acc[i][r], a[i], b[r]);
+        }
+    }
+    // each sum block is (square 2i, outputs 2r and 2r + 1), then (square 2i + 1, the same)
+    const float32x4_t m0 = vld1q_f32(c.scale.data() + o), m1 = vld1q_f32(c.scale.data() + o + 4);
+    const float32x4_t b0 = vld1q_f32(c.bias.data() + o), b1 = vld1q_f32(c.bias.data() + o + 4);
+    const int32x4_t f0 = vld1q_s32(c.offset.data() + o), f1 = vld1q_s32(c.offset.data() + o + 4);
+    for (int i = 0; i < 4; i++)
+        for (int sq = 0; sq < 2; sq++) {
+            int32x4_t lo, hi;
+            if (sq == 0) {
+                lo = vreinterpretq_s32_s64(vzip1q_s64(vreinterpretq_s64_s32(acc[i][0]), vreinterpretq_s64_s32(acc[i][1])));
+                hi = vreinterpretq_s32_s64(vzip1q_s64(vreinterpretq_s64_s32(acc[i][2]), vreinterpretq_s64_s32(acc[i][3])));
+            } else {
+                lo = vreinterpretq_s32_s64(vzip2q_s64(vreinterpretq_s64_s32(acc[i][0]), vreinterpretq_s64_s32(acc[i][1])));
+                hi = vreinterpretq_s32_s64(vzip2q_s64(vreinterpretq_s64_s32(acc[i][2]), vreinterpretq_s64_s32(acc[i][3])));
+            }
+            float* dst = out + (y * 8 + 2 * i + sq) * out_stride + o;
+            vst1q_f32(dst, vfmaq_f32(b0, vcvtq_f32_s32(vaddq_s32(lo, f0)), m0));
+            vst1q_f32(dst + 4, vfmaq_f32(b1, vcvtq_f32_s32(vaddq_s32(hi, f1)), m1));
+        }
+}
+
+inline void convolve(const Conv& c, Scratch& s, float* out, int out_stride) {
+    int8_t* pairs = s.pairs.data();
+    pair_up(s.padded.data(), c.cin, pairs);
+    const size_t group = (size_t)c.k * c.k * eights(c.cin) * 64;
+    for (int g = 0; g < c.cout / 8; g++)
+        for (int y = 0; y < 8; y++) {
+            if (c.k == 3) conv_row<3>(c, c.packed.data() + g * group, pairs, y, 8 * g, out, out_stride);
+            else conv_row<1>(c, c.packed.data() + g * group, pairs, y, 8 * g, out, out_stride);
+        }
 }
 #else
 // NEON with the dot product: the board's row of 8 squares by 8 outputs, 16 sums, 8 squares' inputs of 16
@@ -790,7 +878,19 @@ inline void forward(const Net&, Scratch&, const float*, float*, float*) {
 // [8 outputs][4 inputs].
 inline void pack(Conv& c, const int8_t* q) {
     const int c4n = c.cin / 4, taps = c.k * c.k;
-#if NET_ISA == 3
+#if NET_ISA == 3 && defined(__ARM_FEATURE_MATMUL_INT8)
+    // for i8mm, [cout / 8][k * k][cin / 8, rounded up][4 pairs of outputs][2 outputs][8 inputs]
+    const int e = (c.cin + 7) / 8;
+    c.packed.assign((size_t)c.cout * e * 8 * taps, 0);
+    for (int g = 0; g < c.cout / 8; g++)
+        for (int t = 0; t < taps; t++)
+            for (int k = 0; k < e; k++)
+                for (int o = 0; o < 8; o++)
+                    for (int ch = 0; ch < 8; ch++)
+                        if (8 * k + ch < c.cin)
+                            c.packed[(((size_t)g * taps + t) * e + k) * 64 + o * 8 + ch] =
+                                q[((size_t)(8 * g + o) * c.cin + 8 * k + ch) * taps + t];
+#elif NET_ISA == 3
     c.packed.assign((size_t)c.cout * c.cin * taps, 0);
     size_t at8 = 0;
     for (int g = 0; g < c.cout / 8; g++)
@@ -798,6 +898,8 @@ inline void pack(Conv& c, const int8_t* q) {
             for (int c4 = 0; c4 < c4n; c4++)
                 for (int o = 0; o < 8; o++)
                     for (int k = 0; k < 4; k++) c.packed[at8++] = q[((size_t)(8 * g + o) * c.cin + 4 * c4 + k) * taps + t];
+#endif
+#if NET_ISA == 3
     c.offset.assign(c.cout, 0);
     for (int o = 0; o < c.cout; o++)
         for (size_t i = 0; i < (size_t)c.cin * taps; i++) c.offset[o] += ACTIVATION_SHIFT * q[(size_t)o * c.cin * taps + i];
