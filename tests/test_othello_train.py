@@ -526,3 +526,12 @@ def test_retired_networks_training_needs_grow(monkeypatch):
 def test_bad_optimizer_drop_and_noise_options_are_refused(monkeypatch, options):
     with pytest.raises(SystemExit):
         run_main(monkeypatch, *options)
+
+
+def test_a_fixed_network_can_play_and_keep_its_moves(monkeypatch, tmp_path):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(
+            monkeypatch, "--train-steps", "0", "--log-moves", str(tmp_path / "moves")
+        )
+    assert built.value.kwargs["train_steps_per_epoch"] == 0
+    assert built.value.kwargs["log_moves"] == str(tmp_path / "moves")

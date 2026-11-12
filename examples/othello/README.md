@@ -22,7 +22,8 @@ Othello model and against two strong open-source Othello engines,
 | `bench_cpu_backends.py` | Evals a second by CPU backend and batch, each checked against JAX's outputs |
 | `quantize.py`, `fidelity.py`, `bench_quantized.py` | Quantizes a network to int8 for playing on CPU, and measures its outputs and speed against bf16 |
 | `engine_set.py`, `label_positions.py`, `score_engine_set.py` | The engine-labelled set: fixed positions with every legal move scored by Edax, to build, and to score checkpoints on (train.py scores the network on it every epoch) |
-| `distill.py` | Trains a network on a saved training state's replay buffer, with no self-play, on a teacher network's values or the games' outcomes |
+| `distill.py` | Trains a network on a saved training state's replay buffer or a dataset, with no self-play, on a teacher network's values or the games' outcomes |
+| `teacher_dataset.py` | A dataset of whole self-play games from the moves a run kept (`--log-moves`), labelled with exact endgame results |
 | `bench_nets.py` | Times networks on their own: a forward pass at self-play's batch, a training step at training's |
 | `game.py` | What the scripts share: the environment, board symmetries, network, evaluators |
 | `xot.py`, `xot-openings.txt` | The XOT opening list |
@@ -460,6 +461,41 @@ its raw weights and its self-play average: their policy KL and value loss (`fres
 raw weights' excess (`fresh_*_gap`). N is a multiple of the micro-batch (`--train-batch` /
 `--grad-accum`), e.g. 16 of them. It draws its samples from the run's rng, so a run with it
 plays other games than the same run without.
+
+### Keeping every move: datasets of games
+
+`--log-moves DIR` keeps every move self-play plays, fast searches' too, in `DIR` as
+`moves-<EPOCH>.npy` (see `core/memory/move_log.py`): the position, the search's policy target and
+root value, the legal moves, the move played, whether the search was full, the ply, and the game
+it's in, about 190 bytes a move. Training is unchanged. The log isn't part of saved states, so a
+run keeping its moves doesn't `--resume` into the same directory: start another into a new one.
+
+`--train-steps 0` trains nothing: the network and its weight averages only play. With
+`--init-from` a state and `--selfplay-average`, a fixed teacher plays its own self-play settings'
+games, for a dataset that students and architectures train on from disk instead of from live
+self-play:
+
+```bash
+T=~/.cache/turbozero/othello/solo8x128/s14t-s13te340-lr2e6-511s-solve20-past3.5-tandem4x64-5e5
+uv run examples/othello/train.py --net resnet:8x128,pool_every=2,heads=pooled,pool_channels=32,norm=channel,layout=pre \
+    --init-from $T/state-380.npz --fork-into 8x128 --init-without-buffers \
+    --train-steps 0 --average-epochs 4 --selfplay-average 4 \
+    --sims 511 --playout-cap 0.25:127 --tree-factor 4 --advance-every 128 --selfplay-cycles 33280 \
+    --solve-empties 20 --solve-play-past 3.5 --engine-eval-every 0 \
+    --epochs 160 --ckpt-dir runs/teacher --log-moves runs/teacher/moves
+uv run examples/othello/teacher_dataset.py build --moves runs/teacher/moves --out runs/dataset \
+    --solve-empties 20 --threads 8
+```
+
+`build` puts the games back together, drops those the run ended in the middle of, and labels
+every position with its game's exact result for the player to move: positions with 20 empties or
+fewer are each solved on the CPU (win, draw or loss, about 37 ms of a core each), and those before
+a game's first one take its result, as self-play's exact labels do. It holds out whole games
+(`--heldout`, 3% by default). The dataset is a directory of columns, a `.npy` per field and a row
+per position, game by game (see `COLUMNS` in `teacher_dataset.py`), so a later relabelling (e.g.
+a deeper search of some positions) is another column beside them. `distill.py train --data DATASET
+--heldout DATASET` trains on its training games' full searches and measures on its held-out ones;
+`--all-positions`, `--min-empties` and `--max-empties` change which positions.
 
 ### The run controller
 

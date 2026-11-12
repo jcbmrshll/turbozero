@@ -150,6 +150,11 @@ def parse_step(text: str, home: str) -> Step:
             raise ValueError(
                 f"{name}: the Modal image has no Edax; the Elo league measures strength here"
             )
+    if flag(argv, "--log-moves") is not None:
+        raise ValueError(
+            "--log-moves is for local runs: bringing the moves here from the bucket costs more "
+            "in egress than they're worth"
+        )
     root = Path(home) / ".cache" / "turbozero"
     for path in (
         ckpt_dir,
