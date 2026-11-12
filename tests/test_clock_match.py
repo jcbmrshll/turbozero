@@ -372,3 +372,56 @@ def test_egaroucid_is_told_the_clock_only_when_time_is_added():
     engine.move("b", 125.4)
     assert script.sent[0] == f"setboard {GGS_START.text().replace('*', 'X')[:-1]}X"
     assert script.sent[1:] == ["go", "settime B 125", "go"]
+
+
+def test_a_synchro_pair_moves_in_lockstep_both_games_movers_thinking_at_once():
+    import threading
+
+    from clock_match import GameRun, play_synchro
+
+    meet = threading.Barrier(2, timeout=10)
+    log = []
+
+    class Meeting(FirstLegal):
+        def move(self, color, seconds_left):
+            if not self.seconds_left:
+                # each game's first mover waits here for the other's: they must think at once
+                meet.wait()
+            log.append(self)
+            return super().move(color, seconds_left)
+
+    players = [Meeting([0.0], 0) for _ in range(4)]
+    runs = [
+        GameRun(players[0], players[1], (), 100, GGS_START),
+        GameRun(players[3], players[2], (), 100, GGS_START),
+    ]
+    games = play_synchro(runs)
+    assert games[0].moves == games[1].moves
+    assert {id(p) for p in log[:2]} == {id(players[0]), id(players[3])}
+
+
+def test_a_pass_is_a_step_of_its_own_and_asks_no_player():
+    from clock_match import GameRun
+
+    # black's d1 takes c1, leaving white's a2 with no move: white passes, then black takes a3
+    start = Start(
+        1 << action("a1") | 1 << action("b1"),
+        1 << action("c1") | 1 << action("a2"),
+        "b",
+    )
+    black, white = FirstLegal([0.0], 0), FirstLegal([0.0], 0)
+    run = GameRun(black, white, (), 100, start)
+    run.step()
+    assert run.game.moves == [action("d1")] and run.passing
+    run.step()
+    assert not run.passing and run.game.moves == [action("d1")]
+    assert not white.seconds_left
+    run.step()
+    assert run.game.moves == [action("d1"), action("a3")]
+
+
+def test_a_single_pair_has_no_intervals_and_writes_as_strict_json():
+    pairs = pair_summary([Game(result=4), Game(result=4)], [True, False])
+    assert pairs["disc_sum_ci95"] is None and pairs["game_elo_ci95"] is None
+    assert pairs["decisive_elo"] is None and pairs["decisive_elo_ci95"] is None
+    json.dumps(pairs, allow_nan=False)

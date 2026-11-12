@@ -122,6 +122,79 @@ class Game:
     moves: list[int] = field(default_factory=list)
 
 
+class GameRun:
+    """A game being played, a move at a time (`step`), from `start` (else the standard start)
+    after `opening`'s moves, each side charged its own moves on `clock` (a float: a contest's
+    clock of so many seconds, `Clock.contest`). On a contest's clock it's played out after a
+    timeout, with no time left for that side; on a GGS clock, a hard timeout ends it.
+
+    A pass is a step of its own, as on GGS, where a player with no move sends "pass": it takes
+    no time, and the players aren't asked (both engines and the network pass by themselves)."""
+
+    def __init__(
+        self,
+        black: Player,
+        white: Player,
+        opening: Sequence[int],
+        clock: Clock | float,
+        start: Start | None = None,
+    ):
+        clock = clock if isinstance(clock, Clock) else Clock.contest(clock)
+        self.board = start.board() if start is not None else Board()
+        self.game = Game(start=start.text() if start is not None else None)
+        self.players = (black, white)
+        if start is not None:
+            for player in self.players:
+                player.set_position(start.black, start.white, start.color)
+        for move in opening:
+            color = self.board.color
+            self.board.play(int(move))
+            self.game.moves.append(int(move))
+            for player in self.players:
+                player.play(color, int(move))
+        self.clocks = (PlayerClock(clock, GRACE), PlayerClock(clock, GRACE))
+        # whether the next step is a pass, of the player who moved last's opponent
+        self.passing = False
+        self.over = not self.board.legal()
+
+    def step(self) -> None:
+        """The next move of the game, not over."""
+        if self.passing:
+            self.passing = False
+            return
+        board, game = self.board, self.game
+        side = not board.black_to_move
+        color = board.color
+        empties = 64 - (board.discs[0] | board.discs[1]).bit_count()
+        begin = time.perf_counter()
+        move = self.players[side].move(color, self.clocks[side].seconds_left())
+        spent = time.perf_counter() - begin
+        clock = self.clocks[side]
+        clock.charge(spent)
+        game.seconds[side] += spent
+        game.move_seconds.append((empties, not side, spent))
+        if game.flagged is None and clock.soft:
+            game.flagged = color
+        board.play(move)
+        game.moves.append(int(move))
+        if clock.hard:
+            game.hard = color
+            self.over = True
+            return
+        self.players[not side].play(color, move)
+        self.over = not board.legal()
+        # the referee passed for the opponent, with no move
+        self.passing = not self.over and board.color == color
+
+    def finish(self) -> Game:
+        """The game, once it's over."""
+        self.game.margin = self.board.margin()
+        self.game.result = game_result(
+            disc_result(self.board), self.game.flagged, self.game.hard
+        )
+        return self.game
+
+
 def play_game(
     black: Player,
     white: Player,
@@ -129,45 +202,37 @@ def play_game(
     clock: Clock | float,
     start: Start | None = None,
 ) -> Game:
-    """Plays a game to its end from `start` (else the standard start), then `opening`'s moves,
-    charging each side its own moves on `clock` (a float: a contest's clock of so many seconds,
-    `Clock.contest`). A game on a contest's clock is played out after a timeout, with no time
-    left for that side; on a GGS clock, a hard timeout ends it."""
-    clock = clock if isinstance(clock, Clock) else Clock.contest(clock)
-    board = start.board() if start is not None else Board()
-    game = Game(start=start.text() if start is not None else None)
-    players = (black, white)
-    if start is not None:
-        for player in players:
-            player.set_position(start.black, start.white, start.color)
-    for move in opening:
-        color = board.color
-        board.play(int(move))
-        game.moves.append(int(move))
-        for player in players:
-            player.play(color, int(move))
-    clocks = (PlayerClock(clock, GRACE), PlayerClock(clock, GRACE))
-    while board.legal():
-        side = not board.black_to_move
-        color = board.color
-        empties = 64 - (board.discs[0] | board.discs[1]).bit_count()
-        begin = time.perf_counter()
-        move = players[side].move(color, clocks[side].seconds_left())
-        spent = time.perf_counter() - begin
-        clocks[side].charge(spent)
-        game.seconds[side] += spent
-        game.move_seconds.append((empties, not side, spent))
-        if game.flagged is None and clocks[side].soft:
-            game.flagged = color
-        board.play(move)
-        game.moves.append(int(move))
-        if clocks[side].hard:
-            game.hard = color
-            break
-        players[not side].play(color, move)
-    game.margin = board.margin()
-    game.result = game_result(disc_result(board), game.flagged, game.hard)
-    return game
+    """Plays a game to its end (see `GameRun`)."""
+    run = GameRun(black, white, opening, clock, start)
+    while not run.over:
+        run.step()
+    return run.finish()
+
+
+def step_catching(run: GameRun, errors: list[BaseException]) -> None:
+    """`run.step()`, what it raises put in `errors`, for a thread to raise in its caller's."""
+    try:
+        run.step()
+    except BaseException as error:  # noqa: BLE001 - raised in the caller's thread
+        errors.append(error)
+
+
+def play_synchro(runs: Sequence[GameRun]) -> list[Game]:
+    """Plays games in lockstep, as GGS plays a synchro match's two: in each round, each game
+    not over makes its next move (or pass), all at once, each in a thread of its own, and the
+    next round starts once all have."""
+    while active := [run for run in runs if not run.over]:
+        errors: list[BaseException] = []
+        threads = [
+            threading.Thread(target=step_catching, args=(run, errors)) for run in active
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        if errors:
+            raise errors[0]
+    return [run.finish() for run in runs]
 
 
 def points(result: int, a_black: bool) -> float:
@@ -231,10 +296,11 @@ def pair_summary(games: list[Game], a_black: list[bool]) -> dict:
         return {"pairs": 0}
     sums_, scores_ = np.array(sums, float), np.array(scores) / 2
     won, lost = int(np.sum(scores_ > 0.5)), int(np.sum(scores_ < 0.5))
-    spread = float(np.std(sums_, ddof=1)) / math.sqrt(n) if n > 1 else math.inf
-    score_spread = float(np.std(scores_, ddof=1)) / math.sqrt(n) if n > 1 else math.inf
+    # intervals need two pairs, and the decisive pairs' one a decisive pair: None without
+    spread = float(np.std(sums_, ddof=1)) / math.sqrt(n) if n > 1 else None
+    score_spread = float(np.std(scores_, ddof=1)) / math.sqrt(n) if n > 1 else None
     low, high = wilson(won, won + lost)
-    score = float(scores_.mean())
+    score, mean = float(scores_.mean()), float(sums_.mean())
     return {
         "pairs": n,
         "split": n - won - lost,
@@ -243,15 +309,18 @@ def pair_summary(games: list[Game], a_black: list[bool]) -> dict:
         "ggs_won": int(np.sum(sums_ > 0)),
         "ggs_drawn": int(np.sum(sums_ == 0)),
         "ggs_lost": int(np.sum(sums_ < 0)),
-        "disc_sum": round(float(sums_.mean()), 2),
-        "disc_sum_ci95": [
-            round(float(sums_.mean()) - Z95 * spread, 2),
-            round(float(sums_.mean()) + Z95 * spread, 2),
-        ],
-        "decisive_elo": round(elo(won / max(won + lost, 1)), 1) if won + lost else None,
-        "decisive_elo_ci95": [round(elo(low), 1), round(elo(high), 1)],
+        "disc_sum": round(mean, 2),
+        "disc_sum_ci95": None
+        if spread is None
+        else [round(mean - Z95 * spread, 2), round(mean + Z95 * spread, 2)],
+        "decisive_elo": round(elo(won / (won + lost)), 1) if won + lost else None,
+        "decisive_elo_ci95": [round(elo(low), 1), round(elo(high), 1)]
+        if won + lost
+        else None,
         "game_elo": round(elo(score), 1),
-        "game_elo_ci95": [
+        "game_elo_ci95": None
+        if score_spread is None
+        else [
             round(elo(score - Z95 * score_spread), 1),
             round(elo(score + Z95 * score_spread), 1),
         ],
@@ -391,25 +460,25 @@ def play_one(
         second.close()
 
 
-def play_together(games: list[tuple]) -> list[Game]:
-    """`play_one`'s games, each of its arguments, at the same time, a thread each."""
-    results: list[Game | BaseException | None] = [None] * len(games)
-
-    def play(i: int) -> None:
-        try:
-            results[i] = play_one(*games[i])
-        except BaseException as error:  # noqa: BLE001 - raised in the caller's thread
-            results[i] = error
-
-    threads = [threading.Thread(target=play, args=(i,)) for i in range(len(games))]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-    for outcome in results:
-        if isinstance(outcome, BaseException):
-            raise outcome
-    return [outcome for outcome in results if isinstance(outcome, Game)]
+def play_pair_synchro(
+    players: Sequence[tuple[Callable[[], Player], Callable[[], Player]]],
+    opening: Opening,
+    clock: Clock | float,
+) -> list[Game]:
+    """A pair's two games in lockstep (`play_synchro`), by fresh players, a black in the first:
+    each of `players` (a's maker, b's) plays one game."""
+    made: list[Player] = []
+    try:
+        runs = []
+        for (a, b), a_black in zip(players, (True, False)):
+            first, second = a(), b()
+            made += [first, second]
+            black, white = (first, second) if a_black else (second, first)
+            runs.append(GameRun(black, white, opening[0], clock, opening[1]))
+        return play_synchro(runs)
+    finally:
+        for player in made:
+            player.close()
 
 
 def play_match(
@@ -422,16 +491,18 @@ def play_match(
 ) -> tuple[list[Game], list[bool]]:
     """Each opening played with both colors, a black first, by fresh players: one game at a
     time, or with `parallel` (players for the second game: a network's can't search two trees
-    at once) the pair's two games at the same time, each in a thread of its own."""
+    at once) the pair's two games in lockstep, as GGS plays them (`play_synchro`)."""
     games, a_black = [], []
     for opening in openings:
         if parallel is None:
-            pair = [play_one(a, b, opening, clock, black) for black in (True, False)]
-        else:
-            pair = play_together(
-                [(a, b, opening, clock, True), (*parallel, opening, clock, False)]
-            )
-        for game, black in zip(pair, (True, False)):
+            for black in (True, False):
+                games.append(play_one(a, b, opening, clock, black))
+                a_black.append(black)
+                on_game(games, a_black)
+            continue
+        for game, black in zip(
+            play_pair_synchro([(a, b), parallel], opening, clock), (True, False)
+        ):
             games.append(game)
             a_black.append(black)
             on_game(games, a_black)
