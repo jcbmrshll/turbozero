@@ -34,6 +34,7 @@ if __name__ == "__main__":
 import numpy as np
 from engines import CLOCKED, ENGINES, GTPEngine
 from game import square
+from native_target import cpus
 from xot import XOT_PATH, load_xot
 
 # seconds past the clock that don't lose a game: an engine that plans its whole clock can pass
@@ -260,7 +261,7 @@ def net_player(options: dict[str, str]) -> Callable[[], Player]:
 
     options = dict(options)
     native = bool(int(options.pop("engine", 0)))
-    cores = int(options.pop("threads", len(os.sched_getaffinity(0))))
+    cores = int(options.pop("threads", len(cpus())))
     solving = None
     if "solve" in options:
         solving = Solving(
@@ -293,7 +294,7 @@ def make_player(spec: str, seconds: int) -> Callable[[], Player]:
     engine_dir = (
         Path(options["dir"]) if "dir" in options else ENGINES[name].default_dir()
     )
-    threads = int(options.get("threads", len(os.sched_getaffinity(0))))
+    threads = int(options.get("threads", len(cpus())))
     args = options.get("args", "").split()
     if "level" in options:
         level = int(options["level"])
@@ -367,7 +368,7 @@ def main() -> None:
         "player_a": args.a,
         "player_b": args.b,
         "seed": args.seed,
-        "cores": sorted(os.sched_getaffinity(0)),
+        "cores": cpus(),
         "load": os.getloadavg()[0],
         **summarize(games, a_black, args.seconds),
     }

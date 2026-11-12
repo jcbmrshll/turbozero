@@ -39,6 +39,14 @@ NEEDS = {
 }
 
 
+def cpus() -> list[int]:
+    """The CPUs this process may run on: its affinity (Linux's taskset), or all of them where the OS
+    has none to read (macOS)."""
+    if hasattr(os, "sched_getaffinity"):
+        return sorted(os.sched_getaffinity(0))
+    return list(range(os.cpu_count() or 1))
+
+
 def architecture() -> str:
     return "arm" if platform.machine().lower() in ("aarch64", "arm64") else "x86"
 
