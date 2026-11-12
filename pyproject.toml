@@ -30,11 +30,12 @@ venvPath = "."
 venv = ".venv"
 # the examples' scripts import their sibling modules
 executionEnvironments = [
+    { root = "examples/othello/ggs_client", extraPaths = ["examples/othello/ggs_client", "examples/othello"] },
     { root = "examples/othello", extraPaths = ["examples/othello"] },
     { root = "examples/hex", extraPaths = ["examples/hex"] },
     { root = "examples/connect_four", extraPaths = ["examples/connect_four"] },
     # tests of the Othello example's modules import them as its scripts do
-    { root = "tests", extraPaths = ["examples/othello"] },
+    { root = "tests", extraPaths = ["examples/othello", "examples/othello/ggs_client"] },
 ]
 
 [tool.ruff]

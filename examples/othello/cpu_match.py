@@ -399,6 +399,10 @@ class NetPlayer:
         # moves solved, and solves given up, in this game
         self.solved = 0
         self.gave_up = 0
+        # what the last move() made of its position, for the player to move there: ("q", the
+        # search's root value, -1 to 1), ("margin", the solved final margin in discs), or
+        # ("wdl", a solve's sign only, with `exact` off); None if it didn't search
+        self.last_value: tuple[str, float] | None = None
 
     def sync(self, color: str) -> None:
         """Passes for the other color if `color` moves out of turn: the game passes for a player
@@ -429,6 +433,7 @@ class NetPlayer:
         if solved is None:
             self.gave_up += 1
             return None
+        self.last_value = ("margin" if solving.exact else "wdl", float(solved.margin))
         if not solving.exact and solved.margin < 0:
             return None
         self.solved += 1
@@ -440,6 +445,7 @@ class NetPlayer:
         me, opp, _, _ = self.search.position()
         empties = 64 - (me | opp).bit_count()
         action = None
+        self.last_value = None
         if self.search.num_legal() == 1:
             action = self.search.first_legal()
         elif self.solving is not None and empties <= self.solving.empties:
@@ -460,6 +466,7 @@ class NetPlayer:
             else:
                 timed_move(self.search, seconds, self.batch, self.evaluate)
             action = self.search.best_action()
+            self.last_value = ("q", self.search.root_q())
         self.search.play(action)
         return action
 
