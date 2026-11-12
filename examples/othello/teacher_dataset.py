@@ -5,6 +5,12 @@ experiments to train on from disk (distill.py's --data takes its directory).
     uv run examples/othello/teacher_dataset.py build --moves RUN/moves [RUN2/moves ...] \\
         --out DATASET --solve-empties 20 --threads 8
 
+The exact solves take most of a build's time (about 37 ms of a core each, about 4 a game):
+`solve` does them ahead, each epoch's moves as they're written, so they run beside the
+generating run, and `build` takes them from there (`solves-<EPOCH>.npy` beside the moves):
+
+    uv run examples/othello/teacher_dataset.py solve --moves RUN/moves --solve-empties 20
+
 `build` puts each game back together from its moves, drops those the runs ended in the middle of
 (or that hit the step limit), and labels every position with the game's result for its player to
 move, exactly: every position with --solve-empties or fewer empty squares is solved (win, draw or
@@ -13,8 +19,9 @@ point, has the solve point's. A game that ended before any has the result it end
 
 The dataset's directory holds one .npy per column, a row per position, game by game, each game's
 in the order played (see `COLUMNS`), and:
-- games.npz: per game, its first row (`start`), its rows (`length`), and where it came from
-  (`run`, the index of its --moves directory; `env`; `env_game`, the environment's game number)
+- games.npz: per game, its first row (`start`), its rows (`length`), its XOT opening
+  (`opening`, see `COLUMNS`), and where it came from (`run`, the index of its --moves
+  directory; `env`; `env_game`, the environment's game number)
 - meta.json: what it was built from and how, and counts
 
 About a few percent of games (--heldout) are held out, whole games chosen at random: their rows
@@ -29,14 +36,19 @@ import time
 from pathlib import Path
 from typing import Any
 
+import jax
 import numpy as np
 from exact_labels import bitboards
+from game import env, state_to_nn_input
+from xot import load_xot
 
 from core.memory.move_log import (
     ENDED,
     GOES_ON,
     STOPPED,
     TRUNCATED,
+    move_epochs,
+    moves_path,
     read_meta,
     read_moves,
     unpack,
@@ -61,7 +73,92 @@ COLUMNS = {
     "solved": "bool, whether `outcome` is the position's own solve (empties <= the solve "
     "empties), rather than its game's solve point's",
     "heldout": "bool, whether its game is held out",
+    "opening": "int16, its game's XOT opening, the index in xot-openings.txt of the first "
+    "whose position is the game's first (-1 if none is)",
 }
+# `solve`'s files: a row's exact result, or this if it has more empties than the solves' cut
+UNSOLVED = 2
+SOLVES_META = "solves.json"
+
+
+def solves_path(directory: str | Path, epoch: int) -> Path:
+    """`solve`'s file of an epoch's moves."""
+    return Path(directory) / f"solves-{epoch}.npy"
+
+
+def solve_moves(directory: str, solve_empties: int, threads: int) -> int:
+    """Solves the positions of each epoch's moves in `directory` with `solve_empties` or fewer
+    empty squares, those not solved already, into `solves_path`: per row, its exact result for
+    the player to move, or `UNSOLVED`. Returns the epochs it solved."""
+    meta_path = Path(directory) / SOLVES_META
+    if meta_path.exists():
+        done_at = json.loads(meta_path.read_text())["solve_empties"]
+        if done_at != solve_empties:
+            raise ValueError(f"{directory}'s solves are at {done_at} empties")
+    else:
+        meta_path.write_text(json.dumps({"solve_empties": solve_empties}))
+    meta = read_meta(directory)
+    solved = 0
+    for epoch in move_epochs(directory):
+        target = solves_path(directory, epoch)
+        if target.exists():
+            continue
+        rows = np.load(moves_path(directory, epoch))
+        me, opp = bitboards(unpack(rows, "observation", meta))
+        empties = 64 - np.bitwise_count(me | opp)
+        out = np.full(len(rows), UNSOLVED, np.int8)
+        at = np.nonzero(empties <= solve_empties)[0]
+        started = time.time()
+        out[at] = solve_wld(me[at], opp[at], threads)
+        with open(f"{target}.tmp", "wb") as f:
+            np.save(f, out)
+        os.replace(f"{target}.tmp", target)
+        print(
+            f"epoch {epoch}: {len(at)} solves in {time.time() - started:.0f} s",
+            flush=True,
+        )
+        solved += 1
+    return solved
+
+
+def read_solves(directory: str, solve_empties: int, count: int) -> np.ndarray:
+    """`solve`'s results of every row of `read_moves(directory)` (`count` of them), in its
+    order: `UNSOLVED` where there are none."""
+    meta_path = Path(directory) / SOLVES_META
+    if not meta_path.exists():
+        return np.full(count, UNSOLVED, np.int8)
+    if json.loads(meta_path.read_text())["solve_empties"] != solve_empties:
+        raise ValueError(f"{directory}'s solves aren't at {solve_empties} empties")
+    parts = []
+    for epoch in move_epochs(directory):
+        path = solves_path(directory, epoch)
+        if path.exists():
+            parts.append(np.load(path))
+        else:
+            rows = np.load(moves_path(directory, epoch), mmap_mode="r")
+            parts.append(np.full(len(rows), UNSOLVED, np.int8))
+    out = np.concatenate(parts)
+    assert len(out) == count
+    return out
+
+
+def xot_positions() -> dict[tuple[int, int], int]:
+    """Each XOT opening's position, (player to move's discs, opponent's) as bitboards, to the
+    index of the first opening that reaches it."""
+
+    def play(opening):
+        state = env.init(jax.random.PRNGKey(0))
+        state = jax.lax.fori_loop(
+            0, len(opening), lambda i, s: env.step(s, opening[i]), state
+        )
+        return state_to_nn_input(state)
+
+    openings = load_xot()
+    me, opp = bitboards(np.asarray(jax.jit(jax.vmap(play))(openings)))
+    positions: dict[tuple[int, int], int] = {}
+    for i, key in enumerate(zip(me.tolist(), opp.tolist(), strict=True)):
+        positions.setdefault(key, i)
+    return positions
 
 
 def unpack_legal(legal: np.ndarray) -> np.ndarray:
@@ -203,11 +300,15 @@ def build(
     run = np.concatenate([np.full(len(r), i, np.int32) for i, r, _ in parts])
     rows = np.concatenate([r for _, r, _ in parts])
     observation = np.concatenate([unpack(r, "observation", m) for _, r, m in parts])
+    solves = np.concatenate(
+        [read_solves(moves_dirs[i], solve_empties, len(r)) for i, r, _ in parts]
+    )
     del parts
 
     # games: rows by run, environment, game, ply
     order = np.lexsort((rows["ply"], rows["game"], rows["env"], run))
     rows, run, observation = rows[order], run[order], observation[order]
+    solves = solves[order]
     key = np.stack([run, rows["env"], rows["game"]], axis=1)
     new_game = np.r_[True, (key[1:] != key[:-1]).any(axis=1)]
     starts = np.nonzero(new_game)[0]
@@ -222,6 +323,7 @@ def build(
     keep = np.repeat(finished, lengths)
     dropped_rows = int((~keep).sum())
     rows, run, observation = rows[keep], run[keep], observation[keep]
+    solves = solves[keep]
     starts = np.r_[0, np.cumsum(lengths[finished])[:-1]]
     game_runs = run[starts]
     lengths = lengths[finished]
@@ -234,12 +336,23 @@ def build(
     me, opp = bitboards(observation)
     del observation
     empties = (64 - np.bitwise_count(me | opp)).astype(np.uint8)
-    to_solve = np.nonzero(empties <= solve_empties)[0]
-    print(f"solving {len(to_solve)} positions on {threads} threads", flush=True)
+    to_solve = np.nonzero((empties <= solve_empties) & (solves == UNSOLVED))[0]
+    print(
+        f"{int((solves != UNSOLVED).sum())} positions solved ahead; solving "
+        f"{len(to_solve)} on {threads} threads",
+        flush=True,
+    )
     solve_started = time.time()
-    solves = np.zeros(len(rows), np.int8)
     solves[to_solve] = solve_wld(me[to_solve], opp[to_solve], threads)
     solve_seconds = time.time() - solve_started
+    xot = xot_positions()
+    opening = np.array(
+        [
+            xot.get((int(m), int(o)), -1)
+            for m, o in zip(me[starts], opp[starts], strict=True)
+        ],
+        np.int16,
+    )
     outcome, solved = label_games(
         starts,
         lengths,
@@ -267,6 +380,7 @@ def build(
         "outcome": outcome,
         "solved": solved,
         "heldout": held[game],
+        "opening": opening[game],
     }
     assert set(columns) == set(COLUMNS)
     for name, x in columns.items():
@@ -278,6 +392,7 @@ def build(
         run=game_runs,
         env=rows["env"][starts],
         env_game=rows["game"][starts],
+        opening=opening,
     )
     full = rows["full"]
     meta = {
@@ -294,6 +409,8 @@ def build(
         "dropped_games": int((~finished).sum()),
         "truncated_games": truncated,
         "draw_fraction": float((outcome[starts] == 0).mean()),
+        "openings": len(np.unique(opening[opening >= 0])),
+        "games_without_opening": int((opening < 0).sum()),
         "solve_seconds": solve_seconds,
         "build_seconds": time.time() - started,
         "columns": COLUMNS,
@@ -322,7 +439,15 @@ def main():
     )
     b.add_argument("--seed", type=int, default=0, help="the held-out games' seed")
     b.add_argument("--threads", type=int, default=8, help="the solver's threads")
+    s = commands.add_parser(
+        "solve", help="the exact solves of the moves written so far, ahead of `build`"
+    )
+    s.add_argument("--moves", required=True, help="a --log-moves directory")
+    s.add_argument("--solve-empties", type=int, default=20)
+    s.add_argument("--threads", type=int, default=8, help="the solver's threads")
     args = parser.parse_args()
+    if args.command == "solve":
+        solve_moves(args.moves, args.solve_empties, args.threads)
     if args.command == "build":
         meta = build(
             args.moves,

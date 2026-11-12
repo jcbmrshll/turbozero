@@ -170,3 +170,27 @@ def test_distill_reads_a_datasets_training_and_held_out_games(
     assert len(rows) == 6 and positions.observation_nn.shape == (6, 8, 8, 2)
     _, held_rows = distill.load_data(str(out), True, args)
     assert len(held_rows) == 0
+
+
+def test_solves_done_ahead_are_taken_by_build(
+    moves, tmp_path, fake_solver, monkeypatch
+):
+    assert teacher_dataset.solve_moves(str(moves), 20, threads=1) == 2
+    assert teacher_dataset.solve_moves(str(moves), 20, threads=1) == 0
+
+    def no_more(me, opp, threads):
+        assert len(me) == 0
+        return np.zeros(0, np.int8)
+
+    monkeypatch.setattr(teacher_dataset, "solve_wld", no_more)
+    out = tmp_path / "dataset"
+    teacher_dataset.build([str(moves)], str(out), 20, 0.0, 0, threads=1)
+    np.testing.assert_array_equal(column(out, "outcome"), [1, -1, 1, -1, 1, -1])
+    with pytest.raises(ValueError, match="empties"):
+        teacher_dataset.solve_moves(str(moves), 18, threads=1)
+
+
+def test_xot_positions_name_the_openings():
+    positions = teacher_dataset.xot_positions()
+    assert len(positions) > 10_000
+    assert min(positions.values()) == 0 and max(positions.values()) < 10_784
