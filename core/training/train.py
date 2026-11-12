@@ -661,6 +661,7 @@ class Trainer:
         growth: Growth | None = None,
         waiting_train_steps: int | None = None,
         train_retired: bool = False,
+        train_playing: bool = True,
         averages: Sequence[float] = (),
         selfplay_average: float | None = None,
         average_warmup: float = 10.0,
@@ -798,6 +799,10 @@ class Trainer:
                 games (not compute-optimal). Not part of a saved state: a run or branch turns
                 it on or off from any state, and a retired network takes up its training where
                 it left it
+            train_playing: (optional) with `growth`, whether the network playing self-play
+                trains (default) or stays as it is, weights and weight averages: a fixed teacher
+                whose games the networks before it learn from with `train_retired`. Not part of
+                a saved state, as `train_retired`
             averages: (optional) horizons, in epochs, of averages of each network's weights
                 (as KataGo plays and rates averaged weights while training at a constant learning
                 rate): after each epoch a network trains, each of its averages moves towards its
@@ -924,6 +929,15 @@ class Trainer:
         if train_retired and growth is None:
             raise ValueError("train_retired is for a run with growth")
         self.train_retired = train_retired
+        if not train_playing and growth is None:
+            raise ValueError(
+                "a network that plays without training is for a run with growth"
+            )
+        if not train_playing and lr_plateau is not None:
+            raise ValueError(
+                "the learning rate rule follows the network playing, which doesn't train"
+            )
+        self.train_playing = train_playing
         # testing
         self.testers = testers
         if evaluator_test is None:
@@ -1090,6 +1104,7 @@ class Trainer:
                 else {}
             ),
             **({"train_retired": True} if self.train_retired else {}),
+            **({"train_playing": False} if not self.train_playing else {}),
             "max_episode_steps": self.max_episode_steps,
             "nn": self.nn.__class__.__name__,
             "nn_params": sum(
@@ -3856,9 +3871,14 @@ class Trainer:
         def training_now() -> tuple[int, ...]:
             if growth is None or self.growth is None:
                 return (0,)
-            # the growth rule's (the one playing, and the next), and those retired before it
+            # the growth rule's (the one playing, and the next), and those retired before it;
+            # the one playing only if it trains
             retired = range(growth.playing) if self.train_retired else ()
-            return (*retired, *self.growth.training(growth))
+            return tuple(
+                i
+                for i in (*retired, *self.growth.training(growth))
+                if self.train_playing or i != growth.playing
+            )
 
         def state_now() -> TrainLoopOutput:
             return TrainLoopOutput(
@@ -4067,7 +4087,10 @@ class Trainer:
                         ),
                     }
             if fresh_metrics:
-                train_metrics[playing] = {**train_metrics[playing], **fresh_metrics}
+                train_metrics[playing] = {
+                    **train_metrics.get(playing, {}),
+                    **fresh_metrics,
+                }
             # the learning rate rule follows the network playing
             stop = False
             watch_loss = self.lr_plateau_metric == "loss"

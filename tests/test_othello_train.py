@@ -532,6 +532,26 @@ def test_retired_networks_training_needs_grow(monkeypatch):
         run_main(monkeypatch, "--grow-train-retired")
 
 
+def test_a_frozen_teacher_reaches_the_trainer(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(
+            monkeypatch,
+            "--grow",
+            "resnet:2x8",
+            "--grow-switch-at",
+            "80",
+            "--grow-train-retired",
+            "--grow-frozen",
+        )
+    assert built.value.kwargs["train_playing"] is False
+    assert built.value.kwargs["train_retired"] is True
+
+
+def test_a_frozen_teacher_needs_grow(monkeypatch):
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, "--grow-frozen")
+
+
 @pytest.mark.parametrize(
     "options",
     [

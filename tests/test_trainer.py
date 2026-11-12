@@ -3646,6 +3646,52 @@ def test_train_retired_needs_growth(env, tmp_path):
         make_trainer(env, tmp_path, train_retired=True)
 
 
+def test_a_frozen_network_plays_while_the_others_train_on_its_games(
+    env, tmp_path, fake_loop
+):
+    def trainer(ckpt_dir, **kwargs):
+        made, _ = growth_trainer(
+            env,
+            tmp_path / ckpt_dir,
+            SCRIPTS,
+            growth_kwargs={"manual": True},
+            train_steps_per_epoch=4,
+            waiting_train_steps=3,
+            save_state_at=[2],
+            averages=(4,),
+            **kwargs,
+        )
+        return made, fake_loop(made)
+
+    trunk, _ = trainer("trunk")
+    trunk.train_loop(seed=0, num_epochs=2)
+    # n1 takes over as a fixed teacher: n0, retired, and n2, waiting, train on its games
+    frozen, calls = trainer("frozen", train_retired=True, train_playing=False)
+    start = frozen.branch(str(tmp_path / "trunk"), take_over=True)
+    output = frozen.train_loop(seed=0, num_epochs=3, initial_state=start)
+    assert [(c.learner, c.num_steps) for c in of_kind(calls, "train")] == [
+        (0, 4),
+        (2, 3),
+    ]
+    # it played, and neither its weights nor their average moved
+    assert len(of_kind(calls, "collect")) > 0
+    assert jax.tree.all(
+        jax.tree.map(
+            lambda a, b: bool((a == b).all()),
+            output.train_states[1].params,
+            start.train_states[1].params,
+        )
+    )
+    assert output.averaged[1] == start.averaged[1]
+    assert output.averaged[0] == start.averaged[0] + 1
+    assert frozen.get_config()["train_playing"] is False
+
+
+def test_a_frozen_network_needs_growth(env, tmp_path):
+    with pytest.raises(ValueError, match="with growth"):
+        make_trainer(env, tmp_path, train_playing=False)
+
+
 # the gradient noise scale and the batch size rule
 
 

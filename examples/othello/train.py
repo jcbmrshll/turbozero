@@ -297,6 +297,14 @@ def main():
         "resumed or branched run can turn it on or off",
     )
     parser.add_argument(
+        "--grow-frozen",
+        action="store_true",
+        help="with --grow, the network playing self-play never trains, nor do its weight "
+        "averages move: a fixed teacher, e.g. a trained network forked into the last place "
+        "with --init-from and --fork-into, whose games the networks before it train on with "
+        "--grow-train-retired",
+    )
+    parser.add_argument(
         "--grow-train-steps",
         type=int,
         default=None,
@@ -998,6 +1006,8 @@ def main():
         parser.error("--grow-train-steps is a positive number of steps, with --grow")
     if args.grow_train_retired and not args.grow:
         parser.error("--grow-train-retired is for a run with --grow")
+    if args.grow_frozen and not args.grow:
+        parser.error("--grow-frozen is for a run with --grow")
     if args.grow_lr is not None and (not args.grow or args.grow_lr <= 0):
         parser.error("--grow-lr is a positive learning rate, with --grow")
     if any(h < 1 for h in args.average_epochs) or len(set(args.average_epochs)) != len(
@@ -1358,6 +1368,7 @@ def main():
         growth=growth,
         waiting_train_steps=args.grow_train_steps,
         train_retired=args.grow_train_retired,
+        train_playing=not args.grow_frozen,
         averages=args.average_epochs,
         selfplay_average=args.selfplay_average,
         average_warmup=args.average_warmup,
