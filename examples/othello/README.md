@@ -13,6 +13,7 @@ Othello model and against two strong open-source Othello engines,
 | `engines.py` | Edax and Egaroucid, each driven over GTP, and what their searches made of each position, from their logs |
 | `setup_edax.sh`, `setup_egaroucid.sh` | Build the engines for `vs_engine.py` and `clock_match.py` |
 | `clock_match.py` | Games on a real clock, one at a time on the same cores, each side at its best settings |
+| `ggs.py` | GGS's random starts, its archive's, and its clock and scoring, for `clock_match.py` |
 | `gcp_cpu_jobs.py`, `gcp_cpu_runner.py` | Commands on Google Cloud Spot VMs of one CPU model (8 Zen 5 cores, AVX-512 VNNI), for timed games |
 | `cpu_search.py`, `cpu_search.cpp` | A single game's MCTS for playing on CPU: a tree in C++, its leaves evaluated in batches by OpenVINO or ONNX Runtime, or searched by a thread to a core (`Engine`) |
 | `cpu_net.py`, `cpu_net.h` | A network's int8 forward pass in C++ (AVX-512 VNNI), for `Engine`: no OpenVINO, closer to the float network |
@@ -699,6 +700,37 @@ A level is no stand-in for a clock. On real positions, from XOT openings, with 8
 More threads make a level no stronger, only faster (at level 16, 150 games each: 8 threads
 against 1 scored 0.49 for Edax and 0.50 for Egaroucid, each about 0.04 either way), and one
 search took 3.5 times less time on 8 threads than on 1 at level 20.
+
+### GGS conditions
+
+Programs play each other on GGS, Michael Buro's game server, mostly in `s8r14` synchro matches:
+two games from one random 14-disc position, colours swapped, on a clock of `ini/inc/ext` (most
+often `01:00//02:00`: a minute a game, and once that's out, a loss by 2 discs at best and two
+more minutes to finish). `ggs.py` has its random starts, clock and scoring, and `clock_match.py`
+plays them:
+
+```
+taskset -c 16-23 uv run examples/othello/clock_match.py --a net:net=NAME,engine=1 --b edax:threads=8 \
+    --clock 01:00//02:00 --starts random:14 --openings 50
+```
+
+- **The starts are far from XOT's.** The server makes half of them by dropping discs near the
+  centre and half by random moves from 5 central discs (`ggs.random_start`). The two ways give
+  different positions, and only their even mix matches the archive's 43,000 `s8r14` starts of
+  2024-2026 (disc balance, squares filled, and how lopsided Edax finds them). Edax at level 12
+  puts a third of them at 8 discs or more for one side, where every XOT opening is within 2.
+  None can be reached from the standard start, so each player is given the board
+  (`set_position`): Edax by `loadsgf` of a GGF file, Egaroucid by its console's `setboard`, a
+  network by a fresh tree.
+- **Pairs are the unit.** Top programs split 90-95% of GGS's pairs 1-1, so a match's signal is in
+  the decisive pairs and in the two games' disc results summed, which is how GGS scores a pair.
+  `clock_match.py` reports both (`pairs`), with the Elo of the decisive pairs alone.
+- **One game at a time by default.** On GGS a pair's games run at once, in lockstep: each round,
+  the player to move in each game moves, at the same time. `--parallel` plays them so, on the
+  same cores, with a second network for a net player.
+- `ggs.py extract` takes an archive's starts (e.g. `Othello.2010-11-2026.ggf.bz2` from
+  https://skatgame.net/mburo/ggs/game-archive/Othello/) for `--starts file:PATH`, and `ggs.py
+  compare` sets them beside `ggs.random_start`'s.
 
 ### During training
 
