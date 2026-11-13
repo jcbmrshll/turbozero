@@ -502,16 +502,19 @@ Search* search_new(int mode, float weight, float c_init, int max_collisions, int
 
 void search_free(Search* s) { delete s; }
 
-// the game's start: black to move
-void search_reset(Search* s) {
+// A position given whole, its tree cleared: `me` the discs of the player to move, `opp` the other's.
+void search_set_position(Search* s, uint64_t me, uint64_t opp) {
     s->nodes.clear();
     s->edges.clear();
     s->evaluated.clear();
     Position p{};
-    p.me = (1ULL << 28) | (1ULL << 35);
-    p.opp = (1ULL << 27) | (1ULL << 36);
+    p.me = me;
+    p.opp = opp;
     s->root = new_node(*s, p);
 }
+
+// the game's start: black to move
+void search_reset(Search* s) { search_set_position(s, (1ULL << 28) | (1ULL << 35), (1ULL << 27) | (1ULL << 36)); }
 
 // the search for a move: `visits` more of the tree, each a leaf to evaluate or a game's end reached
 void search_begin(Search* s, int visits) { s->remaining = visits; }

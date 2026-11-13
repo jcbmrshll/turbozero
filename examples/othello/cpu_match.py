@@ -36,6 +36,7 @@ from cpu_search import (
     ort_session,
 )
 from export_onnx import export_checkpoint
+from native_target import cpus
 from quantize import quantized_path
 from xot import XOT_PATH, load_xot
 
@@ -290,7 +291,7 @@ def make_engine(name: str, backend: str, cores: int, batch: int) -> Engine:
 def match(args: argparse.Namespace) -> None:
     a = Player.parse(args.a, args.net, args.backend)
     b = Player.parse(args.b, args.net, args.backend)
-    cores = len(os.sched_getaffinity(0))
+    cores = len(cpus())
     evals = {(p.net, p.backend): make_eval(p.net, p.backend, cores) for p in (a, b)}
     pool = load_xot(XOT_PATH)
     rng = np.random.default_rng(args.seed)
@@ -399,6 +400,10 @@ class NetPlayer:
         # moves solved, and solves given up, in this game
         self.solved = 0
         self.gave_up = 0
+        # what the last move() made of its position, for the player to move there: ("q", the
+        # search's root value, -1 to 1), ("margin", the solved final margin in discs), or
+        # ("wdl", a solve's sign only, with `exact` off); None if it didn't search
+        self.last_value: tuple[str, float] | None = None
 
     def sync(self, color: str) -> None:
         """Passes for the other color if `color` moves out of turn: the game passes for a player
@@ -412,6 +417,12 @@ class NetPlayer:
         self.sync(color)
         self.search.play(move)
 
+    def set_position(self, black: int, white: int, color: str) -> None:
+        """Starts the game from a position given whole (see `engines.Board.at`)."""
+        me, opp = (black, white) if color == "b" else (white, black)
+        self.search.set_position(me, opp)
+        self.to_move = color
+
     def solve(self, me: int, opp: int, seconds_left: float) -> int | None:
         """The move the endgame's solution plays, if it's solved in time (and with `exact` off,
         isn't lost)."""
@@ -423,6 +434,7 @@ class NetPlayer:
         if solved is None:
             self.gave_up += 1
             return None
+        self.last_value = ("margin" if solving.exact else "wdl", float(solved.margin))
         if not solving.exact and solved.margin < 0:
             return None
         self.solved += 1
@@ -434,6 +446,7 @@ class NetPlayer:
         me, opp, _, _ = self.search.position()
         empties = 64 - (me | opp).bit_count()
         action = None
+        self.last_value = None
         if self.search.num_legal() == 1:
             action = self.search.first_legal()
         elif self.solving is not None and empties <= self.solving.empties:
@@ -454,6 +467,7 @@ class NetPlayer:
             else:
                 timed_move(self.search, seconds, self.batch, self.evaluate)
             action = self.search.best_action()
+            self.last_value = ("q", self.search.root_q())
         self.search.play(action)
         return action
 
@@ -463,7 +477,7 @@ class NetPlayer:
 
 def speed(args: argparse.Namespace) -> None:
     """One game at a time against itself, reporting evals a second and where the time goes."""
-    cores = len(os.sched_getaffinity(0))
+    cores = len(cpus())
     evaluate = make_eval(args.net, args.backend, cores)
     pool = load_xot(XOT_PATH)
     rng = np.random.default_rng(args.seed)
