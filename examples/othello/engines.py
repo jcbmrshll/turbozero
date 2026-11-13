@@ -1,12 +1,14 @@
-"""Othello engines to test against, each driven as a subprocess over GTP (the Go Text
-Protocol, which both speak for Othello). One process plays one game.
+"""Othello engines to test against, each driven as a subprocess, over GTP (the Go Text
+Protocol, which Edax and Egaroucid speak for Othello) or the engine's own protocol. One
+process plays one game.
 
 - Edax (https://github.com/okuhara/edax-reversi-AVX): build it with `setup_edax.sh`
 - Egaroucid (https://github.com/Nyanyan/Egaroucid): build it with `setup_egaroucid.sh`
+- Melody (https://github.com/HCyrano/Melody): build it with `setup_melody.sh`
 
-Both play at a "level" L, with their opening books off: up to level 10, they search L moves
-ahead, and solve the game exactly once 2L or fewer squares are empty. Or on a clock, books on,
-as `ClockedEngine`s (see `clock_match.py`).
+Each plays at a "level" L, with its opening book off: up to level 10, it searches L moves
+ahead, and solves the game exactly once 2L or fewer squares are empty. Or on a clock, books
+on, as `ClockedEngine`s (see `clock_match.py`). Melody has no book.
 
 An engine started with `analyse` also says, after each move it makes, what its search made
 of the position (`GTPEngine.analysis`), read from the logs it writes as it searches; it plays
@@ -473,6 +475,21 @@ class Edax(GTPEngine):
             self.log_dir.cleanup()
 
 
+class EdaxFM(Edax):
+    """Edax-FM (https://github.com/Yoka0014/edax-fm-reversi), Edax 4.6 with a factorization-
+    machines layer in its evaluation, what its author plays on GGS as "Kalmia", built with
+    `setup_edax_fm.sh`: driven as Edax is, with the same levels."""
+
+    name = "edax-fm"
+    setup_script = "setup_edax_fm.sh"
+    # Edax's, and its larger weights; measured at about 225 MB
+    memory_per_process = 240 << 20
+
+    @classmethod
+    def default_dir(cls) -> Path:
+        return CACHE_DIR / "engines-2026-11" / cls.name
+
+
 class EdaxAnalyst:
     """An Edax process at a level that scores every legal move of a position it's given,
     each with the line it expects after it, over the NBoard protocol, whose `hint` searches
@@ -774,11 +791,411 @@ class ClockedEgaroucid(ClockedEngine):
         self.process.wait()
 
 
+# Edax's levels above 10, as its `search_global_init` sets them: (the highest level of a row,
+# then, by the most empties, the confidence (%) its endgame searches prune at from there). With
+# more empties than those, it searches `level` moves ahead at 73%; with fewer, exactly
+EDAX_LEVELS = (
+    (12, ((24, 98), (21, 100))),
+    (18, ((27, 87), (24, 98), (21, 100))),
+    (21, ((30, 87), (27, 98), (24, 100))),
+    (24, ((33, 73), (30, 95), (27, 99), (24, 100))),
+    (27, ((33, 87), (30, 98), (27, 100))),
+    (29, ((36, 73), (33, 95), (30, 99), (27, 100))),
+    (31, ((36, 87), (33, 98), (30, 100))),
+    (33, ((39, 73), (36, 95), (33, 99), (30, 100))),
+    (35, ((39, 87), (36, 98), (33, 99), (30, 100))),
+)
+
+
+def edax_level(level: int, empties: int) -> tuple[int, int]:
+    """How deep Edax searches at `level` with `empties` empty squares, and the confidence (%)
+    its ProbCut prunes at, 100 for none: at most `empties` deep, a search of the whole game."""
+    if level <= 10:
+        return (empties, 100) if empties <= 2 * level else (level, 100)
+    if level >= 60:
+        return empties, 100
+    rows = next((r for top, r in EDAX_LEVELS if level <= top), None)
+    if rows is None:
+        # levels 36 to 59
+        rows = tuple(
+            (level + more, percent)
+            for more, percent in (
+                (9, 73),
+                (6, 87),
+                (3, 95),
+                (0, 98),
+                (-3, 99),
+                (-6, 100),
+            )
+        )
+    found = [percent for most, percent in rows if empties <= most]
+    return (empties, found[-1]) if found else (level, 73)
+
+
+# its hash table's size, in bits, unless it's told otherwise
+MELODY_HASH_BITS = 20
+
+
+class Melody(GTPEngine):
+    """Melody (https://github.com/HCyrano/Melody), Bruno Causse's engine, built with
+    `setup_melody.sh`. It speaks not GTP but a protocol of its own, IOStd, where each search
+    is given the whole position, so the board is kept here. A level is Edax's: the same depth
+    and ProbCut confidence for each number of empties (`edax_level`), which Melody rounds up
+    to the next of its own confidences (60, 72, 84, 91, 95, 98, 100%). It has no opening book.
+    Analysing, it gives only its score of the move it plays."""
+
+    name = "melody"
+    setup_script = "setup_melody.sh"
+    # its weights, about 250 MB, and a hash table of 2^20 entries of about 64 bytes
+    memory_per_process = 330 << 20
+
+    def __init__(
+        self,
+        engine_dir: Path,
+        level: int,
+        analyse: bool = False,
+        args: Sequence[str] = (),
+        threads: int = 1,
+    ):
+        self.board = Board()
+        self.analyse = analyse
+        self.threads = threads
+        self.analysis: list[Analysis] | None = None
+        self.nodes: int | None = None
+        self.log: list[str] = []
+        self.engine_dir = engine_dir
+        self.level = level
+        self.process = subprocess.Popen(
+            [*self.command_line(engine_dir, level), *args],
+            cwd=self.working_dir(engine_dir),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+        # it replies once it has loaded its weights, so that no move is charged for that
+        self.send("IOStd init")
+        self.read_until("ready.")
+
+    @classmethod
+    def default_dir(cls) -> Path:
+        return CACHE_DIR / "engines-2026-11" / cls.name
+
+    @classmethod
+    def installed(cls, engine_dir: Path) -> bool:
+        return (engine_dir / "build" / "Melody").exists()
+
+    def command_line(self, engine_dir: Path, level: int) -> list[str]:
+        # it finds its weights in its working directory
+        return [str(engine_dir / "build" / "Melody"), "-mode", "IOStd",
+                "-t", str(self.threads)]  # fmt: skip
+
+    def send(self, command: str) -> None:
+        assert self.process.stdin is not None
+        self.process.stdin.write(command + "\n")
+        self.process.stdin.flush()
+
+    def read_until(self, prefix: str) -> str:
+        """The first line of its output starting with `prefix`; what came before goes in
+        `log`."""
+        assert self.process.stdout is not None
+        self.log = []
+        while not (line := self.process.stdout.readline()).startswith(prefix):
+            if line == "":
+                raise RuntimeError(f"{self.name} exited")
+            if "SYNTAX ERROR" in line:
+                raise RuntimeError(f"{self.name} rejected a command")
+            if line.strip():
+                self.log.append(line.rstrip())
+        return line.strip()
+
+    def set_position(self, black: int, white: int, color: str) -> None:
+        self.board = Board.at(black, white, color)
+
+    def position(self) -> str:
+        """The board as Melody reads it: the squares a1, ..., h8, then who's to move."""
+        black, white = self.board.discs
+        side = "X" if self.board.black_to_move else "O"
+        return f"{board_string(black, white, 'X', 'O', '-')} {side}"
+
+    def play(self, color: str, move: int) -> None:
+        # the board passes by itself for a player with no move
+        if move != PASS:
+            assert color == self.board.color, (
+                f"{color} told, {self.board.color} to move"
+            )
+            self.board.play(int(move))
+
+    def search(self, command: str, color: str, depth: int) -> int:
+        """Sends a search, `command` with the position to search from, and plays its move."""
+        assert color == self.board.color, f"{color} asked, {self.board.color} to move"
+        self.send(f"IOStd {command}")
+        # "move C4 score 0": the move and its score for the player making it
+        _, name, _, score = self.read_until("move ").split()
+        move = action(name)
+        if self.analyse:
+            self.analysis = [Analysis([move], int(score), depth)]
+        self.board.play(move)
+        return move
+
+    def genmove(self, color: str) -> int:
+        empties = 64 - (self.board.discs[0] | self.board.discs[1]).bit_count()
+        depth, confidence = edax_level(self.level, empties)
+        return self.search(
+            f"search-fixed-depth {self.position()} {depth} {confidence}", color, depth
+        )
+
+    def weights(self) -> list[Path]:
+        names = ("weight_v11.bin", "weight_0_v12.txt", "weight_Va_v12.bin",
+                 "weight_Vb_v12.bin")  # fmt: skip
+        return [self.engine_dir / name for name in names]
+
+    def book_and_hash(self, arguments: list[str]) -> tuple[bool, int]:
+        return False, int(_last_value(arguments, "-h", str(MELODY_HASH_BITS)))
+
+    def discs(self) -> tuple[int, int]:
+        return self.board.discs[0].bit_count(), self.board.discs[1].bit_count()
+
+
+class ClockedMelody(ClockedEngine):
+    """Melody told before each move what's left of its clock, to the millisecond. Its time
+    management was made for GGS's clocks of a minute or more a game: it keeps up to 15 s in
+    reserve and takes at least a second a move, so on a clock of much less it loses on time.
+    It has no book, and doesn't think on its opponent's time here (it does on GGS, with more
+    than one thread)."""
+
+    def __init__(
+        self,
+        engine_dir: Path,
+        seconds: float,
+        threads: int,
+        args: Sequence[str] = (),
+    ):
+        # hash size 25, as in the author's script for it (melody.py); later options win
+        self.engine = Melody(
+            engine_dir, CLOCKED_LEVEL, args=["-h", "25", *args], threads=threads
+        )
+
+    def set_position(self, black: int, white: int, color: str) -> None:
+        self.engine.set_position(black, white, color)
+
+    def play(self, color: str, move: int) -> None:
+        self.engine.play(color, move)
+
+    def move(self, color: str, seconds_left: float) -> int:
+        milliseconds = int(max(seconds_left, 0) * 1000)
+        command = f"search-limited-time {self.engine.position()} {milliseconds}"
+        return self.engine.search(command, color, depth=0)
+
+    def close(self) -> None:
+        self.engine.close()
+
+
+class NeuralReversi(GTPEngine):
+    """Neural Reversi (https://github.com/natsutteatsuiyone/neural-reversi), an engine that
+    searches like Edax with a neural network's evaluation, built with
+    `setup_neural_reversi.sh`, over GTP. Its levels are its own (up to 30): up to 10, L moves
+    ahead and exact from 2L empties, as Edax's, but with ProbCut at 86% in the middle game.
+    It has no opening book, and doesn't say what its search made of the position."""
+
+    name = "neural-reversi"
+    setup_script = "setup_neural_reversi.sh"
+    # its networks, decompressed, and a hash table of 512 MB, its default; measured at 1.6 GB
+    memory_per_process = 1650 << 20
+
+    @classmethod
+    def default_dir(cls) -> Path:
+        return CACHE_DIR / "engines-2026-11" / cls.name
+
+    @classmethod
+    def installed(cls, engine_dir: Path) -> bool:
+        return (engine_dir / "target" / "release" / "cli").exists()
+
+    def command_line(self, engine_dir: Path, level: int) -> list[str]:
+        return [str(engine_dir / "target" / "release" / "cli"), "gtp",
+                "--level", str(level), "--threads", str(self.threads)]  # fmt: skip
+
+    def read_analysis(self, move: int) -> list[Analysis] | None:
+        return None
+
+    def weights(self) -> list[Path]:
+        # compiled into the binary, from these
+        return sorted(self.engine_dir.glob("eval*.zst"))
+
+    def book_and_hash(self, arguments: list[str]) -> tuple[bool, int]:
+        # the hash table's size in MB
+        return False, int(_last_value(arguments, "--hash-size", "512"))
+
+    def set_position(self, black: int, white: int, color: str) -> None:
+        side = "B" if color == "b" else "W"
+        self.command(f"setboard {board_string(black, white, 'X', 'O', '-')} {side}")
+
+    def position(self) -> tuple[int, int, str]:
+        """(black's discs, white's, who's to move) on its board, read from `showboard`: rows
+        "4 | | |.|O|X| | | |", "." a legal move."""
+        text = self.command("showboard")
+        black = white = 0
+        for line in text.splitlines():
+            if line[:2] in BOARD_ROWS and "|" in line:
+                row = int(line[0]) - 1
+                for column, cell in enumerate(line.split("|")[1:9]):
+                    black |= (cell == "X") << (row * 8 + column)
+                    white |= (cell == "O") << (row * 8 + column)
+        return black, white, "b" if "Black(X)'s turn" in text else "w"
+
+    def discs(self) -> tuple[int, int]:
+        black, white, _ = self.position()
+        return black.bit_count(), white.bit_count()
+
+
+class ClockedNeuralReversi(ClockedEngine):
+    """Neural Reversi over GTP, on a clock of the game's seconds and no increment, told what's
+    left of it before each move, in whole seconds (its `time_left` takes no fraction)."""
+
+    def __init__(
+        self,
+        engine_dir: Path,
+        seconds: float,
+        threads: int,
+        args: Sequence[str] = (),
+    ):
+        self.engine = NeuralReversi(engine_dir, 21, args=args, threads=threads)
+        self.engine.command(f"time_settings {max(round(seconds), 1)} 0 0")
+
+    def set_position(self, black: int, white: int, color: str) -> None:
+        self.engine.set_position(black, white, color)
+
+    def play(self, color: str, move: int) -> None:
+        self.engine.play(color, move)
+
+    def move(self, color: str, seconds_left: float) -> int:
+        self.engine.command(f"time_left {color} {int(max(seconds_left, 0))} 0")
+        return self.engine.genmove(color)
+
+    def close(self) -> None:
+        self.engine.close()
+
+
+class ClockedYmatioun(ClockedEngine):
+    """ymatioun (https://github.com/ymatioun/reversi), Youri Matiounine's engine, built with
+    `setup_ymatioun.sh`, over its own protocol, much like chess's UCI: each search is given the
+    whole position, so the board is kept here, and what's left of the clock, in milliseconds.
+    It has no levels, so it plays only on a clock; no opening book; and its threads are fixed
+    when it's built, a binary for each number of them."""
+
+    name = "ymatioun"
+    setup_script = "setup_ymatioun.sh"
+    # a position whose player to move has one move, which it answers at once, without
+    # searching: what it's sent to know it's ready
+    READY = "*O" + "-" * 62 + " *"
+
+    def __init__(
+        self,
+        engine_dir: Path,
+        seconds: float,
+        threads: int,
+        args: Sequence[str] = (),
+    ):
+        binary = engine_dir / "bin" / f"ymatioun-t{threads}"
+        if not binary.exists():
+            raise FileNotFoundError(
+                f"no {binary}: run THREADS={threads} examples/othello/{self.setup_script}"
+            )
+        self.board = Board()
+        self.process = subprocess.Popen(
+            [str(binary), *args],
+            # it finds its weights in data/, under its working directory
+            cwd=engine_dir,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+        # its hash tables cleared, as its author's own matches start a game; then it has
+        # loaded its weights, so that no move is charged for that
+        self.send("newgame")
+        self.send(f"position fen {self.READY}")
+        self.send("go time 1000")
+        self.read_move()
+
+    @classmethod
+    def default_dir(cls) -> Path:
+        return CACHE_DIR / "engines-2026-11" / cls.name
+
+    @classmethod
+    def installed(cls, engine_dir: Path) -> bool:
+        return any((engine_dir / "bin").glob("ymatioun-t*"))
+
+    def send(self, command: str) -> None:
+        assert self.process.stdin is not None
+        self.process.stdin.write(command + "\n")
+        self.process.stdin.flush()
+
+    def read_move(self) -> int:
+        """The square of its reply, "bestmove 19 score 0 time 67 depth 16.3", past the lines
+        its search writes as it goes ("info ...")."""
+        assert self.process.stdout is not None
+        while not (line := self.process.stdout.readline()).startswith("bestmove"):
+            if line == "":
+                raise RuntimeError(f"{self.name} exited")
+        # bit 0 is a1, as here
+        return int(line.split()[1])
+
+    def set_position(self, black: int, white: int, color: str) -> None:
+        self.board = Board.at(black, white, color)
+
+    def position(self) -> str:
+        """The board as it reads it: the squares a1, ..., h8, then who's to move."""
+        black, white = self.board.discs
+        side = "*" if self.board.black_to_move else "O"
+        return f"{board_string(black, white, '*', 'O', '-')} {side}"
+
+    def play(self, color: str, move: int) -> None:
+        # the board passes by itself for a player with no move
+        if move != PASS:
+            assert color == self.board.color, (
+                f"{color} told, {self.board.color} to move"
+            )
+            self.board.play(int(move))
+
+    def move(self, color: str, seconds_left: float) -> int:
+        assert color == self.board.color, f"{color} asked, {self.board.color} to move"
+        self.send(f"position fen {self.position()}")
+        self.send(f"go time {int(max(seconds_left, 0) * 1000)}")
+        move = self.read_move()
+        self.board.play(move)
+        return move
+
+    def close(self) -> None:
+        self.process.kill()
+        self.process.wait()
+
+
+def default_dir(name: str) -> Path:
+    """Where `name`'s setup script builds it: an engine of `ENGINES`, or one that plays only on
+    a clock."""
+    return (
+        ENGINES[name].default_dir()
+        if name in ENGINES
+        else CLOCK_ONLY[name].default_dir()
+    )
+
+
 # what makes an engine's `ClockedEngine`: (engine_dir, seconds, threads, args)
 CLOCKED: dict[str, Callable[[Path, float, int, Sequence[str]], ClockedEngine]] = {
     Edax.name: ClockedEdax,
+    EdaxFM.name: ClockedEdax,
     Egaroucid.name: ClockedEgaroucid,
+    Melody.name: ClockedMelody,
+    NeuralReversi.name: ClockedNeuralReversi,
+    ClockedYmatioun.name: ClockedYmatioun,
 }
-ENGINES: dict[str, type[GTPEngine]] = {e.name: e for e in (Edax, Egaroucid)}
+ENGINES: dict[str, type[GTPEngine]] = {
+    e.name: e for e in (Edax, EdaxFM, Egaroucid, Melody, NeuralReversi)
+}
+# the engines that play only on a clock, by name
+CLOCK_ONLY: dict[str, type[ClockedYmatioun]] = {ClockedYmatioun.name: ClockedYmatioun}
 # the engines with an analyst, by name
 ANALYSTS: dict[str, type[EdaxAnalyst]] = {Edax.name: EdaxAnalyst}

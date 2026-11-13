@@ -30,6 +30,7 @@ from core.evaluators.evaluation_fns import make_nn_eval_fn
 from core.evaluators.evaluator import EvalOutput, Evaluator
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.mcts.mcts import MCTS
+from core.memory.move_log import ENDED, GOES_ON, read_meta, read_moves, unpack
 from core.memory.replay_memory import (
     BaseExperience,
     EpisodeReplayBuffer,
@@ -3925,3 +3926,82 @@ def test_fresh_positions_must_fill_micro_batches(env, tmp_path):
         make_trainer(
             env, tmp_path, train_batch_size=4, grad_accum_steps=2, fresh_positions=3
         )
+
+
+def test_self_play_logs_every_move_of_whole_games(env, tmp_path):
+    moves_dir = tmp_path / "moves"
+    trainer = make_trainer(
+        env,
+        tmp_path / "ckpt",
+        warmup_steps=0,
+        log_moves=str(moves_dir),
+        save_state_at=(3,),
+    )
+    output = trainer.train_loop(seed=0, num_epochs=3)
+    rows = read_moves(moves_dir)
+    meta = read_meta(moves_dir)
+    assert meta["num_envs"] == 2
+    assert len(rows) == int(output.collection_state.moves.sum())
+    np.testing.assert_array_equal(np.unique(rows["epoch"]), [0, 1, 2])
+    for env_index in (0, 1):
+        mine = rows[rows["env"] == env_index]
+        # 3-move games, one after another, the last move of each ending it with player 0's win
+        np.testing.assert_array_equal(mine["ply"], np.arange(len(mine)) % 3)
+        np.testing.assert_array_equal(mine["game"], np.arange(len(mine)) // 3)
+        np.testing.assert_array_equal(
+            mine["end"], np.where(mine["ply"] == 2, ENDED, GOES_ON)
+        )
+        np.testing.assert_array_equal(mine["result"], np.where(mine["ply"] == 2, 1, 0))
+        assert (mine["value"] == 0.0).all() and mine["full"].all()
+    # the replay buffer's positions are the logged ones
+    buffer = output.collection_state.buffer_state
+    stored = np.asarray(buffer.populated)
+    observations = np.asarray(buffer.buffer.observation_nn)[stored]
+    logged = {tuple(np.ravel(x)) for x in unpack(rows, "observation", meta)}
+    assert {tuple(np.ravel(x)) for x in observations} <= logged
+    # saved states leave the log out
+    leaves = read_state_meta(state_path(str(tmp_path / "ckpt"), 3))["leaves"]
+    assert not any("move_log" in leaf[0] for leaf in leaves["collection_state"])
+
+
+def test_with_no_training_steps_the_network_and_its_averages_only_play(
+    env, tmp_path, fake_loop
+):
+    trainer = make_trainer(
+        env,
+        tmp_path,
+        train_steps_per_epoch=0,
+        averages=(4.0,),
+        selfplay_average=4.0,
+        memory_buffer=EpisodeReplayBuffer(capacity=8),
+        evaluator=TaggedEvaluator(0.0),
+    )
+    calls = fake_loop(trainer)
+    trainer.train_loop(seed=0, num_epochs=3)
+    assert not [c for c in calls if c.kind == "train"]
+    played = [c.params for c in calls if c.kind == "collect"]
+    for params in played[1:]:
+        jax.tree.map(np.testing.assert_array_equal, params, played[0])
+
+
+@pytest.mark.parametrize(
+    "kwargs", [{"log_moves": "x", "warmup_steps": 2}, {"train_steps_per_epoch": 0}]
+)
+def test_settings_that_dont_go_together_are_refused(env, tmp_path, kwargs):
+    if kwargs.get("train_steps_per_epoch") == 0:
+        kwargs = {**kwargs, "lr_plateau": PLATEAU}
+    with pytest.raises(ValueError):
+        make_trainer(env, tmp_path, **kwargs)
+
+
+def test_logging_moves_changes_nothing_else(env, tmp_path):
+    def run(name, **kwargs):
+        trainer = make_trainer(env, tmp_path / name, warmup_steps=0, **kwargs)
+        return trainer.train_loop(seed=0, num_epochs=2)
+
+    plain = run("plain")
+    logged = run("logged", log_moves=str(tmp_path / "moves"))
+    assert leaves_equal(
+        replace(logged.collection_state, move_log=None), plain.collection_state
+    )
+    assert leaves_equal(logged.train_states, plain.train_states)

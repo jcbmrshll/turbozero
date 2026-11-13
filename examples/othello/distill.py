@@ -10,12 +10,20 @@ game's outcome, the search's value stored with each position, the value a teache
         --value-source teacher --value-target-q 1 --teacher-values teacher-values \\
         --ckpt-dir runs/student --monitor --notes "does a student learn from its teacher?"
 
+--data and --heldout also take a dataset's directory (see teacher_dataset.py): --data trains on
+its training games, --heldout measures on its held-out ones, full searches' positions only unless
+--all-positions, and --min-empties/--max-empties narrow both.
+
+    uv run examples/othello/distill.py train --data DATASET --heldout DATASET \\
+        --net resnet:4x64,pool_every=2,heads=pooled,pool_channels=16 --ckpt-dir runs/student
+
 Its checkpoints load with `game.load_checkpoint`, like train.py's.
 """
 
 import argparse
 import dataclasses
 import json
+import os
 import time
 from dataclasses import replace
 from functools import partial
@@ -35,6 +43,7 @@ from game import (
     make_network,
     make_optimizer,
 )
+from teacher_dataset import column, load_rows, select
 
 from core.memory.replay_memory import BaseExperience, transform_randomly
 from core.monitoring import DEFAULT_URL, Monitor
@@ -43,6 +52,8 @@ from core.training.loss_fns import az_default_loss_fn
 
 # positions evaluated at once when measuring a network, not training it
 EVAL_BATCH = 4096
+# a dataset's positions the `values` command loads at once
+VALUES_CHUNK = 1 << 20
 
 
 def load_positions(path: str) -> BaseExperience:
@@ -63,6 +74,28 @@ def load_positions(path: str) -> BaseExperience:
             for field in dataclasses.fields(BaseExperience)
         }
         return BaseExperience(**fields)
+
+
+def load_data(
+    path: str, heldout: bool, args
+) -> tuple[BaseExperience, np.ndarray | None]:
+    """The positions of --data or --heldout: a saved state's (see `load_positions`), or of a
+    dataset's directory, its training games' (or held-out games') rows with the filters of
+    `args`, and which rows (None for a state)."""
+    if not os.path.isdir(path):
+        return load_positions(path), None
+    rows = select(
+        path,
+        heldout,
+        full_only=not args.all_positions,
+        min_empties=args.min_empties,
+        max_empties=args.max_empties,
+    )
+    print(
+        f"{path}: {len(rows)} {'held-out' if heldout else 'training'} positions",
+        flush=True,
+    )
+    return load_rows(path, rows), rows
 
 
 def outcomes(positions: BaseExperience) -> np.ndarray:
@@ -228,6 +261,21 @@ def values_command(args) -> None:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     for path in args.data:
+        if os.path.isdir(path):
+            # a dataset's every row, in chunks
+            count = len(column(path, "game"))
+            parts = [
+                measure(
+                    network,
+                    params,
+                    load_rows(path, np.arange(start, min(start + VALUES_CHUNK, count))),
+                )
+                for start in range(0, count, VALUES_CHUNK)
+            ]
+            values = np.concatenate([part[1] for part in parts])
+            np.save(teacher_values_path(out, path), values)
+            print(json.dumps({"dataset": path, "positions": count}), flush=True)
+            continue
         positions = load_positions(path)
         metrics, values = measure(network, params, positions)
         np.save(teacher_values_path(out, path), values)
@@ -253,13 +301,13 @@ def values_command(args) -> None:
 def teacher_values_path(directory: Path, state: str) -> Path:
     """Where the `values` command keeps a teacher's values of a state's positions: named by the
     state's run directory and file, so that one directory can hold several runs' states."""
-    state_path = Path(state)
+    state_path = Path(state.rstrip("/"))
     return directory / f"{state_path.parent.name}-{state_path.stem}.npy"
 
 
 def train_command(args) -> None:
-    positions = load_positions(args.data)
-    heldout = load_positions(args.heldout)
+    positions, data_rows = load_data(args.data, False, args)
+    heldout, heldout_rows = load_data(args.heldout, True, args)
     if args.heldout_size < len(heldout.reward):
         chosen = np.random.default_rng(0).choice(
             len(heldout.reward), args.heldout_size, replace=False
@@ -271,7 +319,12 @@ def train_command(args) -> None:
     if args.teacher_values is not None:
         directory = Path(args.teacher_values)
         teacher_values = np.load(teacher_values_path(directory, args.data))
-        heldout_teacher = np.load(teacher_values_path(directory, args.heldout))[chosen]
+        if data_rows is not None:
+            teacher_values = teacher_values[data_rows]
+        heldout_teacher = np.load(teacher_values_path(directory, args.heldout))
+        if heldout_rows is not None:
+            heldout_teacher = heldout_teacher[heldout_rows]
+        heldout_teacher = heldout_teacher[chosen]
     positions = with_value_source(positions, args.value_source, teacher_values)
     network, nn_state = make_network(
         args.net,
@@ -333,19 +386,43 @@ def main():
     values.add_argument("--teacher", required=True, help="the teacher's checkpoint")
     values.add_argument("--teacher-net", required=True, help="the teacher's --net")
     values.add_argument(
-        "--data", nargs="+", required=True, help="saved training states"
+        "--data",
+        nargs="+",
+        required=True,
+        help="saved training states, or datasets' directories (every row of each)",
     )
     values.add_argument("--out", required=True, help="directory to write the values to")
     values.set_defaults(run=values_command)
 
     fit = commands.add_parser("train", help="train a network on a state's positions")
     fit.add_argument(
-        "--data", required=True, help="the saved training state to learn from"
+        "--data",
+        required=True,
+        help="the saved training state to learn from, or a dataset's directory (its training "
+        "games)",
     )
     fit.add_argument(
         "--heldout",
         required=True,
-        help="a saved training state of games the network and teacher never trained on",
+        help="a saved training state of games the network and teacher never trained on, or "
+        "a dataset's directory (its held-out games)",
+    )
+    fit.add_argument(
+        "--all-positions",
+        action="store_true",
+        help="of a dataset, fast searches' positions too, not only full ones'",
+    )
+    fit.add_argument(
+        "--min-empties",
+        type=int,
+        default=0,
+        help="of a dataset, positions with at least these",
+    )
+    fit.add_argument(
+        "--max-empties",
+        type=int,
+        default=64,
+        help="of a dataset, positions with at most these",
     )
     fit.add_argument("--heldout-size", type=int, default=100_000)
     fit.add_argument("--net", required=True, help="the network, as train.py's --net")

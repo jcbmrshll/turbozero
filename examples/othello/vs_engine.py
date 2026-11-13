@@ -209,7 +209,11 @@ def play_games(
     for ply in range(openings.shape[1]):
         moves = openings[:, ply]
         assert np.asarray(states.legal_action_mask)[np.arange(num_games), moves].all()
-        list(pool.map(GTPEngine.play, engines, [color(ply)] * num_games, moves))
+        list(
+            pool.map(
+                lambda e, c, m: e.play(c, m), engines, [color(ply)] * num_games, moves
+            )
+        )
         trees, states = advance(trees, states, jnp.asarray(moves))
         if recorder is not None:
             recorder.moved(states)
@@ -233,8 +237,11 @@ def play_games(
             # asking)
             movers = theirs
             asking = [g for g in np.flatnonzero(theirs) if not mask[g, PASS]]
+            # each engine's own genmove (Melody's isn't GTP's)
             replies = pool.map(
-                GTPEngine.genmove, [engines[g] for g in asking], colors[asking]
+                lambda engine, color: engine.genmove(color),
+                [engines[g] for g in asking],
+                colors[asking],
             )
             for g, move in zip(asking, replies):
                 moves[g] = move
@@ -249,7 +256,7 @@ def play_games(
             moved = np.flatnonzero(movers)
             list(
                 pool.map(
-                    GTPEngine.play,
+                    lambda engine, color, move: engine.play(color, move),
                     [engines[g] for g in moved],
                     colors[moved],
                     moves[moved],

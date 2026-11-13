@@ -10,8 +10,8 @@ Othello model and against two strong open-source Othello engines,
 | `train.py` | Trains a network by self-play, scoring it against Edax's scores of fixed positions as it goes, and in games against Edax if asked |
 | `eval_pgx.py` | Plays a checkpoint against pgx's pretrained model at several search budgets |
 | `vs_engine.py` | Plays a checkpoint against Edax or Egaroucid at several levels, from XOT openings (and train.py's network as it trains) |
-| `engines.py` | Edax and Egaroucid, each driven over GTP, and what their searches made of each position, from their logs |
-| `setup_edax.sh`, `setup_egaroucid.sh` | Build the engines for `vs_engine.py` and `clock_match.py` |
+| `engines.py` | Edax and Egaroucid, each driven over GTP, and what their searches made of each position, from their logs; and Melody, Neural Reversi, ymatioun and Edax-FM, for `clock_match.py` |
+| `setup_edax.sh`, `setup_egaroucid.sh`, `setup_melody.sh`, `setup_neural_reversi.sh`, `setup_ymatioun.sh`, `setup_edax_fm.sh` | Build the engines for `vs_engine.py` and `clock_match.py` |
 | `clock_match.py` | Games on a real clock, one at a time on the same cores, each side at its best settings |
 | `ggs.py` | GGS's random starts, its archive's, and its clock and scoring, for `clock_match.py` |
 | `gcp_cpu_jobs.py`, `gcp_cpu_runner.py` | Commands on Google Cloud Spot VMs of one CPU model (8 Zen 5 cores, AVX-512 VNNI), for timed games |
@@ -23,7 +23,8 @@ Othello model and against two strong open-source Othello engines,
 | `bench_cpu_backends.py` | Evals a second by CPU backend and batch, each checked against JAX's outputs |
 | `quantize.py`, `fidelity.py`, `bench_quantized.py` | Quantizes a network to int8 for playing on CPU, and measures its outputs and speed against bf16 |
 | `engine_set.py`, `label_positions.py`, `score_engine_set.py` | The engine-labelled set: fixed positions with every legal move scored by Edax, to build, and to score checkpoints on (train.py scores the network on it every epoch) |
-| `distill.py` | Trains a network on a saved training state's replay buffer, with no self-play, on a teacher network's values or the games' outcomes |
+| `distill.py` | Trains a network on a saved training state's replay buffer or a dataset, with no self-play, on a teacher network's values or the games' outcomes |
+| `teacher_dataset.py` | A dataset of whole self-play games from the moves a run kept (`--log-moves`), labelled with exact endgame results |
 | `bench_nets.py` | Times networks on their own: a forward pass at self-play's batch, a training step at training's |
 | `game.py` | What the scripts share: the environment, board symmetries, network, evaluators |
 | `xot.py`, `xot-openings.txt` | The XOT opening list |
@@ -462,6 +463,41 @@ raw weights' excess (`fresh_*_gap`). N is a multiple of the micro-batch (`--trai
 `--grad-accum`), e.g. 16 of them. It draws its samples from the run's rng, so a run with it
 plays other games than the same run without.
 
+### Keeping every move: datasets of games
+
+`--log-moves DIR` keeps every move self-play plays, fast searches' too, in `DIR` as
+`moves-<EPOCH>.npy` (see `core/memory/move_log.py`): the position, the search's policy target and
+root value, the legal moves, the move played, whether the search was full, the ply, and the game
+it's in, about 190 bytes a move. Training is unchanged. The log isn't part of saved states, so a
+run keeping its moves doesn't `--resume` into the same directory: start another into a new one.
+
+`--train-steps 0` trains nothing: the network and its weight averages only play. With
+`--init-from` a state and `--selfplay-average`, a fixed teacher plays its own self-play settings'
+games, for a dataset that students and architectures train on from disk instead of from live
+self-play:
+
+```bash
+T=~/.cache/turbozero/othello/solo8x128/s14t-s13te340-lr2e6-511s-solve20-past3.5-tandem4x64-5e5
+uv run examples/othello/train.py --net resnet:8x128,pool_every=2,heads=pooled,pool_channels=32,norm=channel,layout=pre \
+    --init-from $T/state-380.npz --fork-into 8x128 --init-without-buffers \
+    --train-steps 0 --average-epochs 4 --selfplay-average 4 \
+    --sims 511 --playout-cap 0.25:127 --tree-factor 4 --advance-every 128 --selfplay-cycles 33280 \
+    --solve-empties 20 --solve-play-past 3.5 --engine-eval-every 0 \
+    --epochs 160 --ckpt-dir runs/teacher --log-moves runs/teacher/moves
+uv run examples/othello/teacher_dataset.py build --moves runs/teacher/moves --out runs/dataset \
+    --solve-empties 20 --threads 8
+```
+
+`build` puts the games back together, drops those the run ended in the middle of, and labels
+every position with its game's exact result for the player to move: positions with 20 empties or
+fewer are each solved on the CPU (win, draw or loss, about 37 ms of a core each), and those before
+a game's first one take its result, as self-play's exact labels do. It holds out whole games
+(`--heldout`, 3% by default). The dataset is a directory of columns, a `.npy` per field and a row
+per position, game by game (see `COLUMNS` in `teacher_dataset.py`), so a later relabelling (e.g.
+a deeper search of some positions) is another column beside them. `distill.py train --data DATASET
+--heldout DATASET` trains on its training games' full searches and measures on its held-out ones;
+`--all-positions`, `--min-empties` and `--max-empties` change which positions.
+
 ### The run controller
 
 `controller.py` runs a long growing run in steps, each its own entry in slick's GPU queue, so
@@ -700,6 +736,26 @@ A level is no stand-in for a clock. On real positions, from XOT openings, with 8
 More threads make a level no stronger, only faster (at level 16, 150 games each: 8 threads
 against 1 scored 0.49 for Edax and 0.50 for Egaroucid, each about 0.04 either way), and one
 search took 3.5 times less time on 8 threads than on 1 at level 20.
+
+### More engines
+
+Four more engines, each plausibly near Edax's strength or above, play in `clock_match.py` (and,
+but for ymatioun, at a level in `vs_engine.py`). Each `setup_*.sh` builds one at a pinned commit
+into `~/.cache/turbozero/othello/engines-2026-11/`, for a standard ISA level, never `-march=native`.
+None has an opening book.
+
+| Engine | Name | Licence | Protocol | Levels | Notes |
+|---|---|---|---|---|---|
+| [Melody](https://github.com/HCyrano/Melody), Bruno Causse | `melody` | GPLv3 | its own, IOStd: a whole position and a depth or the milliseconds left | Edax's (`engines.edax_level`) | AVX2 at most. Its time management keeps up to 15 s in reserve and takes at least 1 s a move: it lost on time at 10 s a game, not at 60 |
+| [Neural Reversi](https://github.com/natsutteatsuiyone/neural-reversi) | `neural-reversi` | GPLv3 | GTP, with `setboard` | its own, up to 30 | Edax-like search, neural network evaluation; `time_left` in whole seconds |
+| [ymatioun](https://github.com/ymatioun/reversi), Youri Matiounine | `ymatioun` | MIT | its own, like UCI: `position fen`, `go time <ms>` | none: clock only | threads fixed at build (`bin/ymatioun-t<N>`, `THREADS="1 8"`); the setup script patches its weights' paths, threads, hash size and page-rounded allocations |
+| [Edax-FM](https://github.com/Yoka0014/edax-fm-reversi) | `edax-fm` | GPLv3 | Edax's GTP | Edax's | Edax 4.6 with a factorization-machines layer; "Kalmia" on GGS |
+
+```
+examples/othello/setup_melody.sh                    # once each
+taskset -c 8 uv run examples/othello/clock_match.py --a melody:threads=1 --b edax:threads=1 \
+    --seconds 60 --openings 50
+```
 
 ### GGS conditions
 
