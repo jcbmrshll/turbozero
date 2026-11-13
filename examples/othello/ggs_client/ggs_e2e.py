@@ -102,7 +102,10 @@ class EdaxBot(Process):
 
 class Client(Process):
     def __init__(self, args: list[str], cores: str, log: Path):
-        env = dict(os.environ, JAX_PLATFORMS="cpu")
+        env = dict(os.environ)
+        if "device=gpu" not in " ".join(args):
+            # JAX would otherwise take the GPU
+            env["JAX_PLATFORMS"] = "cpu"
         command = [
             "taskset",
             "-c",
@@ -237,10 +240,14 @@ def main() -> None:
             print(f"match {i + 1}/{len(plan)}: {match_type} {args.clock}"
                   + (f", {action}" if action else ""), flush=True)  # fmt: skip
             offset = transcript.stat().st_size if transcript.exists() else 0
-            edax.ask(f"{match_type} {args.clock}", rated=i == 1)
+            # a dropped connection ends any match outside a tournament; a rated one is stored,
+            # and resumed as a new match
+            edax.ask(f"{match_type} {args.clock}", rated=i == 1 or action is not None)
             start = time.monotonic()
             acted = False
-            while len(ended_matches(transcript)) == before:
+            while not [
+                m for m in ended_matches(transcript)[before:] if m.result is not None
+            ]:
                 if time.monotonic() - start > timeout:
                     raise TimeoutError(f"match {i + 1} didn't end in {timeout:.0f} s")
                 if action and not acted and our_moves(transcript, offset) >= 8:
@@ -257,12 +264,12 @@ def main() -> None:
                     if process.popen.poll() is not None:
                         raise RuntimeError(f"{name} exited")
                 time.sleep(1)
-            end = ended_matches(transcript)[-1]
-            ours = end.result if end.players[0] == LOGIN else -(end.result or 0)
-            print(f"  ended: {end.reason or f'{ours:+.2f} for us'}"
-                  f" ({time.monotonic() - start:.0f} s)", flush=True)  # fmt: skip
-            if end.result is None:
-                failures.append(f"match {end.id} didn't finish: {end.reason}")
+            for end in ended_matches(transcript)[before:]:
+                ours = end.result if end.players[0] == LOGIN else -(end.result or 0)
+                print(f"  {end.id} ended: {end.reason or f'{ours:+.2f} for us'}"
+                      f" ({time.monotonic() - start:.0f} s)", flush=True)  # fmt: skip
+                if end.result is None and not action:
+                    failures.append(f"match {end.id} didn't finish: {end.reason}")
             time.sleep(3)
         client.stop(timeout=60)
         edax.stop()
@@ -276,6 +283,9 @@ def main() -> None:
             if items:
                 failures.append(f"{kind}: {items}")
         for result in results:
+            adjourned = [r for r in result["results"] if r[3] is None]
+            if adjourned and len(results) == 1 and "drop" in skip:
+                failures.append(f"adjourned: {adjourned}")
             errors = [e for e in result["errors"] if "not registered" not in e]
             if errors:
                 failures.append(f"client errors: {errors}")

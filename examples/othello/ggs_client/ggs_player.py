@@ -44,6 +44,7 @@ class GameView:
         increment: added to our clock after each move
         komi: whether this is a komi game's first move, which both players send, each with
             the result it expects for the player to move
+        mine: our colour, "b" or "w" (None before a komi game's colours are set)
     """
 
     game_id: str
@@ -57,6 +58,7 @@ class GameView:
     extended: bool = False
     increment: float = 0.0
     komi: bool = False
+    mine: str | None = None
 
     @property
     def empties(self) -> int:
@@ -74,9 +76,18 @@ class Decision:
 
 
 class Bridge(Protocol):
-    """What the client asks of a player."""
+    """What the client asks of a player, whatever it runs on. One serves all of a client's
+    games; it keeps their trees, by `game_id`.
+
+    `decide` is our move, called on a thread of its own for each game (two can overlap, with
+    two matches); `cores` is the CPU share the client gives the search. `observe` is told every
+    board of our games as the server shows it, whoever's to move, on the client's thread: it
+    must return at once (a player that ponders queues it). `forget` is a game's end.
+    """
 
     def decide(self, view: GameView, cores: int) -> Decision: ...
+
+    def observe(self, view: GameView) -> None: ...
 
     def forget(self, game_id: str) -> None: ...
 
@@ -184,6 +195,9 @@ class FirstLegal:
         legal = Board.at(view.black, view.white, view.color).legal()
         return Decision(legal[0] if legal else PASS, 0.0, self.seconds)
 
+    def observe(self, view: GameView) -> None:
+        pass
+
     def forget(self, game_id: str) -> None:
         self.forgotten.append(game_id)
 
@@ -215,50 +229,22 @@ class EnginePool:
             self.idle.setdefault(cores, []).append(engine)
 
 
-class NetBridge:
-    """`Bridge` for `cpu_match.NetPlayer`s of one network, from `clock_match.py`'s `net:`
-    options (`net`, `batch`, `solve`, `solve_exact`, `solve_share`, `taper`, ... ; `engine=1`
-    is implied: the native int8 engine, a worker to a core)."""
+class PlayerBridge:
+    """`Bridge` for players like `cpu_match.NetPlayer`, made by `new_player(seed)`, each
+    searching with an engine of `make_engine(cores)` (set as its `evaluate` for each move)."""
 
     def __init__(
         self,
-        options: dict[str, str],
-        cores: int | None = None,
+        new_player: Callable[[int], Any],
+        make_engine: Callable[[int], Any],
+        cores: int,
+        taper: int = 0,
         time_policy: TimePolicy | None = None,
     ):
-        from cpu_match import NetPlayer, Solving, make_engine
-        from cpu_match import Player as NetSpec
-
-        options = dict(options)
-        options.pop("engine", None)
-        self.cores = cores or int(options.pop("threads", len(os.sched_getaffinity(0))))
-        options.pop("threads", None)
-        self.solving = None
-        if "solve" in options:
-            self.solving = Solving(
-                empties=int(options.pop("solve")),
-                exact=bool(int(options.pop("solve_exact", 0))),
-                share=float(options.pop("solve_share", Solving.share)),
-                threads=self.cores,
-            )
-        self.taper = int(options.pop("taper", 0))
-        fields = ",".join(f"{k}={v}" for k, v in options.items())
-        self.spec = NetSpec.parse(f"visits=0,{fields}", options["net"], "native")
-        self.pool = EnginePool(
-            lambda n: make_engine(
-                self.spec.net, self.spec.backend, n, self.spec.settings.batch
-            )
-        )
-        # an engine of every core, made now: the first move shouldn't wait for it
-        self.pool.release(self.cores, self.pool.acquire(self.cores))
-        self.new_player = lambda seed: NetPlayer(
-            self.spec.settings,
-            None,
-            self.taper,
-            seed,
-            0,
-            self.solving,  # type: ignore[arg-type]
-        )
+        self.new_player = new_player
+        self.pool = EnginePool(make_engine)
+        self.cores = cores
+        self.taper = taper
         self.time = time_policy or TimePolicy()
         self.players: dict[str, _Game] = {}
         self.seed = 0
@@ -321,11 +307,64 @@ class NetBridge:
         info = {"cores": cores, "value": value, "desyncs": game.desyncs}
         return Decision(move, game.last_eval, time.perf_counter() - start, info)
 
+    def observe(self, view: GameView) -> None:
+        """Nothing: the CPU player doesn't ponder (its cores are the opponent's meanwhile, in
+        a contest on one machine; on GGS, the move it's told is played in its tree)."""
+
     def forget(self, game_id: str) -> None:
         self.players.pop(game_id, None)
 
     def close(self) -> None:
         self.players.clear()
+
+
+class NetBridge(PlayerBridge):
+    """`PlayerBridge` for `cpu_match.NetPlayer`s of one network, from `clock_match.py`'s `net:`
+    options (`net`, `batch`, `solve`, `solve_exact`, `solve_share`, `taper`, ... ; `engine=1`
+    is implied: the native int8 engine, a worker to a core). Unlike there, `solve_exact`
+    defaults to 1: a game's score is its disc margin, so a won endgame should win by the most
+    and a lost one lose by the least, which the network's win/loss value doesn't see."""
+
+    def __init__(
+        self,
+        options: dict[str, str],
+        cores: int | None = None,
+        time_policy: TimePolicy | None = None,
+    ):
+        from cpu_match import NetPlayer, Solving, make_engine
+        from cpu_match import Player as NetSpec
+
+        options = dict(options)
+        options.pop("engine", None)
+        cores = cores or int(options.pop("threads", len(os.sched_getaffinity(0))))
+        options.pop("threads", None)
+        solving = None
+        if "solve" in options:
+            solving = Solving(
+                empties=int(options.pop("solve")),
+                # GGS scores games by discs: solve for the best margin, not just the win
+                exact=bool(int(options.pop("solve_exact", 1))),
+                share=float(options.pop("solve_share", Solving.share)),
+                threads=cores,
+            )
+        taper = int(options.pop("taper", 0))
+        fields = ",".join(f"{k}={v}" for k, v in options.items())
+        spec = NetSpec.parse(f"visits=0,{fields}", options["net"], "native")
+
+        def new_player(seed: int) -> NetPlayer:
+            # its engine is set for each move (see `decide`)
+            player = NetPlayer(spec.settings, None, taper, seed, 0, solving)  # type: ignore[arg-type]
+            return player
+
+        super().__init__(
+            new_player,
+            lambda n: make_engine(spec.net, spec.backend, n, spec.settings.batch),
+            cores,
+            taper,
+            time_policy,
+        )
+        # an engine of every core, made now: the first move shouldn't wait for it
+        self.pool.release(cores, self.pool.acquire(cores))
 
 
 @dataclass
@@ -337,3 +376,23 @@ class _Game:
     told: int = 0
     last_eval: float = 0.0
     desyncs: int = 0
+
+
+def make_bridge(options: dict[str, str], cores: int) -> Bridge:
+    """The player `--player` names: `net=NAME,...` on the CPU's native engine (`NetBridge`), or
+    with `device=gpu`, the GPU player's bridge (see the README)."""
+    options = dict(options)
+    device = options.pop("device", "cpu")
+    if device == "cpu":
+        return NetBridge(options, cores)
+    if device == "gpu":
+        # the GPU player (examples/othello/gpu_play.py), its trees' leaves batched on one
+        # stream, pondering the game the opponent's moving in; it takes our types so as not to
+        # import this module
+        import importlib
+
+        gpu_play = importlib.import_module("gpu_play")
+        return gpu_play.make_ggs_bridge(
+            options, cores, decision=Decision, time_policy=TimePolicy()
+        )
+    raise ValueError(f"no GGS player for device={device}")

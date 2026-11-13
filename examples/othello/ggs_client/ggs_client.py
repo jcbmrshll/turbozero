@@ -23,6 +23,7 @@ import logging
 import os
 import queue
 import random
+import re
 import signal
 import socket
 import sys
@@ -35,7 +36,12 @@ from pathlib import Path
 # examples/othello, whose modules the player imports
 sys.path.insert(1, str(Path(__file__).resolve().parent.parent))
 
+# the CPU player's JAX (loading a network) would otherwise take the GPU, and the league with it
+if __name__ == "__main__" and "device=gpu" not in " ".join(sys.argv):
+    os.environ.setdefault("JAX_PLATFORMS", "cpu")
+
 import ggs_protocol as gp
+from engines import Board
 from ggs_player import Bridge, Decision, GameView, replay
 
 log = logging.getLogger("ggs")
@@ -82,6 +88,9 @@ class Policy:
             return False, f"{other} not an allowed opponent"
         if games + request.type.games > self.max_games:
             return False, f"{games} games already"
+        if request.type.size != 8 or request.type.anti:
+            # the player knows 8x8 Othello, where more discs win
+            return False, f"type {request.type.text}"
         if request.rating_mode == "S":
             return (self.resume_stored, "stored matches not resumed")
         if request.type.text.lower() not in {t.lower() for t in self.types}:
@@ -122,6 +131,8 @@ class GameState:
     komi: float | None = None
     players: tuple[gp.PlayerLine, ...] = ()
     finished: bool = False
+    # neither player has a move: over, its end message to come
+    over: bool = False
     result: float | None = None
     # when our turn began, by our clock, and the move number it's for
     turn_since: float = 0.0
@@ -140,7 +151,7 @@ class GameState:
 
     @property
     def our_turn(self) -> bool:
-        if self.finished:
+        if self.finished or self.over:
             return False
         if self.my_color is None:
             # a komi game's first move: both players send one before colours are set
@@ -196,6 +207,7 @@ class Session:
         send: Callable[[str], None],
         ask_move: Callable[[Job], None],
         forget_game: Callable[[str], None] = lambda game_id: None,
+        observe: Callable[[GameView], None] = lambda view: None,
         clock: Callable[[], float] = time.monotonic,
         aform: str | None = None,
         keepalive: float = 60.0,
@@ -208,6 +220,7 @@ class Session:
         self._send = send
         self.ask_move = ask_move
         self.forget_game = forget_game
+        self.observe = observe
         self.clock = clock
         self.aform = aform
         self.keepalive = keepalive
@@ -433,6 +446,10 @@ class Session:
         game.to_move = gp.color_letter(msg.to_move)
         game.komi = msg.komi
         game.players = msg.players
+        board = Board.at(game.black, game.white, game.to_move)
+        if not board.legal():
+            board.black_to_move = not board.black_to_move
+            game.over = not board.legal()
         mine = msg.color_of(self.login)
         game.my_color = gp.color_letter(mine) if mine else None
         if game.start is not None:
@@ -447,6 +464,8 @@ class Session:
                 self.resync(msg.match_id, now)
         if game.our_turn and game.turn_number != game.number:
             game.turn_since, game.turn_number = now, game.number
+        if not game.finished and not game.over:
+            self.observe(self.view(game))
         held = self.pending.pop(game.id, None)
         if held is not None:
             self.decided(*held)
@@ -485,6 +504,7 @@ class Session:
             extended=game.extended,
             increment=clock.inc if clock else 0.0,
             komi=game.type.komi and game.komi is None,
+            mine=game.my_color,
         )
 
     def maybe_move(self, game: GameState) -> None:
@@ -497,11 +517,14 @@ class Session:
     # -- the player's decisions
 
     def decided(self, job: Job, decision: Decision) -> None:
-        if not self.logged_in:
+        match = self.matches.get(gp.match_id_of(job.game_id))
+        if not self.logged_in or (match is not None and match.unconfirmed is not None):
             # sent once the server shows the game again, if it's still this move
             self.pending[job.game_id] = (job, decision)
             return
         game = self.games.get(job.game_id)
+        if game is not None and game.sent == job.number:
+            return  # sent already
         if game is None or game.number != job.number or not game.our_turn:
             log.info("%s: decision for move %d dropped", job.game_id, job.number)
             if game is not None and game.asked == job.number:
@@ -529,6 +552,11 @@ class Session:
                 gp.SERVICE,
             )
             return
+        gone = re.match(r"match '(\.\d+)' not found", event.text)
+        if gone and gone.group(1) in self.matches:
+            # a match the server ended while we were away (see `tick`)
+            self.end_unconfirmed(self.matches[gone.group(1)])
+            return
         log.warning("%s: ERR %s", gp.SERVICE, event.text)
         self.errors.append(event.text)
         # an error about one of our games (an illegal move, not our turn): get it whole again
@@ -550,10 +578,7 @@ class Session:
         for match in list(self.matches.values()):
             if match.unconfirmed is not None and now - match.unconfirmed > 15:
                 # the server didn't show it again: adjourned when the connection dropped
-                self.on_match_end(
-                    gp.MatchEnd(match.id, match.players, match.type, match.rated, None,
-                                "adjourned: our connection dropped")
-                )  # fmt: skip
+                self.end_unconfirmed(match)
         if now - self.last_keepalive >= self.keepalive:
             self.last_keepalive = now
             self.send(f"tell {gp.SERVICE} open {self.open_value()}")
@@ -572,6 +597,16 @@ class Session:
         ):
             self.last_ask = now
             self.send(f"tell {gp.SERVICE} ask {random.choice(self.asks)}")
+
+    def end_unconfirmed(self, match: MatchState) -> None:
+        for gid in [g for g in self.pending if gp.match_id_of(g) == match.id]:
+            self.pending.pop(gid)
+        self.on_match_end(
+            gp.MatchEnd(
+                match.id, match.players, match.type, match.rated, None,
+                "adjourned: our connection dropped",
+            )
+        )  # fmt: skip
 
     def drain(self) -> None:
         """Takes no more matches, finishing those under way."""
@@ -855,9 +890,9 @@ def main() -> None:
 
         bridge: Bridge = FirstLegal()
     else:
-        from ggs_player import NetBridge
+        from ggs_player import make_bridge
 
-        bridge = NetBridge(parse_options(args.player), cores)
+        bridge = make_bridge(parse_options(args.player), cores)
     events: queue.Queue[tuple] = queue.Queue()
     scheduler = Scheduler(bridge, cores, events)
     session = Session(
@@ -867,6 +902,7 @@ def main() -> None:
         send=lambda command: None,
         ask_move=scheduler.submit,
         forget_game=bridge.forget,
+        observe=bridge.observe,
         aform=args.aform,
         keepalive=args.keepalive,
         asks=tuple(args.ask),
