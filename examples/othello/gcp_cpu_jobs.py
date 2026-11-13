@@ -21,8 +21,8 @@ replacement skipping what's done. Run it again with the same --name to pick up a
 short.
 
 What a VM has: this checkout's files as they are now (uncommitted and new ones too, not ignored),
-the engines' builds from ~/.cache/turbozero/othello (built here for Zen 5 at x86-64-v4, which
-Turin runs), and each --files path, under the same ~/.cache/turbozero/othello. The bucket and its key
+the engines' builds from ~/.cache/turbozero/othello (built here for Zen 5 at x86-64-v4 or v3,
+which Turin runs), and each --files path, under the same ~/.cache/turbozero/othello. The bucket and its key
 are modal_jobs.py's. Every VM has --hours as its limit, after which Google deletes it whatever
 it's doing, and `run` deletes its VMs when it ends, however it ends.
 """
@@ -57,6 +57,17 @@ ENGINES = (
     "engines-2026-10/edax/bin",
     "engines-2026-10/edax/data",
     "engines-2026-10/egaroucid/bin",
+    "engines-2026-11/edax-fm/bin",
+    "engines-2026-11/edax-fm/data",
+    "engines-2026-11/melody/build/Melody",
+    *(
+        f"engines-2026-11/melody/weight_{w}"
+        for w in ("v11.bin", "0_v12.txt", "Va_v12.bin", "Vb_v12.bin")
+    ),
+    # its weights are in the binary
+    "engines-2026-11/neural-reversi/target/release/cli",
+    "engines-2026-11/ymatioun/bin",
+    "engines-2026-11/ymatioun/data",
 )
 LABEL = "tz-cpu-job"
 POLL_SECONDS = 20.0
@@ -130,6 +141,24 @@ def gcloud_binary() -> str:
     return found or str(fallback)
 
 
+# machine families of ARM cores (Axion, Ampere), and those whose boot disk can't be a hyperdisk;
+# other families (N4D, C4D, C3, C4A...) are timed on one as they are
+ARM_FAMILIES = ("c4a", "t2a")
+PD_FAMILIES = ("c2d", "c2", "n2d", "n2", "n1", "t2d", "e2")
+
+
+def machine_options(machine: str) -> list[str]:
+    """What creating a VM of `machine` needs: its image's architecture, its boot disk's type,
+    and one thread a core (ARM's cores run one already)."""
+    family = machine.split("-")[0]
+    arm = family in ARM_FAMILIES
+    return [
+        f"--image-family=ubuntu-2404-lts-{'arm64' if arm else 'amd64'}",
+        f"--boot-disk-type={'pd-balanced' if family in PD_FAMILIES else 'hyperdisk-balanced'}",
+        *([] if arm else ["--threads-per-core=1"]),
+    ]
+
+
 class Cloud(Protocol):
     def create(
         self,
@@ -179,13 +208,11 @@ class Gcloud:
                 "compute", "instances", "create", name,
                 f"--zone={zone}",
                 f"--machine-type={self.machine}",
-                "--threads-per-core=1",
+                *machine_options(self.machine),
                 "--provisioning-model=SPOT",
                 "--instance-termination-action=DELETE",
                 f"--max-run-duration={max(1, round(hours * 60))}m",
-                "--image-family=ubuntu-2404-lts-amd64",
                 "--image-project=ubuntu-os-cloud",
-                "--boot-disk-type=hyperdisk-balanced",
                 "--boot-disk-size=20GB",
                 "--scopes=cloud-platform",
                 "--labels=" + ",".join(f"{k}={v}" for k, v in labels.items()),
@@ -257,10 +284,13 @@ def code_archive(repo: Path = REPO) -> bytes:
     return tar_gz(add)
 
 
-def env_key(repo: Path = REPO) -> str:
+def env_key(repo: Path = REPO, machine: str = MACHINE) -> str:
     """Where a VM leaves its built environment for the next VMs, by what decides it."""
-    # what the boot script puts in an environment: change it with the script
+    # what the boot script puts in an environment: change it with the script; and the CPU's
+    # architecture, whose packages and venv it holds
     digest = hashlib.sha256(b"debs+uv")
+    if machine.split("-")[0] in ARM_FAMILIES:
+        digest.update(b"arm64")
     for name in ("uv.lock", "pyproject.toml", ".python-version"):
         digest.update((repo / name).read_bytes())
     return f"{PREFIX}/env/{digest.hexdigest()[:24]}.tar"
@@ -454,7 +484,7 @@ def run(args: argparse.Namespace) -> None:
             "bucket": config["bucket"],
             "hours": args.hours,
             "inputs": upload_inputs(store, [*ENGINES, *args.files]),
-            "env": env_key(),
+            "env": env_key(machine=args.machine),
         }
         store.put_bytes(f"{prefix}/code.tar.gz", code_archive())
         put_json(store, f"{prefix}/spec.json", spec)
