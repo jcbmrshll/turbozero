@@ -58,6 +58,10 @@ With --lr-plateau, the learning rate drops when the training loss stops improvin
 from --lr to each of its rates in turn, --epochs only capping the run (see README.md):
 
     uv run examples/othello/train.py --epochs 600 --lr-plateau --save-state-every 10 --ckpt-dir runs/plateau
+
+With --log-moves, every move self-play plays is kept on disk too, for teacher_dataset.py to make
+a dataset of whole games from; --train-steps 0 plays a fixed network's games without training it
+(see README.md).
 """
 
 import argparse
@@ -509,7 +513,11 @@ def main():
         "network, see --remat and --grad-accum, which keep the batch",
     )
     parser.add_argument(
-        "--train-steps", type=int, default=256, help="training steps per epoch"
+        "--train-steps",
+        type=int,
+        default=256,
+        help="training steps per epoch. 0 trains nothing: the network (and its weight "
+        "averages) only plays, e.g. a fixed teacher's games for --log-moves",
     )
     parser.add_argument(
         "--remat",
@@ -883,6 +891,15 @@ def main():
         metavar="N",
         help="also save the whole training state every N epochs, keeping the newest, to "
         "continue the run with --resume if it stops",
+    )
+    parser.add_argument(
+        "--log-moves",
+        default=None,
+        metavar="DIR",
+        help="also keep every move self-play plays, fast searches' too, in DIR (a new "
+        "directory) as moves-<EPOCH>.npy, for teacher_dataset.py: about 180 bytes a move. "
+        "Training isn't changed. The log isn't in saved states: a run that keeps its moves "
+        "doesn't --resume into the same DIR",
     )
     init = parser.add_mutually_exclusive_group()
     init.add_argument(
@@ -1385,6 +1402,7 @@ def main():
         endgame_solve=endgame_solve,
         save_state_at=args.save_state_at,
         save_state_every=args.save_state_every,
+        log_moves=args.log_moves,
         # every argument but how the run starts (a fork or branch records its parent)
         extra_config={
             "args": {
