@@ -275,6 +275,8 @@ def resolve_net(
     )
     where = device + (f"/{search['backend']}" if device == "cpu" else "")
     solve = f" solve{search['solve']}" if "solve" in search else ""
+    temperature = search.get("prior_temperature", 1.0)
+    prior = f" T{temperature:g}" if temperature != 1.0 else ""
     relative = _relative(checkpoint)
     runtime = {
         "player": "net",
@@ -292,7 +294,7 @@ def resolve_net(
     return PlayerSpec(
         config,
         runtime,
-        f"{name} {budget_label} {where}{solve}",
+        f"{name} {budget_label} {where}{solve}{prior}",
         tuple(sorted({_relative(f) or str(f) for f in files})),
     )
 
