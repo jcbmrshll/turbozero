@@ -676,6 +676,7 @@ class Trainer:
         growth: Growth | None = None,
         waiting_train_steps: int | None = None,
         train_retired: bool = False,
+        train_playing: bool = True,
         averages: Sequence[float] = (),
         selfplay_average: float | None = None,
         average_warmup: float = 10.0,
@@ -816,6 +817,10 @@ class Trainer:
                 games (not compute-optimal). Not part of a saved state: a run or branch turns
                 it on or off from any state, and a retired network takes up its training where
                 it left it
+            train_playing: (optional) with `growth`, whether the network playing self-play
+                trains (default) or stays as it is, weights and weight averages: a fixed teacher
+                whose games the networks before it learn from with `train_retired`. Not part of
+                a saved state, as `train_retired`
             averages: (optional) horizons, in epochs, of averages of each network's weights
                 (as KataGo plays and rates averaged weights while training at a constant learning
                 rate): after each epoch a network trains, each of its averages moves towards its
@@ -955,6 +960,15 @@ class Trainer:
         if train_retired and growth is None:
             raise ValueError("train_retired is for a run with growth")
         self.train_retired = train_retired
+        if not train_playing and growth is None:
+            raise ValueError(
+                "a network that plays without training is for a run with growth"
+            )
+        if not train_playing and lr_plateau is not None:
+            raise ValueError(
+                "the learning rate rule follows the network playing, which doesn't train"
+            )
+        self.train_playing = train_playing
         # testing
         self.testers = testers
         if evaluator_test is None:
@@ -1121,6 +1135,7 @@ class Trainer:
                 else {}
             ),
             **({"train_retired": True} if self.train_retired else {}),
+            **({"train_playing": False} if not self.train_playing else {}),
             "max_episode_steps": self.max_episode_steps,
             "nn": self.nn.__class__.__name__,
             "nn_params": sum(
@@ -3220,22 +3235,24 @@ class Trainer:
     def fork_averages(
         self, path: str, into: int, name: str | None = None
     ) -> tuple[tuple[Any, ...], int] | None:
-        """The weight averages of the network a fork takes from a saved growth run's state (see
-        `fork_state`: network `name`, by default network `into`'s name), and the epochs in
-        them, if it saved this trainer's horizons; else None, and the fork starts them at the
-        network's weights."""
+        """The weight averages of the network a fork takes from a saved state (see `fork_state`):
+        a growth run's network `name` (by default network `into`'s name), or a run without
+        growth's one network; and the epochs in them. None if the state has no averages over
+        this trainer's horizons, and the fork starts them at the network's weights."""
         meta = read_state_meta(path)
         info = meta.get("averages")
-        if meta["growth"] is None or not self.averages or info is None:
+        if not self.averages or info is None or info["horizons"] != list(self.averages):
             return None
-        if info["horizons"] != list(self.averages):
-            return None
-        index = saved_network_names(meta).index(name or self.learners[into].name)
-        params = jax.eval_shape(partial(self.init_train_state, into)).params
+        template = tuple(
+            jax.eval_shape(partial(self.init_train_state, into)).params
+            for _ in self.averages
+        )
         with np.load(path) as saved:
-            averages = self._load_network(
-                saved, meta, "averages", index, tuple(params for _ in self.averages)
-            )
+            if meta["growth"] is None:
+                (averages,) = self._load_part(saved, meta, "averages", (template,))
+                return averages, int(info["averaged"][0])
+            index = saved_network_names(meta).index(name or self.learners[into].name)
+            averages = self._load_network(saved, meta, "averages", index, template)
         return averages, int(info["averaged"][index])
 
     def _check_meta(self, path: str, meta: dict) -> dict:
@@ -3698,13 +3715,13 @@ class Trainer:
             fork_from: (optional) a saved state (see `save_state`), or a directory to take the
                 newest from, to fork a new run from. It's a run from scratch at epoch 0 (with its
                 own schedules, rng, games and testers), except that it starts with the saved
-                network and optimizer state (its learning rate schedule starting over), and its
-                replay buffers (see `fork_state`). The monitor run's config records it as
-                `parent`. Not with `initial_state`.
+                network, optimizer state (its learning rate schedule starting over) and weight
+                averages (see `fork_averages`), and its replay buffers (see `fork_state`). The
+                monitor run's config records it as `parent`. Not with `initial_state`.
             fork_replay_buffers: with `fork_from`, start with its replay buffers (default), or with
                 empty ones
             fork_into: (with `fork_from`) the name of the saved network to fork, from a growth
-                run's state too, with its weight averages. With `growth`, it forks into this
+                run's state too. With `growth`, it forks into this
                 run's network of that name: it plays from the run's start, those before it are
                 retired (training with `train_retired`), the next waits, and the rest start
                 from scratch. Without growth, it forks into the Trainer's own network (one
@@ -3714,7 +3731,7 @@ class Trainer:
                 directory to take the newest from: the network of that name starts from the saved
                 state's network of the same name (or its only one) instead of from scratch, with
                 its optimizer state, its step count and schedules back at 0 (see `warm_state`),
-                and from a growth run's state its weight averages (see `fork_averages`), e.g. a
+                and its weight averages (see `fork_averages`), e.g. a
                 student trained beside a forked teacher. Not the network a fork goes into
 
         Returns:
@@ -3930,7 +3947,7 @@ class Trainer:
         else:
             averages = [self.fresh_averages(ts) for ts in train_states]
             averaged = [0] * num_learners
-            if fork_from is not None and fork_into is not None:
+            if fork_from is not None:
                 saved_averages = self.fork_averages(fork_from, into, fork_into)
                 if saved_averages is not None:
                     averages[into], averaged[into] = saved_averages
@@ -3947,9 +3964,14 @@ class Trainer:
                 return ()
             if growth is None or self.growth is None:
                 return (0,)
-            # the growth rule's (the one playing, and the next), and those retired before it
+            # the growth rule's (the one playing, and the next), and those retired before it;
+            # the one playing only if it trains
             retired = range(growth.playing) if self.train_retired else ()
-            return (*retired, *self.growth.training(growth))
+            return tuple(
+                i
+                for i in (*retired, *self.growth.training(growth))
+                if self.train_playing or i != growth.playing
+            )
 
         def state_now() -> TrainLoopOutput:
             return TrainLoopOutput(
@@ -4114,9 +4136,10 @@ class Trainer:
                 train_key, key = jax.random.split(key)
                 # epochs it has played before this one (without growth, the run's)
                 played = growth.played[i] if growth is not None else cur_epoch
-                lr_scale = (
-                    self.lr_drop.scale(played) if self.lr_drop is not None else None
-                )
+                # its learning rate: its own multiple of the optimizer's, and the drop's
+                drop = self.lr_drop.scale(played) if self.lr_drop is not None else None
+                own = self.learners[i].lr_scale
+                lr_scale = None if drop is None and own == 1.0 else (drop or 1.0) * own
                 collection_state, train_states[i], train_metrics[i] = self.train_steps(
                     train_key,
                     collection_state,

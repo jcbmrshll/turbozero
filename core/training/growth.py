@@ -26,6 +26,9 @@ class Learner:
         evaluator_test: the evaluator its testers play with
         testers: its testers, run while it trains
         nn_state: (optional) the network's initial state (e.g. BatchNorm's)
+        lr_scale: (optional) its learning rate as a multiple of the optimizer's: its updates are
+            scaled by this (on top of `lr_drop`'s), so that networks of one run can train at
+            different rates, e.g. 5 for 5e-5 beside 1e-5
     """
 
     name: str
@@ -34,6 +37,7 @@ class Learner:
     evaluator_test: Evaluator
     testers: Sequence[BaseTester] = ()
     nn_state: eqx.nn.State | None = None
+    lr_scale: float = 1.0
 
     @property
     def schedule(self) -> EvaluatorSchedule:
