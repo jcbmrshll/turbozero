@@ -69,7 +69,9 @@ def test_rules_match_pgx_over_random_games():
             state = step(state, jnp.int32(action))
 
 
-def core_visits(sims: int, moves: list[int]) -> np.ndarray:
+def core_visits(
+    sims: int, moves: list[int], prior_temperature: float = 1.0
+) -> np.ndarray:
     """The root visits of `core`'s MCTS, after `moves`, with `fake_eval` as its network."""
     from game import env, make_test_evaluator, metadata, step_fn
 
@@ -87,7 +89,9 @@ def core_visits(sims: int, moves: list[int]) -> np.ndarray:
             state.observation,
         )
 
-    evaluator = make_test_evaluator(eval_callback, sims, noise=False)
+    evaluator = make_test_evaluator(
+        eval_callback, sims, noise=False, prior_temperature=prior_temperature
+    )
     key = jax.random.PRNGKey(0)
     state = env.init(key)
     for action in moves:
@@ -116,6 +120,29 @@ def test_a_batch_of_one_visits_as_core_does():
     # a visit for the root's own evaluation, which core counts apart
     search.run(sims + 1, fake_eval)
     assert np.array_equal(search.visits(), core_visits(sims, moves))
+
+
+@pytest.mark.parametrize("temperature", [0.8, 1.6])
+def test_a_prior_temperature_visits_as_cores_does(temperature):
+    from cpu_search import Search, SearchSettings
+
+    moves = [19, 18, 26]
+    search = Search(SearchSettings(prior_temperature=temperature))
+    for action in moves:
+        search.play(action)
+    sims = 48
+    search.run(sims + 1, fake_eval)
+    visits = core_visits(sims, moves, temperature)
+    assert np.array_equal(search.visits(), visits)
+    # and not as at 1
+    assert not np.array_equal(visits, core_visits(sims, moves))
+
+
+def test_a_prior_temperature_is_positive():
+    from cpu_search import SearchSettings
+
+    with pytest.raises(ValueError, match="prior_temperature"):
+        SearchSettings(prior_temperature=0.0)
 
 
 def test_reused_evaluations_search_as_core_does():
@@ -424,6 +451,8 @@ def test_a_player_parses_random_symmetry():
 
     assert not settings("visits=10").random_symmetry
     assert settings("visits=10,random_symmetry=1").random_symmetry
+    assert settings("visits=10").prior_temperature == 1.0
+    assert settings("visits=10,prior_temperature=1.6").prior_temperature == 1.6
 
 
 @pytest.mark.parametrize(

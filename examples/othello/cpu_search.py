@@ -89,6 +89,7 @@ def load_library() -> ctypes.CDLL:
                 ctypes.c_int,
                 ctypes.c_float,
                 ctypes.c_float,
+                ctypes.c_float,
                 ctypes.c_int,
                 ctypes.c_int,
                 ctypes.c_int,
@@ -192,6 +193,8 @@ class SearchSettings:
             "draw", a drawn one; "visit", a visit in the exploration term only (Leela Chess Zero's)
         weight: visits a traversal in flight counts as
         c_init: PUCT's exploration constant (see `core`'s `PUCTSelector`)
+        prior_temperature: the softmax temperature of every node's prior, the network's logits
+            divided by it: above 1 flattens the prior (see `core`'s `MCTS`)
         max_collisions: traversals of a batch allowed to find a leaf already in flight before it
             stops short; None for the batch's size
         random_symmetry: show the network each leaf in a random one of the board's 8 symmetries,
@@ -207,9 +210,16 @@ class SearchSettings:
     virtual_loss: str = "loss"
     weight: float = 1.0
     c_init: float = 1.25
+    prior_temperature: float = 1.0
     max_collisions: int | None = None
     random_symmetry: bool = False
     reuse: bool = True
+
+    def __post_init__(self) -> None:
+        if self.prior_temperature <= 0:
+            raise ValueError(
+                f"prior_temperature must be positive, got {self.prior_temperature}"
+            )
 
 
 class Search:
@@ -224,6 +234,7 @@ class Search:
             VIRTUAL_LOSS[settings.virtual_loss],
             settings.weight,
             settings.c_init,
+            settings.prior_temperature,
             settings.batch if collisions is None else collisions,
             settings.random_symmetry,
             settings.reuse,

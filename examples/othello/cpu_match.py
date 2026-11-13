@@ -62,6 +62,7 @@ class Player:
             virtual_loss=fields.pop("virtual_loss", "loss"),
             weight=float(fields.pop("weight", 1)),
             c_init=float(fields.pop("c_init", 1.25)),
+            prior_temperature=float(fields.pop("prior_temperature", 1.0)),
             max_collisions=int(fields["max_collisions"])
             if "max_collisions" in fields
             else None,

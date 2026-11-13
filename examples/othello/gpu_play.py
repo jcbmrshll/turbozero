@@ -254,7 +254,7 @@ class GpuSettings:
     @classmethod
     def parse(cls, options: dict[str, str]) -> "GpuSettings":
         """From `net:`'s options, which it removes: batch, inflight, virtual_loss, weight,
-        c_init, max_collisions, random_symmetry, reuse."""
+        c_init, prior_temperature, max_collisions, random_symmetry, reuse."""
         batch = int(options.pop("batch", cls.batch))
         collisions = options.pop("max_collisions", None)
         search = SearchSettings(
@@ -262,6 +262,7 @@ class GpuSettings:
             virtual_loss=options.pop("virtual_loss", "loss"),
             weight=float(options.pop("weight", 1)),
             c_init=float(options.pop("c_init", 1.25)),
+            prior_temperature=float(options.pop("prior_temperature", 1.0)),
             max_collisions=int(collisions) if collisions is not None else None,
             random_symmetry=bool(int(options.pop("random_symmetry", 0))),
             reuse=bool(int(options.pop("reuse", 1))),

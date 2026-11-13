@@ -57,6 +57,7 @@ SEARCH = {
     "virtual_loss": (str, "loss"),
     "weight": (float, 1.0),
     "c_init": (float, 1.25),
+    "prior_temperature": (float, 1.0),
     "max_collisions": (int, None),
     "random_symmetry": (int, 0),
     "reuse": (int, 1),
