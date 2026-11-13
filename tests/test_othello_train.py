@@ -339,7 +339,6 @@ def test_warm_starts_reach_the_training_loop(monkeypatch):
             loops.append(kwargs)
 
     monkeypatch.setattr(train, "Trainer", Trainer)
-    monkeypatch.setattr(train, "export_last", lambda net_dir, spec: None)
     monkeypatch.setattr(
         sys,
         "argv",

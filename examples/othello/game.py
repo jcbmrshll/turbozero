@@ -2,10 +2,8 @@
 turbozero talks to it, board symmetries, the network and optimizer, evaluators for
 test games, square names, and loading checkpoints."""
 
-import sys
 from collections.abc import Sequence
 from dataclasses import replace
-from pathlib import Path
 from typing import cast
 
 import equinox as eqx
@@ -23,8 +21,6 @@ from core.networks.spec import make_network as build_network
 from core.networks.spec import network_config
 from core.training.lr_plateau import LRPlateau
 from core.training.train import (
-    checkpoint_epochs,
-    checkpoint_path,
     sgdw,
     weight_decay_mask,
 )
@@ -226,18 +222,6 @@ def make_optimizer(
         weight_decay=weight_decay,
         mask=weight_decay_mask,
     )
-
-
-def export_last(ckpt_dir: str, net: str) -> None:
-    """Exports a finished run's last checkpoint to ONNX beside it. A failure only says so: the
-    run's results are safe by now, and the checkpoint can be exported later (`export_onnx.py`)."""
-    try:
-        from export_onnx import save_onnx
-
-        last = checkpoint_path(ckpt_dir, max(checkpoint_epochs(ckpt_dir)))
-        save_onnx(last, net, Path(last).with_suffix(".onnx"))
-    except Exception as e:  # noqa: BLE001
-        print(f"no ONNX export: {e!r}", file=sys.stderr)
 
 
 def load_checkpoint(path: str, net: str, inference_dtype: str = "float32"):

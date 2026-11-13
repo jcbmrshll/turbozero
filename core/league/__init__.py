@@ -8,6 +8,4 @@ implementing `game.LeagueGame` (see `examples/othello/elo_league.py`).
 - `match`: plays a batch, each player with its own search, parameters and tree
 - `gate`: says whether anyone else needs the GPU
 - `worker`: plays batches while the GPU is free, giving it up as soon as anyone else needs it
-- `dashboard`: the web pages, whose scripts are in `web/`, where trained networks run in the browser
-- `runtime`: fetches what they run on, onnxruntime-web, into the store
 """
