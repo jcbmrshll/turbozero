@@ -666,7 +666,13 @@ uv run --extra cuda examples/othello/evaluate.py run --openings 256 \
 uv run examples/othello/evaluate.py matches                  # every match, and how far it got
 uv run examples/othello/evaluate.py show MATCH [--games]     # what it showed
 uv run examples/othello/evaluate.py players -v               # every player, with its config
+uv run examples/othello/evaluate.py page                     # the web page, on port 8031
 ```
+
+**The page.** Every player's Elo, ± and record, the latest games, and a page per player with its
+record against each opponent. Elo is fit to every game, whatever its match's setup. Players linked
+by games, directly or through others, make a pool, fit on its own with its mean at 0: Elos from
+different pools don't compare.
 
 **Players.** A player is `kind:key=value,...` (`eval_players.py`), or a table of a `--config` file
 (TOML or JSON, with the match's other settings): a network, `net:`, the league's by `net=NAME` or
@@ -1165,9 +1171,6 @@ game is stored; ratings are fit to all of them, with an uncertainty for each pla
 A network's players keep a tree of 2 x sims nodes unless they're added with a bigger one
 (`add-player NET --sims 4000 --tree-factor 4`, a player of its own, `NET@4000-t4`). For a session
 of requested series only, with the GPU to itself: `play --requests-only --batch-seconds 900`.
-
-The dashboard (`elo_league.py dashboard`) lists every player's rating and record and the latest
-games; a player's page has its record against each opponent.
 
 `timings.json`, beside the store, holds what players' moves cost on fixed hardware. A benchmark
 writes it atomically:

@@ -72,7 +72,7 @@ def check_match_games(games: int) -> None:
 class LeagueGame(ABC):
     """A two-player game's part in the league."""
 
-    # the game's name, on the dashboard
+    # the game's name
     name: str = ""
     # the game's environment (pgx's interface: init, step and each state's fields)
     env: Any

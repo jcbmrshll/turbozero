@@ -503,7 +503,6 @@ class Store:
     def __init__(self, root: Path | str):
         self.root = Path(root)
         (self.root / "networks").mkdir(parents=True, exist_ok=True)
-        # the dashboard reads it from its server's threads, one at a time
         self.db = sqlite3.connect(
             self.root / "league.db", timeout=30, check_same_thread=False
         )

@@ -10,7 +10,6 @@ anchor NAME; retire NAME; resume NAME
 ratings
 settings-changes; accept-settings NAME; variant SUFFIX [NAME ...]
 start; stop
-dashboard
 """
 
 import argparse
@@ -213,9 +212,6 @@ def main(make_game: Callable[[], LeagueGame], default_root: Path, argv=None) -> 
         action="store_true",
         help="stop once no requested series can be played",
     )
-    dashboard_cmd = commands.add_parser("dashboard", help="serve the web page")
-    dashboard_cmd.add_argument("--host", default="0.0.0.0")
-    dashboard_cmd.add_argument("--port", type=int, default=8031)
 
     args = parser.parse_args(argv)
     store = Store(args.root)
@@ -317,7 +313,3 @@ def main(make_game: Callable[[], LeagueGame], default_root: Path, argv=None) -> 
         print(reason)
         if reason == "no two players can play":
             sys.exit(1)
-    elif args.command == "dashboard":
-        from core.league.dashboard import serve
-
-        serve(store, make_game().name, args.host, args.port)

@@ -9,7 +9,6 @@ each played with both colors, and no pair repeats an opening until it's played t
     uv run examples/othello/elo_league.py add-player A-8x --sims 4000 --tree-factor 4
     uv run examples/othello/elo_league.py match A-8x@1000 edax-L24 --games 400
     uv run examples/othello/elo_league.py ratings
-    uv run examples/othello/elo_league.py dashboard
 
 The worker runs from a frozen copy of the code, from a slick task whose worktree it queues in
 (SLICK_TASK names the task; a queue entry's end prompts that task's agent):

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>League</title>
+<title>Evals</title>
 <style>
   body { font: 14px/1.4 system-ui, sans-serif; margin: 0; background: #fafafa; color: #1d1d1f; }
   main { max-width: 1400px; margin: 0 auto; padding: 16px 24px; }
@@ -11,6 +11,7 @@
   h1 { font-size: 20px; margin: 0 0 12px; }
   h1 a { color: inherit; text-decoration: none; }
   h2 { font-size: 15px; margin: 0 0 8px; }
+  h3 { font-size: 13px; margin: 16px 0 6px; color: #6e6e73; }
   .muted { color: #6e6e73; }
   .cols { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 24px; align-items: start; }
   @media (max-width: 1000px) { .cols { grid-template-columns: 1fr; } }
@@ -18,7 +19,6 @@
   th, td { padding: 3px 8px; border-bottom: 1px solid #ececec; text-align: right; white-space: nowrap; }
   th { position: sticky; top: 0; background: #f2f2f2; font-weight: 600; cursor: pointer; user-select: none; }
   td.name, th.name { text-align: left; white-space: normal; word-break: break-all; }
-  tr.retired td { color: #8e8e93; }
   a { color: #0b57d0; text-decoration: none; }
   a:hover { text-decoration: underline; }
   .win { color: #137333; } .loss { color: #b3261e; }
@@ -29,7 +29,7 @@
 </head>
 <body>
 <main>
-  <header><h1><a href="#">League</a></h1><span id="totals" class="muted"></span></header>
+  <header><h1><a href="#">Evals</a></h1><span id="totals" class="muted"></span></header>
   <div id="view"></div>
 </main>
 <script>
@@ -39,7 +39,7 @@ const totals = document.getElementById("totals");
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 const elo = (x) => x.toFixed(0);
 const pct = (x) => (x === null ? "" : (100 * x).toFixed(1) + "%");
-const playerLink = (id, name) => `<a href="#player/${id}">${esc(name)}</a>`;
+const playerLink = (id, name) => `<a href="#player/${encodeURIComponent(id)}">${esc(name)}</a>`;
 const ago = (t) => {
   const s = Date.now() / 1000 - t;
   if (s < 90) return `${Math.round(s)} s ago`;
@@ -68,7 +68,7 @@ function table(columns, rows, sort) {
       "<thead><tr>" +
       columns.map((c) => `<th class="${c.cls || ""}" data-key="${c.key}">${c.label}${c.key === key ? (dir > 0 ? " ▲" : " ▼") : ""}</th>`).join("") +
       "</tr></thead><tbody>" +
-      sorted.map((r, i) => `<tr class="${r.retired ? "retired" : ""}">` +
+      sorted.map((r, i) => "<tr>" +
         columns.map((c) => `<td class="${c.cls || ""}">${c.cell(r, i)}</td>`).join("") + "</tr>").join("") +
       "</tbody>";
   };
@@ -97,16 +97,16 @@ function playerColumns(rank) {
   ];
 }
 
-function resultCell(g) {
-  const score = g.first_score === null ? "" : ` ${g.first_score}-${g.second_score}`;
-  return (g.result > 0 ? "1-0" : g.result < 0 ? "0-1" : "½-½") + score;
-}
+const resultCell = (g) => (g.result > 0 ? "1-0" : g.result < 0 ? "0-1" : "½-½");
+const marginCell = (g) => (g.margin > 0 ? "+" : "") + g.margin;
+const endingCell = (g) =>
+  (g.ending === "solved" ? `solved at ${g.solved_at}` : g.ending) + (g.flagged ? ` · ${g.flagged === "b" ? "black" : "white"} flagged` : "");
 
 async function showLeague() {
   const s = await get("/api/summary");
   s.players = s.players.filter((p) => p.games > 0);
-  document.title = `${s.game} league`;
-  totals.textContent = `${s.game} · ${s.players.length} players · ${s.games.toLocaleString()} games`;
+  document.title = "Evals";
+  totals.textContent = `${s.players.length} players · ${s.games.toLocaleString()} games`;
 
   const filter = document.createElement("input");
   filter.placeholder = "filter";
@@ -116,17 +116,25 @@ async function showLeague() {
     sessionStorage.setItem("filter", filter.value);
     const terms = filter.value.toLowerCase().split(/\s+/).filter(Boolean);
     const rows = s.players.filter((p) => terms.every((t) => p.name.toLowerCase().includes(t)));
-    holder.replaceChildren(table(playerColumns(true), rows, { key: "elo", dir: -1 }));
+    const pools = [...new Set(rows.map((p) => p.pool))].sort((a, b) => a - b);
+    holder.replaceChildren(...pools.flatMap((pool) => {
+      const members = rows.filter((p) => p.pool === pool);
+      const title = document.createElement("h3");
+      title.textContent = `Pool ${pool} · ${members.length} players`;
+      return [title, table(playerColumns(true), members, { key: "elo", dir: -1 })];
+    }));
   };
   filter.addEventListener("input", drawPlayers);
   drawPlayers();
 
   const recent = table(
     [
-      { key: "finished", label: "When", value: (g) => g.id, cell: (g) => `<span title="${new Date(g.finished * 1000).toLocaleString()}">${ago(g.finished)}</span>` },
-      { key: "first", label: "First", cls: "name", value: (g) => g.first_name, cell: (g) => playerLink(g.first, g.first_name), dir: 1 },
-      { key: "second", label: "Second", cls: "name", value: (g) => g.second_name, cell: (g) => playerLink(g.second, g.second_name), dir: 1 },
-      { key: "result", label: "Result", value: (g) => g.result, cell: resultCell },
+      { key: "finished", label: "When", value: (g) => g.finished, cell: (g) => `<span title="${new Date(g.finished * 1000).toLocaleString()}">${ago(g.finished)}</span>` },
+      { key: "black", label: "Black", cls: "name", value: (g) => g.black_name, cell: (g) => playerLink(g.black, g.black_name), dir: 1 },
+      { key: "white", label: "White", cls: "name", value: (g) => g.white_name, cell: (g) => playerLink(g.white, g.white_name), dir: 1 },
+      { key: "result", label: "Result", value: (g) => Math.sign(g.result), cell: resultCell },
+      { key: "margin", label: "Discs", value: (g) => g.margin, cell: marginCell },
+      { key: "ending", label: "Ended", value: (g) => g.ending, cell: endingCell, dir: 1 },
     ],
     s.recent,
     { key: "finished", dir: -1 },
@@ -145,10 +153,10 @@ async function showLeague() {
 }
 
 async function showPlayer(id) {
-  const { player: p, opponents } = await get(`/api/player?id=${id}`);
+  const { player: p, opponents } = await get(`/api/player?id=${encodeURIComponent(id)}`);
   document.title = p.name;
   view.innerHTML = `
-    <h2>${esc(p.name)}${p.retired ? ' <span class="muted">(paused)</span>' : ""}</h2>
+    <h2>${esc(p.name)} <span class="muted">${esc(p.id)} · pool ${p.pool}</span></h2>
     <div class="stats">
       <div><span class="muted">Elo</span><b>${elo(p.elo)} ± ${p.sd.toFixed(0)}</b></div>
       <div><span class="muted">Games</span><b>${p.games}</b></div>
@@ -163,9 +171,9 @@ async function showPlayer(id) {
 }
 
 async function route() {
-  const match = location.hash.match(/^#player\/(\d+)$/);
+  const match = location.hash.match(/^#player\/(.+)$/);
   try {
-    if (match) await showPlayer(match[1]);
+    if (match) await showPlayer(decodeURIComponent(match[1]));
     else await showLeague();
   } catch (e) {
     view.textContent = String(e.message || e);
