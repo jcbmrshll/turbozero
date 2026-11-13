@@ -30,7 +30,6 @@ printed is every result.
 
 import argparse
 import json
-import os
 import platform
 import re
 import statistics
@@ -49,6 +48,7 @@ from engines import (
     Melody,
     NeuralReversi,
 )
+from native_target import cpus
 
 SETS_DIR = CACHE_DIR / "engine-fairness"
 # a solve's seconds, nodes (None where the engine doesn't say), and how many positions it gave up
@@ -232,7 +232,7 @@ def main() -> None:
         }
     print(
         json.dumps({"set": args.set, "threads": args.threads, "rounds": args.rounds,
-                    "cpu": cpu(), "cpus": sorted(os.sched_getaffinity(0)),
+                    "cpu": cpu(), "cpus": sorted(cpus()),
                     "results": results}),
         flush=True,
     )  # fmt: skip
