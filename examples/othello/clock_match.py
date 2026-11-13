@@ -279,23 +279,6 @@ def elo(score: float) -> float:
     return -400 * math.log10(1 / score - 1)
 
 
-def phase_seconds(games: list[Game], a_black: list[bool], a: bool) -> dict[str, float]:
-    """A player's mean seconds a game in three parts of the game by empty squares."""
-    parts = {"mid_34+": 0.0, "late_24-33": 0.0, "end_0-23": 0.0}
-    for game, black in zip(games, a_black):
-        for empties, by_black, spent in game.move_seconds:
-            if by_black == (black == a):
-                part = (
-                    "mid_34+"
-                    if empties >= 34
-                    else "late_24-33"
-                    if empties >= 24
-                    else "end_0-23"
-                )
-                parts[part] += spent
-    return {k: round(v / max(len(games), 1), 3) for k, v in parts.items()}
-
-
 def wilson(wins: int, n: int) -> tuple[float, float]:
     """A 95% interval of a proportion of `wins` in `n` (Wilson's)."""
     if n == 0:
@@ -362,57 +345,6 @@ def pair_summary(games: list[Game], a_black: list[bool]) -> dict:
     }
 
 
-def summarize(games: list[Game], a_black: list[bool], clock: Clock | float) -> dict:
-    """What a match showed, for player a against b."""
-    board = [points(g.margin, b) for g, b in zip(games, a_black)]
-    final = [points(g.result, b) for g, b in zip(games, a_black)]
-    score = float(np.mean(final))
-    used = {"a": [], "b": []}
-    moves = {"a": [], "b": []}
-    flags = {"a": 0, "b": 0}
-    hard = {"a": 0, "b": 0}
-    for game, black in zip(games, a_black):
-        used["a"].append(game.seconds[not black])
-        used["b"].append(game.seconds[black])
-        for _, by_black, spent in game.move_seconds:
-            moves["a" if by_black == black else "b"].append(spent)
-        if game.flagged is not None:
-            flags["a" if (game.flagged == "b") == black else "b"] += 1
-        if game.hard is not None:
-            hard["a" if (game.hard == "b") == black else "b"] += 1
-    result = {
-        "games": len(games),
-        "clock": str(clock),
-        "score": round(score, 4),
-        "stderr": round(float(np.std(final) / math.sqrt(max(len(final), 1))), 4),
-        "elo": round(elo(score), 1),
-        "board_score": round(float(np.mean(board)), 4),
-        "board_wins": int(sum(p == 1 for p in board)),
-        "board_draws": int(sum(p == 0.5 for p in board)),
-        "board_losses": int(sum(p == 0 for p in board)),
-        # a's discs less b's, game by game
-        "margins": [int(g.margin if b else -g.margin) for g, b in zip(games, a_black)],
-        # a's results as GGS counts them, timeouts and all
-        "results": [int(g.result if b else -g.result) for g, b in zip(games, a_black)],
-        # clock losses: soft timeouts (the first to run out of a GGS clock's ini, or of a
-        # contest's), hard ones, and games whose winner the clock changed
-        "flags": flags,
-        "hard_timeouts": hard,
-        "clock_changed": int(sum(f != b for f, b in zip(final, board))),
-        "pairs": pair_summary(games, a_black),
-    }
-    for side in ("a", "b"):
-        result[side] = {
-            "seconds_a_game": round(float(np.mean(used[side])), 3),
-            "seconds_a_game_max": round(float(np.max(used[side])), 3),
-            "seconds_a_move": round(float(np.mean(moves[side])), 4),
-            "seconds_a_move_max": round(float(np.max(moves[side])), 3),
-            "seconds_a_move_p99": round(float(np.percentile(moves[side], 99)), 3),
-            "phases": phase_seconds(games, a_black, side == "a"),
-        }
-    return result
-
-
 def net_player(options: dict[str, str]) -> Callable[[], Player]:
     """What builds a network's player, which all games share a network for. Its `options` are
     `cpu_match.Player.parse`'s, with `net`, `taper` (see `cpu_match.move_budget`), `engine=1`
@@ -420,7 +352,9 @@ def net_player(options: dict[str, str]) -> Callable[[], Player]:
     evaluates at a time, and `threads`, the cores used, by default all it may run on. With
     `visits`, it searches so many a move, ignoring the clock. With `solve=N`, positions with N or
     fewer empties are solved on the same cores (see `cpu_match.Solving`), `solve_exact=1` for the
-    best margin, `solve_share` what of the clock left a solve may take.
+    best margin, `solve_share` what of the game's clock a solve may be expected to take,
+    `solve_cost` its expected seconds at 24 empties on 8 threads (on a clock, it solves from as
+    many empties as that affords).
 
     With `device=gpu`, a GGS-only player (engine comparisons stay on CPU vector units): its tree
     on the host, its leaves evaluated on the GPU many at a time (see `gpu_play.player_factory`
@@ -445,6 +379,7 @@ def net_player(options: dict[str, str]) -> Callable[[], Player]:
             exact=bool(int(options.pop("solve_exact", 0))),
             share=float(options.pop("solve_share", Solving.share)),
             threads=cores,
+            cost_at_24=float(options.pop("solve_cost", Solving.cost_at_24)),
         )
     fields = ",".join(f"{k}={v}" for k, v in options.items())
     spec = NetSpec.parse(f"visits=0,{fields}", options["net"], "bf16")

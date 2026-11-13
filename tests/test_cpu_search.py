@@ -549,6 +549,22 @@ def test_move_budget_shares_the_clock():
     )
 
 
+def test_a_planned_solve_takes_its_moves_and_reserve_out_of_the_budget():
+    from cpu_match import Solving, move_budget
+
+    # 40 empties to a solve from 24: 8 moves share the clock less the reserve
+    assert move_budget(10, 40, solve_from=24, reserve=2) == pytest.approx(0.95 * 8 / 8)
+    # at or past the solve (it gave up): the moves to the end share all that's left
+    assert move_budget(10, 24, solve_from=24, reserve=2) == move_budget(10, 24)
+    solving = Solving(empties=24, threads=8, cost_at_24=0.2)
+    assert solving.cost(22) == pytest.approx(0.05)
+    assert Solving(empties=24, threads=4, cost_at_24=0.2).cost(24) == pytest.approx(0.4)
+    # the most empties whose solve fits a quarter of the game's clock, no more than asked for
+    assert solving.depth(10) == 24
+    assert solving.depth(0.4) == 23
+    assert solving.depth(1e-9) == 0
+
+
 def test_net_players_play_a_game_through_the_clock_driver():
     from clock_match import play_game
     from cpu_match import NetPlayer

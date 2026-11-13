@@ -5,6 +5,7 @@
     net:checkpoint=runs/othello/199.eqx,spec=resnet:8x128,clock=10
     edax:level=24
     egaroucid:clock=10,threads=8
+    pgx:visits=256
 
 Every player has a budget: a network `visits` a move or a `clock`, an engine a `level` or a
 `clock`. A clock is a contest's, seconds for the whole game ("10"), or GGS's ("01:00//02:00").
@@ -17,6 +18,9 @@ A network is one of the league store's, by `net`, or any checkpoint, by `checkpo
 - `gpu`: a tree on the host, leaves evaluated on the GPU a batch at a time (`gpu_play.py`)
 - `gpu-batched`: core's MCTS, many games at once on the GPU, as the Elo league plays: fixed
   visits only, against engines at a level or other such networks
+
+pgx's pretrained Othello model (`pgx:`, `model=othello_v0` by default) plays as a `gpu-batched`
+network does, at fixed `visits`.
 
 Everything that decides how a player plays is in its config, defaults filled in, and its id is the
 config's digest (`core.evals.store.player_id`): a network's checkpoint by its sha256, and a
@@ -84,6 +88,8 @@ OPTIONS: dict[str, dict[str, tuple[type, Any]]] = {
 }
 # a network's endgame solve, with `solve=N` (see `cpu_match.Solving`)
 SOLVE = {"solve_exact": (int, 0), "solve_share": (float, 0.25)}
+# a CPU network's expected seconds for a solve at 24 empties on 8 threads: Edax's (`cpu_match.Solving`)
+SOLVE_COST = 0.19
 # what names a network and where it is: not options of its search
 NETWORK_KEYS = ("net", "checkpoint", "spec", "device")
 
@@ -239,6 +245,11 @@ def resolve_net(
         search["solve"] = _typed("solve", options.pop("solve"), int)
         for key, (kind, default) in SOLVE.items():
             search[key] = _typed(key, options.pop(key, default), kind)
+        if device == "cpu":
+            # what it plans its solve on a clock by (see `cpu_match.Solving`)
+            search["solve_cost"] = _typed(
+                "solve_cost", options.pop("solve_cost", SOLVE_COST), float
+            )
     if options:
         raise ValueError(f"unknown options for a {device} network: {sorted(options)}")
     config: dict[str, Any] = {
@@ -282,6 +293,32 @@ def resolve_net(
         f"{name} {budget_label} {where}{solve}",
         tuple(sorted({_relative(f) or str(f) for f in files})),
     )
+
+
+def resolve_pgx(options: dict[str, Any]) -> PlayerSpec:
+    """pgx's pretrained model, which plays only in batches on the GPU, as our networks do there:
+    no root noise, temperature 0, a tree of `tree_factor` x visits nodes. pgx's version is part of
+    who it is: its weights come with it."""
+    import pgx
+
+    options = dict(options)
+    model = str(options.pop("model", "othello_v0"))
+    visits = _typed("visits", options.pop("visits", None), int)
+    if visits is None or "clock" in options:
+        raise ValueError("pgx: plays at fixed visits only")
+    tree_factor = _typed("tree_factor", options.pop("tree_factor", 4), int)
+    if options:
+        raise ValueError(f"unknown options for pgx: {sorted(options)}")
+    config = {
+        "kind": "pgx",
+        "model": model,
+        "pgx": pgx.__version__,
+        "device": "gpu-batched",
+        "budget": {"visits": visits},
+        "search": {"tree_factor": tree_factor},
+    }
+    runtime = {"player": "pgx", "model": model}
+    return PlayerSpec(config, runtime, f"pgx-{model} {visits}v", ())
 
 
 def resolve_engine(name: str, options: dict[str, Any], cores: int) -> PlayerSpec:
@@ -358,6 +395,8 @@ def resolve(
     kind, options = parse(spec)
     if kind == "net":
         return resolve_net(options, cores, store)
+    if kind == "pgx":
+        return resolve_pgx(options)
     if kind not in ENGINES and kind not in CLOCK_ONLY:
         raise ValueError(f"unknown player {kind!r}: net, or one of {sorted(ENGINES)}")
     return resolve_engine(kind, options, 1 if batched else cores)

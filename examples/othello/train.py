@@ -12,37 +12,19 @@ openings (see xot.py), which keeps them varied.
 
 Every epoch it scores the network on the engine-labelled set, if there is one (see
 engine_set.py and --engine-set), logged as `engine_*`: `engine_exp_regret`, the discs its
-policy gives up against Edax's best move, is the one to watch. Games against Edax measure
-strength: --vs-engine-every N plays them after every N epochs, and --vs-engine-last K after
-each of the last K epochs, logging the mean of those too (by default 512 games at level 8,
-searching 1000 iterations a move; see vs_engine.py and README.md):
-
-    uv run examples/othello/train.py --epochs 50 --monitor --vs-engine-last 3
-
-Each level's score is logged at the epoch of the network that played, as
-`edax_level8_sims1000` (with `_se`, `_win`, `_draw` and `_loss`), the mean as
-`edax_level8_sims1000_last3`, and the time the games took as `edax_seconds`, to take out of
-the run's wall time. --eval-every N also plays test
-games every N epochs, on a ladder of opponents: a random player, a greedy tile counter, then
-pgx's pretrained Othello model searching more and more.
+policy gives up against Edax's best move, is the one to watch. Games measure strength:
+`evaluate.py` plays checkpoints against engines and each other, and the Elo league rates them.
 
 With --monitor the run logs to slick's seaglass server ($SEAGLASS_URL, set in a slick task;
 --monitor URL for another, e.g. `uv run seaglass serve --dir runs` at http://localhost:8008).
-The run's page shows the metrics, and with
---eval-every which rung of the ladder the agent has reached, and a game against the last
-opponent it played, which it draws in the browser.
+The run's page shows the metrics.
 
 The first epoch is slow: nearly all of the training loop is JIT-compiled the first
 time it runs. On one RTX 5080 the rest take about 63s each (36s with
---inference-dtype bfloat16, see README.md). With these settings and the ladder every 5
-epochs, one 200-epoch run passed every rung by epoch 65; at the end, in 512 games against
-pgx's model (our agent searching 64 iterations a move), it scored 0.82 against the model
-searching 64, 0.74 against it searching 256, and 0.57 against it searching 1024
-(draws count half).
+--inference-dtype bfloat16, see README.md).
 
-Checkpoints go to --ckpt-dir, with the results of games against the engine in
-`vs_engine.jsonl`, and the last is exported to ONNX beside itself when the run ends; `eval_pgx.py` and `evaluate.py` evaluate checkpoints further (see
-README.md). The hyperparameters here are only an example; tune them for your task and
+Checkpoints go to --ckpt-dir, and the last is exported to ONNX beside itself when the run
+ends; `evaluate.py` evaluates checkpoints further (see README.md). The hyperparameters here are only an example; tune them for your task and
 hardware.
 
 With --save-state-at or --save-state-every, the whole training state (network, optimizer,
@@ -61,17 +43,14 @@ from --lr to each of its rates in turn, --epochs only capping the run (see READM
 """
 
 import argparse
-import os
 import re
 import tempfile
 import warnings
 from functools import partial
 from pathlib import Path
 
-import pgx
 from engine_set import DEFAULT_PATH as DEFAULT_ENGINE_SET
 from engine_set import EngineSet
-from engines import ENGINES
 from exact_labels import SOLVERS, default_threads, make_solve_fn, solve_slots, stops_at
 from game import (
     DEFAULT_NET,
@@ -82,29 +61,23 @@ from game import (
     env,
     episode_metrics,
     export_last,
-    greedy_eval,
     make_network,
     make_optimizer,
     make_test_evaluator,
     state_to_nn_input,
     step_fn,
 )
-from vs_engine import EngineMatch, EngineMatchTester, describe_scores
-from xot import load_xot, make_xot_init_fn, xot_episode_fn
+from xot import load_xot, make_xot_init_fn
 
 from core.evaluators.alphazero import AlphaZero
 from core.evaluators.evaluation_fns import (
     make_nn_eval_fn,
-    make_nn_eval_fn_no_params_callable,
 )
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.mcts.mcts import MCTS, PlayoutCap
 from core.evaluators.mcts.policy_targets import CompletedQ, VisitCounts
-from core.evaluators.random_evaluator import RandomEvaluator
 from core.memory.replay_memory import EpisodeReplayBuffer
 from core.monitoring import DEFAULT_URL, Monitor
-from core.monitoring.episodes import pgx_two_player_episode
-from core.testing.ladder import LadderTester, Rung
 from core.testing.scored_positions import ScoredPositionsTester
 from core.testing.tester import BaseTester
 from core.training.endgame_solve import EndgameSolve
@@ -600,8 +573,7 @@ def main():
     parser.add_argument(
         "--lr-plateau-stop",
         action="store_true",
-        help="with --lr-plateau, end the run once the last rate plateaus, before --epochs "
-        "(--vs-engine-last's games are then not played)",
+        help="with --lr-plateau, end the run once the last rate plateaus, before --epochs",
     )
     parser.add_argument(
         "--optimizer",
@@ -763,13 +735,6 @@ def main():
         "of self-play",
     )
     parser.add_argument(
-        "--eval-every",
-        type=int,
-        default=0,
-        help="epochs between test games on the ladder (0 for none: the engine-labelled "
-        "set tracks the run, see --engine-set)",
-    )
-    parser.add_argument(
         "--engine-set",
         default=None,
         metavar="PATH",
@@ -782,50 +747,6 @@ def main():
         default=1,
         help="epochs between scoring the network on the engine-labelled set (0 for never). "
         "A forward pass over its positions: a fraction of a second",
-    )
-    parser.add_argument(
-        "--vs-engine-every",
-        type=int,
-        default=0,
-        metavar="N",
-        help="play games against --vs-engine after every N epochs, between epochs (0, the "
-        "default, for never), and log them to the run at the epoch of the network that "
-        "played (see vs_engine.py). At the defaults, 512 games at level 8 take minutes",
-    )
-    parser.add_argument(
-        "--vs-engine-last",
-        type=int,
-        default=0,
-        metavar="K",
-        help="play the games after each of the run's last K epochs too, and log their mean "
-        "at the last, as <name>_last<K>: one network's score drifts from its neighbours' "
-        "by more than the games' own noise (0, the default, for none)",
-    )
-    parser.add_argument(
-        "--vs-engine",
-        choices=sorted(ENGINES),
-        default="edax",
-        help="the engine to play",
-    )
-    parser.add_argument(
-        "--vs-engine-levels",
-        type=int,
-        nargs="+",
-        default=[8],
-        help="the engine's levels to play at",
-    )
-    parser.add_argument(
-        "--vs-engine-sims",
-        type=int,
-        default=1000,
-        help="our MCTS iterations a move in games against the engine",
-    )
-    parser.add_argument(
-        "--vs-engine-openings",
-        type=int,
-        default=256,
-        help="XOT openings a level in games against the engine, each played with both "
-        "colors: the same ones every time, and in every run",
     )
     parser.add_argument(
         "--ckpt-dir",
@@ -1068,8 +989,6 @@ def main():
         parser.error("--dirichlet-alpha must be positive")
     if not 0 <= args.dirichlet_epsilon <= 1:
         parser.error("--dirichlet-epsilon must be between 0 and 1")
-    if args.vs_engine_last > args.epochs:
-        parser.error("--vs-engine-last can't be more than --epochs")
     if args.policy_target == "completed-q" and args.tree_positions > 0:
         # a tree position's target is its visits: the network's policy before the
         # search isn't kept below the root
@@ -1179,43 +1098,9 @@ def main():
         else None
     )
 
-    def make_testers(network, results_dir: str) -> list[BaseTester]:
-        """A network's testers: the ladder, the engine-labelled set, games against Edax."""
+    def make_testers(network) -> list[BaseTester]:
+        """A network's testers: the engine-labelled set."""
         testers: list[BaseTester] = []
-        if args.eval_every > 0:
-            # opponents: the greedy tile counter and pgx's pretrained model (others are listed
-            # at https://sotets.uk/pgx/api/#pgx.BaselineModelId)
-            pretrained = make_nn_eval_fn_no_params_callable(
-                pgx.make_baseline_model("othello_v0"), state_to_nn_input
-            )
-            greedy = make_nn_eval_fn_no_params_callable(greedy_eval, state_to_nn_input)
-
-            # with a monitor, each test sends a game for the run's page to play, its XOT
-            # opening's moves before it
-            episode_fn = (
-                xot_episode_fn(pgx_two_player_episode(), load_xot())
-                if args.monitor
-                else None
-            )
-
-            # the ladder, easiest first: each test plays the lowest rung the agent hasn't
-            # beaten, and moves up past every rung it scores at least 55% against. Our agent
-            # searches 64 iterations a move throughout; pgx's model searches more and more
-            rungs = [
-                Rung("random", RandomEvaluator()),
-                Rung("greedy", make_test_evaluator(greedy)),
-            ] + [
-                Rung(f"pgx{n}", make_test_evaluator(pretrained, n))
-                for n in (1, 4, 16, 64, 256)
-            ]
-            testers.append(
-                LadderTester(
-                    num_episodes=128,
-                    rungs=rungs,
-                    episode_fn=episode_fn,
-                    epochs_per_test=args.eval_every,
-                )
-            )
         if engine_set is not None:
             testers.append(
                 ScoredPositionsTester(
@@ -1228,31 +1113,6 @@ def main():
                     },
                 )
             )
-        # games against Edax (or Egaroucid), between epochs, in this process (see vs_engine.py)
-        if args.vs_engine_every > 0 or args.vs_engine_last > 0:
-            try:
-                match = EngineMatch(
-                    network,
-                    ENGINES[args.vs_engine],
-                    args.vs_engine_levels,
-                    args.vs_engine_sims,
-                    args.vs_engine_openings,
-                )
-            except ValueError as e:
-                parser.error(str(e))
-            match_tester = EngineMatchTester(
-                match,
-                args.epochs,
-                every=args.vs_engine_every,
-                last=args.vs_engine_last,
-                # with a monitor, a game at each level for the run's page
-                record=monitor is not None,
-                results=Path(results_dir) / "vs_engine.jsonl",
-                config={"dtype": args.inference_dtype},
-            )
-            testers.append(match_tester)
-            if monitor is not None:
-                describe_scores(monitor, match_tester.score_names())
         return testers
 
     network, network_state = make_net(args.net)
@@ -1273,7 +1133,7 @@ def main():
                     evaluator_test=make_test_evaluator(
                         make_nn_eval_fn(grown, state_to_nn_input)
                     ),
-                    testers=make_testers(grown, os.path.join(ckpt_dir, net_name(spec))),
+                    testers=make_testers(grown),
                 )
             )
         try:
@@ -1290,10 +1150,7 @@ def main():
             )
         except ValueError as e:
             parser.error(f"--grow: {e}")
-    testers = make_testers(
-        network,
-        os.path.join(ckpt_dir, net_name(args.net)) if args.grow else ckpt_dir,
-    )
+    testers = make_testers(network)
 
     endgame_solve = None
     if args.solve_empties is not None:
@@ -1415,8 +1272,7 @@ def main():
     trainer.train_loop(
         seed=args.seed,
         num_epochs=args.epochs,
-        # each tester keeps its own cadence (--eval-every, --engine-eval-every,
-        # --vs-engine-every and --vs-engine-last)
+        # each tester keeps its own cadence (--engine-eval-every)
         eval_every=1,
         initial_state=initial_state,
         fork_from=args.init_from,

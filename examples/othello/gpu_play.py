@@ -9,15 +9,15 @@ computes, and backs each up when it comes back. A job has `inflight` batches of 
 traversals in flight are about `inflight * batch`, steered apart by virtual loss as in the CPU
 engine.
 
-    # a player for clock_match.py
+    # a player of evaluate.py
     net:net=NAME,device=gpu,batch=256,inflight=2,solve=20
 
     # one game's speed (or a synchro pair's, --games 2), against the CPU engine's
     uv run --extra cuda examples/othello/gpu_play.py speed --net NAME --batch 64 256 --visits 20000
 
     # strength at equal visits, two settings on the GPU, many games at once
-    uv run --extra cuda examples/othello/gpu_play.py match --net NAME \\
-        --a visits=4000,batch=8,inflight=2 --b visits=4000,batch=128,inflight=2 --openings 200
+    uv run --extra cuda examples/othello/evaluate.py run --parallel 64 --openings 200 \\
+        --a net:net=NAME,device=gpu,visits=4000,batch=8 --b net:net=NAME,device=gpu,visits=4000,batch=128
 
 On GGS, `make_ggs_bridge` is the client's player (`ggs_client/ggs_player.py`'s `Bridge`): a tree a
 game, and a ponder of each game where the opponent is to move.
@@ -809,80 +809,10 @@ def speed(args: argparse.Namespace) -> None:
                 f.write(json.dumps(record) + "\n")
 
 
-def match(args: argparse.Namespace) -> None:
-    """Two GPU settings at fixed visits a move, `--parallel` games at once through one stream
-    (each game's moves its own jobs), from XOT openings with both colours."""
-    from clock_match import play_game, summarize
-    from gpu_net import GpuNet
-    from xot import XOT_PATH, load_xot
-
-    pool = load_xot(XOT_PATH)
-    rng = np.random.default_rng(args.seed)
-    openings = pool[rng.choice(len(pool), size=args.openings, replace=False)]
-    network = GpuNet.load(args.net, args.dtype, sizes=tuple(args.sizes))
-    network.warm()
-    stream = Stream(network, args.max_call, args.calls)
-    sides = []
-    for spec in (args.a, args.b):
-        options = dict(item.split("=", 1) for item in spec.split(","))
-        visits = int(options.pop("visits"))
-        settings = GpuSettings.parse(options)
-        if options:
-            raise ValueError(f"unknown options {sorted(options)}")
-        sides.append((settings, visits))
-    queue = [(o, black) for o in range(len(openings)) for black in (True, False)]
-    games: list = [None] * len(queue)
-    lock = threading.Lock()
-    begin = time.perf_counter()
-
-    def worker() -> None:
-        while True:
-            with lock:
-                if not queue:
-                    return
-                index = len(queue) - 1
-                o, a_black = queue.pop()
-            seed = (args.seed << 20) + 2 * o + (not a_black)
-            a = GpuPlayer(stream, sides[0][0], seed=2 * seed, visits=sides[0][1])
-            b = GpuPlayer(stream, sides[1][0], seed=2 * seed + 1, visits=sides[1][1])
-            black, white = (a, b) if a_black else (b, a)
-            games[index] = (play_game(black, white, openings[o], 1e9), a_black)
-            with lock:
-                done = sum(g is not None for g in games)
-            if done % 50 == 0:
-                print(
-                    f"  {done} games, {time.perf_counter() - begin:.0f} s", flush=True
-                )
-
-    threads = [threading.Thread(target=worker) for _ in range(args.parallel)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    stream.close()
-    played = [g for g in games if g is not None]
-    summary = summarize([g for g, _ in played], [b for _, b in played], 1e9)
-    record = {
-        "net": args.net,
-        "a": args.a,
-        "b": args.b,
-        "seed": args.seed,
-        "seconds": round(time.perf_counter() - begin),
-        "score": summary.get("score"),
-        "elo": summary.get("elo"),
-        "games": len(played),
-        "summary": summary,
-    }
-    print(json.dumps(record), flush=True)
-    if args.results:
-        with open(args.results, "a") as f:
-            f.write(json.dumps(record) + "\n")
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     commands = parser.add_subparsers(required=True)
-    for name, fn in (("speed", speed), ("match", match)):
+    for name, fn in (("speed", speed),):
         p = commands.add_parser(name)
         p.add_argument("--net", required=True)
         p.add_argument("--dtype", default="bfloat16")
@@ -894,11 +824,11 @@ def main() -> None:
         )
         p.add_argument("--max-call", type=int, default=MAX_CALL)
         p.add_argument("--calls", type=int, default=2)
-        p.add_argument("--openings", type=int, default=2 if name == "speed" else 100)
+        p.add_argument("--openings", type=int, default=2)
         p.add_argument("--seed", type=int, default=0)
         p.add_argument("--results", default=None)
         p.set_defaults(fn=fn)
-        if name == "speed":
+        if name == "speed":  # the only command
             p.add_argument("--batch", type=int, nargs="+", default=[64, 256])
             p.add_argument("--inflight", type=int, nargs="+", default=[2])
             p.add_argument("--visits", type=int, default=20000)
@@ -910,12 +840,6 @@ def main() -> None:
                 default=20,
                 help="games stop at this many empties, where play solves instead",
             )
-        else:
-            p.add_argument(
-                "--a", required=True, help="e.g. visits=4000,batch=8,inflight=2"
-            )
-            p.add_argument("--b", required=True)
-            p.add_argument("--parallel", type=int, default=64)
     args = parser.parse_args()
     args.fn(args)
 

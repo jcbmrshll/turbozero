@@ -13,7 +13,14 @@ import eval_players
 import evaluate
 from clock_match import UNTIMED, GameRun
 from engines import Board
-from eval_games import MatchSpec, Opening, numbers_of, play_sequential, replay
+from eval_games import (
+    MatchSpec,
+    Opening,
+    numbers_of,
+    play_parallel,
+    play_sequential,
+    replay,
+)
 from eval_players import PlayerSpec, resolve
 from ggs import Clock
 
@@ -489,7 +496,7 @@ def test_a_host_plays_its_share_and_picks_up_where_it_stopped(monkeypatch, tmp_p
     spec = MatchSpec(a, b, openings=3)
     played = []
 
-    def play(spec_, match_id, numbers, emit, record_run):
+    def play(spec_, match_id, numbers, emit, record_run, parallel):
         played.append(list(numbers))
         for n in numbers:
             emit(record(match_id, n))
@@ -501,6 +508,7 @@ def test_a_host_plays_its_share_and_picks_up_where_it_stopped(monkeypatch, tmp_p
         out=str(out),
         skip="1",
         slice="0/1",
+        parallel=1,
     )
     evaluate.host_play(args)
     evaluate.host_play(args)
@@ -537,3 +545,82 @@ def test_jax_stays_off_the_gpu_unless_a_player_is_on_it(tmp_path):
     match.write_text(json.dumps({"spec": {"a": {"config": {"device": "gpu"}}}}))
     assert evaluate.wants_gpu(["play", "--match", f"@{match}"])
     assert evaluate.wants_gpu(["play", "--match", match.read_text()])
+
+
+def test_games_in_parallel_are_the_games_one_at_a_time(now):
+    a, b = fake("a", {"level": 1}), fake("b", {"level": 2})
+    spec = MatchSpec(a, b, openings=3, seed=2)
+
+    def make(player, clock):
+        return lambda: FirstLegal([0.0])
+
+    alone: list[GameRecord] = []
+    together: list[GameRecord] = []
+    play_sequential(spec, "m-x", numbers_of(3), alone.append, make=make)
+    play_parallel(spec, "m-x", numbers_of(3), together.append, 4, make=make)
+    by_number = {r.number: r.moves for r in together}
+    assert by_number == {r.number: r.moves for r in alone}
+
+
+def test_networks_on_the_cpu_play_one_game_at_a_time():
+    net = fake("n", {"visits": 10}, kind="net", device="cpu")
+    spec = MatchSpec(net, fake("e", {"level": 1}), openings=1)
+    with pytest.raises(ValueError, match="one game at a time"):
+        play_parallel(spec, "m-x", [0, 1], lambda r: None, 2)
+
+
+def test_pgx_plays_only_in_batches_at_fixed_visits(engine_dir):
+    pgx = resolve("pgx:visits=64", 8)
+    assert pgx.device == "gpu-batched" and pgx.config["model"] == "othello_v0"
+    assert resolve("pgx:visits=64,tree_factor=4", 8).id == pgx.id
+    with pytest.raises(ValueError, match="fixed visits"):
+        resolve("pgx:clock=10", 8)
+    edax = resolve(f"edax:level=8,dir={engine_dir}", 8, batched=True)
+    assert MatchSpec(pgx, edax, openings=1).batched
+    cpu_edax = fake("e", {"level": 1}, threads=1)
+    with pytest.raises(ValueError, match="only in batched"):
+        MatchSpec(
+            fake("p", {"visits": 1}, kind="pgx", device="cpu"), cpu_edax, openings=1
+        )
+
+
+def test_timings_are_each_fixed_budget_players_side_on_one_host(tmp_path):
+    store = Store(tmp_path / "e.db")
+    engine = {"kind": "engine", "engine": "edax", "threads": 8, "budget": {"level": 20}}
+    clocked = {
+        "kind": "engine",
+        "engine": "edax",
+        "threads": 8,
+        "budget": {"clock": {}},
+    }
+    me, other = store.add_player(engine, "edax L20"), store.add_player(clocked, "c")
+    store.start_match("m-self", me, me, {}, "local", "abc", 4)
+    store.start_match("m-vs", me, other, {}, "local", "abc", 2)
+    here, there = {"cpu": "here"}, {"cpu": "there"}
+    # moves: an opening move, then black's, white's, black's
+    timed = {"moves": [37, 43, 34, 29], "opening_moves": 1, "black": me, "white": me}
+    store.record_games(
+        [
+            record("m-self", 0, **timed, move_seconds=[1.0, 2.0, 3.0], host=here,
+                   black_seconds=4.0, white_seconds=2.0),
+            record("m-self", 1, **timed, move_seconds=[1.0, 1.0, 1.0], host=here,
+                   black_seconds=2.0, white_seconds=1.0),
+            # elsewhere, solved, or played in a batch: not timings
+            record("m-self", 2, **timed, move_seconds=[9.0, 9.0, 9.0], host=there,
+                   black_seconds=18.0, white_seconds=9.0),
+            record("m-self", 3, **timed, move_seconds=[9.0] * 3, host=here,
+                   black_seconds=18.0, white_seconds=9.0, ending="solved"),
+            record("m-vs", 0, moves=[37, 43, 34, 29], opening_moves=1, black=me,
+                   white=other, move_seconds=[5.0] * 3, host=here,
+                   black_seconds=10.0, white_seconds=5.0),
+        ]
+    )  # fmt: skip
+    from core.evals.store import host_id
+
+    (config,) = evaluate.timing_configs(store, host_id(here))
+    assert (config["engine"], config["level"], config["games"]) == ("edax", 20, 2)
+    assert config["seconds_per_game"] == 2.25
+    assert config["seconds_per_move"] == 1.5
+    assert config["moves_per_game"] == 1.5
+    with_any = evaluate.timing_configs(store, host_id(here), any_opponent=True)
+    assert [c["games"] for c in with_any] == [3]

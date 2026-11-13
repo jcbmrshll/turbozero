@@ -37,6 +37,7 @@ import json
 import math
 import os
 import re
+import statistics
 import sys
 import threading
 import time
@@ -90,6 +91,11 @@ MATCH_KEYS = (
     "tag",
 )
 SYNC_SECONDS = 60.0
+# `run --require-idle`: over which a CPU (or its SMT sibling) is too busy to start on, and how
+# long it looks. Other load costs engines 30-45%; open agent sessions take a percent or so each
+BUSY_TO_START = 0.15
+QUIET_SECONDS = 15.0
+LEAGUE_TIMINGS = CACHE_DIR / "league" / "timings.json"
 
 
 def parse_cores(text: str) -> list[int]:
@@ -192,12 +198,19 @@ def run(args: argparse.Namespace) -> None:
     if args.dry_run:
         print(json.dumps(spec.to_dict(), indent=2))
         return
+    if args.require_idle and args.on == "local":
+        busy = busy_cpus(sorted(os.sched_getaffinity(0)), QUIET_SECONDS)
+        if busy:
+            shares = ", ".join(f"{c}: {s:.0%}" for c, s in sorted(busy.items()))
+            raise SystemExit(
+                f"the machine isn't idle ({shares}): stop what's running first"
+            )
     store = Store(args.store)
     register(store, spec, placement, setup.get("note", ""))
     if args.on == "local" and args.jobs > 1:
         play_here_in_jobs(store, spec, match_id, args.jobs, args.store)
     elif args.on == "local":
-        play_here(store, spec, match_id)
+        play_here(store, spec, match_id, args.parallel)
     else:
         play_in_cloud(store, spec, match_id, placement, args)
     report(store, match_id)
@@ -211,7 +224,7 @@ def run(args: argparse.Namespace) -> None:
         raise SystemExit(f"{played} of {spec.games} games played{where}")
 
 
-def play_here(store: Store, spec: MatchSpec, match_id: str) -> None:
+def play_here(store: Store, spec: MatchSpec, match_id: str, parallel: int = 1) -> None:
     check_devices(spec)
     done = store.numbers(match_id)
     numbers = [n for n in numbers_of(spec.openings) if n not in done]
@@ -230,6 +243,7 @@ def play_here(store: Store, spec: MatchSpec, match_id: str) -> None:
         numbers,
         emit,
         lambda info, host: store.add_run(match_id, info, host),
+        parallel,
     )
 
 
@@ -308,7 +322,12 @@ def job_files(spec: MatchSpec) -> list[str]:
 
 
 def cloud_jobs(
-    spec: MatchSpec, match_id: str, placement: str, jobs: int, skip: set[int]
+    spec: MatchSpec,
+    match_id: str,
+    placement: str,
+    jobs: int,
+    skip: set[int],
+    parallel: int = 1,
 ) -> list[dict[str, Any]]:
     """The match as `jobs` jobs for `gcp_cpu_jobs`' hosts, each a share of its starts."""
     match = json.dumps({"id": match_id, "spec": spec.to_dict()})
@@ -333,6 +352,8 @@ def cloud_jobs(
                     ",".join(str(n) for n in sorted(skip)),
                     "--out",
                     path,
+                    "--parallel",
+                    str(parallel),
                 ],
                 "outputs": [path],
             }
@@ -387,7 +408,7 @@ def play_in_cloud(
     # a match's jobs, continued as they were when run again, unless asked for new ones for
     # what's left (e.g. after a job failed): the store keeps a game once whichever ran it
     name = match_id if not args.fresh_jobs else f"{match_id}-r{int(time.time())}"
-    jobs = cloud_jobs(spec, match_id, placement, args.jobs, done)
+    jobs = cloud_jobs(spec, match_id, placement, args.jobs, done, args.parallel)
     if args.on == "gcp":
         cloud: Any = Gcloud(project(), args.machine)
     else:
@@ -577,7 +598,7 @@ def host_play(args: argparse.Namespace) -> None:
     def record_run(info: dict[str, Any], host: dict[str, Any]) -> None:
         write(json.dumps({"match": match_id, "run": info, "host": host}))
 
-    play(spec, match_id, numbers, emit, record_run)
+    play(spec, match_id, numbers, emit, record_run, args.parallel)
     print(json.dumps({"match": match_id, "slice": args.slice, "played": played}))
 
 
@@ -596,6 +617,185 @@ def import_files(args: argparse.Namespace) -> None:
     for path in args.files:
         added = sync_lines(store, Path(path).read_text().splitlines())
         print(f"{path}: {added} new games")
+
+
+def cpu_ticks() -> dict[int, tuple[int, int]]:
+    """Each CPU's (busy, all) ticks so far."""
+    ticks = {}
+    for line in Path("/proc/stat").read_text().splitlines():
+        found = re.match(r"cpu(\d+) (.*)", line)
+        if found:
+            fields = [int(field) for field in found[2].split()]
+            idle = fields[3] + fields[4]
+            ticks[int(found[1])] = sum(fields[:8]) - idle, sum(fields[:8])
+    return ticks
+
+
+def busy_cpus(
+    cpus: Sequence[int], seconds: float, threshold: float = BUSY_TO_START
+) -> dict[int, float]:
+    """The CPUs busier than `threshold` over `seconds`: those of `cpus`, and their SMT siblings,
+    which share their cores."""
+    from core.evals.hardware import siblings
+
+    watched = set(cpus) | {s for c in cpus for s in siblings(c)}
+    before = cpu_ticks()
+    time.sleep(seconds)
+    after = cpu_ticks()
+    shares = {
+        cpu: (after[cpu][0] - before[cpu][0]) / max(after[cpu][1] - before[cpu][1], 1)
+        for cpu in watched
+        if cpu in after
+    }
+    return {cpu: share for cpu, share in shares.items() if share > threshold}
+
+
+def plotted_batch(sims: int) -> int:
+    """The batch a net's point is plotted at: the largest with no strength lost where it's been
+    measured, and as if it scaled with visits elsewhere (`batch_strength` says which)."""
+    if sims < 1000:
+        return 1
+    return 16 if sims < 4000 else 32
+
+
+def batch_strength(net: str, sims: int, batch: int) -> str:
+    """What's known of the strength a batch costs. Measured on 8x128 only."""
+    if batch == 1:
+        return "sequential"
+    if net.startswith("resnet:8x128") and (sims, batch) in ((1000, 16), (4000, 32)):
+        return "measured_no_loss"
+    return "unmeasured"
+
+
+def timing_configs(
+    store: Store, host: str, any_opponent: bool = False
+) -> list[dict[str, Any]]:
+    """What each player at a fixed budget cost on the host `host` (a host id), one side's time
+    over its games played out there, timed alone: from its games against itself, or with
+    `any_opponent`, against anyone (an engine's time rises with its opponent's strength). The
+    league's `timings.json` configs (see `core.league.dashboard`)."""
+    from core.evals.store import host_id
+
+    players = {p.id: p for p in store.players()}
+    # player: [(its seconds a game, its moves' seconds)], a side each, and a game each, the mean
+    # of its sides in it (two against itself, which aren't independent)
+    sides: dict[str, list[tuple[float, list[float]]]] = {}
+    means: dict[str, list[float]] = {}
+    for match in store.matches():
+        if match.a != match.b and not any_opponent:
+            continue
+        for game in store.games(match.id):
+            if game.ending != "end" or game.black_seconds is None:
+                continue
+            if not game.host or host_id(game.host) != host:
+                continue
+            black = _black_moves(game)
+            for player, mine, seconds in (
+                (game.black, True, game.black_seconds),
+                (game.white, False, game.white_seconds),
+            ):
+                moves = [
+                    s
+                    for s, b in zip(game.move_seconds, black)
+                    if s is not None and b == mine
+                ]
+                sides.setdefault(player, []).append((seconds or 0.0, moves))
+            if game.black == game.white:
+                means.setdefault(game.black, []).append(
+                    ((game.black_seconds or 0.0) + (game.white_seconds or 0.0)) / 2
+                )
+            else:
+                means.setdefault(game.black, []).append(game.black_seconds or 0.0)
+                means.setdefault(game.white, []).append(game.white_seconds or 0.0)
+    configs = []
+    for id_, samples in sorted(sides.items()):
+        config = players[id_].config
+        budget = config["budget"]
+        if "clock" in budget:
+            continue
+        per_game = [s for s, _ in samples]
+        moves = [m for _, ms in samples for m in ms]
+        if not moves:
+            continue
+        spread = means[id_]
+        out: dict[str, Any] = {"player": id_, "label": players[id_].label}
+        if config["kind"] == "net":
+            search, sims = config["search"], budget["visits"]
+            batch = search.get("batch", 1)
+            out |= {
+                "net": config["network"]["net"],
+                "sims": sims,
+                "device": config["device"],
+                "batch": batch,
+                "backend": search.get("backend"),
+                "engine": search.get("engine"),
+                "virtual_loss": search.get("virtual_loss"),
+                "threads": search.get("threads"),
+                "batch_strength": batch_strength(config["network"]["net"], sims, batch),
+                "plot": batch == plotted_batch(sims),
+            }
+        else:
+            out |= {
+                "engine": config["engine"],
+                "level": budget["level"],
+                "threads": config["threads"],
+                "plot": True,
+            }
+        out |= {
+            "source": "measured",
+            # games, not sides: a game against itself is two of its sides
+            "games": len(spread),
+            "seconds_per_game": statistics.mean(per_game),
+            "seconds_per_game_se": statistics.stdev(spread) / len(spread) ** 0.5
+            if len(spread) > 1
+            else None,
+            "moves_per_game": len(moves) / len(per_game),
+            "seconds_per_move": statistics.mean(moves),
+            "p50_move": float(np.percentile(moves, 50)),
+            "p95_move": float(np.percentile(moves, 95)),
+            "p99_move": float(np.percentile(moves, 99)),
+            "max_move": max(moves),
+        }
+        configs.append(out)
+    return configs
+
+
+def timings(args: argparse.Namespace) -> None:
+    """Each fixed-budget player's time on a host, from the store, as a run of the league's
+    `timings.json`: printed, or with `--publish`, put in it, replacing a run of the same name."""
+    store = Store(args.store)
+    hosts = store.db.execute(
+        "SELECT h.id, h.info, COUNT(*) FROM games g JOIN hosts h ON h.id = g.host_id "
+        "WHERE g.black_seconds IS NOT NULL GROUP BY h.id"
+    ).fetchall()
+    if args.host is None:
+        for id_, info, count in hosts:
+            info = json.loads(info)
+            print(
+                f"{id_}  {count} timed games  {info.get('placement')}  {info.get('cpu')}  "
+                f"{info.get('physical_cores')} cores {info.get('affinity')}"
+            )
+        return
+    found = [h for h in hosts if h[0].startswith(args.host)]
+    if len(found) != 1:
+        raise SystemExit(f"{args.host}: {len(found)} hosts match")
+    host, info = found[0][0], json.loads(found[0][1])
+    run = {
+        "name": args.name or host,
+        "hardware": info,
+        "configs": timing_configs(store, host, args.any_opponent),
+    }
+    if args.publish is None:
+        print(json.dumps(run, indent=2))
+        return
+    path = Path(args.publish)
+    published = json.loads(path.read_text()) if path.exists() else {"runs": []}
+    published["runs"] = [r for r in published["runs"] if r.get("name") != run["name"]]
+    published["runs"].append(run)
+    tmp = path.with_suffix(".json.part")
+    tmp.write_text(json.dumps(published, indent=1))
+    os.replace(tmp, path)
+    print(f"{path}: run {run['name']}, {len(run['configs'])} configs")
 
 
 def show(args: argparse.Namespace) -> None:
@@ -675,6 +875,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     p.add_argument("--on", default="local", choices=("local", "gcp", "modal"))
     p.add_argument("--cores", help="here, e.g. 16-23: the CPUs to play on")
     p.add_argument(
+        "--parallel",
+        type=int,
+        default=1,
+        help="games at once in a process, each in a thread on the same cores: for engines and "
+        "networks on the GPU (whose games share one stream). Same moves at fixed budgets",
+    )
+    p.add_argument(
         "--jobs",
         type=int,
         default=1,
@@ -694,6 +901,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     p.add_argument(
         "--dry-run", action="store_true", help="resolve the players and stop"
     )
+    p.add_argument(
+        "--require-idle",
+        action="store_true",
+        help=f"here: refuse to start unless the cores and their siblings are idle "
+        f"(each under {BUSY_TO_START:.0%} over {QUIET_SECONDS:g} s), for timings",
+    )
     p.set_defaults(fn=run)
 
     p = commands.add_parser(
@@ -703,6 +916,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     p.add_argument("--slice", default="0/1", help="k/n: every nth start from the kth")
     p.add_argument("--skip", default="", help="games already played, by number")
     p.add_argument("--out", required=True)
+    p.add_argument("--parallel", type=int, default=1, help="games at once, in threads")
     p.set_defaults(fn=host_play)
 
     p = commands.add_parser("sync", help="bring a cloud match's games here")
@@ -717,6 +931,27 @@ def main(argv: Sequence[str] | None = None) -> None:
     p.add_argument("match")
     p.add_argument("--games", action="store_true", help="each game too")
     p.set_defaults(fn=show)
+
+    p = commands.add_parser(
+        "timings",
+        help="what fixed-budget players cost on a host, for the league's plot",
+    )
+    p.add_argument("--host", help="a host's id (or its start); without, the hosts")
+    p.add_argument(
+        "--name", help="the run's name in timings.json (default: the host's id)"
+    )
+    p.add_argument(
+        "--any-opponent",
+        action="store_true",
+        help="time players against anyone, not only themselves",
+    )
+    p.add_argument(
+        "--publish",
+        nargs="?",
+        const=str(LEAGUE_TIMINGS),
+        help=f"put the run in timings.json (default {LEAGUE_TIMINGS})",
+    )
+    p.set_defaults(fn=timings)
 
     p = commands.add_parser("matches", help="every match")
     p.set_defaults(fn=list_matches)

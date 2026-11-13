@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from engines import CACHE_DIR, ENGINES, GTPEngine
+from engines import CACHE_DIR, ENGINES, GTPEngine, available_cpus, max_parallel_games
 from game import (
     PASS,
     env,
@@ -50,7 +50,6 @@ from game import (
     state_to_nn_input,
     step_fn,
 )
-from vs_engine import available_cpus, max_parallel_games
 from xot import XOT_PATH, load_xot
 
 from core.evaluators.evaluation_fns import make_nn_eval_fn

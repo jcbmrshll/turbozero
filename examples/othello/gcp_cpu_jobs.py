@@ -53,7 +53,7 @@ PREFIX = "cpu-jobs"
 # 16 vCPUs at one thread a core: 8 physical cores of AMD Turin (EPYC 9B45), AVX-512 VNNI
 MACHINE = "n4d-highcpu-16"
 ZONES = ("us-central1-a", "us-central1-b", "us-central1-c", "us-central1-f")
-# the engines' runtime files, what evaluate.py and the timing benchmark need of them
+# the engines' runtime files, what evaluate.py needs of them
 ENGINES = tuple(
     f"{default_dir(name).relative_to(CACHE)}/{part}"
     for name, parts in RUNTIME.items()

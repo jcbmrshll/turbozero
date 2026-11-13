@@ -58,6 +58,20 @@ def physical_cores(cpus: list[int]) -> int:
     return len(cores)
 
 
+def siblings(cpu: int) -> list[int]:
+    """The other logical CPUs of `cpu`'s core."""
+    path = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list")
+    try:
+        text = path.read_text().strip()
+    except OSError:
+        return []
+    out = []
+    for part in text.split(","):
+        low, _, high = part.partition("-")
+        out += range(int(low), int(high or low) + 1)
+    return [c for c in out if c != cpu]
+
+
 def gpu() -> list[str]:
     """The GPUs' names and driver, if there's an NVIDIA GPU."""
     if shutil.which("nvidia-smi") is None:

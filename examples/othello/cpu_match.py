@@ -138,38 +138,70 @@ def timed_move(
     return leaves, search.total_visits() - before
 
 
-def move_budget(seconds_left: float, empties: int, taper: int = 0) -> float:
+def move_budget(
+    seconds_left: float,
+    empties: int,
+    taper: int = 0,
+    solve_from: int = 0,
+    reserve: float = 0.0,
+) -> float:
     """Seconds to search a move on a game's clock: its share of what's left over the moves still to
     play, each side playing every other empty square, with 5% held back for what isn't searching.
     Moves count alike, or with `taper`, those with fewer empties than that less and less, by the
-    square of the fraction of it left: positions near the end are small, and their values good."""
+    square of the fraction of it left: positions near the end are small, and their values good.
+    With `solve_from`, the game is to be solved from so many empties: only the moves before it are
+    searched, and `reserve` seconds are kept for the solve. Once there (a solve gave up), the
+    moves to the end share what's left."""
 
     def weight(e: int) -> float:
         return min(1.0, e / taper) ** 2 if taper else 1.0
 
-    total = sum(weight(e) for e in range(empties, 0, -2))
-    return 0.95 * seconds_left * weight(empties) / max(total, 1e-9)
+    if empties <= solve_from:
+        solve_from, reserve = 0, 0.0
+    total = sum(weight(e) for e in range(empties, solve_from, -2))
+    return 0.95 * max(seconds_left - reserve, 0.0) * weight(empties) / max(total, 1e-9)
 
 
 @dataclass(frozen=True)
 class Solving:
     """When a player solves the endgame rather than searching it (see `endgame.py`).
 
+    On a clock, a game plans its solve as Edax does: from the most empties, up to `empties`,
+    whose expected solve takes at most `share` of the game's clock; the moves before it share the
+    clock less that, and the solve may take all but a tenth of what's left before it gives up and
+    the move is searched. A solve that succeeds leaves the game's later moves almost nothing to do.
+    At fixed visits, positions with `empties` or fewer are solved, taking what they take.
+
     Attributes:
-        empties: positions with this many empty squares or fewer are solved
+        empties: positions with this many empty squares or fewer are solved, at most
         exact: solve for the best final margin; else, about ten times faster, only for a win, a
             draw or a loss, which is all a game's result needs: a position solved as lost is
             then searched as usual, the network's best try against a fallible opponent
-        share: of the clock left, what a solve may take before it gives up and the move is
-            searched with what's left; a solve that succeeds leaves the game's later moves
-            almost nothing to do. Ignored at fixed visits, where a solve takes what it takes
+        share: of the game's clock, the most a planned solve may be expected to take
         threads: the solver's, by default one
+        cost_at_24: a solve's expected seconds at 24 empties on 8 threads, twice as long each
+            empty more, and shorter in proportion to more threads. By default Edax's exact solver
+            on positions of real games on the contest's cores (0.07, 0.19 and 0.80 s at 22, 24
+            and 26 empties, 2026-11-10): the speed we assume ours will have. Ours took about 2.0 s
+            at 24 for a win, a draw or a loss then; plan with that to play with it as it is
     """
 
     empties: int
     exact: bool = False
     share: float = 0.25
     threads: int = 1
+    cost_at_24: float = 0.19
+
+    def cost(self, empties: int) -> float:
+        """A solve's expected seconds at `empties`."""
+        return self.cost_at_24 * 2.0 ** (empties - 24) * 8 / self.threads
+
+    def depth(self, clock: float) -> int:
+        """The empties a game on a clock of `clock` seconds plans to solve from; 0 for none."""
+        fits = [
+            e for e in range(1, self.empties + 1) if self.cost(e) <= self.share * clock
+        ]
+        return max(fits, default=0)
 
 
 class NetPlayer:
@@ -203,6 +235,8 @@ class NetPlayer:
         # moves solved, and solves given up, in this game
         self.solved = 0
         self.gave_up = 0
+        # the empties the game is solved from, planned on the game's clock at its first move
+        self.solve_from: int | None = None
 
     def sync(self, color: str) -> None:
         """Passes for the other color if `color` moves out of turn: the game passes for a player
@@ -228,7 +262,7 @@ class NetPlayer:
         solving = self.solving
         assert solving is not None and self.solver is not None
         # a solve at fixed visits has no deadline; one with no time left, the least of one
-        seconds = 0.0 if self.visits else max(solving.share * seconds_left, 1e-3)
+        seconds = 0.0 if self.visits else max(0.9 * seconds_left, 1e-3)
         solved = self.solver.solve(me, opp, seconds, solving.exact)
         if solved is None:
             self.gave_up += 1
@@ -243,15 +277,30 @@ class NetPlayer:
         self.sync(color)
         me, opp, _, _ = self.search.position()
         empties = 64 - (me | opp).bit_count()
+        if self.solving is not None and self.solve_from is None:
+            # the first move sees the game's whole clock
+            self.solve_from = (
+                self.solving.empties
+                if self.visits
+                else self.solving.depth(seconds_left)
+            )
+        solve_from = self.solve_from or 0
         action = None
         if self.search.num_legal() == 1:
             action = self.search.first_legal()
-        elif self.solving is not None and empties <= self.solving.empties:
+        elif self.solving is not None and empties <= solve_from:
             start = time.perf_counter()
             action = self.solve(me, opp, seconds_left)
             seconds_left -= time.perf_counter() - start
         if action is None:
-            seconds = move_budget(max(seconds_left, 0.0), empties, self.taper)
+            reserve = (
+                self.solving.cost(solve_from)
+                if self.solving is not None and solve_from
+                else 0.0
+            )
+            seconds = move_budget(
+                max(seconds_left, 0.0), empties, self.taper, solve_from, reserve
+            )
             if isinstance(self.evaluate, Engine):
                 self.evaluate.search(
                     self.search,

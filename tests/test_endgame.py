@@ -179,6 +179,33 @@ def test_solves_match_plain_minimax():
             assert np.sign(after[sign_move]) == np.sign(expected)
 
 
+def test_a_match_solves_with_the_solver():
+    from clock_match import endgame_solve
+    from endgame import LIB
+
+    exact, wld = endgame_solve(exact=True), endgame_solve(exact=False)
+    for me, opp in random_positions([8, 10], 10, seed=2):
+        expected = LIB.endgame_minimax(me, opp)
+        assert exact(me, opp) == expected
+        assert np.sign(wld(me, opp)) == np.sign(expected)
+
+
+def test_a_net_player_on_a_clock_plans_its_solve_by_its_cost():
+    from cpu_match import NetPlayer, Solving
+    from cpu_search import SearchSettings
+
+    # on one thread a solve from 20 is expected to take 0.19 / 16 * 8 = 0.095 s, from 21 0.19 s:
+    # a quarter of half a second fits only the first
+    solving = Solving(empties=24, threads=1)
+    player = NetPlayer(SearchSettings(), fake_eval, solving=solving)
+    player.move("b", 0.5)
+    assert player.solve_from == 20
+    # at fixed visits there's no clock to plan by: it solves from what it was asked
+    player = NetPlayer(SearchSettings(), fake_eval, visits=8, solving=solving)
+    player.move("b", 0.5)
+    assert player.solve_from == 24
+
+
 def test_a_pass_is_solved_through():
     from endgame import LIB, PASS, move_margins
 
@@ -334,10 +361,15 @@ def test_a_net_player_plays_its_endgame_solved(exact):
 
     n = 14
     opening = load_xot(XOT_PATH)[3]
+    # planned on our solver's own cost (exact about 7 s at 24 empties on 8 threads, a win, a draw
+    # or a loss about 2 s), not the Edax speed play assumes by default, which on a clock this
+    # short would leave the solve too little time to finish
     black = NetPlayer(
         SearchSettings(batch=2),
         fake_eval,
-        solving=Solving(empties=n, exact=exact, threads=2),
+        solving=Solving(
+            empties=n, exact=exact, threads=2, cost_at_24=7.0 if exact else 2.0
+        ),
     )
     white = NetPlayer(SearchSettings(batch=2), fake_eval, seed=1)
     game = play_game(black, white, opening, 1.0)
@@ -366,8 +398,9 @@ def test_a_net_player_searches_when_a_solve_gives_up():
     from cpu_match import NetPlayer, Solving
     from cpu_search import SearchSettings
 
+    # planned from 60 empties by a solver thought far faster than it is
     player = NetPlayer(
-        SearchSettings(), fake_eval, solving=Solving(empties=60, share=1e-4)
+        SearchSettings(), fake_eval, solving=Solving(empties=60, cost_at_24=1e-30)
     )
     move = player.move("b", 0.2)
     assert player.gave_up == 1 and player.solved == 0

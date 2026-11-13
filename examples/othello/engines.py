@@ -1241,3 +1241,31 @@ def build_digest(name: str, engine_dir: Path | None = None) -> str:
     for path in runtime_files(name, root):
         digest.update(f"{path.relative_to(root)}\0{file_sha256(path)}\n".encode())
     return digest.hexdigest()[:16]
+
+
+def available_memory() -> int:
+    """Bytes of memory available to new processes: free memory plus what the kernel
+    could reclaim from caches (MemAvailable on Linux), or just free memory elsewhere."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+
+
+def available_cpus() -> int:
+    """The cores this process may run on (and the engine processes it starts, which inherit
+    them, e.g. from `taskset`), or all of them where that can't be told."""
+    if hasattr(os, "sched_getaffinity"):
+        return len(os.sched_getaffinity(0))
+    return os.cpu_count() or 1
+
+
+def max_parallel_games(engine: type[GTPEngine], limit: int = 128) -> int:
+    """How many engine processes to run at once: as many as fit in a quarter of the
+    memory available now (the machine may be shared), up to `limit`."""
+    fit = int(0.25 * available_memory() / engine.memory_per_process)
+    return max(2, min(fit, limit) // 2 * 2)
