@@ -30,8 +30,6 @@ GPU_PER_SECOND = {
 }
 CORE_PER_SECOND = 0.0000131
 GIB_PER_SECOND = 0.00000222
-# in-run games need Edax, which the image doesn't build
-UNSUPPORTED = ("--vs-engine-every", "--vs-engine-last")
 
 
 def flag(argv: list[str], name: str) -> str | None:
@@ -145,11 +143,6 @@ def parse_step(text: str, home: str) -> Step:
     for path in warm_start_paths(argv):
         if not re.fullmatch(STATE, Path(path).name):
             raise ValueError(f"--warm-start names a state-<EPOCH>.npz: {path}")
-    for name in UNSUPPORTED:
-        if flag(argv, name) is not None:
-            raise ValueError(
-                f"{name}: the Modal image has no Edax; the Elo league measures strength here"
-            )
     if flag(argv, "--log-moves") is not None:
         raise ValueError(
             "--log-moves is for local runs: bringing the moves here from the bucket costs more "

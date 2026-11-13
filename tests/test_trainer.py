@@ -715,7 +715,7 @@ def test_train_loop_reports_to_the_monitor(env, tmp_path, fake_loop):
 
 class StagedTester(FakeTester):
     """Logs its results with `log_fn` as it goes, a game among them, and returns none (as
-    examples/othello/vs_engine.py's EngineMatchTester does)."""
+    examples/hex/vs_engine.py's EngineMatchTester does)."""
 
     def run(self, *args, log_fn=None, **kwargs):  # pyright: ignore[reportIncompatibleMethodOverride]
         assert log_fn is not None

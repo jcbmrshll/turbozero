@@ -1,50 +1,27 @@
-"""Games on a clock, one at a time on the same cores, as in a contest: each side has the same
-seconds for the whole game, and only its own moves are charged. Run under `taskset`, with both
-sides on the same cores and nothing else on those cores or their SMT siblings.
+"""The referee of evaluation games (`evaluate.py`), and its players: a game on each side's own
+clock or at its fixed budget, one move at a time, each side charged only its own moves, from the
+standard start, an opening's moves or a position given whole; with `solve_at`, stopped at so many
+empties and solved for the result (`GameRun`). GGS's synchro pairs are two games in lockstep
+(`play_synchro`).
 
-    taskset -c 0-5,12-13 uv run examples/othello/clock_match.py \
-        --a edax:threads=8 --b egaroucid:threads=8 --seconds 10 --openings 100
+A player (`player_maker`) is a network (`net_player`: `cpu_match.NetPlayer` on the CPU, or
+`gpu_play.py`'s on the GPU), or an engine at a level (`LevelEngine`) or on its clock
+(`engines.ClockedEngine`).
 
-Or as GGS plays its synchro matches (see `ggs.py`): from random 14-disc starts, on its clock of
-1 minute a game and 2 of extension:
-
-    taskset -c 0-7 uv run examples/othello/clock_match.py \
-        --a net:net=NAME,engine=1 --b edax --clock 01:00//02:00 --starts random:14 --openings 50
-
-`--starts` is `xot` (XOT openings, played as moves from the standard start), `random:N` (GGS's
-random starts of N discs) or `file:PATH` (starts drawn from a file: a GGS archive's of
-`--match-type`, or `ggs.py extract`'s). Each start is played with both colors, a pair of games,
-each by fresh processes, so nothing carries over from one game to the next. With `--parallel`,
-a pair's two games are played at the same time on the same cores, as GGS plays them.
-
-A player is `net:net=NAME,batch=16,...` (a network of the league's store, see `cpu_match.py`; with
-`solve=20`, it solves positions with 20 or fewer empties, see `net_player`), or
-`name:key=value,...`: `edax`, `egaroucid`, `melody`, `neural-reversi`, `ymatioun` or `edax-fm`
-(see `engines.py`), with `threads`, `dir` (where the engine is built), `level` (play at this
-level, ignoring the clock, its book off; not ymatioun) and `args`
-(more of the engine's own options, separated by spaces).
-
-On `--seconds`, who runs out of time, by more than `GRACE`, loses, and the game is played out
-with no time for them. On `--clock`, GGS's rules (`ggs.PlayerClock`, `ggs.game_result`). A
-game's `board` result ignores the clock, to show what timeouts changed. Pairs are scored as
-GGS scores a synchro match, by the two games' disc results together (see `pair_summary`).
+On a contest's clock, who runs out of time, by more than `GRACE`, loses, and the game is played out
+with no time for them. On GGS's clock, GGS's rules (`ggs.PlayerClock`, `ggs.game_result`). A game's
+`board` result ignores the clock, to show what timeouts changed. Pairs are scored as GGS scores a
+synchro match, by the two games' disc results together (see `pair_summary`).
 """
 
-import argparse
 import itertools
-import json
 import math
-import os
 import threading
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
-
-# a CPU script: JAX would otherwise take the GPU's memory, and the league would give way
-if __name__ == "__main__":
-    os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import numpy as np
 from engines import (
@@ -62,11 +39,8 @@ from ggs import (
     Start,
     disc_result,
     game_result,
-    load_starts,
-    random_start,
 )
 from native_target import cpus
-from xot import XOT_PATH, load_xot
 
 # seconds past the clock that don't lose a game: an engine that plans its whole clock can pass
 # it by milliseconds, the pipes and the operating system's doing as much as its own
@@ -120,6 +94,8 @@ class Game:
         hard: who ran out of a GGS clock's extension too, which ended the game
         start: the position it started from, if not the standard one (`ggs.Start.text`)
         moves: every move, the opening's first, as squares (bit 0 is a1); passes aren't moves
+        solved_at: the empties of the position solved for the result, if the game was stopped
+            there (`GameRun`'s `solve_at`)
     """
 
     margin: int = 0
@@ -130,13 +106,39 @@ class Game:
     hard: str | None = None
     start: str | None = None
     moves: list[int] = field(default_factory=list)
+    solved_at: int | None = None
+
+
+# the final margin for the player to move of a position, as (mover's discs, opponent's)
+Solve = Callable[[int, int], int]
+
+# a clock that never runs out, for a player at a fixed budget, who ignores it
+UNTIMED = Clock.contest(1e9)
+
+
+def endgame_solve(exact: bool) -> Solve:
+    """Our solver (`endgame.py`) on all the cores we may run on, for a position's final margin,
+    or with `exact` False, about ten times faster, a margin whose sign alone is right."""
+    from endgame import Solver
+
+    solver = Solver(threads=len(cpus()))
+
+    def solve(me: int, opp: int) -> int:
+        solved = solver.solve(me, opp, exact=exact)
+        assert solved is not None
+        return solved.margin
+
+    return solve
 
 
 class GameRun:
     """A game being played, a move at a time (`step`), from `start` (else the standard start)
     after `opening`'s moves, each side charged its own moves on `clock` (a float: a contest's
-    clock of so many seconds, `Clock.contest`). On a contest's clock it's played out after a
-    timeout, with no time left for that side; on a GGS clock, a hard timeout ends it.
+    clock of so many seconds, `Clock.contest`), or each on its own, (black's, white's); `UNTIMED`
+    for a side at a fixed budget. On a contest's clock it's played out after a timeout, with no
+    time left for that side; on a GGS clock, a hard timeout ends it. With `solve_at`, it stops
+    at the first position with so many empties or fewer and `solve` gives the result, as if both
+    sides played perfectly from there.
 
     A pass is a step of its own, as on GGS, where a player with no move sends "pass": it takes
     no time, and the players aren't asked (both engines and the network pass by themselves)."""
@@ -146,10 +148,20 @@ class GameRun:
         black: Player,
         white: Player,
         opening: Sequence[int],
-        clock: Clock | float,
+        clock: Clock | float | tuple[Clock, Clock],
         start: Start | None = None,
+        solve_at: int | None = None,
+        solve: Solve | None = None,
     ):
-        clock = clock if isinstance(clock, Clock) else Clock.contest(clock)
+        if solve_at is not None and solve is None:
+            raise ValueError("solve_at needs a solve")
+        if isinstance(clock, tuple):
+            clocks = clock
+        else:
+            clock = clock if isinstance(clock, Clock) else Clock.contest(clock)
+            clocks = (clock, clock)
+        self.solve_at = solve_at
+        self.solve = solve
         self.board = start.board() if start is not None else Board()
         self.game = Game(start=start.text() if start is not None else None)
         self.players = (black, white)
@@ -162,9 +174,11 @@ class GameRun:
             self.game.moves.append(int(move))
             for player in self.players:
                 player.play(color, int(move))
-        self.clocks = (PlayerClock(clock, GRACE), PlayerClock(clock, GRACE))
+        self.clocks = (PlayerClock(clocks[0], GRACE), PlayerClock(clocks[1], GRACE))
         # whether the next step is a pass, of the player who moved last's opponent
         self.passing = False
+        # black's margin of the position solved, once the game stopped to solve it
+        self.solved_margin = 0
         self.over = not self.board.legal()
 
     def step(self) -> None:
@@ -176,6 +190,13 @@ class GameRun:
         side = not board.black_to_move
         color = board.color
         empties = 64 - (board.discs[0] | board.discs[1]).bit_count()
+        if self.solve_at is not None and empties <= self.solve_at:
+            assert self.solve is not None
+            margin = self.solve(board.discs[side], board.discs[not side])
+            game.solved_at = empties
+            self.solved_margin = margin if board.black_to_move else -margin
+            self.over = True
+            return
         begin = time.perf_counter()
         move = self.players[side].move(color, self.clocks[side].seconds_left())
         spent = time.perf_counter() - begin
@@ -198,10 +219,13 @@ class GameRun:
 
     def finish(self) -> Game:
         """The game, once it's over."""
-        self.game.margin = self.board.margin()
-        self.game.result = game_result(
-            disc_result(self.board), self.game.flagged, self.game.hard
-        )
+        if self.game.solved_at is not None:
+            self.game.margin = self.solved_margin
+            board_result = self.solved_margin
+        else:
+            self.game.margin = self.board.margin()
+            board_result = disc_result(self.board)
+        self.game.result = game_result(board_result, self.game.flagged, self.game.hard)
         return self.game
 
 
@@ -253,23 +277,6 @@ def points(result: int, a_black: bool) -> float:
 def elo(score: float) -> float:
     score = min(max(score, 1e-3), 1 - 1e-3)
     return -400 * math.log10(1 / score - 1)
-
-
-def phase_seconds(games: list[Game], a_black: list[bool], a: bool) -> dict[str, float]:
-    """A player's mean seconds a game in three parts of the game by empty squares."""
-    parts = {"mid_34+": 0.0, "late_24-33": 0.0, "end_0-23": 0.0}
-    for game, black in zip(games, a_black):
-        for empties, by_black, spent in game.move_seconds:
-            if by_black == (black == a):
-                part = (
-                    "mid_34+"
-                    if empties >= 34
-                    else "late_24-33"
-                    if empties >= 24
-                    else "end_0-23"
-                )
-                parts[part] += spent
-    return {k: round(v / max(len(games), 1), 3) for k, v in parts.items()}
 
 
 def wilson(wins: int, n: int) -> tuple[float, float]:
@@ -338,57 +345,6 @@ def pair_summary(games: list[Game], a_black: list[bool]) -> dict:
     }
 
 
-def summarize(games: list[Game], a_black: list[bool], clock: Clock | float) -> dict:
-    """What a match showed, for player a against b."""
-    board = [points(g.margin, b) for g, b in zip(games, a_black)]
-    final = [points(g.result, b) for g, b in zip(games, a_black)]
-    score = float(np.mean(final))
-    used = {"a": [], "b": []}
-    moves = {"a": [], "b": []}
-    flags = {"a": 0, "b": 0}
-    hard = {"a": 0, "b": 0}
-    for game, black in zip(games, a_black):
-        used["a"].append(game.seconds[not black])
-        used["b"].append(game.seconds[black])
-        for _, by_black, spent in game.move_seconds:
-            moves["a" if by_black == black else "b"].append(spent)
-        if game.flagged is not None:
-            flags["a" if (game.flagged == "b") == black else "b"] += 1
-        if game.hard is not None:
-            hard["a" if (game.hard == "b") == black else "b"] += 1
-    result = {
-        "games": len(games),
-        "clock": str(clock),
-        "score": round(score, 4),
-        "stderr": round(float(np.std(final) / math.sqrt(max(len(final), 1))), 4),
-        "elo": round(elo(score), 1),
-        "board_score": round(float(np.mean(board)), 4),
-        "board_wins": int(sum(p == 1 for p in board)),
-        "board_draws": int(sum(p == 0.5 for p in board)),
-        "board_losses": int(sum(p == 0 for p in board)),
-        # a's discs less b's, game by game
-        "margins": [int(g.margin if b else -g.margin) for g, b in zip(games, a_black)],
-        # a's results as GGS counts them, timeouts and all
-        "results": [int(g.result if b else -g.result) for g, b in zip(games, a_black)],
-        # clock losses: soft timeouts (the first to run out of a GGS clock's ini, or of a
-        # contest's), hard ones, and games whose winner the clock changed
-        "flags": flags,
-        "hard_timeouts": hard,
-        "clock_changed": int(sum(f != b for f, b in zip(final, board))),
-        "pairs": pair_summary(games, a_black),
-    }
-    for side in ("a", "b"):
-        result[side] = {
-            "seconds_a_game": round(float(np.mean(used[side])), 3),
-            "seconds_a_game_max": round(float(np.max(used[side])), 3),
-            "seconds_a_move": round(float(np.mean(moves[side])), 4),
-            "seconds_a_move_max": round(float(np.max(moves[side])), 3),
-            "seconds_a_move_p99": round(float(np.percentile(moves[side], 99)), 3),
-            "phases": phase_seconds(games, a_black, side == "a"),
-        }
-    return result
-
-
 def net_player(options: dict[str, str]) -> Callable[[], Player]:
     """What builds a network's player, which all games share a network for. Its `options` are
     `cpu_match.Player.parse`'s, with `net`, `taper` (see `cpu_match.move_budget`), `engine=1`
@@ -396,11 +352,24 @@ def net_player(options: dict[str, str]) -> Callable[[], Player]:
     evaluates at a time, and `threads`, the cores used, by default all it may run on. With
     `visits`, it searches so many a move, ignoring the clock. With `solve=N`, positions with N or
     fewer empties are solved on the same cores (see `cpu_match.Solving`), `solve_exact=1` for the
-    best margin, `solve_share` what of the clock left a solve may take."""
+    best margin, `solve_share` what of the game's clock a solve may be expected to take,
+    `solve_cost` its expected seconds at 24 empties on 8 threads (on a clock, it solves from as
+    many empties as that affords).
+
+    With `device=gpu`, a GGS-only player (engine comparisons stay on CPU vector units): its tree
+    on the host, its leaves evaluated on the GPU many at a time (see `gpu_play.player_factory`
+    for its options), the endgame solved on `threads` CPU cores; all its games share one GPU
+    stream, as a synchro pair's two do."""
     from cpu_match import NetPlayer, Solving, make_engine, make_eval
     from cpu_match import Player as NetSpec
 
     options = dict(options)
+    if options.get("device", "cpu") == "gpu":
+        from gpu_play import player_factory
+
+        cores = int(options.pop("threads", len(cpus())))
+        return player_factory(options, cores)
+    options.pop("device", None)
     native = bool(int(options.pop("engine", 0)))
     cores = int(options.pop("threads", len(cpus())))
     solving = None
@@ -410,6 +379,7 @@ def net_player(options: dict[str, str]) -> Callable[[], Player]:
             exact=bool(int(options.pop("solve_exact", 0))),
             share=float(options.pop("solve_share", Solving.share)),
             threads=cores,
+            cost_at_24=float(options.pop("solve_cost", Solving.cost_at_24)),
         )
     fields = ",".join(f"{k}={v}" for k, v in options.items())
     spec = NetSpec.parse(f"visits=0,{fields}", options["net"], "bf16")
@@ -426,11 +396,12 @@ def net_player(options: dict[str, str]) -> Callable[[], Player]:
     )
 
 
-def make_player(spec: str, clock: Clock) -> Callable[[], Player]:
-    """What builds a player from its `name:key=value,...`, for each game. Engines plan for
-    `clock.ini`, told what's left of the clock before each move."""
-    name, _, settings = spec.partition(":")
-    options = dict(s.split("=", 1) for s in settings.split(",") if s)
+def player_maker(
+    name: str, options: dict[str, str], clock: Clock
+) -> Callable[[], Player]:
+    """What builds the player `name` ("net" or an engine's) with `options`, for each game.
+    Engines plan for `clock.ini`, told what's left of the clock before each move."""
+    options = dict(options)
     if name == "net":
         return net_player(options)
     engine_dir = Path(options["dir"]) if "dir" in options else default_dir(name)
@@ -445,167 +416,3 @@ def make_player(spec: str, clock: Clock) -> Callable[[], Player]:
             ENGINES[name](engine_dir, level, args=args, threads=threads)
         )
     return lambda: CLOCKED[name](engine_dir, clock.ini, threads, args)
-
-
-# where a game starts: the moves of an opening, played from a position (None: the standard one)
-Opening = tuple[Sequence[int], Start | None]
-
-
-def play_one(
-    a: Callable[[], Player],
-    b: Callable[[], Player],
-    opening: Opening,
-    clock: Clock | float,
-    a_black: bool,
-) -> Game:
-    """One game, by fresh players, closed after."""
-    first, second = a(), b()
-    try:
-        black, white = (first, second) if a_black else (second, first)
-        return play_game(black, white, opening[0], clock, opening[1])
-    finally:
-        first.close()
-        second.close()
-
-
-def play_pair_synchro(
-    players: Sequence[tuple[Callable[[], Player], Callable[[], Player]]],
-    opening: Opening,
-    clock: Clock | float,
-) -> list[Game]:
-    """A pair's two games in lockstep (`play_synchro`), by fresh players, a black in the first:
-    each of `players` (a's maker, b's) plays one game."""
-    made: list[Player] = []
-    try:
-        runs = []
-        for (a, b), a_black in zip(players, (True, False)):
-            first, second = a(), b()
-            made += [first, second]
-            black, white = (first, second) if a_black else (second, first)
-            runs.append(GameRun(black, white, opening[0], clock, opening[1]))
-        return play_synchro(runs)
-    finally:
-        for player in made:
-            player.close()
-
-
-def play_match(
-    a: Callable[[], Player],
-    b: Callable[[], Player],
-    openings: Sequence[Opening],
-    clock: Clock | float,
-    on_game: Callable[[list[Game], list[bool]], None] = lambda _games, _a_black: None,
-    parallel: tuple[Callable[[], Player], Callable[[], Player]] | None = None,
-) -> tuple[list[Game], list[bool]]:
-    """Each opening played with both colors, a black first, by fresh players: one game at a
-    time, or with `parallel` (players for the second game: a network's can't search two trees
-    at once) the pair's two games in lockstep, as GGS plays them (`play_synchro`)."""
-    games, a_black = [], []
-    for opening in openings:
-        if parallel is None:
-            for black in (True, False):
-                games.append(play_one(a, b, opening, clock, black))
-                a_black.append(black)
-                on_game(games, a_black)
-            continue
-        for game, black in zip(
-            play_pair_synchro([(a, b), parallel], opening, clock), (True, False)
-        ):
-            games.append(game)
-            a_black.append(black)
-            on_game(games, a_black)
-    return games, a_black
-
-
-def choose_openings(
-    starts: str, count: int, seed: int, match_type: str, since: str
-) -> list[Opening]:
-    """`count` openings from `--starts`'s source, drawn by `seed`."""
-    rng = np.random.default_rng(seed)
-    kind, _, value = starts.partition(":")
-    if kind == "xot":
-        pool = load_xot(XOT_PATH)
-        return [
-            (o, None) for o in pool[rng.choice(len(pool), size=count, replace=False)]
-        ]
-    if kind == "random":
-        return [((), random_start(int(value), rng).playable()) for _ in range(count)]
-    if kind == "file":
-        found = load_starts(value, match_type, since)
-        picked = rng.choice(len(found), size=min(count, len(found)), replace=False)
-        return [((), found[i].playable()) for i in picked]
-    raise ValueError(f"unknown starts {starts!r}")
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Games on a clock, one at a time.")
-    parser.add_argument("--a", required=True, help="e.g. edax:threads=8")
-    parser.add_argument("--b", required=True)
-    timing = parser.add_mutually_exclusive_group(required=True)
-    timing.add_argument("--seconds", type=float, help="each, per game, as in a contest")
-    timing.add_argument("--clock", type=Clock.parse, help="GGS's, e.g. 01:00//02:00")
-    parser.add_argument("--openings", type=int, default=100, help="pairs of games")
-    parser.add_argument("--starts", default="xot", help="xot, random:N or file:PATH")
-    parser.add_argument("--match-type", default="s8r14", help="an archive's starts of")
-    parser.add_argument(
-        "--since", default="", help='an archive\'s starts from, e.g. "2024"'
-    )
-    parser.add_argument(
-        "--parallel",
-        action="store_true",
-        help="a pair's two games at once, on the same cores",
-    )
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--results", type=Path, default=None)
-    parser.add_argument(
-        "--games",
-        type=Path,
-        default=None,
-        help="where each game is written, a line each",
-    )
-    args = parser.parse_args()
-
-    clock = args.clock if args.clock is not None else Clock.contest(args.seconds)
-    openings = choose_openings(
-        args.starts, args.openings, args.seed, args.match_type, args.since
-    )
-
-    def report(games: list[Game], a_black: list[bool]) -> None:
-        if args.games is not None:
-            game = games[-1]
-            with open(args.games, "a") as f:
-                f.write(json.dumps({"a_black": a_black[-1], **asdict(game)}) + "\n")
-        if len(games) % 20 == 0:
-            print(json.dumps(summarize(games, a_black, clock)), flush=True)
-
-    second = (
-        (make_player(args.a, clock), make_player(args.b, clock))
-        if args.parallel
-        else None
-    )
-    games, a_black = play_match(
-        make_player(args.a, clock),
-        make_player(args.b, clock),
-        openings,
-        clock,
-        report,
-        second,
-    )
-    record = {
-        "player_a": args.a,
-        "player_b": args.b,
-        "starts": args.starts,
-        "parallel": args.parallel,
-        "seed": args.seed,
-        "cores": cpus(),
-        "load": os.getloadavg()[0],
-        **summarize(games, a_black, clock),
-    }
-    print(json.dumps(record), flush=True)
-    if args.results is not None:
-        with open(args.results, "a") as f:
-            f.write(json.dumps(record) + "\n")
-
-
-if __name__ == "__main__":
-    main()

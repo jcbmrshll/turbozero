@@ -16,7 +16,7 @@ two-minute extension, scored by the mean of the two games' disc results.
 | `ggs_e2e.py` | The client end to end against Edax's GGS bot on the private server |
 
 The server's start positions, clock and scoring are modelled in `../ggs.py` (and played locally,
-without a server, by `../clock_match.py`).
+without a server, by `../evaluate.py`).
 
 ## Trying it locally
 

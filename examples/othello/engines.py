@@ -1199,3 +1199,73 @@ ENGINES: dict[str, type[GTPEngine]] = {
 CLOCK_ONLY: dict[str, type[ClockedYmatioun]] = {ClockedYmatioun.name: ClockedYmatioun}
 # the engines with an analyst, by name
 ANALYSTS: dict[str, type[EdaxAnalyst]] = {Edax.name: EdaxAnalyst}
+
+
+# the files each engine plays with, from its build's directory: what a host needs of it to play,
+# and what its build's digest is of (`build_digest`)
+RUNTIME: dict[str, tuple[str, ...]] = {
+    Edax.name: ("bin", "data"),
+    EdaxFM.name: ("bin", "data"),
+    Egaroucid.name: ("bin",),
+    Melody.name: (
+        "build/Melody",
+        *(f"weight_{w}" for w in ("v11.bin", "0_v12.txt", "Va_v12.bin", "Vb_v12.bin")),
+    ),
+    # its weights are in the binary
+    NeuralReversi.name: ("target/release/cli",),
+    ClockedYmatioun.name: ("bin", "data"),
+}
+
+
+def runtime_files(name: str, engine_dir: Path | None = None) -> list[Path]:
+    """Every file `name` plays with, in its build `engine_dir` (by default its setup script's)."""
+    root = engine_dir if engine_dir is not None else default_dir(name)
+    files = []
+    for part in RUNTIME[name]:
+        path = root / part
+        if not path.exists():
+            raise FileNotFoundError(f"{path}: build {name} first (see engines.py)")
+        files += (
+            [path]
+            if path.is_file()
+            else sorted(p for p in path.rglob("*") if p.is_file())
+        )
+    return files
+
+
+def build_digest(name: str, engine_dir: Path | None = None) -> str:
+    """What `name`'s build is, by what's in the files it plays with: a rebuild that changes
+    any of them is another build."""
+    root = engine_dir if engine_dir is not None else default_dir(name)
+    digest = hashlib.sha256()
+    for path in runtime_files(name, root):
+        digest.update(f"{path.relative_to(root)}\0{file_sha256(path)}\n".encode())
+    return digest.hexdigest()[:16]
+
+
+def available_memory() -> int:
+    """Bytes of memory available to new processes: free memory plus what the kernel
+    could reclaim from caches (MemAvailable on Linux), or just free memory elsewhere."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+
+
+def available_cpus() -> int:
+    """The cores this process may run on (and the engine processes it starts, which inherit
+    them, e.g. from `taskset`), or all of them where that can't be told."""
+    if hasattr(os, "sched_getaffinity"):
+        return len(os.sched_getaffinity(0))
+    return os.cpu_count() or 1
+
+
+def max_parallel_games(engine: type[GTPEngine], limit: int = 128) -> int:
+    """How many engine processes to run at once: as many as fit in a quarter of the
+    memory available now (the machine may be shared), up to `limit`."""
+    fit = int(0.25 * available_memory() / engine.memory_per_process)
+    return max(2, min(fit, limit) // 2 * 2)

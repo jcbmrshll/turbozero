@@ -15,9 +15,7 @@ from clock_match import (
     Game,
     pair_summary,
     play_game,
-    play_match,
     points,
-    summarize,
 )
 from engines import Board, ClockedEdax, ClockedEgaroucid, Edax, Egaroucid, flips
 from game import action
@@ -142,28 +140,6 @@ def test_points_are_for_player_a(result, a_black, expected):
     assert points(result, a_black) == expected
 
 
-def test_summary_is_for_player_a_whichever_color():
-    games = [
-        Game(margin=4, seconds=[1, 3], move_seconds=[(40, True, 1), (39, False, 3)]),
-        Game(
-            margin=4,
-            result=-2,
-            seconds=[2, 4],
-            move_seconds=[(20, True, 2), (19, False, 4)],
-            flagged="b",
-        ),
-    ]
-    games[0].result = 4
-    summary = summarize(games, [True, False], 5)
-    assert summary["score"] == 1
-    assert summary["board_score"] == 0.5
-    assert summary["flags"] == {"a": 0, "b": 1}
-    assert summary["clock_changed"] == 1
-    assert summary["a"]["seconds_a_game"] == 2.5
-    assert summary["b"]["seconds_a_game"] == 2.5
-    assert summary["a"]["phases"] == {"mid_34+": 0.5, "late_24-33": 0, "end_0-23": 2}
-
-
 def test_threads_reach_each_engine_only_once():
     for engine in (Edax, Egaroucid):
         fake: Any = engine.__new__(engine)
@@ -239,18 +215,6 @@ def test_clocked_egaroucid_reads_its_move_past_prompts_and_noise():
     assert script.sent == ["play c4", "go"]
 
 
-def test_a_summary_counts_results_and_writes_as_json():
-    games = [Game(margin=m, result=m) for m in (4, -2, 0, 6)]
-    for game in games:
-        game.move_seconds.append((40, True, 0.1))
-        game.move_seconds.append((39, False, 0.1))
-    summary = summarize(games, [True, True, False, False], 10)
-    assert (summary["board_wins"], summary["board_draws"]) == (1, 1)
-    assert summary["board_losses"] == 2
-    assert summary["margins"] == [4, -2, 0, -6]
-    json.dumps(summary)
-
-
 def test_a_game_records_its_moves_from_the_opening(clock):
     game, _ = play_with(clock, 1000)
     board = Board()
@@ -320,19 +284,6 @@ def test_pairs_are_scored_by_points_and_by_summed_discs():
     assert pairs["disc_sum_ci95"][0] < 2 < pairs["disc_sum_ci95"][1]
     assert pairs["decisive_elo"] == 0
     assert pairs["game_elo"] == 0
-
-
-def test_a_match_plays_each_start_with_both_colors_also_in_parallel():
-    def player():
-        return FirstLegal([0.0], 0)
-
-    openings = [((), GGS_START), (moves("f5d6"), None)]
-    for parallel in (None, (player, player)):
-        games, a_black = play_match(player, player, openings, 100, parallel=parallel)
-        assert a_black == [True, False, True, False]
-        assert [g.start for g in games] == [GGS_START.text()] * 2 + [None] * 2
-        # first-legal players play the same game whatever the colors
-        assert games[0].moves == games[1].moves
 
 
 @pytest.mark.skipif(not Edax.installed(Edax.default_dir()), reason="Edax isn't built")

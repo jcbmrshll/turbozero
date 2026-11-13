@@ -365,8 +365,10 @@ bool reuse_evaluation(Search& s, int32_t index) {
     return true;
 }
 
-// `search_collect`'s traversals, their paths kept in `b` until `apply`
-int collect(Search& s, Batch& b, int batch, float* out) {
+// `search_collect`'s traversals, their paths kept in `b` until `apply`; each leaf's observation written
+// to `out` as (2, 8, 8) floats, or with `bits`, to it as two words, the discs of the player to move and
+// of the other
+int collect(Search& s, Batch& b, int batch, float* out, uint64_t* bits = nullptr) {
     b.paths.clear();
     b.collisions.clear();
     b.leaf_ends.clear();
@@ -416,8 +418,13 @@ int collect(Search& s, Batch& b, int batch, float* out) {
             int symmetry = s.random_symmetry ? draw_symmetry(s) : 0;
             b.leaf_symmetries.push_back((uint8_t)symmetry);
             const Position& p = s.nodes[index].position;
-            write_observation(symmetric_bits(p.me, symmetry), symmetric_bits(p.opp, symmetry),
-                              out + (size_t)leaves * 128);
+            uint64_t me = symmetric_bits(p.me, symmetry), opp = symmetric_bits(p.opp, symmetry);
+            if (bits) {
+                bits[2 * (size_t)leaves] = me;
+                bits[2 * (size_t)leaves + 1] = opp;
+            } else {
+                write_observation(me, opp, out + (size_t)leaves * 128);
+            }
             leaves++;
             visits++;
             s.ended_in_a_row = 0;
@@ -517,7 +524,10 @@ void search_set_position(Search* s, uint64_t me, uint64_t opp) {
 void search_reset(Search* s) { search_set_position(s, (1ULL << 28) | (1ULL << 35), (1ULL << 27) | (1ULL << 36)); }
 
 // the search for a move: `visits` more of the tree, each a leaf to evaluate or a game's end reached
-void search_begin(Search* s, int visits) { s->remaining = visits; }
+void search_begin(Search* s, int visits) {
+    s->remaining = visits;
+    s->ended_in_a_row = 0;
+}
 
 int search_remaining(const Search* s) { return s->remaining; }
 
@@ -531,6 +541,30 @@ int search_collect(Search* s, int batch, float* out) { return collect(*s, s->bat
 
 // The evaluations of the leaves `search_collect` returned, (leaves, 65) policy logits and (leaves) values.
 void search_apply(Search* s, const float* logits, const float* values) { apply(*s, s->batch, logits, values); }
+
+// Batches of a search's own, beside its `search_collect`'s, for a caller with several in flight at once:
+// each collected into while the others are out for evaluation, its leaves' traversals steered away
+// from theirs by their virtual visits.
+Batch* batch_new() { return new Batch(); }
+
+void batch_free(Batch* b) { delete b; }
+
+// `search_collect` into `b`
+int search_collect_into(Search* s, Batch* b, int batch, float* out) { return collect(*s, *b, batch, out); }
+
+// `search_collect_into`, each leaf's observation written to `out` packed: (batch, 2) words, the discs of
+// the player to move and the other's, bit i the square of row i / 8, column i % 8
+int search_collect_bits(Search* s, Batch* b, int batch, uint64_t* out) {
+    return collect(*s, *b, batch, nullptr, out);
+}
+
+// `search_apply` of what `search_collect_into` put in `b`
+void search_apply_from(Search* s, Batch* b, const float* logits, const float* values) {
+    apply(*s, *b, logits, values);
+}
+
+// traversals in a row, to now, that ended the game with no leaf between
+int search_ended_in_a_row(const Search* s) { return s->ended_in_a_row; }
 
 int search_num_legal(const Search* s) {
     const Position& p = s->nodes[s->root].position;
