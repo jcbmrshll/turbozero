@@ -143,6 +143,11 @@ def parse_step(text: str, home: str) -> Step:
     for path in warm_start_paths(argv):
         if not re.fullmatch(STATE, Path(path).name):
             raise ValueError(f"--warm-start names a state-<EPOCH>.npz: {path}")
+    if flag(argv, "--log-moves") is not None:
+        raise ValueError(
+            "--log-moves is for local runs: bringing the moves here from the bucket costs more "
+            "in egress than they're worth"
+        )
     root = Path(home) / ".cache" / "turbozero"
     for path in (
         ckpt_dir,

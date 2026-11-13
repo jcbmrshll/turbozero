@@ -15,14 +15,15 @@ engines, chiefly [Edax](https://github.com/abulmo/edax-reversi) and
 | `ggs.py` | GGS's random starts, its archive's, and its clock and scoring |
 | `gcp_cpu_jobs.py`, `gcp_cpu_runner.py`, `modal_hosts.py` | Commands on Google Cloud Spot VMs of one CPU model (8 Zen 5 cores, AVX-512 VNNI), for timed games, or in Modal containers |
 | `cpu_search.py`, `cpu_search.cpp` | A single game's MCTS for playing on CPU: a tree in C++, its leaves evaluated in batches by OpenVINO or ONNX Runtime, or searched by a thread to a core (`Engine`) |
-| `cpu_net.py`, `cpu_net.h` | A network's int8 forward pass in C++ (AVX-512 VNNI), for `Engine`: no OpenVINO, closer to the float network |
+| `cpu_net.py`, `cpu_net.h` | A network's int8 forward pass in C++ (AVX-512 VNNI, AVX2 or ARM's NEON), for `Engine`: no OpenVINO, closer to the float network |
 | `cpu_match.py` | Our player on the CPU, and its speed in evals a second |
 | `endgame.py`, `endgame.cpp` | The endgame solved exactly in C++, for a player (`solve=N`) and in batches for labels |
 | `export_onnx.py` | Exports a checkpoint's network to ONNX |
 | `bench_cpu_backends.py` | Evals a second by CPU backend and batch, each checked against JAX's outputs |
 | `quantize.py`, `fidelity.py`, `bench_quantized.py` | Quantizes a network to int8 for playing on CPU, and measures its outputs and speed against bf16 |
 | `engine_set.py`, `label_positions.py`, `score_engine_set.py` | The engine-labelled set: fixed positions with every legal move scored by Edax, to build, and to score checkpoints on (train.py scores the network on it every epoch) |
-| `distill.py` | Trains a network on a saved training state's replay buffer, with no self-play, on a teacher network's values or the games' outcomes |
+| `distill.py` | Trains a network on a saved training state's replay buffer or a dataset, with no self-play, on a teacher network's values or the games' outcomes |
+| `teacher_dataset.py` | A dataset of whole self-play games from the moves a run kept (`--log-moves`), labelled with exact endgame results |
 | `bench_nets.py` | Times networks on their own: a forward pass at self-play's batch, a training step at training's |
 | `game.py` | What the scripts share: the environment, board symmetries, network, evaluators |
 | `xot.py`, `xot-openings.txt` | The XOT opening list |
@@ -451,6 +452,41 @@ its raw weights and its self-play average: their policy KL and value loss (`fres
 raw weights' excess (`fresh_*_gap`). N is a multiple of the micro-batch (`--train-batch` /
 `--grad-accum`), e.g. 16 of them. It draws its samples from the run's rng, so a run with it
 plays other games than the same run without.
+
+### Keeping every move: datasets of games
+
+`--log-moves DIR` keeps every move self-play plays, fast searches' too, in `DIR` as
+`moves-<EPOCH>.npy` (see `core/memory/move_log.py`): the position, the search's policy target and
+root value, the legal moves, the move played, whether the search was full, the ply, and the game
+it's in, about 190 bytes a move. Training is unchanged. The log isn't part of saved states, so a
+run keeping its moves doesn't `--resume` into the same directory: start another into a new one.
+
+`--train-steps 0` trains nothing: the network and its weight averages only play. With
+`--init-from` a state and `--selfplay-average`, a fixed teacher plays its own self-play settings'
+games, for a dataset that students and architectures train on from disk instead of from live
+self-play:
+
+```bash
+T=~/.cache/turbozero/othello/solo8x128/s14t-s13te340-lr2e6-511s-solve20-past3.5-tandem4x64-5e5
+uv run examples/othello/train.py --net resnet:8x128,pool_every=2,heads=pooled,pool_channels=32,norm=channel,layout=pre \
+    --init-from $T/state-380.npz --fork-into 8x128 --init-without-buffers \
+    --train-steps 0 --average-epochs 4 --selfplay-average 4 \
+    --sims 511 --playout-cap 0.25:127 --tree-factor 4 --advance-every 128 --selfplay-cycles 33280 \
+    --solve-empties 20 --solve-play-past 3.5 --engine-eval-every 0 \
+    --epochs 160 --ckpt-dir runs/teacher --log-moves runs/teacher/moves
+uv run examples/othello/teacher_dataset.py build --moves runs/teacher/moves --out runs/dataset \
+    --solve-empties 20 --threads 8
+```
+
+`build` puts the games back together, drops those the run ended in the middle of, and labels
+every position with its game's exact result for the player to move: positions with 20 empties or
+fewer are each solved on the CPU (win, draw or loss, about 37 ms of a core each), and those before
+a game's first one take its result, as self-play's exact labels do. It holds out whole games
+(`--heldout`, 3% by default). The dataset is a directory of columns, a `.npy` per field and a row
+per position, game by game (see `COLUMNS` in `teacher_dataset.py`), so a later relabelling (e.g.
+a deeper search of some positions) is another column beside them. `distill.py train --data DATASET
+--heldout DATASET` trains on its training games' full searches and measures on its held-out ones;
+`--all-positions`, `--min-empties` and `--max-empties` change which positions.
 
 ### The run controller
 
@@ -977,11 +1013,46 @@ collects its own few leaves, evaluates them on its own core while the others car
 up, the tree shared under a lock. The batch above waits on its slowest stream, and goes through Python,
 at every step; here the network's time is 90-97% of the search's. `backend=native` evaluates with
 `cpu_net.py`'s network, our own int8 convolutions with float between them, a leaf at a time, so each
-thread needs only one leaf in flight. The library is built for a standard x86-64 level, as engines
-ship builds for: AVX-512 with VNNI (x86-64-v4) where the CPU has them, else AVX2 (x86-64-v3), whose
-kernel sums exactly what VNNI does at about a quarter of the speed; `TURBOZERO_X86_LEVEL=v3` plays as
-an AVX2 build would. Build it once a network, calibrated as `quantize.py`
-is:
+thread needs only one leaf in flight. The library is built for a standard level of the CPU's
+architecture, as engines ship builds for (`native_target.py`). On x86: AVX-512 with VNNI (x86-64-v4)
+where the CPU has them, else AVX2 (x86-64-v3), with AVX-VNNI where the CPU has it (Intel's client
+chips from Alder Lake, which lack AVX-512). On ARM: ARMv8.2 with the dot product and the 8-bit matrix
+multiply (i8mm: Apple's M2 on, Graviton 3 on, Axion), else with the dot product alone (Apple's M1,
+Graviton 2). `TURBOZERO_CPU_LEVEL` (`v4`, `v3-vnni`, `v3`, `arm-i8mm`, `arm-dotprod`) picks one,
+e.g. to play as an AVX2 build would. Every kernel sums exactly the same integers:
+
+- AVX2's 3x3 convolutions run Winograd's F(2x2, 3x3) in integers: each 2x2 tile's 4x4 input patch and
+  the weights are transformed into values that fit 16 bits, multiplied in pairs summed into 32 bits,
+  and transformed back, in 16 products where the direct convolution takes 36.
+- NEON's multiply signed bytes: the inputs go in less 128, and 128 times each output's weight sum is
+  added back. `sdot` takes 4 channels of a square against 4 outputs' weights; i8mm's `smmla` takes 8
+  channels of two neighbouring squares against two outputs' weights, twice the products an instruction,
+  from the input laid out in such pairs.
+
+Evals a second on one core, a leaf at a time:
+
+| Core, kernel | 8x128 | 4x64 |
+|---|---|---|
+| Zen 5, AVX-512 VNNI | 3615 | 22264 |
+| Zen 5, AVX2 Winograd (a direct 16-bit kernel) | 1729 (933) | 11618 (6650) |
+| Axion (Neoverse V2), i8mm (`sdot`) | 1442 (974) | 7868 (5931) |
+| Apple M4, i8mm (`sdot`) | 1450 (1490) | 9330 (9690) |
+
+Our engine's seconds a game over the engine's, at the visits that tie with each level on Zen 5 (the
+8 pairings of Edax and Egaroucid at levels 20 and 24 with 8x128 and 4x64 nets, 4 threads a side, whole
+cores):
+
+| Machine, our build | Against Edax | Against Egaroucid |
+|---|---|---|
+| Zen 5 (EPYC 9B45), AVX-512 | 0.89-1.05 | 0.89-1.02 |
+| Zen 3 (EPYC 7B13), AVX2 Winograd (direct 16-bit) | 1.92-2.34 (3.29-4.61) | 2.06-2.43 (3.60-4.25) |
+| Axion, i8mm (`sdot`) | 1.34-1.61 (1.94-2.35) | 0.84-1.08 (1.20-1.43) |
+| Apple M4 (MacBook Air, in use during the run), i8mm | 2.08-2.72 | 2.10-2.58 |
+
+Egaroucid's SIMD is x86's: on ARM it runs its generic build, as it ships for Apple's chips. The
+engines' branchy search runs best on Apple's cores (Edax at level 20 1.9 s a game, Zen 5 2.0-2.3,
+Axion 2.6), while the network's 128-bit NEON doesn't, so the M4 is our worst case.
+Build it once a network, calibrated as `quantize.py` is:
 
 ```
 uv run examples/othello/cpu_net.py --net 8x128-128s-8p-w1125-274m --positions LEAVES/calibration.npy
@@ -1045,7 +1116,7 @@ Edax spent 0.03 s a game on the last 23 empty squares, the net 1.6 s, but the ga
 earlier: solved exactly, perfect play from 24 empties would have scored 36% instead of 34% (100
 games), and from 28, 37.5%. The net gives up about 5 discs from 24 empties, and rarely the result.
 
-Below AVX2 the library builds without the native network, and `Engine` runs OpenVINO.
+Below AVX2 (or the dot product on ARM) the library builds without the native network, and `Engine` runs OpenVINO.
 
 ### Solving the endgame
 

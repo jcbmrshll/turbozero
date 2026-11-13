@@ -16,7 +16,6 @@ synchro match, by the two games' disc results together (see `pair_summary`).
 
 import itertools
 import math
-import os
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -41,6 +40,7 @@ from ggs import (
     disc_result,
     game_result,
 )
+from native_target import cpus
 
 # seconds past the clock that don't lose a game: an engine that plans its whole clock can pass
 # it by milliseconds, the pipes and the operating system's doing as much as its own
@@ -121,7 +121,7 @@ def endgame_solve(exact: bool) -> Solve:
     or with `exact` False, about ten times faster, a margin whose sign alone is right."""
     from endgame import Solver
 
-    solver = Solver(threads=len(os.sched_getaffinity(0)))
+    solver = Solver(threads=len(cpus()))
 
     def solve(me: int, opp: int) -> int:
         solved = solver.solve(me, opp, exact=exact)
@@ -367,11 +367,11 @@ def net_player(options: dict[str, str]) -> Callable[[], Player]:
     if options.get("device", "cpu") == "gpu":
         from gpu_play import player_factory
 
-        cores = int(options.pop("threads", len(os.sched_getaffinity(0))))
+        cores = int(options.pop("threads", len(cpus())))
         return player_factory(options, cores)
     options.pop("device", None)
     native = bool(int(options.pop("engine", 0)))
-    cores = int(options.pop("threads", len(os.sched_getaffinity(0))))
+    cores = int(options.pop("threads", len(cpus())))
     solving = None
     if "solve" in options:
         solving = Solving(
@@ -405,7 +405,7 @@ def player_maker(
     if name == "net":
         return net_player(options)
     engine_dir = Path(options["dir"]) if "dir" in options else default_dir(name)
-    threads = int(options.get("threads", len(os.sched_getaffinity(0))))
+    threads = int(options.get("threads", len(cpus())))
     args = options.get("args", "").split()
     if "level" in options:
         level = int(options["level"])

@@ -32,6 +32,7 @@ from cpu_search import (
     ort_session,
 )
 from export_onnx import export_checkpoint
+from native_target import cpus
 from quantize import quantized_path
 from xot import XOT_PATH, load_xot
 
@@ -237,6 +238,10 @@ class NetPlayer:
         self.gave_up = 0
         # the empties the game is solved from, planned on the game's clock at its first move
         self.solve_from: int | None = None
+        # what the last move() made of its position, for the player to move there: ("q", the
+        # search's root value, -1 to 1), ("margin", the solved final margin in discs), or
+        # ("wdl", a solve's sign only, with `exact` off); None if it didn't search
+        self.last_value: tuple[str, float] | None = None
 
     def sync(self, color: str) -> None:
         """Passes for the other color if `color` moves out of turn: the game passes for a player
@@ -267,6 +272,7 @@ class NetPlayer:
         if solved is None:
             self.gave_up += 1
             return None
+        self.last_value = ("margin" if solving.exact else "wdl", float(solved.margin))
         if not solving.exact and solved.margin < 0:
             return None
         self.solved += 1
@@ -286,6 +292,7 @@ class NetPlayer:
             )
         solve_from = self.solve_from or 0
         action = None
+        self.last_value = None
         if self.search.num_legal() == 1:
             action = self.search.first_legal()
         elif self.solving is not None and empties <= solve_from:
@@ -313,6 +320,7 @@ class NetPlayer:
             else:
                 timed_move(self.search, seconds, self.batch, self.evaluate)
             action = self.search.best_action()
+            self.last_value = ("q", self.search.root_q())
         self.search.play(action)
         return action
 
@@ -322,7 +330,7 @@ class NetPlayer:
 
 def speed(args: argparse.Namespace) -> None:
     """One game at a time against itself, reporting evals a second and where the time goes."""
-    cores = len(os.sched_getaffinity(0))
+    cores = len(cpus())
     evaluate = make_eval(args.net, args.backend, cores)
     pool = load_xot(XOT_PATH)
     rng = np.random.default_rng(args.seed)

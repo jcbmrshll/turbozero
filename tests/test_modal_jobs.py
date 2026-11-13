@@ -224,6 +224,7 @@ def test_parse_step_takes_a_local_command():
         ("examples/othello/train.py > ~/.cache/turbozero/l", "--ckpt-dir"),
         ("examples/othello/train.py --ckpt-dir /tmp/c > ~/.cache/turbozero/l", "wouldn't come back"),
         ("examples/othello/train.py --resume --ckpt-dir ~/.cache/turbozero/c > ~/.cache/turbozero/l", "--resume"),
+        ("examples/othello/train.py --log-moves ~/.cache/turbozero/m --ckpt-dir ~/.cache/turbozero/c > ~/.cache/turbozero/l", "local runs"),
         (
             "examples/othello/train.py --init-from ~/.cache/turbozero/dir --ckpt-dir ~/.cache/turbozero/c > ~/.cache/turbozero/l",
             "state-<EPOCH>",

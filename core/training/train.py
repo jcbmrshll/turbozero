@@ -21,6 +21,18 @@ from seaglass.client import to_number
 from core.common import step_env_and_evaluator, step_with_output
 from core.evaluators.evaluator import Evaluator
 from core.evaluators.mcts.mcts import MCTS
+from core.memory.move_log import (
+    ENDED,
+    GOES_ON,
+    STOPPED,
+    TRUNCATED,
+    LoggedMove,
+    MoveLog,
+    MoveLogWriter,
+    emptied,
+    init_move_log,
+    log_move,
+)
 from core.memory.replay_memory import (
     BaseExperience,
     DataTransformFn,
@@ -86,6 +98,8 @@ class CollectionState:
             without resignation
         pending: each environment's positions waiting for exact solves (see `Trainer`'s
             `endgame_solve`), None without
+        move_log: each environment's moves since the end of the last epoch's self-play (see
+            `Trainer`'s `log_moves`), None without. Not part of a saved state
     """
 
     eval_state: Any
@@ -103,6 +117,7 @@ class CollectionState:
     tree_written_at: jax.Array | None = None
     resign_state: ResignState | None = None
     pending: PendingSolves | None = None
+    move_log: MoveLog | None = None
 
 
 @dataclass(frozen=True)
@@ -661,9 +676,11 @@ class Trainer:
         growth: Growth | None = None,
         waiting_train_steps: int | None = None,
         train_retired: bool = False,
+        train_playing: bool = True,
         averages: Sequence[float] = (),
         selfplay_average: float | None = None,
         average_warmup: float = 10.0,
+        log_moves: str | None = None,
         extra_config: dict | None = None,
     ):
         """Initializes a Trainer.
@@ -674,7 +691,9 @@ class Trainer:
             warmup_steps: # of steps (per batch) to collect via self-play prior to entering the training loop.
                 - This is used to populate the replay memory with some initial samples
             collection_steps_per_epoch: # of steps (per batch) to collect via self-play in each epoch
-            train_steps_per_epoch: # of training steps to take in each epoch
+            train_steps_per_epoch: # of training steps to take in each epoch. 0 trains nothing:
+                the networks, their weight averages and their testers stay as they are, and
+                self-play is all an epoch does (e.g. a fixed network's games, with `log_moves`)
             nn: neural network (an equinox module, see core.networks.utils.apply_nn), training starts from its parameters
             loss_fn: loss function for training (see core.training.loss_fns)
             optimizer: optax optimizer. Wrap it in `optax.inject_hyperparams` to have its hyperparameters
@@ -798,6 +817,10 @@ class Trainer:
                 games (not compute-optimal). Not part of a saved state: a run or branch turns
                 it on or off from any state, and a retired network takes up its training where
                 it left it
+            train_playing: (optional) with `growth`, whether the network playing self-play
+                trains (default) or stays as it is, weights and weight averages: a fixed teacher
+                whose games the networks before it learn from with `train_retired`. Not part of
+                a saved state, as `train_retired`
             averages: (optional) horizons, in epochs, of averages of each network's weights
                 (as KataGo plays and rates averaged weights while training at a constant learning
                 rate): after each epoch a network trains, each of its averages moves towards its
@@ -814,6 +837,11 @@ class Trainer:
             average_warmup: the epochs an average takes in for each epoch its horizon grows
                 by, from 1 to its own (see `average_share`); 1 makes it the plain mean of the
                 epochs so far until its horizon
+            log_moves: (optional) a directory to keep every move self-play plays in, whether
+                its search trains or not, an epoch's moves to a file (see
+                `core.memory.move_log`). It doesn't change training. A new directory, or one
+                without moves: the log isn't saved with the training state, so a run that keeps
+                its moves doesn't continue into the same directory
             extra_config: (optional) extra config to record with the monitor's run
         """
         # environment
@@ -891,6 +919,14 @@ class Trainer:
         )
         # training
         self.train_steps_per_epoch = train_steps_per_epoch
+        if train_steps_per_epoch == 0 and (
+            lr_plateau is not None or growth is not None
+        ):
+            raise ValueError("lr_plateau and growth need training steps")
+        if log_moves is not None and warmup_steps:
+            raise ValueError("log_moves doesn't go with warmup_steps")
+        self.log_moves = log_moves
+        self.move_log_writer: MoveLogWriter | None = None
         self.train_batch_size = train_batch_size
         if grad_accum_steps < 1 or train_batch_size % grad_accum_steps:
             raise ValueError(
@@ -924,6 +960,15 @@ class Trainer:
         if train_retired and growth is None:
             raise ValueError("train_retired is for a run with growth")
         self.train_retired = train_retired
+        if not train_playing and growth is None:
+            raise ValueError(
+                "a network that plays without training is for a run with growth"
+            )
+        if not train_playing and lr_plateau is not None:
+            raise ValueError(
+                "the learning rate rule follows the network playing, which doesn't train"
+            )
+        self.train_playing = train_playing
         # testing
         self.testers = testers
         if evaluator_test is None:
@@ -1090,6 +1135,7 @@ class Trainer:
                 else {}
             ),
             **({"train_retired": True} if self.train_retired else {}),
+            **({"train_playing": False} if not self.train_playing else {}),
             "max_episode_steps": self.max_episode_steps,
             "nn": self.nn.__class__.__name__,
             "nn_params": sum(
@@ -1416,6 +1462,31 @@ class Trainer:
             state = self.store_tree_positions(
                 tree_key, state, searched_eval_state, reused, evaluator, valid=stored
             )
+        move_log = state.move_log
+        if move_log is not None:
+            move_log = log_move(
+                move_log,
+                LoggedMove(
+                    observation=self.state_to_nn_input_fn(state.env_state),
+                    policy=eval_output.policy_weights,
+                    legal=state.metadata.action_mask,
+                    value=search_value,
+                    action=jnp.where(stopped, -1, eval_output.action),
+                    player=state.metadata.cur_player_id,
+                    full=evaluator.trains_on(state.eval_state),
+                    ply=state.metadata.step,
+                    game=jnp.zeros((), jnp.int32),
+                    end=jnp.select(
+                        [terminated, stopped, truncated],
+                        [ENDED, STOPPED, TRUNCATED],
+                        GOES_ON,
+                    ),
+                    result=jnp.where(
+                        terminated, rewards[state.metadata.cur_player_id], 0.0
+                    ),
+                ),
+                done,
+            )
         # return new collection state
         return replace(
             state,
@@ -1434,6 +1505,7 @@ class Trainer:
             search_cycles=jnp.where(done, 0, state.search_cycles),
             resign_state=resign_state,
             pending=pending,
+            move_log=move_log,
         )
 
     def collect(
@@ -2477,7 +2549,8 @@ class Trainer:
             raise ValueError("can't save a training state without its rng (`key`)")
         parts = {
             "train_states": state.train_states,
-            "collection_state": state.collection_state,
+            # without the move log (see `log_moves`)
+            "collection_state": replace(state.collection_state, move_log=None),
             "test_states": state.test_states,
             # with `averages`, the weight averages and how many epochs they hold
             **({"averages": state.averages} if state.averages else {}),
@@ -3069,7 +3142,7 @@ class Trainer:
                     raise ValueError(f"{path} has no collection state{leaf_path}")
                 return saved[f"collection_state.{index[leaf_path]}"]
 
-            stats = {
+            stats: dict[str, Any] = {
                 name: _to_device(get(f".{name}"))
                 for name in (
                     "episodes",
@@ -3162,22 +3235,24 @@ class Trainer:
     def fork_averages(
         self, path: str, into: int, name: str | None = None
     ) -> tuple[tuple[Any, ...], int] | None:
-        """The weight averages of the network a fork takes from a saved growth run's state (see
-        `fork_state`: network `name`, by default network `into`'s name), and the epochs in
-        them, if it saved this trainer's horizons; else None, and the fork starts them at the
-        network's weights."""
+        """The weight averages of the network a fork takes from a saved state (see `fork_state`):
+        a growth run's network `name` (by default network `into`'s name), or a run without
+        growth's one network; and the epochs in them. None if the state has no averages over
+        this trainer's horizons, and the fork starts them at the network's weights."""
         meta = read_state_meta(path)
         info = meta.get("averages")
-        if meta["growth"] is None or not self.averages or info is None:
+        if not self.averages or info is None or info["horizons"] != list(self.averages):
             return None
-        if info["horizons"] != list(self.averages):
-            return None
-        index = saved_network_names(meta).index(name or self.learners[into].name)
-        params = jax.eval_shape(partial(self.init_train_state, into)).params
+        template = tuple(
+            jax.eval_shape(partial(self.init_train_state, into)).params
+            for _ in self.averages
+        )
         with np.load(path) as saved:
-            averages = self._load_network(
-                saved, meta, "averages", index, tuple(params for _ in self.averages)
-            )
+            if meta["growth"] is None:
+                (averages,) = self._load_part(saved, meta, "averages", (template,))
+                return averages, int(info["averaged"][0])
+            index = saved_network_names(meta).index(name or self.learners[into].name)
+            averages = self._load_network(saved, meta, "averages", index, template)
         return averages, int(info["averaged"][index])
 
     def _check_meta(self, path: str, meta: dict) -> dict:
@@ -3297,6 +3372,31 @@ class Trainer:
         """
         env_state, _ = self.env_init_fn(jax.random.PRNGKey(0))
         return env_state
+
+    def move_log_length(self) -> int:
+        """The rows an environment's move log needs (see `log_moves`): the most moves it can play
+        in an epoch's self-play, one each time moves are played (see `collect_steps`), with any of
+        the schedule's evaluators."""
+        return max(
+            self.collection_steps_per_epoch
+            * evaluator.search_cycles()
+            // (
+                evaluator.search_cycles()
+                if self.advance_every is None
+                else self.advance_every
+            )
+            for _, evaluator in self.collection_schedule.stages
+        )
+
+    def init_move_log(self) -> MoveLog:
+        """Empty move logs (see `log_moves`), one per environment."""
+        template = self.make_template_experience()
+        return init_move_log(
+            self.batch_size,
+            self.move_log_length(),
+            template.observation_nn,
+            template.policy_weights.shape[-1],
+        )
 
     def make_template_experience(self) -> BaseExperience:
         """Create a template experience used for initializing data structures that hold experiences to the correct shape.
@@ -3449,7 +3549,7 @@ class Trainer:
         )
 
     @staticmethod
-    def init_moves(key: jax.Array, batch_size: int) -> dict[str, jax.Array]:
+    def init_moves(key: jax.Array, batch_size: int) -> dict[str, Any]:
         """`CollectionState`'s moves in progress, for `batch_size` environments: none, so each
         environment's first cycle starts one."""
         return {
@@ -3615,13 +3715,13 @@ class Trainer:
             fork_from: (optional) a saved state (see `save_state`), or a directory to take the
                 newest from, to fork a new run from. It's a run from scratch at epoch 0 (with its
                 own schedules, rng, games and testers), except that it starts with the saved
-                network and optimizer state (its learning rate schedule starting over), and its
-                replay buffers (see `fork_state`). The monitor run's config records it as
-                `parent`. Not with `initial_state`.
+                network, optimizer state (its learning rate schedule starting over) and weight
+                averages (see `fork_averages`), and its replay buffers (see `fork_state`). The
+                monitor run's config records it as `parent`. Not with `initial_state`.
             fork_replay_buffers: with `fork_from`, start with its replay buffers (default), or with
                 empty ones
             fork_into: (with `fork_from`) the name of the saved network to fork, from a growth
-                run's state too, with its weight averages. With `growth`, it forks into this
+                run's state too. With `growth`, it forks into this
                 run's network of that name: it plays from the run's start, those before it are
                 retired (training with `train_retired`), the next waits, and the rest start
                 from scratch. Without growth, it forks into the Trainer's own network (one
@@ -3631,7 +3731,7 @@ class Trainer:
                 directory to take the newest from: the network of that name starts from the saved
                 state's network of the same name (or its only one) instead of from scratch, with
                 its optimizer state, its step count and schedules back at 0 (see `warm_state`),
-                and from a growth run's state its weight averages (see `fork_averages`), e.g. a
+                and its weight averages (see `fork_averages`), e.g. a
                 student trained beside a forked teacher. Not the network a fork goes into
 
         Returns:
@@ -3701,6 +3801,11 @@ class Trainer:
                 # the last epoch
                 total=num_epochs - 1,
             )
+        self.move_log_writer = (
+            MoveLogWriter(self.log_moves, self.batch_size)
+            if self.log_moves is not None
+            else None
+        )
         try:
             output = self._train_loop(
                 seed,
@@ -3718,6 +3823,9 @@ class Trainer:
                     "stopped" if isinstance(e, KeyboardInterrupt) else "crashed"
                 )
             raise
+        finally:
+            if self.move_log_writer is not None:
+                self.move_log_writer.close()
         if self.monitor is not None:
             self.monitor.finish()
         return output
@@ -3839,7 +3947,7 @@ class Trainer:
         else:
             averages = [self.fresh_averages(ts) for ts in train_states]
             averaged = [0] * num_learners
-            if fork_from is not None and fork_into is not None:
+            if fork_from is not None:
                 saved_averages = self.fork_averages(fork_from, into, fork_into)
                 if saved_averages is not None:
                     averages[into], averaged[into] = saved_averages
@@ -3852,11 +3960,18 @@ class Trainer:
             return growth.playing if growth is not None else 0
 
         def training_now() -> tuple[int, ...]:
+            if self.train_steps_per_epoch == 0:
+                return ()
             if growth is None or self.growth is None:
                 return (0,)
-            # the growth rule's (the one playing, and the next), and those retired before it
+            # the growth rule's (the one playing, and the next), and those retired before it;
+            # the one playing only if it trains
             retired = range(growth.playing) if self.train_retired else ()
-            return (*retired, *self.growth.training(growth))
+            return tuple(
+                i
+                for i in (*retired, *self.growth.training(growth))
+                if self.train_playing or i != growth.playing
+            )
 
         def state_now() -> TrainLoopOutput:
             return TrainLoopOutput(
@@ -3877,6 +3992,8 @@ class Trainer:
                 return text
             return f"{text} ({self.learners[learner].name})"
 
+        if self.move_log_writer is not None:
+            collection_state = replace(collection_state, move_log=self.init_move_log())
         evaluator, collection_state = self.follow_schedule(
             cur_epoch, evaluator, collection_state, playing_now()
         )
@@ -3921,7 +4038,7 @@ class Trainer:
             before = CollectionStats.of(collection_state)
             fresh_from = (
                 jnp.copy(collection_state.buffer_state.next_idx)
-                if self.fresh_positions
+                if self.fresh_positions and playing in training
                 else None
             )
             # the positions waiting for exact solves are solved on the host from the end of one
@@ -3969,6 +4086,12 @@ class Trainer:
                         collection_state, solved[-1]
                     )
                 solve_metrics = solve_summary(solved, waited)
+            if self.move_log_writer is not None:
+                assert collection_state.move_log is not None
+                self.move_log_writer.write(cur_epoch, collection_state.move_log)
+                collection_state = replace(
+                    collection_state, move_log=emptied(collection_state.move_log)
+                )
             collection_metrics = {
                 **self.collection_metrics(before, collection_state),
                 **solve_metrics,
@@ -4013,9 +4136,10 @@ class Trainer:
                 train_key, key = jax.random.split(key)
                 # epochs it has played before this one (without growth, the run's)
                 played = growth.played[i] if growth is not None else cur_epoch
-                lr_scale = (
-                    self.lr_drop.scale(played) if self.lr_drop is not None else None
-                )
+                # its learning rate: its own multiple of the optimizer's, and the drop's
+                drop = self.lr_drop.scale(played) if self.lr_drop is not None else None
+                own = self.learners[i].lr_scale
+                lr_scale = None if drop is None and own == 1.0 else (drop or 1.0) * own
                 collection_state, train_states[i], train_metrics[i] = self.train_steps(
                     train_key,
                     collection_state,
@@ -4063,7 +4187,7 @@ class Trainer:
                             grad_sq > 0, tr_sigma / grad_sq, jnp.inf
                         ),
                     }
-            if fresh_metrics:
+            if fresh_metrics and playing in train_metrics:
                 train_metrics[playing] = {**train_metrics[playing], **fresh_metrics}
             # the learning rate rule follows the network playing
             stop = False
@@ -4278,5 +4402,7 @@ class Trainer:
 
         if solver is not None:
             solver.shutdown()
+        if self.move_log_writer is not None:
+            self.move_log_writer.flush()
         # return state so that training can be continued!
         return state_now()

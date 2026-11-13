@@ -40,6 +40,10 @@ With --lr-plateau, the learning rate drops when the training loss stops improvin
 from --lr to each of its rates in turn, --epochs only capping the run (see README.md):
 
     uv run examples/othello/train.py --epochs 600 --lr-plateau --save-state-every 10 --ckpt-dir runs/plateau
+
+With --log-moves, every move self-play plays is kept on disk too, for teacher_dataset.py to make
+a dataset of whole games from; --train-steps 0 plays a fixed network's games without training it
+(see README.md).
 """
 
 import argparse
@@ -270,6 +274,14 @@ def main():
         "resumed or branched run can turn it on or off",
     )
     parser.add_argument(
+        "--grow-frozen",
+        action="store_true",
+        help="with --grow, the network playing self-play never trains, nor do its weight "
+        "averages move: a fixed teacher, e.g. a trained network forked into the last place "
+        "with --init-from and --fork-into, whose games the networks before it train on with "
+        "--grow-train-retired",
+    )
+    parser.add_argument(
         "--grow-train-steps",
         type=int,
         default=None,
@@ -305,6 +317,14 @@ def main():
         metavar="EPOCHS",
         help="with --grow, instead of --grow-metric's rule, the numbers of epochs done after "
         "which each network takes over, e.g. 80 (one per --grow)",
+    )
+    parser.add_argument(
+        "--grow-lr",
+        type=float,
+        default=None,
+        metavar="LR",
+        help="the --grow networks' learning rate, where --lr is the first network's (their "
+        "schedules are --lr's, scaled by --grow-lr / --lr); default --lr",
     )
     parser.add_argument(
         "--grow-manual",
@@ -482,7 +502,11 @@ def main():
         "network, see --remat and --grad-accum, which keep the batch",
     )
     parser.add_argument(
-        "--train-steps", type=int, default=256, help="training steps per epoch"
+        "--train-steps",
+        type=int,
+        default=256,
+        help="training steps per epoch. 0 trains nothing: the network (and its weight "
+        "averages) only plays, e.g. a fixed teacher's games for --log-moves",
     )
     parser.add_argument(
         "--remat",
@@ -805,6 +829,15 @@ def main():
         help="also save the whole training state every N epochs, keeping the newest, to "
         "continue the run with --resume if it stops",
     )
+    parser.add_argument(
+        "--log-moves",
+        default=None,
+        metavar="DIR",
+        help="also keep every move self-play plays, fast searches' too, in DIR (a new "
+        "directory) as moves-<EPOCH>.npy, for teacher_dataset.py: about 180 bytes a move. "
+        "Training isn't changed. The log isn't in saved states: a run that keeps its moves "
+        "doesn't --resume into the same DIR",
+    )
     init = parser.add_mutually_exclusive_group()
     init.add_argument(
         "--init-from",
@@ -813,7 +846,7 @@ def main():
         help="fork a new run from a saved state (state-<EPOCH>.npz, or a --ckpt-dir to take "
         "the newest from): it starts at epoch 0, with its own schedules, games and seed, "
         "from the saved network, optimizer state (the learning rate decaying anew from "
-        "--lr) and replay buffers. Needs the same --net; --buffer may "
+        "--lr), weight averages and replay buffers. Needs the same --net; --buffer may "
         "differ (each environment's newest entries are kept)",
     )
     parser.add_argument(
@@ -821,7 +854,7 @@ def main():
         default=None,
         metavar="SIZE",
         help="with --init-from: the saved run's network to fork, by size (e.g. 8x128), from a "
-        "--grow run's state too, with its weight averages. With --grow, it forks into this "
+        "--grow run's state too. With --grow, it forks into this "
         "run's network of that size, which plays from the start; the ones before it are retired "
         "(training beside it with --grow-train-retired), the next waits, and the rest start from "
         "scratch. Without --grow, it is this run's --net, trained alone",
@@ -835,7 +868,7 @@ def main():
         help="with --grow, in a new run: this run's network of that size (e.g. 4x64) starts from "
         "a saved state's (state-<EPOCH>.npz, or a --ckpt-dir to take the newest from; a --grow "
         "run's network of that size, or a run's one network) instead of from scratch, with its "
-        "optimizer state (the learning rate decaying anew) and a --grow run's weight averages, "
+        "optimizer state (the learning rate decaying anew) and weight averages, "
         "e.g. a student beside a teacher forked with --init-from and --fork-into. Repeatable; "
         "not the network --init-from forks into",
     )
@@ -911,6 +944,10 @@ def main():
         parser.error("--grow-train-steps is a positive number of steps, with --grow")
     if args.grow_train_retired and not args.grow:
         parser.error("--grow-train-retired is for a run with --grow")
+    if args.grow_frozen and not args.grow:
+        parser.error("--grow-frozen is for a run with --grow")
+    if args.grow_lr is not None and (not args.grow or args.grow_lr <= 0):
+        parser.error("--grow-lr is a positive learning rate, with --grow")
     if any(h < 1 for h in args.average_epochs) or len(set(args.average_epochs)) != len(
         args.average_epochs
     ):
@@ -1134,6 +1171,7 @@ def main():
                         make_nn_eval_fn(grown, state_to_nn_input)
                     ),
                     testers=make_testers(grown),
+                    lr_scale=1.0 if args.grow_lr is None else args.grow_lr / args.lr,
                 )
             )
         try:
@@ -1204,6 +1242,7 @@ def main():
         growth=growth,
         waiting_train_steps=args.grow_train_steps,
         train_retired=args.grow_train_retired,
+        train_playing=not args.grow_frozen,
         averages=args.average_epochs,
         selfplay_average=args.selfplay_average,
         average_warmup=args.average_warmup,
@@ -1242,6 +1281,7 @@ def main():
         endgame_solve=endgame_solve,
         save_state_at=args.save_state_at,
         save_state_every=args.save_state_every,
+        log_moves=args.log_moves,
         # every argument but how the run starts (a fork or branch records its parent)
         extra_config={
             "args": {
