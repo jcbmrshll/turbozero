@@ -34,6 +34,7 @@ import itertools
 import json
 import math
 import os
+import sys
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -43,7 +44,9 @@ from typing import Protocol
 
 # a CPU script: JAX would otherwise take the GPU's memory, and the league would give way
 if __name__ == "__main__":
-    os.environ.setdefault("JAX_PLATFORMS", "cpu")
+    # unless a player is on the GPU (see `net_player`)
+    if "device=gpu" not in " ".join(sys.argv):
+        os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import numpy as np
 from engines import CLOCKED, ENGINES, Board, ClockedEgaroucid, Egaroucid, GTPEngine
@@ -386,11 +389,22 @@ def net_player(options: dict[str, str]) -> Callable[[], Player]:
     evaluates at a time, and `threads`, the cores used, by default all it may run on. With
     `visits`, it searches so many a move, ignoring the clock. With `solve=N`, positions with N or
     fewer empties are solved on the same cores (see `cpu_match.Solving`), `solve_exact=1` for the
-    best margin, `solve_share` what of the clock left a solve may take."""
+    best margin, `solve_share` what of the clock left a solve may take.
+
+    With `device=gpu`, a GGS-only player (engine comparisons stay on CPU vector units): its tree
+    on the host, its leaves evaluated on the GPU many at a time (see `gpu_play.player_factory`
+    for its options), the endgame solved on `threads` CPU cores; all its games share one GPU
+    stream, as a synchro pair's two do."""
     from cpu_match import NetPlayer, Solving, make_engine, make_eval
     from cpu_match import Player as NetSpec
 
     options = dict(options)
+    if options.get("device", "cpu") == "gpu":
+        from gpu_play import player_factory
+
+        cores = int(options.pop("threads", len(os.sched_getaffinity(0))))
+        return player_factory(options, cores)
+    options.pop("device", None)
     native = bool(int(options.pop("engine", 0)))
     cores = int(options.pop("threads", len(os.sched_getaffinity(0))))
     solving = None

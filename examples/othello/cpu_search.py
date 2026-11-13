@@ -98,6 +98,17 @@ def load_library() -> ctypes.CDLL:
         "search_remaining": (ctypes.c_int, [Search]),
         "search_collect": (ctypes.c_int, [Search, ctypes.c_int, ctypes.c_void_p]),
         "search_apply": (None, [Search, ctypes.c_void_p, ctypes.c_void_p]),
+        "batch_new": (ctypes.c_void_p, []),
+        "batch_free": (None, [ctypes.c_void_p]),
+        "search_collect_into": (
+            ctypes.c_int,
+            [Search, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p],
+        ),
+        "search_apply_from": (
+            None,
+            [Search, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p],
+        ),
+        "search_ended_in_a_row": (ctypes.c_int, [Search]),
         "search_num_legal": (ctypes.c_int, [Search]),
         "search_first_legal": (ctypes.c_int, [Search]),
         "search_best_action": (ctypes.c_int, [Search]),
@@ -248,6 +259,36 @@ class Search:
             logits, values = evaluate(batch[:count])
             self.apply(logits, values)
 
+    def collect_into(self, batch: "Batch", count: int, out: np.ndarray) -> int:
+        """`collect`, of up to `count` leaves, into a `Batch` of the caller's: several can be
+        out for evaluation at once, each applied (`apply_from`) when its evaluation comes back,
+        in any order. `out` is C-contiguous float32 with room for `count`."""
+        assert out.dtype == np.float32 and out.flags.c_contiguous and len(out) >= count
+        return LIB.search_collect_into(
+            self.handle, batch.handle, count, out.ctypes.data_as(ctypes.c_void_p)
+        )
+
+    def apply_from(
+        self, batch: "Batch", logits: np.ndarray | None, values: np.ndarray | None
+    ) -> None:
+        """The evaluations of what `collect_into` put in `batch`, (leaves, 65) and (leaves)
+        float32, C-contiguous; None for a batch of no leaves (it may still hold collisions)."""
+        if logits is None or values is None:
+            LIB.search_apply_from(self.handle, batch.handle, None, None)
+            return
+        logits = np.ascontiguousarray(logits, np.float32)
+        values = np.ascontiguousarray(values, np.float32)
+        LIB.search_apply_from(
+            self.handle,
+            batch.handle,
+            logits.ctypes.data_as(ctypes.c_void_p),
+            values.ctypes.data_as(ctypes.c_void_p),
+        )
+
+    def ended_in_a_row(self) -> int:
+        """Traversals in a row, to now, that ended the game with no leaf between."""
+        return LIB.search_ended_in_a_row(self.handle)
+
     def best_action(self) -> int:
         """The most visited action."""
         return LIB.search_best_action(self.handle)
@@ -315,6 +356,18 @@ class Search:
         """Leaves that took an evaluation from elsewhere in the tree, of the same position reached
         by another order of moves, rather than the network's."""
         return LIB.search_reused(self.handle)
+
+
+class Batch:
+    """The traversals of one collection of a `Search`'s, until their evaluations are applied:
+    see `Search.collect_into`."""
+
+    def __init__(self) -> None:
+        self.handle = LIB.batch_new()
+
+    def __del__(self) -> None:
+        if getattr(self, "handle", None):
+            LIB.batch_free(self.handle)
 
 
 class Engine:
