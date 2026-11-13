@@ -1,5 +1,5 @@
-"""A network on the GPU for play: JAX, jitted once for each of a few batch sizes, evaluating
-`cpu_search.py`'s observations, (batch, 2, 8, 8) float32, as `Eval` takes them.
+"""A network on the GPU for play: JAX, compiled once for each of a few batch sizes, evaluating
+`cpu_search.py`'s positions packed, two 64-bit words each (or its observations, as `Eval`).
 
     uv run --extra cuda examples/othello/gpu_net.py --net NAME --batch 1 64 256 1024
     uv run --extra cuda examples/othello/gpu_net.py --spec resnet:10x192,... --batch 256
@@ -40,7 +40,9 @@ class Pending:
 class GpuNet:
     """A network's inference on the default JAX device, in the dtype it was made to compute in
     (`make_network`'s `inference_dtype`: "bfloat16", or "float32", whose convolutions use TF32
-    on the GPU, as JAX's default precision does)."""
+    on the GPU, as JAX's default precision does). It takes positions packed, as
+    `Search.collect_bits` writes them, (n, 2) uint64: 16 bytes a position to the GPU, unpacked
+    there, rather than 128 floats."""
 
     def __init__(self, network, state, sizes: tuple[int, ...] = DEFAULT_SIZES):
         import equinox as eqx
@@ -54,13 +56,21 @@ class GpuNet:
         model = jax.device_put(eqx.nn.inference_mode(network))
         state = jax.device_put(state)
 
-        def forward(x):
-            x = jnp.moveaxis(x, 1, -1)
-            (policy, value), _ = apply_nn(model, state, x)
+        def forward(words):
+            # (n, 4) uint32, each position's two words in halves, the low first: bit i of a
+            # plane is bit i % 32 of its half i // 32
+            shifts = jnp.arange(32, dtype=jnp.uint32)
+            bits = (words.reshape(-1, 2, 2, 1) >> shifts) & 1
+            x = bits.reshape(-1, 2, 8, 8).astype(jnp.float32)
+            (policy, value), _ = apply_nn(model, state, jnp.moveaxis(x, 1, -1))
             return policy.astype(jnp.float32), value.reshape(-1).astype(jnp.float32)
 
-        self.forward = jax.jit(forward)
-        self.jax = jax
+        jitted = jax.jit(forward)
+        # compiled ahead for each size: a call skips jit's dispatch of a traced function
+        self.compiled = {
+            size: jitted.lower(jax.ShapeDtypeStruct((size, 4), jnp.uint32)).compile()
+            for size in self.sizes
+        }
 
     @classmethod
     def load(cls, name: str, dtype: str = "bfloat16", **kwargs) -> "GpuNet":
@@ -83,24 +93,26 @@ class GpuNet:
         return cls(network, state, **kwargs)
 
     def warm(self) -> None:
-        """Compiles every size."""
+        """Runs every size once."""
         for size in self.sizes:
-            self.wait(self.launch(np.zeros((size, 2, 8, 8), np.float32)))
+            self.wait(self.launch(np.zeros((size, 2), np.uint64), size))
 
-    def launch(self, x: np.ndarray) -> Pending:
-        """Starts evaluating `x`, at most the largest size, padded to a size compiled."""
-        count = len(x)
+    def launch(self, bits: np.ndarray, count: int | None = None) -> Pending:
+        """Starts evaluating the first `count` (by default all) of `bits`, packed positions,
+        (n, 2) uint64, at most the largest size. The call is the least size compiled holding
+        them: rows of `bits` past `count` up to it are evaluated too, whatever they hold, and
+        their outputs dropped, so a caller filling a buffer of the largest size passes it whole,
+        with no copy. JAX may read `bits` after this returns: the caller mustn't reuse it."""
+        count = len(bits) if count is None else count
         size = bucket(count, self.sizes)
         if count > size:
             raise ValueError(f"{count} positions, more than the largest size {size}")
-        if count < size:
-            padded = np.zeros((size, 2, 8, 8), np.float32)
-            padded[:count] = x
-            x = padded
-        else:
-            # JAX may read the host buffer after the call returns: a copy the caller can't reuse
-            x = np.array(x, np.float32, copy=True)
-        return Pending(self.forward(x), count)
+        if len(bits) < size:
+            padded = np.zeros((size, 2), np.uint64)
+            padded[:count] = bits[:count]
+            bits = padded
+        words = np.ascontiguousarray(bits[:size]).view(np.uint32)
+        return Pending(self.compiled[size](words), count)
 
     def wait(self, pending: Pending) -> tuple[np.ndarray, np.ndarray]:
         """A launched call's (count, 65) policy logits and (count) values."""
@@ -109,12 +121,18 @@ class GpuNet:
         return np.asarray(policy)[:count], np.asarray(value)[:count]
 
     def __call__(self, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """`Eval`: evaluated at once, split into calls of the largest size."""
+        """`Eval`, of (n, 2, 8, 8) observations: packed, evaluated at once in calls of the
+        largest size."""
+        from cpu_search import pack
+
+        bits = pack(x)
         largest = self.sizes[-1]
-        if len(x) <= largest:
-            return self.wait(self.launch(x))
-        calls = [self.launch(x[i : i + largest]) for i in range(0, len(x), largest)]
+        calls = [
+            self.launch(bits[i : i + largest]) for i in range(0, len(bits), largest)
+        ]
         parts = [self.wait(p) for p in calls]
+        if not parts:
+            return np.empty((0, 65), np.float32), np.empty((0,), np.float32)
         return np.concatenate([p[0] for p in parts]), np.concatenate(
             [p[1] for p in parts]
         )
@@ -124,10 +142,13 @@ def throughput(
     net: GpuNet, size: int, inflight: int, seconds: float = 1.5
 ) -> dict[str, float]:
     """Positions a second at batch `size` with `inflight` calls queued, and a call's latency
-    alone. Inputs are random boards: the time doesn't depend on them."""
+    alone, each call's input sent from the host as in play. Inputs are random boards: the time
+    doesn't depend on them."""
+    from cpu_search import pack
+
     rng = np.random.default_rng(0)
     squares = rng.integers(0, 3, size=(size, 8, 8))
-    x = np.stack([squares == 1, squares == 2], axis=1).astype(np.float32)
+    x = pack(np.stack([squares == 1, squares == 2], axis=1))
     net.wait(net.launch(x))
     # latency: one call at a time
     start, calls = time.perf_counter(), 0

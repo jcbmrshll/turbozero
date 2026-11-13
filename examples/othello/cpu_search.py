@@ -108,6 +108,10 @@ def load_library() -> ctypes.CDLL:
             None,
             [Search, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p],
         ),
+        "search_collect_bits": (
+            ctypes.c_int,
+            [Search, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p],
+        ),
         "search_ended_in_a_row": (ctypes.c_int, [Search]),
         "search_num_legal": (ctypes.c_int, [Search]),
         "search_first_legal": (ctypes.c_int, [Search]),
@@ -268,6 +272,16 @@ class Search:
             self.handle, batch.handle, count, out.ctypes.data_as(ctypes.c_void_p)
         )
 
+    def collect_bits(self, batch: "Batch", count: int, out: np.ndarray) -> int:
+        """`collect_into`, each leaf's observation packed: `out`, C-contiguous uint64 with room
+        for `count` rows of two words, the discs of the player to move and the other's (bit i
+        the square of row i // 8, column i % 8; see `unpack`)."""
+        assert out.dtype == np.uint64 and out.flags.c_contiguous
+        assert out.shape[1:] == (2,) and len(out) >= count
+        return LIB.search_collect_bits(
+            self.handle, batch.handle, count, out.ctypes.data_as(ctypes.c_void_p)
+        )
+
     def apply_from(
         self, batch: "Batch", logits: np.ndarray | None, values: np.ndarray | None
     ) -> None:
@@ -356,6 +370,23 @@ class Search:
         """Leaves that took an evaluation from elsewhere in the tree, of the same position reached
         by another order of moves, rather than the network's."""
         return LIB.search_reused(self.handle)
+
+
+def pack(x: np.ndarray) -> np.ndarray:
+    """(n, 2, 8, 8) observations, 0 or 1, as `Search.collect_bits` writes them: (n, 2) uint64."""
+    flat = np.asarray(x).reshape(len(x), 2, 64) > 0.5
+    return (
+        np.packbits(flat, axis=-1, bitorder="little").view(np.uint64).reshape(len(x), 2)
+    )
+
+
+def unpack(bits: np.ndarray) -> np.ndarray:
+    """`pack`'s inverse: (n, 2) uint64 to (n, 2, 8, 8) float32."""
+    bytes_ = (
+        np.ascontiguousarray(bits, np.uint64).view(np.uint8).reshape(len(bits), 2, 8)
+    )
+    planes = np.unpackbits(bytes_, axis=-1, bitorder="little")
+    return planes.reshape(len(bits), 2, 8, 8).astype(np.float32)
 
 
 class Batch:

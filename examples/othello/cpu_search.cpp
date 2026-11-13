@@ -365,8 +365,10 @@ bool reuse_evaluation(Search& s, int32_t index) {
     return true;
 }
 
-// `search_collect`'s traversals, their paths kept in `b` until `apply`
-int collect(Search& s, Batch& b, int batch, float* out) {
+// `search_collect`'s traversals, their paths kept in `b` until `apply`; each leaf's observation written
+// to `out` as (2, 8, 8) floats, or with `bits`, to it as two words, the discs of the player to move and
+// of the other
+int collect(Search& s, Batch& b, int batch, float* out, uint64_t* bits = nullptr) {
     b.paths.clear();
     b.collisions.clear();
     b.leaf_ends.clear();
@@ -416,8 +418,13 @@ int collect(Search& s, Batch& b, int batch, float* out) {
             int symmetry = s.random_symmetry ? draw_symmetry(s) : 0;
             b.leaf_symmetries.push_back((uint8_t)symmetry);
             const Position& p = s.nodes[index].position;
-            write_observation(symmetric_bits(p.me, symmetry), symmetric_bits(p.opp, symmetry),
-                              out + (size_t)leaves * 128);
+            uint64_t me = symmetric_bits(p.me, symmetry), opp = symmetric_bits(p.opp, symmetry);
+            if (bits) {
+                bits[2 * (size_t)leaves] = me;
+                bits[2 * (size_t)leaves + 1] = opp;
+            } else {
+                write_observation(me, opp, out + (size_t)leaves * 128);
+            }
             leaves++;
             visits++;
             s.ended_in_a_row = 0;
@@ -544,6 +551,12 @@ void batch_free(Batch* b) { delete b; }
 
 // `search_collect` into `b`
 int search_collect_into(Search* s, Batch* b, int batch, float* out) { return collect(*s, *b, batch, out); }
+
+// `search_collect_into`, each leaf's observation written to `out` packed: (batch, 2) words, the discs of
+// the player to move and the other's, bit i the square of row i / 8, column i % 8
+int search_collect_bits(Search* s, Batch* b, int batch, uint64_t* out) {
+    return collect(*s, *b, batch, nullptr, out);
+}
 
 // `search_apply` of what `search_collect_into` put in `b`
 void search_apply_from(Search* s, Batch* b, const float* logits, const float* values) {

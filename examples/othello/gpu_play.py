@@ -48,7 +48,7 @@ class Network(Protocol):
 
     sizes: tuple[int, ...]
 
-    def launch(self, x: np.ndarray) -> Any: ...
+    def launch(self, bits: np.ndarray, count: int | None = None) -> Any: ...
 
     def wait(self, pending: Any) -> tuple[np.ndarray, np.ndarray]: ...
 
@@ -108,6 +108,10 @@ class Stream:
         self.total_leaves = 0
         # the thread's time waiting for the network: near all of it when the GPU is the limit
         self.wait_seconds = 0.0
+        # and its time in the tree, collecting and backing up, and launching calls
+        self.collect_seconds = 0.0
+        self.apply_seconds = 0.0
+        self.launch_seconds = 0.0
         # where the next call starts in the jobs of a priority, for fairness among many
         self.turn = 0
         self.error: BaseException | None = None
@@ -150,9 +154,11 @@ class Stream:
                 for job in self.jobs:
                     job.done.set()
 
-    def _fill(self, jobs: list[Job], now: float) -> tuple[np.ndarray, list]:
-        """A call's leaves, a batch of each job with one free, the highest priority first."""
-        buffer = np.empty((self.max_call, 2, 8, 8), np.float32)
+    def _fill(self, jobs: list[Job], now: float) -> tuple[np.ndarray, list, int]:
+        """A call's leaves, a batch of each job with one free, the highest priority first:
+        packed in a buffer of its own (the GPU may read it after the call is launched), and
+        how many."""
+        buffer = np.empty((self.max_call, 2), np.uint64)
         parts = []
         offset = 0
         self.turn += 1
@@ -171,7 +177,7 @@ class Stream:
             if room <= 0:
                 break
             batch = job.free.pop()
-            count = job.search.collect_into(batch, room, buffer[offset:])
+            count = job.search.collect_bits(batch, room, buffer[offset:])
             if count == 0:
                 # a game's ends, collisions: nothing to evaluate, but collisions to undo
                 job.search.apply_from(batch, None, None)
@@ -179,7 +185,7 @@ class Stream:
                 continue
             parts.append((job, batch, offset, count))
             offset += count
-        return buffer[:offset], parts
+        return buffer, parts, offset
 
     def _loop(self) -> None:
         in_flight: deque = deque()
@@ -193,15 +199,19 @@ class Stream:
             now = time.perf_counter()
             launched = False
             if len(in_flight) < self.calls:
-                x, parts = self._fill(jobs, now)
+                bits, parts, count = self._fill(jobs, now)
+                began = time.perf_counter()
+                self.collect_seconds += began - now
                 if parts:
-                    in_flight.append((self.network.launch(x), parts))
+                    in_flight.append((self.network.launch(bits, count), parts))
                     launched = True
+                    self.launch_seconds += time.perf_counter() - began
             if in_flight and (not launched or len(in_flight) >= self.calls):
                 pending, parts = in_flight.popleft()
                 began = time.perf_counter()
                 logits, values = self.network.wait(pending)
-                self.wait_seconds += time.perf_counter() - began
+                applying = time.perf_counter()
+                self.wait_seconds += applying - began
                 self.total_calls += 1
                 self.total_leaves += len(values)
                 for job, batch, offset, count in parts:
@@ -213,6 +223,7 @@ class Stream:
                     job.free.append(batch)
                     job.leaves += count
                     job.calls += 1
+                self.apply_seconds += time.perf_counter() - applying
             # jobs whose leaves are all back and which collect no more
             now = time.perf_counter()
             finished = []
@@ -606,6 +617,10 @@ class GgsBridge:
                 player.taper = 0
                 per_move = self.time.extension_move(view)
                 move = player.move(view.color, per_move * (view.empties + 1) / 2 / 0.95)
+            elif player.solving is not None and hasattr(self.time, "planned_left"):
+                # the clock spread over the moves searched, the solver's held back
+                left = self.time.planned_left(view, player.solving.empties)
+                move = player.move(view.color, left)
             else:
                 move = player.move(view.color, self.time.seconds_left(view))
             game.told += 1
@@ -785,6 +800,9 @@ def speed(args: argparse.Namespace) -> None:
                 stream.total_leaves / max(stream.total_calls, 1), 1
             )
             record["gpu_wait_share"] = round(stream.wait_seconds / seconds, 3)
+            record["collect_share"] = round(stream.collect_seconds / seconds, 3)
+            record["apply_share"] = round(stream.apply_seconds / seconds, 3)
+            record["launch_share"] = round(stream.launch_seconds / seconds, 3)
         print(json.dumps(record), flush=True)
         if args.results:
             with open(args.results, "a") as f:

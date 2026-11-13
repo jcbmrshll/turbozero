@@ -35,9 +35,12 @@ class FakeNetwork:
         self.delay = delay
         self.calls: list[int] = []
 
-    def launch(self, x: np.ndarray):
-        self.calls.append(len(x))
-        return x.copy()
+    def launch(self, bits: np.ndarray, count: int | None = None):
+        from cpu_search import unpack
+
+        count = len(bits) if count is None else count
+        self.calls.append(count)
+        return unpack(bits[:count])
 
     def wait(self, pending):
         if self.delay:
@@ -228,7 +231,14 @@ class Decision:
 
 
 class Policy:
+    def __init__(self):
+        self.planned: list[int] = []
+
     def seconds_left(self, view) -> float:
+        return 0.3
+
+    def planned_left(self, view, solve_from: int) -> float:
+        self.planned.append(solve_from)
         return 0.3
 
     def extension_move(self, view) -> float:
@@ -357,6 +367,7 @@ def test_net_player_on_the_gpu_parses_its_options(monkeypatch):
         }
     )
     player = new()
+    assert isinstance(player, gpu_play.GpuPlayer)
     try:
         assert made == {"net": "N", "dtype": "bfloat16", "max_call": 512, "calls": 2}
         assert player.settings.batch == 64 and player.settings.inflight == 3
@@ -390,6 +401,67 @@ def test_ggs_bridge_factory_takes_the_clients_classes(monkeypatch):
         assert isinstance(decided, Decision)
         player = bridge.games[".7"].player
         assert player.solving is not None and player.solving.exact
+        # the clock planned over the moves searched, the solver's held back
+        assert bridge.time.planned == [14]
     finally:
         bridge.close()
         bridge.games.clear()
+
+
+def test_pack_and_unpack_and_collect_bits_match_the_floats():
+    from cpu_search import Batch, Search, SearchSettings, pack, unpack
+
+    rng = np.random.default_rng(0)
+    x = (rng.random((50, 2, 8, 8)) < 0.4).astype(np.float32)
+    assert np.array_equal(unpack(pack(x)), x)
+    # bit i of a plane is the square of row i // 8, column i % 8
+    one = np.zeros((1, 2, 8, 8), np.float32)
+    one[0, 1, 2, 3] = 1
+    assert pack(one)[0, 1] == 1 << 19 and pack(one)[0, 0] == 0
+
+    settings = SearchSettings(batch=16, random_symmetry=True)
+    a, b = Search(settings, 7), Search(settings, 7)
+    ba, bb = Batch(), Batch()
+    floats = np.empty((16, 2, 8, 8), np.float32)
+    bits = np.empty((16, 2), np.uint64)
+    for _ in range(20):
+        a.begin(16)
+        b.begin(16)
+        n = a.collect_into(ba, 16, floats)
+        assert b.collect_bits(bb, 16, bits) == n
+        assert np.array_equal(unpack(bits[:n]), floats[:n])
+        logits, values = fake_eval(floats[:n])
+        a.apply_from(ba, logits, values)
+        b.apply_from(bb, logits, values)
+    assert np.array_equal(a.visits(), b.visits())
+
+
+def test_gpu_net_unpacks_on_the_device_as_the_floats_are():
+    """On JAX's CPU here: the packed input reaches the network as the observations would."""
+    import equinox as eqx
+    import jax.numpy as jnp
+    from cpu_search import pack
+    from game import make_network
+    from gpu_net import GpuNet
+
+    from core.networks.utils import apply_nn
+
+    spec = (
+        "resnet:2x32,pool_every=2,heads=pooled,pool_channels=16,norm=channel,layout=pre"
+    )
+    network, state = make_network(spec)
+    net = GpuNet(network, state, sizes=(8, 32))
+    rng = np.random.default_rng(1)
+    squares = rng.integers(0, 3, size=(20, 8, 8))
+    x = np.stack([squares == 1, squares == 2], axis=1).astype(np.float32)
+    model = eqx.nn.inference_mode(network)
+    (policy, value), _ = apply_nn(model, state, jnp.moveaxis(jnp.asarray(x), 1, -1))
+    got_policy, got_value = net(x)
+    np.testing.assert_allclose(got_policy, np.asarray(policy), atol=1e-5)
+    np.testing.assert_allclose(got_value, np.asarray(value).reshape(-1), atol=1e-5)
+    # a buffer of the largest size, filled in part, its tail whatever it holds
+    buffer = np.full((32, 2), 0xFFFF0000FFFF0000, np.uint64)
+    buffer[:20] = pack(x)
+    got_policy, got_value = net.wait(net.launch(buffer, 20))
+    assert got_policy.shape == (20, 65)
+    np.testing.assert_allclose(got_value, np.asarray(value).reshape(-1), atol=1e-5)
