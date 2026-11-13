@@ -19,8 +19,9 @@ a pair's two games are played at the same time on the same cores, as GGS plays t
 
 A player is `net:net=NAME,batch=16,...` (a network of the league's store, see `cpu_match.py`; with
 `solve=20`, it solves positions with 20 or fewer empties, see `net_player`), or
-`name:key=value,...`: `edax` or `egaroucid`, with `threads`, `dir` (where the
-engine is built), `level` (play at this level, ignoring the clock, its book off) and `args`
+`name:key=value,...`: `edax`, `egaroucid`, `melody`, `neural-reversi`, `ymatioun` or `edax-fm`
+(see `engines.py`), with `threads`, `dir` (where the engine is built), `level` (play at this
+level, ignoring the clock, its book off; not ymatioun) and `args`
 (more of the engine's own options, separated by spaces).
 
 On `--seconds`, who runs out of time, by more than `GRACE`, loses, and the game is played out
@@ -49,7 +50,15 @@ if __name__ == "__main__":
         os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import numpy as np
-from engines import CLOCKED, ENGINES, Board, ClockedEgaroucid, Egaroucid, GTPEngine
+from engines import (
+    CLOCKED,
+    ENGINES,
+    Board,
+    ClockedEgaroucid,
+    Egaroucid,
+    GTPEngine,
+    default_dir,
+)
 from ggs import (
     Clock,
     PlayerClock,
@@ -437,9 +446,7 @@ def make_player(spec: str, clock: Clock) -> Callable[[], Player]:
     options = dict(s.split("=", 1) for s in settings.split(",") if s)
     if name == "net":
         return net_player(options)
-    engine_dir = (
-        Path(options["dir"]) if "dir" in options else ENGINES[name].default_dir()
-    )
+    engine_dir = Path(options["dir"]) if "dir" in options else default_dir(name)
     threads = int(options.get("threads", len(os.sched_getaffinity(0))))
     args = options.get("args", "").split()
     if "level" in options:
