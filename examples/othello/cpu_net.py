@@ -523,13 +523,16 @@ def load(path: Path) -> tuple[Program, dict[str, QuantizedConv]]:
 class NativeNet:
     """A quantized program built in C++, for `cpu_search.Engine.native` or `forward` here."""
 
-    def __init__(self, p: Program, q: dict[str, QuantizedConv]):
-        from cpu_search import LIB
+    def __init__(self, p: Program, q: dict[str, QuantizedConv], lib=None):
+        """`lib`: the compiled search to build it in (`cpu_search.load_library`), by default the
+        one play loads, for this CPU's level."""
+        if lib is None:
+            from cpu_search import LIB as lib
 
         if p.channels % 16 or (3 * p.head_channels) % 16:
             raise ValueError("the native network takes channels in multiples of 16")
-        self.lib = LIB
-        self.handle = LIB.net_new(p.channels, int(p.pre), p.head_channels)
+        self.lib = lib
+        self.handle = lib.net_new(p.channels, int(p.pre), p.head_channels)
         self.channels = p.channels
         # the C++ copies everything it's given
         floats = ctypes.POINTER(ctypes.c_float)
@@ -537,7 +540,7 @@ class NativeNet:
 
         def conv(where: str, block: int, qc: QuantizedConv) -> None:
             cout, cin, k, _ = qc.q.shape
-            err = LIB.net_set_conv(
+            err = lib.net_set_conv(
                 self.handle,
                 where.encode(),
                 block,
@@ -560,7 +563,7 @@ class NativeNet:
         def norm(where: str, block: int, n: Norm, channels: int) -> None:
             a = n.a if n.a is not None else np.zeros(channels, np.float32)
             c = n.c if n.c is not None else np.zeros(channels, np.float32)
-            LIB.net_set_norm(
+            lib.net_set_norm(
                 self.handle,
                 where.encode(),
                 block,
@@ -573,7 +576,7 @@ class NativeNet:
 
         def linear(where: str, block: int, layer: Linear) -> None:
             out, n_in = layer.w.shape
-            LIB.net_set_linear(
+            lib.net_set_linear(
                 self.handle,
                 where.encode(),
                 block,
@@ -584,7 +587,7 @@ class NativeNet:
             )
 
         for i, b in enumerate(p.blocks):
-            LIB.net_add_block(self.handle, b.pool_channels)
+            lib.net_add_block(self.handle, b.pool_channels)
         conv("stem", 0, q["stem"])
         norm("stem", 0, p.stem_norm, p.channels)
         for i, b in enumerate(p.blocks):
@@ -604,7 +607,7 @@ class NativeNet:
         linear("value_hidden", -1, p.value_hidden)
         linear("value_out", -1, p.value_out)
         conv("head", 0, q["head"])
-        LIB.net_set_heads(self.handle, ptr(p.square_w))
+        lib.net_set_heads(self.handle, ptr(p.square_w))
 
     def __del__(self) -> None:
         if getattr(self, "handle", None):

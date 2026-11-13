@@ -15,7 +15,7 @@ Othello model and against two strong open-source Othello engines,
 | `clock_match.py` | Games on a real clock, one at a time on the same cores, each side at its best settings |
 | `gcp_cpu_jobs.py`, `gcp_cpu_runner.py` | Commands on Google Cloud Spot VMs of one CPU model (8 Zen 5 cores, AVX-512 VNNI), for timed games |
 | `cpu_search.py`, `cpu_search.cpp` | A single game's MCTS for playing on CPU: a tree in C++, its leaves evaluated in batches by OpenVINO or ONNX Runtime, or searched by a thread to a core (`Engine`) |
-| `cpu_net.py`, `cpu_net.h` | A network's int8 forward pass in C++ (AVX-512 VNNI), for `Engine`: no OpenVINO, closer to the float network |
+| `cpu_net.py`, `cpu_net.h` | A network's int8 forward pass in C++ (AVX-512 VNNI, AVX2 or ARM's NEON), for `Engine`: no OpenVINO, closer to the float network |
 | `cpu_match.py` | Games between two such players at fixed visits a move, and their speed in evals a second |
 | `endgame.py`, `endgame.cpp` | The endgame solved exactly in C++, for a player (`solve=N`) and in batches for labels |
 | `export_onnx.py` | Exports a checkpoint's network to ONNX |
@@ -936,11 +936,46 @@ collects its own few leaves, evaluates them on its own core while the others car
 up, the tree shared under a lock. The batch above waits on its slowest stream, and goes through Python,
 at every step; here the network's time is 90-97% of the search's. `backend=native` evaluates with
 `cpu_net.py`'s network, our own int8 convolutions with float between them, a leaf at a time, so each
-thread needs only one leaf in flight. The library is built for a standard x86-64 level, as engines
-ship builds for: AVX-512 with VNNI (x86-64-v4) where the CPU has them, else AVX2 (x86-64-v3), whose
-kernel sums exactly what VNNI does at about a quarter of the speed; `TURBOZERO_X86_LEVEL=v3` plays as
-an AVX2 build would. Build it once a network, calibrated as `quantize.py`
-is:
+thread needs only one leaf in flight. The library is built for a standard level of the CPU's
+architecture, as engines ship builds for (`native_target.py`). On x86: AVX-512 with VNNI (x86-64-v4)
+where the CPU has them, else AVX2 (x86-64-v3), with AVX-VNNI where the CPU has it (Intel's client
+chips from Alder Lake, which lack AVX-512). On ARM: ARMv8.2 with the dot product and the 8-bit matrix
+multiply (i8mm: Apple's M2 on, Graviton 3 on, Axion), else with the dot product alone (Apple's M1,
+Graviton 2). `TURBOZERO_CPU_LEVEL` (`v4`, `v3-vnni`, `v3`, `arm-i8mm`, `arm-dotprod`) picks one,
+e.g. to play as an AVX2 build would. Every kernel sums exactly the same integers:
+
+- AVX2's 3x3 convolutions run Winograd's F(2x2, 3x3) in integers: each 2x2 tile's 4x4 input patch and
+  the weights are transformed into values that fit 16 bits, multiplied in pairs summed into 32 bits,
+  and transformed back, in 16 products where the direct convolution takes 36.
+- NEON's multiply signed bytes: the inputs go in less 128, and 128 times each output's weight sum is
+  added back. `sdot` takes 4 channels of a square against 4 outputs' weights; i8mm's `smmla` takes 8
+  channels of two neighbouring squares against two outputs' weights, twice the products an instruction,
+  from the input laid out in such pairs.
+
+Evals a second on one core, a leaf at a time:
+
+| Core, kernel | 8x128 | 4x64 |
+|---|---|---|
+| Zen 5, AVX-512 VNNI | 3615 | 22264 |
+| Zen 5, AVX2 Winograd (a direct 16-bit kernel) | 1729 (933) | 11618 (6650) |
+| Axion (Neoverse V2), i8mm (`sdot`) | 1442 (974) | 7868 (5931) |
+| Apple M4, i8mm (`sdot`) | 1450 (1490) | 9330 (9690) |
+
+Our engine's seconds a game over the engine's, at the visits that tie with each level on Zen 5 (the
+8 pairings of Edax and Egaroucid at levels 20 and 24 with 8x128 and 4x64 nets, 4 threads a side, whole
+cores):
+
+| Machine, our build | Against Edax | Against Egaroucid |
+|---|---|---|
+| Zen 5 (EPYC 9B45), AVX-512 | 0.89-1.05 | 0.89-1.02 |
+| Zen 3 (EPYC 7B13), AVX2 Winograd (direct 16-bit) | 1.92-2.34 (3.29-4.61) | 2.06-2.43 (3.60-4.25) |
+| Axion, i8mm (`sdot`) | 1.34-1.61 (1.94-2.35) | 0.84-1.08 (1.20-1.43) |
+| Apple M4 (MacBook Air, in use during the run), i8mm | 2.08-2.72 | 2.10-2.58 |
+
+Egaroucid's SIMD is x86's: on ARM it runs its generic build, as it ships for Apple's chips. The
+engines' branchy search runs best on Apple's cores (Edax at level 20 1.9 s a game, Zen 5 2.0-2.3,
+Axion 2.6), while the network's 128-bit NEON doesn't, so the M4 is our worst case.
+Build it once a network, calibrated as `quantize.py` is:
 
 ```
 uv run examples/othello/cpu_net.py --net 8x128-128s-8p-w1125-274m --positions LEAVES/calibration.npy
@@ -1004,7 +1039,7 @@ Edax spent 0.03 s a game on the last 23 empty squares, the net 1.6 s, but the ga
 earlier: solved exactly, perfect play from 24 empties would have scored 36% instead of 34% (100
 games), and from 28, 37.5%. The net gives up about 5 discs from 24 empties, and rarely the result.
 
-Below AVX2 the library builds without the native network, and `Engine` runs OpenVINO.
+Below AVX2 (or the dot product on ARM) the library builds without the native network, and `Engine` runs OpenVINO.
 
 ### Solving the endgame
 
