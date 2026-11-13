@@ -15,7 +15,6 @@ import tarfile
 from pathlib import Path
 from typing import Any
 
-REPO = Path(__file__).resolve().parents[2]
 HOME = "/root"
 
 
@@ -77,15 +76,17 @@ class ModalHosts:
     def image(self) -> Any:
         import modal
 
-        here = Path(__file__).parent
+        here = Path(__file__).resolve().parent
+        repo = here.parents[1]
         image = (
-            modal.Image.debian_slim(python_version="3.12")
+            # Ubuntu's glibc, which the engines' builds (made on Ubuntu 24.04) need
+            modal.Image.from_registry("ubuntu:24.04", add_python="3.12")
             # g++ builds the search's and the solver's libraries on first use
             .apt_install("g++", "git")
             .pip_install("uv", "google-cloud-storage")
-            .add_local_file(REPO / "pyproject.toml", "/src/pyproject.toml", copy=True)
-            .add_local_file(REPO / "uv.lock", "/src/uv.lock", copy=True)
-            .add_local_file(REPO / ".python-version", "/src/.python-version", copy=True)
+            .add_local_file(repo / "pyproject.toml", "/src/pyproject.toml", copy=True)
+            .add_local_file(repo / "uv.lock", "/src/uv.lock", copy=True)
+            .add_local_file(repo / ".python-version", "/src/.python-version", copy=True)
             .run_commands(
                 "cd /src && uv sync --frozen --no-install-project --extra cuda"
             )

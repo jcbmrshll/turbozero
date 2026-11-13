@@ -46,7 +46,6 @@ from pathlib import Path
 from typing import Any
 
 
-
 def wants_gpu(argv: Sequence[str]) -> bool:
     """Whether a player of the match asked for on the command line, in its `--config` or in its
     `--match @FILE`, plays on the GPU."""
@@ -54,7 +53,7 @@ def wants_gpu(argv: Sequence[str]) -> bool:
     for flag in ("--config", "--match"):
         if flag in argv[:-1]:
             value = argv[list(argv).index(flag) + 1]
-            path = Path(value[1:] if value.startswith("@") else value)
+            path = Path(value.removeprefix("@"))
             if (flag == "--config" or value.startswith("@")) and path.is_file():
                 texts.append(path.read_text())
     return any(GPU_DEVICE.search(text) for text in texts)
@@ -202,6 +201,14 @@ def run(args: argparse.Namespace) -> None:
     else:
         play_in_cloud(store, spec, match_id, placement, args)
     report(store, match_id)
+    played = len(store.numbers(match_id))
+    if played < spec.games:
+        where = (
+            f"; each job's log is in the bucket, under cpu-jobs/{match_id}*/logs/"
+            if args.on != "local"
+            else ""
+        )
+        raise SystemExit(f"{played} of {spec.games} games played{where}")
 
 
 def play_here(store: Store, spec: MatchSpec, match_id: str) -> None:
