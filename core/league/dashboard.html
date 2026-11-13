@@ -104,6 +104,7 @@ function resultCell(g) {
 
 async function showLeague() {
   const s = await get("/api/summary");
+  s.players = s.players.filter((p) => p.games > 0);
   document.title = `${s.game} league`;
   totals.textContent = `${s.game} · ${s.players.length} players · ${s.games.toLocaleString()} games`;
 

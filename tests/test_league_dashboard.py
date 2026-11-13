@@ -37,7 +37,12 @@ def test_the_summary_has_each_players_record_and_the_latest_games_first(store):
     records = {
         p["name"]: (p["wins"], p["draws"], p["losses"]) for p in summary["players"]
     }
-    assert records == {"x": (2, 1, 1), "y": (0, 1, 1), "z": (1, 0, 1)}
+    assert records == {
+        "x": (2, 1, 1),
+        "y": (0, 1, 1),
+        "z": (1, 0, 1),
+        "idle": (0, 0, 0),
+    }
     elos = [p["elo"] for p in summary["players"]]
     assert elos == sorted(elos, reverse=True)
     assert [g["id"] for g in summary["recent"]] == [4, 3, 2, 1]

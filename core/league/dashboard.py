@@ -81,9 +81,7 @@ class League:
                     for k in range(3):
                         records[player][k] += counts[k]
             rows = [
-                self._row(i, ratings, records[p.id])
-                for i, p in enumerate(self.players)
-                if ratings.games[i]
+                self._row(i, ratings, records[p.id]) for i, p in enumerate(self.players)
             ]
             rows.sort(key=lambda row: -row["elo"])
             return {
