@@ -135,7 +135,7 @@ class Evals:
         names = {id_: label for id_, label, _ in self.players}
         rows = db.execute(
             "SELECT id, finished, black_id, white_id, result, margin, ending, solved_at, "
-            "flagged FROM games ORDER BY finished DESC, id DESC LIMIT ?",
+            "flagged, solve_exact FROM games ORDER BY finished DESC, id DESC LIMIT ?",
             (RECENT_GAMES,),
         ).fetchall()
         return [
@@ -147,7 +147,8 @@ class Evals:
                 "white": r[3],
                 "white_name": names.get(r[3], r[3]),
                 "result": r[4],
-                "margin": r[5],
+                # a solve for the result alone gives a margin whose sign alone is right
+                "margin": None if r[6] == "solved" and not r[9] else r[5],
                 "ending": r[6],
                 "solved_at": r[7],
                 "flagged": r[8],

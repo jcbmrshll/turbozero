@@ -98,7 +98,7 @@ function playerColumns(rank) {
 }
 
 const resultCell = (g) => (g.result > 0 ? "1-0" : g.result < 0 ? "0-1" : "½-½");
-const marginCell = (g) => (g.margin > 0 ? "+" : "") + g.margin;
+const marginCell = (g) => (g.margin === null ? "" : (g.margin > 0 ? "+" : "") + g.margin);
 const endingCell = (g) =>
   (g.ending === "solved" ? `solved at ${g.solved_at}` : g.ending) + (g.flagged ? ` · ${g.flagged === "b" ? "black" : "white"} flagged` : "");
 
@@ -133,7 +133,7 @@ async function showLeague() {
       { key: "black", label: "Black", cls: "name", value: (g) => g.black_name, cell: (g) => playerLink(g.black, g.black_name), dir: 1 },
       { key: "white", label: "White", cls: "name", value: (g) => g.white_name, cell: (g) => playerLink(g.white, g.white_name), dir: 1 },
       { key: "result", label: "Result", value: (g) => Math.sign(g.result), cell: resultCell },
-      { key: "margin", label: "Discs", value: (g) => g.margin, cell: marginCell },
+      { key: "margin", label: "Discs", value: (g) => g.margin ?? 0, cell: marginCell },
       { key: "ending", label: "Ended", value: (g) => g.ending, cell: endingCell, dir: 1 },
     ],
     s.recent,

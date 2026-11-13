@@ -76,6 +76,8 @@ def test_the_summary_has_each_players_record_and_the_latest_games_first(path):
     last = summary["recent"][-1]
     assert (last["black_name"], last["white_name"], last["result"]) == ("x", "y", 4)
     assert (last["ending"], last["solved_at"]) == ("solved", 20)
+    # solved for the result alone: its margin's size means nothing
+    assert last["margin"] is None
 
 
 def test_a_players_page_has_its_record_against_each_opponent(path):
