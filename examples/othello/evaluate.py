@@ -9,6 +9,7 @@ kept in one store (`core.evals.store`, in ~/.cache/turbozero/othello/evals/evals
         --a net:net=NAME,device=gpu-batched,visits=1000 --b edax:level=20 --openings 256
     uv run examples/othello/evaluate.py run --config match.toml
     uv run examples/othello/evaluate.py show MATCH          # what a match showed; matches, players
+    uv run examples/othello/evaluate.py page                # the web page, on port 8031
 
 A player is `kind:key=value,...` (see `eval_players.py`): a network (`net:`) at `visits` a move
 or on a `clock`, on the CPU, the GPU a game at a time, or the GPU in batches; or an engine at a
@@ -673,7 +674,7 @@ def timing_configs(
     """What each player at a fixed budget cost on the host `host` (a host id), one side's time
     over its games played out there, timed alone: from its games against itself, or with
     `any_opponent`, against anyone (an engine's time rises with its opponent's strength). The
-    league's `timings.json` configs (see `core.league.dashboard`)."""
+    league's `timings.json` configs (format in README.md)."""
     from core.evals.store import host_id
 
     players = {p.id: p for p in store.players()}
@@ -826,6 +827,12 @@ def list_players(args: argparse.Namespace) -> None:
             print(f"    {json.dumps(p.config, sort_keys=True)}")
 
 
+def serve_page(args: argparse.Namespace) -> None:
+    from core.evals.page import serve
+
+    serve(args.store, args.host, args.port)
+
+
 def list_matches(args: argparse.Namespace) -> None:
     store = Store(args.store)
     labels = {p.id: p.label for p in store.players()}
@@ -959,6 +966,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     p = commands.add_parser("players", help="every player")
     p.add_argument("--verbose", "-v", action="store_true", help="with its config")
     p.set_defaults(fn=list_players)
+
+    p = commands.add_parser(
+        "page", help="serve the web page: Elo, records, recent games"
+    )
+    p.add_argument("--host", default="0.0.0.0")
+    p.add_argument("--port", type=int, default=8031)
+    p.set_defaults(fn=serve_page)
 
     args = parser.parse_args(argv)
     args.fn(args)

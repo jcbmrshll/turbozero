@@ -38,7 +38,6 @@ import optax
 from game import (
     SYMMETRY_TRANSFORM_FNS,
     WEIGHT_DECAY,
-    export_last,
     load_checkpoint,
     make_network,
     make_optimizer,
@@ -364,8 +363,6 @@ def train_command(args) -> None:
             ckpt_dir=Path(args.ckpt_dir) if args.ckpt_dir else None,
             log=log,
         )
-        if args.ckpt_dir:
-            export_last(args.ckpt_dir, args.net)
     except BaseException as e:
         if monitor is not None:
             monitor.finish("stopped" if isinstance(e, KeyboardInterrupt) else "crashed")

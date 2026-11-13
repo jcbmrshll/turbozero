@@ -6,14 +6,10 @@ link NAME URL
 add-external NAME ENGINE --settings '{"level": 8}'
 add-result A B WINS DRAWS LOSSES --source SOURCE
 match A B --games N; matches; cancel-match ID
-export-onnx
-fetch-ort
-build-browser-engines
 anchor NAME; retire NAME; resume NAME
 ratings
 settings-changes; accept-settings NAME; variant SUFFIX [NAME ...]
 start; stop
-dashboard
 """
 
 import argparse
@@ -99,28 +95,6 @@ def settings_changes(store: Store) -> str:
     return "\n".join(lines)
 
 
-def export_network(store: Store, game: LeagueGame, player: Player) -> bool:
-    """Exports `player`'s network to the store unless that's been done; False if it fails,
-    which leaves everything else as it was: the network plays on, and can be tried again."""
-    out = store.onnx_path(player)
-    assert out is not None and player.path is not None and player.net is not None
-    if out.exists():
-        return True
-    try:
-        game.export_network(player.path, player.net, out)
-    except Exception as e:  # noqa: BLE001
-        print(f"{player.network}: no ONNX export: {e!r}", file=sys.stderr)
-        return False
-    return True
-
-
-def export_networks(store: Store, game: LeagueGame) -> bool:
-    """Exports every network in the store that hasn't been; False if any failed."""
-    networks = {p.network: p for p in store.players() if p.network is not None}
-    done = [export_network(store, game, p) for p in networks.values()]
-    return all(done)
-
-
 def queue_command(root: Path, script: str) -> str:
     """What the queue runs to play: from this code, on capped cores, taking GPU memory
     only as needed, with compiled programs kept between entries."""
@@ -193,17 +167,6 @@ def main(make_game: Callable[[], LeagueGame], default_root: Path, argv=None) -> 
     match.add_argument(
         "--games", type=int, required=True, help="even: half each colour"
     )
-    commands.add_parser(
-        "export-onnx", help="export the store's networks that haven't been"
-    )
-    commands.add_parser(
-        "fetch-ort",
-        help="download what the dashboard runs networks with in the browser",
-    )
-    commands.add_parser(
-        "build-browser-engines",
-        help="build the engines the dashboard can run in the browser",
-    )
     commands.add_parser("matches", help="the series still to finish")
     cancel = commands.add_parser("cancel-match", help="drop a series")
     cancel.add_argument("id", type=int)
@@ -257,9 +220,6 @@ def main(make_game: Callable[[], LeagueGame], default_root: Path, argv=None) -> 
         action="store_true",
         help="stop once no requested series can be played",
     )
-    dashboard_cmd = commands.add_parser("dashboard", help="serve the web page")
-    dashboard_cmd.add_argument("--host", default="0.0.0.0")
-    dashboard_cmd.add_argument("--port", type=int, default=8031)
 
     args = parser.parse_args(argv)
     store = Store(args.root)
@@ -271,8 +231,6 @@ def main(make_game: Callable[[], LeagueGame], default_root: Path, argv=None) -> 
             store.add_net_player(args.name, sims)
         if args.url:
             store.set_network_url(args.name, args.url)
-        added = next(p for p in store.players() if p.network == args.name)
-        export_network(store, make_game(), added)
     elif args.command == "add-player":
         # each setting that isn't the default is in the name, e.g. n@1000-t4-T1.6
         settings: dict[str, Any] = {}
@@ -304,18 +262,6 @@ def main(make_game: Callable[[], LeagueGame], default_root: Path, argv=None) -> 
         except ValueError as e:
             parser.error(str(e))
         print(f"#{store.request_match(a.id, b.id, args.games)}")
-    elif args.command == "export-onnx":
-        if not export_networks(store, make_game()):
-            sys.exit(1)
-    elif args.command == "fetch-ort":
-        from core.league.runtime import fetch_runtime
-
-        fetch_runtime(store.root)
-    elif args.command == "build-browser-engines":
-        game = make_game()
-        if game.browser_engines is None:
-            sys.exit(f"{game.name} has no browser engines")
-        game.build_browser_engines(store.root / "wasm-engines" / game.browser_engines)
     elif args.command == "matches":
         print(pending_matches(store))
     elif args.command == "cancel-match":
@@ -378,8 +324,3 @@ def main(make_game: Callable[[], LeagueGame], default_root: Path, argv=None) -> 
         print(reason)
         if reason == "no two players can play":
             sys.exit(1)
-    elif args.command == "dashboard":
-        from core.league.dashboard import serve
-
-        # only what draws its boards: nothing here touches the GPU
-        serve(store, make_game, args.host, args.port)

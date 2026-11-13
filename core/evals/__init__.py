@@ -2,6 +2,7 @@
 
 - `store`: players by their config's digest, matches, every game's moves, timing and host
 - `hardware`: what a game ran on
+- `page`: the web page: every player's Elo and record, the latest games, each player's opponents
 
 A game joins with a runner and a CLI of its own: see `examples/othello/evaluate.py`.
 """

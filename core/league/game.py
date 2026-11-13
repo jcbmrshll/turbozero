@@ -2,7 +2,6 @@
 two-player games."""
 
 from abc import ABC, abstractmethod
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -78,29 +77,10 @@ def check_match_games(games: int) -> None:
 class LeagueGame(ABC):
     """A two-player game's part in the league."""
 
-    # the game's name, on the dashboard
+    # the game's name
     name: str = ""
     # the game's environment (pgx's interface: init, step and each state's fields)
     env: Any
-    # a module of the dashboard's: draws the game's boards and steps through its moves. See
-    # `examples/othello/league_board.js`
-    board_js: Path | None = None
-    # engines the dashboard can run in the browser, the build's name: see `build_browser_engines`,
-    # and `board_js`'s `engines`
-    browser_engines: str | None = None
-
-    def facts(self, player: Player) -> dict[str, str | float | bool]:
-        """What can be read from `player`'s name and settings, to filter by: label to value."""
-        return {}
-
-    def export_network(self, checkpoint: str, net: str, out: Path) -> None:
-        """Writes the `net` network in `checkpoint` to `out` as ONNX, whole or not at all, for
-        the dashboard to run in the browser. The dashboard's `board_js` says how to use it."""
-        raise NotImplementedError(f"{self.name} has no ONNX export")
-
-    def build_browser_engines(self, out: Path) -> None:
-        """Fills the directory `out` with `browser_engines`' files, a file named `complete` last."""
-        raise NotImplementedError(f"{self.name} has no browser engines")
 
     def can_play(self, player: Player) -> bool:
         """Whether `player` can play here, rather than having only results from elsewhere."""
