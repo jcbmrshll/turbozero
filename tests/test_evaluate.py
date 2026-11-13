@@ -182,8 +182,18 @@ def test_batched_networks_play_at_fixed_visits_only(tmp_path):
     checkpoint.write_bytes(b"params")
     base = f"net:checkpoint={checkpoint},spec=s,device=gpu-batched"
     assert resolve(f"{base},visits=100", 8).config["search"]["tree_factor"] == 4
+    assert resolve(f"{base},visits=100", 8).config["search"]["prior_temperature"] == 1
     with pytest.raises(ValueError, match="fixed visits"):
         resolve(f"{base},clock=10", 8)
+
+
+def test_a_batched_networks_prior_temperature_makes_it_another_player(tmp_path):
+    checkpoint = tmp_path / "1.eqx"
+    checkpoint.write_bytes(b"params")
+    base = f"net:checkpoint={checkpoint},spec=s,device=gpu-batched,visits=100"
+    flat = resolve(f"{base},prior_temperature=1.6", 8)
+    assert flat.config["search"]["prior_temperature"] == 1.6
+    assert flat.id != resolve(base, 8).id
 
 
 def test_engines_in_batched_matches_default_to_a_thread(engine_dir):

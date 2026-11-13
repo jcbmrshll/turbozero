@@ -16,7 +16,8 @@ A network is one of the league store's, by `net`, or any checkpoint, by `checkpo
   native, int8-VARIANT), with `engine=1` by a thread a core (see `clock_match.net_player`)
 - `gpu`: a tree on the host, leaves evaluated on the GPU a batch at a time (`gpu_play.py`)
 - `gpu-batched`: core's MCTS, many games at once on the GPU, as the Elo league plays: fixed
-  visits only, against engines at a level or other such networks
+  visits only, against engines at a level or other such networks; `prior_temperature` flattens
+  its prior (above 1, see `core.evaluators.mcts.mcts.MCTS`)
 
 Everything that decides how a player plays is in its config, defaults filled in, and its id is the
 config's digest (`core.evals.store.player_id`): a network's checkpoint by its sha256, and a
@@ -79,8 +80,13 @@ OPTIONS: dict[str, dict[str, tuple[type, Any]]] = {
         "ponder": (int, 0),
         "threads": (int, None),
     },
-    # a tree of 4 x visits nodes, no root noise, temperature 0 (`elo_league.Othello`)
-    "gpu-batched": {"tree_factor": (int, 4), "dtype": (str, "bfloat16")},
+    # a tree of 4 x visits nodes, no root noise, temperature 0 (`elo_league.Othello`), the prior
+    # the policy's softmax at `prior_temperature`
+    "gpu-batched": {
+        "tree_factor": (int, 4),
+        "dtype": (str, "bfloat16"),
+        "prior_temperature": (float, 1.0),
+    },
 }
 # a network's endgame solve, with `solve=N` (see `cpu_match.Solving`)
 SOLVE = {"solve_exact": (int, 0), "solve_share": (float, 0.25)}

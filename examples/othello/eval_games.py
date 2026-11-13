@@ -446,7 +446,10 @@ def play_batched(
                 network=network["name"],
                 path=path if path.startswith("/") else str(CACHE_DIR / path),
                 net=network["net"],
-                settings={"tree_factor": p.config["search"]["tree_factor"]},
+                settings={
+                    key: p.config["search"][key]
+                    for key in ("tree_factor", "prior_temperature")
+                },
             )
         return Player(
             id=index,
