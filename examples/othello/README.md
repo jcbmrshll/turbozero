@@ -678,7 +678,8 @@ games in parallel share the machine). `--on gcp` plays on `--jobs` Spot VMs of o
 `--modal-cpu`, `--modal-memory`): Modal's CPUs are a mix of models, so its seconds don't compare,
 and some have no AVX-512, which the engines' default builds need. Play engines built for x86-64-v3
 there, e.g. `EDAX_DIR=~/.cache/turbozero/othello/engines-2026-10/edax-v3 ARCH=x86-64-v3
-examples/othello/setup_edax.sh`, then `edax:dir=...,level=8`: another build, so another player. Cloud hosts send their games to the bucket as
+examples/othello/setup_edax.sh` (and `ARCH=x86-64-v3 EGAROUCID_DIR=...egaroucid-v3` for
+`setup_egaroucid.sh`), then `edax:dir=...,level=8`: another build, so another player. Cloud hosts send their games to the bucket as
 they go, and `run` brings them into the store while it waits; `evaluate.py sync MATCH` brings in
 what's there later. JAX stays off the GPU unless a player is on it.
 

@@ -4,6 +4,8 @@
 # it ships, into ~/.cache/turbozero/othello/engines-2026-10/egaroucid (or $EGAROUCID_DIR).
 #
 #     examples/othello/setup_egaroucid.sh
+#     ARCH=x86-64-v3 EGAROUCID_DIR=~/.cache/turbozero/othello/engines-2026-10/egaroucid-v3 \
+#         examples/othello/setup_egaroucid.sh       # a standard ISA level, for other CPUs (Modal)
 #
 # Needs git and a C++20 compiler (g++ or clang++). Each Egaroucid process takes about
 # 1.3 GB of memory, so vs_engine.py runs as many games at a time as memory allows.
@@ -32,11 +34,18 @@ case "$CXX" in
     *) EXTRA=-mfpmath=both ;;
 esac
 # the build instructions from https://www.egaroucid.nyanyan.dev/en/console/, with its option
-# for a CPU with AVX-512 and the one for AMD's where those apply
-if grep -q avx512vl /proc/cpuinfo; then EXTRA="$EXTRA -DHAS_AVX512"; fi
-if grep -q AuthenticAMD /proc/cpuinfo; then EXTRA="$EXTRA -DHAS_AMD_PROCESSOR"; fi
+# for a CPU with AVX-512 and the one for AMD's where those apply; with ARCH, for that ISA level
+# rather than this CPU (AVX-512 only at x86-64-v4), as engines ship builds
+if [ -n "${ARCH:-}" ]; then
+    TARGET="-march=$ARCH -mtune=generic"
+    if [ "$ARCH" = x86-64-v4 ]; then EXTRA="$EXTRA -DHAS_AVX512"; fi
+else
+    TARGET="-mtune=native -march=native"
+    if grep -q avx512vl /proc/cpuinfo; then EXTRA="$EXTRA -DHAS_AVX512"; fi
+    if grep -q AuthenticAMD /proc/cpuinfo; then EXTRA="$EXTRA -DHAS_AMD_PROCESSOR"; fi
+fi
 "$CXX" -O2 src/Egaroucid_for_Console.cpp -o bin/Egaroucid_for_Console.out \
-    -mtune=native -march=native $EXTRA -pthread -std=c++20 >build.log 2>&1 \
+    $TARGET $EXTRA -pthread -std=c++20 >build.log 2>&1 \
     || { cat build.log >&2; echo "setup_egaroucid.sh: build failed (log above)" >&2; exit 1; }
 
 echo "Egaroucid is in $EGAROUCID_DIR (binary bin/Egaroucid_for_Console.out, weights bin/resources)"
