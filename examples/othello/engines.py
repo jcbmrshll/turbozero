@@ -21,7 +21,8 @@ import os
 import re
 import subprocess
 import tempfile
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
@@ -35,6 +36,120 @@ CACHE_DIR = (
     / "turbozero"
     / "othello"
 )
+
+
+DIRECTIONS = (1, -1, 8, -8, 9, -9, 7, -7)
+
+
+def flips(mine: int, theirs: int, move: int) -> int:
+    """The discs that `move` turns, as a bitboard (bit 0 is a1, bit 7 h1, bit 63 h8)."""
+    result = 0
+    for step in DIRECTIONS:
+        run, at = 0, move
+        while True:
+            column = at % 8
+            at += step
+            # off the board, or wrapped around from one edge to the other
+            if not 0 <= at < 64 or abs(at % 8 - column) > 1:
+                run = 0
+                break
+            if theirs >> at & 1:
+                run |= 1 << at
+            else:
+                if not mine >> at & 1:
+                    run = 0
+                break
+        result |= run
+    return result
+
+
+def board_string(
+    black: int,
+    white: int,
+    black_char: str = "*",
+    white_char: str = "O",
+    empty: str = "-",
+) -> str:
+    """The 64 squares a1, b1, ..., h1, a2, ..., h8 of bitboards, a character each."""
+    return "".join(
+        black_char if black >> i & 1 else white_char if white >> i & 1 else empty
+        for i in range(64)
+    )
+
+
+# how a row of a printed board starts
+BOARD_ROWS = tuple(f"{row} " for row in range(1, 9))
+
+
+def read_board(
+    text: str, black_char: str, white_char: str, black_to_move: str
+) -> tuple[int, int, str]:
+    """(black's discs, white's, who's to move) of a board an engine printed: rows "1 ..." to
+    "8 ...", a square a token after the row's number; black to move if `black_to_move` is in
+    `text`."""
+    black = white = 0
+    rows = [
+        line.split()
+        for line in text.splitlines()
+        if line[:2] in BOARD_ROWS and len(line.split()) >= 9
+    ]
+    assert len(rows) == 8, f"no board in {text!r}"
+    for row in rows:
+        for column, cell in enumerate(row[1:9]):
+            bit = 1 << ((int(row[0]) - 1) * 8 + column)
+            black |= bit if cell == black_char else 0
+            white |= bit if cell == white_char else 0
+    return black, white, "b" if black_to_move in text else "w"
+
+
+class Board:
+    """The rules, enough to referee: the discs, who's to move, and passes."""
+
+    def __init__(self) -> None:
+        # bits for black's and white's discs (d5 and e4 are black, d4 and e5 white)
+        self.discs = [1 << 28 | 1 << 35, 1 << 27 | 1 << 36]
+        self.black_to_move = True
+
+    @classmethod
+    def at(cls, black: int, white: int, color: str) -> "Board":
+        """A position given whole: the discs as bitboards, and who's to move, "b" or "w"."""
+        board = cls()
+        board.discs = [black, white]
+        board.black_to_move = color == "b"
+        return board
+
+    @property
+    def color(self) -> str:
+        return "b" if self.black_to_move else "w"
+
+    def text(self) -> str:
+        """The squares as `board_string`'s, then who's to move, "*" or "O"."""
+        return board_string(self.discs[0], self.discs[1]) + (
+            "*" if self.black_to_move else "O"
+        )
+
+    def legal(self) -> list[int]:
+        """The moves of the player to move."""
+        mine = self.discs[not self.black_to_move]
+        theirs = self.discs[self.black_to_move]
+        taken = mine | theirs
+        return [m for m in range(64) if not taken >> m & 1 and flips(mine, theirs, m)]
+
+    def play(self, move: int) -> None:
+        """Plays a legal `move`, then passes for the next player if they have no move."""
+        side = not self.black_to_move
+        turned = flips(self.discs[side], self.discs[not side], move)
+        if not turned:
+            raise ValueError(f"illegal move {square(move)}")
+        self.discs[side] |= turned | 1 << move
+        self.discs[not side] &= ~turned
+        self.black_to_move = not self.black_to_move
+        if not self.legal():
+            self.black_to_move = not self.black_to_move
+
+    def margin(self) -> int:
+        """Black's discs less white's."""
+        return self.discs[0].bit_count() - self.discs[1].bit_count()
 
 
 @dataclass(frozen=True)
@@ -158,6 +273,10 @@ class GTPEngine:
         # if it has no move, and an explicit pass would then be one too many
         if move != PASS:
             self.command(f"play {color} {square(move)}")
+
+    def set_position(self, black: int, white: int, color: str) -> None:
+        """Starts the game from a position given whole, one moves can't reach (see `Board.at`)."""
+        raise NotImplementedError(f"{self.name}'s GTP can't take a board")
 
     def genmove(self, color: str) -> int:
         """The engine's move for `color`, which it also plays."""
@@ -334,6 +453,19 @@ class Edax(GTPEngine):
                 )
         return counts["*"], counts["O"]
 
+    def set_position(self, black: int, white: int, color: str) -> None:
+        # its GTP has no command to set a board, but loads a game from a file, a GGF one
+        # starting from its board, BO (no GM, which it reads only in lower case)
+        side = "*" if color == "b" else "O"
+        with tempfile.TemporaryDirectory(prefix="edax-") as directory:
+            path = Path(directory) / "start.ggf"
+            path.write_text(f"(;BO[8 {board_string(black, white)} {side}];)\n")
+            self.command(f"loadsgf {path}")
+
+    def position(self) -> tuple[int, int, str]:
+        """(black's discs, white's, who's to move) on its board, read from `showboard`."""
+        return read_board(self.command("showboard"), "*", "O", "* to move")
+
     def close(self) -> None:
         super().close()
         if self.search_log is not None:
@@ -492,6 +624,10 @@ class ClockedEngine:
     expects: it's told what's left of the clock and plans the rest of the game itself, at
     no fixed level, with its shipped opening book on. Only `move` takes its time."""
 
+    def set_position(self, black: int, white: int, color: str) -> None:
+        """Starts the game from a position given whole (see `Board.at`), before any move."""
+        raise NotImplementedError
+
     def play(self, color: str, move: int) -> None:
         """Tells the engine about a move by `color` ("b" or "w")."""
         raise NotImplementedError
@@ -510,7 +646,7 @@ class ClockedEdax(ClockedEngine):
     def __init__(
         self,
         engine_dir: Path,
-        seconds: int,
+        seconds: float,
         threads: int,
         args: Sequence[str] = (),
     ):
@@ -521,7 +657,11 @@ class ClockedEdax(ClockedEngine):
             args=["-h", "25", "-book-usage", "on", *args],
             threads=threads,
         )
-        self.engine.command(f"time_settings {seconds} 0 0")
+        # whole seconds; it plans from each move's `time_left`
+        self.engine.command(f"time_settings {max(round(seconds), 1)} 0 0")
+
+    def set_position(self, black: int, white: int, color: str) -> None:
+        self.engine.set_position(black, white, color)
 
     def play(self, color: str, move: int) -> None:
         self.engine.play(color, move)
@@ -534,20 +674,37 @@ class ClockedEdax(ClockedEngine):
         self.engine.close()
 
 
+# Egaroucid's console's move: alone on a line, quiet; else in its search's table, a column
+EGAROUCID_MOVE = r"([a-h][1-8])|\|[^|]*\|[^|]*\|\s*([a-h][1-8])\|.*"
+
+
 class ClockedEgaroucid(ClockedEngine):
-    """Egaroucid over its own console protocol: its GTP has no clock. It keeps the clock
-    itself, in whole seconds to start with, and charges each search as it ends, so
-    `seconds_left` goes unused. Passes are its own: it plays them for whoever has no move."""
+    """Egaroucid over its own console protocol: its GTP has no clock, and no way to set a
+    board. It keeps the clock itself, in whole seconds to start with, and charges each search
+    as it ends. It's told the clock (`settime`, in whole seconds) only when time has been added
+    to it, an increment or an extension, that its own clock doesn't know of. Passes are its
+    own: it plays them for whoever has no move.
+
+    With `level`, it plays at that level, its book off, ignoring the clock. With `show_board`,
+    it prints its board after each command, for `position` to read."""
 
     def __init__(
         self,
         engine_dir: Path,
-        seconds: int,
+        seconds: float,
         threads: int,
         args: Sequence[str] = (),
+        level: int | None = None,
+        show_board: bool = False,
     ):
-        command = [str(engine_dir / "bin" / "Egaroucid_for_Console.out"), "-quiet",
-                   "-noboard", "-threads", str(threads), "-time", str(seconds), *args]  # fmt: skip
+        self.level = level
+        clock = ["-time", str(max(round(seconds), 1))]
+        if level is not None:
+            clock = ["-level", str(level), "-nobook"]
+        # quiet, it says only its move; showing its board, it's not quiet, so as to print it
+        command = [str(engine_dir / "bin" / "Egaroucid_for_Console.out"),
+                   *([] if show_board else ["-quiet", "-noboard"]),
+                   "-threads", str(threads), *clock, *args]  # fmt: skip
         self.process = subprocess.Popen(
             command,
             cwd=engine_dir / "bin",
@@ -557,9 +714,10 @@ class ClockedEgaroucid(ClockedEngine):
             text=True,
             bufsize=1,
         )
+        # what its own clock should have left, by our clock: each player's
+        self.expected = {"b": float(round(seconds)), "w": float(round(seconds))}
         # replies once it has loaded its weights, so that no move is charged for that
-        self.send("version")
-        self.reply()
+        self.version()
 
     def send(self, command: str) -> None:
         assert self.process.stdin is not None
@@ -574,22 +732,50 @@ class ClockedEgaroucid(ClockedEngine):
             raise RuntimeError("egaroucid exited")
         return line.replace(">", "").strip()
 
+    def version(self) -> None:
+        """Asks its version, and reads through the reply's last line."""
+        self.send("version")
+        while not self.reply().startswith("@website"):
+            pass
+
+    def set_position(self, black: int, white: int, color: str) -> None:
+        side = "X" if color == "b" else "O"
+        self.send(f"setboard {board_string(black, white, 'X', 'O', '-')}{side}")
+
+    def position(self) -> tuple[int, int, str]:
+        """(black's discs, white's, who's to move) on its board, as it prints it after its
+        version; with `show_board` only."""
+        self.version()
+        lines = []
+        while sum(line[:2] in BOARD_ROWS for line in lines) < 8:
+            lines.append(self.reply())
+        return read_board("\n".join(lines), "X", "O", "BLACK to move")
+
     def play(self, color: str, move: int) -> None:
         if move != PASS:
             self.send(f"play {square(move)}")
 
     def move(self, color: str, seconds_left: float) -> int:
+        if self.level is None and seconds_left > self.expected[color] + 0.5:
+            self.send(f"settime {'B' if color == 'b' else 'W'} {int(seconds_left)}")
+            self.expected[color] = float(int(seconds_left))
+        start = time.perf_counter()
         self.send("go")
-        while not re.fullmatch(r"[a-h][1-8]", text := self.reply()):
+        # its move alone on a line, or, not quiet, in its search's table: "|  3|  3@100%|  e3|"
+        while not (found := re.fullmatch(EGAROUCID_MOVE, self.reply())):
             pass
-        return action(text)
+        self.expected[color] = max(
+            self.expected[color] - (time.perf_counter() - start), 0.0
+        )
+        return action(found[1] or found[2])
 
     def close(self) -> None:
         self.process.kill()
         self.process.wait()
 
 
-CLOCKED: dict[str, type[ClockedEdax] | type[ClockedEgaroucid]] = {
+# what makes an engine's `ClockedEngine`: (engine_dir, seconds, threads, args)
+CLOCKED: dict[str, Callable[[Path, float, int, Sequence[str]], ClockedEngine]] = {
     Edax.name: ClockedEdax,
     Egaroucid.name: ClockedEgaroucid,
 }

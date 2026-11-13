@@ -38,7 +38,7 @@ BATCH_TABLE_BITS = 20
 
 
 def library_path() -> Path:
-    """The compiled solver, built for this machine's x86-64 level, named after its source and
+    """The compiled solver, built for this machine's level (`native_target`), named after its source and
     target."""
     target = target_flags()
     digest = hashlib.sha256(SOURCE.read_bytes() + str(target).encode()).hexdigest()

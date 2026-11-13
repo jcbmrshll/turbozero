@@ -42,12 +42,16 @@ def openvino_paths() -> tuple[Path, Path]:
     import openvino
 
     root = Path(openvino.__file__).parent
-    (library,) = (root / "libs").glob("libopenvino.so.*")
+    # libopenvino.so.<version> on Linux, libopenvino.<version>.dylib on macOS
+    (library,) = [
+        *(root / "libs").glob("libopenvino.so.*"),
+        *(root / "libs").glob("libopenvino.*.dylib"),
+    ]
     return root / "include", library
 
 
 def library_path() -> Path:
-    """The compiled search, built for this machine's x86-64 level, named after its source, its
+    """The compiled search, built for this machine's level (`native_target`), named after its source, its
     target and the OpenVINO it links."""
     include, openvino = openvino_paths()
     target = target_flags()
@@ -93,6 +97,7 @@ def load_library() -> ctypes.CDLL:
         ),
         "search_free": (None, [Search]),
         "search_reset": (None, [Search]),
+        "search_set_position": (None, [Search, ctypes.c_uint64, ctypes.c_uint64]),
         "search_begin": (None, [Search, ctypes.c_int]),
         "search_remaining": (ctypes.c_int, [Search]),
         "search_collect": (ctypes.c_int, [Search, ctypes.c_int, ctypes.c_void_p]),
@@ -274,6 +279,11 @@ class Search:
 
     def play(self, action: int) -> None:
         LIB.search_play(self.handle, action)
+
+    def set_position(self, me: int, opp: int) -> None:
+        """Starts the tree afresh from a position given whole: the discs of the player to move,
+        and the opponent's, as bits (bit 0 is a1)."""
+        LIB.search_set_position(self.handle, me, opp)
 
     def position(self) -> tuple[int, int, bool, bool]:
         """(the discs of the player to move, the opponent's, as bits row by row; whether the last

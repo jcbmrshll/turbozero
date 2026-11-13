@@ -1,7 +1,6 @@
-"""endgame.py's solver: its rules against clock_match's referee, hand positions, plain minimax, and
+"""endgame.py's solver: its rules against the referee's (engines.Board), hand positions, plain minimax, and
 Edax's own solver where Edax is built; and a network's player solving its endgame."""
 
-import os
 import random
 import re
 import shutil
@@ -18,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "examples" / "othello"))
 
 pytestmark = pytest.mark.skipif(shutil.which("g++") is None, reason="needs g++")
 
-from clock_match import Board, flips
+from engines import Board, flips
 from xot import XOT_PATH, load_xot
 
 
@@ -287,6 +286,8 @@ def edax_dir() -> Path:
     not (edax_dir() / "bin" / "edax").exists(), reason="needs Edax built"
 )
 def test_solves_match_edax():
+    from native_target import cpus
+
     positions = random_positions(list(range(10, 21)), 220, seed=5)
     with tempfile.TemporaryDirectory() as tmp:
         problems = Path(tmp) / "positions.obf"
@@ -300,7 +301,7 @@ def test_solves_match_edax():
                 f.write(f"{cells} X;\n")
         out = subprocess.run(
             [str(edax_dir() / "bin" / "edax"), "-solve", str(problems), "-l", "60"]
-            + ["-n", str(min(4, len(os.sched_getaffinity(0)))), "-book-usage", "off"],
+            + ["-n", str(min(4, len(cpus()))), "-book-usage", "off"],
             cwd=edax_dir(),
             capture_output=True,
             text=True,
@@ -310,7 +311,7 @@ def test_solves_match_edax():
         int(m) for m in re.findall(r"^\s*\d+\|\s*\d+\S*\s+([+-]\d+)", out, re.MULTILINE)
     ]
     assert len(edax) == len(positions)
-    margins, _ = solve_all(positions, threads=min(4, len(os.sched_getaffinity(0))))
+    margins, _ = solve_all(positions, threads=min(4, len(cpus())))
     assert margins.tolist() == edax
     wld, _ = solve_all(positions, exact=False)
     assert np.sign(wld).tolist() == np.sign(edax).tolist()
