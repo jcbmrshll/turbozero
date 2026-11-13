@@ -683,7 +683,9 @@ GGS's (`01:00//02:00`). A network plays on a `device`: `cpu` (`cpu_search.py`, w
 `backend`, `batch` and the rest, see [Playing on CPU](#playing-on-cpu)), `gpu` (a game at a time,
 its leaves batched on the GPU, `gpu_play.py`) or `gpu-batched` (core's MCTS, many games moving in
 step, at fixed visits against engines at a level or other such networks, with a tree of 4 x visits
-nodes). Engines get `threads` (all the cores by default, one in batched games) and `args`.
+nodes). On every device `prior_temperature` is the softmax temperature of the search's prior,
+default 2: flatter than the network's policy, which self-play trains at 1.
+Engines get `threads` (all the cores by default, one in batched games) and `args`.
 
 **Ids.** A player is everything that decides how it plays: its config, defaults filled in, with a
 network's checkpoint by its sha256 (and a quantized model by its file's), and an engine's build by

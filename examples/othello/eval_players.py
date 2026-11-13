@@ -18,6 +18,9 @@ A network is one of the league store's, by `net`, or any checkpoint, by `checkpo
 - `gpu-batched`: core's MCTS, many games at once on the GPU, as the Elo league plays: fixed
   visits only, against engines at a level or other such networks
 
+On every device `prior_temperature` (default 2, `game.PLAY_PRIOR_TEMPERATURE`) is the softmax
+temperature of the search's prior: above 1 flatter than the network's policy.
+
 Everything that decides how a player plays is in its config, defaults filled in, and its id is the
 config's digest (`core.evals.store.player_id`): a network's checkpoint by its sha256, and a
 quantized model by its file's; an engine's build by its files' (`engines.build_digest`). Where
@@ -56,6 +59,8 @@ SEARCH = {
     "virtual_loss": (str, "loss"),
     "weight": (float, 1.0),
     "c_init": (float, 1.25),
+    # game.PLAY_PRIOR_TEMPERATURE
+    "prior_temperature": (float, 2.0),
     "max_collisions": (int, None),
     "random_symmetry": (int, 0),
     "reuse": (int, 1),
@@ -79,8 +84,13 @@ OPTIONS: dict[str, dict[str, tuple[type, Any]]] = {
         "ponder": (int, 0),
         "threads": (int, None),
     },
-    # a tree of 4 x visits nodes, no root noise, temperature 0 (`elo_league.Othello`)
-    "gpu-batched": {"tree_factor": (int, 4), "dtype": (str, "bfloat16")},
+    # a tree of 4 x visits nodes, no root noise, temperature 0 (`elo_league.Othello`), the prior
+    # the policy's softmax at `prior_temperature`
+    "gpu-batched": {
+        "tree_factor": (int, 4),
+        "dtype": (str, "bfloat16"),
+        "prior_temperature": (float, 2.0),
+    },
 }
 # a network's endgame solve, with `solve=N` (see `cpu_match.Solving`)
 SOLVE = {"solve_exact": (int, 0), "solve_share": (float, 0.25)}
@@ -269,6 +279,8 @@ def resolve_net(
     )
     where = device + (f"/{search['backend']}" if device == "cpu" else "")
     solve = f" solve{search['solve']}" if "solve" in search else ""
+    temperature = search.get("prior_temperature")
+    prior = f" T{temperature:g}" if temperature != known["prior_temperature"][1] else ""
     relative = _relative(checkpoint)
     runtime = {
         "player": "net",
@@ -286,7 +298,7 @@ def resolve_net(
     return PlayerSpec(
         config,
         runtime,
-        f"{name} {budget_label} {where}{solve}",
+        f"{name} {budget_label} {where}{solve}{prior}",
         tuple(sorted({_relative(f) or str(f) for f in files})),
     )
 

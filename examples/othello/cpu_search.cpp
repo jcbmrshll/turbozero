@@ -250,6 +250,8 @@ struct Search {
     int mode;
     float weight;
     float c_init;
+    // 1 / the prior's softmax temperature (see core's `MCTS`): logits are scaled by it
+    float inverse_temperature;
     int max_collisions;
     bool random_symmetry;
     // whether a leaf may take an evaluation of its position from elsewhere in the tree
@@ -461,7 +463,7 @@ void apply(Search& s, Batch& b, const float* logits, const float* values) {
         }
         float total = 0;
         auto add = [&](int action) {
-            float prior = std::exp(l[shown_at[action]] - top);
+            float prior = std::exp((l[shown_at[action]] - top) * s.inverse_temperature);
             total += prior;
             s.edges.push_back(Edge{prior, 0, 0, 0, -1, action});
         };
@@ -488,12 +490,13 @@ void apply(Search& s, Batch& b, const float* logits, const float* values) {
 
 extern "C" {
 
-Search* search_new(int mode, float weight, float c_init, int max_collisions, int random_symmetry, int reuse,
-                   uint64_t seed) {
+Search* search_new(int mode, float weight, float c_init, float prior_temperature, int max_collisions,
+                   int random_symmetry, int reuse, uint64_t seed) {
     Search* s = new Search();
     s->mode = mode;
     s->weight = weight;
     s->c_init = c_init;
+    s->inverse_temperature = 1.0f / prior_temperature;
     s->max_collisions = max_collisions;
     s->random_symmetry = random_symmetry != 0;
     s->reuse = reuse != 0;

@@ -110,12 +110,20 @@ class Programs:
         return found
 
     def program(self, player: Player, games: int) -> Program:
-        key = (player.net, player.sims, player.tree_factor, games)
+        key = (
+            player.net,
+            player.sims,
+            player.tree_factor,
+            player.prior_temperature,
+            games,
+        )
         found = self.programs.get(key)
         if found is None:
             assert player.sims is not None
             network, _ = self.network(player)
-            found = self._compile(network, player.sims, player.tree_factor)
+            found = self._compile(
+                network, player.sims, player.tree_factor, player.prior_temperature
+            )
             self.programs[key] = found
             self.compiled = True
             if len(self.programs) > self.keep:
@@ -123,9 +131,11 @@ class Programs:
         self.programs.move_to_end(key)
         return found
 
-    def _compile(self, network: Any, sims: int, tree_factor: int) -> Program:
+    def _compile(
+        self, network: Any, sims: int, tree_factor: int, prior_temperature: float
+    ) -> Program:
         game = self.game
-        evaluator = game.make_evaluator(network, sims, tree_factor)
+        evaluator = game.make_evaluator(network, sims, tree_factor, prior_temperature)
         return Program(
             init=jax.jit(
                 jax.vmap(lambda state: evaluator.init(template_embedding=state))

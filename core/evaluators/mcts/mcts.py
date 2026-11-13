@@ -71,6 +71,7 @@ class MCTS(Evaluator):
         policy_target: PolicyTarget | None = None,
         traversal_steps: int = 1,
         playout_cap: PlayoutCap | None = None,
+        prior_temperature: float = 1.0,
     ):
         """Initializes an MCTS evaluator.
 
@@ -109,7 +110,16 @@ class MCTS(Evaluator):
             playout_cap: (optional) search each move in full (`num_iterations` iterations) only
                 some of the time, and otherwise with fewer, see `PlayoutCap`. With
                 `count_reused_visits`, a fast search stops at `fast_iterations + 1` root visits
+            prior_temperature: (optional) the softmax temperature of the prior, at every node: the
+                network's policy logits are divided by it before the softmax (default: 1.0, the
+                policy itself). Above 1 flattens the prior, so the search tries more of the moves
+                the network rates low (Leela Chess Zero's policy softmax temperature). The root's
+                noise is mixed into the flattened prior; `root_logits` stay the network's
         """
+        if prior_temperature <= 0:
+            raise ValueError(
+                f"prior_temperature must be positive, got {prior_temperature}"
+            )
         if traversal_steps < 1:
             raise ValueError(
                 f"traversal_steps must be at least 1, got {traversal_steps}"
@@ -140,6 +150,7 @@ class MCTS(Evaluator):
         self.persist_tree = persist_tree
         self.policy_target = policy_target or VisitCounts()
         self.traversal_steps = traversal_steps
+        self.prior_temperature = prior_temperature
 
     def get_config(self) -> dict:
         """Returns a config object for checkpoints."""
@@ -159,6 +170,7 @@ class MCTS(Evaluator):
             "playout_cap": self.playout_cap.get_config()
             if self.playout_cap is not None
             else None,
+            "prior_temperature": self.prior_temperature,
         }
 
     def evaluate(
@@ -443,16 +455,16 @@ class MCTS(Evaluator):
         Returns:
             MCTSTree: updated MCTSTree
         """
-        policy_logits = jnp.where(
-            root_metadata.action_mask, policy_logits, jnp.finfo(policy_logits).min
-        )
-        policy = jax.nn.softmax(policy_logits)
+        policy = self.prior(policy_logits, root_metadata.action_mask)
         prior = self.root_prior(tree.root_noise, policy, root_metadata.action_mask)
         if self.playout_cap is not None:
             # a fast search's root takes no noise. The barrier keeps XLA from fusing the noise's
             # mix into the select, which it does differently in `evaluate` and in a search a cycle
             # at a time, rounding the prior differently
             prior = jnp.where(tree.fast, policy, jax.lax.optimization_barrier(prior))
+        policy_logits = jnp.where(
+            root_metadata.action_mask, policy_logits, jnp.finfo(policy_logits).min
+        )
         root_node = self.update_root_node(
             tree.data_at(tree.ROOT_INDEX), prior, value, root_embedding
         )
@@ -463,6 +475,27 @@ class MCTS(Evaluator):
             root_value=jnp.where(write, value, tree.root_value),
         )
         return tree.set_root(root_node, write=write)
+
+    def prior(self, policy_logits: jax.Array, action_mask: jax.Array) -> jax.Array:
+        """A node's prior over its legal actions: the softmax of the network's policy logits
+        at `prior_temperature`, 0 for illegal actions.
+
+        Args:
+            policy_logits: the network's policy logits
+            action_mask: the legal actions
+
+        Returns:
+            jax.Array: the prior
+        """
+        # divided before masking, so the masked logits stay finite: dividing the lowest float by a
+        # temperature below 1 would overflow it
+        return jax.nn.softmax(
+            jnp.where(
+                action_mask,
+                policy_logits / self.prior_temperature,
+                jnp.finfo(policy_logits).min,
+            )
+        )
 
     def root_prior(
         self, noise: jax.Array, policy: jax.Array, action_mask: jax.Array
@@ -552,10 +585,7 @@ class MCTS(Evaluator):
         parent, action = leaf.parent, leaf.action
         new_embedding, metadata = leaf.embedding, leaf.metadata
         player_reward = metadata.rewards[metadata.cur_player_id]
-        policy_logits = jnp.where(
-            metadata.action_mask, policy_logits, jnp.finfo(policy_logits).min
-        )
-        policy = jax.nn.softmax(policy_logits)
+        policy = self.prior(policy_logits, metadata.action_mask)
         value = jnp.where(metadata.terminated, player_reward, value)
         # add leaf node to tree, or update it if it's already there (e.g. a terminal node)
         node_exists = tree.is_edge(parent, action)

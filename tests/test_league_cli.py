@@ -24,7 +24,7 @@ class FakeGame(LeagueGame):
     def load_network(self, path, net, dtype):
         raise NotImplementedError
 
-    def make_evaluator(self, network, sims, tree_factor=2):
+    def make_evaluator(self, network, sims, tree_factor=2, prior_temperature=1.0):
         raise NotImplementedError
 
     def num_openings(self):
@@ -73,6 +73,24 @@ def test_more_players_of_a_network_can_have_a_bigger_tree(root, tmp_path):
     store = Store(root)
     factors = {p.name: p.tree_factor for p in store.players() if p.network == "n"}
     assert factors == {"n@128": 2, "n@1000": 2, "n@1000-t4": 4}
+
+
+def test_more_players_of_a_network_can_have_a_flatter_prior(root, tmp_path):
+    checkpoint = tmp_path / "n.ckpt"
+    checkpoint.write_text("n")
+    store = Store(root)
+    store.add_network("n", checkpoint, "tiny", "r")
+    store.close()
+    run(root, "add-player", "n", "--sims", "128", "--prior-temperature", "1.6")
+    run(root, "add-player", "n", "--sims", "128", "--tree-factor", "4",
+        "--prior-temperature", "2")  # fmt: skip
+    store = Store(root)
+    players = {p.name: p for p in store.players() if p.network == "n"}
+    assert {name: p.settings for name, p in players.items()} == {
+        "n@128-T1.6": {"prior_temperature": 1.6},
+        "n@128-t4-T2": {"tree_factor": 4, "prior_temperature": 2.0},
+    }
+    assert players["n@128-T1.6"].prior_temperature == 1.6
 
 
 def test_matches_says_when_a_player_has_retired_since(root, capsys):

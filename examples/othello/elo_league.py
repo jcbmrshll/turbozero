@@ -49,7 +49,13 @@ from xot import XOT_PATH, load_xot
 from core.evaluators.evaluation_fns import make_nn_eval_fn
 from core.league.cli import main
 from core.league.game import ExternalPlayer, LeagueGame
-from core.league.store import DEFAULT_TREE_FACTOR, EngineSearch, Player, Search
+from core.league.store import (
+    DEFAULT_PRIOR_TEMPERATURE,
+    DEFAULT_TREE_FACTOR,
+    EngineSearch,
+    Player,
+    Search,
+)
 from core.monitoring.episodes import BOARDS
 
 
@@ -161,13 +167,18 @@ class Othello(LeagueGame):
         return load_checkpoint(path, net, dtype)
 
     def make_evaluator(
-        self, network: Any, sims: int, tree_factor: int = DEFAULT_TREE_FACTOR
+        self,
+        network: Any,
+        sims: int,
+        tree_factor: int = DEFAULT_TREE_FACTOR,
+        prior_temperature: float = DEFAULT_PRIOR_TEMPERATURE,
     ):
         return make_test_evaluator(
             make_nn_eval_fn(network, state_to_nn_input),
             sims,
             noise=False,
             tree_factor=tree_factor,
+            prior_temperature=prior_temperature,
         )
 
     def num_openings(self) -> int:
