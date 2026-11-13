@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds Edax, a strong open-source Othello engine, for vs_engine.py: Toshihiko Okuhara's
+# Builds Edax, a strong open-source Othello engine, for evaluate.py: Toshihiko Okuhara's
 # edax-reversi-AVX (https://github.com/okuhara/edax-reversi-AVX), the fastest build of it we
 # measured, without profile-guided optimization, which slowed it and upstream's 4.7, and its
 # evaluation weights, into ~/.cache/turbozero/othello/engines-2026-10/edax (or $EDAX_DIR).

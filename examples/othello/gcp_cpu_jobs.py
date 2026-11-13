@@ -21,8 +21,8 @@ replacement skipping what's done. Run it again with the same --name to pick up a
 short.
 
 What a VM has: this checkout's files as they are now (uncommitted and new ones too, not ignored),
-the engines' builds from ~/.cache/turbozero/othello (built here for Zen 5 at x86-64-v4, which
-Turin runs), and each --files path, under the same ~/.cache/turbozero/othello. The bucket and its key
+the engines' builds from ~/.cache/turbozero/othello (built here for Zen 5 at x86-64-v4 or v3,
+which Turin runs), and each --files path, under the same ~/.cache/turbozero/othello. The bucket and its key
 are modal_jobs.py's. Every VM has --hours as its limit, after which Google deletes it whatever
 it's doing, and `run` deletes its VMs when it ends, however it ends.
 """
@@ -41,6 +41,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol
 
+from engines import RUNTIME, default_dir
 from gcp_cpu_runner import result_key
 from modal_jobs import open_store
 from modal_store import Store, get_json, put_json
@@ -52,11 +53,11 @@ PREFIX = "cpu-jobs"
 # 16 vCPUs at one thread a core: 8 physical cores of AMD Turin (EPYC 9B45), AVX-512 VNNI
 MACHINE = "n4d-highcpu-16"
 ZONES = ("us-central1-a", "us-central1-b", "us-central1-c", "us-central1-f")
-# the engines' runtime files, what clock_match.py and the timing benchmark need of them
-ENGINES = (
-    "engines-2026-10/edax/bin",
-    "engines-2026-10/edax/data",
-    "engines-2026-10/egaroucid/bin",
+# the engines' runtime files, what evaluate.py needs of them
+ENGINES = tuple(
+    f"{default_dir(name).relative_to(CACHE)}/{part}"
+    for name, parts in RUNTIME.items()
+    for part in parts
 )
 LABEL = "tz-cpu-job"
 POLL_SECONDS = 20.0
@@ -130,6 +131,24 @@ def gcloud_binary() -> str:
     return found or str(fallback)
 
 
+# machine families of ARM cores (Axion, Ampere), and those whose boot disk can't be a hyperdisk;
+# other families (N4D, C4D, C3, C4A...) are timed on one as they are
+ARM_FAMILIES = ("c4a", "t2a")
+PD_FAMILIES = ("c2d", "c2", "n2d", "n2", "n1", "t2d", "e2")
+
+
+def machine_options(machine: str) -> list[str]:
+    """What creating a VM of `machine` needs: its image's architecture, its boot disk's type,
+    and one thread a core (ARM's cores run one already)."""
+    family = machine.split("-")[0]
+    arm = family in ARM_FAMILIES
+    return [
+        f"--image-family=ubuntu-2404-lts-{'arm64' if arm else 'amd64'}",
+        f"--boot-disk-type={'pd-balanced' if family in PD_FAMILIES else 'hyperdisk-balanced'}",
+        *([] if arm else ["--threads-per-core=1"]),
+    ]
+
+
 class Cloud(Protocol):
     def create(
         self,
@@ -179,13 +198,11 @@ class Gcloud:
                 "compute", "instances", "create", name,
                 f"--zone={zone}",
                 f"--machine-type={self.machine}",
-                "--threads-per-core=1",
+                *machine_options(self.machine),
                 "--provisioning-model=SPOT",
                 "--instance-termination-action=DELETE",
                 f"--max-run-duration={max(1, round(hours * 60))}m",
-                "--image-family=ubuntu-2404-lts-amd64",
                 "--image-project=ubuntu-os-cloud",
-                "--boot-disk-type=hyperdisk-balanced",
                 "--boot-disk-size=20GB",
                 "--scopes=cloud-platform",
                 "--labels=" + ",".join(f"{k}={v}" for k, v in labels.items()),
@@ -257,10 +274,13 @@ def code_archive(repo: Path = REPO) -> bytes:
     return tar_gz(add)
 
 
-def env_key(repo: Path = REPO) -> str:
+def env_key(repo: Path = REPO, machine: str = MACHINE) -> str:
     """Where a VM leaves its built environment for the next VMs, by what decides it."""
-    # what the boot script puts in an environment: change it with the script
+    # what the boot script puts in an environment: change it with the script; and the CPU's
+    # architecture, whose packages and venv it holds
     digest = hashlib.sha256(b"debs+uv")
+    if machine.split("-")[0] in ARM_FAMILIES:
+        digest.update(b"arm64")
     for name in ("uv.lock", "pyproject.toml", ".python-version"):
         digest.update((repo / name).read_bytes())
     return f"{PREFIX}/env/{digest.hexdigest()[:24]}.tar"
@@ -438,34 +458,50 @@ def setup(args: argparse.Namespace) -> None:
     )
 
 
-def run(args: argparse.Namespace) -> None:
-    if not NAME.fullmatch(args.name):
-        raise SystemExit("--name: lowercase letters, digits and -, up to 31")
-    store, config = open_store()
-    prefix = f"{PREFIX}/{args.name}"
-    cloud = Gcloud(project(), args.machine)
+def launch(
+    store: Store,
+    cloud: "Cloud",
+    name: str,
+    jobs: list[dict[str, Any]] | None,
+    out: Path,
+    vms: int = 1,
+    hours: float = 2.0,
+    attempts: int = 3,
+    files: list[str] | None = None,
+    machine: str = MACHINE,
+    each: bool = False,
+    bucket: str = "",
+    with_engines: bool = True,
+) -> dict[str, str]:
+    """Runs `jobs` on `cloud`'s hosts as the job `name`, or continues `name` as it was, until
+    they're done; each slot's outcome. Hosts get `files` from ~/.cache/turbozero/othello, and with
+    `with_engines` every engine's build. Every host of it is deleted when it ends, however it
+    ends."""
+    if not NAME.fullmatch(name):
+        raise SystemExit(f"{name}: lowercase letters, digits and -, up to 31")
+    prefix = f"{PREFIX}/{name}"
     spec = get_json(store, f"{prefix}/spec.json")
     if spec is None:
-        if args.jobs is None:
-            raise SystemExit(f"{args.name} is new: give its --jobs")
-        jobs = json.loads(Path(args.jobs).read_text())
+        if jobs is None:
+            raise SystemExit(f"{name} is new: give its jobs")
         spec = {
-            "slots": split_jobs(jobs, args.vms, args.each),
-            "bucket": config["bucket"],
-            "hours": args.hours,
-            "inputs": upload_inputs(store, [*ENGINES, *args.files]),
-            "env": env_key(),
+            "slots": split_jobs(jobs, vms, each),
+            "bucket": bucket,
+            "hours": hours,
+            "inputs": upload_inputs(
+                store, [*(ENGINES if with_engines else ()), *(files or [])]
+            ),
+            "env": env_key(machine=machine),
         }
         store.put_bytes(f"{prefix}/code.tar.gz", code_archive())
         put_json(store, f"{prefix}/spec.json", spec)
     else:
-        print(
-            f"{args.name} exists: continuing it, its jobs, files and code as they were"
-        )
+        print(f"{name} exists: continuing it, its jobs, files and code as they were")
+    out.parent.mkdir(parents=True, exist_ok=True)
     try:
-        outcome = watch(store, cloud, args.name, spec, Path(args.out), args.attempts)
+        outcome = watch(store, cloud, name, spec, out, attempts)
     finally:
-        left = cloud.instances(args.name)
+        left = cloud.instances(name)
         if left:
             cloud.delete([(vm["name"], vm["zone"]) for vm in left])
             print(f"deleted {', '.join(vm['name'] for vm in left)}")
@@ -476,6 +512,25 @@ def run(args: argparse.Namespace) -> None:
         )
         if log:
             print(f"slot {slot}'s log:\n{log.decode()[-3000:]}")
+    return outcome
+
+
+def run(args: argparse.Namespace) -> None:
+    store, config = open_store()
+    launch(
+        store,
+        Gcloud(project(), args.machine),
+        args.name,
+        json.loads(Path(args.jobs).read_text()) if args.jobs else None,
+        Path(args.out),
+        vms=args.vms,
+        hours=args.hours,
+        attempts=args.attempts,
+        files=args.files,
+        machine=args.machine,
+        each=args.each,
+        bucket=config["bucket"],
+    )
 
 
 def list_vms(_args: argparse.Namespace) -> None:

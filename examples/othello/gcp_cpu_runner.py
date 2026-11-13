@@ -183,11 +183,25 @@ def delete_self() -> None:
 
 
 def main() -> None:
-    bucket, prefix, slot = sys.argv[1], sys.argv[2], int(sys.argv[3])
+    """On a VM: `BUCKET PREFIX SLOT`, the bucket by the VM's own account, deleting itself when
+    done. In a Modal container (`modal_hosts.py`): `--modal BUCKET PREFIX SLOT`, the bucket by
+    the key in its environment, the container ending by itself."""
+    modal = sys.argv[1] == "--modal"
+    bucket, prefix, slot = (
+        sys.argv[1 + modal],
+        sys.argv[2 + modal],
+        int(sys.argv[3 + modal]),
+    )
     idle = settle()
-    machine = {"vm": metadata("instance/name"), **cpu_model(), "idle_at_start": idle}
-    run_slot(GcsStore(bucket, None), prefix, slot, machine)
-    delete_self()
+    if modal:
+        host = {"container": os.environ.get("MODAL_TASK_ID", "modal")}
+        store = GcsStore(bucket, os.environ["GCS_KEY_JSON"])
+    else:
+        host = {"vm": metadata("instance/name")}
+        store = GcsStore(bucket, None)
+    run_slot(store, prefix, slot, {**host, **cpu_model(), "idle_at_start": idle})
+    if not modal:
+        delete_self()
 
 
 if __name__ == "__main__":

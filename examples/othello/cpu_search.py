@@ -97,10 +97,26 @@ def load_library() -> ctypes.CDLL:
         ),
         "search_free": (None, [Search]),
         "search_reset": (None, [Search]),
+        "search_set_position": (None, [Search, ctypes.c_uint64, ctypes.c_uint64]),
         "search_begin": (None, [Search, ctypes.c_int]),
         "search_remaining": (ctypes.c_int, [Search]),
         "search_collect": (ctypes.c_int, [Search, ctypes.c_int, ctypes.c_void_p]),
         "search_apply": (None, [Search, ctypes.c_void_p, ctypes.c_void_p]),
+        "batch_new": (ctypes.c_void_p, []),
+        "batch_free": (None, [ctypes.c_void_p]),
+        "search_collect_into": (
+            ctypes.c_int,
+            [Search, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p],
+        ),
+        "search_apply_from": (
+            None,
+            [Search, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p],
+        ),
+        "search_collect_bits": (
+            ctypes.c_int,
+            [Search, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p],
+        ),
+        "search_ended_in_a_row": (ctypes.c_int, [Search]),
         "search_num_legal": (ctypes.c_int, [Search]),
         "search_first_legal": (ctypes.c_int, [Search]),
         "search_best_action": (ctypes.c_int, [Search]),
@@ -251,6 +267,46 @@ class Search:
             logits, values = evaluate(batch[:count])
             self.apply(logits, values)
 
+    def collect_into(self, batch: "Batch", count: int, out: np.ndarray) -> int:
+        """`collect`, of up to `count` leaves, into a `Batch` of the caller's: several can be
+        out for evaluation at once, each applied (`apply_from`) when its evaluation comes back,
+        in any order. `out` is C-contiguous float32 with room for `count`."""
+        assert out.dtype == np.float32 and out.flags.c_contiguous and len(out) >= count
+        return LIB.search_collect_into(
+            self.handle, batch.handle, count, out.ctypes.data_as(ctypes.c_void_p)
+        )
+
+    def collect_bits(self, batch: "Batch", count: int, out: np.ndarray) -> int:
+        """`collect_into`, each leaf's observation packed: `out`, C-contiguous uint64 with room
+        for `count` rows of two words, the discs of the player to move and the other's (bit i
+        the square of row i // 8, column i % 8; see `unpack`)."""
+        assert out.dtype == np.uint64 and out.flags.c_contiguous
+        assert out.shape[1:] == (2,) and len(out) >= count
+        return LIB.search_collect_bits(
+            self.handle, batch.handle, count, out.ctypes.data_as(ctypes.c_void_p)
+        )
+
+    def apply_from(
+        self, batch: "Batch", logits: np.ndarray | None, values: np.ndarray | None
+    ) -> None:
+        """The evaluations of what `collect_into` put in `batch`, (leaves, 65) and (leaves)
+        float32, C-contiguous; None for a batch of no leaves (it may still hold collisions)."""
+        if logits is None or values is None:
+            LIB.search_apply_from(self.handle, batch.handle, None, None)
+            return
+        logits = np.ascontiguousarray(logits, np.float32)
+        values = np.ascontiguousarray(values, np.float32)
+        LIB.search_apply_from(
+            self.handle,
+            batch.handle,
+            logits.ctypes.data_as(ctypes.c_void_p),
+            values.ctypes.data_as(ctypes.c_void_p),
+        )
+
+    def ended_in_a_row(self) -> int:
+        """Traversals in a row, to now, that ended the game with no leaf between."""
+        return LIB.search_ended_in_a_row(self.handle)
+
     def best_action(self) -> int:
         """The most visited action."""
         return LIB.search_best_action(self.handle)
@@ -278,6 +334,11 @@ class Search:
 
     def play(self, action: int) -> None:
         LIB.search_play(self.handle, action)
+
+    def set_position(self, me: int, opp: int) -> None:
+        """Starts the tree afresh from a position given whole: the discs of the player to move,
+        and the opponent's, as bits (bit 0 is a1)."""
+        LIB.search_set_position(self.handle, me, opp)
 
     def position(self) -> tuple[int, int, bool, bool]:
         """(the discs of the player to move, the opponent's, as bits row by row; whether the last
@@ -313,6 +374,35 @@ class Search:
         """Leaves that took an evaluation from elsewhere in the tree, of the same position reached
         by another order of moves, rather than the network's."""
         return LIB.search_reused(self.handle)
+
+
+def pack(x: np.ndarray) -> np.ndarray:
+    """(n, 2, 8, 8) observations, 0 or 1, as `Search.collect_bits` writes them: (n, 2) uint64."""
+    flat = np.asarray(x).reshape(len(x), 2, 64) > 0.5
+    return (
+        np.packbits(flat, axis=-1, bitorder="little").view(np.uint64).reshape(len(x), 2)
+    )
+
+
+def unpack(bits: np.ndarray) -> np.ndarray:
+    """`pack`'s inverse: (n, 2) uint64 to (n, 2, 8, 8) float32."""
+    bytes_ = (
+        np.ascontiguousarray(bits, np.uint64).view(np.uint8).reshape(len(bits), 2, 8)
+    )
+    planes = np.unpackbits(bytes_, axis=-1, bitorder="little")
+    return planes.reshape(len(bits), 2, 8, 8).astype(np.float32)
+
+
+class Batch:
+    """The traversals of one collection of a `Search`'s, until their evaluations are applied:
+    see `Search.collect_into`."""
+
+    def __init__(self) -> None:
+        self.handle = LIB.batch_new()
+
+    def __del__(self) -> None:
+        if getattr(self, "handle", None):
+            LIB.batch_free(self.handle)
 
 
 class Engine:

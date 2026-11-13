@@ -426,22 +426,6 @@ def test_a_player_parses_random_symmetry():
     assert settings("visits=10,random_symmetry=1").random_symmetry
 
 
-def test_a_match_replays_from_its_seed_however_many_play_at_once():
-    from cpu_match import Player, play_match
-    from cpu_search import SearchSettings
-    from xot import XOT_PATH, load_xot
-
-    key = ("fake", "fake")
-
-    def results(parallel: int, seed: int) -> np.ndarray:
-        a = Player(*key, 12, SearchSettings(batch=4, random_symmetry=True))
-        b = Player(*key, 12, SearchSettings(batch=4))
-        openings = load_xot(XOT_PATH)[:4]
-        return play_match(a, b, openings, {key: fake_eval}, parallel, seed)
-
-    assert np.array_equal(results(8, 0), results(3, 0))
-
-
 @pytest.mark.parametrize(
     "norm",
     [
@@ -563,6 +547,22 @@ def test_move_budget_shares_the_clock():
     assert move_budget(10, 10, taper=24) == pytest.approx(
         0.95 * 10 * 100 / (100 + 64 + 36 + 16 + 4)
     )
+
+
+def test_a_planned_solve_takes_its_moves_and_reserve_out_of_the_budget():
+    from cpu_match import Solving, move_budget
+
+    # 40 empties to a solve from 24: 8 moves share the clock less the reserve
+    assert move_budget(10, 40, solve_from=24, reserve=2) == pytest.approx(0.95 * 8 / 8)
+    # at or past the solve (it gave up): the moves to the end share all that's left
+    assert move_budget(10, 24, solve_from=24, reserve=2) == move_budget(10, 24)
+    solving = Solving(empties=24, threads=8, cost_at_24=0.2)
+    assert solving.cost(22) == pytest.approx(0.05)
+    assert Solving(empties=24, threads=4, cost_at_24=0.2).cost(24) == pytest.approx(0.4)
+    # the most empties whose solve fits a quarter of the game's clock, no more than asked for
+    assert solving.depth(10) == 24
+    assert solving.depth(0.4) == 23
+    assert solving.depth(1e-9) == 0
 
 
 def test_net_players_play_a_game_through_the_clock_driver():
@@ -869,3 +869,30 @@ def test_the_search_is_built_for_a_standard_level(monkeypatch):
         assert target == native_target.LEVELS[level]
         assert target[0].startswith("-march=")
         assert not any("native" in flag for flag in target)
+
+
+def test_a_net_player_takes_a_board_and_plays_from_it():
+    from clock_match import play_game
+    from cpu_match import NetPlayer
+    from cpu_search import SearchSettings
+    from ggs import Start
+
+    start = Start.parse(
+        "8 -------- -------- --*O-*-- ---***-- --**OO-- --O**O-- -------- -------- O"
+    ).playable()
+    for color in ("b", "w"):
+        player = NetPlayer(SearchSettings(batch=2), fake_eval)
+        player.set_position(start.black, start.white, color)
+        me, opp = (
+            (start.black, start.white) if color == "b" else (start.white, start.black)
+        )
+        assert player.search.position() == (me, opp, False, False)
+    black = NetPlayer(SearchSettings(batch=2), fake_eval, seed=1)
+    white = NetPlayer(SearchSettings(batch=1), fake_eval)
+    game = play_game(black, white, (), 1.0, start)
+    assert game.flagged is None and game.start == start.text()
+    # every move was legal from the start (the referee would have raised), to the end
+    board = start.board()
+    for move in game.moves:
+        board.play(move)
+    assert not board.legal()

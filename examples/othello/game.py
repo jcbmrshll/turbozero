@@ -82,13 +82,6 @@ def action(name: str) -> int:
     return (int(name[1]) - 1) * 8 + "abcdefgh".index(name[0])
 
 
-def greedy_eval(obs):
-    """Values a position by the active player's lead in tiles, with a uniform policy:
-    a baseline that doesn't use a neural network at all."""
-    value = (obs[..., 0].sum() - obs[..., 1].sum()) / 64
-    return jnp.ones((1, env.num_actions)), jnp.array([value])
-
-
 def episode_metrics(rewards):
     """What train.py tracks about each finished self-play game (the Trainer's
     `episode_metrics_fn`): whether it was a draw, logged as its fraction `episode_draw`."""

@@ -1,12 +1,14 @@
 #!/bin/sh
 # Builds Egaroucid for Console (https://github.com/Nyanyan/Egaroucid), a very strong
-# open-source Othello engine, for vs_engine.py: release 7.8.4, with the evaluation weights
+# open-source Othello engine, for evaluate.py: release 7.8.4, with the evaluation weights
 # it ships, into ~/.cache/turbozero/othello/engines-2026-10/egaroucid (or $EGAROUCID_DIR).
 #
 #     examples/othello/setup_egaroucid.sh
+#     ARCH=x86-64-v3 EGAROUCID_DIR=~/.cache/turbozero/othello/engines-2026-10/egaroucid-v3 \
+#         examples/othello/setup_egaroucid.sh       # a standard ISA level, for other CPUs (Modal)
 #
 # Needs git and a C++20 compiler (g++ or clang++). Each Egaroucid process takes about
-# 1.3 GB of memory, so vs_engine.py runs as many games at a time as memory allows.
+# 1.3 GB of memory, so batched games run as many at a time as memory allows.
 set -eu
 
 EGAROUCID_COMMIT=3b1c6ad380209162c2ad07aefe5c1fc6fd8072cb
@@ -29,17 +31,23 @@ git checkout --quiet FETCH_HEAD
 
 # the build instructions from https://www.egaroucid.nyanyan.dev/en/console/, with its option
 # for a CPU with AVX-512 and the one for AMD's where those apply; its SIMD code is x86's, so on ARM
-# (Apple's M chips, Graviton, Axion) its generic build with its ARM option
+# (Apple's M chips, Graviton, Axion) its generic build with its ARM option. With ARCH, on x86, for
+# that ISA level rather than this CPU (AVX-512 only at x86-64-v4), as engines ship builds
 case "$(uname -m)" in
     aarch64 | arm64) TARGET=-mcpu=native EXTRA="-DHAS_NO_AVX2 -DHAS_ARM_PROCESSOR" ;;
     *)
-        TARGET="-mtune=native -march=native"
         case "$CXX" in
             *clang*) EXTRA= ;;
             *) EXTRA=-mfpmath=both ;;
         esac
-        if grep -q avx512vl /proc/cpuinfo; then EXTRA="$EXTRA -DHAS_AVX512"; fi
-        if grep -q AuthenticAMD /proc/cpuinfo; then EXTRA="$EXTRA -DHAS_AMD_PROCESSOR"; fi
+        if [ -n "${ARCH:-}" ]; then
+            TARGET="-march=$ARCH -mtune=generic"
+            if [ "$ARCH" = x86-64-v4 ]; then EXTRA="$EXTRA -DHAS_AVX512"; fi
+        else
+            TARGET="-mtune=native -march=native"
+            if grep -q avx512vl /proc/cpuinfo; then EXTRA="$EXTRA -DHAS_AVX512"; fi
+            if grep -q AuthenticAMD /proc/cpuinfo; then EXTRA="$EXTRA -DHAS_AMD_PROCESSOR"; fi
+        fi
         ;;
 esac
 "$CXX" -O2 src/Egaroucid_for_Console.cpp -o bin/Egaroucid_for_Console.out \

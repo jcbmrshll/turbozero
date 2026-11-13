@@ -1,28 +1,29 @@
 # Othello
 
-AlphaZero on Othello: training, and evaluating the result against pgx's pretrained
-Othello model and against two strong open-source Othello engines,
-[Edax](https://github.com/abulmo/edax-reversi) and
+AlphaZero on Othello: training, and evaluating the result against strong open-source Othello
+engines, chiefly [Edax](https://github.com/abulmo/edax-reversi) and
 [Egaroucid](https://github.com/Nyanyan/Egaroucid).
 
 | File | |
 |---|---|
 | `train.py` | Trains a network by self-play, scoring it against Edax's scores of fixed positions as it goes, and in games against Edax if asked |
-| `eval_pgx.py` | Plays a checkpoint against pgx's pretrained model at several search budgets |
-| `vs_engine.py` | Plays a checkpoint against Edax or Egaroucid at several levels, from XOT openings (and train.py's network as it trains) |
-| `engines.py` | Edax and Egaroucid, each driven over GTP, and what their searches made of each position, from their logs |
-| `setup_edax.sh`, `setup_egaroucid.sh` | Build the engines for `vs_engine.py` and `clock_match.py` |
-| `clock_match.py` | Games on a real clock, one at a time on the same cores, each side at its best settings |
-| `gcp_cpu_jobs.py`, `gcp_cpu_runner.py` | Commands on Google Cloud Spot VMs of one CPU model (8 Zen 5 cores, AVX-512 VNNI), for timed games |
+| `evaluate.py` | Every evaluation game, between any two players (networks or engines), here, on the GPU, on Google Cloud or on Modal, kept in one store |
+| `eval_players.py`, `eval_games.py` | Its players, each a config with an id of its digest, and its games: one at a time on clocks or fixed budgets, or in batches on the GPU |
+| `engines.py` | Edax and Egaroucid, each driven over GTP, and what their searches made of each position, from their logs; and Melody, Neural Reversi, ymatioun and Edax-FM |
+| `setup_edax.sh`, `setup_egaroucid.sh`, `setup_melody.sh`, `setup_neural_reversi.sh`, `setup_ymatioun.sh`, `setup_edax_fm.sh` | Build the engines |
+| `clock_match.py` | The referee of `evaluate.py`'s games: each side on its own clock or budget, stopped and solved at a depth if asked |
+| `ggs.py` | GGS's random starts, its archive's, and its clock and scoring |
+| `gcp_cpu_jobs.py`, `gcp_cpu_runner.py`, `modal_hosts.py` | Commands on Google Cloud Spot VMs of one CPU model (8 Zen 5 cores, AVX-512 VNNI), for timed games, or in Modal containers |
 | `cpu_search.py`, `cpu_search.cpp` | A single game's MCTS for playing on CPU: a tree in C++, its leaves evaluated in batches by OpenVINO or ONNX Runtime, or searched by a thread to a core (`Engine`) |
 | `cpu_net.py`, `cpu_net.h` | A network's int8 forward pass in C++ (AVX-512 VNNI, AVX2 or ARM's NEON), for `Engine`: no OpenVINO, closer to the float network |
-| `cpu_match.py` | Games between two such players at fixed visits a move, and their speed in evals a second |
+| `cpu_match.py` | Our player on the CPU, and its speed in evals a second |
 | `endgame.py`, `endgame.cpp` | The endgame solved exactly in C++, for a player (`solve=N`) and in batches for labels |
 | `export_onnx.py` | Exports a checkpoint's network to ONNX |
 | `bench_cpu_backends.py` | Evals a second by CPU backend and batch, each checked against JAX's outputs |
 | `quantize.py`, `fidelity.py`, `bench_quantized.py` | Quantizes a network to int8 for playing on CPU, and measures its outputs and speed against bf16 |
 | `engine_set.py`, `label_positions.py`, `score_engine_set.py` | The engine-labelled set: fixed positions with every legal move scored by Edax, to build, and to score checkpoints on (train.py scores the network on it every epoch) |
-| `distill.py` | Trains a network on a saved training state's replay buffer, with no self-play, on a teacher network's values or the games' outcomes |
+| `distill.py` | Trains a network on a saved training state's replay buffer or a dataset, with no self-play, on a teacher network's values or the games' outcomes |
+| `teacher_dataset.py` | A dataset of whole self-play games from the moves a run kept (`--log-moves`), labelled with exact endgame results |
 | `bench_nets.py` | Times networks on their own: a forward pass at self-play's batch, a training step at training's |
 | `game.py` | What the scripts share: the environment, board symmetries, network, evaluators |
 | `xot.py`, `xot-openings.txt` | The XOT opening list |
@@ -30,8 +31,7 @@ Othello model and against two strong open-source Othello engines,
 ## Training
 
 ```
-uv run examples/othello/train.py --monitor --ckpt-dir runs/othello --notes "the baseline" \
-    --vs-engine-last 3   # Edax games after each of the last 3 epochs
+uv run examples/othello/train.py --monitor --ckpt-dir runs/othello --notes "the baseline"
 ```
 
 `--name` names the run on the server, and `--notes` says what it's testing and why, at the
@@ -40,23 +40,16 @@ top of its page.
 Self-play runs in 1024 games at once, searching 64 MCTS iterations a move. Replay memory
 stores each position once, and training maps each position it samples through one of the
 board's 8 symmetries (rotations and reflections), drawn at random. Games start
-from XOT openings rather than the standard start, which keeps self-play varied; every
-test game starts from one too (`--standard-starts` mixes in the standard start).
+from XOT openings rather than the standard start, which keeps self-play varied
+(`--standard-starts` mixes in the standard start).
 
 A run is tracked by the engine-labelled set: every epoch, `train.py` scores the raw network
 on Edax's scores of 5000 fixed positions, in about 20 ms, and logs `engine_exp_regret` (the
 discs its policy gives up against Edax's best move) and the rest of the `engine_*` metrics
 (see [below](#against-edaxs-scores-of-fixed-positions)). They're much finer than games: a
-difference between two checkpoints is good to about ±0.015 discs. Games against Edax
-measure strength itself, with `--vs-engine-every` and `--vs-engine-last` (see
-[During training](#during-training)).
-
-`--eval-every N` also plays test games every N epochs, on a ladder of opponents, easiest
-first: a random player, a greedy tile counter, then pgx's pretrained model searching 1, 4,
-16, 64 and 256 iterations a move against our 64. It moves up past each rung it scores at
-least 0.55 against (a draw counts half). A 10-block network passes every rung within about
-60 epochs. Each test plays 128 games a rung it tries, so it costs real time; it's off by
-default.
+difference between two checkpoints is good to about ±0.015 discs. Games measure strength
+itself: `evaluate.py` plays checkpoints against engines and each other (see [Evaluating a
+checkpoint](#evaluating-a-checkpoint)), and the Elo league rates them.
 
 The run's page also plots `episode_draw`, the fraction of self-play games drawn, which
 `game.py`'s `episode_metrics` reports through the Trainer's `episode_metrics_fn`. See `--help` for
@@ -69,9 +62,9 @@ instead of `--sims` throughout. OLIVAW did this in three stages, doubling each t
 of 20 (`0:100,4:200,11:400`, counting its generations as epochs).
 Cheap searches are enough while the network learns the basics, and deeper ones refine
 its policy later. Each change compiles self-play again, as the first epoch does, so
-keep changes few; games in progress carry on, searching from new, empty trees. Test
-games, `eval_pgx.py` and the games against engines keep their own budgets. The
-run's page plots the budget as `search_iterations`.
+keep changes few; games in progress carry on, searching from new, empty trees.
+Evaluation games keep their own budgets. The run's page plots the budget as
+`search_iterations`.
 
 Each self-play environment searches at its own pace, a network evaluation a cycle, so a
 search needn't take a fixed number of iterations: with `--count-reused-visits` it stops
@@ -122,8 +115,7 @@ at random. `--train-steps` changes it (or `--train-batch`).
 The network computes in bfloat16 by default: in self-play and test games
 (`--inference-dtype`), and its convolutions in training (`--train-dtype`, mixed precision:
 its parameters, BatchNorm and heads stay in float32). On one RTX 5080, with the plain
-`resnet:6x128` (below) computing in float32 throughout, an epoch takes about 63 seconds, and
-one 200-epoch run (with `--eval-every 5`) passed every rung of the ladder by epoch 65.
+`resnet:6x128` (below) computing in float32 throughout, an epoch takes about 63 seconds.
 bfloat16 in self-play and test games brings an epoch to about 36 seconds; searching with
 the same checkpoint, bfloat16 and float32 play evenly. bfloat16 training then takes each training step in less
 than half the time (a 10-block, 128-channel network's from 157 to 72 ms), and trained as
@@ -317,7 +309,7 @@ targets, and the engine-set metrics how good its policy is.
 Checkpoints hold only the network and optimizer state. `--save-state-at 50,150` also
 saves the whole training state once 50 and 150 epochs are done, as `state-50.npz` and
 `state-150.npz` in `--ckpt-dir`: the network, optimizer state, replay buffers, games in
-progress with their search trees, the ladder's rung (with `--eval-every`) and the rng.
+progress with their search trees and the rng.
 `--save-state-every 10` saves one every 10 epochs and keeps only the newest of these. A state takes about as much
 disk space as replay memory takes GPU memory, about 0.18 GB per 375 positions per
 environment, and K times that again with `--tree-positions K`.
@@ -461,6 +453,41 @@ raw weights' excess (`fresh_*_gap`). N is a multiple of the micro-batch (`--trai
 `--grad-accum`), e.g. 16 of them. It draws its samples from the run's rng, so a run with it
 plays other games than the same run without.
 
+### Keeping every move: datasets of games
+
+`--log-moves DIR` keeps every move self-play plays, fast searches' too, in `DIR` as
+`moves-<EPOCH>.npy` (see `core/memory/move_log.py`): the position, the search's policy target and
+root value, the legal moves, the move played, whether the search was full, the ply, and the game
+it's in, about 190 bytes a move. Training is unchanged. The log isn't part of saved states, so a
+run keeping its moves doesn't `--resume` into the same directory: start another into a new one.
+
+`--train-steps 0` trains nothing: the network and its weight averages only play. With
+`--init-from` a state and `--selfplay-average`, a fixed teacher plays its own self-play settings'
+games, for a dataset that students and architectures train on from disk instead of from live
+self-play:
+
+```bash
+T=~/.cache/turbozero/othello/solo8x128/s14t-s13te340-lr2e6-511s-solve20-past3.5-tandem4x64-5e5
+uv run examples/othello/train.py --net resnet:8x128,pool_every=2,heads=pooled,pool_channels=32,norm=channel,layout=pre \
+    --init-from $T/state-380.npz --fork-into 8x128 --init-without-buffers \
+    --train-steps 0 --average-epochs 4 --selfplay-average 4 \
+    --sims 511 --playout-cap 0.25:127 --tree-factor 4 --advance-every 128 --selfplay-cycles 33280 \
+    --solve-empties 20 --solve-play-past 3.5 --engine-eval-every 0 \
+    --epochs 160 --ckpt-dir runs/teacher --log-moves runs/teacher/moves
+uv run examples/othello/teacher_dataset.py build --moves runs/teacher/moves --out runs/dataset \
+    --solve-empties 20 --threads 8
+```
+
+`build` puts the games back together, drops those the run ended in the middle of, and labels
+every position with its game's exact result for the player to move: positions with 20 empties or
+fewer are each solved on the CPU (win, draw or loss, about 37 ms of a core each), and those before
+a game's first one take its result, as self-play's exact labels do. It holds out whole games
+(`--heldout`, 3% by default). The dataset is a directory of columns, a `.npy` per field and a row
+per position, game by game (see `COLUMNS` in `teacher_dataset.py`), so a later relabelling (e.g.
+a deeper search of some positions) is another column beside them. `distill.py train --data DATASET
+--heldout DATASET` trains on its training games' full searches and measures on its held-out ones;
+`--all-positions`, `--min-empties` and `--max-empties` change which positions.
+
 ### The run controller
 
 `controller.py` runs a long growing run in steps, each its own entry in slick's GPU queue, so
@@ -588,7 +615,7 @@ uv run examples/othello/modal_jobs.py sync               # `launch` keeps one ru
 
 A step is the command as you'd write it here, with `> LOG`; paths must be under
 `~/.cache/turbozero`. `--init-from` names a `state-<EPOCH>.npz`, here, in the bucket, or from an
-earlier step. `--vs-engine-*` is refused, as the image has no Edax. A job runs without this machine.
+earlier step. A job runs without this machine.
 Files go to the bucket as they're written: the sync brings them here, and a `--monitor` run appears
 on slick's seaglass while it runs, tagged with `$SEAGLASS_TAGS` and `modal`, its chip in its
 provenance. `modal-job.json` beside the checkpoints records commit, chip, flags and wall time.
@@ -619,33 +646,79 @@ $0.10 in GCS egress, which is why states saved only to continue from stay in the
 
 ## Evaluating a checkpoint
 
-Checkpoints from `train.py` are named after their epoch (`199.eqx` is the last of a
-200-epoch run). Pass the run's `--net` if it isn't the default: `--net resnet:6x128` for
-a run trained before the pooled network became the default.
+Every game between two players, networks or engines, goes through `evaluate.py`, and every game is
+kept in one store, `~/.cache/turbozero/othello/evals/evals.db`:
 
 ```
-uv run examples/othello/eval_pgx.py runs/othello/199.eqx --pgx-sims 64 256 1024
-
 examples/othello/setup_edax.sh                      # once
 examples/othello/setup_egaroucid.sh                 # once
-uv run examples/othello/vs_engine.py runs/othello/199.eqx --engine edax --sims 400 --levels 4 6 8 10
-uv run examples/othello/vs_engine.py runs/othello/199.eqx --engine egaroucid --levels 2 4 6
+
+# a network on the CPU at fixed visits, against Edax at level 24, every game solved from 24 empties
+uv run examples/othello/evaluate.py run --cores 16-23 --openings 50 --solve-at 24 \
+    --a net:net=NAME,visits=26400,engine=1,backend=native,virtual_loss=visit --b edax:level=24
+# each on a 10 s clock, on 4 Google Cloud VMs
+uv run examples/othello/evaluate.py run --on gcp --jobs 4 --openings 100 \
+    --a net:net=NAME,clock=10,engine=1,backend=native --b edax:clock=10
+# a checkpoint on the GPU, many games at once, against Edax at level 8 (the league's way)
+uv run --extra cuda examples/othello/evaluate.py run --openings 256 \
+    --a net:checkpoint=runs/othello/199.eqx,spec=resnet:8x128,device=gpu-batched,visits=400 \
+    --b edax:level=8
+uv run examples/othello/evaluate.py matches                  # every match, and how far it got
+uv run examples/othello/evaluate.py show MATCH [--games]     # what it showed
+uv run examples/othello/evaluate.py players -v               # every player, with its config
 ```
 
-`vs_engine.py` plays the engine with its opening book off and one thread per game, at a
-fixed level: at level L (up to 10) both engines search L moves ahead, and solve the game
-exactly once 2L or fewer squares are empty. It plays many games at once, each with its own
-engine process (an Edax process takes about 170 MB and an Egaroucid one about 1.3 GB, so it
-runs as many as fit in a quarter of the available memory, up to 128).
-The engines and our agent (at temperature 0, without root noise) are all deterministic,
-so games start from **XOT openings**: a list of 10,784 eight-move openings that each end
-in a position Edax judges nearly even (the same ones for every checkpoint, given the
-same `--seed`). Each opening is played twice, with the colors swapped. This is how
-OLIVAW, an AlphaZero-style Othello program, was compared with Edax
+**Players.** A player is `kind:key=value,...` (`eval_players.py`), or a table of a `--config` file
+(TOML or JSON, with the match's other settings): a network, `net:`, the league's by `net=NAME` or
+any checkpoint by `checkpoint=PATH,spec=NET`; or an engine, `edax`, `egaroucid`, `melody`,
+`neural-reversi`, `ymatioun` or `edax-fm`. Each side has its own budget: a network `visits` a move
+or a `clock`, an engine a `level` or a `clock`, a contest's seconds for the whole game (`10`) or
+GGS's (`01:00//02:00`). A network plays on a `device`: `cpu` (`cpu_search.py`, with `engine`,
+`backend`, `batch` and the rest, see [Playing on CPU](#playing-on-cpu)), `gpu` (a game at a time,
+its leaves batched on the GPU, `gpu_play.py`) or `gpu-batched` (core's MCTS, many games moving in
+step, at fixed visits against engines at a level or other such networks, with a tree of 4 x visits
+nodes). Engines get `threads` (all the cores by default, one in batched games) and `args`.
+
+**Ids.** A player is everything that decides how it plays: its config, defaults filled in, with a
+network's checkpoint by its sha256 (and a quantized model by its file's), and an engine's build by
+its files'. Its id is the config's digest, so the same settings are the same player wherever they
+play, and any change, a level, a thread, a rebuilt engine, is a new player. What it ran on isn't
+part of it: each game records its host (CPU model and ISA extensions, the cores it had, the GPU,
+where: `local`, `gcp:MACHINE`, `modal:GPU:CORESc`) and the machine's load.
+
+**Matches.** A match plays `--openings` starts, each with both colors, drawn by `--seed` from
+`--starts` (`xot`, the default; GGS's `random:14`; or `file:PATH`, see [GGS
+conditions](#ggs-conditions)). With `--solve-at N` every game stops at its first position with N
+empties or fewer, solved by `endgame.py` for both sides (for a win, a draw or a loss; `--solve-exact`
+for the margin); without it, games are played to the end. A match's id is its setup's and where
+it's played: running it again continues it, and `--tag` starts another of the same. Each game keeps
+its moves, every move's seconds (where moves are timed alone: not in GPU batches, whose timing is
+the match's), how it ended (`end`, `solved`, `timeout`), and its host.
+
+**Where.** `--on local` plays here, on `--cores` (else every core this process may use), one game
+at a time, or `--jobs N` processes at once, each on its share of the cores (for fixed budgets: timed
+games in parallel share the machine). `--on gcp` plays on `--jobs` Spot VMs of one CPU model (see
+[On Google Cloud CPUs](#on-google-cloud-cpus)), and `--on modal` in Modal containers (`--gpu`,
+`--modal-cpu`, `--modal-memory`): Modal's CPUs are a mix of models, so its seconds don't compare,
+and some have no AVX-512, which the engines' default builds need. Play engines built for x86-64-v3
+there, e.g. `EDAX_DIR=~/.cache/turbozero/othello/engines-2026-10/edax-v3 ARCH=x86-64-v3
+examples/othello/setup_edax.sh` (and `ARCH=x86-64-v3 EGAROUCID_DIR=...egaroucid-v3` for
+`setup_egaroucid.sh`), then `edax:dir=...,level=8`: another build, so another player. Cloud hosts send their games to the bucket as
+they go, and `run` brings them into the store while it waits; `evaluate.py sync MATCH` brings in
+what's there later. JAX stays off the GPU unless a player is on it.
+
+The engines play with their opening book off at a fixed level: at level L (up to 10) both engines
+search L moves ahead, and solve the game exactly once 2L or fewer squares are empty. In batched
+games each has its own engine process (an Edax process takes about 170 MB and an Egaroucid one about
+1.3 GB, so it runs as many as fit in a quarter of the available memory, up to 128). The engines and
+our agent (at temperature 0, without root noise) are all deterministic, so games start from **XOT
+openings**: a list of 10,784 eight-move openings that each end in a position Edax judges nearly even
+(the same ones for every checkpoint, given the same `--seed`). Each opening is played twice, with
+the colors swapped. This is how OLIVAW, an AlphaZero-style Othello program, was compared with Edax
 ([Norelli & Panconesi, 2022](https://arxiv.org/abs/2103.17228)).
 
-The run above scored, out of 256 games against each level (128 openings), searching
-400 MCTS iterations a move:
+A 10x128 checkpoint scored, out of 256 games against each level (128 openings), searching 400 MCTS
+iterations a move:
 
 | Edax level | 4 | 6 | 8 | 10 |
 |---|---|---|---|---|
@@ -653,14 +726,14 @@ The run above scored, out of 256 games against each level (128 openings), search
 
 ### On a clock
 
-`clock_match.py` plays games the way a contest would: one at a time, the same seconds for each
-side for the whole game, on the same cores. Each engine runs its own time management at its
+On a clock, `evaluate.py` plays games the way a contest would: one at a time, the same seconds for
+each side for the whole game, on the same cores. Each engine runs its own time management at its
 strongest settings: Edax over GTP (`time_settings`, then `time_left` before each move), and
 Egaroucid over its console protocol (`-time`, `play`, `go`), since its GTP has no clock.
 
 ```
-taskset -c 16-23 uv run examples/othello/clock_match.py --a edax:threads=8 --b egaroucid:threads=8 \
-    --seconds 10 --openings 100
+uv run examples/othello/evaluate.py run --cores 16-23 --openings 100 \
+    --a edax:clock=10,threads=8 --b egaroucid:clock=10,threads=8
 ```
 
 which amounts to these engine processes, each with a fresh process for every game:
@@ -700,54 +773,56 @@ More threads make a level no stronger, only faster (at level 16, 150 games each:
 against 1 scored 0.49 for Edax and 0.50 for Egaroucid, each about 0.04 either way), and one
 search took 3.5 times less time on 8 threads than on 1 at level 20.
 
-### During training
+### More engines
 
-`train.py` tracks a run by the engine-labelled set every epoch (below), and plays it against
-Edax when asked to: `--vs-engine-every N` after every N epochs, and `--vs-engine-last K` after
-each of the last K epochs. By default it plays 512 games (256 XOT openings) at level 8,
-searching 1000 MCTS iterations a move, the same games every time and in every run:
+Four more engines, each plausibly near Edax's strength or above, play in `evaluate.py`, on a clock
+or (but for ymatioun) at a level. Each `setup_*.sh` builds one at a pinned commit
+into `~/.cache/turbozero/othello/engines-2026-11/`, for a standard ISA level, never `-march=native`.
+None has an opening book.
 
-```
-uv run examples/othello/train.py --epochs 50 --ckpt-dir runs/othello --monitor --vs-engine-last 3
-uv run examples/othello/train.py --ckpt-dir runs/othello --monitor --vs-engine-every 25 \
-    --vs-engine-levels 4 6 8 --vs-engine-sims 400
-```
-
-`--vs-engine-levels`, `--vs-engine-sims` and `--vs-engine-openings` set the games, and
-`--vs-engine egaroucid` plays Egaroucid instead. Each level's result is logged to the run at
-the epoch of the network that played (counting from 0, so `--vs-engine-every 25` logs at
-epochs 24, 49, ...), as `edax_level8_sims1000`, the score, with its standard error
-`edax_level8_sims1000_se` and the fractions of games won, drawn and lost (`_win`, `_draw`,
-`_loss`), and a game at that level, `edax_level8_sims1000_game`, to step through: our agent's
-search of each position, and the engine's scores (its predicted disc margin / 64): Edax's of
-every legal move of every position, each with the line it expects after it (from its own
-search where it moved, and from a separate Edax process elsewhere, so as not to change its
-moves), Egaroucid's of the moves it played. Results also go to `runs/othello/vs_engine.jsonl`,
-a line per level and epoch.
-
-One network's score drifts from its neighbours' by about ±0.035, more than the ±0.02 of
-512 games' own noise, so `--vs-engine-last K` also logs the mean of the last K networks'
-scores at the last epoch, as `edax_level8_sims1000_last3` (for K = 3), with its standard
-error (`_last3_se`), each game's results averaged over the networks first, since they all
-play the same games.
-
-The games are played between epochs, in the training process: our agent's search shares
-the run's GPU memory and its compiled search, and the engine processes (single-threaded, one
-a game) run on the cores the run may use, so `taskset -c 0-7` keeps them on those 8, as many
-searching at once as there are cores. Training waits for them: each evaluation's time is
-logged as `edax_seconds`, to take out of the run's wall time. On one RTX 5080, with an
-8-block network, a level at the defaults took about 7.5 minutes before our agent's searches
-computed in bfloat16 and searched only on its own moves (each about twice as fast). A resumed run (`--resume`) goes on logging them to
-the same run, at the same epochs, and keeps the results of the last networks it played
-before it stopped for their mean.
-
-To evaluate a checkpoint after training, `vs_engine.py` logs to its run with `--monitor
---run ID` (the id in the run's seaglass link), at the checkpoint's epoch:
+| Engine | Name | Licence | Protocol | Levels | Notes |
+|---|---|---|---|---|---|
+| [Melody](https://github.com/HCyrano/Melody), Bruno Causse | `melody` | GPLv3 | its own, IOStd: a whole position and a depth or the milliseconds left | Edax's (`engines.edax_level`) | AVX2 at most. Its time management keeps up to 15 s in reserve and takes at least 1 s a move: it lost on time at 10 s a game, not at 60 |
+| [Neural Reversi](https://github.com/natsutteatsuiyone/neural-reversi) | `neural-reversi` | GPLv3 | GTP, with `setboard` | its own, up to 30 | Edax-like search, neural network evaluation; `time_left` in whole seconds |
+| [ymatioun](https://github.com/ymatioun/reversi), Youri Matiounine | `ymatioun` | MIT | its own, like UCI: `position fen`, `go time <ms>` | none: clock only | threads fixed at build (`bin/ymatioun-t<N>`, `THREADS="1 8"`); the setup script patches its weights' paths, threads, hash size and page-rounded allocations |
+| [Edax-FM](https://github.com/Yoka0014/edax-fm-reversi) | `edax-fm` | GPLv3 | Edax's GTP | Edax's | Edax 4.6 with a factorization-machines layer; "Kalmia" on GGS |
 
 ```
-uv run examples/othello/vs_engine.py runs/othello/49.eqx --levels 8 --sims 1000 --openings 256 \
-    --stop-below -1 --monitor --run ID
+examples/othello/setup_melody.sh                    # once each
+uv run examples/othello/evaluate.py run --cores 8 --openings 50 \
+    --a melody:clock=60,threads=1 --b edax:clock=60,threads=1
 ```
+
+### GGS conditions
+
+Programs play each other on GGS, Michael Buro's game server, mostly in `s8r14` synchro matches:
+two games from one random 14-disc position, colours swapped, on a clock of `ini/inc/ext` (most
+often `01:00//02:00`: a minute a game, and once that's out, a loss by 2 discs at best and two
+more minutes to finish). `ggs.py` has its random starts, clock and scoring, and `evaluate.py`
+plays them:
+
+```
+uv run examples/othello/evaluate.py run --cores 16-23 --starts random:14 --openings 50 \
+    --a net:net=NAME,engine=1,clock=01:00//02:00 --b edax:threads=8,clock=01:00//02:00
+```
+
+- **The starts are far from XOT's.** The server makes half of them by dropping discs near the
+  centre and half by random moves from 5 central discs (`ggs.random_start`). The two ways give
+  different positions, and only their even mix matches the archive's 43,000 `s8r14` starts of
+  2024-2026 (disc balance, squares filled, and how lopsided Edax finds them). Edax at level 12
+  puts a third of them at 8 discs or more for one side, where every XOT opening is within 2.
+  None can be reached from the standard start, so each player is given the board
+  (`set_position`): Edax by `loadsgf` of a GGF file, Egaroucid by its console's `setboard`, a
+  network by a fresh tree.
+- **Pairs are the unit.** Top programs split 90-95% of GGS's pairs 1-1, so a match's signal is in
+  the decisive pairs and in the two games' disc results summed, which is how GGS scores a pair.
+  `evaluate.py show` reports both (`pairs`), with the Elo of the decisive pairs alone.
+- **One game at a time by default.** On GGS a pair's games run at once, in lockstep: each round,
+  the player to move in each game moves, at the same time. `--synchro` plays them so, on the
+  same cores, with a second network for a net player.
+- `ggs.py extract` takes an archive's starts (e.g. `Othello.2010-11-2026.ggf.bz2` from
+  https://skatgame.net/mburo/ggs/game-archive/Othello/) for `--starts file:PATH`, and `ggs.py
+  compare` sets them beside `ggs.random_start`'s.
 
 ### On Google Cloud CPUs
 
@@ -755,7 +830,8 @@ Timed games need the same CPU every time, and Modal's are a mix (some AMD Zen 3 
 where the native network runs its AVX2 kernel at about a quarter of the speed). `gcp_cpu_jobs.py`
 runs commands on Spot VMs of one model: `n4d-highcpu-16` with one thread a core, 8 physical cores
 of AMD Turin (EPYC 9B45, Zen 5, AVX-512 VNNI), the same generation as razorback's 9900X3D but at a
-lower clock (4.1 GHz at most).
+lower clock (4.1 GHz at most). `evaluate.py run --on gcp` plays a match on them; underneath, any
+command can run there:
 
 ```sh
 uv run examples/othello/gcp_cpu_jobs.py setup --project PROJECT        # once; the bucket is modal_jobs.py's
@@ -768,7 +844,7 @@ uv run examples/othello/gcp_cpu_jobs.py cleanup                        # every j
 
 `jobs.json` is a list of `{"name": ..., "cmd": [...], "outputs": [...]}`: each command runs in
 `examples/othello` with the environment's python first on `PATH`, and the last line of JSON it
-prints is its result. Files named in `outputs` (e.g. a `clock_match.py --games` file) go to the
+prints is its result. Files named in `outputs` (e.g. `evaluate.py play`'s games) go to the
 bucket every 20 seconds while the job runs, which `follow` prints line by line, and come back
 beside `--out`, in `OUT-files/SLOT/NAME/`, when it ends. The jobs are dealt out over the VMs; with
 `--each`, every VM runs every job, to compare VMs. A VM takes this checkout's files as they are
@@ -838,13 +914,12 @@ uv run examples/othello/score_engine_set.py runs/othello/49.eqx runs/othello/99.
 
 Self-play's search is built for thousands of games at once on a GPU. Alone on CPU it spends about
 12 times what the network costs: 86 evals a second for an 8x128 net whose forward pass alone does
-1056. `cpu_search.py` plays one game on CPU instead: `clock_match.py` plays it, as `net:`, against
-another or an engine on a per-game clock.
+1056. `cpu_search.py` plays one game on CPU instead: `evaluate.py` plays it, as `net:`, against
+another or an engine, on a per-game clock or at fixed visits.
 
 ```
-taskset -c 16-23 uv run examples/othello/clock_match.py --seconds 10 --openings 20 \
-    --a net:net=8x128-128s-8p-w1125-274m,batch=16,virtual_loss=visit,random_symmetry=1,taper=24 \
-    --b edax:threads=8
+uv run examples/othello/evaluate.py run --cores 16-23 --openings 20 --b edax:clock=10,threads=8 \
+    --a net:net=8x128-128s-8p-w1125-274m,clock=10,batch=16,virtual_loss=visit,random_symmetry=1,taper=24
 ```
 
 The network is named as in the league's store. Its search collects 16 traversals at a time, each
@@ -873,19 +948,21 @@ batch 16 took 86.5% of 100 games from the same net searching sequentially.
 
 ### What a player costs
 
-`timing_benchmark.py` times every player alone: each game is a player against itself from XOT
-openings, and only the side to move is charged, move by move. Stop everything else on the machine
-first (other load costs engines 30-45%); it won't start if any CPU is doing real work.
+A player's cost is timed alone: a match of the player against itself from XOT openings, only the
+side to move charged, move by move. Stop everything else on the machine first (other load costs
+engines 30-45%); `--require-idle` won't start unless the cores and their SMT siblings are idle. The
+store keeps every move's seconds, and `timings` sums them up by host, for the league's plot:
 
 ```
-uv run examples/othello/timing_benchmark.py prepare     # the nets, as ONNX, once
-taskset -c 16-23 uv run examples/othello/timing_benchmark.py work run-1 --hours 3.5
-uv run examples/othello/timing_benchmark.py summarize run-1 --publish
+uv run examples/othello/evaluate.py run --cores 16-23 --require-idle --openings 12 \
+    --a edax:level=20,threads=8 --b edax:level=20,threads=8
+uv run examples/othello/evaluate.py timings                          # the hosts with timed games
+uv run examples/othello/evaluate.py timings --host HOST --name razorback-8t-16-23 --publish
 ```
 
-`--publish` writes the league's `timings.json`; each move's record stays under
-`~/.cache/turbozero/othello/timing/`. One side's seconds a game on 8 threads of those cores, with
-bf16 networks, on 2026-11-01:
+`--publish` puts the host's run in the league's `timings.json`, replacing one of the same name: each
+player at a fixed budget that played itself there, its games played out. One side's seconds a game
+on 8 threads of those cores, with bf16 networks, on 2026-11-01:
 
 | Sims | 4x64 | 6x96 | 8x128 | 10x128 |
 |---|---|---|---|---|
@@ -911,8 +988,8 @@ batches. Build the model, calibrated on the leaves of its own searches, and play
 ```
 uv run examples/othello/fidelity.py leaves --net 8x128-128s-8p-w1125-274m --out LEAVES
 uv run examples/othello/quantize.py --net 8x128-128s-8p-w1125-274m --positions LEAVES/calibration.npy
-taskset -c 16-23 uv run examples/othello/clock_match.py --seconds 4 --openings 100 --b edax:threads=8 \
-    --a net:net=8x128-128s-8p-w1125-274m,batch=16,virtual_loss=visit,taper=24,backend=int8-performance_leaves_heads_minmax
+uv run examples/othello/evaluate.py run --cores 16-23 --openings 100 --b edax:clock=4,threads=8 \
+    --a net:net=8x128-128s-8p-w1125-274m,clock=4,batch=16,virtual_loss=visit,taper=24,backend=int8-performance_leaves_heads_minmax
 ```
 
 Int8 against bf16, on the same eight cores with nothing else running, batch 16 with the search; games
@@ -931,7 +1008,7 @@ bf16's least closely, and it hasn't played.
 
 ### The engine and the native network
 
-`clock_match.py`'s `engine=1` searches with a thread to a core, all in C++ (`cpu_search.Engine`): each
+A network's `engine=1` searches with a thread to a core, all in C++ (`cpu_search.Engine`): each
 collects its own few leaves, evaluates them on its own core while the others carry on, and backs them
 up, the tree shared under a lock. The batch above waits on its slowest stream, and goes through Python,
 at every step; here the network's time is 90-97% of the search's. `backend=native` evaluates with
@@ -979,8 +1056,8 @@ Build it once a network, calibrated as `quantize.py` is:
 
 ```
 uv run examples/othello/cpu_net.py --net 8x128-128s-8p-w1125-274m --positions LEAVES/calibration.npy
-taskset -c 16-23 uv run examples/othello/clock_match.py --seconds 4 --openings 100 --b edax:threads=8 \
-    --a net:net=8x128-128s-8p-w1125-274m,engine=1,backend=native,batch=1,virtual_loss=visit,taper=24
+uv run examples/othello/evaluate.py run --cores 16-23 --openings 100 --b edax:clock=4,threads=8 \
+    --a net:net=8x128-128s-8p-w1125-274m,clock=4,engine=1,backend=native,batch=1,virtual_loss=visit,taper=24
 ```
 
 A leaf whose position the game's searches have already evaluated, reached by another order of moves,
@@ -1047,15 +1124,21 @@ With `solve=N`, a `net:` player solves positions with N or fewer empty squares e
 searching them (`endgame.py`), on the same threads, its time charged to the clock:
 
 ```bash
-taskset -c 16-23 uv run examples/othello/clock_match.py --seconds 10 --openings 100 --b edax:threads=8 \
-    --a net:net=8x128-128s-8p-w1125-274m,engine=1,backend=native,batch=1,virtual_loss=visit,solve=20
+uv run examples/othello/evaluate.py run --cores 16-23 --openings 100 --b edax:clock=10,threads=8 \
+    --a net:net=8x128-128s-8p-w1125-274m,clock=10,engine=1,backend=native,batch=1,virtual_loss=visit,solve=20
 ```
 
 By default it solves for a win, a draw or a loss, about ten times faster than the margin
 (`solve_exact=1`) and all a result needs: it plays a winning or drawing move, and a lost position is
-searched as usual, the network's best try against a fallible opponent. A solve may take a quarter
-of the clock left (`solve_share`), else it gives up and the move is searched; once one succeeds the
-moves after it take milliseconds, its transposition table kept from move to move. `solve_batch`
+searched as usual, the network's best try against a fallible opponent. On a clock the game plans
+its solve as Edax does: from the most empties, up to N, whose expected solve takes at most a quarter
+of the game's clock (`solve_share`), the moves before it sharing the clock less that. The expected
+cost (`solve_cost`, seconds at 24 empties on 8 threads, doubling each empty more) is by default
+Edax's own exact solver's, 0.19 s, the speed we assume ours will reach; ours took about 2.0 s for a
+win, a draw or a loss there (2026-11-10). A solve may take all but a tenth of what's left, else it
+gives up and the move is searched; once one succeeds the moves after it take milliseconds, its
+transposition table kept from move to move. With `--solve-at N`, give the network `solve=N` too: it
+then budgets its clock for the moves before it. `solve_batch`
 solves many positions at once, a thread to each, for training labels.
 
 The solver is alpha-beta over bitboards: the last four empties tried in place, odd quadrants
