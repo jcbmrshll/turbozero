@@ -253,3 +253,21 @@ def test_a_vm_waits_for_its_cpus_to_go_idle_but_not_forever():
     assert share == 0.99
     always_busy = gcp_cpu_runner.settle(lambda: (0, 100), lambda s: None, 5.0, 20.0)
     assert always_busy == 0.0
+
+
+def test_each_machine_gets_its_image_disk_and_threads():
+    assert gcp_cpu_jobs.machine_options("n4d-highcpu-16") == [
+        "--image-family=ubuntu-2404-lts-amd64",
+        "--boot-disk-type=hyperdisk-balanced",
+        "--threads-per-core=1",
+    ]
+    # Milan's C2D boots only from persistent disks; Axion is ARM, a thread a core already
+    assert "--boot-disk-type=pd-balanced" in gcp_cpu_jobs.machine_options(
+        "c2d-standard-16"
+    )
+    axion = gcp_cpu_jobs.machine_options("c4a-standard-8")
+    assert "--image-family=ubuntu-2404-lts-arm64" in axion
+    assert not any(o.startswith("--threads-per-core") for o in axion)
+    # an environment holds one architecture's packages and venv
+    assert gcp_cpu_jobs.env_key(machine="c4a-standard-8") != gcp_cpu_jobs.env_key()
+    assert gcp_cpu_jobs.env_key(machine="c2d-standard-16") == gcp_cpu_jobs.env_key()
