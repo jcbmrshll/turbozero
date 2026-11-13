@@ -36,6 +36,7 @@ from cpu_search import (
     ort_session,
 )
 from export_onnx import export_checkpoint
+from native_target import cpus
 from quantize import quantized_path
 from xot import XOT_PATH, load_xot
 
@@ -290,7 +291,7 @@ def make_engine(name: str, backend: str, cores: int, batch: int) -> Engine:
 def match(args: argparse.Namespace) -> None:
     a = Player.parse(args.a, args.net, args.backend)
     b = Player.parse(args.b, args.net, args.backend)
-    cores = len(os.sched_getaffinity(0))
+    cores = len(cpus())
     evals = {(p.net, p.backend): make_eval(p.net, p.backend, cores) for p in (a, b)}
     pool = load_xot(XOT_PATH)
     rng = np.random.default_rng(args.seed)
@@ -476,7 +477,7 @@ class NetPlayer:
 
 def speed(args: argparse.Namespace) -> None:
     """One game at a time against itself, reporting evals a second and where the time goes."""
-    cores = len(os.sched_getaffinity(0))
+    cores = len(cpus())
     evaluate = make_eval(args.net, args.backend, cores)
     pool = load_xot(XOT_PATH)
     rng = np.random.default_rng(args.seed)
