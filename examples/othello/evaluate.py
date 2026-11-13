@@ -145,7 +145,7 @@ def match_setup(args: argparse.Namespace) -> dict[str, Any]:
 
 def build_match(setup: dict[str, Any], cores: int) -> MatchSpec:
     batched = any(
-        kind == "net" and options.get("device") == "gpu-batched"
+        kind == "pgx" or (kind == "net" and options.get("device") == "gpu-batched")
         for kind, options in (parse(setup["a"]), parse(setup["b"]))
     )
     a, b = (resolve(setup[side], cores, batched) for side in ("a", "b"))

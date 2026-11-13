@@ -624,3 +624,26 @@ def test_timings_are_each_fixed_budget_players_side_on_one_host(tmp_path):
     assert config["moves_per_game"] == 1.5
     with_any = evaluate.timing_configs(store, host_id(here), any_opponent=True)
     assert [c["games"] for c in with_any] == [3]
+
+
+def test_games_in_parallel_are_emitted_in_the_callers_thread(now):
+    import threading
+
+    a, b = fake("a", {"level": 1}), fake("b", {"level": 2})
+    spec = MatchSpec(a, b, openings=2)
+    threads = []
+
+    def emit(record):
+        threads.append(threading.current_thread())
+
+    play_parallel(
+        spec, "m-x", numbers_of(2), emit, 3, make=lambda p, c: lambda: FirstLegal(now)
+    )
+    assert threads == [threading.current_thread()] * 4
+
+
+def test_pgx_makes_a_match_batched_its_engines_a_thread_each(engine_dir):
+    spec = evaluate.build_match(
+        {"a": "pgx:visits=16", "b": f"edax:level=1,dir={engine_dir}"}, cores=8
+    )
+    assert spec.batched and spec.b.config["threads"] == 1

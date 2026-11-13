@@ -23,6 +23,7 @@ import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
+from queue import Empty, Queue
 from typing import Any
 
 import numpy as np
@@ -323,6 +324,7 @@ def play_parallel(
     queue = list(reversed(numbers))
     lock = threading.Lock()
     errors: list[BaseException] = []
+    done: Queue[GameRecord] = Queue()
 
     def worker() -> None:
         # a solver to a thread: one solves a position at a time
@@ -351,9 +353,7 @@ def play_parallel(
                 )
                 while not run.over:
                     run.step()
-                record = record_of(match_id, number, spec, opening, run.finish(), host)
-                with lock:
-                    emit(record)
+                done.put(record_of(match_id, number, spec, opening, run.finish(), host))
             except BaseException as error:  # noqa: BLE001 - raised in the caller's thread
                 errors.append(error)
             finally:
@@ -363,6 +363,13 @@ def play_parallel(
     threads = [threading.Thread(target=worker) for _ in range(parallel)]
     for thread in threads:
         thread.start()
+    # games are emitted here, in the caller's thread: what keeps them (a SQLite store) may be
+    # usable only in the thread that made it
+    while any(thread.is_alive() for thread in threads) or not done.empty():
+        try:
+            emit(done.get(timeout=0.1))
+        except Empty:
+            pass
     for thread in threads:
         thread.join()
     if errors:
