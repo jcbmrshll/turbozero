@@ -98,6 +98,8 @@ class ScoredPositionsTester(BaseTester):
     every epoch. Logs `<name>_<metric>` for all positions and `<name>_<metric>_<group>` for each
     group."""
 
+    stateless = True
+
     def __init__(
         self,
         positions: ScoredPositions,

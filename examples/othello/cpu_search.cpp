@@ -3,10 +3,21 @@
 // and pgx's Othello have them, with virtual loss steering a batch's traversals apart. A search can show
 // the network each leaf in a random one of the board's 8 symmetries.
 #include <algorithm>
+#include <chrono>
+#include <climits>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <memory>
+#include <mutex>
+#include <openvino/openvino.hpp>
+#include <string>
+#include <thread>
 #include <vector>
+
+#include "cpu_net.h"
 
 namespace {
 
@@ -163,11 +174,76 @@ struct Node {
     int32_t first_edge;
     int32_t num_edges;  // 0 until it's been evaluated
     float w;            // for the player to move
+    float value;        // the network's, once it's been evaluated
+};
+
+// The nodes evaluated so far, by position: a leaf whose position the game's searches have evaluated
+// before, reached by another order of moves, takes that evaluation instead of the network's
+// (Leela Chess Zero's cache of network evaluations, here the tree itself). Open addressing.
+struct Evaluated {
+    struct Slot {
+        uint64_t me, opp;
+        int32_t node;  // -1 for an empty slot
+    };
+    std::vector<Slot> slots = std::vector<Slot>(1024, Slot{0, 0, -1});
+    size_t used = 0;
+
+    static uint64_t hash(uint64_t me, uint64_t opp) {
+        uint64_t z = me ^ (opp * 0x9e3779b97f4a7c15ULL) ^ (opp >> 29);
+        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+        return z ^ (z >> 31);
+    }
+
+    int32_t find(uint64_t me, uint64_t opp) const {
+        size_t mask = slots.size() - 1;
+        for (size_t i = hash(me, opp) & mask;; i = (i + 1) & mask) {
+            const Slot& slot = slots[i];
+            if (slot.node < 0) return -1;
+            if (slot.me == me && slot.opp == opp) return slot.node;
+        }
+    }
+
+    void insert(uint64_t me, uint64_t opp, int32_t node) {
+        if (2 * (used + 1) > slots.size()) {
+            std::vector<Slot> old(slots.size() * 2, Slot{0, 0, -1});
+            old.swap(slots);
+            used = 0;
+            for (const Slot& slot : old)
+                if (slot.node >= 0) insert(slot.me, slot.opp, slot.node);
+        }
+        size_t mask = slots.size() - 1;
+        for (size_t i = hash(me, opp) & mask;; i = (i + 1) & mask) {
+            Slot& slot = slots[i];
+            if (slot.node < 0) {
+                slot = Slot{me, opp, node};
+                used++;
+                return;
+            }
+            if (slot.me == me && slot.opp == opp) return;
+        }
+    }
+
+    void clear() {
+        slots.assign(1024, Slot{0, 0, -1});
+        used = 0;
+    }
 };
 
 struct PathStep {
     int32_t node;
     int32_t edge;  // the edge taken to the node, -1 for the root
+};
+
+// the paths of a batch collected, end to end, for one caller at a time: a search's own (see
+// `search_collect`), or an engine worker's
+struct Batch {
+    std::vector<PathStep> path;
+    std::vector<PathStep> paths;
+    std::vector<PathStep> collisions;
+    std::vector<int32_t> leaf_ends;       // where each leaf's path ends in `paths`
+    std::vector<int32_t> collision_ends;  // and each collision's, after the leaves'
+    std::vector<uint8_t> leaf_symmetries;  // the symmetry each leaf was shown in
 };
 
 struct Search {
@@ -176,19 +252,21 @@ struct Search {
     float c_init;
     int max_collisions;
     bool random_symmetry;
+    // whether a leaf may take an evaluation of its position from elsewhere in the tree
+    bool reuse;
     uint64_t rng;  // splitmix64's state
     int32_t root;
     int remaining;
     std::vector<Node> nodes;
     std::vector<Edge> edges;
-    std::vector<PathStep> path;
-    // the paths of the batch collected, end to end
-    std::vector<PathStep> paths;
-    std::vector<int32_t> leaf_ends;       // where each leaf's path ends in `paths`
-    std::vector<int32_t> collision_ends;  // and each collision's, after the leaves'
-    std::vector<uint8_t> leaf_symmetries;  // the symmetry each leaf was shown in
+    Batch batch;
+    Evaluated evaluated;
     int collisions_total;
     int visits_total;
+    // leaves that took an evaluation from the tree
+    long reused_total;
+    // traversals in a row that ended the game, with no leaf between
+    int ended_in_a_row;
 };
 
 inline float edge_q(const Search& s, const Edge& e) {
@@ -245,8 +323,8 @@ void back_up(Search& s, const PathStep* path, int length, float value, bool was_
     }
 }
 
-void fly(Search& s, int delta) {
-    for (const PathStep& step : s.path) {
+void fly(Search& s, const std::vector<PathStep>& path, int delta) {
+    for (const PathStep& step : path) {
         s.nodes[step.node].in_flight += delta;
         if (step.edge >= 0) s.edges[step.edge].in_flight += delta;
     }
@@ -267,22 +345,158 @@ inline int draw_symmetry(Search& s) {
     return (int)((z ^ (z >> 31)) >> 61);
 }
 
+
+// Expands a leaf from the evaluation of a node of the same position, if there's one. Its edges list the
+// same legal moves in the same order.
+bool reuse_evaluation(Search& s, int32_t index) {
+    const Position& p = s.nodes[index].position;
+    int32_t source = s.evaluated.find(p.me, p.opp);
+    if (source < 0) return false;
+    int first = (int)s.edges.size();
+    int from = s.nodes[source].first_edge, count = s.nodes[source].num_edges;
+    for (int i = 0; i < count; i++) {
+        const Edge& e = s.edges[from + i];
+        s.edges.push_back(Edge{e.prior, 0, 0, 0, -1, e.action});
+    }
+    Node& node = s.nodes[index];
+    node.first_edge = first;
+    node.num_edges = count;
+    node.value = s.nodes[source].value;
+    return true;
+}
+
+// `search_collect`'s traversals, their paths kept in `b` until `apply`
+int collect(Search& s, Batch& b, int batch, float* out) {
+    b.paths.clear();
+    b.collisions.clear();
+    b.leaf_ends.clear();
+    b.collision_ends.clear();
+    b.leaf_symmetries.clear();
+    int leaves = 0, visits = 0, collided = 0;
+    int want = std::min(batch, s.remaining);
+    while (visits < want && collided <= s.max_collisions) {
+        b.path.clear();
+        int32_t index = s.root;
+        b.path.push_back({index, -1});
+        enum { LEAF, END, COLLISION } outcome;
+        while (true) {
+            Node& node = s.nodes[index];
+            if (node.position.terminated) {
+                outcome = END;
+                break;
+            }
+            if (node.num_edges == 0) {
+                outcome = node.in_flight > 0 ? COLLISION : LEAF;
+                break;
+            }
+            int e = select(s, node);
+            int32_t child = s.edges[e].child;
+            if (child < 0) {
+                Position next = play(node.position, s.edges[e].action);
+                // (new_node may move `nodes`: `node` isn't used again)
+                child = new_node(s, next);
+                s.edges[e].child = child;
+            }
+            index = child;
+            b.path.push_back({index, e});
+        }
+        if (outcome == END) {
+            back_up(s, b.path.data(), (int)b.path.size(), s.nodes[index].position.reward, false);
+            visits++;
+            s.ended_in_a_row++;
+        } else if (outcome == LEAF && s.reuse && reuse_evaluation(s, index)) {
+            back_up(s, b.path.data(), (int)b.path.size(), s.nodes[index].value, false);
+            visits++;
+            s.reused_total++;
+            s.ended_in_a_row = 0;
+        } else if (outcome == LEAF) {
+            fly(s, b.path, 1);
+            b.paths.insert(b.paths.end(), b.path.begin(), b.path.end());
+            b.leaf_ends.push_back((int32_t)b.paths.size());
+            int symmetry = s.random_symmetry ? draw_symmetry(s) : 0;
+            b.leaf_symmetries.push_back((uint8_t)symmetry);
+            const Position& p = s.nodes[index].position;
+            write_observation(symmetric_bits(p.me, symmetry), symmetric_bits(p.opp, symmetry),
+                              out + (size_t)leaves * 128);
+            leaves++;
+            visits++;
+            s.ended_in_a_row = 0;
+        } else {
+            fly(s, b.path, 1);
+            b.collisions.insert(b.collisions.end(), b.path.begin(), b.path.end());
+            b.collision_ends.push_back((int32_t)b.collisions.size());
+            collided++;
+        }
+    }
+    s.remaining -= visits;
+    s.visits_total += visits;
+    s.collisions_total += collided;
+    return leaves;
+}
+
+// the evaluations of the leaves `collect` put in `b`, and its collisions undone
+void apply(Search& s, Batch& b, const float* logits, const float* values) {
+    int leaves = (int)b.leaf_ends.size();
+    int start = 0;
+    for (int i = 0; i < leaves; i++) {
+        int end = b.leaf_ends[i];
+        int32_t index = b.paths[end - 1].node;
+        const Position p = s.nodes[index].position;
+        const float* l = logits + (size_t)i * 65;
+        const uint8_t* shown_at = SYMMETRIC_ACTIONS.to[b.leaf_symmetries[i]];
+        uint64_t legal = legal_moves(p.me, p.opp);
+        int first = (int)s.edges.size();
+        float top = -1e30f;
+        if (legal) {
+            for (uint64_t m = legal; m; m &= m - 1) top = std::max(top, l[shown_at[__builtin_ctzll(m)]]);
+        } else {
+            top = l[PASS];
+        }
+        float total = 0;
+        auto add = [&](int action) {
+            float prior = std::exp(l[shown_at[action]] - top);
+            total += prior;
+            s.edges.push_back(Edge{prior, 0, 0, 0, -1, action});
+        };
+        if (legal) {
+            for (uint64_t m = legal; m; m &= m - 1) add(__builtin_ctzll(m));
+        } else {
+            add(PASS);
+        }
+        for (size_t e = first; e < s.edges.size(); e++) s.edges[e].prior /= total;
+        s.nodes[index].first_edge = first;
+        s.nodes[index].num_edges = (int32_t)s.edges.size() - first;
+        s.nodes[index].value = values[i];
+        s.evaluated.insert(p.me, p.opp, index);
+        back_up(s, b.paths.data() + start, end - start, values[i], true);
+        start = end;
+    }
+    for (const PathStep& step : b.collisions) {
+        s.nodes[step.node].in_flight--;
+        if (step.edge >= 0) s.edges[step.edge].in_flight--;
+    }
+}
+
 }  // namespace
 
 extern "C" {
 
-Search* search_new(int mode, float weight, float c_init, int max_collisions, int random_symmetry, uint64_t seed) {
+Search* search_new(int mode, float weight, float c_init, int max_collisions, int random_symmetry, int reuse,
+                   uint64_t seed) {
     Search* s = new Search();
     s->mode = mode;
     s->weight = weight;
     s->c_init = c_init;
     s->max_collisions = max_collisions;
     s->random_symmetry = random_symmetry != 0;
+    s->reuse = reuse != 0;
     s->rng = seed;
     s->root = -1;
     s->remaining = 0;
     s->collisions_total = 0;
     s->visits_total = 0;
+    s->ended_in_a_row = 0;
+    s->reused_total = 0;
     return s;
 }
 
@@ -292,6 +506,7 @@ void search_free(Search* s) { delete s; }
 void search_reset(Search* s) {
     s->nodes.clear();
     s->edges.clear();
+    s->evaluated.clear();
     Position p{};
     p.me = (1ULL << 28) | (1ULL << 35);
     p.opp = (1ULL << 27) | (1ULL << 36);
@@ -309,114 +524,10 @@ int search_remaining(const Search* s) { return s->remaining; }
 // end, which counts as a visit without one. A traversal ending in a leaf already in flight is a
 // collision: it visits nothing, but counts against the edges it took until `search_apply`. After
 // `max_collisions` of them the batch stops short. Returns the leaves.
-int search_collect(Search* s, int batch, float* out) {
-    s->paths.clear();
-    s->leaf_ends.clear();
-    s->collision_ends.clear();
-    s->leaf_symmetries.clear();
-    std::vector<PathStep> collisions;
-    int leaves = 0, visits = 0, collided = 0;
-    int want = std::min(batch, s->remaining);
-    while (visits < want && collided <= s->max_collisions) {
-        s->path.clear();
-        int32_t index = s->root;
-        s->path.push_back({index, -1});
-        enum { LEAF, END, COLLISION } outcome;
-        while (true) {
-            Node& node = s->nodes[index];
-            if (node.position.terminated) {
-                outcome = END;
-                break;
-            }
-            if (node.num_edges == 0) {
-                outcome = node.in_flight > 0 ? COLLISION : LEAF;
-                break;
-            }
-            int e = select(*s, node);
-            int32_t child = s->edges[e].child;
-            if (child < 0) {
-                Position next = play(node.position, s->edges[e].action);
-                // (new_node may move `nodes`: `node` isn't used again)
-                child = new_node(*s, next);
-                s->edges[e].child = child;
-            }
-            index = child;
-            s->path.push_back({index, e});
-        }
-        if (outcome == END) {
-            back_up(*s, s->path.data(), (int)s->path.size(), s->nodes[index].position.reward, false);
-            visits++;
-        } else if (outcome == LEAF) {
-            fly(*s, 1);
-            s->paths.insert(s->paths.end(), s->path.begin(), s->path.end());
-            s->leaf_ends.push_back((int32_t)s->paths.size());
-            int symmetry = s->random_symmetry ? draw_symmetry(*s) : 0;
-            s->leaf_symmetries.push_back((uint8_t)symmetry);
-            const Position& p = s->nodes[index].position;
-            write_observation(symmetric_bits(p.me, symmetry), symmetric_bits(p.opp, symmetry),
-                              out + (size_t)leaves * 128);
-            leaves++;
-            visits++;
-        } else {
-            fly(*s, 1);
-            collisions.insert(collisions.end(), s->path.begin(), s->path.end());
-            s->collision_ends.push_back((int32_t)collisions.size());
-            collided++;
-        }
-    }
-    s->remaining -= visits;
-    s->visits_total += visits;
-    s->collisions_total += collided;
-    // collisions are undone with `search_apply`
-    s->paths.insert(s->paths.end(), collisions.begin(), collisions.end());
-    return leaves;
-}
+int search_collect(Search* s, int batch, float* out) { return collect(*s, s->batch, batch, out); }
 
 // The evaluations of the leaves `search_collect` returned, (leaves, 65) policy logits and (leaves) values.
-void search_apply(Search* s, const float* logits, const float* values) {
-    int leaves = (int)s->leaf_ends.size();
-    int start = 0;
-    for (int i = 0; i < leaves; i++) {
-        int end = s->leaf_ends[i];
-        int32_t index = s->paths[end - 1].node;
-        const Position p = s->nodes[index].position;
-        const float* l = logits + (size_t)i * 65;
-        const uint8_t* shown_at = SYMMETRIC_ACTIONS.to[s->leaf_symmetries[i]];
-        uint64_t legal = legal_moves(p.me, p.opp);
-        int first = (int)s->edges.size();
-        float top = -1e30f;
-        if (legal) {
-            for (uint64_t m = legal; m; m &= m - 1) top = std::max(top, l[shown_at[__builtin_ctzll(m)]]);
-        } else {
-            top = l[PASS];
-        }
-        float total = 0;
-        auto add = [&](int action) {
-            float prior = std::exp(l[shown_at[action]] - top);
-            total += prior;
-            s->edges.push_back(Edge{prior, 0, 0, 0, -1, action});
-        };
-        if (legal) {
-            for (uint64_t m = legal; m; m &= m - 1) add(__builtin_ctzll(m));
-        } else {
-            add(PASS);
-        }
-        for (size_t e = first; e < s->edges.size(); e++) s->edges[e].prior /= total;
-        s->nodes[index].first_edge = first;
-        s->nodes[index].num_edges = (int32_t)s->edges.size() - first;
-        back_up(*s, s->paths.data() + start, end - start, values[i], true);
-        start = end;
-    }
-    size_t offset = start;
-    for (int32_t end : s->collision_ends) {
-        for (size_t i = offset; i < (size_t)start + end; i++) {
-            const PathStep& step = s->paths[i];
-            s->nodes[step.node].in_flight--;
-            if (step.edge >= 0) s->edges[step.edge].in_flight--;
-        }
-        offset = (size_t)start + end;
-    }
-}
+void search_apply(Search* s, const float* logits, const float* values) { apply(*s, s->batch, logits, values); }
 
 int search_num_legal(const Search* s) {
     const Position& p = s->nodes[s->root].position;
@@ -491,6 +602,9 @@ long search_collisions(const Search* s) { return s->collisions_total; }
 
 long search_total_visits(const Search* s) { return s->visits_total; }
 
+// leaves that took an evaluation from the tree rather than the network
+long search_reused(const Search* s) { return s->reused_total; }
+
 long search_num_nodes(const Search* s) { return (long)s->nodes.size(); }
 
 void search_legal(const Search* s, int32_t* out) {
@@ -504,4 +618,272 @@ void search_legal(const Search* s, int32_t* out) {
 uint64_t search_symmetric_bits(uint64_t x, int symmetry) { return symmetric_bits(x, symmetry); }
 
 int search_symmetric_action(int action, int symmetry) { return SYMMETRIC_ACTIONS.to[symmetry][action]; }
+
+// An engine: a network compiled by OpenVINO for `threads` workers, each with its own requests on a core,
+// which search a tree together, each collecting up to `batch` leaves, evaluating them while the others
+// go on, and backing them up. The tree is shared under a lock; its virtual visits keep their
+// traversals apart, as a batch's are. Python only starts a move's search and reads its result.
+struct Worker {
+    std::vector<float> observations;  // (batch, 2, 8, 8)
+    // a request for each number of leaves, 1 to batch, their input `observations`, with OpenVINO
+    std::vector<ov::InferRequest> requests;
+    // or the native network's buffers, and its outputs
+    std::unique_ptr<net::Scratch> scratch;
+    std::vector<float> logits, values;
+    Batch batch;
+};
+
+struct Engine {
+    ov::Core core;
+    std::vector<ov::CompiledModel> models;
+    // the native network, if it has one rather than OpenVINO's
+    const net::Net* network = nullptr;
+    std::vector<Worker> workers;
+    int batch;
+    long calls = 0;
+    long leaves = 0;
+    double infer_seconds = 0;
+};
+
+Engine* engine_new(const char* model_path, const char* precision, int threads, int batch) {
+    try {
+        Engine* engine = new Engine();
+        engine->batch = batch;
+        engine->workers.resize(threads);
+        auto network = engine->core.read_model(model_path);
+        ov::element::Type type = std::string(precision) == "bf16" ? ov::element::bf16 : ov::element::f32;
+        std::vector<std::shared_ptr<ov::Model>> sized;
+        for (int k = 1; k <= batch; k++) {
+            auto copy = network->clone();
+            copy->reshape({{copy->input().get_any_name(), ov::PartialShape{k, 2, 8, 8}}});
+            sized.push_back(copy);
+        }
+        // a model of each size for each worker, one thread and one stream each, compiled in parallel
+        engine->models.resize((size_t)threads * batch);
+        std::vector<std::thread> compiling;
+        for (int t = 0; t < threads; t++) {
+            compiling.emplace_back([engine, &sized, type, t, batch] {
+                Worker& w = engine->workers[t];
+                w.observations.assign((size_t)batch * 128, 0.0f);
+                for (int k = 1; k <= batch; k++) {
+                    ov::CompiledModel& m = engine->models[(size_t)t * batch + k - 1];
+                    m = engine->core.compile_model(sized[k - 1], "CPU", ov::inference_num_threads(1),
+                                                   ov::num_streams(1), ov::hint::inference_precision(type),
+                                                   ov::hint::enable_cpu_pinning(false));
+                    ov::InferRequest request = m.create_infer_request();
+                    request.set_input_tensor(
+                        ov::Tensor(ov::element::f32, ov::Shape{(size_t)k, 2, 8, 8}, w.observations.data()));
+                    request.infer();
+                    w.requests.push_back(request);
+                }
+            });
+        }
+        for (auto& c : compiling) c.join();
+        return engine;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "engine_new: %s\n", e.what());
+        return nullptr;
+    }
+}
+
+// An engine of the native network `n` (see `cpu_net.h`), which must outlive it.
+Engine* engine_new_net(const net::Net* n, int threads, int batch) {
+    if (!NET_NATIVE) return nullptr;
+    Engine* engine = new Engine();
+    engine->network = n;
+    engine->batch = batch;
+    engine->workers.resize(threads);
+    for (Worker& w : engine->workers) {
+        w.observations.assign((size_t)batch * 128, 0.0f);
+        w.scratch = std::make_unique<net::Scratch>(*n);
+        w.logits.assign((size_t)batch * 65, 0.0f);
+        w.values.assign(batch, 0.0f);
+    }
+    return engine;
+}
+
+void engine_free(Engine* engine) { delete engine; }
+
+// Searches `s`'s tree with all the engine's workers: `visits` visits, or with none, until `seconds`
+// pass, or, either way, until `stop_ended` traversals in a row end the game with no leaf between (the
+// tree has nothing left to evaluate), 0 for never. Batches in flight then are finished. Returns the
+// leaves evaluated.
+long engine_search(Engine* engine, Search* s, int visits, double seconds, int stop_ended) {
+    using clock = std::chrono::steady_clock;
+    auto start = clock::now();
+    auto deadline = start + std::chrono::duration_cast<clock::duration>(std::chrono::duration<double>(seconds));
+    bool timed = visits <= 0;
+    s->remaining = timed ? INT_MAX : visits;
+    s->ended_in_a_row = 0;
+    std::mutex lock;
+    std::condition_variable applied;
+    long generation = 0;
+    bool stop = false;
+    long leaves = 0;
+    auto work = [&](Worker& w) {
+        long calls = 0, mine = 0;
+        double inferring = 0;
+        std::unique_lock<std::mutex> held(lock);
+        while (true) {
+            if (stop || s->remaining <= 0 || (timed && clock::now() >= deadline) ||
+                (stop_ended > 0 && s->ended_in_a_row >= stop_ended)) {
+                stop = true;
+                applied.notify_all();
+                break;
+            }
+            int n = collect(*s, w.batch, engine->batch, w.observations.data());
+            if (n == 0) {
+                bool collided = !w.batch.collisions.empty();
+                apply(*s, w.batch, nullptr, nullptr);
+                if (collided) {
+                    // every leaf it found is another's in flight: wait for one of them
+                    long seen = generation;
+                    applied.wait_for(held, std::chrono::milliseconds(2),
+                                     [&] { return generation != seen || stop; });
+                }
+                continue;
+            }
+            held.unlock();
+            auto t0 = clock::now();
+            const float *logits, *values;
+            if (engine->network) {
+                for (int i = 0; i < n; i++)
+                    net::forward(*engine->network, *w.scratch, w.observations.data() + (size_t)i * 128,
+                                 w.logits.data() + (size_t)i * 65, w.values.data() + i);
+                logits = w.logits.data();
+                values = w.values.data();
+            } else {
+                ov::InferRequest& request = w.requests[n - 1];
+                request.infer();
+                logits = request.get_output_tensor(0).data<float>();
+                values = request.get_output_tensor(1).data<float>();
+            }
+            inferring += std::chrono::duration<double>(clock::now() - t0).count();
+            held.lock();
+            apply(*s, w.batch, logits, values);
+            generation++;
+            applied.notify_all();
+            calls++;
+            mine += n;
+        }
+        leaves += mine;
+        engine->calls += calls;
+        engine->infer_seconds += inferring;
+    };
+    std::vector<std::thread> threads;
+    for (size_t t = 1; t < engine->workers.size(); t++) threads.emplace_back(work, std::ref(engine->workers[t]));
+    work(engine->workers[0]);
+    for (auto& t : threads) t.join();
+    s->remaining = 0;
+    engine->leaves += leaves;
+    return leaves;
+}
+
+// (calls, leaves, seconds in inference summed over workers) since the engine was made
+void engine_stats(const Engine* engine, double* out) {
+    out[0] = (double)engine->calls;
+    out[1] = (double)engine->leaves;
+    out[2] = engine->infer_seconds;
+}
+
+// whether this build has the native network (see `cpu_net.h`)
+int net_supported() { return NET_NATIVE; }
+
+// The native network, built a part at a time by `cpu_net.py`.
+net::Net* net_new(int channels, int pre, int head_channels) {
+    net::Net* n = new net::Net();
+    n->channels = channels;
+    n->pre = pre != 0;
+    n->head_channels = head_channels;
+    return n;
+}
+
+void net_free(net::Net* n) { delete n; }
+
+void net_add_block(net::Net* n, int pool_channels) {
+    n->blocks.emplace_back();
+    n->blocks.back().pool_channels = pool_channels;
+}
+
+// A convolution: "stem", "head" (the heads' three 1x1 convolutions in one), or a block's "conv1" or
+// "conv2". `q`, (cout, cin, k, k), its weights; `scale`
+// and `bias`, of each output, what its integer sums are multiplied by and then added to; `inverse`,
+// of each input channel, and `zero_point`, how its input is quantized: round(x * inverse) + zero_point.
+int net_set_conv(net::Net* n, const char* where, int block, int cin, int cout, int k, const int8_t* q,
+                 const float* scale, const float* bias, const float* inverse, int zero_point) {
+    std::string name(where);
+    net::Conv* c = name == "stem"    ? &n->stem
+                   : name == "head" ? &n->head
+                   : name == "conv1" ? &n->blocks.at(block).conv1
+                   : name == "conv2" ? &n->blocks.at(block).conv2
+                                     : nullptr;
+    if (!c || cin % 4 || cout % 16 || (k != 1 && k != 3)) return -1;
+    c->cin = cin;
+    c->cout = cout;
+    c->k = k;
+    net::pack(*c, q);
+    c->scale.assign(scale, scale + cout);
+    c->bias.assign(bias, bias + cout);
+    c->inverse.assign(inverse, inverse + cin);
+    c->zero_point = zero_point;
+    return 0;
+}
+
+// A normalization (see `net::Norm`): "stem", "final", a block's "norm1" or "norm2", or the heads'
+// "policy", "pool" or "value".
+int net_set_norm(net::Net* n, const char* where, int block, int type, int channels, const float* a,
+                 const float* c, float eps) {
+    std::string name(where);
+    net::Norm* norm = name == "stem"     ? &n->stem_norm
+                      : name == "final"  ? &n->final_norm
+                      : name == "norm1"  ? &n->blocks.at(block).norm1
+                      : name == "norm2"  ? &n->blocks.at(block).norm2
+                      : name == "policy" ? &n->policy_norm
+                      : name == "pool"   ? &n->pool_norm
+                      : name == "value"  ? &n->value_norm
+                                         : nullptr;
+    if (!norm) return -1;
+    norm->type = type;
+    norm->channels = channels;
+    if (type != net::NORM_NONE) {
+        norm->a.assign(a, a + channels);
+        norm->c.assign(c, c + channels);
+    }
+    norm->eps = eps;
+    return 0;
+}
+
+// A linear layer, `w` (out, in): a block's "pool", or the heads' "pool", "pass", "value_hidden" or
+// "value_out".
+int net_set_linear(net::Net* n, const char* where, int block, int in, int out, const float* w, const float* b) {
+    std::string name(where);
+    net::Linear* l = block >= 0 && name == "pool" ? &n->blocks.at(block).pool
+                     : name == "pool"             ? &n->pool_linear
+                     : name == "pass"             ? &n->pass_linear
+                     : name == "value_hidden"     ? &n->value_hidden
+                     : name == "value_out"        ? &n->value_out
+                                                  : nullptr;
+    if (!l) return -1;
+    l->in = in;
+    l->out = out;
+    l->w.assign(w, w + (size_t)in * out);
+    l->b.assign(b, b + out);
+    return 0;
+}
+
+// The policy's last 1x1 convolution, `square_w` (head_channels).
+void net_set_heads(net::Net* n, const float* square_w) { n->square_w.assign(square_w, square_w + n->head_channels); }
+
+// `count` positions, (count, 2, 8, 8), to (count, 65) logits and (count) values, split over `threads`.
+void net_forward(const net::Net* n, int count, const float* obs, float* logits, float* values, int threads) {
+    auto part = [&](int t) {
+        net::Scratch scratch(*n);
+        for (int i = t; i < count; i += threads)
+            net::forward(*n, scratch, obs + (size_t)i * 128, logits + (size_t)i * 65, values + i);
+    };
+    std::vector<std::thread> others;
+    for (int t = 1; t < threads; t++) others.emplace_back(part, t);
+    part(0);
+    for (auto& t : others) t.join();
+}
 }

@@ -97,6 +97,19 @@ class Evaluator:
         """
         return jnp.array(True)
 
+    def trains_on(self, state: Any) -> jax.Array:  # pylint: disable=unused-argument
+        """Whether the search in `state` makes a training position (self-play stores its
+        position in the replay buffer): always, unless an evaluator says otherwise (e.g. MCTS's
+        fast searches, see `PlayoutCap`).
+
+        Args:
+            state: The internal state of the Evaluator, during or after a search.
+
+        Returns:
+            jax.Array: whether to store the position searched
+        """
+        return jnp.array(True)
+
     def start_search(self, key: jax.Array, state: Any, active: ArrayLike = True) -> Any:  # pylint: disable=unused-argument
         """What a search does once before its cycles, rather than in each (under vmap, all of a
         cycle is computed in every cycle): nothing.

@@ -13,8 +13,11 @@ Othello model and against two strong open-source Othello engines,
 | `engines.py` | Edax and Egaroucid, each driven over GTP, and what their searches made of each position, from their logs |
 | `setup_edax.sh`, `setup_egaroucid.sh` | Build the engines for `vs_engine.py` and `clock_match.py` |
 | `clock_match.py` | Games on a real clock, one at a time on the same cores, each side at its best settings |
-| `cpu_search.py`, `cpu_search.cpp` | A single game's MCTS for playing on CPU: a tree in C++, leaves evaluated in batches by OpenVINO or ONNX Runtime |
+| `gcp_cpu_jobs.py`, `gcp_cpu_runner.py` | Commands on Google Cloud Spot VMs of one CPU model (8 Zen 5 cores, AVX-512 VNNI), for timed games |
+| `cpu_search.py`, `cpu_search.cpp` | A single game's MCTS for playing on CPU: a tree in C++, its leaves evaluated in batches by OpenVINO or ONNX Runtime, or searched by a thread to a core (`Engine`) |
+| `cpu_net.py`, `cpu_net.h` | A network's int8 forward pass in C++ (AVX-512 VNNI, AVX2 or ARM's NEON), for `Engine`: no OpenVINO, closer to the float network |
 | `cpu_match.py` | Games between two such players at fixed visits a move, and their speed in evals a second |
+| `endgame.py`, `endgame.cpp` | The endgame solved exactly in C++, for a player (`solve=N`) and in batches for labels |
 | `export_onnx.py` | Exports a checkpoint's network to ONNX |
 | `bench_cpu_backends.py` | Evals a second by CPU backend and batch, each checked against JAX's outputs |
 | `quantize.py`, `fidelity.py`, `bench_quantized.py` | Quantizes a network to int8 for playing on CPU, and measures its outputs and speed against bf16 |
@@ -80,6 +83,18 @@ environment, so it plays more moves (logged as `moves` and `cycles_per_move`), a
 the replay buffer faster. `--min-iterations` sets the fewest a search takes, and
 `--advance-every` how often finished searches play their moves (5 cycles by default with
 `--count-reused-visits`; a search done in between goes on until then).
+
+`--playout-cap P:FAST` is KataGo's playout cap randomization: each move is searched with
+`--sims` iterations with probability P, and otherwise with FAST, without the root's noise.
+Only the full searches' positions are stored for training; the fast ones are played, and
+count towards their game's outcome. At the same compute, that plays more moves and so more
+games (KataGo: P 0.25, 600 and 100 playouts). `--selfplay-cycles` holds an epoch's
+self-play compute fixed across settings, in cycles per environment (by default 128 full
+searches, 128 × (`--sims` + 1)); size `--buffer` by the share of moves stored, for the
+same span of self-play, and pass a small `--advance-every` whose multiples the searches'
+cycles (iterations + 1) are, so that no search waits for its move to be played. For
+example, 25% of moves at 127 iterations and 75% at 43, at the compute of uniform 64:
+`--sims 127 --playout-cap 0.25:43 --selfplay-cycles 8320 --advance-every 4 --buffer 281`.
 
 By default every search starts from the subtree of the move played that the last search
 explored, and adds `--sims` iterations to its visits. `--no-persist-tree` starts each from
@@ -248,6 +263,36 @@ The run's page shows, each epoch, the tree positions stored (`tree_positions`, a
 training could sample (`tree_buffer_samples`), and the share of each training batch they
 made up (`tree_batch_fraction`).
 
+### Exact endgame labels
+
+`--solve-empties N` stops each self-play game once its position has N or fewer empty
+squares. That position is searched and stored like any other, and an exact solver's result
+for it (win, draw or loss for the player to move) becomes every position's value target,
+instead of the result the game would have had if played out. Self-play skips the searches
+for the last N moves and plays more games in the same compute. The labels lose the noise of
+endgame mistakes: in F2 e440's self-play (the 8x128 at 511/127 sims), the played result
+differs from the exact one at 16-20 empties in 17% of games, mostly a win or loss played
+as a draw or the reverse.
+
+The solver (`--solver native`, endgame.py, a win/draw/loss solve; `edax` for comparison)
+runs on the CPU while the GPU trains and plays. Games stopped in an epoch's self-play are solved
+through its training and the next epoch's self-play, and trained on from then. A new run's first epoch solves them at once,
+since it has nothing else to train on. At N = 20, a solve averages about 80 ms a core on
+F2's positions, and an epoch at F2's settings should stop about 4,600 games (152,000 moves at
+about 33 a game from an XOT opening), so the solver needs
+3-4 cores to keep up with a 5080 (`--solve-threads`, default every core the process may
+use; on Modal, `--cpu 8`). `solve_wait_seconds` shows how long self-play waited for it,
+and `solve_games`, `solve_draw` and `solve_missed` count the games.
+
+Stopped games never produce positions with fewer than N empty squares, though searches from
+just above N still reach them, and their leaves there are valued by the network.
+`--solve-play-past MEAN` plays each game on past N, ending before each further move with
+probability 1 / (1 + MEAN): MEAN moves on average, a geometric number. Positions up to N keep the
+solved result at N; each position stored past N is solved on its own and gets its own exact
+result. Solves below N are cheap (24 ms at 18 empties, a few below that), so at MEAN 3.5 the
+solver's time goes up about 15% a game. `solve_positions` counts every solve. `--solve-share P`
+stops only a fraction P of games and plays the rest to the end, unsolved.
+
 ### Policy target from the search
 
 By default the network learns each played position's policy from the search's visit
@@ -331,6 +376,199 @@ its own `--lr`: to carry on at 1e-4, fork with `--lr 1e-4 --lr-plateau 1e-5`.
 ```
 uv run examples/othello/train.py --epochs 600 --lr-plateau --save-state-every 10 --ckpt-dir runs/plateau
 ```
+
+`--branch-from` continues a run from a state in a new `--ckpt-dir`, with other self-play
+settings: a branch of the run rather than a new one. It goes on at the state's epoch (`--epochs`
+counts the epochs before it too), with every network and optimizer state, the learning rate
+rule's and growth's progress, the buffers, the games in progress and the rng. Only a search of
+another size starts its trees anew, its moves in progress searched again; with the run's own
+settings a branch continues it exactly. Two branches of one state, one at `--sims 128` and one
+at `--sims 64`, compare the two at the same point of the same run. It works for runs with
+`--grow`, which can't be forked, and `--take-over` hands self-play to the next network from
+the branch's first epoch. A different `--buffer` resizes the replay buffer at the branch's
+start, each environment keeping its newest positions. The branch logs to a seaglass run of its
+own, whose config records the state as `parent`.
+
+```
+uv run examples/othello/train.py --epochs 180 --sims 128 --branch-from runs/trunk/state-150.npz \
+    --save-state-at 180 --ckpt-dir runs/trunk150-sims128
+```
+
+### Growing the network
+
+Self-play costs far more than training. KataGo started with small nets and trained the next
+size up on the same games, switching when it caught up. `--grow NET` (repeat it for several,
+smallest first) does the same: `--net` plays self-play, and the next network trains on the same
+replay buffer each epoch without playing. When it takes over, the one before stops, and the
+one after that, if any, starts training from scratch on the buffer as it is. So two networks
+train at a time.
+
+The next network takes over when its `--grow-metric` on the engine-labelled set
+(`engine_value_mse`, scored every epoch) is at or below the playing one's, or with
+`--grow-metric loss` its training loss on the data both train on, as KataGo's rule had it.
+`--grow-margin 0.01` makes the next lead by 1% of the playing one's metric, and `--grow-guard
+engine_value_mse` makes it also no worse on the engine set's value error. Each is averaged over
+the last `--grow-window` (10) epochs, and the next must have trained `--grow-min-epochs` (10) first.
+With `--grow-switch-at EPOCHS`, it takes over after fixed numbers of epochs instead. Either way,
+a playing network whose `--lr-plateau-stop` rule is done hands over rather than stopping the
+run. A waiting network trains at `--lr`, and follows `--lr-plateau` from its first rate once it
+plays. `--grow-train-retired` keeps the networks that played before training on the replay buffer,
+`--train-steps` each an epoch, without playing; a resumed or branched run turns it on or off.
+`--grow-train-steps N` has the waiting network take N training steps an epoch
+rather than `--train-steps`, e.g. what its own play would afford for the same compute. With
+`--grow-manual`, nothing takes over by itself: the run logs `growth_caught_up` (1 once
+the rule would switch), saved states record it too, and the next network takes over in a branch
+of the run, with `--branch-from` and `--take-over` (see the run controller below). A branch can
+also grow past the networks the run started with: `--grow` networks after the saved state's
+last start from scratch, as one that hasn't joined a run yet does, so a run whose last network
+plays can go on into a bigger one.
+
+Each network's checkpoints go to `--ckpt-dir/<its size>`, e.g. `runs/grow/2x32` and `runs/grow/4x64`.
+Saved states hold every network, in `--ckpt-dir`. Each network's metrics are logged as
+`<its size>/<metric>`, and the playing network's also without the prefix. The run logs which
+network played (`growth_playing`), the next's mean metric minus the playing one's (`growth_gap`),
+and the switch (`growth_switch`). Every run logs its compute per epoch, to compare runs at equal
+GPU time: `selfplay_seconds`, `train_seconds` and `test_seconds` (with `--grow`, each network's
+as `<its size>/train_seconds` and `<its size>/test_seconds`), `epoch_seconds`, and the run's total,
+`run_seconds`. It also logs it in network evaluations, which don't depend on the hardware:
+`selfplay_evals`, the positions self-play evaluated (search cycles times environments, since
+every environment pays every cycle), and `train_samples`, the samples trained on (with
+`--grow`, each network's as `<its size>/train_samples`, and the evaluations under the playing
+one's name too).
+
+```
+uv run examples/othello/train.py --net resnet:2x32,pool_every=2,heads=pooled,pool_channels=8 \
+    --grow resnet:4x64,pool_every=2,heads=pooled,pool_channels=16 --engine-eval-every 1 \
+    --lr-plateau --lr-plateau-stop --epochs 600 --ckpt-dir runs/grow
+```
+
+### Weight averages
+
+At a constant learning rate the network's weights jitter from epoch to epoch, and so does its
+play: KataGo played and rated averaged weights. `--average-epochs 4 16` keeps averages of each
+network's weights over about 4 and 16 epochs: the mean of the epochs so far, then an exponential
+moving average that moves 1/H of the way to each epoch's weights. Training itself is unchanged,
+and so is the run's rng: a run with averages is the run without them, plus each average's
+checkpoints in `avg<H>` in the network's checkpoint directory (e.g. `runs/grow/8x128/avg4`) and
+its scores on the engine-labelled set, `avg<H>/engine_*`. Saved states keep them; a state saved
+without them starts them at its weights. `--selfplay-average 4` has self-play play with the
+4-epoch average instead of the current weights.
+
+What the jitter costs can be watched, off by default: `--fresh-positions N` scores the playing
+network every epoch on N of the positions its self-play just stored, before it trains on them,
+its raw weights and its self-play average: their policy KL and value loss (`fresh_*`), and the
+raw weights' excess (`fresh_*_gap`). N is a multiple of the micro-batch (`--train-batch` /
+`--grad-accum`), e.g. 16 of them. It draws its samples from the run's rng, so a run with it
+plays other games than the same run without.
+
+### The run controller
+
+`controller.py` runs a long growing run in steps, each its own entry in slick's GPU queue, so
+other work can be slotted in between them, and decides between steps what the run does next.
+Each period:
+
+1. **Trunk**: the run trains on at its current settings, for `trunk_turnovers` turnovers of
+   its replay buffer, the next network training beside the one playing, on its games. No
+   network takes over during it (`--grow-manual`); the next's training loss against the
+   playing one's is logged (`growth_gap`, `growth_caught_up`), but nothing switches on it. The
+   next network trains the steps its own play would afford for the same compute
+   (`--grow-train-steps`): the playing one's steps times the ratio of the two regimes'
+   benchmarked epoch costs, each regime with its own waiting network (solved from the last
+   back). With 8x128 playing at 255/63 sims, 12x144 takes 146 of 256 steps; the smaller steps
+   of the ladder about 40%. So when the test plays the two, the bigger one has trained about
+   what the run would have spent on it as the one playing.
+2. **Size**: if there's a next network, it plays the one playing, both as they trained in the
+   trunk, each with its weights averaged over the last `average_epochs` (4) epochs
+   (`--average-epochs`; see weight averages above). If it scores `margin_se` (2) standard
+   errors of its series or more, the run grows: the next network takes over from the trunk's
+   state at the next trunk (`--take-over`), and the period needs no branches. Growing comes
+   first: the search only goes up while the next network doesn't pay its way, a bigger network
+   being what makes more search worth it.
+3. **Sims**, otherwise: two branches of the run (`--branch-from`) at equal benchmarked compute,
+   in which no network takes over either. `double` searches twice the iterations, both budgets
+   with playout cap randomization, for `branch_turnovers` turnovers of its buffer; `stay` keeps
+   the search for as many epochs as cost the same. If `double`'s playing network scores
+   `margin_se` standard errors or more against `stay`'s, the run goes on from `double`, else
+   from `stay`; `double`'s next network plays `stay`'s too, for the record. One branch is
+   thrown away: longer trunks (`trunk_turnovers`) test less often. With `selfplay_average`,
+   self-play plays the averages too (`--selfplay-average`).
+4. **Ladder**: the network the run kept plays the league's Edax players in turn (`ladder`,
+   edax-L1 up to edax-L24), a series each, from the rung the last period lost to, on to the next
+   while it scores over half. Its games put the kept line on the league's scale.
+
+Every network is rated at 128 sims, the best model per search; for the record, the run also
+plays them at equal time. `clock_sims` gives each size the sims that take it about 1 s of one
+side's clock a game on the contest CPU path (bf16 OpenVINO, 8 threads, batched search, from the
+league's `timings.json`): 4x64 3000, 6x96 1100, 8x128 520, 12x144 250. The size step plays the next
+network against the one playing at those sims too (`size on the clock`), and the kept network
+climbs a second ladder of its own at its clock's sims (`pNNN-clock-ladder`). Those players have
+4 tree nodes an iteration (`clock_tree_factor`): at thousands of sims, the default 2 costs
+strength. Nothing is decided on the clock's games.
+
+With `train_retired`, the networks that played before keep training on the run's games, as many
+steps as the one playing (train.py `--grow-train-retired`), and the period's first test (the size
+step, or the sims step once the last network plays) plays each of them against the one playing
+(`retired <size>`): whether a smaller network keeps up on a bigger one's
+games, or falls behind for want of capacity. It isn't compute-optimal (about 10% more compute,
+15% with three retired), so it's counted in the run's compute and on its own
+(`retired_seconds`), but not in the next network's steps or any decision. It isn't part of a
+saved state: changed in controller.json, it holds from the next step, and a retired network
+takes up its training where it left it.
+
+With `"window"` in the config, the replay window grows with the positions the kept line of
+states has stored per environment, n, by the replay-window task's rule: n until `c` (256), then
+`c (1 + beta ((n / c)^alpha - 1) / alpha)` (KataGo's shape, `alpha` 0.75, `beta` 0.075, which
+reaches about 1125 at an 8x128 run's 30M positions). A step starts with the buffer resized once
+the target is 25% past its capacity. With playout cap randomization n counts the positions
+stored. Periods are in turnovers of the buffer, so they lengthen as it grows, and as the
+networks do; `trunk_hours` caps a trunk at that many GPU hours by the cost model, so the
+tests come about as often throughout.
+
+Compute is counted in network evaluations (self-play's positions evaluated, the samples each
+network trains on) and in GPU time: the first step times each network's forward pass at
+self-play's batch and its training step at training's (`bench_nets.py`), and each training
+step measures what the search's own bookkeeping adds per cycle (its epochs' self-play time
+less the forward passes, about 20% at 8x128; each search's median, the nearest budget's for a
+search not run yet). A step's time is those times its cycles and steps: branches are matched
+on it, and the waiting network's steps follow it. Compiling and tests aren't counted. The losing branch counts in what the run spent (`spent`), not
+in the line of states it kept (`kept`). Decisions, with their series, go to `decisions.jsonl`.
+
+The learning rate (`lr`, 5e-4) is constant through the run, as KataGo held its until its final
+net's last days. The config is JSON: the networks, smallest first, the search to start with
+(`full`, or with playout cap randomization `full`, `fast`, `full_probability` and `cycles`,
+train.py's `--selfplay-cycles`), train.py's other arguments, and the steps' frozen worktree
+(with `./install.sh`'s CUDA environment) and the slick task's worktree to queue from. See
+`controller.Config` for the rest.
+
+```json
+{
+  "name": "grow1",
+  "nets": ["resnet:4x64,pool_every=2,heads=pooled,pool_channels=16",
+           "resnet:6x96,pool_every=2,heads=pooled,pool_channels=24"],
+  "search": {"full": 127, "fast": 31, "full_probability": 0.25, "cycles": 8320},
+  "buffer": 256,
+  "window": {"c": 256},
+  "lr": 5e-4,
+  "worktree": "~/worktrees/turbozero/grow1-frozen",
+  "queue_cwd": "~/worktrees/turbozero/<the task's worktree>"
+}
+```
+
+```
+uv run examples/othello/controller.py init runs/grow1 --config grow1.json
+uv run examples/othello/controller.py start runs/grow1
+uv run examples/othello/controller.py status runs/grow1
+uv run examples/othello/controller.py stop runs/grow1             # after the steps queued now
+uv run examples/othello/controller.py retry runs/grow1 p003-double
+uv run examples/othello/controller.py advance runs/grow1           # what a step's end queues
+```
+
+`advance` also catches a run up after an update of the controller, e.g. a run from before the
+ladder plays each period's ladder, in order.
+
+A rating step runs the league's player in its own queue entry, playing only requested series,
+from the league's frozen worktree. If something queued at its priority or above takes the GPU
+first, the step goes back in the queue. Its players are retired once their series are done.
 
 ### Training on Modal
 
@@ -511,6 +749,45 @@ uv run examples/othello/vs_engine.py runs/othello/49.eqx --levels 8 --sims 1000 
     --stop-below -1 --monitor --run ID
 ```
 
+### On Google Cloud CPUs
+
+Timed games need the same CPU every time, and Modal's are a mix (some AMD Zen 3 without AVX-512,
+where the native network runs its AVX2 kernel at about a quarter of the speed). `gcp_cpu_jobs.py`
+runs commands on Spot VMs of one model: `n4d-highcpu-16` with one thread a core, 8 physical cores
+of AMD Turin (EPYC 9B45, Zen 5, AVX-512 VNNI), the same generation as razorback's 9900X3D but at a
+lower clock (4.1 GHz at most).
+
+```sh
+uv run examples/othello/gcp_cpu_jobs.py setup --project PROJECT        # once; the bucket is modal_jobs.py's
+uv run examples/othello/gcp_cpu_jobs.py run --name check-1 --jobs jobs.json --out results.jsonl \
+    --vms 2 --files quantized/4x64-...-native.npz
+uv run examples/othello/gcp_cpu_jobs.py follow check-1                 # lines jobs add to their outputs
+uv run examples/othello/gcp_cpu_jobs.py list
+uv run examples/othello/gcp_cpu_jobs.py cleanup                        # every job's VMs
+```
+
+`jobs.json` is a list of `{"name": ..., "cmd": [...], "outputs": [...]}`: each command runs in
+`examples/othello` with the environment's python first on `PATH`, and the last line of JSON it
+prints is its result. Files named in `outputs` (e.g. a `clock_match.py --games` file) go to the
+bucket every 20 seconds while the job runs, which `follow` prints line by line, and come back
+beside `--out`, in `OUT-files/SLOT/NAME/`, when it ends. The jobs are dealt out over the VMs; with
+`--each`, every VM runs every job, to compare VMs. A VM takes this checkout's files as they are
+(new and uncommitted ones too), the engines' builds and each `--files` path under
+`~/.cache/turbozero/othello`, waits for its CPUs to go idle (Ubuntu's own startup work skewed a
+first timed job by 11%), runs its jobs, sending each result to the bucket as it ends, and deletes
+itself. A preempted VM is replaced, the replacement skipping what's done; `run` again with the
+same `--name` continues a job cut short. Every VM is deleted after `--hours` whatever it's doing,
+and `run` deletes any left when it ends.
+
+The first VM of a `uv.lock` builds the environment (g++ from Ubuntu's mirror, uv, the venv from
+PyPI: 3-13 minutes) and leaves it in the bucket; VMs after it start from that, ready about 40
+seconds after their startup script begins (a minute or so after they're created).
+
+Two VMs playing the same games agreed within 1-4% on each game's time where both played the same
+moves. The engines took about 1.45x their time on razorback's CPUs 16-23 (1.24-1.7x by level),
+Egaroucid a little more than Edax, so these VMs need their own timings rather than razorback's
+scaled.
+
 ### Against Edax's scores of fixed positions
 
 Games against engines measure strength, but coarsely: 512 games give a score within about
@@ -651,6 +928,142 @@ from XOT openings, 1000 visits a move, or 4 s a side:
 At a batch of 1 it's no faster (0.94-0.99x). The gain is OpenVINO's int8 kernels on AVX512_VNNI: on
 ONNX Runtime int8 only matched bf16, and a CPU without VNNI will differ. The 4x64 net's outputs follow
 bf16's least closely, and it hasn't played.
+
+### The engine and the native network
+
+`clock_match.py`'s `engine=1` searches with a thread to a core, all in C++ (`cpu_search.Engine`): each
+collects its own few leaves, evaluates them on its own core while the others carry on, and backs them
+up, the tree shared under a lock. The batch above waits on its slowest stream, and goes through Python,
+at every step; here the network's time is 90-97% of the search's. `backend=native` evaluates with
+`cpu_net.py`'s network, our own int8 convolutions with float between them, a leaf at a time, so each
+thread needs only one leaf in flight. The library is built for a standard level of the CPU's
+architecture, as engines ship builds for (`native_target.py`). On x86: AVX-512 with VNNI (x86-64-v4)
+where the CPU has them, else AVX2 (x86-64-v3), with AVX-VNNI where the CPU has it (Intel's client
+chips from Alder Lake, which lack AVX-512). On ARM: ARMv8.2 with the dot product and the 8-bit matrix
+multiply (i8mm: Apple's M2 on, Graviton 3 on, Axion), else with the dot product alone (Apple's M1,
+Graviton 2). `TURBOZERO_CPU_LEVEL` (`v4`, `v3-vnni`, `v3`, `arm-i8mm`, `arm-dotprod`) picks one,
+e.g. to play as an AVX2 build would. Every kernel sums exactly the same integers:
+
+- AVX2's 3x3 convolutions run Winograd's F(2x2, 3x3) in integers: each 2x2 tile's 4x4 input patch and
+  the weights are transformed into values that fit 16 bits, multiplied in pairs summed into 32 bits,
+  and transformed back, in 16 products where the direct convolution takes 36.
+- NEON's multiply signed bytes: the inputs go in less 128, and 128 times each output's weight sum is
+  added back. `sdot` takes 4 channels of a square against 4 outputs' weights; i8mm's `smmla` takes 8
+  channels of two neighbouring squares against two outputs' weights, twice the products an instruction,
+  from the input laid out in such pairs.
+
+Evals a second on one core, a leaf at a time:
+
+| Core, kernel | 8x128 | 4x64 |
+|---|---|---|
+| Zen 5, AVX-512 VNNI | 3615 | 22264 |
+| Zen 5, AVX2 Winograd (a direct 16-bit kernel) | 1729 (933) | 11618 (6650) |
+| Axion (Neoverse V2), i8mm (`sdot`) | 1442 (974) | 7868 (5931) |
+| Apple M4, i8mm (`sdot`) | 1450 (1490) | 9330 (9690) |
+
+Our engine's seconds a game over the engine's, at the visits that tie with each level on Zen 5 (the
+8 pairings of Edax and Egaroucid at levels 20 and 24 with 8x128 and 4x64 nets, 4 threads a side, whole
+cores):
+
+| Machine, our build | Against Edax | Against Egaroucid |
+|---|---|---|
+| Zen 5 (EPYC 9B45), AVX-512 | 0.89-1.05 | 0.89-1.02 |
+| Zen 3 (EPYC 7B13), AVX2 Winograd (direct 16-bit) | 1.92-2.34 (3.29-4.61) | 2.06-2.43 (3.60-4.25) |
+| Axion, i8mm (`sdot`) | 1.34-1.61 (1.94-2.35) | 0.84-1.08 (1.20-1.43) |
+| Apple M4 (MacBook Air, in use during the run), i8mm | 2.08-2.72 | 2.10-2.58 |
+
+Egaroucid's SIMD is x86's: on ARM it runs its generic build, as it ships for Apple's chips. The
+engines' branchy search runs best on Apple's cores (Edax at level 20 1.9 s a game, Zen 5 2.0-2.3,
+Axion 2.6), while the network's 128-bit NEON doesn't, so the M4 is our worst case.
+Build it once a network, calibrated as `quantize.py` is:
+
+```
+uv run examples/othello/cpu_net.py --net 8x128-128s-8p-w1125-274m --positions LEAVES/calibration.npy
+taskset -c 16-23 uv run examples/othello/clock_match.py --seconds 4 --openings 100 --b edax:threads=8 \
+    --a net:net=8x128-128s-8p-w1125-274m,engine=1,backend=native,batch=1,virtual_loss=visit,taper=24
+```
+
+A leaf whose position the game's searches have already evaluated, reached by another order of moves,
+takes that evaluation from the tree rather than the network's (`reuse`, on by default): 14-17% of
+leaves at 1000-4000 visits, about 27% under 10 empties. Without random symmetry the search is
+otherwise the same.
+
+The native network's convolutions take each input channel's own scale, folded into the weights
+(SmoothQuant, alpha 0.75), then the tensor's, from the minimum and maximum seen in calibration; their
+float epilogues normalize each square's channels where OpenVINO runs separate ops. Against the float
+network on 2000 search leaves (value's mean error, its 99th percentile, top move):
+
+| Network | Native | OpenVINO int8 |
+|---|---|---|
+| 8x128 | 0.010 / 0.052 / 97.9% | 0.043 / 0.191 / 96.6% |
+| 4x64 | 0.017 / 0.095 / 96.7% | 0.079 / 0.323 / 91.1% |
+| 8x128, channel norm | 0.024 / 0.116 / 95.2% | 0.078 / 0.352 / 86.7% |
+| 4x64, channel norm | 0.024 / 0.094 / 92.8% | 0.058 / 0.223 / 80.2% |
+
+Evals a second on one core, the native network a leaf at a time against OpenVINO int8's best batch:
+8x128 3908 against 4060 at 4; 4x64 26362 against 24840; 8x128 with channel norm 3548 against 3345;
+4x64 with channel norm 21970 against 16170. Channel norm costs OpenVINO int8 19-37% over BatchNorm,
+the native network 9-17%.
+
+On a 4 s clock, 4 physical cores (both sides the same 4 threads), XOT openings with both colours, 200
+games each (standard errors over the openings' pairs of games):
+
+| Player a against player b | Network | Elo for a |
+|---|---|---|
+| Engine, OpenVINO int8, 2 leaves a thread, reuse; against the batch of 16, no reuse | 8x128 | +133 ± 18 |
+| The same engine, reuse against none | 8x128 | +44 ± 14 |
+| Engine with the native network, 1 leaf a thread; against OpenVINO's engine, 2 a thread | 8x128 | -2 ± 17 |
+| The same | 8x128, channel norm | +31 ± 20 |
+| Engine, native network, 1 leaf a thread, reuse; against the batch of 16, no reuse | 6x96 | +141 ± 19 |
+| The same | 4x64 | +215 ± 21 |
+
+Leaves in flight cost a little search quality, and how much depends on the net and the visits. At
+equal visits, 8 threads against the batch of 16, the native network on both sides, 300-400 games each:
+
+| Leaves a thread | 1 | 2 | 4 |
+|---|---|---|---|
+| 8x128, 1000 visits | +9 ± 11 | -10 ± 13 | |
+| 8x128, 4000 | +9 ± 9 | +5 ± 12 | -9 ± 11 |
+| 6x96, 4000 | -13 ± 12 | -6 ± 12 | -22 ± 11 |
+| 4x64, 4000 | -31 ± 12 | -9 ± 12 | +13 ± 14 |
+
+The native network costs nothing per core to run a leaf at a time, so the choice is search quality
+alone: 1 a thread for 8x128; small nets at high visits want 2-4. It matched bf16 at
+equal visits: -3 ± 12 on 4x64 and on 8x128 with channel norm, 400 games each.
+
+Against engines the gain is smaller than against the same net. At 10 s a game, 4 physical cores and
+4 threads a side, the 700-minute 8x128 scored 35.5% against Edax with the engine and native network
+(1 leaf a thread) and 31.5% with the batch of 16, on the same 100 games' openings and colours: +4.0
+± 3.8 points, about +31 ± 30 Elo. With random symmetry it scored 37.5%, and against Egaroucid 41%.
+Edax spent 0.03 s a game on the last 23 empty squares, the net 1.6 s, but the games were decided
+earlier: solved exactly, perfect play from 24 empties would have scored 36% instead of 34% (100
+games), and from 28, 37.5%. The net gives up about 5 discs from 24 empties, and rarely the result.
+
+Below AVX2 (or the dot product on ARM) the library builds without the native network, and `Engine` runs OpenVINO.
+
+### Solving the endgame
+
+With `solve=N`, a `net:` player solves positions with N or fewer empty squares exactly instead of
+searching them (`endgame.py`), on the same threads, its time charged to the clock:
+
+```bash
+taskset -c 16-23 uv run examples/othello/clock_match.py --seconds 10 --openings 100 --b edax:threads=8 \
+    --a net:net=8x128-128s-8p-w1125-274m,engine=1,backend=native,batch=1,virtual_loss=visit,solve=20
+```
+
+By default it solves for a win, a draw or a loss, about ten times faster than the margin
+(`solve_exact=1`) and all a result needs: it plays a winning or drawing move, and a lost position is
+searched as usual, the network's best try against a fallible opponent. A solve may take a quarter
+of the clock left (`solve_share`), else it gives up and the move is searched; once one succeeds the
+moves after it take milliseconds, its transposition table kept from move to move. `solve_batch`
+solves many positions at once, a thread to each, for training labels.
+
+The solver is alpha-beta over bitboards: the last four empties tried in place, odd quadrants
+first; above them moves ordered fastest first (fewest replies), principal variation search, cuts by
+the opponent's stable discs, and from 8 empties a transposition table, which from 10 is looked at
+for each child's bound before searching it. Its exact scores match Edax's `-solve` (tests run the
+comparison where Edax is built). On one core it visits about three times Edax's nodes for an exact
+solve at 18-20 empties, at a similar rate a node; Edax narrows its window with its evaluation first.
 
 ## Credits
 
