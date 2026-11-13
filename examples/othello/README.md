@@ -9,15 +9,17 @@ Othello model and against two strong open-source Othello engines,
 |---|---|
 | `train.py` | Trains a network by self-play, scoring it against Edax's scores of fixed positions as it goes, and in games against Edax if asked |
 | `eval_pgx.py` | Plays a checkpoint against pgx's pretrained model at several search budgets |
-| `vs_engine.py` | Plays a checkpoint against Edax or Egaroucid at several levels, from XOT openings (and train.py's network as it trains) |
-| `engines.py` | Edax and Egaroucid, each driven over GTP, and what their searches made of each position, from their logs; and Melody, Neural Reversi, ymatioun and Edax-FM, for `clock_match.py` |
-| `setup_edax.sh`, `setup_egaroucid.sh`, `setup_melody.sh`, `setup_neural_reversi.sh`, `setup_ymatioun.sh`, `setup_edax_fm.sh` | Build the engines for `vs_engine.py` and `clock_match.py` |
-| `clock_match.py` | Games on a real clock, one at a time on the same cores, each side at its best settings |
-| `ggs.py` | GGS's random starts, its archive's, and its clock and scoring, for `clock_match.py` |
-| `gcp_cpu_jobs.py`, `gcp_cpu_runner.py` | Commands on Google Cloud Spot VMs of one CPU model (8 Zen 5 cores, AVX-512 VNNI), for timed games |
+| `evaluate.py` | Every evaluation game, between any two players (networks or engines), here, on the GPU, on Google Cloud or on Modal, kept in one store |
+| `eval_players.py`, `eval_games.py` | Its players, each a config with an id of its digest, and its games: one at a time on clocks or fixed budgets, or in batches on the GPU |
+| `vs_engine.py` | train.py's games against Edax or Egaroucid as it trains |
+| `engines.py` | Edax and Egaroucid, each driven over GTP, and what their searches made of each position, from their logs; and Melody, Neural Reversi, ymatioun and Edax-FM |
+| `setup_edax.sh`, `setup_egaroucid.sh`, `setup_melody.sh`, `setup_neural_reversi.sh`, `setup_ymatioun.sh`, `setup_edax_fm.sh` | Build the engines |
+| `clock_match.py` | The referee of `evaluate.py`'s games: each side on its own clock or budget, stopped and solved at a depth if asked |
+| `ggs.py` | GGS's random starts, its archive's, and its clock and scoring |
+| `gcp_cpu_jobs.py`, `gcp_cpu_runner.py`, `modal_hosts.py` | Commands on Google Cloud Spot VMs of one CPU model (8 Zen 5 cores, AVX-512 VNNI), for timed games, or in Modal containers |
 | `cpu_search.py`, `cpu_search.cpp` | A single game's MCTS for playing on CPU: a tree in C++, its leaves evaluated in batches by OpenVINO or ONNX Runtime, or searched by a thread to a core (`Engine`) |
 | `cpu_net.py`, `cpu_net.h` | A network's int8 forward pass in C++ (AVX-512 VNNI), for `Engine`: no OpenVINO, closer to the float network |
-| `cpu_match.py` | Games between two such players at fixed visits a move, and their speed in evals a second |
+| `cpu_match.py` | Our player on the CPU, and its speed in evals a second |
 | `endgame.py`, `endgame.cpp` | The endgame solved exactly in C++, for a player (`solve=N`) and in batches for labels |
 | `export_onnx.py` | Exports a checkpoint's network to ONNX |
 | `bench_cpu_backends.py` | Evals a second by CPU backend and batch, each checked against JAX's outputs |
@@ -620,33 +622,76 @@ $0.10 in GCS egress, which is why states saved only to continue from stay in the
 
 ## Evaluating a checkpoint
 
-Checkpoints from `train.py` are named after their epoch (`199.eqx` is the last of a
-200-epoch run). Pass the run's `--net` if it isn't the default: `--net resnet:6x128` for
-a run trained before the pooled network became the default.
+Every game between two players, networks or engines, goes through `evaluate.py`, and every game is
+kept in one store, `~/.cache/turbozero/othello/evals/evals.db`:
 
 ```
-uv run examples/othello/eval_pgx.py runs/othello/199.eqx --pgx-sims 64 256 1024
-
 examples/othello/setup_edax.sh                      # once
 examples/othello/setup_egaroucid.sh                 # once
-uv run examples/othello/vs_engine.py runs/othello/199.eqx --engine edax --sims 400 --levels 4 6 8 10
-uv run examples/othello/vs_engine.py runs/othello/199.eqx --engine egaroucid --levels 2 4 6
+
+# a network on the CPU at fixed visits, against Edax at level 24, every game solved from 24 empties
+uv run examples/othello/evaluate.py run --cores 16-23 --openings 50 --solve-at 24 \
+    --a net:net=NAME,visits=26400,engine=1,backend=native,virtual_loss=visit --b edax:level=24
+# each on a 10 s clock, on 4 Google Cloud VMs
+uv run examples/othello/evaluate.py run --on gcp --jobs 4 --openings 100 \
+    --a net:net=NAME,clock=10,engine=1,backend=native --b edax:clock=10
+# a checkpoint on the GPU, many games at once, against Edax at level 8 (the league's way)
+uv run --extra cuda examples/othello/evaluate.py run --openings 256 \
+    --a net:checkpoint=runs/othello/199.eqx,spec=resnet:8x128,device=gpu-batched,visits=400 \
+    --b edax:level=8
+uv run examples/othello/evaluate.py matches                  # every match, and how far it got
+uv run examples/othello/evaluate.py show MATCH [--games]     # what it showed
+uv run examples/othello/evaluate.py players -v               # every player, with its config
 ```
 
-`vs_engine.py` plays the engine with its opening book off and one thread per game, at a
-fixed level: at level L (up to 10) both engines search L moves ahead, and solve the game
-exactly once 2L or fewer squares are empty. It plays many games at once, each with its own
-engine process (an Edax process takes about 170 MB and an Egaroucid one about 1.3 GB, so it
-runs as many as fit in a quarter of the available memory, up to 128).
-The engines and our agent (at temperature 0, without root noise) are all deterministic,
-so games start from **XOT openings**: a list of 10,784 eight-move openings that each end
-in a position Edax judges nearly even (the same ones for every checkpoint, given the
-same `--seed`). Each opening is played twice, with the colors swapped. This is how
-OLIVAW, an AlphaZero-style Othello program, was compared with Edax
+**Players.** A player is `kind:key=value,...` (`eval_players.py`), or a table of a `--config` file
+(TOML or JSON, with the match's other settings): a network, `net:`, the league's by `net=NAME` or
+any checkpoint by `checkpoint=PATH,spec=NET`; or an engine, `edax`, `egaroucid`, `melody`,
+`neural-reversi`, `ymatioun` or `edax-fm`. Each side has its own budget: a network `visits` a move
+or a `clock`, an engine a `level` or a `clock`, a contest's seconds for the whole game (`10`) or
+GGS's (`01:00//02:00`). A network plays on a `device`: `cpu` (`cpu_search.py`, with `engine`,
+`backend`, `batch` and the rest, see [Playing on CPU](#playing-on-cpu)), `gpu` (a game at a time,
+its leaves batched on the GPU, `gpu_play.py`) or `gpu-batched` (core's MCTS, many games moving in
+step, at fixed visits against engines at a level or other such networks, with a tree of 4 x visits
+nodes). Engines get `threads` (all the cores by default, one in batched games) and `args`.
+
+**Ids.** A player is everything that decides how it plays: its config, defaults filled in, with a
+network's checkpoint by its sha256 (and a quantized model by its file's), and an engine's build by
+its files'. Its id is the config's digest, so the same settings are the same player wherever they
+play, and any change, a level, a thread, a rebuilt engine, is a new player. What it ran on isn't
+part of it: each game records its host (CPU model and ISA extensions, the cores it had, the GPU,
+where: `local`, `gcp:MACHINE`, `modal:GPU:CORESc`) and the machine's load.
+
+**Matches.** A match plays `--openings` starts, each with both colors, drawn by `--seed` from
+`--starts` (`xot`, the default; GGS's `random:14`; or `file:PATH`, see [GGS
+conditions](#ggs-conditions)). With `--solve-at N` every game stops at its first position with N
+empties or fewer, solved by `endgame.py` for both sides (for a win, a draw or a loss; `--solve-exact`
+for the margin); without it, games are played to the end. A match's id is its setup's and where
+it's played: running it again continues it, and `--tag` starts another of the same. Each game keeps
+its moves, every move's seconds (where moves are timed alone: not in GPU batches, whose timing is
+the match's), how it ended (`end`, `solved`, `timeout`), and its host.
+
+**Where.** `--on local` plays here, on `--cores` (else every core this process may use), one game
+at a time, or `--jobs N` processes at once, each on its share of the cores (for fixed budgets: timed
+games in parallel share the machine). `--on gcp` plays on `--jobs` Spot VMs of one CPU model (see
+[On Google Cloud CPUs](#on-google-cloud-cpus)), and `--on modal` in Modal containers (`--gpu`,
+`--modal-cpu`, `--modal-memory`): Modal's CPUs are a mix of models, some without AVX-512, which the
+engines' builds need, so its seconds don't compare. Cloud hosts send their games to the bucket as
+they go, and `run` brings them into the store while it waits; `evaluate.py sync MATCH` brings in
+what's there later. JAX stays off the GPU unless a player is on it.
+
+The engines play with their opening book off at a fixed level: at level L (up to 10) both engines
+search L moves ahead, and solve the game exactly once 2L or fewer squares are empty. In batched
+games each has its own engine process (an Edax process takes about 170 MB and an Egaroucid one about
+1.3 GB, so it runs as many as fit in a quarter of the available memory, up to 128). The engines and
+our agent (at temperature 0, without root noise) are all deterministic, so games start from **XOT
+openings**: a list of 10,784 eight-move openings that each end in a position Edax judges nearly even
+(the same ones for every checkpoint, given the same `--seed`). Each opening is played twice, with
+the colors swapped. This is how OLIVAW, an AlphaZero-style Othello program, was compared with Edax
 ([Norelli & Panconesi, 2022](https://arxiv.org/abs/2103.17228)).
 
-The run above scored, out of 256 games against each level (128 openings), searching
-400 MCTS iterations a move:
+A 10x128 checkpoint scored, out of 256 games against each level (128 openings), searching 400 MCTS
+iterations a move:
 
 | Edax level | 4 | 6 | 8 | 10 |
 |---|---|---|---|---|
@@ -654,14 +699,14 @@ The run above scored, out of 256 games against each level (128 openings), search
 
 ### On a clock
 
-`clock_match.py` plays games the way a contest would: one at a time, the same seconds for each
-side for the whole game, on the same cores. Each engine runs its own time management at its
+On a clock, `evaluate.py` plays games the way a contest would: one at a time, the same seconds for
+each side for the whole game, on the same cores. Each engine runs its own time management at its
 strongest settings: Edax over GTP (`time_settings`, then `time_left` before each move), and
 Egaroucid over its console protocol (`-time`, `play`, `go`), since its GTP has no clock.
 
 ```
-taskset -c 16-23 uv run examples/othello/clock_match.py --a edax:threads=8 --b egaroucid:threads=8 \
-    --seconds 10 --openings 100
+uv run examples/othello/evaluate.py run --cores 16-23 --openings 100 \
+    --a edax:clock=10,threads=8 --b egaroucid:clock=10,threads=8
 ```
 
 which amounts to these engine processes, each with a fresh process for every game:
@@ -703,8 +748,8 @@ search took 3.5 times less time on 8 threads than on 1 at level 20.
 
 ### More engines
 
-Four more engines, each plausibly near Edax's strength or above, play in `clock_match.py` (and,
-but for ymatioun, at a level in `vs_engine.py`). Each `setup_*.sh` builds one at a pinned commit
+Four more engines, each plausibly near Edax's strength or above, play in `evaluate.py`, on a clock
+or (but for ymatioun) at a level. Each `setup_*.sh` builds one at a pinned commit
 into `~/.cache/turbozero/othello/engines-2026-11/`, for a standard ISA level, never `-march=native`.
 None has an opening book.
 
@@ -717,8 +762,8 @@ None has an opening book.
 
 ```
 examples/othello/setup_melody.sh                    # once each
-taskset -c 8 uv run examples/othello/clock_match.py --a melody:threads=1 --b edax:threads=1 \
-    --seconds 60 --openings 50
+uv run examples/othello/evaluate.py run --cores 8 --openings 50 \
+    --a melody:clock=60,threads=1 --b edax:clock=60,threads=1
 ```
 
 ### GGS conditions
@@ -726,12 +771,12 @@ taskset -c 8 uv run examples/othello/clock_match.py --a melody:threads=1 --b eda
 Programs play each other on GGS, Michael Buro's game server, mostly in `s8r14` synchro matches:
 two games from one random 14-disc position, colours swapped, on a clock of `ini/inc/ext` (most
 often `01:00//02:00`: a minute a game, and once that's out, a loss by 2 discs at best and two
-more minutes to finish). `ggs.py` has its random starts, clock and scoring, and `clock_match.py`
+more minutes to finish). `ggs.py` has its random starts, clock and scoring, and `evaluate.py`
 plays them:
 
 ```
-taskset -c 16-23 uv run examples/othello/clock_match.py --a net:net=NAME,engine=1 --b edax:threads=8 \
-    --clock 01:00//02:00 --starts random:14 --openings 50
+uv run examples/othello/evaluate.py run --cores 16-23 --starts random:14 --openings 50 \
+    --a net:net=NAME,engine=1,clock=01:00//02:00 --b edax:threads=8,clock=01:00//02:00
 ```
 
 - **The starts are far from XOT's.** The server makes half of them by dropping discs near the
@@ -744,9 +789,9 @@ taskset -c 16-23 uv run examples/othello/clock_match.py --a net:net=NAME,engine=
   network by a fresh tree.
 - **Pairs are the unit.** Top programs split 90-95% of GGS's pairs 1-1, so a match's signal is in
   the decisive pairs and in the two games' disc results summed, which is how GGS scores a pair.
-  `clock_match.py` reports both (`pairs`), with the Elo of the decisive pairs alone.
+  `evaluate.py show` reports both (`pairs`), with the Elo of the decisive pairs alone.
 - **One game at a time by default.** On GGS a pair's games run at once, in lockstep: each round,
-  the player to move in each game moves, at the same time. `--parallel` plays them so, on the
+  the player to move in each game moves, at the same time. `--synchro` plays them so, on the
   same cores, with a second network for a net player.
 - `ggs.py extract` takes an archive's starts (e.g. `Othello.2010-11-2026.ggf.bz2` from
   https://skatgame.net/mburo/ggs/game-archive/Othello/) for `--starts file:PATH`, and `ggs.py
@@ -793,13 +838,8 @@ computed in bfloat16 and searched only on its own moves (each about twice as fas
 the same run, at the same epochs, and keeps the results of the last networks it played
 before it stopped for their mean.
 
-To evaluate a checkpoint after training, `vs_engine.py` logs to its run with `--monitor
---run ID` (the id in the run's seaglass link), at the checkpoint's epoch:
-
-```
-uv run examples/othello/vs_engine.py runs/othello/49.eqx --levels 8 --sims 1000 --openings 256 \
-    --stop-below -1 --monitor --run ID
-```
+A checkpoint's games after training are `evaluate.py`'s (`device=gpu-batched` plays them the same
+way), kept in its store rather than logged to the run.
 
 ### On Google Cloud CPUs
 
@@ -807,7 +847,8 @@ Timed games need the same CPU every time, and Modal's are a mix (some AMD Zen 3 
 where the native network runs its AVX2 kernel at about a quarter of the speed). `gcp_cpu_jobs.py`
 runs commands on Spot VMs of one model: `n4d-highcpu-16` with one thread a core, 8 physical cores
 of AMD Turin (EPYC 9B45, Zen 5, AVX-512 VNNI), the same generation as razorback's 9900X3D but at a
-lower clock (4.1 GHz at most).
+lower clock (4.1 GHz at most). `evaluate.py run --on gcp` plays a match on them; underneath, any
+command can run there:
 
 ```sh
 uv run examples/othello/gcp_cpu_jobs.py setup --project PROJECT        # once; the bucket is modal_jobs.py's
@@ -820,7 +861,7 @@ uv run examples/othello/gcp_cpu_jobs.py cleanup                        # every j
 
 `jobs.json` is a list of `{"name": ..., "cmd": [...], "outputs": [...]}`: each command runs in
 `examples/othello` with the environment's python first on `PATH`, and the last line of JSON it
-prints is its result. Files named in `outputs` (e.g. a `clock_match.py --games` file) go to the
+prints is its result. Files named in `outputs` (e.g. `evaluate.py play`'s games) go to the
 bucket every 20 seconds while the job runs, which `follow` prints line by line, and come back
 beside `--out`, in `OUT-files/SLOT/NAME/`, when it ends. The jobs are dealt out over the VMs; with
 `--each`, every VM runs every job, to compare VMs. A VM takes this checkout's files as they are
@@ -890,13 +931,12 @@ uv run examples/othello/score_engine_set.py runs/othello/49.eqx runs/othello/99.
 
 Self-play's search is built for thousands of games at once on a GPU. Alone on CPU it spends about
 12 times what the network costs: 86 evals a second for an 8x128 net whose forward pass alone does
-1056. `cpu_search.py` plays one game on CPU instead: `clock_match.py` plays it, as `net:`, against
-another or an engine on a per-game clock.
+1056. `cpu_search.py` plays one game on CPU instead: `evaluate.py` plays it, as `net:`, against
+another or an engine, on a per-game clock or at fixed visits.
 
 ```
-taskset -c 16-23 uv run examples/othello/clock_match.py --seconds 10 --openings 20 \
-    --a net:net=8x128-128s-8p-w1125-274m,batch=16,virtual_loss=visit,random_symmetry=1,taper=24 \
-    --b edax:threads=8
+uv run examples/othello/evaluate.py run --cores 16-23 --openings 20 --b edax:clock=10,threads=8 \
+    --a net:net=8x128-128s-8p-w1125-274m,clock=10,batch=16,virtual_loss=visit,random_symmetry=1,taper=24
 ```
 
 The network is named as in the league's store. Its search collects 16 traversals at a time, each
@@ -963,8 +1003,8 @@ batches. Build the model, calibrated on the leaves of its own searches, and play
 ```
 uv run examples/othello/fidelity.py leaves --net 8x128-128s-8p-w1125-274m --out LEAVES
 uv run examples/othello/quantize.py --net 8x128-128s-8p-w1125-274m --positions LEAVES/calibration.npy
-taskset -c 16-23 uv run examples/othello/clock_match.py --seconds 4 --openings 100 --b edax:threads=8 \
-    --a net:net=8x128-128s-8p-w1125-274m,batch=16,virtual_loss=visit,taper=24,backend=int8-performance_leaves_heads_minmax
+uv run examples/othello/evaluate.py run --cores 16-23 --openings 100 --b edax:clock=4,threads=8 \
+    --a net:net=8x128-128s-8p-w1125-274m,clock=4,batch=16,virtual_loss=visit,taper=24,backend=int8-performance_leaves_heads_minmax
 ```
 
 Int8 against bf16, on the same eight cores with nothing else running, batch 16 with the search; games
@@ -983,7 +1023,7 @@ bf16's least closely, and it hasn't played.
 
 ### The engine and the native network
 
-`clock_match.py`'s `engine=1` searches with a thread to a core, all in C++ (`cpu_search.Engine`): each
+A network's `engine=1` searches with a thread to a core, all in C++ (`cpu_search.Engine`): each
 collects its own few leaves, evaluates them on its own core while the others carry on, and backs them
 up, the tree shared under a lock. The batch above waits on its slowest stream, and goes through Python,
 at every step; here the network's time is 90-97% of the search's. `backend=native` evaluates with
@@ -996,8 +1036,8 @@ is:
 
 ```
 uv run examples/othello/cpu_net.py --net 8x128-128s-8p-w1125-274m --positions LEAVES/calibration.npy
-taskset -c 16-23 uv run examples/othello/clock_match.py --seconds 4 --openings 100 --b edax:threads=8 \
-    --a net:net=8x128-128s-8p-w1125-274m,engine=1,backend=native,batch=1,virtual_loss=visit,taper=24
+uv run examples/othello/evaluate.py run --cores 16-23 --openings 100 --b edax:clock=4,threads=8 \
+    --a net:net=8x128-128s-8p-w1125-274m,clock=4,engine=1,backend=native,batch=1,virtual_loss=visit,taper=24
 ```
 
 A leaf whose position the game's searches have already evaluated, reached by another order of moves,
@@ -1064,8 +1104,8 @@ With `solve=N`, a `net:` player solves positions with N or fewer empty squares e
 searching them (`endgame.py`), on the same threads, its time charged to the clock:
 
 ```bash
-taskset -c 16-23 uv run examples/othello/clock_match.py --seconds 10 --openings 100 --b edax:threads=8 \
-    --a net:net=8x128-128s-8p-w1125-274m,engine=1,backend=native,batch=1,virtual_loss=visit,solve=20
+uv run examples/othello/evaluate.py run --cores 16-23 --openings 100 --b edax:clock=10,threads=8 \
+    --a net:net=8x128-128s-8p-w1125-274m,clock=10,engine=1,backend=native,batch=1,virtual_loss=visit,solve=20
 ```
 
 By default it solves for a win, a draw or a loss, about ten times faster than the margin

@@ -15,7 +15,6 @@ from clock_match import (
     Game,
     pair_summary,
     play_game,
-    play_match,
     points,
     summarize,
 )
@@ -320,19 +319,6 @@ def test_pairs_are_scored_by_points_and_by_summed_discs():
     assert pairs["disc_sum_ci95"][0] < 2 < pairs["disc_sum_ci95"][1]
     assert pairs["decisive_elo"] == 0
     assert pairs["game_elo"] == 0
-
-
-def test_a_match_plays_each_start_with_both_colors_also_in_parallel():
-    def player():
-        return FirstLegal([0.0], 0)
-
-    openings = [((), GGS_START), (moves("f5d6"), None)]
-    for parallel in (None, (player, player)):
-        games, a_black = play_match(player, player, openings, 100, parallel=parallel)
-        assert a_black == [True, False, True, False]
-        assert [g.start for g in games] == [GGS_START.text()] * 2 + [None] * 2
-        # first-legal players play the same game whatever the colors
-        assert games[0].moves == games[1].moves
 
 
 @pytest.mark.skipif(not Edax.installed(Edax.default_dir()), reason="Edax isn't built")

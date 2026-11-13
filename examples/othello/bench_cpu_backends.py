@@ -44,7 +44,15 @@ BATCHES = (1, 8, 64)
 Eval = Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]]
 
 
+# networks known here without the league's store, by name: (checkpoint, net). `evaluate.py`
+# names those it ships to a cloud host, where there's no store
+NETWORKS: dict[str, tuple[str, str]] = {}
+
+
 def network_path(name: str) -> tuple[str, str]:
+    """The checkpoint of the league store's network `name`, and its net's spec."""
+    if name in NETWORKS:
+        return NETWORKS[name]
     store = sqlite3.connect(f"file:{STORE}?mode=ro", uri=True)
     row = store.execute(
         "select path, net from networks where name = ?", (name,)

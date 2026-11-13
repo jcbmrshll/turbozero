@@ -426,22 +426,6 @@ def test_a_player_parses_random_symmetry():
     assert settings("visits=10,random_symmetry=1").random_symmetry
 
 
-def test_a_match_replays_from_its_seed_however_many_play_at_once():
-    from cpu_match import Player, play_match
-    from cpu_search import SearchSettings
-    from xot import XOT_PATH, load_xot
-
-    key = ("fake", "fake")
-
-    def results(parallel: int, seed: int) -> np.ndarray:
-        a = Player(*key, 12, SearchSettings(batch=4, random_symmetry=True))
-        b = Player(*key, 12, SearchSettings(batch=4))
-        openings = load_xot(XOT_PATH)[:4]
-        return play_match(a, b, openings, {key: fake_eval}, parallel, seed)
-
-    assert np.array_equal(results(8, 0), results(3, 0))
-
-
 @pytest.mark.parametrize(
     "norm",
     [

@@ -41,7 +41,7 @@ searching 64, 0.74 against it searching 256, and 0.57 against it searching 1024
 (draws count half).
 
 Checkpoints go to --ckpt-dir, with the results of games against the engine in
-`vs_engine.jsonl`, and the last is exported to ONNX beside itself when the run ends; `eval_pgx.py` and `vs_engine.py` evaluate checkpoints further (see
+`vs_engine.jsonl`, and the last is exported to ONNX beside itself when the run ends; `eval_pgx.py` and `evaluate.py` evaluate checkpoints further (see
 README.md). The hyperparameters here are only an example; tune them for your task and
 hardware.
 

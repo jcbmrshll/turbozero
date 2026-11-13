@@ -1,14 +1,10 @@
-"""Games between two `cpu_search.py` players at fixed visits a move, or one's speed.
+"""Our player on the CPU, a `cpu_search.py` search of one game (`NetPlayer`, the `net:` player of
+`evaluate.py`), the networks it evaluates with (`make_eval`, `make_engine`), and its speed:
 
-    taskset -c 16-23 uv run examples/othello/cpu_match.py match --net NET \
-        --a visits=1000,batch=1 --b visits=1000,batch=8,virtual_loss=visit --openings 200
-
-Games start from XOT openings, each played with both colors, sharing nothing but the network's
-session. Many are played at once, their leaves evaluated in one call: at fixed visits, how fast
-doesn't change the moves. A position with one legal move is played without a search.
+    taskset -c 16-23 uv run examples/othello/cpu_match.py speed --net NET --batch 1 8 16
 
 `speed` plays one game at a time, as in a contest, and reports evals a second including everything
-the search does. `clock_match.py` plays on a clock, with a `NetPlayer` as "net:".
+the search does. Games between players are `evaluate.py`'s.
 """
 
 import argparse
@@ -39,8 +35,6 @@ from export_onnx import export_checkpoint
 from quantize import quantized_path
 from xot import XOT_PATH, load_xot
 
-# the most leaves one call of the network evaluates
-MAX_CALL = 64
 # traversals in a row that ended the game after which a search on a clock stops
 ENDED_VISITS = 64
 
@@ -74,171 +68,6 @@ class Player:
             reuse=bool(int(fields.pop("reuse", 1))),
         )
         return cls(net, backend, visits, settings)
-
-
-def chunked(evaluate: Eval) -> Eval:
-    """`evaluate`, calling it with at most `MAX_CALL` leaves at a time."""
-
-    def run(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        if len(x) <= MAX_CALL:
-            return evaluate(x)
-        parts = [evaluate(x[i : i + MAX_CALL]) for i in range(0, len(x), MAX_CALL)]
-        return (
-            np.concatenate([p[0] for p in parts]),
-            np.concatenate([p[1] for p in parts]),
-        )
-
-    return run
-
-
-class Game:
-    """A game between players a and b, from an opening. Each keeps its own tree, seeded apart."""
-
-    def __init__(
-        self, a: Player, b: Player, opening: np.ndarray, a_black: bool, seed: int = 0
-    ):
-        self.players = (a, b)
-        self.searches = (Search(a.settings, 2 * seed), Search(b.settings, 2 * seed + 1))
-        self.a_black = a_black
-        self.ply = 0
-        for action in opening:
-            self.play(int(action))
-        self.begin()
-
-    @property
-    def evaluator(self) -> tuple[str, str]:
-        """The network and backend of the player to move."""
-        player = self.players[self.mover]
-        return player.net, player.backend
-
-    @property
-    def mover(self) -> int:
-        """Which of the players moves: 0, a, or 1, b."""
-        return 0 if (self.ply % 2 == 0) == self.a_black else 1
-
-    def play(self, action: int) -> None:
-        for search in self.searches:
-            search.play(action)
-        self.ply += 1
-
-    def begin(self) -> None:
-        """Starts the search of the next move, past moves with only one choice and to the game's
-        end."""
-        search = self.searches[self.mover]
-        while not search.terminated() and search.num_legal() == 1:
-            self.play(search.first_legal())
-            search = self.searches[self.mover]
-        if not search.terminated():
-            search.begin(self.players[self.mover].visits)
-
-    def over(self) -> bool:
-        return self.searches[0].terminated()
-
-    def result(self) -> float:
-        """The result for a: +1, 0 or -1."""
-        reward = self.searches[0].reward()
-        return reward if self.mover == 0 else -reward
-
-    def collect(self, out: np.ndarray) -> int:
-        """The next leaves to evaluate, past any moves whose search is done. Returns how many, 0
-        if none this time, the game then over or the batch all game's ends."""
-        search = self.searches[self.mover]
-        while search.remaining == 0:
-            self.play(search.best_action())
-            self.begin()
-            if self.over():
-                return 0
-            search = self.searches[self.mover]
-        return search.collect(out)
-
-    def apply(self, logits: np.ndarray, values: np.ndarray) -> None:
-        self.searches[self.mover].apply(logits, values)
-
-
-def play_match(
-    a: Player,
-    b: Player,
-    openings: np.ndarray,
-    evals: dict[tuple[str, str], Eval],
-    parallel: int,
-    seed: int = 0,
-) -> np.ndarray:
-    """Plays each opening twice, a black in the first, `parallel` games at once. Each game has a
-    seed of its own, from `seed`: how many are played at once doesn't change them.
-
-    Returns:
-        (openings, 2) a's result in each game.
-    """
-    results = np.zeros((len(openings), 2))
-    queue = [(o, side) for o in range(len(openings)) for side in range(2)]
-    queue.reverse()
-    active: list[tuple[Game, int, int]] = []
-    capacity = max(a.settings.batch, b.settings.batch)
-    buffers = {
-        key: np.empty((parallel * capacity, 2, 8, 8), np.float32) for key in evals
-    }
-    start = time.perf_counter()
-    done = 0
-    while queue or active:
-        while queue and len(active) < parallel:
-            o, side = queue.pop()
-            game_seed = (seed << 20) + 2 * o + side
-            active.append((Game(a, b, openings[o], side == 0, game_seed), o, side))
-        filled = dict.fromkeys(evals, 0)
-        pending = []
-        still = []
-        for game, o, side in active:
-            key = game.evaluator
-            count = game.collect(buffers[key][filled[key] :])
-            if game.over():
-                results[o, side] = game.result()
-                done += 1
-                if done % 40 == 0:
-                    rate = done / (time.perf_counter() - start)
-                    print(f"  {done} games, {rate:.2f} a second", flush=True)
-                continue
-            # `collect` may have moved on to the other player's move, whose leaves it wrote to the
-            # buffer of the player it started with: move them
-            moved = game.evaluator
-            if moved != key:
-                buffers[moved][filled[moved] : filled[moved] + count] = buffers[key][
-                    filled[key] : filled[key] + count
-                ]
-                key = moved
-            pending.append((game, key, filled[key], count))
-            filled[key] += count
-            still.append((game, o, side))
-        active = still
-        outs = {
-            key: chunked(evaluate)(buffers[key][: filled[key]])
-            for key, evaluate in evals.items()
-        }
-        for game, key, offset, count in pending:
-            logits, values = outs[key]
-            game.apply(logits[offset : offset + count], values[offset : offset + count])
-    return results
-
-
-def elo(score: float) -> float:
-    score = min(max(score, 1e-3), 1 - 1e-3)
-    return 400 * np.log10(score / (1 - score))
-
-
-def summarize(results: np.ndarray) -> dict[str, float]:
-    """a's score, Elo over b and its standard error, from the openings' mean scores."""
-    points = (1 + results) / 2
-    pairs = points.mean(axis=1)
-    score = float(pairs.mean())
-    se = float(pairs.std() / np.sqrt(len(pairs)))
-    return {
-        "games": int(results.size),
-        "score": score,
-        "se": se,
-        "elo": float(elo(score)),
-        "elo_se": float((elo(score + se) - elo(score - se)) / 2),
-        "win": float((results > 0).mean()),
-        "draw": float((results == 0).mean()),
-    }
 
 
 def model_and_precision(name: str, arm: str) -> tuple[bytes | str, str]:
@@ -285,31 +114,6 @@ def make_engine(name: str, backend: str, cores: int, batch: int) -> Engine:
         f.write(model)
         f.flush()
         return Engine.openvino(f.name, cores, batch, precision)
-
-
-def match(args: argparse.Namespace) -> None:
-    a = Player.parse(args.a, args.net, args.backend)
-    b = Player.parse(args.b, args.net, args.backend)
-    cores = len(os.sched_getaffinity(0))
-    evals = {(p.net, p.backend): make_eval(p.net, p.backend, cores) for p in (a, b)}
-    pool = load_xot(XOT_PATH)
-    rng = np.random.default_rng(args.seed)
-    openings = pool[rng.choice(len(pool), size=args.openings, replace=False)]
-    start = time.perf_counter()
-    results = play_match(a, b, openings, evals, args.parallel, args.seed)
-    record = {
-        "a": args.a,
-        "b": args.b,
-        "net": args.net,
-        "seed": args.seed,
-        "seconds": round(time.perf_counter() - start),
-        "load": os.getloadavg()[0],
-        **summarize(results),
-    }
-    print(json.dumps(record), flush=True)
-    if args.results is not None:
-        with open(args.results, "a") as f:
-            f.write(json.dumps(record) + "\n")
 
 
 def timed_move(
@@ -534,16 +338,6 @@ def speed(args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     commands = parser.add_subparsers(required=True)
-    m = commands.add_parser("match")
-    m.add_argument("--net", required=True)
-    m.add_argument("--backend", default="bf16")
-    m.add_argument("--a", required=True, help="e.g. visits=1000,batch=1")
-    m.add_argument("--b", required=True)
-    m.add_argument("--openings", type=int, default=200)
-    m.add_argument("--parallel", type=int, default=64)
-    m.add_argument("--seed", type=int, default=0)
-    m.add_argument("--results", type=Path, default=None)
-    m.set_defaults(fn=match)
     s = commands.add_parser("speed")
     s.add_argument("--net", required=True)
     s.add_argument("--backend", default="bf16")

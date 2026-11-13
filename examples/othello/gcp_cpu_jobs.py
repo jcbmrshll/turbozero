@@ -41,6 +41,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol
 
+from engines import RUNTIME, default_dir
 from gcp_cpu_runner import result_key
 from modal_jobs import open_store
 from modal_store import Store, get_json, put_json
@@ -52,22 +53,11 @@ PREFIX = "cpu-jobs"
 # 16 vCPUs at one thread a core: 8 physical cores of AMD Turin (EPYC 9B45), AVX-512 VNNI
 MACHINE = "n4d-highcpu-16"
 ZONES = ("us-central1-a", "us-central1-b", "us-central1-c", "us-central1-f")
-# the engines' runtime files, what clock_match.py and the timing benchmark need of them
-ENGINES = (
-    "engines-2026-10/edax/bin",
-    "engines-2026-10/edax/data",
-    "engines-2026-10/egaroucid/bin",
-    "engines-2026-11/edax-fm/bin",
-    "engines-2026-11/edax-fm/data",
-    "engines-2026-11/melody/build/Melody",
-    *(
-        f"engines-2026-11/melody/weight_{w}"
-        for w in ("v11.bin", "0_v12.txt", "Va_v12.bin", "Vb_v12.bin")
-    ),
-    # its weights are in the binary
-    "engines-2026-11/neural-reversi/target/release/cli",
-    "engines-2026-11/ymatioun/bin",
-    "engines-2026-11/ymatioun/data",
+# the engines' runtime files, what evaluate.py and the timing benchmark need of them
+ENGINES = tuple(
+    f"{default_dir(name).relative_to(CACHE)}/{part}"
+    for name, parts in RUNTIME.items()
+    for part in parts
 )
 LABEL = "tz-cpu-job"
 POLL_SECONDS = 20.0
@@ -468,34 +458,50 @@ def setup(args: argparse.Namespace) -> None:
     )
 
 
-def run(args: argparse.Namespace) -> None:
-    if not NAME.fullmatch(args.name):
-        raise SystemExit("--name: lowercase letters, digits and -, up to 31")
-    store, config = open_store()
-    prefix = f"{PREFIX}/{args.name}"
-    cloud = Gcloud(project(), args.machine)
+def launch(
+    store: Store,
+    cloud: "Cloud",
+    name: str,
+    jobs: list[dict[str, Any]] | None,
+    out: Path,
+    vms: int = 1,
+    hours: float = 2.0,
+    attempts: int = 3,
+    files: list[str] | None = None,
+    machine: str = MACHINE,
+    each: bool = False,
+    bucket: str = "",
+    with_engines: bool = True,
+) -> dict[str, str]:
+    """Runs `jobs` on `cloud`'s hosts as the job `name`, or continues `name` as it was, until
+    they're done; each slot's outcome. Hosts get `files` from ~/.cache/turbozero/othello, and with
+    `with_engines` every engine's build. Every host of it is deleted when it ends, however it
+    ends."""
+    if not NAME.fullmatch(name):
+        raise SystemExit(f"{name}: lowercase letters, digits and -, up to 31")
+    prefix = f"{PREFIX}/{name}"
     spec = get_json(store, f"{prefix}/spec.json")
     if spec is None:
-        if args.jobs is None:
-            raise SystemExit(f"{args.name} is new: give its --jobs")
-        jobs = json.loads(Path(args.jobs).read_text())
+        if jobs is None:
+            raise SystemExit(f"{name} is new: give its jobs")
         spec = {
-            "slots": split_jobs(jobs, args.vms, args.each),
-            "bucket": config["bucket"],
-            "hours": args.hours,
-            "inputs": upload_inputs(store, [*ENGINES, *args.files]),
-            "env": env_key(machine=args.machine),
+            "slots": split_jobs(jobs, vms, each),
+            "bucket": bucket,
+            "hours": hours,
+            "inputs": upload_inputs(
+                store, [*(ENGINES if with_engines else ()), *(files or [])]
+            ),
+            "env": env_key(machine=machine),
         }
         store.put_bytes(f"{prefix}/code.tar.gz", code_archive())
         put_json(store, f"{prefix}/spec.json", spec)
     else:
-        print(
-            f"{args.name} exists: continuing it, its jobs, files and code as they were"
-        )
+        print(f"{name} exists: continuing it, its jobs, files and code as they were")
+    out.parent.mkdir(parents=True, exist_ok=True)
     try:
-        outcome = watch(store, cloud, args.name, spec, Path(args.out), args.attempts)
+        outcome = watch(store, cloud, name, spec, out, attempts)
     finally:
-        left = cloud.instances(args.name)
+        left = cloud.instances(name)
         if left:
             cloud.delete([(vm["name"], vm["zone"]) for vm in left])
             print(f"deleted {', '.join(vm['name'] for vm in left)}")
@@ -506,6 +512,25 @@ def run(args: argparse.Namespace) -> None:
         )
         if log:
             print(f"slot {slot}'s log:\n{log.decode()[-3000:]}")
+    return outcome
+
+
+def run(args: argparse.Namespace) -> None:
+    store, config = open_store()
+    launch(
+        store,
+        Gcloud(project(), args.machine),
+        args.name,
+        json.loads(Path(args.jobs).read_text()) if args.jobs else None,
+        Path(args.out),
+        vms=args.vms,
+        hours=args.hours,
+        attempts=args.attempts,
+        files=args.files,
+        machine=args.machine,
+        each=args.each,
+        bucket=config["bucket"],
+    )
 
 
 def list_vms(_args: argparse.Namespace) -> None:

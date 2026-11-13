@@ -1,6 +1,6 @@
 """The conditions of program-vs-program Othello on GGS, Michael Buro's Generic Game Server
 (https://skatgame.net/mburo/ggs/), for a match driver or a client to use: its random start
-positions, its clock and its scoring. Nothing here plays a game (see `clock_match.py`).
+positions, its clock and its scoring. Nothing here plays a game (see `evaluate.py`).
 
 Most of its games are synchro matches, `s8r14`: two games from the same random position of 14
 discs, the colors swapped, each on its own clock, played at once; the match's result is the
