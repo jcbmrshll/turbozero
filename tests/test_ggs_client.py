@@ -682,3 +682,23 @@ def test_observe_sees_every_board():
         )
     )
     assert len(seen) == 2 and seen[1].moves == (19,) and len(jobs) == 1
+
+
+def test_clock_planned_to_the_solve():
+    """With the endgame solved from 20 empties, the clock goes to our moves before it."""
+    from cpu_match import move_budget
+
+    policy = TimePolicy()
+    board = Board()
+    view = GameView(".1", (0, 0, "b"), (), board.discs[0], board.discs[1], "b", 60.0)
+    assert view.empties == 60
+    usable = policy.seconds_left(view)
+    per_move = move_budget(policy.planned_left(view, 20), view.empties)
+    # 20 of our moves to reach 20 empties, the solve's reserve kept
+    assert per_move == pytest.approx(0.95 * (usable - policy.solve_reserve) / 20)
+    # unsolved, or within the solve: the whole game's plan
+    assert policy.planned_left(view, 0) == usable
+    late = GameView(".1", (0, 0, "b"), (), (1 << 45) - 1, 0, "b", 10.0)
+    assert late.empties == 19 and policy.planned_left(late, 20) == policy.seconds_left(
+        late
+    )

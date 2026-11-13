@@ -60,19 +60,20 @@ JAX_PLATFORMS=cpu taskset -c 4,5,16,17 uv run examples/othello/ggs_client/ggs_cl
 uv run examples/othello/ggs_client/ggs_server.py stop --run /tmp/ggs-run
 ```
 
-The server binds 127.0.0.1 only. A new login needs no account: the first password it's given
-becomes its own until the server restarts. `register` makes it permanent and lets it play rated
-games. `ggs_server.py admin --run DIR COMMAND` runs a command as root.
+The server binds 127.0.0.1 only. A login that isn't registered needs no account and takes any
+password, every time. `register` gives it one (its password then checked) and lets it play
+rated games. `ggs_server.py admin --run DIR COMMAND` runs a command as root.
 
 ## On the public server
 
 Not done yet: logging in claims a name there, and that's for us to decide.
 
-- **Login.** 2 to 8 characters, not starting with `.` or `_`, no `,` or `\`. A new name
-  logs in with any password and plays unrated games at once. Its password then holds while
-  it's logged in; rated play, and keeping the name, need the account **registered**: give your
-  name and email to an admin (`group _admin` lists them; Michael Buro is `mic`). Until then
-  pass `--rated unrated`, or the server says "you are not registered" (logged, harmless).
+- **Login.** 2 to 8 characters, not starting with `.` or `_`, no `,` or `\`. A name that
+  isn't registered logs in with any password and plays unrated games at once, but anyone can
+  log in as it whenever it's offline. Rated play, and owning the name, need the account
+  **registered**: give your name and email to an admin (`group _admin` lists them; Michael
+  Buro is `mic`). Until then pass `--rated unrated`, or the server says "you are not
+  registered" (logged, harmless).
 - **Running.**
 
   ```
@@ -101,7 +102,7 @@ Not done yet: logging in claims a name there, and that's for us to decide.
 |---|---|---|
 | `--host`, `--port` | 127.0.0.1, 5000 | The server (plain port; the public one is `skatgame.net 5000`) |
 | `--login`, `--password-file` | | The login, and a file holding its password (mode 600) |
-| `--player` | | The net player: `net=NAME` (a network of the league's store, quantized for the native engine), and `clock_match.py`'s `net:` options: `batch` (leaves each worker evaluates at once), `solve=N` (solve exactly from N empties), `solve_exact` (here 1 by default: GGS scores discs, so a won endgame should win by the most), `solve_share`, `taper`, and the search's (`c_init`, `virtual_loss`, ...) |
+| `--player` | | The player: `net=NAME` (a network of the league's store, quantized for the native engine), `device` (`cpu`, the default; `gpu`, the GPU player of `../gpu_play.py`, its own options added), and `clock_match.py`'s `net:` options: `batch` (leaves each worker evaluates at once), `solve=N` (solve exactly from N empties), `solve_exact` (here 1 by default: GGS scores discs, so a won endgame should win by the most), `solve_share`, `taper`, and the search's (`c_init`, `virtual_loss`, ...) |
 | `--cores` | all it may run on | Cores the player uses (run it under `taskset`) |
 | `--types` | `s8r14,s8r16,s8r18,8` | Match types it accepts; 8x8 non-anti only, whatever this says |
 | `--min-seconds`, `--max-seconds` | 60, 900 | Our clock's initial time, accepted range |
@@ -119,8 +120,9 @@ Not done yet: logging in claims a name there, and that's for us to decide.
 
 Fixed in the code, `ggs_player.TimePolicy`: 1.5 s plus 3% of the clock held back (the server
 prints clocks in whole seconds; network delay isn't charged: with `trust +` it charges the time
-we report, if no more than 4 s under its own count); past a soft timeout, a tenth of the
-extension a move. `ggs_player.DISC_SCALE`: evals sent are `6.5 × atanh(value)` discs for a
+we report, if no more than 4 s under its own count); with `solve=N`, 4 s (or 5%) kept for the
+solved endgame and the rest spread evenly over our moves until N empties; past a soft timeout,
+a tenth of the extension a move. `ggs_player.DISC_SCALE`: evals sent are `6.5 × atanh(value)` discs for a
 search's root value, a solve's margin when solved.
 
 ## How it plays
@@ -136,11 +138,25 @@ search's root value, a solve's margin when solved.
 - **Tree reuse.** A player per game, started from the game's start (`set_position`), is told
   every move, so the tree carries over between our moves; if what it was told disagrees with
   the server it starts again from the server's board.
-- **Time.** A move's search time is `cpu_match.move_budget` of the usable clock over the moves
-  left; positions with `solve` or fewer empties are solved exactly (`solve_share` of the clock).
+- **Time.** A move's search time is the usable clock over our moves left until the solve
+  (`TimePolicy.planned_left`, through `cpu_match.move_budget`); positions with `solve` or fewer
+  empties are solved exactly (`solve_share` of the clock). Planning to the end of the game
+  instead left 26 of 60 s unused at `01:00//02:00` (from 20 empties a solve takes about a
+  second); planned to the solve, about 6.
 - **Komi games** (`K`): before colours are set, both players send a first move with the result
   they expect for the player to move; ours is the search's eval, in discs.
 - **Offers.** Undo, abort and score offers are left unanswered, which declines them.
+
+## Another player
+
+The client sees its player only through `ggs_player.Bridge`: `decide(view, cores)` for our
+move (on a thread a game), `observe(view)` for every board of our games, whoever's to move (to
+ponder; it must return at once), `forget(game_id)` at a game's end, `close()`. A `GameView` is a
+game as the server has it: its start, every move since, the position, our colour and clock.
+`make_bridge` picks it from `--player`: the CPU's `NetBridge` (a `cpu_match.NetPlayer` a game,
+driven by `PlayerBridge`, which doesn't ponder), or with `device=gpu`,
+`gpu_play.make_ggs_bridge`, whose trees share one batch stream on the GPU and ponder the game
+the opponent's moving in.
 
 ## Tests
 

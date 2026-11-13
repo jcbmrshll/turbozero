@@ -136,11 +136,16 @@ class TimePolicy:
         reserve_share: and this share of what's left
         extension_share: on the extension (a soft timeout: the game is lost by at least the
             least margin already), this share of it a move, so as never to run out of it too
+        solve_reserve, solve_share: with the endgame solved from N empties, the seconds (or
+            this share of the clock, whichever is more) kept for it; the rest is planned over
+            our moves before it
     """
 
     reserve: float = 1.5
     reserve_share: float = 0.03
     extension_share: float = 0.1
+    solve_reserve: float = 4.0
+    solve_share: float = 0.05
 
     def seconds_left(self, view: GameView) -> float:
         """What the player may plan the rest of the game on."""
@@ -151,6 +156,21 @@ class TimePolicy:
         # an increment comes after each move, the game's half of the empties ours
         usable += view.increment * max(view.empties // 2 - 1, 0)
         return max(usable, 0.0)
+
+    def planned_left(self, view: GameView, solve_from: int = 0) -> float:
+        """What to tell `cpu_match.move_budget` is left (untapered), for its share of it a move
+        to spread the clock over our moves until the endgame's solved from `solve_from` empties,
+        rather than to the end: solved, those moves take little (about a second, from 20
+        empties, against tens of seconds planned)."""
+        usable = self.seconds_left(view)
+        empties = view.empties
+        if not solve_from or empties <= solve_from:
+            return usable
+        kept = max(self.solve_reserve, self.solve_share * usable)
+        ours_to_solve = max((empties - solve_from + 1) // 2, 1)
+        ours_to_end = max((empties + 1) // 2, 1)
+        # move_budget gives 0.95 * left / ours_to_end a move, untapered
+        return max(usable - kept, 0.0) / ours_to_solve * ours_to_end
 
     def extension_move(self, view: GameView) -> float:
         """A move's seconds on the extension."""
@@ -240,8 +260,12 @@ class PlayerBridge:
         cores: int,
         taper: int = 0,
         time_policy: TimePolicy | None = None,
+        solve_from: int = 0,
     ):
+        """`solve_from`: the empties from which the player solves the endgame (its `solve`),
+        which the clock is planned to reach."""
         self.new_player = new_player
+        self.solve_from = solve_from
         self.pool = EnginePool(make_engine)
         self.cores = cores
         self.taper = taper
@@ -296,8 +320,14 @@ class PlayerBridge:
                     view.color, per_move * (view.empties + 1) / 2 / 0.95
                 )
             else:
-                game.player.taper = self.taper
-                move = game.player.move(view.color, self.time.seconds_left(view))
+                if self.solve_from:
+                    # planned to the solve, evenly (see `TimePolicy.planned_left`)
+                    game.player.taper = 0
+                    left = self.time.planned_left(view, self.solve_from)
+                else:
+                    game.player.taper = self.taper
+                    left = self.time.seconds_left(view)
+                move = game.player.move(view.color, left)
         finally:
             self.pool.release(cores, engine)
         game.told += 1
@@ -362,6 +392,7 @@ class NetBridge(PlayerBridge):
             cores,
             taper,
             time_policy,
+            solve_from=solving.empties if solving else 0,
         )
         # an engine of every core, made now: the first move shouldn't wait for it
         self.pool.release(cores, self.pool.acquire(cores))
