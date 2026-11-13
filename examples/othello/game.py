@@ -138,6 +138,12 @@ SGD_WEIGHT_DECAY = 1e-4
 # sims (1.2x to 1.25x faster self-play than 1; 16 was slower again)
 TRAVERSAL_STEPS = 8
 
+# the softmax temperature of the prior in every search that plays to win (test games,
+# evaluation, contests; see MCTS.prior_temperature), not self-play's, which trains at 1. On a
+# 4x64 against Edax, 2 beat 1 by about 57-101 Elo at 128 visits and 43 at 9,700, and was the
+# best of 1-4 at both. Also cpu_search.SearchSettings' and eval_players' default
+PLAY_PRIOR_TEMPERATURE = 2.0
+
 # the network every script here defaults to: a ResNet of 6 blocks of 128 channels with
 # KataGo's global pooling, in every 2nd block and in the policy and value heads. Pooling
 # beat the AlphaZero paper's plain ResNet, resnet:6x128 before, against Edax and on the
@@ -275,7 +281,7 @@ def make_test_evaluator(
     num_iterations: int = 64,
     noise: bool = True,
     tree_factor: int = 2,
-    prior_temperature: float = 1.0,
+    prior_temperature: float = PLAY_PRIOR_TEMPERATURE,
 ) -> MCTS:
     """Evaluator used in test games: temperature 0 to always play the most-visited
     action. Opponents share these settings, so that only the quality of their
@@ -285,7 +291,7 @@ def make_test_evaluator(
     two deterministic players don't replay the same game; turn it off to measure an
     evaluator at full strength when the games get their variety elsewhere (e.g. from
     XOT openings, see `xot.py`). `prior_temperature` flattens (above 1) or sharpens the
-    search's prior (see `MCTS`)."""
+    search's prior (see `MCTS`); play's is flatter than self-play's (`PLAY_PRIOR_TEMPERATURE`)."""
     return AlphaZero(MCTS)(
         eval_fn=eval_fn,
         num_iterations=num_iterations,

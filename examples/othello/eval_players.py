@@ -16,8 +16,10 @@ A network is one of the league store's, by `net`, or any checkpoint, by `checkpo
   native, int8-VARIANT), with `engine=1` by a thread a core (see `clock_match.net_player`)
 - `gpu`: a tree on the host, leaves evaluated on the GPU a batch at a time (`gpu_play.py`)
 - `gpu-batched`: core's MCTS, many games at once on the GPU, as the Elo league plays: fixed
-  visits only, against engines at a level or other such networks; `prior_temperature` flattens
-  its prior (above 1, see `core.evaluators.mcts.mcts.MCTS`)
+  visits only, against engines at a level or other such networks
+
+On every device `prior_temperature` (default 2, `game.PLAY_PRIOR_TEMPERATURE`) is the softmax
+temperature of the search's prior: above 1 flatter than the network's policy.
 
 Everything that decides how a player plays is in its config, defaults filled in, and its id is the
 config's digest (`core.evals.store.player_id`): a network's checkpoint by its sha256, and a
@@ -57,7 +59,8 @@ SEARCH = {
     "virtual_loss": (str, "loss"),
     "weight": (float, 1.0),
     "c_init": (float, 1.25),
-    "prior_temperature": (float, 1.0),
+    # game.PLAY_PRIOR_TEMPERATURE
+    "prior_temperature": (float, 2.0),
     "max_collisions": (int, None),
     "random_symmetry": (int, 0),
     "reuse": (int, 1),
@@ -86,7 +89,7 @@ OPTIONS: dict[str, dict[str, tuple[type, Any]]] = {
     "gpu-batched": {
         "tree_factor": (int, 4),
         "dtype": (str, "bfloat16"),
-        "prior_temperature": (float, 1.0),
+        "prior_temperature": (float, 2.0),
     },
 }
 # a network's endgame solve, with `solve=N` (see `cpu_match.Solving`)
@@ -276,8 +279,8 @@ def resolve_net(
     )
     where = device + (f"/{search['backend']}" if device == "cpu" else "")
     solve = f" solve{search['solve']}" if "solve" in search else ""
-    temperature = search.get("prior_temperature", 1.0)
-    prior = f" T{temperature:g}" if temperature != 1.0 else ""
+    temperature = search.get("prior_temperature")
+    prior = f" T{temperature:g}" if temperature != known["prior_temperature"][1] else ""
     relative = _relative(checkpoint)
     runtime = {
         "player": "net",

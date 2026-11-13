@@ -262,7 +262,9 @@ class GpuSettings:
             virtual_loss=options.pop("virtual_loss", "loss"),
             weight=float(options.pop("weight", 1)),
             c_init=float(options.pop("c_init", 1.25)),
-            prior_temperature=float(options.pop("prior_temperature", 1.0)),
+            prior_temperature=float(
+                options.pop("prior_temperature", SearchSettings.prior_temperature)
+            ),
             max_collisions=int(collisions) if collisions is not None else None,
             random_symmetry=bool(int(options.pop("random_symmetry", 0))),
             reuse=bool(int(options.pop("reuse", 1))),

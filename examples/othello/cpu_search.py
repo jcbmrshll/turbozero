@@ -210,7 +210,8 @@ class SearchSettings:
     virtual_loss: str = "loss"
     weight: float = 1.0
     c_init: float = 1.25
-    prior_temperature: float = 1.0
+    # game.PLAY_PRIOR_TEMPERATURE: this search only plays, it doesn't make training data
+    prior_temperature: float = 2.0
     max_collisions: int | None = None
     random_symmetry: bool = False
     reuse: bool = True

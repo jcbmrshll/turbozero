@@ -70,9 +70,10 @@ def test_rules_match_pgx_over_random_games():
 
 
 def core_visits(
-    sims: int, moves: list[int], prior_temperature: float = 1.0
+    sims: int, moves: list[int], prior_temperature: float | None = None
 ) -> np.ndarray:
-    """The root visits of `core`'s MCTS, after `moves`, with `fake_eval` as its network."""
+    """The root visits of `core`'s MCTS, after `moves`, with `fake_eval` as its network, at the
+    play searches' prior temperature unless given."""
     from game import env, make_test_evaluator, metadata, step_fn
 
     from core.evaluators.mcts.policy_targets import VisitCounts
@@ -89,8 +90,12 @@ def core_visits(
             state.observation,
         )
 
-    evaluator = make_test_evaluator(
-        eval_callback, sims, noise=False, prior_temperature=prior_temperature
+    evaluator = (
+        make_test_evaluator(eval_callback, sims, noise=False)
+        if prior_temperature is None
+        else make_test_evaluator(
+            eval_callback, sims, noise=False, prior_temperature=prior_temperature
+        )
     )
     key = jax.random.PRNGKey(0)
     state = env.init(key)
@@ -122,7 +127,7 @@ def test_a_batch_of_one_visits_as_core_does():
     assert np.array_equal(search.visits(), core_visits(sims, moves))
 
 
-@pytest.mark.parametrize("temperature", [0.8, 1.6])
+@pytest.mark.parametrize("temperature", [0.8, 1.0, 1.6])
 def test_a_prior_temperature_visits_as_cores_does(temperature):
     from cpu_search import Search, SearchSettings
 
@@ -134,8 +139,19 @@ def test_a_prior_temperature_visits_as_cores_does(temperature):
     search.run(sims + 1, fake_eval)
     visits = core_visits(sims, moves, temperature)
     assert np.array_equal(search.visits(), visits)
-    # and not as at 1
+    # and not as at the default
     assert not np.array_equal(visits, core_visits(sims, moves))
+
+
+def test_every_play_search_defaults_to_the_same_prior_temperature():
+    from cpu_search import SearchSettings
+    from eval_players import OPTIONS
+    from game import PLAY_PRIOR_TEMPERATURE
+
+    assert SearchSettings().prior_temperature == PLAY_PRIOR_TEMPERATURE
+    assert {o["prior_temperature"][1] for o in OPTIONS.values()} == {
+        PLAY_PRIOR_TEMPERATURE
+    }
 
 
 def test_a_prior_temperature_is_positive():
@@ -451,7 +467,7 @@ def test_a_player_parses_random_symmetry():
 
     assert not settings("visits=10").random_symmetry
     assert settings("visits=10,random_symmetry=1").random_symmetry
-    assert settings("visits=10").prior_temperature == 1.0
+    assert settings("visits=10").prior_temperature == 2.0
     assert settings("visits=10,prior_temperature=1.6").prior_temperature == 1.6
 
 
