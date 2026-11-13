@@ -23,8 +23,7 @@ The first epoch is slow: nearly all of the training loop is JIT-compiled the fir
 time it runs. On one RTX 5080 the rest take about 63s each (36s with
 --inference-dtype bfloat16, see README.md).
 
-Checkpoints go to --ckpt-dir, and the last is exported to ONNX beside itself when the run
-ends; `evaluate.py` evaluates checkpoints further (see README.md). The hyperparameters here are only an example; tune them for your task and
+Checkpoints go to --ckpt-dir; `evaluate.py` evaluates checkpoints further (see README.md). The hyperparameters here are only an example; tune them for your task and
 hardware.
 
 With --save-state-at or --save-state-every, the whole training state (network, optimizer,
@@ -64,7 +63,6 @@ from game import (
     WEIGHT_DECAY,
     env,
     episode_metrics,
-    export_last,
     make_network,
     make_optimizer,
     make_test_evaluator,
@@ -1320,8 +1318,6 @@ def main():
         fork_into=args.fork_into,
         warm_start=args.warm_start,
     )
-    for spec, net_dir in zip([args.net, *args.grow], trainer.ckpt_dirs, strict=True):
-        export_last(net_dir, spec)
 
 
 if __name__ == "__main__":

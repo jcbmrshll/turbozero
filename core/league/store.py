@@ -612,13 +612,6 @@ class Store:
         if cursor.rowcount == 0:
             raise ValueError(f"no network {name} in the store")
 
-    def onnx_path(self, player: Player) -> Path | None:
-        """Where the ONNX export of `player`'s network goes, beside its checkpoint in the store;
-        None if it has no network."""
-        if player.path is None:
-            return None
-        return self.root / "networks" / f"{Path(player.path).stem}.onnx"
-
     def set_notes(
         self,
         player: int,

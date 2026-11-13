@@ -673,7 +673,7 @@ def timing_configs(
     """What each player at a fixed budget cost on the host `host` (a host id), one side's time
     over its games played out there, timed alone: from its games against itself, or with
     `any_opponent`, against anyone (an engine's time rises with its opponent's strength). The
-    league's `timings.json` configs (see `core.league.dashboard`)."""
+    league's `timings.json` configs (format in README.md)."""
     from core.evals.store import host_id
 
     players = {p.id: p for p in store.players()}

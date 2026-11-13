@@ -1166,31 +1166,11 @@ A network's players keep a tree of 2 x sims nodes unless they're added with a bi
 (`add-player NET --sims 4000 --tree-factor 4`, a player of its own, `NET@4000-t4`). For a session
 of requested series only, with the GPU to itself: `play --requests-only --batch-seconds 900`.
 
-The dashboard (`elo_league.py dashboard`) lists the players, with filters read from their names and
-settings, beside the queue of series and a plot of runtime against rating. A player's page holds
-its description and tags. A network's budgets share theirs.
+The dashboard (`elo_league.py dashboard`) lists every player's rating and record and the latest
+games; a player's page has its record against each opponent.
 
-A game's page runs trained networks in the browser, on their ONNX exports, through onnxruntime-web
-served from the store (`elo_league.py fetch-ort`, once). No game's search was kept, so its tree is
-searched again from each position, by default by the player to move's network at the sims it played
-at, with the same PUCT as core's MCTS. Games kept their tree between moves, and this doesn't, so a
-position's tree isn't the one the game had.
-
-The same page can run Edax and Egaroucid in the browser, compiled to WebAssembly from the commits the
-setup scripts pin (`elo_league.py build-browser-engines`, once; `setup_wasm_engines.sh`), with no book.
-It shows each one's best move and its score in discs for the player to move. They run on one thread:
-threads need cross-origin isolation headers and HTTPS, which the tailnet's plain HTTP address doesn't
-have. A search can't be interrupted, so stopping one ends its worker: Edax is back in about 0.1 s, and
-Egaroucid in about 1 s, as it builds its tables again. Edax takes about 130 MB. Egaroucid takes about
-565 MB, with a hash table of 2^23 entries for native's 2^25; its keys are native's, cut to size.
-`wasm/check_against_native.py` compares them with the native engines on the league's own positions.
-These numbers are for exploring a game: they aren't ratings, and they stay off the Pareto plot.
-
-Every run and every network registered with the league is exported to ONNX, which is cheap (about
-0.3 s and 9 MB for an 8x128 once the process is up). A failed export only says so, and
-`elo_league.py export-onnx` tries the store's missing ones again.
-
-The plot reads `timings.json` beside the store, which a benchmark writes atomically:
+`timings.json`, beside the store, holds what players' moves cost on fixed hardware. A benchmark
+writes it atomically:
 
 ```json
 {"runs": [{"name": "...", "hardware": {"cpu": "...", "cores": 8, "threads": 8}, "software": {},
@@ -1201,6 +1181,6 @@ The plot reads `timings.json` beside the store, which a benchmark writes atomica
      "source": "measured", "plot": true, "games": 24, "seconds_per_game": 1.4}]}]}
 ```
 
-A run is one host, and the plot shows one at a time. `seconds_per_game` is one side's mean. Only
-configs that are `measured` and marked `plot` appear, joined to players by architecture and sims or
-engine and level. A `batch_strength` of `unmeasured` draws a point hollow and off the frontier.
+A run is one host. `seconds_per_game` is one side's mean. Configs are joined to players by
+architecture and sims or engine and level; a `batch_strength` of `unmeasured` means the batch size
+hasn't been shown to lose no strength.
