@@ -10,8 +10,8 @@ Othello model and against two strong open-source Othello engines,
 | `train.py` | Trains a network by self-play, scoring it against Edax's scores of fixed positions as it goes, and in games against Edax if asked |
 | `eval_pgx.py` | Plays a checkpoint against pgx's pretrained model at several search budgets |
 | `vs_engine.py` | Plays a checkpoint against Edax or Egaroucid at several levels, from XOT openings (and train.py's network as it trains) |
-| `engines.py` | Edax and Egaroucid, each driven over GTP, and what their searches made of each position, from their logs |
-| `setup_edax.sh`, `setup_egaroucid.sh` | Build the engines for `vs_engine.py` and `clock_match.py` |
+| `engines.py` | Edax and Egaroucid, each driven over GTP, and what their searches made of each position, from their logs; and Melody, Neural Reversi, ymatioun and Edax-FM, for `clock_match.py` |
+| `setup_edax.sh`, `setup_egaroucid.sh`, `setup_melody.sh`, `setup_neural_reversi.sh`, `setup_ymatioun.sh`, `setup_edax_fm.sh` | Build the engines for `vs_engine.py` and `clock_match.py` |
 | `clock_match.py` | Games on a real clock, one at a time on the same cores, each side at its best settings |
 | `ggs.py` | GGS's random starts, its archive's, and its clock and scoring, for `clock_match.py` |
 | `gcp_cpu_jobs.py`, `gcp_cpu_runner.py` | Commands on Google Cloud Spot VMs of one CPU model (8 Zen 5 cores, AVX-512 VNNI), for timed games |
@@ -700,6 +700,26 @@ A level is no stand-in for a clock. On real positions, from XOT openings, with 8
 More threads make a level no stronger, only faster (at level 16, 150 games each: 8 threads
 against 1 scored 0.49 for Edax and 0.50 for Egaroucid, each about 0.04 either way), and one
 search took 3.5 times less time on 8 threads than on 1 at level 20.
+
+### More engines
+
+Four more engines, each plausibly near Edax's strength or above, play in `clock_match.py` (and,
+but for ymatioun, at a level in `vs_engine.py`). Each `setup_*.sh` builds one at a pinned commit
+into `~/.cache/turbozero/othello/engines-2026-11/`, for a standard ISA level, never `-march=native`.
+None has an opening book.
+
+| Engine | Name | Licence | Protocol | Levels | Notes |
+|---|---|---|---|---|---|
+| [Melody](https://github.com/HCyrano/Melody), Bruno Causse | `melody` | GPLv3 | its own, IOStd: a whole position and a depth or the milliseconds left | Edax's (`engines.edax_level`) | AVX2 at most. Its time management keeps up to 15 s in reserve and takes at least 1 s a move: it lost on time at 10 s a game, not at 60 |
+| [Neural Reversi](https://github.com/natsutteatsuiyone/neural-reversi) | `neural-reversi` | GPLv3 | GTP, with `setboard` | its own, up to 30 | Edax-like search, neural network evaluation; `time_left` in whole seconds |
+| [ymatioun](https://github.com/ymatioun/reversi), Youri Matiounine | `ymatioun` | MIT | its own, like UCI: `position fen`, `go time <ms>` | none: clock only | threads fixed at build (`bin/ymatioun-t<N>`, `THREADS="1 8"`); the setup script patches its weights' paths, threads, hash size and page-rounded allocations |
+| [Edax-FM](https://github.com/Yoka0014/edax-fm-reversi) | `edax-fm` | GPLv3 | Edax's GTP | Edax's | Edax 4.6 with a factorization-machines layer; "Kalmia" on GGS |
+
+```
+examples/othello/setup_melody.sh                    # once each
+taskset -c 8 uv run examples/othello/clock_match.py --a melody:threads=1 --b edax:threads=1 \
+    --seconds 60 --openings 50
+```
 
 ### GGS conditions
 
