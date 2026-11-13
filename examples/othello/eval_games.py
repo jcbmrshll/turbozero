@@ -73,8 +73,6 @@ class MatchSpec:
     tag: str = ""
 
     def __post_init__(self) -> None:
-        if not self.batched and "pgx" in (self.a.config["kind"], self.b.config["kind"]):
-            raise ValueError("pgx plays only in batched games")
         if self.batched:
             for p in (self.a, self.b):
                 if p.config["kind"] == "net" and p.device != "gpu-batched":
@@ -404,41 +402,6 @@ def replay(
     return game
 
 
-# a batched player's `net`, for pgx's pretrained model of that name (see `batched_game`)
-PGX = "pgx:"
-
-
-def batched_game() -> Any:
-    """The league's Othello (`elo_league.Othello`), which also plays pgx's pretrained model, a
-    `net` of `PGX` and its name, as our networks play: no root noise, temperature 0."""
-    from elo_league import Othello
-    from game import make_test_evaluator, state_to_nn_input
-
-    from core.evaluators.evaluation_fns import make_nn_eval_fn_no_params_callable
-
-    class Evaluations(Othello):
-        def load_network(self, path: str, net: str, dtype: str) -> Any:
-            if net.startswith(PGX):
-                # the model is its own parameters: none to pass the search
-                return net, None
-            return super().load_network(path, net, dtype)
-
-        def make_evaluator(self, network: Any, sims: int, tree_factor: int = 4) -> Any:
-            if isinstance(network, str) and network.startswith(PGX):
-                import pgx
-
-                model = pgx.make_baseline_model(network[len(PGX) :])  # pyright: ignore[reportArgumentType]
-                return make_test_evaluator(
-                    make_nn_eval_fn_no_params_callable(model, state_to_nn_input),
-                    sims,
-                    noise=False,
-                    tree_factor=tree_factor,
-                )
-            return super().make_evaluator(network, sims, tree_factor)
-
-    return Evaluations()
-
-
 def play_batched(
     spec: MatchSpec,
     match_id: str,
@@ -451,6 +414,8 @@ def play_batched(
     """Plays the games `numbers` on the GPU in batches of `games_at_once` starts (each start's
     two games: one batch half with a black, the other b), emitting each batch's games as it
     ends. `record_run` gets each batch's timing and the host."""
+    from elo_league import Othello
+
     from core.league.match import Programs, play_batch
     from core.league.store import Player
 
@@ -458,7 +423,7 @@ def play_batched(
     host = hardware.describe(with_gpu=True)
     if spec.solve_at is not None and solve is None:
         solve = endgame_solve(spec.solve_exact)
-    game = batched_game()
+    game = Othello()
     dtype = next(
         (
             p.config["search"]["dtype"]
@@ -471,16 +436,6 @@ def play_batched(
 
     def league_player(index: int, p: PlayerSpec) -> Player:
         budget = p.config["budget"]
-        if p.config["kind"] == "pgx":
-            return Player(
-                id=index,
-                name=p.label,
-                sims=budget["visits"],
-                network="pgx",
-                path="pgx",
-                net=PGX + p.config["model"],
-                settings={"tree_factor": p.config["search"]["tree_factor"]},
-            )
         if p.config["kind"] == "net":
             network = p.runtime["network"]
             path = network["checkpoint"]

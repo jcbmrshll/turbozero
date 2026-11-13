@@ -49,7 +49,7 @@ from typing import Any
 
 def wants_gpu(argv: Sequence[str]) -> bool:
     """Whether a player of the match asked for on the command line, in its `--config` or in its
-    `--match @FILE`, plays on the GPU: a network on a GPU device, or pgx's model."""
+    `--match @FILE`, plays on the GPU: a network on a GPU device."""
     texts = list(argv)
     for flag in ("--config", "--match"):
         if flag in argv[:-1]:
@@ -60,10 +60,7 @@ def wants_gpu(argv: Sequence[str]) -> bool:
     return any(GPU_DEVICE.search(text) for text in texts)
 
 
-# a player on the GPU: a network's device, or pgx's model, which plays only there
-GPU_DEVICE = re.compile(
-    r"""device["']?\s*[=:]\s*["']?gpu|(^|[\s"'])pgx:|kind["']?\s*[=:]\s*["']?pgx"""
-)
+GPU_DEVICE = re.compile(r"""device["']?\s*[=:]\s*["']?gpu""")
 
 # JAX picks its devices when the players' modules are imported: off the GPU unless a player is on
 # it, where loading a checkpoint would take its memory and other work there (the league) gives way
@@ -148,7 +145,7 @@ def match_setup(args: argparse.Namespace) -> dict[str, Any]:
 
 def build_match(setup: dict[str, Any], cores: int) -> MatchSpec:
     batched = any(
-        kind == "pgx" or (kind == "net" and options.get("device") == "gpu-batched")
+        kind == "net" and options.get("device") == "gpu-batched"
         for kind, options in (parse(setup["a"]), parse(setup["b"]))
     )
     a, b = (resolve(setup[side], cores, batched) for side in ("a", "b"))

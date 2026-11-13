@@ -545,13 +545,6 @@ def test_jax_stays_off_the_gpu_unless_a_player_is_on_it(tmp_path):
     match.write_text(json.dumps({"spec": {"a": {"config": {"device": "gpu"}}}}))
     assert evaluate.wants_gpu(["play", "--match", f"@{match}"])
     assert evaluate.wants_gpu(["play", "--match", match.read_text()])
-    assert evaluate.wants_gpu(["run", "--a", "pgx:visits=16", "--b", "edax:level=1"])
-    config.write_text('a = "pgx:visits=16"\nb = "edax:level=1"\n')
-    assert evaluate.wants_gpu(["run", "--config", str(config)])
-    match.write_text(json.dumps({"spec": {"a": {"config": {"kind": "pgx"}}}}))
-    assert evaluate.wants_gpu(["play", "--match", f"@{match}"])
-    # an engine's options that merely mention pgx aren't a pgx player
-    assert not evaluate.wants_gpu(["run", "--a", "edax:level=1,args=--note=nopgx:x"])
 
 
 def test_games_in_parallel_are_the_games_one_at_a_time(now):
@@ -574,21 +567,6 @@ def test_networks_on_the_cpu_play_one_game_at_a_time():
     spec = MatchSpec(net, fake("e", {"level": 1}), openings=1)
     with pytest.raises(ValueError, match="one game at a time"):
         play_parallel(spec, "m-x", [0, 1], lambda r: None, 2)
-
-
-def test_pgx_plays_only_in_batches_at_fixed_visits(engine_dir):
-    pgx = resolve("pgx:visits=64", 8)
-    assert pgx.device == "gpu-batched" and pgx.config["model"] == "othello_v0"
-    assert resolve("pgx:visits=64,tree_factor=4", 8).id == pgx.id
-    with pytest.raises(ValueError, match="fixed visits"):
-        resolve("pgx:clock=10", 8)
-    edax = resolve(f"edax:level=8,dir={engine_dir}", 8, batched=True)
-    assert MatchSpec(pgx, edax, openings=1).batched
-    cpu_edax = fake("e", {"level": 1}, threads=1)
-    with pytest.raises(ValueError, match="only in batched"):
-        MatchSpec(
-            fake("p", {"visits": 1}, kind="pgx", device="cpu"), cpu_edax, openings=1
-        )
 
 
 def test_timings_are_each_fixed_budget_players_side_on_one_host(tmp_path):
@@ -647,10 +625,3 @@ def test_games_in_parallel_are_emitted_in_the_callers_thread(now):
         spec, "m-x", numbers_of(2), emit, 3, make=lambda p, c: lambda: FirstLegal(now)
     )
     assert threads == [threading.current_thread()] * 4
-
-
-def test_pgx_makes_a_match_batched_its_engines_a_thread_each(engine_dir):
-    spec = evaluate.build_match(
-        {"a": "pgx:visits=16", "b": f"edax:level=1,dir={engine_dir}"}, cores=8
-    )
-    assert spec.batched and spec.b.config["threads"] == 1
