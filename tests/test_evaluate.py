@@ -545,6 +545,13 @@ def test_jax_stays_off_the_gpu_unless_a_player_is_on_it(tmp_path):
     match.write_text(json.dumps({"spec": {"a": {"config": {"device": "gpu"}}}}))
     assert evaluate.wants_gpu(["play", "--match", f"@{match}"])
     assert evaluate.wants_gpu(["play", "--match", match.read_text()])
+    assert evaluate.wants_gpu(["run", "--a", "pgx:visits=16", "--b", "edax:level=1"])
+    config.write_text('a = "pgx:visits=16"\nb = "edax:level=1"\n')
+    assert evaluate.wants_gpu(["run", "--config", str(config)])
+    match.write_text(json.dumps({"spec": {"a": {"config": {"kind": "pgx"}}}}))
+    assert evaluate.wants_gpu(["play", "--match", f"@{match}"])
+    # an engine's options that merely mention pgx aren't a pgx player
+    assert not evaluate.wants_gpu(["run", "--a", "edax:level=1,args=--note=nopgx:x"])
 
 
 def test_games_in_parallel_are_the_games_one_at_a_time(now):
