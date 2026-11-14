@@ -845,7 +845,7 @@ def list_matches(args: argparse.Namespace) -> None:
         )
 
 
-def main(argv: Sequence[str] | None = None) -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(__doc__ or "").splitlines()[0],
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -912,7 +912,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "--require-idle",
         action="store_true",
         help=f"here: refuse to start unless the cores and their siblings are idle "
-        f"(each under {BUSY_TO_START:.0%} over {QUIET_SECONDS:g} s), for timings",
+        f"(each under {BUSY_TO_START:.0%}% over {QUIET_SECONDS:g} s), for timings",
     )
     p.set_defaults(fn=run)
 
@@ -973,8 +973,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8031)
     p.set_defaults(fn=serve_page)
+    return parser
 
-    args = parser.parse_args(argv)
+
+def main(argv: Sequence[str] | None = None) -> None:
+    args = build_parser().parse_args(argv)
     args.fn(args)
 
 

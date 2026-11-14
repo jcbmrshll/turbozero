@@ -636,3 +636,15 @@ def test_games_in_parallel_are_emitted_in_the_callers_thread(now):
         spec, "m-x", numbers_of(2), emit, 3, make=lambda p, c: lambda: FirstLegal(now)
     )
     assert threads == [threading.current_thread()] * 4
+
+
+def test_every_command_formats_its_help(capsys):
+    # argparse %-formats help strings, so a stray % (say from an f-string's :.0%) crashes --help
+    parser = evaluate.build_parser()
+    (commands,) = [a for a in parser._actions if isinstance(a.choices, dict)]
+    assert commands.choices
+    for command in [[]] + [[c] for c in commands.choices]:
+        with pytest.raises(SystemExit) as raised:
+            parser.parse_args([*command, "--help"])
+        assert raised.value.code == 0
+    assert "--require-idle" in capsys.readouterr().out
