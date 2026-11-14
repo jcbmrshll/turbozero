@@ -223,7 +223,8 @@ def net_name(spec: str) -> str:
     return found.group(0) if found else spec.split(",")[0].replace(":", "-")
 
 
-def main():
+def make_parser() -> argparse.ArgumentParser:
+    """train.py's arguments; selfplay_health.py takes its self-play ones from here too."""
     parser = argparse.ArgumentParser(description="AlphaZero on Othello.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=200)
@@ -911,6 +912,112 @@ def main():
         metavar="URL",
         help=f"log to a seaglass server (default {DEFAULT_URL}: $SEAGLASS_URL, else slick's)",
     )
+    return parser
+
+
+def check_selfplay_args(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> int:
+    """Checks the self-play arguments and fills in their defaults (see make_parser).
+
+    Returns:
+        int: self-play's moves of compute per epoch (see --selfplay-cycles)
+    """
+    if args.no_persist_tree and args.count_reused_visits:
+        parser.error(
+            "--count-reused-visits counts the visits of the subtree a search keeps, which "
+            "--no-persist-tree discards"
+        )
+    if args.advance_every is None and (
+        args.count_reused_visits or args.playout_cap is not None
+    ):
+        # searches of varying lengths: see Trainer's advance_every
+        args.advance_every = 5
+    if args.playout_cap is not None:
+        if args.sims_schedule is not None:
+            parser.error("--playout-cap goes with --sims, not --sims-schedule")
+        if args.playout_cap.fast_iterations >= args.sims:
+            parser.error("--playout-cap's fast sims must be fewer than --sims")
+    collection_steps = 128
+    if args.selfplay_cycles is not None:
+        if args.sims_schedule is not None:
+            parser.error("--selfplay-cycles goes with --sims, not --sims-schedule")
+        if args.selfplay_cycles < 1 or args.selfplay_cycles % (args.sims + 1):
+            parser.error(
+                f"--selfplay-cycles must be a positive multiple of --sims + 1 ({args.sims + 1})"
+            )
+        # self-play runs as many cycles as this many moves' searches take at most
+        collection_steps = args.selfplay_cycles // (args.sims + 1)
+    if args.resign is not None and not 0 < args.resign <= 1:
+        parser.error("--resign must be in (0, 1]")
+    if not 0 <= args.resign_calibration <= 1:
+        parser.error("--resign-calibration must be between 0 and 1")
+    if args.solve_empties is not None:
+        if not 0 <= args.solve_empties < 60:
+            parser.error("--solve-empties must be in [0, 60)")
+        if args.resign is not None:
+            parser.error("--solve-empties doesn't go with --resign")
+    if not 0 <= args.solve_share <= 1:
+        parser.error("--solve-share must be between 0 and 1")
+    if args.solve_play_past < 0:
+        parser.error("--solve-play-past must be at least 0")
+    if args.dirichlet_alpha <= 0:
+        parser.error("--dirichlet-alpha must be positive")
+    if not 0 <= args.dirichlet_epsilon <= 1:
+        parser.error("--dirichlet-epsilon must be between 0 and 1")
+    if args.policy_target == "completed-q" and args.tree_positions > 0:
+        # a tree position's target is its visits: the network's policy before the
+        # search isn't kept below the root
+        parser.error("--policy-target completed-q can't go with --tree-positions")
+    return collection_steps
+
+
+def make_exploration(args: argparse.Namespace) -> Exploration:
+    """How self-play chooses the move to play from a search (see --sampling-moves)."""
+    return Exploration(num_sampling_moves=args.sampling_moves)
+
+
+def make_selfplay(network, args: argparse.Namespace) -> EvaluatorSchedule:
+    """A network's self-play search. AlphaZero takes an arbitrary search backend, here
+    classic MCTS. Temperature 1.0 samples moves in proportion to visit counts, for
+    exploration during self-play. With --sims-schedule, a search for each stage: each
+    takes over at its epoch, starting from empty trees sized for it (see
+    core.training.schedule)"""
+    selfplay_eval_fn = make_nn_eval_fn(network, state_to_nn_input)
+    return EvaluatorSchedule(
+        [
+            (
+                epoch,
+                AlphaZero(MCTS)(
+                    eval_fn=selfplay_eval_fn,
+                    num_iterations=sims,
+                    # counting reused visits, a search's root never has more visits than
+                    # this, those of the cycles it goes on for until its move is played included
+                    max_nodes=sims + args.min_iterations + args.advance_every
+                    if args.count_reused_visits
+                    else int(args.tree_factor * sims),
+                    branching_factor=env.num_actions,
+                    action_selector=PUCTSelector(),
+                    temperature=1.0,
+                    dirichlet_alpha=args.dirichlet_alpha,
+                    dirichlet_epsilon=args.dirichlet_epsilon,
+                    persist_tree=not args.no_persist_tree,
+                    count_reused_visits=args.count_reused_visits,
+                    min_iterations=args.min_iterations,
+                    traversal_steps=args.traversal_steps,
+                    policy_target=CompletedQ(args.value_scale, args.maxvisit_init)
+                    if args.policy_target == "completed-q"
+                    else VisitCounts(),
+                    playout_cap=args.playout_cap,
+                ),
+            )
+            for epoch, sims in args.sims_schedule or [(0, args.sims)]
+        ]
+    )
+
+
+def main():
+    parser = make_parser()
     args = parser.parse_args()
     if args.resume and args.ckpt_dir is None:
         parser.error("--resume needs the run's --ckpt-dir")
@@ -982,52 +1089,7 @@ def main():
             parser.error(
                 f"--lr-plateau-metric {args.lr_plateau_metric} needs --engine-eval-every 1"
             )
-    if args.no_persist_tree and args.count_reused_visits:
-        parser.error(
-            "--count-reused-visits counts the visits of the subtree a search keeps, which "
-            "--no-persist-tree discards"
-        )
-    if args.advance_every is None and (
-        args.count_reused_visits or args.playout_cap is not None
-    ):
-        # searches of varying lengths: see Trainer's advance_every
-        args.advance_every = 5
-    if args.playout_cap is not None:
-        if args.sims_schedule is not None:
-            parser.error("--playout-cap goes with --sims, not --sims-schedule")
-        if args.playout_cap.fast_iterations >= args.sims:
-            parser.error("--playout-cap's fast sims must be fewer than --sims")
-    collection_steps = 128
-    if args.selfplay_cycles is not None:
-        if args.sims_schedule is not None:
-            parser.error("--selfplay-cycles goes with --sims, not --sims-schedule")
-        if args.selfplay_cycles < 1 or args.selfplay_cycles % (args.sims + 1):
-            parser.error(
-                f"--selfplay-cycles must be a positive multiple of --sims + 1 ({args.sims + 1})"
-            )
-        # self-play runs as many cycles as this many moves' searches take at most
-        collection_steps = args.selfplay_cycles // (args.sims + 1)
-    if args.resign is not None and not 0 < args.resign <= 1:
-        parser.error("--resign must be in (0, 1]")
-    if not 0 <= args.resign_calibration <= 1:
-        parser.error("--resign-calibration must be between 0 and 1")
-    if args.solve_empties is not None:
-        if not 0 <= args.solve_empties < 60:
-            parser.error("--solve-empties must be in [0, 60)")
-        if args.resign is not None:
-            parser.error("--solve-empties doesn't go with --resign")
-    if not 0 <= args.solve_share <= 1:
-        parser.error("--solve-share must be between 0 and 1")
-    if args.solve_play_past < 0:
-        parser.error("--solve-play-past must be at least 0")
-    if args.dirichlet_alpha <= 0:
-        parser.error("--dirichlet-alpha must be positive")
-    if not 0 <= args.dirichlet_epsilon <= 1:
-        parser.error("--dirichlet-epsilon must be between 0 and 1")
-    if args.policy_target == "completed-q" and args.tree_positions > 0:
-        # a tree position's target is its visits: the network's policy before the
-        # search isn't kept below the root
-        parser.error("--policy-target completed-q can't go with --tree-positions")
+    collection_steps = check_selfplay_args(parser, args)
 
     if not args.grow and (
         args.grow_switch_at is not None
@@ -1080,44 +1142,6 @@ def main():
             remat=args.remat,
         )
 
-    def make_selfplay(network) -> EvaluatorSchedule:
-        """A network's self-play search. AlphaZero takes an arbitrary search backend, here
-        classic MCTS. Temperature 1.0 samples moves in proportion to visit counts, for
-        exploration during self-play. With --sims-schedule, a search for each stage: each
-        takes over at its epoch, starting from empty trees sized for it (see
-        core.training.schedule)"""
-        selfplay_eval_fn = make_nn_eval_fn(network, state_to_nn_input)
-        return EvaluatorSchedule(
-            [
-                (
-                    epoch,
-                    AlphaZero(MCTS)(
-                        eval_fn=selfplay_eval_fn,
-                        num_iterations=sims,
-                        # counting reused visits, a search's root never has more visits than
-                        # this, those of the cycles it goes on for until its move is played included
-                        max_nodes=sims + args.min_iterations + args.advance_every
-                        if args.count_reused_visits
-                        else int(args.tree_factor * sims),
-                        branching_factor=env.num_actions,
-                        action_selector=PUCTSelector(),
-                        temperature=1.0,
-                        dirichlet_alpha=args.dirichlet_alpha,
-                        dirichlet_epsilon=args.dirichlet_epsilon,
-                        persist_tree=not args.no_persist_tree,
-                        count_reused_visits=args.count_reused_visits,
-                        min_iterations=args.min_iterations,
-                        traversal_steps=args.traversal_steps,
-                        policy_target=CompletedQ(args.value_scale, args.maxvisit_init)
-                        if args.policy_target == "completed-q"
-                        else VisitCounts(),
-                        playout_cap=args.playout_cap,
-                    ),
-                )
-                for epoch, sims in args.sims_schedule or [(0, args.sims)]
-            ]
-        )
-
     # the network's raw moves and values against Edax's, on the engine-labelled set
     engine_set = load_engine_set(parser, args)
     if engine_set is None and args.lr_plateau_metric != "loss":
@@ -1151,7 +1175,7 @@ def main():
         return testers
 
     network, network_state = make_net(args.net)
-    evaluator = make_selfplay(network)
+    evaluator = make_selfplay(network, args)
     evaluator_test = make_test_evaluator(make_nn_eval_fn(network, state_to_nn_input))
     # with --grow, the bigger networks, each with its own searches and testers
     growth = None
@@ -1164,7 +1188,7 @@ def main():
                     name=net_name(spec),
                     nn=grown,
                     nn_state=grown_state,
-                    evaluator=make_selfplay(grown),
+                    evaluator=make_selfplay(grown, args),
                     evaluator_test=make_test_evaluator(
                         make_nn_eval_fn(grown, state_to_nn_input)
                     ),
@@ -1272,7 +1296,7 @@ def main():
         keep_every=args.keep_every,
         # how often self-play games are drawn
         episode_metrics_fn=episode_metrics,
-        exploration=Exploration(num_sampling_moves=args.sampling_moves),
+        exploration=make_exploration(args),
         resignation=Resignation(args.resign, args.resign_calibration)
         if args.resign is not None
         else None,

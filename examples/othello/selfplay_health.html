@@ -1,0 +1,552 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Self-play health</title>
+<style>
+:root {
+  color-scheme: light;
+  --surface-0: #f4f3ef; --surface-1: #fcfcfb; --border: #e3e1da;
+  --text-primary: #0b0b0b; --text-secondary: #52514e; --text-muted: #898781;
+  --grid: #ebe9e3; --axis: #c3c2b7; --hover: #efede6; --active: #e6e3da;
+  --cell: #f0eee8; --good: #1f9d55; --bad: #d64545;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100;
+  --s5: #e87ba4; --s6: #008300; --s7: #6250d6; --s8: #e34948;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --surface-0: #121211; --surface-1: #1a1a19; --border: #2c2c2a;
+    --text-primary: #f0efec; --text-secondary: #c3c2b7; --text-muted: #898781;
+    --grid: #262624; --axis: #383835; --hover: #24241f; --active: #2e2e2a;
+    --cell: #232321; --good: #2fb56a; --bad: #e25c5c;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
+    --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+  }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body { margin: 0; background: var(--surface-0); color: var(--text-primary);
+  font: 13px/1.45 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; display: flex; flex-direction: column; }
+header { padding: 12px 20px 8px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+h1 { font-size: 18px; margin: 0 10px 0 0; font-weight: 600; }
+select, input[type=text] { font: inherit; color: var(--text-primary); background: var(--surface-1);
+  border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; }
+.layout { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 14px; padding: 0 20px 16px; }
+.card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; }
+.left { display: flex; flex-direction: column; gap: 12px; min-width: 0; overflow-y: auto; }
+.config { padding: 10px 14px 12px; overflow-x: auto; flex: none; }
+.config h3 { font-size: 13px; margin: 0 0 6px; font-weight: 600; }
+.config table { border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.config th, .config td { padding: 3px 14px 3px 0; text-align: left; white-space: nowrap; border-bottom: 1px solid var(--grid); }
+.config th { color: var(--text-secondary); font-weight: 600; }
+.config th i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 6px; vertical-align: -1px; }
+.config td { color: var(--text-muted); white-space: normal; overflow-wrap: anywhere; max-width: 220px; vertical-align: top; }
+.config td.k { white-space: nowrap; }
+.config tr.differs td { color: var(--text-primary); }
+.config tr.differs td.k { font-weight: 600; }
+.config td.k { color: var(--text-secondary); }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 12px; }
+.chip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px 3px 8px; border-radius: 14px;
+  border: 1px solid var(--border); background: var(--surface-0); cursor: pointer; color: var(--text-secondary); user-select: none; }
+.chip.on { background: var(--surface-1); color: var(--text-primary); border-color: var(--axis); }
+.chip .sw { width: 10px; height: 10px; border-radius: 2px; background: var(--grid); }
+.chip.base { box-shadow: inset 0 0 0 1px var(--text-secondary); }
+.plot { padding: 12px 14px; flex: none; display: flex; flex-direction: column; }
+.plot h2 { font-size: 16px; margin: 0; font-weight: 600; }
+.plot .sub { color: var(--text-muted); margin: 2px 0 2px; min-height: 18px; }
+.plot .desc { color: var(--text-secondary); margin: 0 0 8px; max-width: 920px; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; color: var(--text-secondary); margin-bottom: 4px; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+.panel-label { color: var(--text-secondary); font-weight: 600; font-size: 12px; margin-top: 6px; }
+svg { display: block; width: 100%; }
+svg text { fill: var(--text-muted); font-size: 11px; }
+.list { overflow: auto; padding: 0 0 8px; outline: none; }
+.list table { border-collapse: separate; border-spacing: 2px 2px; }
+.list thead th { position: sticky; top: 0; background: var(--surface-1); z-index: 1; padding: 8px 0 4px; vertical-align: bottom; }
+.list thead th.run { width: 34px; }
+.list thead .vt { writing-mode: vertical-rl; transform: rotate(180deg); max-height: 190px; overflow: hidden;
+  white-space: nowrap; font-size: 11px; line-height: 13px; display: inline-block; text-align: left; }
+.list thead .vt .m { color: var(--text-muted); }
+.list thead .vt .c { color: var(--text-secondary); font-weight: 600; }
+.list thead .sw { width: 10px; height: 10px; border-radius: 50%; display: block; margin: 4px auto 0; }
+.list td.sec { color: var(--text-muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; padding: 10px 8px 2px 12px; }
+.list tr.item { cursor: pointer; }
+.list tr.item td.nm { padding: 2px 8px 2px 12px; white-space: nowrap; max-width: 230px; overflow: hidden; text-overflow: ellipsis; color: var(--text-secondary); border-radius: 4px; }
+.list tr.item:hover td.nm { background: var(--hover); }
+.list tr.item.cur td.nm { background: var(--active); color: var(--text-primary); font-weight: 600; }
+.list td.cell { width: 34px; height: 20px; border-radius: 3px; }
+.tip { position: fixed; pointer-events: none; background: var(--surface-1); border: 1px solid var(--border);
+  border-radius: 6px; padding: 6px 8px; box-shadow: 0 2px 8px rgba(0,0,0,.15); display: none; z-index: 10; font-size: 12px; }
+.tip .row { display: flex; align-items: center; gap: 6px; }
+.tip .key { width: 12px; height: 2px; }
+.tip b { font-weight: 600; }
+.tip .hd { color: var(--text-secondary); margin-bottom: 3px; }
+.tip .nm { color: var(--text-secondary); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Self-play health</h1>
+  <select id="model"><option value="">all models</option></select>
+  <input id="search" type="text" placeholder="filter config" size="22">
+  <select id="baseline"></select>
+</header>
+<div class="layout">
+  <div class="left">
+    <div class="card chips" id="chips"></div>
+    <div class="card plot">
+      <h2 id="title"></h2>
+      <div class="sub" id="sub"></div>
+      <div class="desc" id="desc"></div>
+      <div class="legend" id="legend"></div>
+      <svg id="main" height="300"></svg>
+      <div class="panel-label" id="diff-label">difference from baseline, ±2 SE</div>
+      <svg id="diff" height="210"></svg>
+    </div>
+    <div class="card config"><h3>Run config</h3><table id="config"></table></div>
+  </div>
+  <div class="card list" id="list" tabindex="0"></div>
+</div>
+<div class="tip" id="tip"></div>
+<script>
+"use strict";
+const SLOTS = 8;
+const PHASES = ["opening", "midgame", "late", "all"];
+const SEARCH_NAMES = { full: "full search", full_no_noise: "full search, no noise", fast: "fast search", raw: "raw network" };
+const PHASE_NOTE = "Phases by empty squares: opening 40–52, midgame 30–39, late 21–29.";
+const SEARCH_DESC = {
+  full: "Each probe position searched once from an empty tree by the config's full search (its sims, root noise and prior).",
+  full_no_noise: "Each probe position searched once from an empty tree by the config's full search without root noise.",
+  fast: "Each probe position searched once by the playout cap's fast search (its sims, no root noise), as self-play's fast moves are.",
+  raw: "The network alone, no search: its policy and value head. The same in every config of a model.",
+};
+const PROBE = [
+  ["entropy", "policy entropy", "nats", 0, "Entropy of the policy over the legal moves (the visit distribution of a search, the softmax prior of the raw network), averaged over probe positions. Higher is flatter."],
+  ["exp_regret", "Edax regret", "discs", -1, "Discs given up against Edax's best move, expected under the policy; Edax at level 24 scores every legal move. Lower is better."],
+  ["top1", "top move is Edax's best", "share", 1, "Share of probe positions where the policy's most likely move is one of Edax's best moves."],
+  ["value_mse", "value MSE vs Edax result", "", -1, "Mean of (value − z)², z the sign of Edax's best score: its predicted win, draw or loss for the player to move. The value is the search's root value, or the value head's."],
+  ["value_r", "value r vs Edax result", "", 1, "Pearson correlation of the value with z, Edax's predicted result (−1, 0 or 1)."],
+  ["value_sign", "value sign agrees with Edax", "share", 1, "Share of the positions Edax calls won or lost where the value has the same sign."],
+];
+const TRAIN_NOTE = "Training positions: full searches of every game in the self-play sample.";
+const SELFPLAY = [
+  ["target_entropy", "target entropy", "nats", 0, "Entropy of the stored policy target: the visit distribution, root noise and the reused subtree's visits included."],
+  ["prior_entropy", "prior entropy", "nats", 0, "Entropy of the network's raw policy on the same positions."],
+  ["kl_target_prior", "KL(target ‖ prior)", "nats", 0, "How far search moves the target from the network's own policy: what the policy loss has to learn from each position."],
+  ["flip_rate", "target's top move ≠ prior's", "share", 0, "Share of positions where the target's most visited move isn't the prior's most likely move."],
+  ["duplicate_rate", "duplicate positions", "share", -1, "1 − distinct / positions, positions the same up to the board's 8 symmetries. The sample's games come from 64 openings, about 32 each, so repeats run higher than in real self-play."],
+  ["decided_share", "|q| > 0.9", "share", -1, "Share of positions whose stored root value is beyond ±0.9: already decided, with little to teach."],
+  ["stored_value_mse", "stored q MSE vs exact result", "", -1, "Mean of (q − z)², q the stored root value and z the game's exact result, solved at its solve point, for the player to move."],
+  ["stored_value_r", "stored q r vs exact result", "", 1, "Pearson correlation of the stored root value q with the game's exact result z."],
+  ["stored_value_sign", "stored q sign agrees with exact result", "share", 1, "Share of the positions whose game is won or lost where q has the result's sign."],
+  ["training_positions", "training positions", "count", 0, "Training positions in the sample, by phase."],
+];
+
+function families() {
+  const f = [];
+  for (const [s, sname] of Object.entries(SEARCH_NAMES))
+    for (const [k, name, unit, good, desc] of PROBE)
+      f.push({ sec: `Probe · ${sname}`, name, unit, good, kind: "phase", path: p => `probe.metrics.${s}.${p}.${k}`, only: s,
+        desc: `${desc} ${SEARCH_DESC[s]} ${PHASE_NOTE}` });
+  f.push({ sec: "Probe · root noise", name: "noise changes the top move", unit: "share", good: 0, kind: "phase", path: p => `probe.noise_flip.${p}`,
+    desc: `Share of probe positions where the full search's most visited move differs with and without root noise: the variety noise adds to the targets' top move. ${PHASE_NOTE}` });
+  for (const [k, name, unit, good, desc] of SELFPLAY)
+    f.push({ sec: "Self-play positions", name, unit, good, kind: "phase", path: p => `selfplay.phases.${p}.${k}`, desc: `${desc} ${TRAIN_NOTE} ${PHASE_NOTE}` });
+  f.push({ sec: "Novelty", name: "distinct positions among games of one opening", unit: "share", good: 1, kind: "curve",
+    desc: "At each ply, the distinct positions (up to symmetry) among 16 games from one opening that are still going, as a share of them, averaged over the 64 openings: 1/16 if all play alike, 1 if all differ. Every move counts, full and fast searches. Ply 8 is the XOT opening." });
+  f.push({ sec: "Novelty", name: "distinct share, sampled plies", unit: "share", good: 1, kind: "scalar", path: () => "selfplay.novelty.distinct_share_sampled",
+    desc: "The distinct-positions curve averaged over the plies moves are sampled in (up to --sampling-moves): one number for how far the games of an opening spread." });
+  f.push({ sec: "Novelty", name: "moves two games of one opening share", unit: "moves", good: -1, kind: "scalar", path: () => "selfplay.novelty.shared_moves",
+    desc: "Moves two games from the same opening play identically after it, averaged over every pair of 16 games of each opening." });
+  f.push({ sec: "Novelty", name: "sampled moves off the target's top", unit: "share", good: 0, kind: "scalar", path: () => "selfplay.off_target_sampled",
+    desc: "Share of the moves played in the sampling plies that aren't the search's most visited move: the variety sampling adds. Every move counts, full and fast searches." });
+  for (const [k, name, unit, desc] of [
+    ["draw_rate", "draws", "share", "Share of games whose exact result at the solve point is a draw."],
+    ["opening_mover_score", "opening mover's score", "", "Score (win 1, draw ½) of the player to move at the XOT opening, by the game's exact result."],
+    ["result_entropy_per_opening", "result entropy per opening", "nats", "Entropy of the exact results (win, draw, loss) among each opening's games, averaged over openings: 0 if an opening's games all end alike."],
+    ["moves_per_game", "moves per game", "moves", "Moves from the XOT opening to the game's end: its solve point, or past it with --solve-play-past."]])
+    f.push({ sec: "Outcomes", name, unit, good: 0, kind: "scalar", path: () => `selfplay.outcomes.${k}`, desc });
+  for (const [k, name, desc] of [
+    ["moves_per_second", "moves", "Self-play moves played a second, full and fast searches, on this run's GPU; the first, compiling call is left out. One timing, no error bar."],
+    ["training_positions_per_second", "training positions", "Training positions (full searches) stored a second."],
+    ["distinct_training_positions_per_second", "distinct training positions", "Training positions a second, discounted by the sample's duplicates: the new positions training gets a second."]])
+    f.push({ sec: "Cost", name: `${name} / s`, unit: "per second", good: 1, kind: "scalar", path: () => `selfplay.throughput.${k}`, desc });
+  for (const [k, name, desc] of [
+    ["probe_seconds", "probe", "Wall time of the probe pass."], ["selfplay_seconds", "self-play", "Wall time of the self-play pass, compilation included."],
+    ["first_call_seconds", "compile + first call", "Wall time of the first self-play call, which compiles it."],
+    ["solve_seconds", "exact solves", "Wall time of the exact solves of the games' solve points, on the CPU."]])
+    f.push({ sec: "Cost", name: `${name} time`, unit: "seconds", good: -1, kind: "scalar", path: () => `timing.${k}`, desc });
+  return f;
+}
+const FAMS = families();
+let runs = [], selected = [], colorOf = new Map(), baseline = null, diffs = {}, diffKey = "", cur = 0;
+
+const $ = id => document.getElementById(id);
+const get = (o, path) => path.split(".").reduce((x, k) => x == null ? x : x[k], o);
+const num = v => typeof v === "number" && Number.isFinite(v);
+const fmt = v => !num(v) ? "–" : Number.isInteger(v) || Math.abs(v) >= 1000 ? Math.round(v).toLocaleString()
+  : Math.abs(v) >= 100 ? v.toFixed(1) : Math.abs(v) >= 1 ? v.toFixed(3) : v.toPrecision(3);
+const color = id => `var(--s${colorOf.get(id) + 1})`;
+const label = r => `${r.model.name} · ${r.config.name}`;
+const byId = id => runs.find(r => r.id === id);
+const sel = () => { const rs = selected.map(byId).filter(Boolean); const b = rs.find(r => r.id === baseline); return b ? [b, ...rs.filter(r => r !== b)] : rs; };
+function el(tag, attrs = {}, text) {
+  const e = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  if (text != null) e.textContent = text;
+  return e;
+}
+function div(cls, text) { const d = document.createElement("div"); if (cls) d.className = cls; if (text != null) d.textContent = text; return d; }
+
+function assignColors() {
+  for (const id of [...colorOf.keys()]) if (!selected.includes(id)) colorOf.delete(id);
+  for (const id of selected) if (!colorOf.has(id)) {
+    const used = new Set(colorOf.values());
+    for (let s = 0; s < SLOTS; s++) if (!used.has(s)) { colorOf.set(id, s); break; }
+  }
+}
+
+const tip = $("tip");
+function showTip(ev, head, rows) {
+  tip.replaceChildren(div("hd", head));
+  for (const [c, v, name] of rows) {
+    const row = div("row");
+    const k = document.createElement("span"); k.className = "key"; k.style.background = c;
+    const b = document.createElement("b"); b.textContent = v;
+    const n = document.createElement("span"); n.className = "nm"; n.textContent = name;
+    row.append(k, b, n); tip.appendChild(row);
+  }
+  tip.style.display = "block";
+  tip.style.left = Math.min(ev.clientX + 14, innerWidth - tip.offsetWidth - 8) + "px";
+  tip.style.top = Math.min(ev.clientY + 14, innerHeight - tip.offsetHeight - 8) + "px";
+}
+const hideTip = () => { tip.style.display = "none"; };
+
+function niceTicks(lo, hi, count = 5) {
+  if (!(hi > lo)) { const pad = Math.abs(lo) * 0.1 || 0.1; lo -= pad; hi += pad; }
+  const step0 = (hi - lo) / count, p = 10 ** Math.floor(Math.log10(step0));
+  const step = [1, 2, 2.5, 5, 10].map(m => m * p).find(s => s >= step0);
+  const a = Math.floor(lo / step) * step, b = Math.ceil(hi / step) * step;
+  const ticks = []; for (let i = 0; a + i * step <= b + step / 2; i++) { const v = a + i * step; ticks.push(Math.abs(v) < step * 1e-6 ? 0 : +v.toPrecision(10)); }
+  return { lo: a, hi: b, ticks };
+}
+
+// a run's value (with its standard error), and its paired difference from the baseline
+const point = (r, path) => ({ v: get(r, path), se: r.se ? r.se[path] : undefined });
+const delta = (r, path) => diffs[r.id] ? diffs[r.id][path] : undefined;
+
+function frame(svg, H, m, lo, hi, groups, zero) {
+  const W = svg.clientWidth || 600;
+  const { lo: a, hi: b, ticks } = niceTicks(lo, hi);
+  const y = v => m.t + (H - m.t - m.b) * (1 - (v - a) / (b - a || 1));
+  for (const v of ticks) {
+    svg.appendChild(el("line", { x1: m.l, x2: W - m.r, y1: y(v), y2: y(v), stroke: zero && v === 0 ? "var(--axis)" : "var(--grid)", "stroke-width": zero && v === 0 ? 1.5 : 1 }));
+    svg.appendChild(el("text", { x: m.l - 6, y: y(v) + 4, "text-anchor": "end" }, fmt(v)));
+  }
+  const gw = (W - m.l - m.r) / groups.length;
+  groups.forEach((g, i) => { if (g) svg.appendChild(el("text", { x: m.l + gw * (i + 0.5), y: H - 6, "text-anchor": "middle" }, g)); });
+  return { y, gw, W };
+}
+
+function dots(svg, H, groups, series, zero) {
+  // series: [{run, at: group => {v, lo, hi, filled}}]
+  svg.replaceChildren(); svg.setAttribute("height", H);
+  const m = { l: 56, r: 12, t: 10, b: 24 };
+  const vals = series.flatMap(s => groups.map(g => s.at(g))).filter(p => p && num(p.v));
+  if (!vals.length) return false;
+  let lo = Math.min(...vals.map(p => num(p.lo) ? p.lo : p.v)), hi = Math.max(...vals.map(p => num(p.hi) ? p.hi : p.v));
+  if (zero) { lo = Math.min(lo, 0); hi = Math.max(hi, 0); }
+  const { y, gw } = frame(svg, H, m, lo, hi, groups, zero);
+  const k = series.length, inner = Math.min(gw * 0.7, k * 34);
+  groups.forEach((g, gi) => {
+    series.forEach((s, si) => {
+      const p = s.at(g); if (!p || !num(p.v)) return;
+      const x = m.l + gw * gi + (gw - inner) / 2 + inner * (si + 0.5) / k, c = color(s.run.id);
+      if (num(p.lo) && num(p.hi)) {
+        svg.appendChild(el("line", { x1: x, x2: x, y1: y(p.lo), y2: y(p.hi), stroke: c, "stroke-width": 2, "stroke-linecap": "round" }));
+        for (const v of [p.lo, p.hi]) svg.appendChild(el("line", { x1: x - 5, x2: x + 5, y1: y(v), y2: y(v), stroke: c, "stroke-width": 2, "stroke-linecap": "round" }));
+      }
+      svg.appendChild(el("circle", { cx: x, cy: y(p.v), r: 5.5, fill: p.filled === false ? "var(--surface-1)" : c, stroke: c, "stroke-width": 2 }));
+      const hit = el("rect", { x: x - 14, y: m.t, width: 28, height: H - m.t - m.b, fill: "transparent" });
+      hit.addEventListener("pointermove", ev => showTip(ev, g || "", [[c, fmt(p.v) + (num(p.lo) ? `  [${fmt(p.lo)}, ${fmt(p.hi)}]` : ""), label(s.run)]]));
+      hit.addEventListener("pointerleave", hideTip);
+      svg.appendChild(hit);
+    });
+  });
+  return true;
+}
+
+function curve(svg, H, series, zero) {
+  // series: [{run, pts: [[t, v, lo, hi]]}]
+  svg.replaceChildren(); svg.setAttribute("height", H);
+  const m = { l: 56, r: 12, t: 10, b: 28 };
+  const all = series.flatMap(s => s.pts);
+  if (!all.length) return false;
+  const W = svg.clientWidth || 600;
+  const t0 = Math.min(...all.map(p => p[0])), t1 = Math.max(...all.map(p => p[0]));
+  let lo = Math.min(...all.map(p => num(p[2]) ? p[2] : p[1])), hi = Math.max(...all.map(p => num(p[3]) ? p[3] : p[1]));
+  if (zero) { lo = Math.min(lo, 0); hi = Math.max(hi, 0); }
+  const { y } = frame(svg, H, m, lo, hi, [""], zero);
+  const x = t => m.l + (W - m.l - m.r) * (t - t0) / Math.max(t1 - t0, 1);
+  for (let t = t0; t <= t1; t++) if ((t + 8) % 4 === 0 && x(t) < W - m.r - 28) svg.appendChild(el("text", { x: x(t), y: H - 10, "text-anchor": "middle" }, String(t + 8)));
+  svg.appendChild(el("text", { x: W - m.r, y: H - 10, "text-anchor": "end" }, "ply"));
+  for (const s of series) {
+    const band = s.pts.filter(p => num(p[2]) && num(p[3]));
+    if (band.length > 1) {
+      const pts = [...band.map(p => [x(p[0]), y(p[3])]), ...band.slice().reverse().map(p => [x(p[0]), y(p[2])])];
+      svg.appendChild(el("path", { d: "M" + pts.map(q => q.join(",")).join("L") + "Z", fill: color(s.run.id), "fill-opacity": 0.15 }));
+    }
+  }
+  for (const s of series) {
+    const d = s.pts.map((p, i) => (i ? "L" : "M") + x(p[0]) + "," + y(p[1])).join("");
+    svg.appendChild(el("path", { d, fill: "none", stroke: color(s.run.id), "stroke-width": 2, "stroke-linejoin": "round" }));
+  }
+  const hair = el("line", { y1: m.t, y2: H - m.b, stroke: "var(--axis)", visibility: "hidden" });
+  const hit = el("rect", { x: m.l, y: m.t, width: W - m.l - m.r, height: H - m.t - m.b, fill: "transparent" });
+  hit.addEventListener("pointermove", ev => {
+    const box = svg.getBoundingClientRect();
+    const t = Math.round(t0 + (ev.clientX - box.left - m.l) / (W - m.l - m.r) * (t1 - t0));
+    hair.setAttribute("x1", x(t)); hair.setAttribute("x2", x(t)); hair.setAttribute("visibility", "visible");
+    showTip(ev, `ply ${t + 8}`, series.map(s => { const p = s.pts.find(q => q[0] === t); return [color(s.run.id), p ? fmt(p[1]) + (num(p[2]) ? `  [${fmt(p[2])}, ${fmt(p[3])}]` : "") : "–", label(s.run)]; }));
+  });
+  hit.addEventListener("pointerleave", () => { hair.setAttribute("visibility", "hidden"); hideTip(); });
+  svg.append(hair, hit);
+  return true;
+}
+
+function legend(rs) {
+  const box = $("legend"); box.replaceChildren();
+  for (const r of rs) {
+    const s = document.createElement("span"); const i = document.createElement("i"); i.style.background = color(r.id);
+    s.append(i, document.createTextNode(label(r) + (r.id === baseline ? " (baseline)" : ""))); box.appendChild(s);
+  }
+}
+
+const slots = f => f.kind === "phase" ? PHASES : [""];
+const pathOf = (f, g) => f.kind === "phase" ? f.path(g) : f.path();
+const curvePath = t => `selfplay.novelty.distinct_share.${t}`;
+function curveSlots(rs) {
+  const n = Math.max(0, ...rs.map(r => r.selfplay.novelty.distinct_share.length));
+  const ts = []; for (let t = 1; t < n; t++) if (rs.some(r => num(r.selfplay.novelty.distinct_share[t]))) ts.push(t);
+  return ts;
+}
+
+function draw() {
+  const f = FAMS[cur], rs = sel();
+  $("title").textContent = f.name;
+  $("sub").textContent = [f.sec, f.unit].filter(Boolean).join(" · ");
+  $("desc").textContent = f.desc || "";
+  legend(rs);
+  const others = rs.filter(r => r.id !== baseline);
+  const main = $("main"), diff = $("diff");
+  // a share's interval stays within [0, 1]
+  const lo = v => f.unit === "share" ? Math.max(0, v) : v, hi = v => f.unit === "share" ? Math.min(1, v) : v;
+  let hasDiff;
+  if (f.kind === "curve") {
+    const ts = curveSlots(rs);
+    curve(main, 300, rs.map(r => ({ run: r, pts: ts.filter(t => num(r.selfplay.novelty.distinct_share[t])).map(t => {
+      const v = r.selfplay.novelty.distinct_share[t], se = r.se ? r.se[curvePath(t)] : undefined;
+      return [t, v, num(se) ? lo(v - 2 * se) : undefined, num(se) ? hi(v + 2 * se) : undefined]; }) })), false);
+    hasDiff = curve(diff, 210, others.map(r => ({ run: r, pts: ts.map(t => [t, delta(r, curvePath(t))]).filter(([, d]) => d)
+      .map(([t, d]) => [t, d[0], d[0] - 2 * d[1], d[0] + 2 * d[1]]) })).filter(s => s.pts.length), true);
+  } else {
+    const groups = slots(f);
+    dots(main, 300, groups, rs.map(r => ({ run: r, at: g => { const p = point(r, pathOf(f, g)); return { v: p.v, lo: num(p.se) ? lo(p.v - 2 * p.se) : undefined, hi: num(p.se) ? hi(p.v + 2 * p.se) : undefined }; } })), false);
+    hasDiff = dots(diff, 210, groups, others.map(r => ({ run: r, at: g => { const d = delta(r, pathOf(f, g)); return d ? { v: d[0], lo: d[0] - 2 * d[1], hi: d[0] + 2 * d[1], filled: Math.abs(d[0]) > 2 * d[1] } : null; } })), true);
+  }
+  $("diff-label").style.visibility = hasDiff ? "visible" : "hidden";
+  if (!hasDiff) diff.replaceChildren();
+  for (const it of document.querySelectorAll(".item")) it.classList.toggle("cur", +it.dataset.i === cur);
+}
+
+// the value a family's row is coloured by: the "all" phase, or the curve's sampled plies
+const rowPath = f => f.kind === "phase" ? f.path("all") : f.kind === "curve" ? "selfplay.novelty.distinct_share_sampled" : f.path();
+
+// the paths a family's cell summarises: each phase, or each ply of the curve
+function familyPaths(f, rs) {
+  return f.kind === "curve" ? curveSlots(rs).map(curvePath) : slots(f).map(g => pathOf(f, g));
+}
+const pathName = (f, p) => f.kind === "curve" ? `ply ${+p.split(".").pop() + 8}` : f.kind === "phase" ? p.split(".").slice(-2, -1)[0] : "";
+
+// a run's difference from the baseline on a path, in standard errors; without one (timings), its
+// relative difference in units of 5%
+function zOf(r, base, p) {
+  const d = delta(r, p);
+  if (d && d[1] > 0) return { z: d[0] / d[1], d: d[0], se: d[1] };
+  if (d) return { z: d[0] === 0 ? 0 : Math.sign(d[0]) * 99, d: d[0], se: d[1] };
+  const v = get(r, p), b = get(base, p);
+  if (num(v) && num(b) && b !== 0) return { z: (v - b) / Math.abs(b) / 0.05, d: v - b };
+  return null;
+}
+
+function cellColor(f, z) {
+  // plain within 1 SE, full from 4
+  const t = Math.max(0, Math.min(1, (Math.abs(z) - 1) / 3));
+  // better green, worse red; where neither direction is better, higher green, lower red
+  const hue = Math.sign(z) === (f.good || 1) ? "var(--good)" : "var(--bad)";
+  return t === 0 ? "var(--cell)" : `color-mix(in oklab, ${hue} ${Math.round(100 * t)}%, var(--cell))`;
+}
+
+function list() {
+  const box = $("list"), rs = sel(); box.replaceChildren();
+  const base = rs.find(r => r.id === baseline);
+  const table = document.createElement("table");
+  const thead = document.createElement("thead"), hr = document.createElement("tr");
+  hr.appendChild(document.createElement("th"));
+  for (const r of rs) {
+    const th = document.createElement("th"); th.className = "run";
+    const vt = document.createElement("span"); vt.className = "vt";
+    const m = document.createElement("span"); m.className = "m"; m.textContent = r.model.name;
+    const c = document.createElement("span"); c.className = "c"; c.textContent = r.config.name + (r.id === baseline ? " · base" : "");
+    vt.append(m, document.createElement("br"), c);
+    const sw = document.createElement("span"); sw.className = "sw"; sw.style.background = color(r.id);
+    th.append(vt, sw);
+    th.addEventListener("pointermove", ev => showTip(ev, label(r), [["transparent", r.config.flags, ""]]));
+    th.addEventListener("pointerleave", hideTip);
+    hr.appendChild(th);
+  }
+  thead.appendChild(hr); table.appendChild(thead);
+  const tbody = document.createElement("tbody");
+  let sec = null;
+  FAMS.forEach((f, i) => {
+    if (f.only && !rs.some(r => r.probe && r.probe.metrics[f.only])) return;
+    if (f.sec !== sec) {
+      sec = f.sec;
+      const tr = document.createElement("tr"), td = document.createElement("td");
+      td.className = "sec"; td.colSpan = rs.length + 1; td.textContent = sec; tr.appendChild(td); tbody.appendChild(tr);
+    }
+    const tr = document.createElement("tr"); tr.className = "item" + (i === cur ? " cur" : ""); tr.dataset.i = i;
+    const nm = document.createElement("td"); nm.className = "nm"; nm.textContent = f.name; tr.appendChild(nm);
+    const paths = familyPaths(f, rs);
+    // each run's place among the runs, on the row's main value: its difference from the baseline in
+    // paired standard errors, less the runs' mean of those
+    const main = rowPath(f);
+    const zs = rs.map(r => !base ? null : r === base ? (num(get(r, main)) ? 0 : null) : (zOf(r, base, main) || {}).z);
+    const known = zs.filter(num), mean = known.length ? known.reduce((a, b) => a + b) / known.length : 0;
+    rs.forEach((r, k) => {
+      const td = document.createElement("td"); td.className = "cell";
+      const shown = paths.map(p => ({ p, v: get(r, p), z: base && r !== base ? zOf(r, base, p) : null }));
+      td.style.background = num(zs[k]) && known.length > 1 ? cellColor(f, zs[k] - mean) : "var(--cell)";
+      td.addEventListener("pointermove", ev => {
+        const rows = (f.kind === "curve" ? shown.filter((x, k) => x.z && (Math.abs(x.z.z) > 2 || k % 4 === 0)).slice(0, 12) : shown).map(x => [color(r.id),
+          fmt(x.v) + (x.z ? `   ${x.z.d >= 0 ? "+" : "−"}${fmt(Math.abs(x.z.d))}` + (num(x.z.se) ? ` ±${fmt(2 * x.z.se)}` : "") : ""), pathName(f, x.p)]);
+        showTip(ev, `${f.name} · ${label(r)}`, rows);
+      });
+      td.addEventListener("pointerleave", hideTip);
+      tr.appendChild(td);
+    });
+    tr.onclick = () => { cur = i; draw(); };
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody); box.appendChild(table);
+}
+
+function step(dir) {
+  const v = [...document.querySelectorAll(".item")].map(it => +it.dataset.i); if (!v.length) return;
+  const k = v.indexOf(cur);
+  cur = v[k < 0 ? 0 : (k + dir + v.length) % v.length];
+  draw();
+  const it = document.querySelector(`.item[data-i="${cur}"]`); if (it) it.scrollIntoView({ block: "nearest" });
+}
+addEventListener("keydown", ev => {
+  if (ev.target instanceof HTMLInputElement || ev.target instanceof HTMLSelectElement) return;
+  if (ev.key === "ArrowDown" || ev.key === "ArrowRight") { step(1); ev.preventDefault(); }
+  if (ev.key === "ArrowUp" || ev.key === "ArrowLeft") { step(-1); ev.preventDefault(); }
+});
+
+function shown() {
+  const model = $("model").value, q = $("search").value.toLowerCase();
+  return runs.filter(r => (!model || r.model.name === model) && (!q || (r.config.name + " " + r.config.flags).toLowerCase().includes(q)));
+}
+function chips() {
+  const box = $("chips"); box.replaceChildren();
+  for (const r of shown().sort((a, b) => label(a) < label(b) ? -1 : 1)) {
+    const on = selected.includes(r.id);
+    const c = div("chip" + (on ? " on" : "") + (r.id === baseline ? " base" : ""));
+    const sw = div("sw"); if (on) sw.style.background = color(r.id);
+    c.append(sw, document.createTextNode(label(r)));
+    c.onclick = () => {
+      if (on) selected = selected.filter(i => i !== r.id);
+      else if (selected.length < SLOTS) selected.push(r.id);
+      update();
+    };
+    c.addEventListener("pointermove", ev => showTip(ev, label(r), [["transparent", r.config.flags, ""]]));
+    c.addEventListener("pointerleave", hideTip);
+    box.appendChild(c);
+  }
+}
+function baselineSelect() {
+  if (!selected.includes(baseline)) baseline = selected[0] ?? null;
+  const b = $("baseline"); b.replaceChildren();
+  for (const id of selected) { const r = byId(id); if (!r) continue; const o = document.createElement("option"); o.value = id; o.textContent = "baseline: " + label(r); b.appendChild(o); }
+  if (baseline) b.value = baseline;
+}
+
+async function fetchDiffs() {
+  const others = selected.filter(id => id !== baseline);
+  const key = baseline + "|" + others.join(",");
+  if (key === diffKey) return;
+  diffKey = key;
+  diffs = baseline && others.length
+    ? await (await fetch(`compare?base=${encodeURIComponent(baseline)}&ids=${others.map(encodeURIComponent).join(",")}`, { cache: "no-store" })).json()
+    : {};
+  list(); draw();
+}
+
+// a config value as the flags give it
+function configText(v) {
+  if (v == null) return "–";
+  if (typeof v === "object") return "full_probability" in v ? `${v.full_probability}:${v.fast_iterations}` : JSON.stringify(v);
+  return String(v);
+}
+
+function configTable() {
+  const t = $("config"); t.replaceChildren();
+  const rs = sel(); if (!rs.length) return;
+  const rows = [
+    ["model", r => r.model.name], ["net", r => r.model.net], ["checkpoint sha256", r => (r.model.sha256 || "").slice(0, 12)],
+    ...[...new Set(rs.flatMap(r => Object.keys(r.config.args)))].map(k => [k, r => r.config.args[k]]),
+    ["games", r => r.settings.games], ["openings", r => r.settings.openings], ["probe positions a phase", r => r.settings.probe_per_phase],
+    ["seed", r => r.settings.seed], ["commit", r => r.commit], ["device", r => r.device],
+  ].map(([k, f]) => { const vals = rs.map(r => configText(f(r))); return { k, vals, differs: new Set(vals).size > 1 }; });
+  // the items that differ first, each group in its own order
+  rows.sort((a, b) => b.differs - a.differs);
+  const head = document.createElement("tr"); head.appendChild(document.createElement("th"));
+  for (const r of rs) {
+    const th = document.createElement("th"); const i = document.createElement("i"); i.style.background = color(r.id);
+    const m = document.createElement("div"); m.textContent = r.model.name; m.style.color = "var(--text-muted)"; m.style.fontWeight = "400";
+    th.append(i, document.createTextNode(r.config.name), m); head.appendChild(th);
+  }
+  t.appendChild(head);
+  for (const row of rows) {
+    const tr = document.createElement("tr"); if (row.differs) tr.className = "differs";
+    const k = document.createElement("td"); k.className = "k"; k.textContent = row.k; tr.appendChild(k);
+    for (const v of row.vals) { const td = document.createElement("td"); td.textContent = v; tr.appendChild(td); }
+    t.appendChild(tr);
+  }
+}
+
+function update() { assignColors(); baselineSelect(); chips(); list(); draw(); configTable(); fetchDiffs(); }
+
+async function load() {
+  runs = await (await fetch("results.json", { cache: "no-store" })).json();
+  const models = [...new Set(runs.map(r => r.model.name))].sort();
+  const ms = $("model"), current = ms.value; ms.replaceChildren();
+  for (const [v, n] of [["", "all models"], ...models.map(m => [m, m])]) { const o = document.createElement("option"); o.value = v; o.textContent = n; ms.appendChild(o); }
+  ms.value = current;
+  selected = selected.filter(id => runs.some(r => r.id === id));
+  if (!selected.length) selected = runs.slice().sort((a, b) => a.created < b.created ? 1 : -1).slice(0, 4).map(r => r.id);
+  diffKey = "";
+  update();
+}
+
+$("model").onchange = chips;
+$("search").oninput = chips;
+$("baseline").onchange = () => { baseline = $("baseline").value; update(); };
+addEventListener("resize", draw);
+load();
+</script>
+</body>
+</html>

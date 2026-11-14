@@ -24,6 +24,7 @@ engines, chiefly [Edax](https://github.com/abulmo/edax-reversi) and
 | `engine_set.py`, `label_positions.py`, `score_engine_set.py` | The engine-labelled set: fixed positions with every legal move scored by Edax, to build, and to score checkpoints on (train.py scores the network on it every epoch) |
 | `distill.py` | Trains a network on a saved training state's replay buffer or a dataset, with no self-play, on a teacher network's values or the games' outcomes |
 | `teacher_dataset.py` | A dataset of whole self-play games from the moves a run kept (`--log-moves`), labelled with exact endgame results |
+| `selfplay_health.py`, `selfplay_health.html` | How healthy a network's self-play data is under a self-play config (train.py's flags): its targets on fixed Edax-labelled positions, its games' variety and outcomes, its cost; and a dashboard comparing runs |
 | `bench_nets.py` | Times networks on their own: a forward pass at self-play's batch, a training step at training's |
 | `game.py` | What the scripts share: the environment, board symmetries, network, evaluators |
 | `xot.py`, `xot-openings.txt` | The XOT opening list |
@@ -487,6 +488,37 @@ per position, game by game (see `COLUMNS` in `teacher_dataset.py`), so a later r
 a deeper search of some positions) is another column beside them. `distill.py train --data DATASET
 --heldout DATASET` trains on its training games' full searches and measures on its held-out ones;
 `--all-positions`, `--min-empties` and `--max-empties` change which positions.
+
+### Self-play health
+
+`selfplay_health.py` measures what a network's self-play would train on under a config of
+train.py's self-play flags, without training: about a minute a config for a 4x64 on the 5080.
+
+```bash
+uv run --extra cuda examples/othello/selfplay_health.py run --ckpt CKPT.eqx --net NET \
+    --config "511/127=--sims 511 --playout-cap 0.25:127 --solve-empties 20 --solve-play-past 3.5" \
+    --config "255/63=--sims 255 --playout-cap 0.25:63 --solve-empties 20 --solve-play-past 3.5"
+uv run examples/othello/selfplay_health.py serve --port 8061
+```
+
+Two passes a config, both built from train.py's own self-play code (`make_selfplay`):
+- probe: the engine-labelled set's positions with 21-51 empties (up to 1024 each of opening 40-52,
+  midgame 30-39 and late 21-29), each searched afresh by the full search, the same without root
+  noise, and the playout cap's fast search, beside the raw network: the policies' entropy, Edax
+  regret and top-move agreement, the values' MSE, correlation and sign agreement with Edax's
+  predicted result, and how often the noise changes the top move.
+- self-play: 2048 games (1024 at a time) from 64 fixed XOT openings, each environment's first game,
+  every move kept, the stopped games solved exactly. The stored targets' entropy, KL from the prior
+  and how often they change its top move; duplicate positions; distinct positions among 16 games
+  from one opening at each ply, and the moves two such games share; the stored root values against
+  the exact results; draws, the opening mover's score; moves, training positions and distinct
+  training positions a second (the first, compiling call untimed).
+
+Each (model, config) is a JSON file in ~/.cache/turbozero/othello/selfplay-health, with every
+metric's bootstrap standard error (probe positions resampled, or openings with all their games),
+and an .npz of the metrics' inputs beside it, so that two runs compare paired: the same positions
+and openings, resampled alike. `serve` shows them all: up to 8 runs at a time, each metric's plot
+in turn (arrow keys), and each run's difference from a baseline run with ±2 standard errors.
 
 ### The run controller
 
