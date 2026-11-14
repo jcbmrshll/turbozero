@@ -8,6 +8,39 @@ from core.types import StepMetadata
 
 
 @dataclass(frozen=True)
+class MoveTemperature:
+    """A temperature for the move played that decays through the game, as KataGo's self-play
+    (`chosenMoveTemperatureEarly` 0.75, `chosenMoveTemperature` 0.15 and
+    `chosenMoveTemperatureHalflife` 19 moves on 19x19): `late + (early - late) * 0.5 ** (moves /
+    halflife)`, where `moves` counts from `start`. It never reaches 0, so every move is sampled.
+
+    Attributes:
+        early: the temperature at `start`
+        late: the temperature it decays towards
+        halflife: moves over which its distance from `late` halves
+        start: the move it starts decaying from (`early` before it); moves count as
+            `StepMetadata.step` does, e.g. from the standard start including an opening's moves
+    """
+
+    early: float = 0.75
+    late: float = 0.15
+    halflife: float = 8.0
+    start: int = 0
+
+    def __post_init__(self):
+        if not (0 < self.late <= self.early and self.halflife > 0 and self.start >= 0):
+            raise ValueError(
+                "MoveTemperature needs 0 < late <= early, a positive halflife and start "
+                f"at least 0, got {self}"
+            )
+
+    def at(self, step: jax.Array) -> jax.Array:
+        """The temperature at move `step`."""
+        moves = jnp.maximum(step - self.start, 0)
+        return self.late + (self.early - self.late) * 0.5 ** (moves / self.halflife)
+
+
+@dataclass(frozen=True)
 class Exploration:
     """Chooses the move data collection actually plays, given the evaluator's output.
 
@@ -31,14 +64,24 @@ class Exploration:
             Dirichlet noise: this is epsilon-greedy exploration on top. Keeps collection visiting
             positions a sharpened policy never reaches on its own (e.g. after an opponent's
             blunder), at the cost of value targets that partly reflect the random moves.
+        temperature: instead of `num_sampling_moves`' schedule, sample every move from the
+            policy weights raised to 1 / `temperature.at(step)` (see `MoveTemperature`): KataGo's
+            schedule, sharpening through the game without ever turning greedy. The policy weights
+            are the evaluator's target (for MCTS by default the root's visits), whatever move it
+            chose itself.
 
-    Both are applied with traced arithmetic, so a schedule or adaptive controller can later
+    All are applied with traced arithmetic, so a schedule or adaptive controller can later
     pass them in as traced values. Changing the attributes of a `Trainer`'s instance between
     epochs has no effect: its data collection is compiled once, with these values baked in.
     """
 
     num_sampling_moves: int | None = None
     random_move_prob: float = 0.0
+    temperature: MoveTemperature | None = None
+
+    def __post_init__(self):
+        if self.temperature is not None and self.num_sampling_moves is not None:
+            raise ValueError("pass num_sampling_moves or temperature, not both")
 
     def choose_action(
         self, key: jax.Array, output: EvalOutput, metadata: StepMetadata
@@ -57,6 +100,19 @@ class Exploration:
         greedy_key, random_key, explore_key = jax.random.split(key, 3)
         mask = metadata.action_mask
         action = output.action
+        if self.temperature is not None:
+            temperature = self.temperature.at(metadata.step)
+            # in logs, so that a sharp temperature doesn't underflow the small weights to 0
+            logits = jnp.where(
+                mask & (output.policy_weights > 0),
+                jnp.log(jnp.maximum(output.policy_weights, 1e-30)) / temperature,
+                -jnp.inf,
+            )
+            # all-zero weights over the legal moves (no visits): uniform over them
+            logits = jnp.where(
+                jnp.isneginf(logits).all(), jnp.where(mask, 0.0, -jnp.inf), logits
+            )
+            action = jax.random.categorical(greedy_key, logits)
         if self.num_sampling_moves is not None:
             weights = jnp.where(mask, output.policy_weights, -jnp.inf)
             best = mask & (weights == weights.max())
@@ -73,4 +129,12 @@ class Exploration:
         return {
             "num_sampling_moves": self.num_sampling_moves,
             "random_move_prob": self.random_move_prob,
+            "temperature": None
+            if self.temperature is None
+            else {
+                "early": self.temperature.early,
+                "late": self.temperature.late,
+                "halflife": self.temperature.halflife,
+                "start": self.temperature.start,
+            },
         }

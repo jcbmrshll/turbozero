@@ -10,7 +10,7 @@ import pytest
 
 from core.common import step_env_and_evaluator
 from core.evaluators.evaluator import EvalOutput
-from core.training.exploration import Exploration
+from core.training.exploration import Exploration, MoveTemperature
 from core.types import StepMetadata
 
 NUM_SAMPLES = 4000
@@ -146,3 +146,61 @@ def test_collect_stores_the_evaluators_policy_not_the_move_played(
     buffer = collect(num_steps=4).buffer_state.buffer
 
     np.testing.assert_array_equal(buffer.policy_weights[0, :4], [[1, 0, 0]] * 4)
+
+
+def test_move_temperature_decays_from_early_towards_late():
+    schedule = MoveTemperature(early=0.75, late=0.15, halflife=8, start=8)
+
+    temperatures = [float(schedule.at(jnp.array(step))) for step in (0, 8, 16, 24, 200)]
+
+    assert temperatures[:4] == pytest.approx([0.75, 0.75, 0.45, 0.3])
+    assert temperatures[4] == pytest.approx(0.15, abs=1e-6)
+
+
+@pytest.mark.parametrize("kwargs", [{"late": 0.0}, {"late": 1.0}, {"halflife": 0}])
+def test_move_temperature_rejects_bad_settings(kwargs):
+    with pytest.raises(ValueError):
+        MoveTemperature(**kwargs)
+
+
+def test_move_temperature_samples_the_sharpened_weights_whatever_the_evaluators_move():
+    # at temperature 0.5 the weights [0.6, 0.0, 0.4, 0.3] (move 3 illegal) become 0.36 : 0.16
+    output = eval_output(1, [0.6, 0.0, 0.4, 0.3])
+    temperature = MoveTemperature(early=0.5, late=0.5)
+
+    actions = choose(
+        Exploration(temperature=temperature), output, step_metadata([1, 1, 1, 0])
+    )
+
+    counts = np.bincount(actions, minlength=4) / NUM_SAMPLES
+    np.testing.assert_allclose(counts, [0.36 / 0.52, 0, 0.16 / 0.52, 0], atol=0.03)
+
+
+def test_move_temperature_never_turns_greedy():
+    # late in the game, at 0.15, a move with half the best's weight is still played sometimes
+    output = eval_output(0, [0.5, 0.25, 0.25])
+
+    actions = choose(
+        Exploration(temperature=MoveTemperature()),
+        output,
+        step_metadata([1, 1, 1], step=200),
+    )
+
+    # 0.5 ** (1 / 0.15) = 0.0098 of the best's weight, each
+    assert (actions != 0).mean() == pytest.approx(2 * 0.0098 / 1.0196, abs=0.006)
+    assert (actions != 0).any()
+
+
+def test_move_temperature_with_no_weights_plays_uniformly_among_legal_moves():
+    output = eval_output(0, [0.0, 0.0, 0.0])
+
+    actions = choose(
+        Exploration(temperature=MoveTemperature()), output, step_metadata([1, 0, 1])
+    )
+
+    assert set(actions.tolist()) == {0, 2}
+
+
+def test_sampling_moves_and_a_move_temperature_dont_go_together():
+    with pytest.raises(ValueError):
+        Exploration(num_sampling_moves=20, temperature=MoveTemperature())

@@ -2,6 +2,7 @@ import jax
 import jax.numpy as jnp
 from jax.typing import ArrayLike
 
+from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.mcts.state import MCTSTree
 
 
@@ -78,6 +79,75 @@ class VisitCounts(PolicyTarget):
         n = tree.get_child_data("n", tree.ROOT_INDEX)
         total = n.sum(axis=-1)
         return jnp.where(total > 0, n / jnp.maximum(total, 1), 1 / n.shape[-1])
+
+
+class PrunedVisitCounts(PolicyTarget):
+    """The root's visit distribution with the visits the search's root noise forced pruned:
+    KataGo's policy target pruning (Wu 2019, https://arxiv.org/abs/1902.10565, section 3.2), with
+    the network's prior before the noise in place of the noised prior KataGo's forced playouts are
+    measured against.
+
+    The most visited child c* keeps its visits. From each other child c, visits are taken away as
+    long as that leaves `PUCT(c) < PUCT(c*)`, both by the search's own selection rule (`selector`'s
+    PUCT at the root's final visits) with the noise-free prior: a child the clean prior would have
+    stopped visiting sooner keeps only the visits it would have had. Children cut to a single
+    visit are dropped. The search, and the move played from its visits, are unchanged: only the
+    target is, so root noise steers which moves are explored without being trained towards.
+
+    Without noise a search's visits already balance its PUCT values, and little is pruned. Unlike
+    KataGo, there's no cap on what's taken from a child (KataGo's forced playouts,
+    sqrt(2 P(c) N)): the clean prior is the bound instead. A child whose value fell after its visits
+    may lose some of them too.
+    """
+
+    def __init__(self, selector: PUCTSelector, prior_temperature: float = 1.0):
+        """Initializes a PrunedVisitCounts policy target.
+
+        Args:
+            selector: the search's action selector at the root, whose PUCT the visits are
+                measured against
+            prior_temperature: the search's prior temperature (see `MCTS`), the softmax
+                temperature of the root's noise-free prior
+        """
+        self.selector = selector
+        self.prior_temperature = prior_temperature
+
+    def get_config(self) -> dict:
+        return {
+            "selector": self.selector.get_config(),
+            "prior_temperature": self.prior_temperature,
+            **super().get_config(),
+        }
+
+    def __call__(self, tree: MCTSTree, discount: float) -> jax.Array:
+        root = tree.data_at(tree.ROOT_INDEX)
+        n = tree.get_child_data("n", tree.ROOT_INDEX)
+        # the children's values for the root's player, as the selector sees them
+        q = tree.get_child_data("q", tree.ROOT_INDEX) * discount
+        q = self.selector.q_transform(q, n, root.q, self.selector.epsilon)
+        # the network's prior, before the root's noise; illegal actions' logits are the lowest float
+        logits = tree.root_logits
+        legal = logits > jnp.finfo(logits.dtype).min
+        prior = jax.nn.softmax(
+            jnp.where(
+                legal, logits / self.prior_temperature, jnp.finfo(logits.dtype).min
+            )
+        )
+        c = self.selector.c_init + jnp.log(
+            (root.n + self.selector.c_base + 1) / self.selector.c_base
+        )
+        # PUCT(c, k) = q + exploration / (k + 1)
+        exploration = c * prior * jnp.sqrt(root.n)
+        best = jnp.argmax(n, axis=-1)
+        best_puct = q[best] + exploration[best] / (n[best] + 1)
+        gap = best_puct - q
+        # the fewest visits k with q + exploration / (k + 1) < best_puct: k + 1 > exploration / gap
+        fewest = jnp.floor(exploration / jnp.where(gap > 0, gap, 1.0))
+        kept = jnp.where(gap > 0, jnp.minimum(n, fewest), n)
+        kept = jnp.where((kept <= 1) & (kept < n), 0, kept)
+        kept = jnp.where(jnp.arange(n.shape[-1]) == best, n, kept)
+        total = kept.sum(axis=-1)
+        return jnp.where(total > 0, kept / jnp.maximum(total, 1), 1 / n.shape[-1])
 
 
 class CompletedQ(PolicyTarget):

@@ -14,7 +14,7 @@ import pytest
 from core.evaluators.alphazero import AlphaZero
 from core.evaluators.mcts.action_selection import MCTSActionSelector, PUCTSelector
 from core.evaluators.mcts.mcts import MCTS, PlayoutCap
-from core.evaluators.mcts.policy_targets import CompletedQ
+from core.evaluators.mcts.policy_targets import CompletedQ, PrunedVisitCounts
 from core.evaluators.mcts.weighted_mcts import WeightedMCTS, WeightedMCTSNode
 
 AZ_MCTS = AlphaZero(MCTS)
@@ -1301,3 +1301,39 @@ def test_mean_iterations_mixes_full_and_fast_searches():
 def test_a_playout_cap_must_be_a_probability_and_fewer_iterations(cap):
     with pytest.raises(ValueError, match="playout cap"):
         make_mcts(num_iterations=5, playout_cap=cap)
+
+
+def center_eval_fn(state, params, key):  # pylint: disable=unused-argument
+    """A policy that strongly prefers tic-tac-toe's center, and a value of 0."""
+    return jnp.zeros((9,)).at[4].set(3.0), jnp.array(0.0)
+
+
+def test_pruned_targets_take_back_what_root_noise_forced(make_search, ttt):
+    """Pruning moves a noisy search's target towards the noise-free search's, and leaves a
+    noise-free search's target nearly as it is."""
+    pruned = PrunedVisitCounts(PUCTSelector())
+
+    def targets(epsilon):
+        search = make_search(
+            eval_fn=center_eval_fn,
+            num_iterations=64,
+            max_nodes=160,
+            dirichlet_epsilon=epsilon,
+        )
+        raw, cut = [], []
+        for seed in range(8):
+            out, _ = run_search(search, jax.random.PRNGKey(seed), [], ttt)
+            raw.append(np.asarray(out.policy_weights))
+            cut.append(np.asarray(pruned(out.eval_state, search.evaluator.discount)))
+        return np.array(raw), np.array(cut)
+
+    clean, clean_pruned = targets(0.0)
+    noisy, noisy_pruned = targets(0.75)
+
+    # the noise-free search puts nearly everything on the center; noise moves visits off it, which
+    # pruning takes back, except where noise made another move the most visited (kept, as KataGo's)
+    assert clean[:, 4].mean() > 0.95
+    assert np.abs(clean_pruned - clean).sum(axis=-1).max() < 0.05
+    assert noisy_pruned[:, 4].mean() > noisy[:, 4].mean() + 0.1
+    led = noisy.argmax(axis=-1) == 4
+    assert led.any() and (noisy_pruned[led, 4] > 0.95).all()
