@@ -77,13 +77,17 @@ from core.evaluators.evaluation_fns import (
 )
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.mcts.mcts import MCTS, PlayoutCap
-from core.evaluators.mcts.policy_targets import CompletedQ, VisitCounts
+from core.evaluators.mcts.policy_targets import (
+    CompletedQ,
+    PrunedVisitCounts,
+    VisitCounts,
+)
 from core.memory.replay_memory import EpisodeReplayBuffer
 from core.monitoring import DEFAULT_URL, Monitor
 from core.testing.scored_positions import ScoredPositionsTester
 from core.testing.tester import BaseTester
 from core.training.endgame_solve import EndgameSolve
-from core.training.exploration import Exploration
+from core.training.exploration import Exploration, MoveTemperature
 from core.training.growth import Growth, Learner
 from core.training.loss_fns import az_default_loss_fn
 from core.training.lr_drop import LRDrop
@@ -192,6 +196,21 @@ def playout_cap(text: str) -> PlayoutCap:
             f"{text!r}: the probability is in (0, 1], the fast sims positive"
         )
     return cap
+
+
+def move_temperature(text: str) -> MoveTemperature:
+    """Parses --move-temperature, EARLY:LATE:HALFLIFE[:START], e.g. 0.75:0.15:8:8."""
+    try:
+        parts = text.split(":")
+        if len(parts) not in (3, 4):
+            raise ValueError
+        start = int(parts[3]) if len(parts) == 4 else 0
+        return MoveTemperature(float(parts[0]), float(parts[1]), float(parts[2]), start)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{text!r}: expected EARLY:LATE:HALFLIFE[:START], 0 < LATE <= EARLY, a positive "
+            "HALFLIFE, e.g. 0.75:0.15:8:8"
+        ) from None
 
 
 def load_engine_set(
@@ -418,6 +437,17 @@ def make_parser() -> argparse.ArgumentParser:
         "moves of a game, then plays the most-visited move, as AlphaZero (30) and "
         "OLIVAW (20) did. N counts from the standard start, so it includes an XOT "
         "opening's 8 moves. 0 samples none; one past a game's length, every move",
+    )
+    parser.add_argument(
+        "--move-temperature",
+        type=move_temperature,
+        default=None,
+        metavar="EARLY:LATE:HALFLIFE[:START]",
+        help="instead of --sampling-moves, KataGo's schedule: sample every self-play move from "
+        "the visit counts at a temperature decaying from EARLY towards LATE, halving its distance "
+        "every HALFLIFE moves from move START (default 0; moves count from the standard start, "
+        "as --sampling-moves'), never fully greedy, e.g. 0.75:0.15:8:8 (KataGo's 0.75 and 0.15, "
+        "its 19 moves on 19x19 scaled to an 8x8 board, from the first move after an XOT opening)",
     )
     parser.add_argument(
         "--dirichlet-alpha",
@@ -686,10 +716,12 @@ def make_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--policy-target",
-        choices=["visits", "completed-q"],
+        choices=["visits", "pruned-visits", "completed-q"],
         default="visits",
         help="train the policy of played positions on the search's visit distribution "
-        "(the default, as AlphaZero), or on Gumbel MuZero's improved policy: the "
+        "(the default, as AlphaZero); on it with the visits root noise forced taken back "
+        "(pruned-visits: KataGo's policy target pruning against the network's prior before "
+        "the noise; the moves played are unchanged); or on Gumbel MuZero's improved policy: the "
         "network's policy at the root, before the root's noise, shifted towards the "
         "children the search found better (see core/evaluators/mcts/policy_targets.py)",
     )
@@ -965,6 +997,10 @@ def check_selfplay_args(
         parser.error("--dirichlet-alpha must be positive")
     if not 0 <= args.dirichlet_epsilon <= 1:
         parser.error("--dirichlet-epsilon must be between 0 and 1")
+    if args.move_temperature is not None and args.sampling_moves != parser.get_default(
+        "sampling_moves"
+    ):
+        parser.error("--move-temperature replaces --sampling-moves: pass one")
     if args.policy_target == "completed-q" and args.tree_positions > 0:
         # a tree position's target is its visits: the network's policy before the
         # search isn't kept below the root
@@ -973,7 +1009,10 @@ def check_selfplay_args(
 
 
 def make_exploration(args: argparse.Namespace) -> Exploration:
-    """How self-play chooses the move to play from a search (see --sampling-moves)."""
+    """How self-play chooses the move to play from a search (see --sampling-moves and
+    --move-temperature)."""
+    if args.move_temperature is not None:
+        return Exploration(temperature=args.move_temperature)
     return Exploration(num_sampling_moves=args.sampling_moves)
 
 
@@ -984,6 +1023,12 @@ def make_selfplay(network, args: argparse.Namespace) -> EvaluatorSchedule:
     takes over at its epoch, starting from empty trees sized for it (see
     core.training.schedule)"""
     selfplay_eval_fn = make_nn_eval_fn(network, state_to_nn_input)
+    selector = PUCTSelector()
+    policy_target = {
+        "visits": VisitCounts(),
+        "pruned-visits": PrunedVisitCounts(selector),
+        "completed-q": CompletedQ(args.value_scale, args.maxvisit_init),
+    }[args.policy_target]
     return EvaluatorSchedule(
         [
             (
@@ -997,7 +1042,7 @@ def make_selfplay(network, args: argparse.Namespace) -> EvaluatorSchedule:
                     if args.count_reused_visits
                     else int(args.tree_factor * sims),
                     branching_factor=env.num_actions,
-                    action_selector=PUCTSelector(),
+                    action_selector=selector,
                     temperature=1.0,
                     dirichlet_alpha=args.dirichlet_alpha,
                     dirichlet_epsilon=args.dirichlet_epsilon,
@@ -1005,9 +1050,7 @@ def make_selfplay(network, args: argparse.Namespace) -> EvaluatorSchedule:
                     count_reused_visits=args.count_reused_visits,
                     min_iterations=args.min_iterations,
                     traversal_steps=args.traversal_steps,
-                    policy_target=CompletedQ(args.value_scale, args.maxvisit_init)
-                    if args.policy_target == "completed-q"
-                    else VisitCounts(),
+                    policy_target=policy_target,
                     playout_cap=args.playout_cap,
                 ),
             )
@@ -1307,7 +1350,7 @@ def main():
         # every argument but how the run starts (a fork or branch records its parent)
         extra_config={
             "args": {
-                k: v.get_config() if isinstance(v, PlayoutCap) else v
+                k: v.get_config() if isinstance(v, PlayoutCap | MoveTemperature) else v
                 for k, v in vars(args).items()
                 if k
                 not in (

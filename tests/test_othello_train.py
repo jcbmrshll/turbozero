@@ -574,3 +574,51 @@ def test_a_fixed_network_can_play_and_keep_its_moves(monkeypatch, tmp_path):
         )
     assert built.value.kwargs["train_steps_per_epoch"] == 0
     assert built.value.kwargs["log_moves"] == str(tmp_path / "moves")
+
+
+def test_sampling_moves_choose_the_move_played_by_default(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, "--sampling-moves", "30")
+    exploration = built.value.kwargs["exploration"]
+    assert exploration.num_sampling_moves == 30
+    assert exploration.temperature is None
+
+
+def test_move_temperature_replaces_sampling_moves(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, "--move-temperature", "0.75:0.15:8:8")
+    exploration = built.value.kwargs["exploration"]
+    assert exploration.num_sampling_moves is None
+    assert exploration.temperature == train.MoveTemperature(0.75, 0.15, 8.0, 8)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ("--move-temperature", "0.75:0.15"),
+        ("--move-temperature", "0.15:0.75:8"),
+        ("--move-temperature", "0.75:0.15:0"),
+        ("--move-temperature", "0.75:0.15:8", "--sampling-moves", "30"),
+    ],
+)
+def test_bad_move_temperatures_are_refused(monkeypatch, options):
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, *options)
+
+
+@pytest.mark.parametrize(
+    "choice, target",
+    [
+        ("visits", "VisitCounts"),
+        ("pruned-visits", "PrunedVisitCounts"),
+        ("completed-q", "CompletedQ"),
+    ],
+)
+def test_policy_target_reaches_self_play(monkeypatch, choice, target):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, "--policy-target", choice)
+    evaluator = built.value.kwargs["evaluator"].at(0)
+    assert type(evaluator.policy_target).__name__ == target
+    if choice == "pruned-visits":
+        # measured against the search's own selection rule
+        assert evaluator.policy_target.selector is evaluator.action_selector

@@ -90,6 +90,7 @@ SELFPLAY_ARGS = (
     "min_iterations",
     "advance_every",
     "sampling_moves",
+    "move_temperature",
     "dirichlet_alpha",
     "dirichlet_epsilon",
     "resign",
@@ -822,7 +823,9 @@ def selfplay_metrics(
             ),
             **stats.value(prefix, opening[both], value[both], z[both], name="stored_"),
         }
-    sampled = (action >= 0) & (moves["ply"] < args.sampling_moves)
+    # the moves sampled rather than played greedily: with a move temperature, all of them
+    sample_until = 60 if args.move_temperature is not None else args.sampling_moves
+    sampled = (action >= 0) & (moves["ply"] < sample_until)
     first_z = z[starts]
     solved = ~np.isnan(first_z)
     by_opening: dict[int, list[float]] = {}
@@ -854,7 +857,7 @@ def selfplay_metrics(
             ends,
             game_opening,
             games_per_opening,
-            max(args.sampling_moves - 8, 1),
+            max(sample_until - 8, 1),
         ),
         "off_target_sampled": stats.mean(
             "selfplay.off_target_sampled",

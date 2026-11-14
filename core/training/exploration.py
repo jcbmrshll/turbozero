@@ -39,6 +39,15 @@ class MoveTemperature:
         moves = jnp.maximum(step - self.start, 0)
         return self.late + (self.early - self.late) * 0.5 ** (moves / self.halflife)
 
+    def get_config(self) -> dict:
+        """Returns the schedule's settings. Used for logging."""
+        return {
+            "early": self.early,
+            "late": self.late,
+            "halflife": self.halflife,
+            "start": self.start,
+        }
+
 
 @dataclass(frozen=True)
 class Exploration:
@@ -131,10 +140,5 @@ class Exploration:
             "random_move_prob": self.random_move_prob,
             "temperature": None
             if self.temperature is None
-            else {
-                "early": self.temperature.early,
-                "late": self.temperature.late,
-                "halflife": self.temperature.halflife,
-                "start": self.temperature.start,
-            },
+            else self.temperature.get_config(),
         }
