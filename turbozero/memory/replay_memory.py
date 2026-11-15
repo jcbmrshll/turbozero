@@ -102,12 +102,6 @@ class EpisodeReplayBuffer:
         """
         self.capacity = capacity
 
-    def get_config(self):
-        """Returns the configuration of the replay buffer. Used for logging."""
-        return {
-            "capacity": self.capacity,
-        }
-
     def add_experience(
         self,
         state: ReplayBufferState,
@@ -249,40 +243,13 @@ class EpisodeReplayBuffer:
         """
         return jnp.logical_and(state.populated, state.has_reward)
 
-    def check_can_sample(self, state: ReplayBufferState, sample_size: int = 1) -> None:
-        """Checks on the host that an episode has finished, and that there are at least
-        `sample_size` entries to sample.
-
-        Not compatible with `jax.jit`: `state` must hold concrete arrays.
-
-        Args:
-            state: replay buffer state
-            sample_size: entries a sample takes
-
-        Raises:
-            ValueError: if no episode has finished yet, or fewer than `sample_size` entries can be
-                sampled
-        """
-        if not self.sample_mask(state).any():
-            raise ValueError(
-                "Cannot sample from the replay buffer: no episodes have finished yet. "
-                "Collect more self-play steps before training (e.g. increase `warmup_steps`)."
-            )
-        count = int(self.sample_mask(state).sum())
-        if count < sample_size:
-            raise ValueError(
-                f"Cannot sample {sample_size} entries from the replay buffer: only {count} can be "
-                "sampled. Collect more self-play steps before training (e.g. increase "
-                "`warmup_steps`), or sample fewer."
-            )
-
     def sample_indices(
         self, key: jax.Array, mask: jax.Array, sample_size: int, replace: bool = False
     ) -> jax.Array:
         """Samples entries uniformly (by default without replacement) from those marked in `mask`.
 
         Compatible with `jax.jit`. Without replacement, `mask` must mark at least `sample_size` entries,
-        else unmarked ones fill the rest of the sample; use `check_can_sample` to check.
+        else unmarked ones fill the rest of the sample.
 
         Args:
             key: rng
@@ -297,38 +264,6 @@ class EpisodeReplayBuffer:
         return jax.random.choice(
             key, mask.size, shape=(sample_size,), replace=replace, p=mask / mask.sum()
         )
-
-    def sample(
-        self,
-        state: ReplayBufferState,
-        key: jax.Array,
-        sample_size: int,
-    ) -> BaseExperience:
-        """Samples experiences from the replay buffer.
-
-        The buffer may have any number of batch dimensions, e.g. (batch_size, capacity, ...);
-        samples are drawn across all of them, not per batch.
-
-        Not compatible with `jax.jit`: checks on the host that there are enough entries to sample
-        (see `check_can_sample`). Use `sample_mask` and `sample_indices` to sample under `jax.jit`.
-
-        Args:
-            state: replay buffer state
-            key: rng
-            sample_size: size of minibatch to sample
-
-        Returns:
-            BaseExperience: minibatch of size (sample_size, ...)
-
-        Raises:
-            ValueError: if fewer than `sample_size` entries can be sampled
-        """
-        self.check_can_sample(state, sample_size)
-        mask = self.sample_mask(state)
-        indices = jnp.unravel_index(
-            self.sample_indices(key, mask, sample_size), mask.shape
-        )
-        return jax.tree_util.tree_map(lambda x: x[indices], state.buffer)
 
     def count_distinct_observations(
         self,

@@ -3,7 +3,6 @@ from dataclasses import replace
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 
 from turbozero.memory.replay_memory import (
     BaseExperience,
@@ -145,7 +144,7 @@ def test_sample_indices_with_replacement_from_fewer_entries():
     np.testing.assert_array_equal(indices, [8 + 3] * 5)
 
 
-def test_sample_only_returns_finished_populated_entries():
+def test_sampling_draws_only_finished_populated_entries():
     buffer = EpisodeReplayBuffer(capacity=4)
     # two environments, as the trainer stores them (batch, capacity, ...)
     states = [init_single(buffer), init_single(buffer)]
@@ -161,18 +160,11 @@ def test_sample_only_returns_finished_populated_entries():
     states[1] = buffer.truncate(add(buffer, states[1], [5, 6]))
     state = jax.tree.map(lambda *x: jnp.stack(x), *states)
 
+    mask = buffer.sample_mask(state)
     for seed in range(10):
-        sample = buffer.sample(state, jax.random.PRNGKey(seed), 3)
-        assert sorted(sample.observation_nn.tolist()) == [1, 2, 4]
-
-
-def test_sample_before_any_episode_finished_raises():
-    buffer = EpisodeReplayBuffer(capacity=4)
-    state = add(buffer, init_single(buffer), [1, 2])
-    state = jax.tree.map(lambda x: x[None], state)
-
-    with pytest.raises(ValueError):
-        buffer.sample(state, jax.random.PRNGKey(0), 2)
+        indices = buffer.sample_indices(jax.random.PRNGKey(seed), mask, 3)
+        sample = state.buffer.observation_nn.reshape(-1)[indices]
+        assert sorted(sample.tolist()) == [1, 2, 4]
 
 
 def test_count_distinct_observations_counts_only_sampleable_experiences():
@@ -282,17 +274,3 @@ def test_transform_randomly_draws_a_transform_for_each_sample_uniformly():
     # without transforms, the experiences are left as they are
     same = transform_randomly(jax.random.PRNGKey(1), experiences, ())
     assert same is experiences
-
-
-def test_sample_needs_enough_finished_entries():
-    buffer = EpisodeReplayBuffer(capacity=8)
-    state = buffer.assign_rewards(
-        add(buffer, init_single(buffer), [1, 2, 3]), jnp.array([1.0, -1.0])
-    )
-    # an episode in progress can't be sampled
-    state = add(buffer, state, [4, 5])
-    state = jax.tree.map(lambda x: x[None], state)
-
-    assert buffer.sample(state, jax.random.PRNGKey(0), 3).observation_nn.shape == (3,)
-    with pytest.raises(ValueError, match="only 3 can be sampled"):
-        buffer.sample(state, jax.random.PRNGKey(0), 4)
