@@ -9,29 +9,24 @@ from jax.typing import ArrayLike
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class BaseExperience:
-    """Experience data structure. Stores a training sample.
-
-    Attributes:
-        reward: reward for each player in the episode this sample belongs to
-        policy_weights: policy weights
-        policy_mask: mask for policy weights (mask out invalid/illegal actions)
-        observation_nn: observation for neural network input
-        cur_player_id: current player id
-        search_value: the search's value of the position, for the player to move (for a position
-            played in self-play, the root value of the search that chose its move)
+    """A training sample: a position, its search's policy target and value, and
+    the result of the game it was played in.
     """
 
-    reward: jax.Array
-    policy_weights: jax.Array
-    policy_mask: jax.Array
-    observation_nn: jax.Array
-    cur_player_id: jax.Array
+    reward: jax.Array  # the game's reward for each player
+    policy_weights: jax.Array  # the search's policy target
+    policy_mask: jax.Array  # the legal actions
+    observation_nn: jax.Array  # the network's input
+    cur_player_id: jax.Array  # the player to move
+    # the search's value of the position, for the player to move (in self-play,
+    # the root value of the search that chose its move)
     search_value: jax.Array
 
 
-# a data transform (e.g. one of a board's symmetries): maps an experience, without batch
-# dimensions, to another as valid, e.g. the board rotated with its policy target and legal actions
-# to match. The value targets (`reward`, `search_value`) and `cur_player_id` stay as they are.
+# a data transform (e.g. one of a board's symmetries): maps an experience,
+# without batch dimensions, to another as valid, e.g. the board rotated with its
+# policy target and legal actions to match. The value targets (`reward`,
+# `search_value`) and `cur_player_id` stay as they are.
 DataTransformFn = Callable[[BaseExperience], BaseExperience]
 
 
@@ -40,16 +35,9 @@ def transform_randomly(
     experiences: BaseExperience,
     transform_fns: Sequence[DataTransformFn],
 ) -> BaseExperience:
-    """Maps each of a batch of experiences through a transform drawn uniformly at random, and
-    independently for each, from the identity and `transform_fns`.
-
-    Args:
-        key: rng
-        experiences: experiences, with a leading batch dimension
-        transform_fns: the transforms besides the identity (e.g. a board's other symmetries)
-
-    Returns:
-        BaseExperience: the transformed experiences
+    """Maps each of a batch of experiences through a transform drawn uniformly
+    at random, independently for each, from the identity and `transform_fns`
+    (e.g. a board's other symmetries).
     """
     if not transform_fns:
         return experiences
@@ -63,43 +51,25 @@ def transform_randomly(
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class ReplayBufferState:
-    """State of the replay buffer.
-
-    Stores objects stored in the buffer and metadata used to determine where to store
-    the next object, as well as which objects are valid to sample from.
-
-    Attributes:
-        next_idx: index where the next experience will be stored
-        episode_start_idx: index where the current episode started, samples are placed in order
-        buffer: buffer of experiences
-        populated: mask for populated buffer indices
-        has_reward: mask for buffer indices that have been assigned a reward
-            - we store samples from in-progress episodes, but don't want to be able to sample them
-              until the episode is complete
+    """A replay buffer's entries, written in order around a ring of `capacity`
+    places. The current episode's entries can't be sampled until it ends and
+    they get its reward.
     """
 
-    next_idx: jax.Array
-    episode_start_idx: jax.Array
-    buffer: BaseExperience
-    populated: jax.Array
-    has_reward: jax.Array
+    next_idx: jax.Array  # where the next entry goes
+    episode_start_idx: jax.Array  # where the current episode's entries start
+    buffer: BaseExperience  # leaves of shape (capacity, ...)
+    populated: jax.Array  # (capacity,) which places hold an entry
+    has_reward: jax.Array  # (capacity,) false for the current episode's entries
 
 
 class EpisodeReplayBuffer:
-    """Replay buffer, stores trajectories from episodes for training.
-
-    Compatible with `jax.jit` and `jax.vmap`.
+    """Stores self-play episodes' experiences for training, `capacity` per
+    environment, overwriting the oldest. Its methods take a single
+    environment's state, so self-play vmaps them over environments.
     """
 
-    def __init__(
-        self,
-        capacity: int,
-    ):
-        """Initializes an EpisodeReplayBuffer.
-
-        Args:
-            capacity: number of experiences to store in the buffer
-        """
+    def __init__(self, capacity: int):
         self.capacity = capacity
 
     def add_experience(
@@ -108,22 +78,15 @@ class EpisodeReplayBuffer:
         experience: BaseExperience,
         valid: ArrayLike = True,
     ) -> ReplayBufferState:
-        """Adds an experience to the replay buffer.
-
-        Args:
-            state: replay buffer state
-            experience: experience to add
-            valid: (optional) whether to add it: if not, the buffer is left as it is. Cheaper under
-                vmap than a lax.cond, which would select between two whole buffers
-
-        Returns:
-            ReplayBufferState: updated replay buffer state
+        """Adds an experience to the current episode. Nothing changes if not
+        `valid`, which is cheaper under vmap than a lax.cond: that would select
+        between two whole buffers.
         """
         # an out-of-bounds write is dropped
         index = jnp.where(valid, state.next_idx, self.capacity)
         return replace(
             state,
-            buffer=jax.tree_util.tree_map(
+            buffer=jax.tree.map(
                 lambda x, y: x.at[index].set(y, mode="drop"), state.buffer, experience
             ),
             next_idx=jnp.where(
@@ -136,25 +99,19 @@ class EpisodeReplayBuffer:
     def add_experiences(
         self, state: ReplayBufferState, experiences: BaseExperience, valid: jax.Array
     ) -> ReplayBufferState:
-        """Adds experiences whose targets are already known (e.g. positions from a search tree, see
-        `core.training.tree_positions`), which can be sampled right away.
-
-        Only the experiences marked in `valid` are added, in order, one after another. Keep them in a
-        buffer of their own: `truncate` would discard them along with an episode in progress.
+        """Adds the experiences marked in `valid`, in order, one after another,
+        ready to sample: their targets are already known (e.g. positions from a
+        search tree). Keep them in a buffer of their own, as `truncate` would
+        discard them along with an episode in progress.
 
         Args:
-            state: replay buffer state
-            experiences: experiences to add, with a leading dimension of at most `capacity`
-            valid: (num experiences,) which of them to add
-
-        Returns:
-            ReplayBufferState: updated replay buffer state
+            experiences: leading dimension of at most `capacity`
         """
         index = self.write_indices(state, valid)
         next_idx = (state.next_idx + valid.sum()) % self.capacity
         return replace(
             state,
-            buffer=jax.tree_util.tree_map(
+            buffer=jax.tree.map(
                 lambda x, y: x.at[index].set(y, mode="drop"), state.buffer, experiences
             ),
             next_idx=next_idx,
@@ -164,15 +121,8 @@ class EpisodeReplayBuffer:
         )
 
     def write_indices(self, state: ReplayBufferState, valid: jax.Array) -> jax.Array:
-        """Where `add_experiences` writes each of the experiences marked in `valid`.
-
-        Args:
-            state: replay buffer state
-            valid: which experiences are added
-
-        Returns:
-            jax.Array: each experience's index in the buffer; the buffer's capacity (out of
-                bounds) for those not added
+        """Where `add_experiences` writes each experience marked in `valid`;
+        `capacity` (out of bounds) for the others.
         """
         # the i-th valid experience goes i places after `next_idx`
         offsets = jnp.cumsum(valid) - 1
@@ -183,14 +133,8 @@ class EpisodeReplayBuffer:
     def assign_rewards(
         self, state: ReplayBufferState, reward: jax.Array
     ) -> ReplayBufferState:
-        """Assign rewards to the current episode.
-
-        Args:
-            state: replay buffer state
-            reward: rewards to assign (for each player)
-
-        Returns:
-            ReplayBufferState: updated replay buffer state
+        """Ends the current episode, giving its entries `reward` (one for each
+        player).
         """
         return replace(
             state,
@@ -204,24 +148,11 @@ class EpisodeReplayBuffer:
             ),
         )
 
-    def truncate(
-        self,
-        state: ReplayBufferState,
-    ) -> ReplayBufferState:
-        """Truncates the replay buffer, removing all experiences from the current episode.
-
-        Use this if we want to discard all experiences from the current episode.
-
-        Args:
-            state: replay buffer state
-
-        Returns:
-            ReplayBufferState: updated replay buffer state
+    def truncate(self, state: ReplayBufferState) -> ReplayBufferState:
+        """Ends the current episode, discarding its entries: they're left
+        unpopulated, so they can't be sampled, and the next episode writes over
+        them.
         """
-        # un-assigned trajectory indices have populated set to False
-        # so their buffer contents will be overwritten (eventually)
-        # and cannot be sampled
-        # so there's no need to overwrite them with zeros here
         return replace(
             state,
             next_idx=state.episode_start_idx,
@@ -230,35 +161,18 @@ class EpisodeReplayBuffer:
         )
 
     def sample_mask(self, state: ReplayBufferState) -> jax.Array:
-        """Marks the buffer entries that can be sampled: populated, and from a finished episode.
-
-        Compatible with `jax.jit`. Works with any number of batch dimensions in front of the
-        capacity dimension.
-
-        Args:
-            state: replay buffer state
-
-        Returns:
-            jax.Array: boolean mask, same shape as `state.populated`
+        """The entries that can be sampled: populated, from a finished episode.
+        Works with any batch dimensions in front of the capacity dimension.
         """
         return jnp.logical_and(state.populated, state.has_reward)
 
     def sample_indices(
         self, key: jax.Array, mask: jax.Array, sample_size: int, replace: bool = False
     ) -> jax.Array:
-        """Samples entries uniformly (by default without replacement) from those marked in `mask`.
-
-        Compatible with `jax.jit`. Without replacement, `mask` must mark at least `sample_size` entries,
-        else unmarked ones fill the rest of the sample.
-
-        Args:
-            key: rng
-            mask: mask of entries that can be sampled (see `sample_mask`), any shape
-            sample_size: number of entries to sample
-            replace: sample with replacement instead (default: False)
-
-        Returns:
-            jax.Array: indices into the flattened `mask`, shape (sample_size,)
+        """(sample_size,) indices into the flattened `mask`, drawn uniformly
+        from the entries it marks (see `sample_mask`). Without `replace`, `mask`
+        must mark at least `sample_size` entries, else unmarked ones fill the
+        rest of the sample.
         """
         mask = mask.reshape(-1)
         return jax.random.choice(
@@ -270,22 +184,16 @@ class EpisodeReplayBuffer:
         state: ReplayBufferState,
         transform_fns: Sequence[DataTransformFn] = (),
     ) -> tuple[jax.Array, jax.Array]:
-        """Counts the experiences that can be sampled, and how many distinct observations they hold.
+        """(distinct observations, experiences) among the experiences that can
+        be sampled: a measure of how varied the replay data is. Works with any
+        batch dimensions in front of the capacity dimension.
 
-        A measure of how varied the replay data is. Observations are compared by a 64-bit hash
-        of their contents, so collisions are possible but vanishingly rare at buffer sizes.
-        With `transform_fns` (e.g. a board's symmetries, which training applies to sampled
-        experiences), observations that one maps to another count as one: each is compared by
-        the least hash of its images under the identity and the transforms, which must be a
-        group (as a board's symmetries are). Works with any number of batch dimensions in front
-        of the capacity dimension.
-
-        Args:
-            state: replay buffer state
-            transform_fns: (optional) the transforms besides the identity
-
-        Returns:
-            Tuple[jax.Array, jax.Array]: (number of distinct observations, number of experiences)
+        Observations are compared by a 64-bit hash of their contents, so
+        collisions are possible but vanishingly rare at buffer sizes. With
+        `transform_fns` (e.g. a board's symmetries, which training applies to
+        sampled experiences), observations that one maps to another count as
+        one: each is compared by the least hash of its images under the identity
+        and the transforms, which must be a group (as a board's symmetries are).
         """
         valid = self.sample_mask(state).reshape(-1)
         experiences = jax.tree.map(
@@ -303,8 +211,9 @@ class EpisodeReplayBuffer:
             position = jnp.arange(1, bits.shape[1] + 1, dtype=jnp.uint32)
 
             def hash_rows(seed: int) -> jax.Array:
-                # mix each element with a constant for its position (murmur3's finalizer),
-                # then sum (mod 2^32), so the hash depends on every element and where it is
+                # mix each element with a constant for its position (murmur3's
+                # finalizer), then sum (mod 2^32), so the hash depends on every
+                # element and where it is
                 h = bits ^ (position * jnp.uint32(0x9E3779B9) + jnp.uint32(seed))
                 h = (h ^ (h >> 16)) * jnp.uint32(0x85EBCA6B)
                 h = (h ^ (h >> 13)) * jnp.uint32(0xC2B2AE35)
@@ -318,7 +227,8 @@ class EpisodeReplayBuffer:
             # keep the least (h1, h2) pair
             less = (t1 < h1) | ((t1 == h1) & (t2 < h2))
             h1, h2 = jnp.where(less, t1, h1), jnp.where(less, t2, h2)
-        # sort valid experiences first, then by hash, so equal observations end up adjacent
+        # valid experiences first, then by hash, so equal observations are
+        # adjacent
         order = jnp.lexsort((h2, h1, ~valid))
         valid, h1, h2 = valid[order], h1[order], h2[order]
         new = jnp.concatenate(
@@ -329,39 +239,17 @@ class EpisodeReplayBuffer:
     def init(
         self, batch_size: int, template_experience: BaseExperience
     ) -> ReplayBufferState:
-        """Initializes the replay buffer state.
-
-        Args:
-            batch_size: number of parallel environments
-            template_experience: template experience data structure
-                - just used to determine the shape of the replay buffer data
-
-        Returns:
-            ReplayBufferState: initialized replay buffer state
+        """Empty states for `batch_size` environments, stacked, holding
+        experiences shaped as `template_experience`.
         """
+        shape = (batch_size, self.capacity)
         return ReplayBufferState(
             next_idx=jnp.zeros((batch_size,), dtype=jnp.int32),
             episode_start_idx=jnp.zeros((batch_size,), dtype=jnp.int32),
-            buffer=jax.tree_util.tree_map(
-                lambda x: jnp.zeros(
-                    (batch_size, self.capacity, *x.shape), dtype=x.dtype
-                ),
+            buffer=jax.tree.map(
+                lambda x: jnp.zeros(shape + x.shape, dtype=x.dtype),
                 template_experience,
             ),
-            populated=jnp.full(
-                (
-                    batch_size,
-                    self.capacity,
-                ),
-                fill_value=False,
-                dtype=jnp.bool_,
-            ),
-            has_reward=jnp.full(
-                (
-                    batch_size,
-                    self.capacity,
-                ),
-                fill_value=True,
-                dtype=jnp.bool_,
-            ),
+            populated=jnp.zeros(shape, dtype=jnp.bool_),
+            has_reward=jnp.ones(shape, dtype=jnp.bool_),
         )
