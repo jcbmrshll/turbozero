@@ -179,6 +179,9 @@ class EpisodeReplayBuffer:
         `replace`, `mask` must mark at least `sample_size` entries, else
         unmarked ones fill the rest of the sample.
         """
+        # over every environment's stacked states: on a single environment's
+        # (e.g. vmapped), each environment would draw its own sample
+        assert mask.ndim >= 2 and mask.dtype == jnp.bool_
         mask = mask.reshape(-1)
         return jax.random.choice(
             key, mask.size, shape=(sample_size,), replace=replace, p=mask / mask.sum()

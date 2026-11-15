@@ -111,6 +111,18 @@ def test_sample_indices_with_replacement_from_fewer_entries():
     np.testing.assert_array_equal(indices, [8 + 3] * 5)
 
 
+def test_sample_indices_takes_every_environments_stacked_states():
+    buffer = EpisodeReplayBuffer(capacity=8)
+    mask = jnp.ones((2, 8), dtype=bool)
+    key = jax.random.PRNGKey(0)
+
+    # a single environment's mask, as under vmap, or one that isn't a mask
+    with pytest.raises(AssertionError):
+        jax.vmap(lambda m: buffer.sample_indices(key, m, 2))(mask)
+    with pytest.raises(AssertionError):
+        buffer.sample_indices(key, mask.astype(jnp.float32), 2)
+
+
 def test_sampling_draws_only_finished_populated_entries():
     buffer = EpisodeReplayBuffer(capacity=4)
     # two environments, as the trainer stores them (batch, capacity, ...)
