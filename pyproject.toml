@@ -1,41 +1,70 @@
-[tool.poetry]
+[project]
 name = "turbozero"
 version = "0.1.1"
 description = "vectorized alphazero/mcts in JAX"
-authors = ["jcbmrshll <92640744+jcbmrshll@users.noreply.github.com>"]
+authors = [{ name = "jcbmrshll", email = "92640744+jcbmrshll@users.noreply.github.com" }]
 license = "Apache-2.0"
 readme = "README.md"
-packages = [
-    { include = "core" }
+requires-python = ">=3.12"
+dependencies = [
+    "equinox>=0.13.8",
+    "jax>=0.11.2",
+    "optax>=0.2.8",
+    "seaglass",
 ]
 
-[[tool.poetry.source]]
-name = "PyPI"
-priority = "primary"
-
-
-[[tool.poetry.source]]
-name = "jax"
-url = "https://storage.googleapis.com/jax-releases/jax_cuda_releases.html"
-priority = "primary"
-
-[tool.poetry.dependencies]
-python = "^3.10"
-graphviz = "^0.20.1"
-wandb = "^0.18.6"
-jax = "0.4.35"
-jaxlib = "^0.4.34"
-flax = "^0.8.4"
-optax = "^0.1.8"
-orbax-checkpoint = "^0.10.1"
-chex = "^0.1.85"
-pgx = "^2.0.1"
-dm-haiku = "^0.0.12"
-cairosvg = "^2.7.1"
-
-[tool.poetry.group.dev.dependencies]
-ipykernel = "^6.25.1"
+[project.optional-dependencies]
+# GPU build of jax; ./install.sh adds this when it finds an NVIDIA GPU
+cuda = ["jax[cuda13]"]
 
 [build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["turbozero"]
+
+[tool.pyright]
+include = ["turbozero", "tests", "examples"]
+venvPath = "."
+venv = ".venv"
+# the examples' scripts import their sibling modules
+executionEnvironments = [
+    { root = "examples/othello/ggs_client", extraPaths = ["examples/othello/ggs_client", "examples/othello"] },
+    { root = "examples/othello", extraPaths = ["examples/othello"] },
+    { root = "examples/hex", extraPaths = ["examples/hex"] },
+    { root = "examples/connect_four", extraPaths = ["examples/connect_four"] },
+    # tests of the Othello example's modules import them as its scripts do
+    { root = "tests", extraPaths = ["examples/othello", "examples/othello/ggs_client"] },
+]
+
+[tool.ruff]
+# `ruff check` uses ruff's default rule set (no select/ignore); `ruff format` uses its defaults (line length 88)
+
+[dependency-groups]
+dev = [
+    # environments + pretrained baselines used by the examples (pgx's baseline models need haiku)
+    "dm-haiku>=0.0.17",
+    "google-cloud-storage>=3.17.1",
+    "modal>=1.6.3",
+    "nncf>=3.4.0",
+    "onnx>=1.23.2",
+    "onnxruntime>=1.31.1",
+    "openvino>=2026.4.1",
+    "pgx>=2.6.0",
+    "pre-commit>=4.6.2",
+    "pyright>=1.1.414",
+    "pytest>=9.1.1",
+    "pytest-xdist>=3.8.0",
+    "ruff>=0.16.10",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# summarise xfails/xpasses/skips at the end of the run; run the tests in parallel, on up
+# to 8 processes (`-n0` runs them in this one, e.g. to debug with --pdb)
+addopts = "-ra -n auto --maxprocesses 8 --dist worksteal"
+xfail_strict = true
+
+[tool.uv.sources]
+seaglass = { git = "https://github.com/jcbmrshll/seaglass", rev = "v0.3.0" }

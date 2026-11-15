@@ -1,0 +1,40 @@
+name: tests
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev, main]
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      # CPU build of jax: no --extra cuda, the runners have no GPU (tests/conftest.py also forces CPU)
+      - run: uv sync --locked
+      # the programs the tests compiled last time (see tests/conftest.py): a run reuses those its
+      # changes didn't touch
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/turbozero/jax-tests
+          key: jax-tests-${{ hashFiles('uv.lock') }}-${{ github.sha }}
+          restore-keys: jax-tests-${{ hashFiles('uv.lock') }}-
+      - run: uv run pytest
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      # CPU build of jax, as above: pyright only needs the packages installed to resolve types
+      - run: uv sync --locked
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run pyright
