@@ -1031,7 +1031,9 @@ e.g. to play as an AVX2 build would. Every kernel sums exactly the same integers
 
 - AVX2's 3x3 convolutions run Winograd's F(2x2, 3x3) in integers: each 2x2 tile's 4x4 input patch and
   the weights are transformed into values that fit 16 bits, multiplied in pairs summed into 32 bits,
-  and transformed back, in 16 products where the direct convolution takes 36.
+  and transformed back, in 16 products where the direct convolution takes 36. With AVX-VNNI they run
+  directly, as AVX-512's do at half the width: `vpdpbusd` takes 4 byte products a lane, so the direct
+  convolution's 36 products cost 9 instructions where Winograd's 16 cost 8, without the transforms.
 - NEON's multiply signed bytes: the inputs go in less 128, and 128 times each output's weight sum is
   added back. `sdot` takes 4 channels of a square against 4 outputs' weights; i8mm's `smmla` takes 8
   channels of two neighbouring squares against two outputs' weights, twice the products an instruction,

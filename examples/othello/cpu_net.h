@@ -12,7 +12,8 @@
 //
 // The convolutions come in three kernels, for the levels engines ship builds for: AVX-512 with VNNI
 // (x86-64-v4), 4 products a lane an instruction; AVX2 (x86-64-v3), Winograd's F(2x2, 3x3) in 16-bit
-// integers; and ARM's NEON with the dot product (ARMv8.2, Apple's M1 on), 4 products a lane. All three
+// integers, or with AVX-VNNI (Intel's client chips from Alder Lake) directly as AVX-512's at half the
+// width; and ARM's NEON with the dot product (ARMv8.2, Apple's M1 on), 4 products a lane. All of them
 // sum exactly the same integers. Elsewhere the library builds without the network.
 #pragma once
 
@@ -52,6 +53,12 @@ namespace net {
 constexpr int SQUARES = 64;
 // the input of a 3x3 convolution: the board with a border of a square all round
 constexpr int PADDED = 100;
+// AVX2's Winograd convolutions: the board's 2x2 tiles of outputs, 4 by 4
+constexpr int TILES = 16;
+// and the planes of their transformed input, one for each of the 16 transformed values, (16 tiles,
+// cin), with a cache line between them: unpadded, 128 channels would put all 16 a power of two (4 KB)
+// apart, in one set of any cache that indexes by the address's low bits
+inline size_t winograd_plane(int cin) { return (size_t)TILES * cin + 32; }
 
 // a convolution's quantized input: 8 bits for VNNI, widened to 16 for AVX2, and for NEON, whose dot
 // product takes signed bytes, less 128, which `Conv::offset` adds back
@@ -86,6 +93,7 @@ struct Conv {
     std::vector<int16_t, Aligned<int16_t>> packed16;
     std::vector<float> scale, bias;  // of each output: acc * scale + bias
     std::vector<int32_t> offset;  // NEON: 128 times each output's weights' sum
+    std::vector<int32_t> shifts;  // AVX-VNNI's 3x3: where each tap's 4 channels are, from a patch's first
     std::vector<int16_t, Aligned<int16_t>> table;  // the stem's, in place of the packed weights (see `stem_table`)
     std::vector<float> inverse;  // of each input channel: its quantization is round(x * inverse) + zero_point
     int zero_point = 0;
@@ -157,14 +165,19 @@ inline void set_linear(Linear& l, int in, int out, const float* w, const float* 
 struct Scratch {
     std::vector<Activation, Aligned<Activation>> padded;  // (100, max channels), a convolution's input
     std::vector<float, Aligned<float>> x, y, h;   // (64, max channels): the trunk, a block's middle, the heads
-    std::vector<int16_t, Aligned<int16_t>> winograd;  // (16, 16 tiles, max channels): AVX2's transformed input
+    std::vector<int16_t, Aligned<int16_t>> winograd;  // (16 planes, `winograd_plane`): AVX2's transformed input
+    std::vector<uint8_t, Aligned<uint8_t>> bytes;  // AVX-VNNI: `padded` as bytes
     // i8mm: the padded input in pairs of neighbouring squares, from even and from odd columns
     std::vector<int8_t, Aligned<int8_t>> pairs;
     explicit Scratch(const Net& n) {
         int c = std::max(n.channels, 4);
         // and room for NEON's loads of 16 channels past the last square's
         padded.assign((size_t)PADDED * c + 16, 0);
-        winograd.assign((size_t)16 * 16 * c, 0);
+#if NET_ISA == 1 && defined(__AVXVNNI__)
+        bytes.assign((size_t)PADDED * c + 32, 0);  // and room for the last 32's store
+#elif NET_ISA == 1
+        winograd.assign(16 * winograd_plane(c), 0);
+#endif
         pairs.assign((size_t)10 * 9 * 16 * ((c + 7) / 8), 0);  // 10 rows of 9 pairs, by eights of channels
         x.assign((size_t)SQUARES * c, 0);
         y.assign((size_t)SQUARES * c, 0);
@@ -247,7 +260,8 @@ inline void convolve(const Conv& c, Scratch& s, float* out, int out_stride, bool
     }
 }
 #elif NET_ISA == 1
-// AVX2: 3x3 convolutions by Winograd's F(2x2, 3x3) in integers, the 1x1 directly. Each 2x2 tile of
+// AVX2: 3x3 convolutions by Winograd's F(2x2, 3x3) in integers (but see AVX-VNNI's below), the 1x1
+// directly. Each 2x2 tile of
 // outputs comes from its 4x4 patch of the padded input: the patch is transformed (B^T d B: sums and
 // differences, values within +-1020), multiplied value by value with the weights transformed (G g G^T,
 // G doubled to whole numbers: within +-1143), summed over the input channels, and transformed back (A^T
@@ -262,35 +276,47 @@ inline __m256i multiply_add(__m256i acc, __m256i a, __m256i b) {
 #endif
 }
 
-constexpr int TILES = 16;  // the board's 2x2 tiles of outputs, 4 by 4
+inline __m256i load16(const int16_t* p) { return _mm256_loadu_si256((const __m256i*)p); }
+inline void store16(int16_t* p, __m256i v) { _mm256_storeu_si256((__m256i*)p, v); }
 
 // each tile's patch of `in`, the padded input, (100, cin), transformed, to `v`, (16 values, 16 tiles,
-// cin)
+// cin) in planes `winograd_plane` apart. 16 channels at a time; B^T d B's first half, down each column of
+// the 4 rows of a row of tiles, is shared by the two tiles that overlap there. cin is a multiple of 4,
+// not always of 16 (a block's second convolution takes only its unpooled channels), so a tile's last
+// 16 may run into the next tile's first: the next tile's own, written after, put those right, as the
+// groups go from the last down and the tiles in order (and the last tile's run into the plane's padding).
 inline void winograd_input(const int16_t* in, int cin, int16_t* v) {
-    const size_t plane = (size_t)TILES * cin;
-    for (int tile = 0; tile < TILES; tile++) {
-        const int16_t* d = in + ((tile / 4) * 20 + (tile % 4) * 2) * cin;
-        int16_t* out = v + (size_t)tile * cin;
-#pragma omp simd
-        for (int c = 0; c < cin; c++) {
-            int16_t t[4][4];
-            for (int j = 0; j < 4; j++) {
-                const int16_t* col = d + j * cin + c;
-                int16_t d0 = col[0], d1 = col[10 * cin], d2 = col[20 * cin], d3 = col[30 * cin];
-                t[0][j] = d0 - d2;
-                t[1][j] = d1 + d2;
-                t[2][j] = d2 - d1;
-                t[3][j] = d1 - d3;
-            }
-            for (int i = 0; i < 4; i++) {
-                int16_t* row = out + (size_t)(4 * i) * plane + c;
-                row[0] = t[i][0] - t[i][2];
-                row[plane] = t[i][1] + t[i][2];
-                row[2 * plane] = t[i][2] - t[i][1];
-                row[3 * plane] = t[i][1] - t[i][3];
+    const size_t plane = winograd_plane(cin);
+    for (int ty = 0; ty < 4; ty++)
+        for (int c = (cin - 1) / 16 * 16; c >= 0; c -= 16) {
+            const int16_t* d = in + (size_t)ty * 20 * cin + c;
+            // column x's 4 values, (d0 - d2, d1 + d2, d2 - d1, d1 - d3), at t[x % 4]
+            __m256i t[4][4];
+            auto column = [&](int x) {
+                const int16_t* p = d + (size_t)x * cin;
+                __m256i d0 = load16(p), d1 = load16(p + 10 * cin), d2 = load16(p + 20 * cin), d3 = load16(p + 30 * cin);
+                __m256i* u = t[x % 4];
+                u[0] = _mm256_sub_epi16(d0, d2);
+                u[1] = _mm256_add_epi16(d1, d2);
+                u[2] = _mm256_sub_epi16(d2, d1);
+                u[3] = _mm256_sub_epi16(d1, d3);
+            };
+            column(0);
+            column(1);
+            _Pragma("GCC unroll 4") for (int tx = 0; tx < 4; tx++) {
+                column(2 * tx + 2);
+                column(2 * tx + 3);
+                const __m256i *c0 = t[(2 * tx) % 4], *c1 = t[(2 * tx + 1) % 4], *c2 = t[(2 * tx + 2) % 4],
+                              *c3 = t[(2 * tx + 3) % 4];
+                int16_t* out = v + (size_t)(ty * 4 + tx) * cin + c;
+                _Pragma("GCC unroll 4") for (int i = 0; i < 4; i++) {
+                    store16(out + (4 * i) * plane, _mm256_sub_epi16(c0[i], c2[i]));
+                    store16(out + (4 * i + 1) * plane, _mm256_add_epi16(c1[i], c2[i]));
+                    store16(out + (4 * i + 2) * plane, _mm256_sub_epi16(c2[i], c1[i]));
+                    store16(out + (4 * i + 3) * plane, _mm256_sub_epi16(c1[i], c3[i]));
+                }
             }
         }
-    }
 }
 
 // one transformed value's sums for 16 outputs: `v`, (16 tiles, cin), by `w`, (cin / 2, 2, 8 outputs,
@@ -344,6 +370,47 @@ inline void winograd_output(const Conv& c, const int32_t* m, int o, float* out, 
     }
 }
 
+#ifdef __AVXVNNI__
+// With AVX-VNNI, 3x3 convolutions directly instead, as AVX-512's at half the width: vpdpbusd takes 4
+// products a lane, unsigned 8-bit inputs by signed 8-bit weights, so that 36 of a direct convolution's
+// products cost 9 instructions where Winograd's 16 cost 8, and there's no transform either way. (Faster
+// than Winograd at up to 64 channels, and level with it at 128, on a Raptor Cove core.) The tile is `S`
+// squares by 16 outputs: 2S sums (12 at most, more than the 8 that its latency times its throughput
+// needs), 2 weight vectors and a broadcast input. Squares come 6 at a time, in the board's order, the
+// last 4; `bytes` is the padded input as bytes, (100, cin).
+template <int S>
+inline void direct_tiles(const Conv& c, const int8_t* w, const uint8_t* bytes, int s0, int o, float* out, int out_stride,
+                         bool add) {
+    const int* shifts = c.shifts.data();
+    const int n = (int)c.shifts.size();
+    __m256i acc[S][2];
+    _Pragma("GCC unroll 16") for (int i = 0; i < S; i++) acc[i][0] = acc[i][1] = _mm256_setzero_si256();
+    const uint8_t* p[S];  // each square's patch's first square
+    _Pragma("GCC unroll 16") for (int i = 0; i < S; i++) p[i] = bytes + ((s0 + i) / 8 * 10 + (s0 + i) % 8) * c.cin;
+    // the taps and their fours of channels in one loop: at 16 or 32 channels a loop over each tap's
+    // would be 4 or 8 long
+#pragma GCC unroll 4
+    for (int k = 0; k < n; k++) {
+        const __m256i w0 = _mm256_loadu_si256((const __m256i*)(w + k * 64));
+        const __m256i w1 = _mm256_loadu_si256((const __m256i*)(w + k * 64 + 32));
+        const int shift = shifts[k];
+        _Pragma("GCC unroll 16") for (int i = 0; i < S; i++) {
+            const __m256i a = _mm256_set1_epi32(load_u32(p[i] + shift));
+            acc[i][0] = _mm256_dpbusd_avx_epi32(acc[i][0], a, w0);
+            acc[i][1] = _mm256_dpbusd_avx_epi32(acc[i][1], a, w1);
+        }
+    }
+    _Pragma("GCC unroll 2") for (int r = 0; r < 2; r++) {
+        const __m256 m = _mm256_loadu_ps(c.scale.data() + o + 8 * r), b = _mm256_loadu_ps(c.bias.data() + o + 8 * r);
+        _Pragma("GCC unroll 16") for (int i = 0; i < S; i++) {
+            float* dst = out + (s0 + i) * out_stride + o + 8 * r;
+            const __m256 v = _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc[i][r]), m, b);
+            _mm256_storeu_ps(dst, add ? _mm256_add_ps(_mm256_loadu_ps(dst), v) : v);
+        }
+    }
+}
+#endif
+
 // a 1x1 convolution, half a row of 4 squares by 16 outputs as in `winograd_multiply`
 inline void conv_quarter(const Conv& c, const int16_t* w, const int16_t* in, int y, int x0, int o, float* out,
                          int out_stride) {
@@ -379,16 +446,33 @@ inline void convolve(const Conv& c, Scratch& s, float* out, int out_stride, bool
                 for (int x0 = 0; x0 < 8; x0 += 4) conv_quarter(c, c.packed16.data() + g * group, in, y, x0, 16 * g, out, out_stride);
         return;
     }
+#ifdef __AVXVNNI__
+    // the input as bytes, 32 at a time (100 cin is a multiple of 16, as cin is of 4: the last 32 may
+    // take 16 past the end, which `Scratch` has room for)
+    uint8_t* bytes = s.bytes.data();
+    for (int i = 0; i < PADDED * c.cin; i += 32) {
+        const __m256i lo = _mm256_loadu_si256((const __m256i*)(in + i)), hi = _mm256_loadu_si256((const __m256i*)(in + i + 16));
+        _mm256_storeu_si256((__m256i*)(bytes + i), _mm256_permute4x64_epi64(_mm256_packus_epi16(lo, hi), 0xd8));
+    }
+    const size_t group = (size_t)9 * c.cin * 16;
+    for (int g = 0; g < c.cout / 16; g++) {
+        const int8_t* w = c.packed.data() + g * group;
+        for (int s0 = 0; s0 < 60; s0 += 6) direct_tiles<6>(c, w, bytes, s0, 16 * g, out, out_stride, add);
+        direct_tiles<4>(c, w, bytes, 60, 16 * g, out, out_stride, add);
+    }
+#else
     int16_t* v = s.winograd.data();
     winograd_input(in, c.cin, v);
+    const size_t plane = winograd_plane(c.cin);
     alignas(32) int32_t m[16 * TILES * 16];
     const size_t chunk = (size_t)(c.cin / 2) * 32;
     for (int g = 0; g < c.cout / 16; g++) {
         const int16_t* w = c.packed16.data() + (size_t)g * 16 * chunk;
         for (int p = 0; p < 16; p++)
-            winograd_multiply(v + (size_t)p * TILES * c.cin, w + p * chunk, c.cin, m + p * TILES * 16);
+            winograd_multiply(v + p * plane, w + p * chunk, c.cin, m + p * TILES * 16);
         winograd_output(c, m, 16 * g, out, out_stride, add);
     }
+#endif
 }
 #elif NET_ISA == 3 && defined(__ARM_FEATURE_MATMUL_INT8)
 // NEON with i8mm (ARMv8.6; Apple's M2 on, Graviton 3 on, Axion): smmla multiplies a 2x8 block of
@@ -1306,7 +1390,8 @@ inline void forward(const Net&, Scratch&, const float*, float*, float*) {
 // Packs `q`, (cout, cin, k, k) signed 8-bit weights, for `convolve`: for VNNI, [cout / 32][k * k]
 // [cin / 4][2][16 outputs][4 inputs], the last 16 outputs alone if cout / 16 is odd; for AVX2, in 16
 // bits, [cout / 16][cin / 2][2][8 outputs][2 inputs] for 1x1, and for 3x3 the same of each of the 16
-// transformed values, [cout / 16][16][cin / 2][2][8][2], 2G g 2G^T; for NEON, [cout / 8][k * k][cin / 4]
+// transformed values, [cout / 16][16][cin / 2][2][8][2], 2G g 2G^T, but with AVX-VNNI 3x3 in 8 bits,
+// [cout / 16][9][cin / 4][2][8 outputs][4 inputs]; for NEON, [cout / 8][k * k][cin / 4]
 // [8 outputs][4 inputs].
 // The stem's sums, for `stem`, from its weights `q`, (cout, 4, 3, 3), the last 2 input channels padding:
 // for each row of the 3 rows of 3 squares a square's sums take in (above, its own, below) and each
@@ -1352,6 +1437,22 @@ inline void pack(Conv& c, const int8_t* q) {
     for (int o = 0; o < c.cout; o++)
         for (size_t i = 0; i < (size_t)c.cin * taps; i++) c.offset[o] += ACTIVATION_SHIFT * q[(size_t)o * c.cin * taps + i];
     return;
+#endif
+#if NET_ISA == 1 && defined(__AVXVNNI__)
+    if (c.k == 3) {
+        // AVX-VNNI's 3x3, [cout / 16][9][cin / 4][2][8 outputs][4 inputs]
+        c.packed.assign((size_t)c.cout * c.cin * 9, 0);
+        size_t at = 0;
+        for (int g = 0; g < c.cout / 16; g++)
+            for (int t = 0; t < 9; t++)
+                for (int c4 = 0; c4 < c4n; c4++)
+                    for (int o = 0; o < 16; o++)
+                        for (int k = 0; k < 4; k++) c.packed[at++] = q[((size_t)(16 * g + o) * c.cin + 4 * c4 + k) * 9 + t];
+        c.shifts.clear();
+        for (int t = 0; t < 9; t++)
+            for (int c4 = 0; c4 < c4n; c4++) c.shifts.push_back((t / 3 * 10 + t % 3) * c.cin + 4 * c4);
+        return;
+    }
 #endif
 #if NET_ISA == 1
     // G of F(2x2, 3x3), doubled

@@ -829,7 +829,7 @@ def test_the_native_networks_layers_compute_the_network(spec):
     np.testing.assert_allclose(got_values, values, atol=1e-5)
 
 
-# each convolution kernel: AVX-512 VNNI's, AVX2's Winograd with and without AVX-VNNI, and NEON's with
+# each convolution kernel: AVX-512 VNNI's, AVX-VNNI's, AVX2's Winograd, and NEON's with
 # i8mm and with the dot product alone
 @pytest.mark.parametrize("level", ["v4", "v3-vnni", "v3", "arm-i8mm", "arm-dotprod"])
 @pytest.mark.parametrize("spec", NATIVE_SPECS)
@@ -860,8 +860,8 @@ def test_the_native_network_computes_its_quantized_layers(
 
 @pytest.mark.parametrize("level", ["v4", "v3-vnni", "v3", "arm-i8mm", "arm-dotprod"])
 def test_the_native_networks_pieces_compute_as_plainer_code_does(level, tmp_path):
-    # its sums of many squares or outputs at once, bit for bit as one at a time, and the stem's
-    # table as its convolution (`cpu_net_checks.cpp`)
+    # its sums of many squares or outputs at once, bit for bit as one at a time, the stem's table as
+    # its convolution, and its 3x3 convolutions as their sums taken directly (`cpu_net_checks.cpp`)
     import subprocess
 
     import native_target
@@ -887,7 +887,7 @@ def test_the_native_networks_pieces_compute_as_plainer_code_does(level, tmp_path
 def test_avx_vnni_sums_as_avx2_does(spec, monkeypatch):
     import cpu_net
 
-    # the same integers, multiplied and added in one instruction or two, and the same float code
+    # the same integers, by AVX-VNNI's direct convolutions or AVX2's Winograd, and the same float code
     libs = [library(level, monkeypatch) for level in ("v3-vnni", "v3")]
     program = cpu_net.extract(*random_network(spec))
     x = (np.random.default_rng(0).random((48, 2, 8, 8)) < 0.3).astype(np.float32)

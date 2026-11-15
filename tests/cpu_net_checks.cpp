@@ -231,7 +231,53 @@ static void check_policy_logits() {
 }
 #endif
 
+// 3x3 convolutions against their sums taken directly, each output fma(sum, scale, bias) (and the
+// residual added after), at widths of 16s and of 4s (a block's second convolution), and at the
+// extremes of inputs and weights, where AVX2's transformed values come nearest 16 bits' range
+static void check_convolve() {
+    const int shapes[][2] = {{32, 32}, {24, 48}, {40, 48}, {64, 64}, {128, 128}, {12, 16}};
+    for (auto [cin, cout] : shapes)
+        for (int extreme = 0; extreme < 2; extreme++) {
+            Conv c;
+            c.cin = cin, c.cout = cout, c.k = 3;
+            std::vector<int8_t> q((size_t)cout * cin * 9);
+            for (auto& w : q) w = (int8_t)(extreme ? (rng() % 2 ? 127 : -127) : (int)(rng() % 255) - 127);
+            pack(c, q.data());
+            for (int o = 0; o < cout; o++) {
+                c.scale.push_back(std::ldexp(1.0f + (float)(rng() % 1000) / 1000, -(int)(rng() % 20)));
+                c.bias.push_back(any_float());
+            }
+            Net n;
+            n.channels = std::max(cin, cout);
+            n.head_channels = 16;
+            Scratch s(n);
+            std::vector<int> x((size_t)PADDED * cin);  // the inputs, 0 to 255
+            for (size_t i = 0; i < x.size(); i++) {
+                x[i] = extreme ? (rng() % 2 ? 255 : 0) : (int)(rng() % 256);
+                s.padded[i] = (Activation)(x[i] - ACTIVATION_SHIFT);
+            }
+            for (int add = 0; add < 2; add++) {
+                std::vector<float> out((size_t)SQUARES * cout), before(out.size());
+                for (auto& v : before) v = any_float();
+                out = before;
+                convolve(c, s, out.data(), cout, add);
+                for (int sq = 0; sq < SQUARES; sq++)
+                    for (int o = 0; o < cout; o++) {
+                        int32_t sum = 0;
+                        for (int t = 0; t < 9; t++)
+                            for (int i = 0; i < cin; i++)
+                                sum += q[((size_t)o * cin + i) * 9 + t] *
+                                       x[((sq / 8 + t / 3) * 10 + sq % 8 + t % 3) * cin + i];
+                        float want = std::fma((float)sum, c.scale[o], c.bias[o]);
+                        if (add) want = before[sq * cout + o] + want;
+                        expect(same(out[sq * cout + o], want), "convolve", (cin * 1000 + sq) * 1000 + o);
+                    }
+            }
+        }
+}
+
 int main() {
+    check_convolve();
     check_reduce();
     check_norm_stats();
     check_stem();
