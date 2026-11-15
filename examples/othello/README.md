@@ -1075,7 +1075,8 @@ otherwise the same.
 
 The native network's convolutions take each input channel's own scale, folded into the weights
 (SmoothQuant, alpha 0.75), then the tensor's, from the minimum and maximum seen in calibration; their
-float epilogues normalize each square's channels where OpenVINO runs separate ops. Against the float
+normalization of each square's channels runs in the pass that quantizes the next one's input, where
+OpenVINO runs separate ops (`profile_native.cpp` times each stage). Against the float
 network on 2000 search leaves (value's mean error, its 99th percentile, top move):
 
 | Network | Native | OpenVINO int8 |

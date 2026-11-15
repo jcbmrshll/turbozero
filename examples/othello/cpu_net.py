@@ -9,8 +9,8 @@ Each convolution of the trunk takes 8-bit inputs, scaled for the whole tensor by
 maximum seen in calibration (with a zero point when the minimum is below 0), and 8-bit weights
 scaled for each output channel, as `quantize.py`'s best OpenVINO model does; and so do the heads'
 first convolutions. The rest of the heads stays in float.
-A normalization of each square's channels runs in the convolution's float epilogue, where OpenVINO
-runs it as several ops of its own.
+A normalization of each square's channels runs in the pass that quantizes the next convolution's
+input, where OpenVINO runs it as several ops of its own.
 
 `float_forward` is the network in NumPy, which `quantize` calibrates on; `int8_forward` is what the
 C++ computes, in NumPy, for tests.

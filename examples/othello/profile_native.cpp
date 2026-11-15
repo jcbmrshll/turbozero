@@ -1,13 +1,15 @@
 // Times the native network (`cpu_net.h`) at batch 1 on one thread, whole and stage by stage, on a
 // network of random weights of the given shape (its time doesn't depend on them).
 //
-//     g++ -std=c++17 -O3 -march=x86-64-v4 -mavx512vnni -mtune=generic -fopenmp-simd \
-//         profile_native.cpp -o /tmp/profile_native
+//     g++ -std=c++17 -O3 -march=x86-64-v4 -mavx512vnni -mtune=generic -fopenmp-simd profile_native.cpp
+//         -o /tmp/profile_native  (or another level's flags, `native_target.LEVELS`)
 //     taskset -c 9 /tmp/profile_native 4 64 pre channel
 //
 // prints one JSON line: the shape, ns a forward pass without the marks (the median of rounds), and ns
 // a pass in each stage with them (each mark costs a few ns of its own).
+#if defined(__x86_64__)
 #include <x86intrin.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -18,6 +20,14 @@
 #include <vector>
 
 namespace profile {
+// a fine clock: the cycle counter on x86, elsewhere the steady clock's ns
+#if defined(__x86_64__)
+inline unsigned long long now() { return __rdtsc(); }
+#else
+inline unsigned long long now() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+#endif
 inline std::vector<std::string> names;
 inline std::vector<unsigned long long> ticks;
 inline unsigned long long last = 0;
@@ -31,9 +41,9 @@ inline int id(const char* name) {
 }
 inline void mark(int i) {
     if (!on) return;
-    unsigned long long now = __rdtsc();
-    ticks[i] += now - last;
-    last = now;
+    unsigned long long t = now();
+    ticks[i] += t - last;
+    last = t;
 }
 }  // namespace profile
 
@@ -127,14 +137,15 @@ Net make_net(int blocks, int channels, bool pre, int norm, int pool_channels, in
 
 int main(int argc, char** argv) {
     if (argc < 5) {
-        std::fprintf(stderr, "usage: profile_native BLOCKS CHANNELS pre|post channel|batch [ROUNDS]\n");
+        std::fprintf(stderr, "usage: profile_native BLOCKS CHANNELS pre|post channel|batch [ROUNDS] [VALUE_HIDDEN]\n");
         return 2;
     }
     int blocks = std::atoi(argv[1]), channels = std::atoi(argv[2]);
     bool pre = std::string(argv[3]) == "pre";
     int norm = std::string(argv[4]) == "channel" ? NORM_CHANNEL : NORM_AFFINE;
     int rounds = argc > 5 ? std::atoi(argv[5]) : 15;
-    Net n = make_net(blocks, channels, pre, norm, channels >= 96 ? 32 : 16, 32, 256);
+    int hidden = argc > 6 ? std::atoi(argv[6]) : 256;
+    Net n = make_net(blocks, channels, pre, norm, channels >= 96 ? 32 : 16, 32, hidden);
     Scratch s(n);
     // positions of random discs, the same every run
     const int P = 1024;
@@ -161,15 +172,15 @@ int main(int argc, char** argv) {
     std::sort(times.begin(), times.end());
     // the marks, and the clock's ticks a ns
     auto t0 = std::chrono::steady_clock::now();
-    unsigned long long c0 = __rdtsc();
+    unsigned long long c0 = profile::now();
     profile::on = true;
     const int marked = reps * 5;
     for (int i = 0; i < marked; i++) {
-        profile::last = __rdtsc();
+        profile::last = profile::now();
         forward(n, s, obs.data() + (size_t)(i % P) * 128, logits, &value);
     }
     double ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count();
-    double per_ns = (__rdtsc() - c0) / ns;
+    double per_ns = (profile::now() - c0) / ns;
     std::printf("{\"shape\": \"%dx%d\", \"pre\": %d, \"norm\": \"%s\", \"ns\": %.1f, \"min_ns\": %.1f, \"marked_ns\": %.1f, \"stages\": {",
                 blocks, channels, (int)pre, argv[4], times[times.size() / 2], times[0], ns / marked);
     for (size_t i = 0; i < profile::names.size(); i++)
