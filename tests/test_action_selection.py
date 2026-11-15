@@ -10,11 +10,21 @@ from turbozero.evaluators.mcts.action_selection import (
     bounded_q_values,
     normalize_q_values,
 )
-from turbozero.evaluators.mcts.mcts import MCTS
-from turbozero.evaluators.mcts.state import init_mcts_tree
+from turbozero.evaluators.mcts.state import MCTSNode, init_mcts_tree
 
 EPS = 1e-8
 KEY = jax.random.PRNGKey(0)
+
+
+def new_node(policy, value, embedding, terminated):
+    """An evaluated node, visited once (dev's `MCTS.new_node`)."""
+    return MCTSNode(
+        n=jnp.array(1, dtype=jnp.int32),
+        p=policy,
+        q=jnp.array(value, dtype=jnp.float32),
+        terminated=jnp.array(terminated, dtype=jnp.bool_),
+        embedding=embedding,
+    )
 
 
 def mctx_qtransform(q, n, parent_q, eps):
@@ -80,7 +90,7 @@ def test_bounded_q_values_keeps_how_far_apart_values_are():
 
 
 def root_only_tree(prior):
-    node = MCTS.new_node(
+    node = new_node(
         policy=jnp.asarray(prior, dtype=jnp.float32),
         value=0.0,
         embedding=jnp.zeros(()),
@@ -99,7 +109,7 @@ def visited_tree(prior, root_q, child_n, child_q):
     """Root with every child visited: `child_q` is from each child's perspective, the root's `n` is 1 + the children's."""
     prior, child_n, child_q = (np.asarray(x) for x in (prior, child_n, child_q))
     root = replace(
-        MCTS.new_node(
+        new_node(
             policy=jnp.asarray(prior, dtype=jnp.float32),
             value=0.0,
             embedding=jnp.zeros(()),
@@ -111,7 +121,7 @@ def visited_tree(prior, root_q, child_n, child_q):
     tree = init_mcts_tree(8, len(prior), root).set_root(root)
     for action, (n, q) in enumerate(zip(child_n, child_q)):
         child = replace(
-            MCTS.new_node(
+            new_node(
                 policy=jnp.zeros(len(prior)),
                 value=0.0,
                 embedding=jnp.zeros(()),
@@ -120,7 +130,7 @@ def visited_tree(prior, root_q, child_n, child_q):
             n=jnp.array(n, dtype=jnp.int32),
             q=jnp.float32(q),
         )
-        tree = tree.add_node(tree.ROOT_INDEX, action, child)
+        tree = tree.set_child(tree.ROOT_INDEX, action, child)
     return tree
 
 

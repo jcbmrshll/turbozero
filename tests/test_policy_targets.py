@@ -50,7 +50,7 @@ def root_tree(logits, raw_value, visits, q, discount=-1.0):
     tree = tree.set_root(node(1 + sum(visits), 0.0, len(logits)))
     for action, (n, value) in enumerate(zip(visits, q)):
         if n > 0:
-            tree = tree.add_node(0, action, node(n, value / discount, len(logits)))
+            tree = tree.set_child(0, action, node(n, value / discount, len(logits)))
     return replace(
         tree,
         root_logits=jnp.asarray(logits, dtype=jnp.float32),
