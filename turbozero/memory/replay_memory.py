@@ -23,8 +23,8 @@ class BaseExperience:
     search_value: jax.Array
 
 
-# a data transform (e.g. one of a board's symmetries): maps an experience,
-# without batch dimensions, to another as valid, e.g. the board rotated with its
+# a data transform: maps an experience, without batch dimensions, to another
+# that's as valid a training sample, its observation transformed with its
 # policy target and legal actions to match. The value targets (`reward`,
 # `search_value`) and `cur_player_id` stay as they are.
 DataTransformFn = Callable[[BaseExperience], BaseExperience]
@@ -36,8 +36,7 @@ def transform_randomly(
     transform_fns: Sequence[DataTransformFn],
 ) -> BaseExperience:
     """Maps each of a batch of experiences through a transform drawn uniformly
-    at random, independently for each, from the identity and `transform_fns`
-    (e.g. a board's other symmetries).
+    at random, independently for each, from the identity and `transform_fns`.
     """
     if not transform_fns:
         return experiences
@@ -190,10 +189,10 @@ class EpisodeReplayBuffer:
 
         Observations are compared by a 64-bit hash of their contents, so
         collisions are possible but vanishingly rare at buffer sizes. With
-        `transform_fns` (e.g. a board's symmetries, which training applies to
-        sampled experiences), observations that one maps to another count as
-        one: each is compared by the least hash of its images under the identity
-        and the transforms, which must be a group (as a board's symmetries are).
+        `transform_fns` (those training applies to sampled experiences),
+        observations that one maps to another count as one: each is compared by
+        the least hash of its images under the identity and the transforms,
+        which must form a group.
         """
         valid = self.sample_mask(state).reshape(-1)
         experiences = jax.tree.map(
