@@ -407,6 +407,15 @@ inline void winograd_output(const Conv& c, const int32_t* m, int o, float* out, 
 }
 
 #ifdef __AVXVNNI__
+// the padded input as bytes, 32 at a time (100 cin is a multiple of 16, as cin is of 4: the last 32
+// may take 16 past the end, which `Scratch` has room for)
+inline void to_bytes(const int16_t* in, int cin, uint8_t* bytes) {
+    for (int i = 0; i < PADDED * cin; i += 32) {
+        const __m256i lo = _mm256_loadu_si256((const __m256i*)(in + i)), hi = _mm256_loadu_si256((const __m256i*)(in + i + 16));
+        _mm256_storeu_si256((__m256i*)(bytes + i), _mm256_permute4x64_epi64(_mm256_packus_epi16(lo, hi), 0xd8));
+    }
+}
+
 // With AVX-VNNI, 3x3 convolutions directly instead, as AVX-512's at half the width: vpdpbusd takes 4
 // products a lane, unsigned 8-bit inputs by signed 8-bit weights, so that 36 of a direct convolution's
 // products cost 9 instructions where Winograd's 16 cost 8, and there's no transform either way. (Faster
@@ -448,30 +457,35 @@ inline void direct_tiles(const Conv& c, const int8_t* w, const uint8_t* bytes, i
 #endif
 
 // A 1x1 convolution's (the heads') 4 squares from `first`, of one row, by `HEAD_BLOCKS` blocks of 8
-// outputs from `o`. With AVX-VNNI, 3 blocks: 12 sums, 3 weight vectors and a broadcast input, all 16
-// registers, the channels' loop 4 pairs at a time (they come in 16s). Without it, 2 blocks, as each
-// product needs a register of its own before it's added: 8 sums and the 4 squares' inputs held, a
-// weight vector at a time, the channels' loop as GCC unrolls it, which times best there.
+// outputs from `o`. With AVX-VNNI, in bytes as its 3x3 (vpdpbusd, 4 channels a lane), 3 blocks: 12
+// sums, 3 weight vectors and a broadcast input, all 16 registers, the channels' loop 4 fours at a time
+// (they come in 16s). Without it, in 16 bits, 2 blocks, as each product needs a register of its own
+// before it's added: 8 sums and the 4 squares' inputs held, a weight vector at a time, the channels'
+// loop as GCC unrolls it, which times best there.
 #ifdef __AVXVNNI__
 constexpr int HEAD_BLOCKS = 3;
+using HeadWeight = int8_t;
+using HeadInput = uint8_t;
 #else
 constexpr int HEAD_BLOCKS = 2;
+using HeadWeight = int16_t;
+using HeadInput = int16_t;
 #endif
-NET_INLINE void conv_1x1(const Conv& c, const int16_t* w, const int16_t* in, int first, int o, float* out,
+NET_INLINE void conv_1x1(const Conv& c, const HeadWeight* w, const HeadInput* in, int first, int o, float* out,
                          int out_stride) {
     constexpr int R = HEAD_BLOCKS;
     __m256i acc[4][R];
     NET_UNROLL for (int i = 0; i < 4; i++) NET_UNROLL for (int r = 0; r < R; r++) acc[i][r] = _mm256_setzero_si256();
-    const int16_t* row = in + ((first / 8 + 1) * 10 + first % 8 + 1) * c.cin;
+    const HeadInput* row = in + ((first / 8 + 1) * 10 + first % 8 + 1) * c.cin;
 #ifdef __AVXVNNI__
-    for (int c2 = 0; c2 < c.cin / 2; c2 += 4) {
+    for (int c4 = 0; c4 < c.cin / 4; c4 += 4) {
         NET_UNROLL for (int u = 0; u < 4; u++) {
             __m256i wv[R];
             NET_UNROLL for (int r = 0; r < R; r++)
-                wv[r] = _mm256_loadu_si256((const __m256i*)(w + ((c2 + u) * R + r) * 16));
+                wv[r] = _mm256_loadu_si256((const __m256i*)(w + ((c4 + u) * R + r) * 32));
             NET_UNROLL for (int i = 0; i < 4; i++) {
-                __m256i a = _mm256_set1_epi32(load_u32(row + i * c.cin + 2 * (c2 + u)));
-                NET_UNROLL for (int r = 0; r < R; r++) acc[i][r] = multiply_add(acc[i][r], a, wv[r]);
+                __m256i a = _mm256_set1_epi32(load_u32(row + i * c.cin + 4 * (c4 + u)));
+                NET_UNROLL for (int r = 0; r < R; r++) acc[i][r] = _mm256_dpbusd_avx_epi32(acc[i][r], a, wv[r]);
             }
         }
     }
@@ -498,22 +512,24 @@ NET_INLINE void conv_1x1(const Conv& c, const int16_t* w, const int16_t* in, int
 // a 1x1 convolution (the heads', never a residual), out of line as for AVX-512
 __attribute__((noinline)) inline void convolve_1x1(const Conv& c, Scratch& s, float* out, int out_stride) {
     constexpr int outputs = 8 * HEAD_BLOCKS;
+#ifdef __AVXVNNI__
+    to_bytes(s.padded.data(), c.cin, s.bytes.data());
+    const HeadInput* in = s.bytes.data();
+    const HeadWeight* w = c.packed.data();
+#else
+    const HeadInput* in = s.padded.data();
+    const HeadWeight* w = c.packed16.data();
+#endif
     for (int g = 0; g < c.cout / outputs; g++)
-        for (int sq = 0; sq < SQUARES; sq += 4)
-            conv_1x1(c, c.packed16.data() + (size_t)g * c.cin * outputs, s.padded.data(), sq, outputs * g, out, out_stride);
+        for (int sq = 0; sq < SQUARES; sq += 4) conv_1x1(c, w + (size_t)g * c.cin * outputs, in, sq, outputs * g, out, out_stride);
 }
 
 inline void convolve(const Conv& c, Scratch& s, float* out, int out_stride, bool add = false) {
     if (c.k == 1) return convolve_1x1(c, s, out, out_stride);
     const Activation* in = s.padded.data();
 #ifdef __AVXVNNI__
-    // the input as bytes, 32 at a time (100 cin is a multiple of 16, as cin is of 4: the last 32 may
-    // take 16 past the end, which `Scratch` has room for)
     uint8_t* bytes = s.bytes.data();
-    for (int i = 0; i < PADDED * c.cin; i += 32) {
-        const __m256i lo = _mm256_loadu_si256((const __m256i*)(in + i)), hi = _mm256_loadu_si256((const __m256i*)(in + i + 16));
-        _mm256_storeu_si256((__m256i*)(bytes + i), _mm256_permute4x64_epi64(_mm256_packus_epi16(lo, hi), 0xd8));
-    }
+    to_bytes(in, c.cin, bytes);
     const size_t group = (size_t)9 * c.cin * 16;
     for (int g = 0; g < c.cout / 16; g++) {
         const int8_t* w = c.packed.data() + g * group;
@@ -1469,7 +1485,7 @@ inline void forward(const Net&, Scratch&, const float*, float*, float*) {
 // [cout / 48][cin / 4][3][16][4]; for AVX2, in 16 bits, 3x3 as each of the 16 transformed values,
 // [cout / 16][16][cin / 2][2][8 outputs][2 inputs], 2G g 2G^T, but with AVX-VNNI in 8 bits as
 // [cout / 16][9][cin / 4][2][8 outputs][4 inputs], and 1x1 as [cout / (8 HEAD_BLOCKS)][cin / 2]
-// [HEAD_BLOCKS][8][2]; for NEON, [cout / 8][k * k][cin / 4][8 outputs][4 inputs]. A 1x1's cout is the
+// [HEAD_BLOCKS][8][2], with AVX-VNNI [cout / 24][cin / 4][3][8][4]; for NEON, [cout / 8][k * k][cin / 4][8 outputs][4 inputs]. A 1x1's cout is the
 // heads', 3 * head_channels, a multiple of 48.
 // The stem's sums, for `stem`, from its weights `q`, (cout, 4, 3, 3), the last 2 input channels padding:
 // for each row of the 3 rows of 3 squares a square's sums take in (above, its own, below) and each
@@ -1519,6 +1535,17 @@ inline void pack(Conv& c, const int8_t* q) {
     return;
 #endif
 #if NET_ISA == 1 && defined(__AVXVNNI__)
+    if (c.k == 1) {
+        // AVX-VNNI's 1x1, [cout / 24][cin / 4][3][8 outputs][4 inputs]
+        c.packed.assign((size_t)c.cout * c.cin, 0);
+        size_t at = 0;
+        for (int o0 = 0; o0 < c.cout; o0 += 8 * HEAD_BLOCKS)
+            for (int c4 = 0; c4 < c4n; c4++)
+                for (int r = 0; r < HEAD_BLOCKS; r++)
+                    for (int o = 0; o < 8; o++)
+                        for (int k = 0; k < 4; k++) c.packed[at++] = q[(size_t)(o0 + 8 * r + o) * c.cin + 4 * c4 + k];
+        return;
+    }
     if (c.k == 3) {
         // AVX-VNNI's 3x3, [cout / 16][9][cin / 4][2][8 outputs][4 inputs]
         c.packed.assign((size_t)c.cout * c.cin * 9, 0);
