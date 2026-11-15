@@ -70,6 +70,7 @@ struct Conv {
     std::vector<int16_t> packed16;
     std::vector<float> scale, bias;  // of each output: acc * scale + bias
     std::vector<int32_t> offset;  // NEON: 128 times each output's weights' sum
+    std::vector<int16_t> table;  // the stem's, in place of the packed weights (see `stem_table`)
     std::vector<float> inverse;  // of each input channel: its quantization is round(x * inverse) + zero_point
     int zero_point = 0;
 };
@@ -508,6 +509,14 @@ struct Lanes {
     static F div(F a, F b) { return _mm512_div_ps(a, b); }
     static F sqrt(F a) { return _mm512_sqrt_ps(a); }
     static F fma(F a, F b, F c) { return _mm512_fmadd_ps(a, b, c); }  // a * b + c, rounded once
+    // the sums of 3 rows of W 16-bit integers, as floats
+    static F widen(const int16_t* a, const int16_t* b, const int16_t* c) {
+        __m256i s = _mm256_add_epi16(_mm256_add_epi16(_mm256_loadu_si256((const __m256i*)a), _mm256_loadu_si256((const __m256i*)b)),
+                                     _mm256_loadu_si256((const __m256i*)c));
+        return _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(s));
+    }
+    // the first 16 of `p` as bits: p[i] > 0.5
+    static uint64_t bits(const float* p) { return _mm512_cmp_ps_mask(_mm512_loadu_ps(p), set1(0.5f), _CMP_GT_OQ); }
     // a * b, rounded on its own: GCC's intrinsics are its vector operators, and fuses an add of a
     // product into an fma where it can
     static F product(F a, F b) {
@@ -652,6 +661,14 @@ struct Lanes {
     static F div(F a, F b) { return _mm256_div_ps(a, b); }
     static F sqrt(F a) { return _mm256_sqrt_ps(a); }
     static F fma(F a, F b, F c) { return _mm256_fmadd_ps(a, b, c); }
+    static F widen(const int16_t* a, const int16_t* b, const int16_t* c) {
+        __m128i s = _mm_add_epi16(_mm_add_epi16(_mm_loadu_si128((const __m128i*)a), _mm_loadu_si128((const __m128i*)b)),
+                                  _mm_loadu_si128((const __m128i*)c));
+        return _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(s));
+    }
+    static uint64_t bits(const float* p) {
+        return (uint64_t)_mm256_movemask_ps(_mm256_cmp_ps(_mm256_loadu_ps(p), set1(0.5f), _CMP_GT_OQ));
+    }
     // a * b, rounded on its own (see AVX-512's)
     static F product(F a, F b) {
         F p = _mm256_mul_ps(a, b);
@@ -739,6 +756,14 @@ struct Lanes {
     static F div(F a, F b) { return vdivq_f32(a, b); }
     static F sqrt(F a) { return vsqrtq_f32(a); }
     static F fma(F a, F b, F c) { return vfmaq_f32(c, a, b); }
+    static F widen(const int16_t* a, const int16_t* b, const int16_t* c) {
+        return vcvtq_f32_s32(vmovl_s16(vadd_s16(vadd_s16(vld1_s16(a), vld1_s16(b)), vld1_s16(c))));
+    }
+    static uint64_t bits(const float* p) {
+        uint64_t b = 0;
+        for (int i = 0; i < W; i++) b |= (uint64_t)(p[i] > 0.5f) << i;
+        return b;
+    }
     // a normalization's ReLU, max(v, 0); and a sum's, std::max(v, 0.0f) as the compiler's loops took
     // it, which keeps a -0
     static F relu(F v) { return vmaxq_f32(v, zero()); }
@@ -1057,6 +1082,36 @@ inline void relu_columns(float* x, int stride, int first, int count) {
         }
 }
 
+// The stem's convolution of the board, `obs`, (2, 8, 8), its discs 0 or 1, to `out`, (64, c.cout): each
+// square's sums are those of its 3 rows of 3 squares' discs' weights, looked up (`stem_table`). The
+// same integers as the convolution kernels sum, scaled the same way, so the same floats.
+inline void stem(const Conv& c, const float* obs, float* out) {
+    // each side's discs, a bit a square
+    uint64_t discs[2] = {0, 0};
+    for (int p = 0; p < 2; p++)
+        for (int sq = 0; sq < SQUARES; sq += W) discs[p] |= Lanes::bits(obs + p * SQUARES + sq) << sq;
+    // each square's 3 squares of its row, the one it's centred on: 6 bits as `stem_table` takes them;
+    // and rows of none above and below the board
+    int patterns[10][8] = {};
+    for (int y = 0; y < 8; y++) {
+        // the row's discs, from bit 1 (bit 0 and 9 off the board)
+        const int mine = (int)((discs[0] >> (8 * y)) & 0xff) << 1, theirs = (int)((discs[1] >> (8 * y)) & 0xff) << 1;
+        for (int x = 0; x < 8; x++) patterns[y + 1][x] = ((mine >> x) & 7) | ((theirs >> x) & 7) << 3;
+    }
+    const int C = c.cout;
+    const float* scale = c.scale.data();
+    const float* bias = c.bias.data();
+    const int16_t* table = c.table.data();
+    for (int sq = 0; sq < SQUARES; sq++) {
+        const int y = sq / 8, x = sq % 8;
+        const int16_t* rows[3];
+        for (int dy = 0; dy < 3; dy++) rows[dy] = table + ((size_t)dy * 64 + patterns[y + dy][x]) * C;
+        for (int i = 0; i < C; i += W)
+            Lanes::store(out + sq * C + i, Lanes::fma(Lanes::widen(rows[0] + i, rows[1] + i, rows[2] + i),
+                                                      Lanes::load(scale + i), Lanes::load(bias + i)));
+    }
+}
+
 // One position: `obs`, (2, 8, 8) channels-first, the mover's discs then the opponent's, to (65)
 // policy logits and a value.
 inline void forward(const Net& n, Scratch& s, const float* obs, float* logits, float* value) {
@@ -1064,15 +1119,8 @@ inline void forward(const Net& n, Scratch& s, const float* obs, float* logits, f
     float* x = s.x.data();
     float* y = s.y.data();
     Activation* padded = s.padded.data();
-    // the stem's input, its 2 planes padded to 4 channels
-    std::fill(s.padded.begin(), s.padded.begin() + (size_t)PADDED * 4, (Activation)-ACTIVATION_SHIFT);
-    for (int sq = 0; sq < SQUARES; sq++)
-        for (int p = 0; p < 2; p++)
-            s.padded[((sq / 8 + 1) * 10 + sq % 8 + 1) * 4 + p] =
-                (Activation)((obs[p * SQUARES + sq] > 0.5f ? 1 : 0) - ACTIVATION_SHIFT);
-    NET_STAGE("stem input");
-    convolve(n.stem, s, x, C);
-    NET_STAGE("stem conv");
+    stem(n.stem, obs, x);
+    NET_STAGE("stem");
     // what takes the trunk's output next: the next block's first convolution, or the heads'
     auto next = [&](size_t i) -> const Conv& { return i < n.blocks.size() ? n.blocks[i].conv1 : n.head; };
     if (!n.pre) normalize_quantize(n.stem_norm, x, C, next(0), padded, x);
@@ -1157,6 +1205,22 @@ inline void forward(const Net&, Scratch&, const float*, float*, float*) {
 // bits, [cout / 16][cin / 2][2][8 outputs][2 inputs] for 1x1, and for 3x3 the same of each of the 16
 // transformed values, [cout / 16][16][cin / 2][2][8][2], 2G g 2G^T; for NEON, [cout / 8][k * k][cin / 4]
 // [8 outputs][4 inputs].
+// The stem's sums, for `stem`, from its weights `q`, (cout, 4, 3, 3), the last 2 input channels padding:
+// for each row of the 3 rows of 3 squares a square's sums take in (above, its own, below) and each
+// pattern of discs on that row's squares (6 bits: the mover's from the left, then the opponent's), the
+// sum of those discs' weights, (3, 64, cout), within 16 bits (and 3 rows' too: 18 weights of at most 127).
+inline void stem_table(Conv& c, const int8_t* q) {
+    c.table.assign((size_t)3 * 64 * c.cout, 0);
+    for (int dy = 0; dy < 3; dy++)
+        for (int pattern = 0; pattern < 64; pattern++)
+            for (int o = 0; o < c.cout; o++) {
+                int sum = 0;
+                for (int k = 0; k < 6; k++)
+                    if (pattern >> k & 1) sum += q[(((size_t)o * c.cin + k / 3) * 3 + dy) * 3 + k % 3];
+                c.table[((size_t)dy * 64 + pattern) * c.cout + o] = (int16_t)sum;
+            }
+}
+
 inline void pack(Conv& c, const int8_t* q) {
     const int c4n = c.cin / 4, taps = c.k * c.k;
 #if NET_ISA == 3 && defined(__ARM_FEATURE_MATMUL_INT8)

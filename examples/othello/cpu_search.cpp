@@ -861,7 +861,12 @@ int net_set_conv(net::Net* n, const char* where, int block, int cin, int cout, i
     c->cin = cin;
     c->cout = cout;
     c->k = k;
-    net::pack(*c, q);
+    if (c == &n->stem) {
+        if (cin != 4 || k != 3) return -1;
+        net::stem_table(*c, q);
+    } else {
+        net::pack(*c, q);
+    }
     c->scale.assign(scale, scale + cout);
     c->bias.assign(bias, bias + cout);
     c->inverse.assign(inverse, inverse + cin);

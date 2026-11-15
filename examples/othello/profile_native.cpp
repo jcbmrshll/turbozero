@@ -57,7 +57,8 @@ Conv make_conv(int cin, int cout, int k, int zero_point) {
     c.k = k;
     std::vector<int8_t> q((size_t)cout * cin * k * k);
     for (auto& v : q) v = (int8_t)std::uniform_int_distribution<int>(-127, 127)(rng);
-    pack(c, q.data());
+    if (cin == 4) stem_table(c, q.data());  // the stem
+    else pack(c, q.data());
     for (int o = 0; o < cout; o++) {
         c.scale.push_back(1.0f / (40.0f * cin * k * k));
         c.bias.push_back(0.1f * normal());
