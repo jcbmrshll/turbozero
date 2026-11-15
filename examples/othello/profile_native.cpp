@@ -91,11 +91,11 @@ Norm make_norm(int type, int channels) {
 }
 
 Linear make_linear(int in, int out) {
+    std::vector<float> w, b;
+    for (int i = 0; i < in * out; i++) w.push_back(normal() / std::sqrt((float)in));
+    for (int o = 0; o < out; o++) b.push_back(0.1f * normal());
     Linear l;
-    l.in = in;
-    l.out = out;
-    for (int i = 0; i < in * out; i++) l.w.push_back(normal() / std::sqrt((float)in));
-    for (int o = 0; o < out; o++) l.b.push_back(0.1f * normal());
+    set_linear(l, in, out, w.data(), b.data());
     return l;
 }
 
