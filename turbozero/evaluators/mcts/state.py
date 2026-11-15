@@ -29,35 +29,18 @@ class MCTSNode:
     terminated: jax.Array
     embedding: Any
 
-    @property
-    def w(self) -> jax.Array:
-        """Cumulative value estimate."""
-        return self.q * self.n
-
 
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class MCTSTree(Tree[MCTSNode]):
-    """A Tree of MCTSNodes, with the network's evaluation of the root at the start of its search.
-
-    The root node's prior can include noise (e.g. AlphaZero's Dirichlet noise) and its value is the
-    search's running average, so the network's own evaluation is kept here, for the policy target
-    (see `CompletedQ`).
+    """A Tree of MCTSNodes, with the noise its root's prior takes.
 
     Attributes:
-        root_logits: (F) the network's policy logits at the root, illegal actions at the dtype's
-            minimum
-        root_value: () the network's value of the root
         root_noise: (F) the noise the root's prior takes (e.g. AlphaZero's Dirichlet noise), drawn
             when the search starts (see `MCTS.start_search`)
-        fast: () with a `PlayoutCap`, whether the search is a fast one, drawn when it starts (see
-            `MCTS.start_search`); False without
     """
 
-    root_logits: jax.Array
-    root_value: jax.Array
     root_noise: jax.Array
-    fast: jax.Array
 
 
 def init_mcts_tree(
@@ -70,10 +53,7 @@ def init_mcts_tree(
         parents=tree.parents,
         edge_map=tree.edge_map,
         data=tree.data,
-        root_logits=jnp.zeros((branching_factor,), dtype=jnp.float32),
-        root_value=jnp.array(0.0, dtype=jnp.float32),
         root_noise=jnp.zeros((branching_factor,), dtype=jnp.float32),
-        fast=jnp.array(False),
     )
 
 
@@ -161,58 +141,3 @@ class MCTSOutput(EvalOutput):
 
     eval_state: MCTSTree
     policy_weights: jax.Array
-
-
-@jax.tree_util.register_dataclass
-@dataclass(frozen=True)
-class SearchRecord:
-    """What a search explored: its tree's structure and statistics, without the environment states
-    (most of the tree), for the monitor to show. Node indices are the tree's.
-
-    Attributes:
-        parents: (N) each node's parent, NULL_INDEX for the root and unused nodes
-        actions: (N) the action from each node's parent to it, NULL_INDEX for the root and unused nodes
-        n: (N) visit counts
-        q: (N) value estimates, for the player to move at each node
-        prior: (N) the policy's weight on the action from each node's parent to it
-        terminated: (N) whether each node's state is terminal
-        policy: (F) the root's policy
-        num_nodes: () nodes in use, 0 to `num_nodes - 1`
-    """
-
-    parents: jax.Array
-    actions: jax.Array
-    n: jax.Array
-    q: jax.Array
-    prior: jax.Array
-    terminated: jax.Array
-    policy: jax.Array
-    num_nodes: jax.Array
-
-
-def search_record(tree: MCTSTree) -> SearchRecord:
-    """The record of what the search in `tree` explored."""
-    capacity, branching = tree.capacity, tree.branching_factor
-    # each child's action is the edge that points at it; missing edges point out of bounds
-    edges = tree.edge_map.reshape(-1)
-    actions = (
-        jnp.full((capacity,), tree.NULL_INDEX, dtype=jnp.int32)
-        .at[jnp.where(edges == tree.NULL_INDEX, capacity, edges)]
-        .set(jnp.tile(jnp.arange(branching, dtype=jnp.int32), capacity), mode="drop")
-    )
-    has_parent = tree.parents != tree.NULL_INDEX
-    prior = jnp.where(
-        has_parent,
-        tree.data.p[jnp.maximum(tree.parents, 0), jnp.maximum(actions, 0)],
-        0.0,
-    )
-    return SearchRecord(
-        parents=tree.parents,
-        actions=actions,
-        n=tree.data.n,
-        q=tree.data.q,
-        prior=prior,
-        terminated=tree.data.terminated,
-        policy=tree.data.p[tree.ROOT_INDEX],
-        num_nodes=tree.next_free_idx,
-    )
