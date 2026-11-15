@@ -1,6 +1,7 @@
 // Checks of `cpu_net.h`'s pieces that must compute exactly what a plainer computation of the same
 // numbers does, bit for bit, at the level it's compiled for (see `test_cpu_search.py`). Prints each
 // failure; exits 1 if any.
+#include <climits>
 #include <cstdio>
 #include <random>
 
@@ -72,6 +73,69 @@ static void check_norm_stats() {
             expect(same(rstd[s], 1.0f / std::sqrt(sum_lanes(sq) / ch + 1e-5f)), "norm rstd", s);
         }
     }
+}
+
+// a block's pooling bias and its second convolution's input in one pass, against the steps it replaces:
+// the normalization in place, a ReLU of the pooled channels, their means and maxima a square at a time,
+// and the kept channels plus the bias a vector at a time, for both layouts and each type of norm
+static void check_pool_bias_quantize() {
+    const int ch = 48, stride = 64;
+    for (int count : {8, 16, 24})
+        for (int type : {NORM_NONE, NORM_AFFINE, NORM_CHANNEL})
+            for (bool pre : {true, false}) {
+                const int kept = ch - count;
+                std::vector<float> y((size_t)SQUARES * stride);
+                for (auto& v : y) v = any_float();
+                y[5 * stride + ch - 1] = NAN;
+                Norm n;
+                n.type = type;
+                n.channels = ch;
+                for (int i = 0; i < ch; i++) {
+                    n.a.push_back(any_float());
+                    n.c.push_back(any_float());
+                }
+                std::vector<float> w(2 * count * kept), b(kept);
+                for (auto& v : w) v = any_float();
+                for (auto& v : b) v = any_float();
+                Linear pool;
+                set_linear(pool, 2 * count, kept, w.data(), b.data());
+                Conv c;
+                c.cin = kept;
+                c.zero_point = 3;
+                for (int i = 0; i < kept; i++) c.inverse.push_back(std::ldexp(1.0f, (int)(rng() % 12) - 4));
+                std::vector<Activation> got((size_t)PADDED * kept + 16), want(got.size());
+                pool_bias_quantize(n, pool, y.data(), stride, ch, pre, c, got.data());
+
+                normalize(n, y.data(), stride, ch, pre);
+                if (!pre)
+                    for (int s = 0; s < SQUARES; s++)
+                        for (int i = 0; i < count; i += W) {
+                            float* v = y.data() + s * stride + kept + i;
+                            Lanes::store(v, Lanes::relu(Lanes::load(v, count - i)), count - i);
+                        }
+                std::vector<float> pooled(2 * count), bias(kept);
+                for (int i = 0; i < count; i++) {
+                    float sum = 0, most = -INFINITY;
+                    for (int s = 0; s < SQUARES; s++) {
+                        const float v = y[(size_t)s * stride + kept + i];
+                        sum += v;
+                        // AVX-512's maximum takes a NaN in either from v, the others' from most
+                        most = NET_ISA == 2 ? (most > v ? most : v) : (v > most ? v : most);
+                    }
+                    pooled[i] = sum * (1.0f / SQUARES);
+                    pooled[count + i] = most;
+                }
+                linear(pool, pooled.data(), bias.data());
+                border(c, want.data());
+                const Quantizer quantize(c);
+                for (int s = 0; s < SQUARES; s++)
+                    for (int i = 0; i < kept; i += W) {
+                        const int m = kept - i;
+                        F v = Lanes::add(Lanes::load(y.data() + s * stride + i, m), Lanes::load(bias.data() + i, m));
+                        quantize(pre ? v : Lanes::relu_sum(v), i, padded_square(want.data(), s, kept), std::min(m, W));
+                    }
+                for (size_t i = 0; i < (size_t)PADDED * kept; i++) expect(got[i] == want[i], "pool bias quantize", (int)i);
+            }
 }
 
 // the stem's table against its convolution summed directly, on random boards
@@ -160,6 +224,71 @@ static void check_convolve() {
                 }
 }
 
+// a convolution's input as each level quantized it a vector at a time before (a44789c): x * inverse
+// rounded, ties to even, plus the zero point, within 0 to 255, out-of-range values and NaN each level's
+// own way
+static int quantized(float x, float inverse, int zero_point) {
+    volatile float t = x * inverse;
+    const float v = t;
+#if NET_ISA == 2
+    // the conversion takes a NaN and floats out of range to INT_MIN; the zero point's add wraps
+    int32_t i = std::isnan(v) || v >= 2147483648.0f || v < -2147483648.0f ? INT32_MIN : (int32_t)std::nearbyint(v);
+    return std::clamp((int32_t)((uint32_t)i + (uint32_t)zero_point), 0, 255);
+#elif NET_ISA == 1
+    // clamped first, a NaN to the low bound (max's second operand)
+    const float low = -zero_point - 1.0f, high = 256.0f - zero_point;
+    const float c = std::isnan(v) ? low : std::min(std::max(v, low), high);
+    return std::clamp((int)std::nearbyint(c) + zero_point, 0, 255);
+#else
+    // a saturating conversion (a NaN to 0), add of the zero point less 128 and narrowing
+    long long i = std::isnan(v) ? 0 : v >= 2147483647.0f ? INT_MAX : v <= -2147483648.0f ? INT_MIN : (long long)std::nearbyint(v);
+    i = std::clamp(i + zero_point - 128, (long long)INT_MIN, (long long)INT_MAX);
+    return (int)std::clamp(i, -128LL, 127LL) + 128;
+#endif
+}
+
+// `Quantizer`'s packing of whole squares (`quantize_square`, 48 channels) and
+// of a vector at a time, against `quantized`, on values about each bound, ties, infinities and NaN
+static void check_quantize() {
+    const int cin = 48;
+    for (int zero_point : {0, 1, 3, 40, 128, 200, 255}) {
+        std::vector<float> x, inverse;
+        for (float v : {0.0f, -0.0f, 0.5f, 1.5f, 2.5f, -0.5f, -1.5f, 1e10f, -1e10f, INFINITY, -INFINITY, NAN, -NAN,
+                        2147483520.0f, 2147483648.0f, -2147483648.0f, -2147483904.0f, 3e9f, 0x1p-130f})
+            x.push_back(v);
+        for (float b : {(float)-zero_point, 255.0f - zero_point})
+            for (float d = -2; d <= 2; d += 0.25f) x.push_back(b + d);
+        inverse.assign(x.size(), 1.0f);
+        while (x.size() % cin) {
+            x.push_back(any_float() * 300);
+            inverse.push_back(std::ldexp(1.0f + (rng() % 1000) / 1000.0f, (int)(rng() % 8)));
+        }
+        for (size_t first = 0; first < x.size(); first += cin) {
+            Conv c;
+            c.cin = cin;
+            c.zero_point = zero_point;
+            for (int i = 0; i < cin; i++) c.inverse.push_back(inverse[first + i]);
+            const Quantizer quantize(c);
+            alignas(64) Activation got[cin], one[cin];
+            quantize_square(quantize, cin, got, [&](int i) { return Lanes::load(x.data() + first + i); });
+            for (int i = 0; i < cin; i += W) quantize(Lanes::load(x.data() + first + i), i, one);
+            for (int i = 0; i < cin; i++) {
+                const int want = quantized(x[first + i], inverse[first + i], zero_point);
+                expect(got[i] + ACTIVATION_SHIFT == want, "quantize square", (int)first + i);
+                expect(one[i] + ACTIVATION_SHIFT == want, "quantize vector", (int)first + i);
+            }
+#if NET_ISA != 3
+            // a vector's first 4 lanes (add_quantize's last channels)
+            Activation part[W];
+            std::fill(part, part + W, (Activation)7);
+            quantize(Lanes::load(x.data() + first), 0, part, 4);
+            for (int i = 0; i < W; i++)
+                expect(part[i] == (i < 4 ? quantized(x[first + i], inverse[first + i], zero_point) : 7), "quantize part", i);
+#endif
+        }
+    }
+}
+
 static void check_transpose() {
     alignas(64) float x[W][W], got[W];
     F r[W];
@@ -234,6 +363,8 @@ int main() {
     check_norm_stats();
     check_stem();
     check_convolve();
+    check_quantize();
+    check_pool_bias_quantize();
     check_transpose();
     check_linear();
     check_policy_logits();
