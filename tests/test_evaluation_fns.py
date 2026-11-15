@@ -5,10 +5,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from turbozero.evaluators.evaluation_fns import (
-    make_nn_eval_fn,
-    make_nn_eval_fn_no_params_callable,
-)
+from turbozero.evaluators.evaluation_fns import make_nn_eval_fn
 
 
 class OffsetNet(eqx.Module):
@@ -43,16 +40,3 @@ def test_nn_eval_fn_applies_the_params_and_state_it_is_given():
     assert logits.shape == (3,) and value.shape == ()
     np.testing.assert_allclose(logits, other.linear(x), rtol=1e-6)
     assert float(value) == 3.0
-
-
-def test_no_params_eval_fn_calls_the_function_on_a_batch_of_one():
-    def nn(x):
-        assert x.shape == (1, 2)
-        return x * 2, x.sum(axis=-1, keepdims=True)
-
-    logits, value = make_nn_eval_fn_no_params_callable(nn, lambda s: s["obs"])(
-        {"obs": jnp.array([1.0, 2.0])}, None, jax.random.PRNGKey(0)
-    )
-
-    np.testing.assert_array_equal(logits, [2.0, 4.0])
-    assert value.shape == () and float(value) == 3.0
