@@ -10,7 +10,6 @@ dependencies = [
     "equinox>=0.13.8",
     "jax>=0.11.2",
     "optax>=0.2.8",
-    "seaglass",
 ]
 
 [project.optional-dependencies]
@@ -25,33 +24,15 @@ build-backend = "hatchling.build"
 packages = ["turbozero"]
 
 [tool.pyright]
-include = ["turbozero", "tests", "examples"]
+include = ["turbozero", "tests"]
 venvPath = "."
 venv = ".venv"
-# the examples' scripts import their sibling modules
-executionEnvironments = [
-    { root = "examples/othello/ggs_client", extraPaths = ["examples/othello/ggs_client", "examples/othello"] },
-    { root = "examples/othello", extraPaths = ["examples/othello"] },
-    { root = "examples/hex", extraPaths = ["examples/hex"] },
-    { root = "examples/connect_four", extraPaths = ["examples/connect_four"] },
-    # tests of the Othello example's modules import them as its scripts do
-    { root = "tests", extraPaths = ["examples/othello", "examples/othello/ggs_client"] },
-]
 
 [tool.ruff]
 # `ruff check` uses ruff's default rule set (no select/ignore); `ruff format` uses its defaults (line length 88)
 
 [dependency-groups]
 dev = [
-    # environments + pretrained baselines used by the examples (pgx's baseline models need haiku)
-    "dm-haiku>=0.0.17",
-    "google-cloud-storage>=3.17.1",
-    "modal>=1.6.3",
-    "nncf>=3.4.0",
-    "onnx>=1.23.2",
-    "onnxruntime>=1.31.1",
-    "openvino>=2026.4.1",
-    "pgx>=2.6.0",
     "pre-commit>=4.6.2",
     "pyright>=1.1.414",
     "pytest>=9.1.1",
@@ -65,6 +46,3 @@ testpaths = ["tests"]
 # to 8 processes (`-n0` runs them in this one, e.g. to debug with --pdb)
 addopts = "-ra -n auto --maxprocesses 8 --dist worksteal"
 xfail_strict = true
-
-[tool.uv.sources]
-seaglass = { git = "https://github.com/jcbmrshll/seaglass", rev = "v0.3.0" }

@@ -1,11 +1,6 @@
 checkpoints/
 .vscode/
 
-# outputs of training runs (and a seaglass server's runs, `seaglass serve --dir runs`)
-runs/
-# pgx baseline models, downloaded by pgx.make_baseline_model
-baselines/
-
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -133,4 +128,3 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
-examples/othello/eval-out/
