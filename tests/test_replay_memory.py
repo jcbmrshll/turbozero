@@ -102,40 +102,6 @@ def test_truncate_wraps_around_mid_episode():
     assert state.buffer.observation_nn[3] == 8
 
 
-def stacked(obs_ids):
-    """Experiences identified by their observations, stacked along a leading dimension."""
-    return jax.tree.map(lambda *x: jnp.stack(x), *[experience(i) for i in obs_ids])
-
-
-def test_add_experiences_adds_the_valid_ones_ready_to_sample():
-    buffer = EpisodeReplayBuffer(capacity=5)
-    state = init_single(buffer)
-
-    state = buffer.add_experiences(
-        state, stacked([1, 2, 3, 4]), jnp.array([True, False, True, False])
-    )
-
-    # written one after another, without gaps, and they can be sampled at once
-    assert state.next_idx == 2
-    np.testing.assert_array_equal(state.buffer.observation_nn, [1, 3, 0, 0, 0])
-    np.testing.assert_array_equal(
-        buffer.sample_mask(state), [True, True, False, False, False]
-    )
-
-    # wrapping around the end
-    state = buffer.add_experiences(
-        state, stacked([5, 6, 7, 8]), jnp.array([True, True, True, True])
-    )
-    state = buffer.add_experiences(state, stacked([9, 10]), jnp.array([False, True]))
-    assert state.next_idx == 2
-    np.testing.assert_array_equal(state.buffer.observation_nn, [8, 10, 5, 6, 7])
-    assert buffer.sample_mask(state).all()
-
-    # none valid: nothing changes
-    unchanged = buffer.add_experiences(state, stacked([11, 12]), jnp.zeros(2, bool))
-    assert jax.tree.all(jax.tree.map(np.array_equal, unchanged, state))
-
-
 def test_sample_indices_with_replacement_from_fewer_entries():
     buffer = EpisodeReplayBuffer(capacity=8)
     mask = jnp.zeros((2, 8), dtype=bool).at[1, 3].set(True)
@@ -318,7 +284,3 @@ def test_buffer_operations_take_the_capacity_of_the_state():
     assert state.populated.shape == (3,)
     assert sampleable(buffer, state) == [2, 3, 4]
     assert state.next_idx == 1
-    # so do tree positions' writes
-    state = buffer.add_experiences(state, stacked([5, 6]), jnp.array([True, True]))
-    assert sampleable(buffer, state) == [4, 5, 6]
-    assert state.next_idx == 0

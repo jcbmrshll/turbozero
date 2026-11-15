@@ -102,40 +102,6 @@ class EpisodeReplayBuffer:
             has_reward=state.has_reward.at[index].set(False, mode="drop"),
         )
 
-    def add_experiences(
-        self, state: ReplayBufferState, experiences: BaseExperience, valid: jax.Array
-    ) -> ReplayBufferState:
-        """Adds the experiences marked in `valid`, in order, one after another,
-        ready to sample: their targets are already known (e.g. positions from a
-        search tree). Keep them in a buffer of their own, as `truncate` would
-        discard them along with an episode in progress.
-
-        Args:
-            experiences: leading dimension of at most `capacity`
-        """
-        index = self.write_indices(state, valid)
-        next_idx = (state.next_idx + valid.sum()) % state.capacity
-        return replace(
-            state,
-            buffer=jax.tree.map(
-                lambda x, y: x.at[index].set(y, mode="drop"), state.buffer, experiences
-            ),
-            next_idx=next_idx,
-            episode_start_idx=next_idx,
-            populated=state.populated.at[index].set(True, mode="drop"),
-            has_reward=state.has_reward.at[index].set(True, mode="drop"),
-        )
-
-    def write_indices(self, state: ReplayBufferState, valid: jax.Array) -> jax.Array:
-        """Where `add_experiences` writes each experience marked in `valid`;
-        `capacity` (out of bounds) for the others.
-        """
-        # the i-th valid experience goes i places after `next_idx`
-        offsets = jnp.cumsum(valid) - 1
-        return jnp.where(
-            valid, (state.next_idx + offsets) % state.capacity, state.capacity
-        )
-
     def assign_rewards(
         self, state: ReplayBufferState, reward: jax.Array
     ) -> ReplayBufferState:
