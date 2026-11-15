@@ -40,13 +40,13 @@ class Evaluator:
         self.discount = discount
 
     def init(self, template_embedding: Any) -> Any:
-        """The evaluator's state before a game, for environment states shaped
+        """The evaluator's state before an episode, for environment states shaped
         like `template_embedding`.
         """
         raise NotImplementedError()
 
     def reset(self, state: Any) -> Any:
-        """The state for a new game."""
+        """The state for a new episode."""
         return state
 
     def evaluate(
@@ -109,7 +109,7 @@ class Evaluator:
         self, state: Any, action: jax.Array, reset: ArrayLike, active: ArrayLike = True
     ) -> Any:
         """The state for the next move: `step` with `action`, or `reset` if
-        `reset` (e.g. at the end of a game); `state` as it is unless `active`.
+        `reset` (e.g. at the end of an episode); `state` as it is unless `active`.
         """
         moved = jax.lax.cond(reset, self.reset, lambda s: self.step(s, action), state)
         return where_tree(active, moved, state)

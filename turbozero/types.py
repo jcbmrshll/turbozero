@@ -14,7 +14,7 @@ class StepMetadata:
 
     rewards: jax.Array  # (players,) this step's reward for each player
     action_mask: jax.Array  # (actions,) the legal actions
-    terminated: jax.Array  # () whether the game is over
+    terminated: jax.Array  # () whether the episode is over
     cur_player_id: jax.Array  # () the player to move
     step: jax.Array  # () steps taken so far in the episode
 
