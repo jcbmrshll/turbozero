@@ -64,6 +64,21 @@ using Activation = int16_t;
 #endif
 constexpr int ACTIVATION_SHIFT = NET_ISA == 3 ? 128 : 0;
 
+// an allocator of memory 64-byte aligned, for vector loads that don't straddle cache lines
+template <class T>
+struct Aligned {
+    using value_type = T;
+    Aligned() = default;
+    template <class U>
+    Aligned(const Aligned<U>&) {}
+    T* allocate(size_t n) { return (T*)::operator new(n * sizeof(T), std::align_val_t(64)); }
+    void deallocate(T* p, size_t) { ::operator delete(p, std::align_val_t(64)); }
+    template <class U>
+    bool operator==(const Aligned<U>&) const { return true; }
+    template <class U>
+    bool operator!=(const Aligned<U>&) const { return false; }
+};
+
 struct Conv {
     int cin = 0, cout = 0, k = 3;
     // the weights for the kernel (see `pack`)
@@ -91,6 +106,9 @@ struct Linear {
     int in = 0, out = 0;
     std::vector<float> w;  // (out, in)
     std::vector<float> b;
+    // x86: `w`'s outputs in blocks of a vector's width V (16 or 8), each block's weights in the order
+    // `linear` reads them, [in / V][V outputs][V inputs], so that it reads one stream (`set_linear`)
+    std::vector<float, Aligned<float>> packed;
 };
 
 struct Block {
@@ -114,6 +132,26 @@ struct Net {
     Linear pool_linear, pass_linear, value_hidden, value_out;
     std::vector<float> square_w;  // (head_channels)
 };
+
+// `l` of `in` inputs and `out` outputs, `w` (out, in) and `b` (out), with its packed weights
+inline void set_linear(Linear& l, int in, int out, const float* w, const float* b) {
+    l.in = in;
+    l.out = out;
+    l.w.assign(w, w + (size_t)in * out);
+    l.b.assign(b, b + out);
+    l.packed.clear();
+#if NET_ISA == 1 || NET_ISA == 2
+    constexpr int V = NET_ISA == 2 ? 16 : 8;  // the x86 vector's width
+    if (in % V) return;
+    l.packed.reserve((size_t)in * (out - out % V));
+    for (int o = 0; o + V <= out; o += V)
+        for (int i = 0; i < in; i += V)
+            for (int k = 0; k < V; k++) {
+                const float* row = w + (size_t)(o + k) * in + i;
+                l.packed.insert(l.packed.end(), row, row + V);
+            }
+#endif
+}
 
 // what a forward pass writes as it goes, one to a thread
 struct Scratch {
@@ -612,15 +650,18 @@ inline void board_pool(const float* x, int stride, int first, int count, float* 
 
 inline void linear(const Linear& l, const float* in, float* out) {
     int o = 0;
-    // 16 outputs at a time, their sums reduced together
+    // 16 outputs at a time, their sums reduced together, from the packed weights (a line a load,
+    // fetched 2 KB ahead); the inputs outside the outputs, so that the 16 sums stay in registers
     if (l.in % 16 == 0)
-        for (; o + 16 <= l.out; o += 16) {
+        for (const float* w = l.packed.data(); o + 16 <= l.out; o += 16) {
             __m512 acc[16];
-            for (int k = 0; k < 16; k++) {
-                const float* w = l.w.data() + (size_t)(o + k) * l.in;
-                __m512 sum = _mm512_setzero_ps();
-                for (int i = 0; i < l.in; i += 16) sum = _mm512_fmadd_ps(_mm512_loadu_ps(w + i), _mm512_loadu_ps(in + i), sum);
-                acc[k] = sum;
+            for (int k = 0; k < 16; k++) acc[k] = _mm512_setzero_ps();
+            for (int i = 0; i < l.in; i += 16, w += 256) {
+                const __m512 x = _mm512_loadu_ps(in + i);
+                for (int k = 0; k < 16; k++) {
+                    _mm_prefetch((const char*)(w + 16 * k + 512), _MM_HINT_T0);
+                    acc[k] = _mm512_fmadd_ps(_mm512_load_ps(w + 16 * k), x, acc[k]);
+                }
             }
             _mm512_storeu_ps(out + o, _mm512_add_ps(_mm512_loadu_ps(l.b.data() + o), Lanes::reduce(acc)));
         }
@@ -835,16 +876,19 @@ inline void linear(const Linear& l, const float* in, float* out) {
     int o = 0;
 #if NET_ISA == 1
     // 8 outputs at a time, summed as the compiler's loop below sums one: products, unfused, added up
-    // 8 lanes at a time, then the lanes in order onto 0
+    // 8 lanes at a time, then the lanes in order onto 0. From the packed weights; the inputs outside
+    // the outputs, so that the 8 sums stay in registers.
     if (l.in % 8 == 0)
-        for (; o + 8 <= l.out; o += 8) {
+        for (const float* w = l.packed.data(); o + 8 <= l.out; o += 8) {
             __m256 acc[8];
-            for (int k = 0; k < 8; k++) {
-                const float* w = l.w.data() + (size_t)(o + k) * l.in;
-                __m256 sum = _mm256_setzero_ps();
-                for (int i = 0; i < l.in; i += 8)
-                    sum = _mm256_add_ps(sum, Lanes::product(_mm256_loadu_ps(w + i), _mm256_loadu_ps(in + i)));
-                acc[k] = sum;
+            for (int k = 0; k < 8; k++) acc[k] = _mm256_setzero_ps();
+            for (int i = 0; i < l.in; i += 8, w += 64) {
+                const __m256 x = _mm256_loadu_ps(in + i);
+                for (int k = 0; k < 8; k++) {
+                    // a line every two loads, fetched 2 KB ahead
+                    if (k % 2 == 0) _mm_prefetch((const char*)(w + 8 * k + 512), _MM_HINT_T0);
+                    acc[k] = _mm256_add_ps(acc[k], Lanes::product(_mm256_load_ps(w + 8 * k), x));
+                }
             }
             // lane j of each output's sum to acc[j]
             Lanes::transpose(acc);
@@ -1085,23 +1129,31 @@ inline void normalize_pool(const Norm& n, const float* x, int stride, int ch, fl
 // the policy's logit of each square: the sum, in order onto 0, of std::max(p + bias, 0) * square_w, the
 // products rounded on their own, over p = n(h), the square's first H (a multiple of W) channels of h,
 // (64, stride); as the compiler's loop summed one square, here W squares a lane each, their channels
-// transposed
+// transposed. K groups of W squares at a time, so that their sums don't wait on each other (AVX-512's
+// 32 registers hold 4 groups' columns; AVX2's 16 only one group's).
 inline void policy_logits(const Norm& n, const float* h, int stride, int H, const float* bias, const float* square_w,
                           float* logits) {
+    constexpr int K = NET_ISA == 2 ? 4 : 1;
     with_norm(n, h, stride, H, [&](const auto& norm) {
-        for (int s0 = 0; s0 < SQUARES; s0 += W) {
-            F logit = Lanes::zero();
+        for (int s0 = 0; s0 < SQUARES; s0 += K * W) {
+            F logit[K];
+            for (int k = 0; k < K; k++) logit[k] = Lanes::zero();
             for (int i0 = 0; i0 < H; i0 += W) {
-                F column[W];
-                for (int s = 0; s < W; s++) column[s] = Lanes::load(h + (s0 + s) * stride + i0);
-                Lanes::transpose(column);
+                F column[K][W];
+                for (int k = 0; k < K; k++) {
+                    for (int s = 0; s < W; s++) column[k][s] = Lanes::load(h + (s0 + k * W + s) * stride + i0);
+                    Lanes::transpose(column[k]);
+                }
                 for (int j = 0; j < W; j++) {
                     const int i = i0 + j;
-                    F p = Lanes::add(norm.column(column[j], s0, i), Lanes::set1(bias[i]));
-                    logit = Lanes::add(logit, Lanes::product(Lanes::max0(p), Lanes::set1(square_w[i])));
+                    const F b = Lanes::set1(bias[i]), w = Lanes::set1(square_w[i]);
+                    for (int k = 0; k < K; k++) {
+                        F p = Lanes::add(norm.column(column[k][j], s0 + k * W, i), b);
+                        logit[k] = Lanes::add(logit[k], Lanes::product(Lanes::max0(p), w));
+                    }
                 }
             }
-            Lanes::store(logits + s0, logit);
+            for (int k = 0; k < K; k++) Lanes::store(logits + s0 + k * W, logit[k]);
         }
     });
 }
@@ -1144,6 +1196,37 @@ inline void stem(const Conv& c, const float* obs, float* out) {
             Lanes::store(out + sq * C + i, Lanes::fma(Lanes::widen(rows[0] + i, rows[1] + i, rows[2] + i),
                                                       Lanes::load(scale + i), Lanes::load(bias + i)));
     }
+}
+
+// the heads' float work, from the head convolution's output `h`, (64, 3 * head_channels)
+inline void heads(const Net& n, float* h, float* logits, float* value) {
+    const int H = n.head_channels, H3 = 3 * H;
+    // each part normalized, of its own channels: the pooled part's and the value's pooled as they go
+    // (out: a vector of outputs, as `linear` writes them, though it takes 1)
+    alignas(64) float pooled[256], bias[128], hidden[1024], out[16];
+    normalize_pool(n.pool_norm, h + H, H3, H, pooled);
+    linear(n.pool_linear, pooled, bias);
+    NET_STAGE("head policy pool");
+#if NET_ISA != 3
+    policy_logits(n.policy_norm, h, H3, H, bias, n.square_w.data(), logits);
+#else
+    normalize(n.policy_norm, h, H3, H, false);
+    for (int sq = 0; sq < SQUARES; sq++) {
+        float* v = h + sq * H3;
+        float logit = 0;
+        for (int i = 0; i < H; i++) logit += std::max(v[i] + bias[i], 0.0f) * n.square_w[i];
+        logits[sq] = logit;
+    }
+#endif
+    NET_STAGE("head square logits");
+    linear(n.pass_linear, pooled, out);
+    logits[SQUARES] = out[0];
+    normalize_pool(n.value_norm, h + 2 * H, H3, H, pooled);
+    linear(n.value_hidden, pooled, hidden);
+    relu(hidden, n.value_hidden.out);
+    linear(n.value_out, hidden, out);
+    *value = std::tanh(out[0]);
+    NET_STAGE("head pass and value");
 }
 
 // One position: `obs`, (2, 8, 8) channels-first, the mover's discs then the opponent's, to (65)
@@ -1197,36 +1280,10 @@ inline void forward(const Net& n, Scratch& s, const float* obs, float* logits, f
     NET_STAGE("final norm quantize");
 
     // the heads: the three 1x1 convolutions at once, then in float
-    const int H = n.head_channels, H3 = 3 * H;
     float* h = s.h.data();
-    convolve(n.head, s, h, H3);
+    convolve(n.head, s, h, 3 * n.head_channels);
     NET_STAGE("head conv");
-    // each part normalized, of its own channels: the pooled part's and the value's pooled as they go
-    // (out: a vector of outputs, as `linear` writes them, though it takes 1)
-    float pooled[256], bias[128], hidden[1024], out[16];
-    normalize_pool(n.pool_norm, h + H, H3, H, pooled);
-    linear(n.pool_linear, pooled, bias);
-    NET_STAGE("head policy pool");
-#if NET_ISA != 3
-    policy_logits(n.policy_norm, h, H3, H, bias, n.square_w.data(), logits);
-#else
-    normalize(n.policy_norm, h, H3, H, false);
-    for (int sq = 0; sq < SQUARES; sq++) {
-        float* v = h + sq * H3;
-        float logit = 0;
-        for (int i = 0; i < H; i++) logit += std::max(v[i] + bias[i], 0.0f) * n.square_w[i];
-        logits[sq] = logit;
-    }
-#endif
-    NET_STAGE("head square logits");
-    linear(n.pass_linear, pooled, out);
-    logits[SQUARES] = out[0];
-    normalize_pool(n.value_norm, h + 2 * H, H3, H, pooled);
-    linear(n.value_hidden, pooled, hidden);
-    relu(hidden, n.value_hidden.out);
-    linear(n.value_out, hidden, out);
-    *value = std::tanh(out[0]);
-    NET_STAGE("head pass and value");
+    heads(n, h, logits, value);
 }
 
 #else
