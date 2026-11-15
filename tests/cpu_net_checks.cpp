@@ -113,51 +113,49 @@ static void check_stem() {
     }
 }
 
-// a convolution's integer sums, any order, then acc * scale + bias rounded once, added to what's there
-// for a residual (only ever a 3x3); channels that aren't a multiple of 16 run a kernel row's taps into
-// one another
+// a 3x3 convolution's integer sums, any order, then acc * scale + bias rounded once, added to what's
+// there for a residual; channels that aren't a multiple of 16 run a kernel row's taps into one another
+// (the heads' 1x1: `check_conv_1x1`)
 static void check_convolve() {
-    for (int k : {3, 1})
-        for (int cin : {16, 40, 64})
-            for (int cout : {32, 48})
-                for (bool add : {false, true}) {
-                    if (add && k == 1) continue;
-                    Conv c;
-                    c.cin = cin;
-                    c.cout = cout;
-                    c.k = k;
-                    const int taps = k * k;
-                    std::vector<int8_t> q((size_t)cout * cin * taps);
-                    for (auto& w : q) w = (int8_t)((int)(rng() % 255) - 127);
-                    pack(c, q.data());
-                    for (int o = 0; o < cout; o++) {
-                        c.scale.push_back(std::ldexp(1.0f + (rng() % 1000) / 1000.0f, -10));
-                        c.bias.push_back(any_float());
-                    }
-                    Net n;
-                    n.channels = cin;
-                    n.head_channels = cout;
-                    Scratch s(n);
-                    // inputs anywhere in their 8 bits, the border too
-                    for (auto& a : s.padded) a = (Activation)((int)(rng() % 256) - ACTIVATION_SHIFT);
-                    std::vector<float> before((size_t)SQUARES * cout), got;
-                    for (auto& v : before) v = any_float();
-                    got = before;
-                    convolve(c, s, got.data(), cout, add);
-                    for (int sq = 0; sq < SQUARES; sq++)
-                        for (int o = 0; o < cout; o++) {
-                            int acc = 0;
-                            for (int t = 0; t < taps; t++) {
-                                const int dy = k == 3 ? t / 3 : 1, dx = k == 3 ? t % 3 : 1;
-                                const Activation* in = s.padded.data() + ((sq / 8 + dy) * 10 + sq % 8 + dx) * cin;
-                                for (int ch = 0; ch < cin; ch++)
-                                    acc += q[((size_t)o * cin + ch) * taps + t] * ((int)in[ch] + ACTIVATION_SHIFT);
-                            }
-                            const float v = std::fma((float)acc, c.scale[o], c.bias[o]);
-                            const size_t at = (size_t)sq * cout + o;
-                            expect(same(got[at], add ? before[at] + v : v), "convolve", (int)at);
-                        }
+    for (int cin : {16, 40, 64})
+        for (int cout : {32, 48})
+            for (bool add : {false, true}) {
+                Conv c;
+                c.cin = cin;
+                c.cout = cout;
+                c.k = 3;
+                const int taps = 9;
+                std::vector<int8_t> q((size_t)cout * cin * taps);
+                for (auto& w : q) w = (int8_t)((int)(rng() % 255) - 127);
+                pack(c, q.data());
+                for (int o = 0; o < cout; o++) {
+                    c.scale.push_back(std::ldexp(1.0f + (rng() % 1000) / 1000.0f, -10));
+                    c.bias.push_back(any_float());
                 }
+                Net n;
+                n.channels = cin;
+                n.head_channels = cout;
+                Scratch s(n);
+                // inputs anywhere in their 8 bits, the border too
+                for (auto& a : s.padded) a = (Activation)((int)(rng() % 256) - ACTIVATION_SHIFT);
+                std::vector<float> before((size_t)SQUARES * cout), got;
+                for (auto& v : before) v = any_float();
+                got = before;
+                convolve(c, s, got.data(), cout, add);
+                for (int sq = 0; sq < SQUARES; sq++)
+                    for (int o = 0; o < cout; o++) {
+                        int acc = 0;
+                        for (int t = 0; t < taps; t++) {
+                            const int dy = t / 3, dx = t % 3;
+                            const Activation* in = s.padded.data() + ((sq / 8 + dy) * 10 + sq % 8 + dx) * cin;
+                            for (int ch = 0; ch < cin; ch++)
+                                acc += q[((size_t)o * cin + ch) * taps + t] * ((int)in[ch] + ACTIVATION_SHIFT);
+                        }
+                        const float v = std::fma((float)acc, c.scale[o], c.bias[o]);
+                        const size_t at = (size_t)sq * cout + o;
+                        expect(same(got[at], add ? before[at] + v : v), "convolve", (int)at);
+                    }
+            }
 }
 
 #if NET_ISA != 3
@@ -231,11 +229,46 @@ static void check_policy_logits() {
 }
 #endif
 
+// a 1x1 convolution (the heads') against its sums done one by one, with the same rounding: every
+// input value and weight, 16 to 128 channels, the heads' 48 to 144 outputs
+static void check_conv_1x1() {
+    for (int cin : {16, 32, 64, 128})
+        for (int cout : {48, 96, 144}) {
+            Conv c;
+            c.cin = cin;
+            c.cout = cout;
+            c.k = 1;
+            std::vector<int8_t> q((size_t)cout * cin);
+            for (auto& v : q) v = (int8_t)((int)(rng() % 255) - 127);
+            pack(c, q.data());
+            for (int o = 0; o < cout; o++) {
+                c.scale.push_back(any_float());
+                c.bias.push_back(any_float());
+            }
+            Net n;
+            n.channels = cin;
+            n.head_channels = cout / 3;
+            Scratch s(n);
+            for (auto& v : s.padded) v = (Activation)((int)(rng() % 256) - ACTIVATION_SHIFT);
+            std::vector<float> got((size_t)SQUARES * cout);
+            convolve(c, s, got.data(), cout);
+            for (int sq = 0; sq < SQUARES; sq++) {
+                const Activation* a = padded_square(s.padded.data(), sq, cin);
+                for (int o = 0; o < cout; o++) {
+                    int32_t acc = 0;
+                    for (int i = 0; i < cin; i++) acc += ((int)a[i] + ACTIVATION_SHIFT) * q[(size_t)o * cin + i];
+                    expect(same(got[(size_t)sq * cout + o], std::fma((float)acc, c.scale[o], c.bias[o])), "conv_1x1", sq);
+                }
+            }
+        }
+}
+
 int main() {
     check_reduce();
     check_norm_stats();
     check_stem();
     check_convolve();
+    check_conv_1x1();
 #if NET_ISA != 3
     check_transpose();
     check_linear();
