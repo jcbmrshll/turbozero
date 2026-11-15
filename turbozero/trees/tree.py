@@ -115,13 +115,15 @@ class Tree[NodeType]:
             self,
             next_free_idx=jnp.where(adding, self.next_free_idx + 1, self.next_free_idx),
             # an existing child's parent is already `parent_index`
-            parents=parents.at[index].set(parent_index),
+            parents=parents.at[index].set(parent_index, mode="drop"),
             # an edge that doesn't exist is NULL_INDEX already (the evicted
             # leaf's edge isn't this one: the edge exists, or it has no child)
             edge_map=edge_map.at[parent_index, edge_index].set(
                 jnp.where(adding | evicting, index, child)
             ),
-            data=jax.tree.map(lambda x, y: x.at[index].set(y), tree_data, data),
+            data=jax.tree.map(
+                lambda x, y: x.at[index].set(y, mode="drop"), tree_data, data
+            ),
         )
 
     def leaves(self) -> jax.Array:
@@ -148,7 +150,9 @@ class Tree[NodeType]:
             next_free_idx=jnp.where(
                 write, jnp.maximum(self.next_free_idx, 1), self.next_free_idx
             ),
-            data=jax.tree.map(lambda x, y: x.at[index].set(y), tree_data, data),
+            data=jax.tree.map(
+                lambda x, y: x.at[index].set(y, mode="drop"), tree_data, data
+            ),
         )
 
     def update_node(self, index: ArrayLike, data: NodeType) -> Self:
