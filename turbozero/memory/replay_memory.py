@@ -71,8 +71,9 @@ class EpisodeReplayBuffer:
     """Stores self-play episodes' experiences for training, overwriting the
     oldest. `capacity` is that of the states `init` makes; the other methods
     take the capacity of the state they're given, so they work on a state
-    `resize`d to another. They take a single environment's state, so self-play
-    vmaps them over environments.
+    `resize`d to another. Writing and resizing take a single environment's
+    state, so self-play vmaps them over environments; sampling takes the
+    stacked states of every environment, and draws across all of them.
     """
 
     def __init__(self, capacity: int):
@@ -172,9 +173,11 @@ class EpisodeReplayBuffer:
         self, key: jax.Array, mask: jax.Array, sample_size: int, replace: bool = False
     ) -> jax.Array:
         """(sample_size,) indices into the flattened `mask`, drawn uniformly
-        from the entries it marks (see `sample_mask`). Without `replace`, `mask`
-        must mark at least `sample_size` entries, else unmarked ones fill the
-        rest of the sample.
+        from all the entries it marks, whatever environment they're in: `mask`
+        is `sample_mask` of the stacked states, and
+        `jnp.unravel_index(indices, mask.shape)` indexes their buffers. Without
+        `replace`, `mask` must mark at least `sample_size` entries, else
+        unmarked ones fill the rest of the sample.
         """
         mask = mask.reshape(-1)
         return jax.random.choice(
