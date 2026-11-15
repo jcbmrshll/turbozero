@@ -3,6 +3,7 @@ from dataclasses import replace
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from turbozero.memory.replay_memory import (
     BaseExperience,
@@ -274,3 +275,108 @@ def test_transform_randomly_draws_a_transform_for_each_sample_uniformly():
     # without transforms, the experiences are left as they are
     same = transform_randomly(jax.random.PRNGKey(1), experiences, ())
     assert same is experiences
+
+
+def sampleable(buffer, state):
+    """Observations of the entries `sample_mask` marks, sorted."""
+    mask = np.asarray(buffer.sample_mask(state))
+    return sorted(np.asarray(state.buffer.observation_nn)[mask].tolist())
+
+
+@pytest.mark.parametrize("capacity", [3, 5, 9])
+def test_resize_keeps_the_newest_entries_oldest_first(capacity):
+    buffer = EpisodeReplayBuffer(capacity=5)
+    # wrapped around: index 0 holds 6, index 1 holds 7
+    state = buffer.assign_rewards(
+        add(buffer, init_single(buffer), [1, 2, 3, 4, 5, 6, 7]), jnp.array([1.0, -1.0])
+    )
+
+    resized = buffer.resize(state, capacity)
+
+    assert resized.capacity == capacity
+    assert sampleable(buffer, resized) == [3, 4, 5, 6, 7][-capacity:]
+    # every array keeps its dtype (e.g. the boolean policy mask)
+    assert [x.dtype for x in jax.tree.leaves(resized)] == [
+        x.dtype for x in jax.tree.leaves(state)
+    ]
+    # and it goes on as a buffer of the new capacity
+    resized = buffer.assign_rewards(add(buffer, resized, [8]), jnp.array([1.0, -1.0]))
+    assert sampleable(buffer, resized) == [3, 4, 5, 6, 7, 8][-capacity:]
+
+
+@pytest.mark.parametrize("capacity", [4, 6, 12])
+def test_resize_keeps_an_episode_in_progress(capacity):
+    buffer = EpisodeReplayBuffer(capacity=7)
+    # a finished episode 1-5, then 6-7 in progress
+    state = buffer.assign_rewards(
+        add(buffer, init_single(buffer), [1, 2, 3, 4, 5]), jnp.array([1.0, -1.0])
+    )
+    state = add(buffer, state, [6, 7])
+
+    resized = buffer.resize(state, capacity)
+
+    # the episode in progress can't be sampled, and is kept
+    assert sampleable(buffer, resized) == [1, 2, 3, 4, 5][-(capacity - 2) :]
+    # when it ends, its entries get its reward
+    ended = buffer.assign_rewards(add(buffer, resized, [8]), jnp.array([-1.0, 1.0]))
+    assert sampleable(buffer, ended) == [1, 2, 3, 4, 5, 6, 7, 8][-capacity:]
+    rewards = {
+        int(obs): float(r[0])
+        for obs, r, ok in zip(
+            ended.buffer.observation_nn,
+            ended.buffer.reward,
+            ended.populated,
+            strict=True,
+        )
+        if ok
+    }
+    assert {obs: rewards[obs] for obs in (6, 7, 8)} == {6: -1.0, 7: -1.0, 8: -1.0}
+    assert all(rewards[obs] == 1.0 for obs in rewards if obs < 6)
+    # or truncating discards just its entries
+    truncated = buffer.truncate(add(buffer, resized, [8]))
+    assert sampleable(buffer, truncated) == [1, 2, 3, 4, 5][-(capacity - 3) :]
+    assert int(truncated.populated.sum()) == min(5, capacity - 3)
+
+
+def test_resize_keeps_the_newest_entries_of_an_episode_longer_than_it():
+    buffer = EpisodeReplayBuffer(capacity=6)
+    state = add(buffer, init_single(buffer), [1, 2, 3, 4, 5])
+
+    resized = buffer.assign_rewards(
+        add(buffer, buffer.resize(state, 3), [6]), jnp.ones(2)
+    )
+
+    assert sampleable(buffer, resized) == [4, 5, 6]
+
+
+def test_resize_under_jit_and_vmap():
+    buffer = EpisodeReplayBuffer(capacity=4)
+    states = [
+        buffer.assign_rewards(add(buffer, init_single(buffer), ids), jnp.ones(2))
+        for ids in ([1, 2, 3, 4, 5], [6, 7])
+    ]
+    state = jax.tree.map(lambda *x: jnp.stack(x), *states)
+
+    resized = jax.jit(jax.vmap(buffer.resize, in_axes=(0, None)), static_argnums=1)(
+        state, 2
+    )
+
+    assert resized.populated.shape == (2, 2)
+    for i, expected in enumerate([[4, 5], [6, 7]]):
+        env = jax.tree.map(lambda x, i=i: x[i], resized)
+        assert sampleable(buffer, env) == expected
+
+
+def test_buffer_operations_take_the_capacity_of_the_state():
+    # a buffer configured for 5 entries, on a state of 3
+    buffer = EpisodeReplayBuffer(capacity=5)
+    state = init_single(EpisodeReplayBuffer(capacity=3))
+
+    state = buffer.assign_rewards(add(buffer, state, [1, 2, 3, 4]), jnp.ones(2))
+    assert state.populated.shape == (3,)
+    assert sampleable(buffer, state) == [2, 3, 4]
+    assert state.next_idx == 1
+    # so do tree positions' writes
+    state = buffer.add_experiences(state, stacked([5, 6]), jnp.array([True, True]))
+    assert sampleable(buffer, state) == [4, 5, 6]
+    assert state.next_idx == 0

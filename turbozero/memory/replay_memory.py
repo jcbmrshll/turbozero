@@ -61,11 +61,18 @@ class ReplayBufferState:
     populated: jax.Array  # (capacity,) which places hold an entry
     has_reward: jax.Array  # (capacity,) false for the current episode's entries
 
+    @property
+    def capacity(self) -> int:
+        """The most entries the buffer holds."""
+        return self.populated.shape[-1]
+
 
 class EpisodeReplayBuffer:
-    """Stores self-play episodes' experiences for training, `capacity` per
-    environment, overwriting the oldest. Its methods take a single
-    environment's state, so self-play vmaps them over environments.
+    """Stores self-play episodes' experiences for training, overwriting the
+    oldest. `capacity` is that of the states `init` makes; the other methods
+    take the capacity of the state they're given, so they work on a state
+    `resize`d to another. They take a single environment's state, so self-play
+    vmaps them over environments.
     """
 
     def __init__(self, capacity: int):
@@ -82,14 +89,14 @@ class EpisodeReplayBuffer:
         between two whole buffers.
         """
         # an out-of-bounds write is dropped
-        index = jnp.where(valid, state.next_idx, self.capacity)
+        index = jnp.where(valid, state.next_idx, state.capacity)
         return replace(
             state,
             buffer=jax.tree.map(
                 lambda x, y: x.at[index].set(y, mode="drop"), state.buffer, experience
             ),
             next_idx=jnp.where(
-                valid, (state.next_idx + 1) % self.capacity, state.next_idx
+                valid, (state.next_idx + 1) % state.capacity, state.next_idx
             ),
             populated=state.populated.at[index].set(True, mode="drop"),
             has_reward=state.has_reward.at[index].set(False, mode="drop"),
@@ -107,7 +114,7 @@ class EpisodeReplayBuffer:
             experiences: leading dimension of at most `capacity`
         """
         index = self.write_indices(state, valid)
-        next_idx = (state.next_idx + valid.sum()) % self.capacity
+        next_idx = (state.next_idx + valid.sum()) % state.capacity
         return replace(
             state,
             buffer=jax.tree.map(
@@ -126,7 +133,7 @@ class EpisodeReplayBuffer:
         # the i-th valid experience goes i places after `next_idx`
         offsets = jnp.cumsum(valid) - 1
         return jnp.where(
-            valid, (state.next_idx + offsets) % self.capacity, self.capacity
+            valid, (state.next_idx + offsets) % state.capacity, state.capacity
         )
 
     def assign_rewards(
@@ -157,6 +164,36 @@ class EpisodeReplayBuffer:
             next_idx=state.episode_start_idx,
             has_reward=jnp.full_like(state.has_reward, True),
             populated=jnp.where(~state.has_reward, False, state.populated),
+        )
+
+    def resize(self, state: ReplayBufferState, capacity: int) -> ReplayBufferState:
+        """`state` with `capacity` places, keeping its newest entries, as many
+        as fit, oldest first, so the next entry written overwrites the oldest.
+        Growing leaves the oldest places empty. An episode in progress carries
+        on: its entries are the newest, so they're kept (its newest, if it has
+        more than fit), and it ends as it would have.
+        """
+        # place j gets the entry of age capacity - 1 - j
+        age = capacity - 1 - jnp.arange(capacity)
+        source = (state.next_idx - 1 - age) % state.capacity
+        kept = age < state.capacity
+
+        def copy(x, empty):
+            return jnp.where(
+                kept.reshape((-1,) + (1,) * (x.ndim - 1)),
+                x[source],
+                jnp.asarray(empty, x.dtype),
+            )
+
+        # the episode in progress is the newest entries, in the last places
+        in_progress = jnp.sum(state.populated & ~state.has_reward)
+        start = (capacity - jnp.minimum(in_progress, capacity)) % capacity
+        return ReplayBufferState(
+            next_idx=jnp.zeros_like(state.next_idx),
+            episode_start_idx=start,
+            buffer=jax.tree.map(lambda x: copy(x, 0), state.buffer),
+            populated=copy(state.populated, False),
+            has_reward=copy(state.has_reward, True),
         )
 
     def sample_mask(self, state: ReplayBufferState) -> jax.Array:
