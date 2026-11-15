@@ -114,6 +114,10 @@ CHUNK_STEPS = 4
 PAIR_SAMPLE = 384
 # Edax's labels of stored positions (--label-stored), by level, kept for every run to reuse
 LABELS_DIR = RESULTS_DIR / "labels"
+# a labelled position is close if Edax's best move's margin is at most this many discs: there an
+# outcome is hard to get right whatever the labels' noise, so label quality is compared within
+# close positions and within clear ones (lopsided positions are easy to label)
+EDAX_CLOSE = 6
 # the scales of the soft collisions, exp(-distance / scale), in each distance's units: squares,
 # and the reference network's cosine distance
 SOFT_SCALES = {
@@ -951,7 +955,8 @@ def selfplay_metrics(
     stored positions' distances include a reference network's (see `pair_statistics`). With
     `labels`, up to `label_per_phase` stored positions of each phase (with a choice of moves) are
     scored by Edax: the targets' regret where self-play actually went, and the stored values and
-    outcomes against Edax's result (`edax_z_*`, `edax_q_*`)."""
+    outcomes against Edax's result (`edax_z_*`, `edax_q_*`), also within close positions (Edax's
+    margin at most EDAX_CLOSE discs, `edax_z_close_*`) and clear ones (`edax_z_clear_*`)."""
     stats = Stats()
     obs, policy, value = moves["observation"], moves["policy"], moves["value"]
     full, env, action = moves["full"].astype(bool), moves["env"], moves["action"]
@@ -1030,15 +1035,32 @@ def selfplay_metrics(
                 }
             )
             phases[phase]["edax_labelled"] = len(choice)
-            # the stored outcome (the value target) and search value against Edax's result
-            phases[phase].update(
-                stats.value(prefix, opening[choice], z[choice], edax_z, name="edax_z_")
+            # the stored outcome (the value target) and search value against Edax's result, over
+            # all the labelled positions and within close and clear ones
+            close = np.abs(best) <= EDAX_CLOSE
+            phases[phase]["edax_close_share"] = stats.mean(
+                f"{prefix}.edax_close_share", opening[choice], close
             )
-            phases[phase].update(
-                stats.value(
-                    prefix, opening[choice], value[choice], edax_z, name="edax_q_"
+            for part, sel in (("", slice(None)), ("close_", close), ("clear_", ~close)):
+                part_ids = opening[choice][sel]
+                phases[phase].update(
+                    stats.value(
+                        prefix,
+                        part_ids,
+                        z[choice][sel],
+                        edax_z[sel],
+                        name=f"edax_z_{part}",
+                    )
                 )
-            )
+                phases[phase].update(
+                    stats.value(
+                        prefix,
+                        part_ids,
+                        value[choice][sel],
+                        edax_z[sel],
+                        name=f"edax_q_{part}",
+                    )
+                )
     # the moves sampled rather than played greedily: with a move temperature, all of them
     sample_until = 60 if args.move_temperature is not None else args.sampling_moves
     sampled = (action >= 0) & (moves["ply"] < sample_until)
