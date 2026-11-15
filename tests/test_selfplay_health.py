@@ -5,7 +5,8 @@ import numpy as np
 import pytest
 from example_modules import load_example
 
-health = load_example("othello", "selfplay_health")[0]
+health, engines = load_example("othello", "selfplay_health", "engines")
+Analysis = engines.Analysis
 
 
 def boards(contents):
@@ -201,3 +202,54 @@ def test_reference_feature_maps_are_equivariant():
     np.testing.assert_allclose(
         turned, np.rot90(np.swapaxes(plain, -2, -1), 3, axes=(-2, -1)), atol=1e-5
     )
+
+
+def test_label_metrics_by_hand():
+    # three legal moves scoring +4, 0 and -2 discs for the player to move; the rest illegal
+    scores = np.full((1, 65), health.ILLEGAL, np.int16)
+    scores[0, [3, 10, 20]] = [4, 0, -2]
+    policy = np.zeros((1, 65))
+    policy[0, [3, 10, 20]] = [0.5, 0.25, 0.25]
+    prior = np.zeros((1, 65))
+    prior[0, [3, 10, 20]] = [0.2, 0.2, 0.6]
+
+    metrics = health.label_metrics(scores, policy, prior)
+
+    # 0.25 * 4 + 0.25 * 6, and 0.2 * 4 + 0.6 * 6
+    assert metrics["edax_target_regret"][0] == pytest.approx(2.5)
+    assert metrics["edax_prior_regret"][0] == pytest.approx(4.4)
+    assert metrics["edax_target_top1"][0]
+
+
+class CountingAnalyst:
+    """A fake Edax: every legal-looking move (the empty squares) scores the square's index, and
+    the positions it was asked about are counted."""
+
+    calls = 0
+
+    def __init__(self, level):
+        self.level = level
+
+    def __call__(self, board):
+        CountingAnalyst.calls += 1
+        return [
+            Analysis(line=[int(i)], score=int(i), depth=self.level)
+            for i in np.flatnonzero(board == 0)[:3]
+        ]
+
+
+def test_label_cache_scores_each_position_once_and_keeps_them(tmp_path):
+    CountingAnalyst.calls = 0
+    obs = random_boards(3, seed=7)
+    cache = health.LabelCache(tmp_path, level=8, workers=0, factory=CountingAnalyst)
+
+    first = cache(obs[[0, 1, 0]])
+    again = health.LabelCache(tmp_path, level=8, workers=0, factory=CountingAnalyst)(
+        obs[[1, 2]]
+    )
+
+    # positions 0 and 1, then only 2: the reloaded cache had the others
+    assert CountingAnalyst.calls == 3
+    np.testing.assert_array_equal(first[0], first[2])
+    np.testing.assert_array_equal(again[0], first[1])
+    assert (first[0] != health.ILLEGAL).sum() == 3
