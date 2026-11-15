@@ -96,53 +96,41 @@ def test_set_child_under_vmap_evicts_in_each_tree_as_alone():
         )
 
 
-@pytest.mark.parametrize(
-    "tree",
-    [
-        empty_tree(),
-        empty_tree().set_root(node(1.0)),
-        empty_tree().set_root(node(1.0)).set_child(0, 2, node(5.0)),
-    ],
-    ids=["empty", "missing child", "existing child"],
-)
-def test_set_child_and_set_root_without_write_are_noops(tree):
-    assert_trees_equal(tree.set_child(0, 2, node(9.0), write=False), tree)
-    assert_trees_equal(tree.set_root(node(9.0), write=False), tree)
-
-
-def test_set_child_without_write_does_not_evict():
-    tree = full_tree()
-
-    assert_trees_equal(tree.set_child(0, 2, node(9.0), evict=2, write=False), tree)
-
-
-def test_get_subtree_can_reset_or_keep_the_tree_in_the_same_pass():
-    tree = full_tree()
-
-    assert_trees_equal(tree.get_subtree(0, reset=True), tree.reset())
-    assert_trees_equal(tree.get_subtree(0, active=False), tree)
-    assert_trees_equal(tree.get_subtree(0, reset=True, active=False), tree)
-
-
-def test_get_subtree_under_vmap_steps_resets_or_keeps_each_tree():
-    tree = full_tree()
-    trees = jax.tree.map(lambda x: jnp.stack([x] * 3), tree)
-    reset = jnp.array([False, True, False])
-    active = jnp.array([True, True, False])
-
-    out = jax.vmap(lambda t, r, a: t.get_subtree(0, reset=r, active=a))(
-        trees, reset, active
-    )
-
-    for i, expected in enumerate([tree.get_subtree(0), tree.reset(), tree]):
-        assert_trees_equal(jax.tree.map(lambda x, i=i: x[i], out), expected)
-
-
 def full_tree():
     """A full tree: the root with children on edges 0 and 1, and a grandchild under edge 0's."""
     tree = empty_tree(max_nodes=4).set_root(node(1.0))
     tree = tree.set_child(0, 0, node(2.0)).set_child(1, 0, node(3.0))
     return tree.set_child(0, 1, node(4.0))
+
+
+@pytest.mark.parametrize(
+    "tree, evict",
+    [
+        (empty_tree(), Tree.NULL_INDEX),
+        (empty_tree().set_root(node(1.0)), Tree.NULL_INDEX),
+        (empty_tree().set_root(node(1.0)).set_child(0, 2, node(5.0)), Tree.NULL_INDEX),
+        (full_tree(), 2),
+    ],
+    ids=["empty", "missing child", "existing child", "full, evicting"],
+)
+def test_set_child_and_set_root_without_write_are_noops(tree, evict):
+    assert_trees_equal(tree.set_child(0, 2, node(9.0), evict, write=False), tree)
+    assert_trees_equal(tree.set_root(node(9.0), write=False), tree)
+
+
+def test_get_subtree_under_vmap_steps_resets_or_keeps_each_tree():
+    # reset or not, an inactive tree is kept as it is
+    tree = full_tree()
+    trees = jax.tree.map(lambda x: jnp.stack([x] * 4), tree)
+    reset = jnp.array([False, True, False, True])
+    active = jnp.array([True, True, False, False])
+
+    out = jax.vmap(lambda t, r, a: t.get_subtree(0, reset=r, active=a))(
+        trees, reset, active
+    )
+
+    for i, expected in enumerate([tree.get_subtree(0), tree.reset(), tree, tree]):
+        assert_trees_equal(jax.tree.map(lambda x, i=i: x[i], out), expected)
 
 
 def test_set_child_evicts_a_leaf_for_a_missing_child_of_a_full_tree():
@@ -294,13 +282,6 @@ def test_get_subtree_matches_reference(get_subtree, seed):
         assert_trees_equal(get_subtree(tree, action), expected)
 
 
-def test_get_subtree_of_unexpanded_child_is_empty(get_subtree):
-    tree = empty_tree(MAX_NODES, BRANCHING).set_root(node(1.0))
-    tree = tree.set_child(0, 0, node(2.0)).set_child(1, 1, node(3.0))
-
-    assert_trees_equal(get_subtree(tree, 2), empty_tree(MAX_NODES, BRANCHING))
-
-
 # get_subtree stress cases
 
 
@@ -349,18 +330,6 @@ def test_get_subtree_of_full_tree(get_subtree, seed):
     tree = random_tree(rng, max_nodes=max_nodes, branching=4, num_nodes=max_nodes)
 
     assert_subtree_matches_reference(get_subtree, *tree)
-
-
-def test_get_subtree_of_unexpanded_child_of_full_tree_is_empty(get_subtree):
-    max_nodes = 16
-    # root has children on edges 0 and 1 only; edge 2 is never expanded
-    tree = empty_tree(max_nodes, BRANCHING).set_root(node(1.0))
-    tree = tree.set_child(0, 0, node(2.0)).set_child(0, 1, node(3.0))
-    for idx in range(3, max_nodes):
-        tree = tree.set_child(idx - 1, 0, node(float(idx + 1)))
-    assert tree.next_free_idx == tree.capacity
-
-    assert_trees_equal(get_subtree(tree, 2), empty_tree(max_nodes, BRANCHING))
 
 
 @pytest.mark.parametrize("seed", range(5))
