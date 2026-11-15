@@ -807,7 +807,8 @@ NATIVE_SPECS = [
     "resnet:3x64,pool_every=2,heads=pooled,pool_channels=16,norm=channel,layout=pre",
     # pooled channels leaving a number of others that is no multiple of 16
     "resnet:2x48,pool_every=1,heads=pooled,pool_channels=8,head_channels=16,layout=pre",
-    "resnet:2x48,pool_every=2,heads=pooled,pool_channels=24,head_channels=16",
+    # and the post layout's residual normalized
+    "resnet:2x48,pool_every=2,heads=pooled,pool_channels=24,head_channels=16,norm=channel",
 ]
 
 
@@ -855,6 +856,31 @@ def test_the_native_network_computes_its_quantized_layers(
     # and quantized, it stays close to the float network
     float_logits, _ = cpu_net.float_forward(program, x)
     assert np.abs(logits - float_logits).mean() < 0.05
+
+
+@pytest.mark.parametrize("level", ["v4", "v3-vnni", "v3", "arm-i8mm", "arm-dotprod"])
+def test_the_native_networks_pieces_compute_as_plainer_code_does(level, tmp_path):
+    # its sums of many squares or outputs at once, bit for bit as one at a time, and the stem's
+    # table as its convolution (`cpu_net_checks.cpp`)
+    import subprocess
+
+    import native_target
+
+    if level not in native_levels():
+        pytest.skip(f"this CPU doesn't run level {level}")
+    here = Path(__file__).parent
+    binary = tmp_path / "checks"
+    subprocess.run(
+        ["g++", "-std=c++17", "-O3", *native_target.LEVELS[level], "-fopenmp-simd"]
+        + [
+            f"-I{here.parent / 'examples' / 'othello'}",
+            str(here / "cpu_net_checks.cpp"),
+        ]
+        + ["-o", str(binary)],
+        check=True,
+    )
+    result = subprocess.run([str(binary)], capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stdout
 
 
 @pytest.mark.parametrize("spec", NATIVE_SPECS)

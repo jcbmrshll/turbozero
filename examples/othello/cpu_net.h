@@ -6,8 +6,9 @@
 // Each convolution takes 8-bit unsigned inputs (a scale and a zero point for the whole tensor, from
 // calibration) and 8-bit signed weights (a scale for each output channel), sums in 32-bit integers, and
 // writes float outputs, acc * scale + bias, which per-square normalizations, the residual sum and the
-// global pooling then take in float. A normalization of each square's channels (ConvNeXt's LayerNorm)
-// costs about what a ReLU does here, where OpenVINO runs it as separate ops.
+// global pooling then take in float, in as few passes over the board as they can: a normalization, its
+// ReLU and the next convolution's quantized input in one, where OpenVINO runs separate ops (see
+// `Lanes`). The stem's input is the discs, 0 or 1, so its sums are looked up (`stem`).
 //
 // The convolutions come in three kernels, for the levels engines ship builds for: AVX-512 with VNNI
 // (x86-64-v4), 4 products a lane an instruction; AVX2 (x86-64-v3), Winograd's F(2x2, 3x3) in 16-bit
@@ -41,6 +42,11 @@
 #include <string>
 #include <vector>
 
+// a profiler's mark at the end of each stage of `forward` (see `profile_native.cpp`), by default none
+#ifndef NET_STAGE
+#define NET_STAGE(name)
+#endif
+
 namespace net {
 
 constexpr int SQUARES = 64;
@@ -65,6 +71,7 @@ struct Conv {
     std::vector<int16_t> packed16;
     std::vector<float> scale, bias;  // of each output: acc * scale + bias
     std::vector<int32_t> offset;  // NEON: 128 times each output's weights' sum
+    std::vector<int16_t> table;  // the stem's, in place of the packed weights (see `stem_table`)
     std::vector<float> inverse;  // of each input channel: its quantization is round(x * inverse) + zero_point
     int zero_point = 0;
 };
@@ -140,7 +147,8 @@ inline int32_t load_u32(const void* p) {
 // AVX-512's 32 registers, each weight used 8 times. It follows from the instruction set, not from
 // any one CPU's caches or timings.
 template <int K, int RO>
-inline void conv_row(const Conv& c, const int8_t* w, const uint8_t* in, int y, int o, float* out, int out_stride) {
+inline void conv_row(const Conv& c, const int8_t* w, const uint8_t* in, int y, int o, float* out, int out_stride,
+                     bool add) {
     const int c4n = c.cin / 4;
     __m512i acc[8][RO];
     for (int i = 0; i < 8; i++)
@@ -162,14 +170,17 @@ inline void conv_row(const Conv& c, const int8_t* w, const uint8_t* in, int y, i
     for (int r = 0; r < RO; r++) {
         __m512 m = _mm512_loadu_ps(c.scale.data() + o + 16 * r);
         __m512 b = _mm512_loadu_ps(c.bias.data() + o + 16 * r);
-        for (int i = 0; i < 8; i++)
-            _mm512_storeu_ps(out + (y * 8 + i) * out_stride + o + 16 * r,
-                             _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc[i][r]), m, b));
+        for (int i = 0; i < 8; i++) {
+            float* dst = out + (y * 8 + i) * out_stride + o + 16 * r;
+            __m512 v = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc[i][r]), m, b);
+            _mm512_storeu_ps(dst, add ? _mm512_add_ps(_mm512_loadu_ps(dst), v) : v);
+        }
     }
 }
 
-// `c` of the padded input `in`, written to `out`, (64, out_stride), its first `c.cout` columns
-inline void convolve(const Conv& c, Scratch& s, float* out, int out_stride) {
+// `c` of the padded input `in`, written to `out`, (64, out_stride), its first `c.cout` columns, or
+// added to them if `add` (a residual)
+inline void convolve(const Conv& c, Scratch& s, float* out, int out_stride, bool add = false) {
     const Activation* in = s.padded.data();
     const int c4n = c.cin / 4;
     const int pairs = c.cout / 32;
@@ -177,15 +188,15 @@ inline void convolve(const Conv& c, Scratch& s, float* out, int out_stride) {
     for (int g = 0; g < pairs; g++) {
         const int8_t* w = c.packed.data() + (size_t)g * taps * c4n * 128;
         for (int y = 0; y < 8; y++) {
-            if (c.k == 3) conv_row<3, 2>(c, w, in, y, 32 * g, out, out_stride);
-            else conv_row<1, 2>(c, w, in, y, 32 * g, out, out_stride);
+            if (c.k == 3) conv_row<3, 2>(c, w, in, y, 32 * g, out, out_stride, add);
+            else conv_row<1, 2>(c, w, in, y, 32 * g, out, out_stride, add);
         }
     }
     if (c.cout % 32) {
         const int8_t* w = c.packed.data() + (size_t)pairs * taps * c4n * 128;
         for (int y = 0; y < 8; y++) {
-            if (c.k == 3) conv_row<3, 1>(c, w, in, y, 32 * pairs, out, out_stride);
-            else conv_row<1, 1>(c, w, in, y, 32 * pairs, out, out_stride);
+            if (c.k == 3) conv_row<3, 1>(c, w, in, y, 32 * pairs, out, out_stride, add);
+            else conv_row<1, 1>(c, w, in, y, 32 * pairs, out, out_stride, add);
         }
     }
 }
@@ -260,7 +271,7 @@ inline void winograd_multiply(const int16_t* v, const int16_t* w, int cin, int32
 }
 
 // `m`, (16 values, 16 tiles, 16 outputs), transformed back, to outputs `o` to `o + 16` of `out`
-inline void winograd_output(const Conv& c, const int32_t* m, int o, float* out, int out_stride) {
+inline void winograd_output(const Conv& c, const int32_t* m, int o, float* out, int out_stride, bool add) {
     const float* scale = c.scale.data() + o;
     const float* bias = c.bias.data() + o;
     for (int tile = 0; tile < TILES; tile++) {
@@ -276,10 +287,12 @@ inline void winograd_output(const Conv& c, const int32_t* m, int o, float* out, 
                 t[1][j] = m1 - m2 - m3;
             }
             for (int i = 0; i < 2; i++) {
-                y[(8 * i) * out_stride + k] =
-                    std::fma((float)(int32_t)(t[i][0] + t[i][1] + t[i][2]), 0.25f * scale[k], bias[k]);
-                y[(8 * i + 1) * out_stride + k] =
-                    std::fma((float)(int32_t)(t[i][1] - t[i][2] - t[i][3]), 0.25f * scale[k], bias[k]);
+                float v0 = std::fma((float)(int32_t)(t[i][0] + t[i][1] + t[i][2]), 0.25f * scale[k], bias[k]);
+                float v1 = std::fma((float)(int32_t)(t[i][1] - t[i][2] - t[i][3]), 0.25f * scale[k], bias[k]);
+                float* y0 = y + (8 * i) * out_stride + k;
+                float* y1 = y0 + out_stride;
+                *y0 = add ? *y0 + v0 : v0;
+                *y1 = add ? *y1 + v1 : v1;
             }
         }
     }
@@ -310,9 +323,10 @@ inline void conv_quarter(const Conv& c, const int16_t* w, const int16_t* in, int
     }
 }
 
-inline void convolve(const Conv& c, Scratch& s, float* out, int out_stride) {
+inline void convolve(const Conv& c, Scratch& s, float* out, int out_stride, bool add = false) {
     const Activation* in = s.padded.data();
     if (c.k == 1) {
+        // (the heads', never a residual)
         const size_t group = (size_t)(c.cin / 2) * 32;
         for (int g = 0; g < c.cout / 16; g++)
             for (int y = 0; y < 8; y++)
@@ -327,7 +341,7 @@ inline void convolve(const Conv& c, Scratch& s, float* out, int out_stride) {
         const int16_t* w = c.packed16.data() + (size_t)g * 16 * chunk;
         for (int p = 0; p < 16; p++)
             winograd_multiply(v + (size_t)p * TILES * c.cin, w + p * chunk, c.cin, m + p * TILES * 16);
-        winograd_output(c, m, 16 * g, out, out_stride);
+        winograd_output(c, m, 16 * g, out, out_stride, add);
     }
 }
 #elif NET_ISA == 3 && defined(__ARM_FEATURE_MATMUL_INT8)
@@ -366,7 +380,8 @@ inline void pair_up(const int8_t* in, int cin, int8_t* out) {
 }
 
 template <int K>
-inline void conv_row(const Conv& c, const int8_t* w, const int8_t* pairs, int y, int o, float* out, int out_stride) {
+inline void conv_row(const Conv& c, const int8_t* w, const int8_t* pairs, int y, int o, float* out, int out_stride,
+                     bool add) {
     const int e = eights(c.cin);
     int32x4_t acc[4][4];
     for (int i = 0; i < 4; i++)
@@ -400,19 +415,21 @@ inline void conv_row(const Conv& c, const int8_t* w, const int8_t* pairs, int y,
                 hi = vreinterpretq_s32_s64(vzip2q_s64(vreinterpretq_s64_s32(acc[i][2]), vreinterpretq_s64_s32(acc[i][3])));
             }
             float* dst = out + (y * 8 + 2 * i + sq) * out_stride + o;
-            vst1q_f32(dst, vfmaq_f32(b0, vcvtq_f32_s32(vaddq_s32(lo, f0)), m0));
-            vst1q_f32(dst + 4, vfmaq_f32(b1, vcvtq_f32_s32(vaddq_s32(hi, f1)), m1));
+            float32x4_t v0 = vfmaq_f32(b0, vcvtq_f32_s32(vaddq_s32(lo, f0)), m0);
+            float32x4_t v1 = vfmaq_f32(b1, vcvtq_f32_s32(vaddq_s32(hi, f1)), m1);
+            vst1q_f32(dst, add ? vaddq_f32(vld1q_f32(dst), v0) : v0);
+            vst1q_f32(dst + 4, add ? vaddq_f32(vld1q_f32(dst + 4), v1) : v1);
         }
 }
 
-inline void convolve(const Conv& c, Scratch& s, float* out, int out_stride) {
+inline void convolve(const Conv& c, Scratch& s, float* out, int out_stride, bool add = false) {
     int8_t* pairs = s.pairs.data();
     pair_up(s.padded.data(), c.cin, pairs);
     const size_t group = (size_t)c.k * c.k * eights(c.cin) * 64;
     for (int g = 0; g < c.cout / 8; g++)
         for (int y = 0; y < 8; y++) {
-            if (c.k == 3) conv_row<3>(c, c.packed.data() + g * group, pairs, y, 8 * g, out, out_stride);
-            else conv_row<1>(c, c.packed.data() + g * group, pairs, y, 8 * g, out, out_stride);
+            if (c.k == 3) conv_row<3>(c, c.packed.data() + g * group, pairs, y, 8 * g, out, out_stride, add);
+            else conv_row<1>(c, c.packed.data() + g * group, pairs, y, 8 * g, out, out_stride, add);
         }
 }
 #else
@@ -420,7 +437,8 @@ inline void convolve(const Conv& c, Scratch& s, float* out, int out_stride) {
 // channels and 2 weight vectors, 26 of its 32 registers, each weight used 8 times. An sdot multiplies 4
 // outputs' weights for 4 channels by one square's 4 channels, picked from its vector by lane.
 template <int K>
-inline void conv_row(const Conv& c, const int8_t* w, const int8_t* in, int y, int o, float* out, int out_stride) {
+inline void conv_row(const Conv& c, const int8_t* w, const int8_t* in, int y, int o, float* out, int out_stride,
+                     bool add) {
     const int c4n = c.cin / 4;
     int32x4_t acc[8][2];
     for (int i = 0; i < 8; i++) acc[i][0] = acc[i][1] = vdupq_n_s32(0);
@@ -447,84 +465,135 @@ inline void conv_row(const Conv& c, const int8_t* w, const int8_t* in, int y, in
     for (int r = 0; r < 2; r++) {
         int32x4_t offset = vld1q_s32(c.offset.data() + o + 4 * r);
         float32x4_t m = vld1q_f32(c.scale.data() + o + 4 * r), b = vld1q_f32(c.bias.data() + o + 4 * r);
-        for (int i = 0; i < 8; i++)
-            vst1q_f32(out + (y * 8 + i) * out_stride + o + 4 * r,
-                      vfmaq_f32(b, vcvtq_f32_s32(vaddq_s32(acc[i][r], offset)), m));
+        for (int i = 0; i < 8; i++) {
+            float* dst = out + (y * 8 + i) * out_stride + o + 4 * r;
+            float32x4_t v = vfmaq_f32(b, vcvtq_f32_s32(vaddq_s32(acc[i][r], offset)), m);
+            vst1q_f32(dst, add ? vaddq_f32(vld1q_f32(dst), v) : v);
+        }
     }
 }
 
-inline void convolve(const Conv& c, Scratch& s, float* out, int out_stride) {
+inline void convolve(const Conv& c, Scratch& s, float* out, int out_stride, bool add = false) {
     const Activation* in = s.padded.data();
     const size_t group = (size_t)c.k * c.k * (c.cin / 4) * 32;
     for (int g = 0; g < c.cout / 8; g++)
         for (int y = 0; y < 8; y++) {
-            if (c.k == 3) conv_row<3>(c, c.packed.data() + g * group, in, y, 8 * g, out, out_stride);
-            else conv_row<1>(c, c.packed.data() + g * group, in, y, 8 * g, out, out_stride);
+            if (c.k == 3) conv_row<3>(c, c.packed.data() + g * group, in, y, 8 * g, out, out_stride, add);
+            else conv_row<1>(c, c.packed.data() + g * group, in, y, 8 * g, out, out_stride, add);
         }
 }
 #endif
 
+// The float work between the convolutions, a vector of `Lanes::W` floats at a time: `Lanes` is each
+// level's vector, and the passes below are written once for all three. Each value comes from the same
+// operations in the same order as a square at a time, one operation over the board at a time, would
+// give it, bit for bit (`tests/cpu_net_checks.cpp`): sums over many squares' channels, or many outputs,
+// are reduced together in each level's own order of a vector's lanes (`Lanes::reduce`).
 #if NET_ISA == 2
-// AVX-512's own, where the compiler's loops came out slower
 // the first `n` lanes (all 16 when n >= 16), the rest zero
 inline __mmask16 lanes(int n) { return n >= 16 ? (__mmask16)0xffff : (__mmask16)((1u << n) - 1); }
 inline __m512 load(const float* p, int n) { return _mm512_maskz_loadu_ps(lanes(n), p); }
 inline void store(float* p, __m512 v, int n) { _mm512_mask_storeu_ps(p, lanes(n), v); }
 
-// the first `channels` of `x`, (64, stride), quantized into `padded` for `c`, its border the zero point
-inline void quantize(const Conv& c, const float* x, int stride, Activation* padded) {
-    const int channels = c.cin;
-    std::memset(padded, c.zero_point, (size_t)PADDED * channels);
-    __m512i zp = _mm512_set1_epi32(c.zero_point);
-    __m512i lo = _mm512_setzero_si512(), hi = _mm512_set1_epi32(255);
-    for (int s = 0; s < SQUARES; s++) {
-        const float* v = x + s * stride;
-        uint8_t* q = padded + ((s / 8 + 1) * 10 + s % 8 + 1) * channels;
-        for (int ch = 0; ch < channels; ch += 16) {
-            int n = channels - ch;
-            __m512 inv = load(c.inverse.data() + ch, n);
-            __m512i i = _mm512_add_epi32(_mm512_cvtps_epi32(_mm512_mul_ps(load(v + ch, n), inv)), zp);
-            i = _mm512_min_epi32(_mm512_max_epi32(i, lo), hi);
-            _mm_mask_storeu_epi8(q + ch, lanes(n), _mm512_cvtepi32_epi8(i));
+struct Lanes {
+    using F = __m512;
+    static constexpr int W = 16;
+    static F zero() { return _mm512_setzero_ps(); }
+    static F set1(float v) { return _mm512_set1_ps(v); }
+    static F load(const float* p) { return _mm512_loadu_ps(p); }
+    static void store(float* p, F v) { _mm512_storeu_ps(p, v); }
+    // the first `n` (all when n >= W), the rest zero
+    static F load(const float* p, int n) { return net::load(p, n); }
+    static void store(float* p, F v, int n) { net::store(p, v, n); }
+    static F add(F a, F b) { return _mm512_add_ps(a, b); }
+    static F sub(F a, F b) { return _mm512_sub_ps(a, b); }
+    static F mul(F a, F b) { return _mm512_mul_ps(a, b); }
+    static F div(F a, F b) { return _mm512_div_ps(a, b); }
+    static F sqrt(F a) { return _mm512_sqrt_ps(a); }
+    static F fma(F a, F b, F c) { return _mm512_fmadd_ps(a, b, c); }  // a * b + c, rounded once
+    // the sums of 3 rows of W 16-bit integers, as floats
+    static F widen(const int16_t* a, const int16_t* b, const int16_t* c) {
+        __m256i s = _mm256_add_epi16(_mm256_add_epi16(_mm256_loadu_si256((const __m256i*)a), _mm256_loadu_si256((const __m256i*)b)),
+                                     _mm256_loadu_si256((const __m256i*)c));
+        return _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(s));
+    }
+    // the first 16 of `p` as bits: p[i] > 0.5
+    static uint64_t bits(const float* p) { return _mm512_cmp_ps_mask(_mm512_loadu_ps(p), set1(0.5f), _CMP_GT_OQ); }
+    // a * b, rounded on its own: GCC's intrinsics are its vector operators, and fuses an add of a
+    // product into an fma where it can
+    static F product(F a, F b) {
+        F p = _mm512_mul_ps(a, b);
+        asm("" : "+v"(p));
+        return p;
+    }
+    // a normalization's ReLU, and a sum's (the residual's, a pooling bias's)
+    static F relu(F v) { return _mm512_max_ps(v, zero()); }
+    static F relu_sum(F v) { return _mm512_max_ps(v, zero()); }
+    // the sums of 16 vectors' lanes, lane s v[s]'s, each added as `_mm512_reduce_add_ps` adds them:
+    // lane j and lane j + 8, those sums' j and j + 4, then j + 2, then j + 1. Pairs of vectors are
+    // shuffled so that each addition adds those same pairs, for several vectors at once.
+    static F reduce(const F* v) {
+        F r1[8], r2[4], r3[2];
+        for (int k = 0; k < 8; k++)  // [v[2k] lanes 0-7, v[2k + 1] lanes 0-7]
+            r1[k] = add(_mm512_shuffle_f32x4(v[2 * k], v[2 * k + 1], _MM_SHUFFLE(1, 0, 1, 0)),
+                        _mm512_shuffle_f32x4(v[2 * k], v[2 * k + 1], _MM_SHUFFLE(3, 2, 3, 2)));
+        for (int k = 0; k < 4; k++)  // 4 lanes each of vectors 4k to 4k + 3
+            r2[k] = add(_mm512_shuffle_f32x4(r1[2 * k], r1[2 * k + 1], _MM_SHUFFLE(2, 0, 2, 0)),
+                        _mm512_shuffle_f32x4(r1[2 * k], r1[2 * k + 1], _MM_SHUFFLE(3, 1, 3, 1)));
+        for (int k = 0; k < 2; k++)  // in each 4 lanes b, 2 of vector 8k + b, then 2 of 8k + 4 + b
+            r3[k] = add(_mm512_shuffle_ps(r2[2 * k], r2[2 * k + 1], _MM_SHUFFLE(1, 0, 1, 0)),
+                        _mm512_shuffle_ps(r2[2 * k], r2[2 * k + 1], _MM_SHUFFLE(3, 2, 3, 2)));
+        // lane 4b + i is vector b + 4i's
+        F r4 = add(_mm512_shuffle_ps(r3[0], r3[1], _MM_SHUFFLE(2, 0, 2, 0)),
+                   _mm512_shuffle_ps(r3[0], r3[1], _MM_SHUFFLE(3, 1, 3, 1)));
+        return _mm512_permutexvar_ps(_mm512_setr_epi32(0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15), r4);
+    }
+    // 16 vectors as a 16 by 16 matrix, transposed in place: r[j] lane i to r[i] lane j
+    static void transpose(F* r) {
+        F a[16], b[16];
+        for (int k = 0; k < 16; k += 2) {
+            a[k] = _mm512_unpacklo_ps(r[k], r[k + 1]);
+            a[k + 1] = _mm512_unpackhi_ps(r[k], r[k + 1]);
+        }
+        for (int k = 0; k < 16; k += 4) {  // b[k + e]: in each 4 lanes q, lane 4q + e of r[k] to r[k + 3]
+            b[k] = _mm512_shuffle_ps(a[k], a[k + 2], _MM_SHUFFLE(1, 0, 1, 0));
+            b[k + 1] = _mm512_shuffle_ps(a[k], a[k + 2], _MM_SHUFFLE(3, 2, 3, 2));
+            b[k + 2] = _mm512_shuffle_ps(a[k + 1], a[k + 3], _MM_SHUFFLE(1, 0, 1, 0));
+            b[k + 3] = _mm512_shuffle_ps(a[k + 1], a[k + 3], _MM_SHUFFLE(3, 2, 3, 2));
+        }
+        for (int e = 0; e < 4; e++) {
+            F c1 = _mm512_shuffle_f32x4(b[e], b[4 + e], _MM_SHUFFLE(2, 0, 2, 0));
+            F c2 = _mm512_shuffle_f32x4(b[e], b[4 + e], _MM_SHUFFLE(3, 1, 3, 1));
+            F d1 = _mm512_shuffle_f32x4(b[8 + e], b[12 + e], _MM_SHUFFLE(2, 0, 2, 0));
+            F d2 = _mm512_shuffle_f32x4(b[8 + e], b[12 + e], _MM_SHUFFLE(3, 1, 3, 1));
+            r[e] = _mm512_shuffle_f32x4(c1, d1, _MM_SHUFFLE(2, 0, 2, 0));
+            r[4 + e] = _mm512_shuffle_f32x4(c2, d2, _MM_SHUFFLE(2, 0, 2, 0));
+            r[8 + e] = _mm512_shuffle_f32x4(c1, d1, _MM_SHUFFLE(3, 1, 3, 1));
+            r[12 + e] = _mm512_shuffle_f32x4(c2, d2, _MM_SHUFFLE(3, 1, 3, 1));
         }
     }
-}
+    // std::max(v, 0.0f), as the compiler's loops take it (a -0 kept)
+    static F max0(F v) { return _mm512_max_ps(zero(), v); }
+    // a board pool's maximum, so far `most`, with `v`
+    static F most(F most, F v) { return _mm512_max_ps(most, v); }
+};
 
-// `n` of `ch` values at `v`, in place, then a ReLU if `relu`
-inline void normalize_square(const Norm& n, float* v, int ch, bool relu) {
-    const __m512 zero = _mm512_setzero_ps();
-    if (n.type == NORM_CHANNEL) {
-        __m512 sum = zero;
-        for (int i = 0; i < ch; i += 16) sum = _mm512_add_ps(sum, load(v + i, ch - i));
-        __m512 mean = _mm512_set1_ps(_mm512_reduce_add_ps(sum) / ch);
-        __m512 sq = zero;
-        for (int i = 0; i < ch; i += 16) {
-            __m512 d = _mm512_maskz_sub_ps(lanes(ch - i), load(v + i, ch - i), mean);
-            sq = _mm512_fmadd_ps(d, d, sq);
-        }
-        __m512 rstd = _mm512_set1_ps(1.0f / std::sqrt(_mm512_reduce_add_ps(sq) / ch + n.eps));
-        for (int i = 0; i < ch; i += 16) {
-            int m = ch - i;
-            __m512 d = _mm512_mul_ps(_mm512_sub_ps(load(v + i, m), mean), rstd);
-            __m512 out = _mm512_fmadd_ps(d, load(n.a.data() + i, m), load(n.c.data() + i, m));
-            store(v + i, relu ? _mm512_max_ps(out, zero) : out, m);
-        }
-    } else if (n.type == NORM_AFFINE) {
-        for (int i = 0; i < ch; i += 16) {
-            int m = ch - i;
-            __m512 out = _mm512_fmadd_ps(load(v + i, m), load(n.a.data() + i, m), load(n.c.data() + i, m));
-            store(v + i, relu ? _mm512_max_ps(out, zero) : out, m);
-        }
-    } else if (relu) {
-        for (int i = 0; i < ch; i += 16) store(v + i, _mm512_max_ps(load(v + i, ch - i), zero), ch - i);
+// a square's channels quantized for `c`'s input
+struct Quantizer {
+    const float* inverse;
+    __m512i zero_point;
+    explicit Quantizer(const Conv& c) : inverse(c.inverse.data()), zero_point(_mm512_set1_epi32(c.zero_point)) {}
+    // the first `n` lanes of `v`, channels `ch` on, into the square's place `q`
+    void operator()(__m512 v, int ch, Activation* q, int n = 16) const {
+        __m512i i = _mm512_add_epi32(_mm512_cvtps_epi32(_mm512_mul_ps(v, load(inverse + ch, n))), zero_point);
+        // at least 0, then at most 255 as it narrows
+        __m128i b = _mm512_cvtusepi32_epi8(_mm512_max_epi32(i, _mm512_setzero_si512()));
+        if (n >= 16) _mm_storeu_si128((__m128i*)(q + ch), b);
+        else _mm_mask_storeu_epi8(q + ch, lanes(n), b);
     }
-}
-
-// `n` of each square's first `n.channels` of `x`, (64, stride), in place, then a ReLU if `relu`
-inline void normalize(const Norm& n, float* x, int stride, bool relu) {
-    if (n.type == NORM_NONE && !relu) return;
-    for (int s = 0; s < SQUARES; s++) normalize_square(n, x + s * stride, n.channels ? n.channels : stride, relu);
-}
+    // 16 channels from `ch`, `v[1]`
+    void group(const __m512* v, int ch, Activation* q) const { (*this)(v[0], ch, q); }
+};
 
 // each of `count` channels from `first`'s mean and maximum over the board, (2 * count)
 inline void board_pool(const float* x, int stride, int first, int count, float* out) {
@@ -542,7 +611,20 @@ inline void board_pool(const float* x, int stride, int first, int count, float* 
 }
 
 inline void linear(const Linear& l, const float* in, float* out) {
-    for (int o = 0; o < l.out; o++) {
+    int o = 0;
+    // 16 outputs at a time, their sums reduced together
+    if (l.in % 16 == 0)
+        for (; o + 16 <= l.out; o += 16) {
+            __m512 acc[16];
+            for (int k = 0; k < 16; k++) {
+                const float* w = l.w.data() + (size_t)(o + k) * l.in;
+                __m512 sum = _mm512_setzero_ps();
+                for (int i = 0; i < l.in; i += 16) sum = _mm512_fmadd_ps(_mm512_loadu_ps(w + i), _mm512_loadu_ps(in + i), sum);
+                acc[k] = sum;
+            }
+            _mm512_storeu_ps(out + o, _mm512_add_ps(_mm512_loadu_ps(l.b.data() + o), Lanes::reduce(acc)));
+        }
+    for (; o < l.out; o++) {
         const float* w = l.w.data() + (size_t)o * l.in;
         __m512 sum = _mm512_setzero_ps();
         int i = 0;
@@ -557,32 +639,8 @@ inline void relu(float* x, int count) {
     for (int i = 0; i < count; i++) x[i] = std::max(x[i], 0.0f);
 }
 
-// `b`, (cols), added to each of the 64 squares' first `cols` of `x`, (64, stride), then a ReLU if
-// `relu_after`
-inline void add_rows(float* x, int stride, const float* b, int cols, bool relu_after) {
-    const __m512 zero = _mm512_setzero_ps();
-    for (int s = 0; s < SQUARES; s++)
-        for (int i = 0; i < cols; i += 16) {
-            int m = cols - i;
-            __m512 v = _mm512_add_ps(load(x + s * stride + i, m), load(b + i, m));
-            store(x + s * stride + i, relu_after ? _mm512_max_ps(v, zero) : v, m);
-        }
-}
-
-// x += y, then a ReLU if `relu_after`, over `count` values, a multiple of 16
-inline void residual(float* x, const float* y, int count, bool relu_after) {
-    const __m512 zero = _mm512_setzero_ps();
-    for (int i = 0; i < count; i += 16) {
-        __m512 v = _mm512_add_ps(_mm512_loadu_ps(x + i), _mm512_loadu_ps(y + i));
-        _mm512_storeu_ps(x + i, relu_after ? _mm512_max_ps(v, zero) : v);
-    }
-}
-
-#else
-#if NET_ISA == 1
-// AVX2: the quantization and normalizations by hand, 8 lanes, as AVX-512's above; the rest, and NEON's,
-// plain loops, which the compiler vectorizes
-// the first `n` of 8 lanes (all when n >= 8)
+#elif NET_ISA == 1
+// AVX2: the first `n` of 8 lanes (all when n >= 8)
 inline __m256i lanes8(int n) {
     return _mm256_cmpgt_epi32(_mm256_set1_epi32(n), _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
 }
@@ -591,143 +649,169 @@ inline void store8(float* p, __m256 v, int n) {
     if (n >= 8) _mm256_storeu_ps(p, v);
     else _mm256_maskstore_ps(p, lanes8(n), v);
 }
-inline float sum8(__m256 v) {
-    __m128 x = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
-    x = _mm_add_ps(x, _mm_movehl_ps(x, x));
-    return _mm_cvtss_f32(_mm_add_ss(x, _mm_movehdup_ps(x)));
-}
 
-// the first `c.cin` channels of `x`, (64, stride), quantized into `padded` for `c`, its border the zero
-// point
-inline void quantize(const Conv& c, const float* x, int stride, Activation* padded) {
-    const int channels = c.cin;
-    std::fill(padded, padded + (size_t)PADDED * channels, (Activation)c.zero_point);
-    const __m256 low = _mm256_set1_ps(-c.zero_point - 1.0f), high = _mm256_set1_ps(256.0f - c.zero_point);
-    const __m256i zp = _mm256_set1_epi32(c.zero_point), lo = _mm256_setzero_si256(), hi = _mm256_set1_epi32(255);
-    for (int s = 0; s < SQUARES; s++) {
-        const float* v = x + s * stride;
-        Activation* q = padded + ((s / 8 + 1) * 10 + s % 8 + 1) * channels;
-        // channels come in fours: 8 at a time, and a last 4
-        for (int ch = 0; ch < channels; ch += 8) {
-            int n = channels - ch;
-            __m256 t = _mm256_mul_ps(load8(v + ch, n), load8(c.inverse.data() + ch, n));
-            t = _mm256_min_ps(_mm256_max_ps(t, low), high);
-            // rounded to the nearest, ties to even, as `rint`
-            __m256i i = _mm256_add_epi32(_mm256_cvtps_epi32(t), zp);
-            i = _mm256_min_epi32(_mm256_max_epi32(i, lo), hi);
-            __m128i packed = _mm_packs_epi32(_mm256_castsi256_si128(i), _mm256_extracti128_si256(i, 1));
-            if (n >= 8) _mm_storeu_si128((__m128i*)(q + ch), packed);
-            else _mm_storel_epi64((__m128i*)(q + ch), packed);
+struct Lanes {
+    using F = __m256;
+    static constexpr int W = 8;
+    static F zero() { return _mm256_setzero_ps(); }
+    static F set1(float v) { return _mm256_set1_ps(v); }
+    static F load(const float* p) { return _mm256_loadu_ps(p); }
+    static void store(float* p, F v) { _mm256_storeu_ps(p, v); }
+    static F load(const float* p, int n) { return load8(p, n); }
+    static void store(float* p, F v, int n) { store8(p, v, n); }
+    static F add(F a, F b) { return _mm256_add_ps(a, b); }
+    static F sub(F a, F b) { return _mm256_sub_ps(a, b); }
+    static F mul(F a, F b) { return _mm256_mul_ps(a, b); }
+    static F div(F a, F b) { return _mm256_div_ps(a, b); }
+    static F sqrt(F a) { return _mm256_sqrt_ps(a); }
+    static F fma(F a, F b, F c) { return _mm256_fmadd_ps(a, b, c); }
+    static F widen(const int16_t* a, const int16_t* b, const int16_t* c) {
+        __m128i s = _mm_add_epi16(_mm_add_epi16(_mm_loadu_si128((const __m128i*)a), _mm_loadu_si128((const __m128i*)b)),
+                                  _mm_loadu_si128((const __m128i*)c));
+        return _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(s));
+    }
+    static uint64_t bits(const float* p) {
+        return (uint64_t)_mm256_movemask_ps(_mm256_cmp_ps(_mm256_loadu_ps(p), set1(0.5f), _CMP_GT_OQ));
+    }
+    // a * b, rounded on its own (see AVX-512's)
+    static F product(F a, F b) {
+        F p = _mm256_mul_ps(a, b);
+        asm("" : "+x"(p));
+        return p;
+    }
+    // a normalization's ReLU, max(v, 0); and a sum's, std::max(v, 0.0f) as the compiler's loops took
+    // it, which keeps a -0
+    static F relu(F v) { return _mm256_max_ps(v, zero()); }
+    static F relu_sum(F v) { return _mm256_max_ps(zero(), v); }
+    // the sums of 8 vectors' lanes, lane s v[s]'s, each added as a vector's lanes were added on their
+    // own: lane j and j + 4, then j + 2, then j + 1
+    static F reduce(const F* v) {
+        F r1[4], r2[2];
+        for (int k = 0; k < 4; k++)  // [v[2k] lanes 0-3, v[2k + 1] lanes 0-3]
+            r1[k] = add(_mm256_permute2f128_ps(v[2 * k], v[2 * k + 1], 0x20),
+                        _mm256_permute2f128_ps(v[2 * k], v[2 * k + 1], 0x31));
+        for (int k = 0; k < 2; k++)  // in each half b, 2 of vector 4k + b, then 2 of 4k + 2 + b
+            r2[k] = add(_mm256_shuffle_ps(r1[2 * k], r1[2 * k + 1], _MM_SHUFFLE(1, 0, 1, 0)),
+                        _mm256_shuffle_ps(r1[2 * k], r1[2 * k + 1], _MM_SHUFFLE(3, 2, 3, 2)));
+        // lanes: vectors 0, 2, 4, 6, 1, 3, 5, 7
+        F r3 = add(_mm256_shuffle_ps(r2[0], r2[1], _MM_SHUFFLE(2, 0, 2, 0)),
+                   _mm256_shuffle_ps(r2[0], r2[1], _MM_SHUFFLE(3, 1, 3, 1)));
+        return _mm256_permutevar8x32_ps(r3, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
+    }
+    // 8 vectors as an 8 by 8 matrix, transposed in place: r[j] lane i to r[i] lane j
+    static void transpose(F* r) {
+        F t[8], u[8];
+        for (int k = 0; k < 8; k += 2) {
+            t[k] = _mm256_unpacklo_ps(r[k], r[k + 1]);
+            t[k + 1] = _mm256_unpackhi_ps(r[k], r[k + 1]);
+        }
+        for (int k = 0; k < 8; k += 4)  // u[k + e]: lanes e and e + 4 of r[k] to r[k + 3]
+            for (int j = 0; j < 2; j++) {
+                u[k + 2 * j] = _mm256_shuffle_ps(t[k + j], t[k + j + 2], _MM_SHUFFLE(1, 0, 1, 0));
+                u[k + 2 * j + 1] = _mm256_shuffle_ps(t[k + j], t[k + j + 2], _MM_SHUFFLE(3, 2, 3, 2));
+            }
+        for (int e = 0; e < 4; e++) {
+            r[e] = _mm256_permute2f128_ps(u[e], u[e + 4], 0x20);
+            r[e + 4] = _mm256_permute2f128_ps(u[e], u[e + 4], 0x31);
         }
     }
-}
+    static F max0(F v) { return _mm256_max_ps(zero(), v); }
+    // a board pool's maximum, so far `most`, with `v`: v > most ? v : most, as the compiler's loop took it
+    static F most(F most, F v) { return _mm256_max_ps(v, most); }
+};
 
-// `n` of `ch` values at `v`, in place, then a ReLU if `relu`
-inline void normalize_square(const Norm& n, float* v, int ch, bool relu) {
-    const __m256 zero = _mm256_setzero_ps();
-    if (n.type == NORM_CHANNEL) {
-        __m256 sum = zero;
-        for (int i = 0; i < ch; i += 8) sum = _mm256_add_ps(sum, load8(v + i, ch - i));
-        __m256 mean = _mm256_set1_ps(sum8(sum) / ch);
-        __m256 sq = zero;
-        for (int i = 0; i < ch; i += 8) {
-            __m256 d = _mm256_and_ps(_mm256_sub_ps(load8(v + i, ch - i), mean), _mm256_castsi256_ps(lanes8(ch - i)));
-            sq = _mm256_fmadd_ps(d, d, sq);
-        }
-        __m256 rstd = _mm256_set1_ps(1.0f / std::sqrt(sum8(sq) / ch + n.eps));
-        for (int i = 0; i < ch; i += 8) {
-            int m = ch - i;
-            __m256 d = _mm256_mul_ps(_mm256_sub_ps(load8(v + i, m), mean), rstd);
-            __m256 out = _mm256_fmadd_ps(d, load8(n.a.data() + i, m), load8(n.c.data() + i, m));
-            store8(v + i, relu ? _mm256_max_ps(out, zero) : out, m);
-        }
-    } else if (n.type == NORM_AFFINE) {
-        for (int i = 0; i < ch; i += 8) {
-            int m = ch - i;
-            __m256 out = _mm256_fmadd_ps(load8(v + i, m), load8(n.a.data() + i, m), load8(n.c.data() + i, m));
-            store8(v + i, relu ? _mm256_max_ps(out, zero) : out, m);
-        }
-    } else if (relu) {
-        for (int i = 0; i < ch; i += 8) store8(v + i, _mm256_max_ps(load8(v + i, ch - i), zero), ch - i);
+// a square's channels quantized for `c`'s input
+struct Quantizer {
+    const float* inverse;
+    __m256 low, high;
+    __m256i zero_point;
+    explicit Quantizer(const Conv& c)
+        : inverse(c.inverse.data()), low(_mm256_set1_ps(-c.zero_point - 1.0f)), high(_mm256_set1_ps(256.0f - c.zero_point)),
+          zero_point(_mm256_set1_epi32(c.zero_point)) {}
+    // the first `n` lanes of `v` (8, or 4: channels come in fours), channels `ch` on, into the square's
+    // place `q`
+    void operator()(__m256 v, int ch, Activation* q, int n = 8) const {
+        __m256 t = _mm256_mul_ps(v, load8(inverse + ch, n));
+        t = _mm256_min_ps(_mm256_max_ps(t, low), high);
+        // rounded to the nearest, ties to even, as `rint`
+        __m256i i = _mm256_add_epi32(_mm256_cvtps_epi32(t), zero_point);
+        i = _mm256_min_epi32(_mm256_max_epi32(i, _mm256_setzero_si256()), _mm256_set1_epi32(255));
+        __m128i packed = _mm_packs_epi32(_mm256_castsi256_si128(i), _mm256_extracti128_si256(i, 1));
+        if (n >= 8) _mm_storeu_si128((__m128i*)(q + ch), packed);
+        else _mm_storel_epi64((__m128i*)(q + ch), packed);
     }
-}
+    // 16 channels from `ch`, `v[2]`
+    void group(const __m256* v, int ch, Activation* q) const {
+        (*this)(v[0], ch, q);
+        (*this)(v[1], ch + 8, q);
+    }
+};
 
 #else
-// NEON: the quantization and normalizations by hand, 4 lanes (GCC leaves the plain loops scalar)
-// the first `channels` (a multiple of 4) of `x`, (64, stride), quantized into `padded` for `c`, less 128
-// for the signed dot product, its border the zero point
-inline void quantize(const Conv& c, const float* x, int stride, Activation* padded) {
-    const int channels = c.cin;
-    std::fill(padded, padded + (size_t)PADDED * channels, (Activation)(c.zero_point - ACTIVATION_SHIFT));
-    const float32x4_t low = vdupq_n_f32(-c.zero_point - 1.0f), high = vdupq_n_f32(256.0f - c.zero_point);
-    const int32x4_t zp = vdupq_n_s32(c.zero_point - ACTIVATION_SHIFT);
-    const int32x4_t lo = vdupq_n_s32(-ACTIVATION_SHIFT), hi = vdupq_n_s32(255 - ACTIVATION_SHIFT);
-    auto step = [&](const float* v, const float* inv) {
-        float32x4_t t = vminq_f32(vmaxq_f32(vmulq_f32(vld1q_f32(v), vld1q_f32(inv)), low), high);
-        // rounded to the nearest, ties to even, as `rint`
-        int32x4_t i = vaddq_s32(vcvtnq_s32_f32(t), zp);
-        return vmovn_s32(vminq_s32(vmaxq_s32(i, lo), hi));
-    };
-    for (int s = 0; s < SQUARES; s++) {
-        const float* v = x + s * stride;
-        Activation* q = padded + ((s / 8 + 1) * 10 + s % 8 + 1) * channels;
-        int ch = 0;
-        for (; ch + 8 <= channels; ch += 8) {
-            int16x8_t h = vcombine_s16(step(v + ch, c.inverse.data() + ch), step(v + ch + 4, c.inverse.data() + ch + 4));
-            vst1_s8(q + ch, vmovn_s16(h));
-        }
-        if (ch < channels) {
-            int8x8_t b = vmovn_s16(vcombine_s16(step(v + ch, c.inverse.data() + ch), vdup_n_s16(0)));
-            vst1_lane_s32((int32_t*)(q + ch), vreinterpret_s32_s8(b), 0);
-        }
+// NEON: 4 lanes
+struct Lanes {
+    using F = float32x4_t;
+    static constexpr int W = 4;
+    static F zero() { return vdupq_n_f32(0); }
+    static F set1(float v) { return vdupq_n_f32(v); }
+    static F load(const float* p) { return vld1q_f32(p); }
+    static void store(float* p, F v) { vst1q_f32(p, v); }
+    // channels come in fours: always all 4
+    static F load(const float* p, int) { return vld1q_f32(p); }
+    static void store(float* p, F v, int) { vst1q_f32(p, v); }
+    static F add(F a, F b) { return vaddq_f32(a, b); }
+    static F sub(F a, F b) { return vsubq_f32(a, b); }
+    static F mul(F a, F b) { return vmulq_f32(a, b); }
+    static F div(F a, F b) { return vdivq_f32(a, b); }
+    static F sqrt(F a) { return vsqrtq_f32(a); }
+    static F fma(F a, F b, F c) { return vfmaq_f32(c, a, b); }
+    static F widen(const int16_t* a, const int16_t* b, const int16_t* c) {
+        return vcvtq_f32_s32(vmovl_s16(vadd_s16(vadd_s16(vld1_s16(a), vld1_s16(b)), vld1_s16(c))));
     }
-}
+    static uint64_t bits(const float* p) {
+        uint64_t b = 0;
+        for (int i = 0; i < W; i++) b |= (uint64_t)(p[i] > 0.5f) << i;
+        return b;
+    }
+    // a normalization's ReLU, max(v, 0); and a sum's, std::max(v, 0.0f) as the compiler's loops took
+    // it, which keeps a -0
+    static F relu(F v) { return vmaxq_f32(v, zero()); }
+    static F relu_sum(F v) { return vbslq_f32(vcltq_f32(v, zero()), zero(), v); }
+    // the sums of 4 vectors' lanes, lane s v[s]'s, each added as `vaddvq_f32` adds them, in pairs:
+    // (lane 0 + lane 1) + (lane 2 + lane 3)
+    static F reduce(const F* v) { return vpaddq_f32(vpaddq_f32(v[0], v[1]), vpaddq_f32(v[2], v[3])); }
+    // a board pool's maximum, so far `most`, with `v`: v > most ? v : most, as the compiler's loop took it
+    static F most(F most, F v) { return vbslq_f32(vcgtq_f32(v, most), v, most); }
+};
 
-// `n` of `ch` values at `v`, in place, then a ReLU if `relu`
-inline void normalize_square(const Norm& n, float* v, int ch, bool relu) {
-    const float32x4_t zero = vdupq_n_f32(0);
-    const float* a = n.a.data();
-    const float* c = n.c.data();
-    const int whole = ch & ~3;
-    float mean = 0, rstd = 1;
-    if (n.type == NORM_CHANNEL) {
-        float32x4_t sum = zero;
-        for (int i = 0; i < whole; i += 4) sum = vaddq_f32(sum, vld1q_f32(v + i));
-        float total = vaddvq_f32(sum);
-        for (int i = whole; i < ch; i++) total += v[i];
-        mean = total / ch;
-        float32x4_t sq = zero, m = vdupq_n_f32(mean);
-        for (int i = 0; i < whole; i += 4) {
-            float32x4_t d = vsubq_f32(vld1q_f32(v + i), m);
-            sq = vfmaq_f32(sq, d, d);
-        }
-        float squares = vaddvq_f32(sq);
-        for (int i = whole; i < ch; i++) squares += (v[i] - mean) * (v[i] - mean);
-        rstd = 1.0f / std::sqrt(squares / ch + n.eps);
+// a square's channels quantized for `c`'s input, less 128 for the signed dot product: round(x *
+// inverse) + zero point - 128 within -128 to 127. The conversion, the addition and the narrowing all
+// saturate, which clamps every value, infinities included, as clamping the float to the zero point's
+// range and then the integer did (and a NaN converts to 0 either way).
+struct Quantizer {
+    const float* inverse;
+    int32x4_t zero_point;
+    explicit Quantizer(const Conv& c) : inverse(c.inverse.data()), zero_point(vdupq_n_s32(c.zero_point - ACTIVATION_SHIFT)) {}
+    int32x4_t integers(float32x4_t v, int ch) const {
+        // rounded to the nearest, ties to even, as `rint`
+        return vqaddq_s32(vcvtnq_s32_f32(vmulq_f32(v, vld1q_f32(inverse + ch))), zero_point);
     }
-    if (n.type == NORM_NONE && !relu) return;
-    const float32x4_t m = vdupq_n_f32(mean), r = vdupq_n_f32(rstd);
-    for (int i = 0; i < whole; i += 4) {
-        float32x4_t x = vld1q_f32(v + i);
-        if (n.type == NORM_CHANNEL) x = vfmaq_f32(vld1q_f32(c + i), vmulq_f32(vsubq_f32(x, m), r), vld1q_f32(a + i));
-        else if (n.type == NORM_AFFINE) x = vfmaq_f32(vld1q_f32(c + i), x, vld1q_f32(a + i));
-        vst1q_f32(v + i, relu ? vmaxq_f32(x, zero) : x);
+    // `v`, channels `ch` to `ch + 4`, into the square's place `q`
+    void operator()(float32x4_t v, int ch, Activation* q, int = 4) const {
+        int8x8_t b = vqmovn_s16(vcombine_s16(vqmovn_s32(integers(v, ch)), vdup_n_s16(0)));
+        vst1_lane_s32((int32_t*)(q + ch), vreinterpret_s32_s8(b), 0);
     }
-    for (int i = whole; i < ch; i++) {
-        float x = v[i];
-        if (n.type == NORM_CHANNEL) x = (x - mean) * rstd * a[i] + c[i];
-        else if (n.type == NORM_AFFINE) x = x * a[i] + c[i];
-        v[i] = relu ? std::max(x, 0.0f) : x;
+    // 16 channels from `ch`, `v[4]`
+    void group(const float32x4_t* v, int ch, Activation* q) const {
+        int16x8_t lo = vqmovn_high_s32(vqmovn_s32(integers(v[0], ch)), integers(v[1], ch + 4));
+        int16x8_t hi = vqmovn_high_s32(vqmovn_s32(integers(v[2], ch + 8)), integers(v[3], ch + 12));
+        vst1q_s8(q + ch, vqmovn_high_s16(vqmovn_s16(lo), hi));
     }
-}
+};
 #endif
 
-// `n` of each square's first `n.channels` of `x`, (64, stride), in place, then a ReLU if `relu`
-inline void normalize(const Norm& n, float* x, int stride, bool relu) {
-    if (n.type == NORM_NONE && !relu) return;
-    for (int s = 0; s < SQUARES; s++) normalize_square(n, x + s * stride, n.channels ? n.channels : stride, relu);
-}
-
+#if NET_ISA != 2
+// AVX2's and NEON's: plain loops, which the compiler vectorizes
 // each of `count` channels from `first`'s mean and maximum over the board, (2 * count)
 inline void board_pool(const float* x, int stride, int first, int count, float* out) {
     float* mean = out;
@@ -748,7 +832,28 @@ inline void board_pool(const float* x, int stride, int first, int count, float* 
 }
 
 inline void linear(const Linear& l, const float* in, float* out) {
-    for (int o = 0; o < l.out; o++) {
+    int o = 0;
+#if NET_ISA == 1
+    // 8 outputs at a time, summed as the compiler's loop below sums one: products, unfused, added up
+    // 8 lanes at a time, then the lanes in order onto 0
+    if (l.in % 8 == 0)
+        for (; o + 8 <= l.out; o += 8) {
+            __m256 acc[8];
+            for (int k = 0; k < 8; k++) {
+                const float* w = l.w.data() + (size_t)(o + k) * l.in;
+                __m256 sum = _mm256_setzero_ps();
+                for (int i = 0; i < l.in; i += 8)
+                    sum = _mm256_add_ps(sum, Lanes::product(_mm256_loadu_ps(w + i), _mm256_loadu_ps(in + i)));
+                acc[k] = sum;
+            }
+            // lane j of each output's sum to acc[j]
+            Lanes::transpose(acc);
+            __m256 total = _mm256_setzero_ps();
+            for (int j = 0; j < 8; j++) total = _mm256_add_ps(total, acc[j]);
+            _mm256_storeu_ps(out + o, _mm256_add_ps(total, _mm256_loadu_ps(l.b.data() + o)));
+        }
+#endif
+    for (; o < l.out; o++) {
         const float* w = l.w.data() + (size_t)o * l.in;
         float sum = 0;
 #pragma omp simd reduction(+ : sum)
@@ -761,30 +866,285 @@ inline void relu(float* x, int count) {
 #pragma omp simd
     for (int i = 0; i < count; i++) x[i] = std::max(x[i], 0.0f);
 }
+#endif
 
-// `b`, (cols), added to each of the 64 squares' first `cols` of `x`, (64, stride), then a ReLU if
-// `relu_after`
-inline void add_rows(float* x, int stride, const float* b, int cols, bool relu_after) {
+using F = Lanes::F;
+constexpr int W = Lanes::W;
+// the passes take channels 16 at a time, G vectors: a fixed number, which the compiler keeps in
+// registers (channels come in 16s, but for a convolution's input after a block's pooled channels)
+constexpr int G = 16 / W;
+
+// where square `s` goes in a convolution's padded input of `cin` channels
+inline Activation* padded_square(Activation* padded, int s, int cin) {
+    return padded + ((s / 8 + 1) * 10 + s % 8 + 1) * cin;
+}
+
+// the border all round the board of `c`'s padded input, its zero point; the board is written by the
+// passes below
+inline void border(const Conv& c, Activation* padded) {
+    const Activation zero = (Activation)(c.zero_point - ACTIVATION_SHIFT);
+    const int cin = c.cin;
+    std::fill(padded, padded + 11 * cin, zero);  // the first row, and the second's first square
+    for (int r = 1; r < 8; r++)  // a row's last square and the next's first
+        std::fill(padded + (r * 10 + 9) * cin, padded + (r * 10 + 11) * cin, zero);
+    std::fill(padded + 89 * cin, padded + PADDED * cin, zero);  // the ninth row's last, and the last row
+}
+
+// a channel normalization's mean and 1 / std for each square of `x`, (64, stride), over its first `ch`
+// (a multiple of W) channels: W squares at a time, so that their sums don't wait on each other
+inline void norm_stats(const float* x, int stride, int ch, float eps, float* mean, float* rstd) {
+    const F count = Lanes::set1((float)ch);
+    for (int s0 = 0; s0 < SQUARES; s0 += W) {
+        F acc[W];
+        for (int s = 0; s < W; s++) {
+            const float* v = x + (size_t)(s0 + s) * stride;
+            F sum = Lanes::zero();
+            for (int i = 0; i < ch; i += W) sum = Lanes::add(sum, Lanes::load(v + i));
+            acc[s] = sum;
+        }
+        Lanes::store(mean + s0, Lanes::div(Lanes::reduce(acc), count));
+        for (int s = 0; s < W; s++) {
+            const float* v = x + (size_t)(s0 + s) * stride;
+            const F m = Lanes::set1(mean[s0 + s]);
+            F sq = Lanes::zero();
+            for (int i = 0; i < ch; i += W) {
+                F d = Lanes::sub(Lanes::load(v + i), m);
+                sq = Lanes::fma(d, d, sq);
+            }
+            acc[s] = sq;
+        }
+        Lanes::store(rstd + s0, Lanes::div(Lanes::set1(1.0f), Lanes::sqrt(Lanes::add(Lanes::div(Lanes::reduce(acc), count),
+                                                                                       Lanes::set1(eps)))));
+    }
+}
+
+// a normalization of type `TYPE` of every square, with its statistics for a channel normalization
+template <int TYPE>
+struct Normalizer {
+    const float* a;
+    const float* c;
+    alignas(64) float mean[SQUARES], rstd[SQUARES];
+    Normalizer(const Norm& n, const float* x, int stride, int ch) : a(n.a.data()), c(n.c.data()) {
+        if (TYPE == NORM_CHANNEL) norm_stats(x, stride, ch, n.eps, mean, rstd);
+    }
+    // square `s`'s
+    struct Square {
+        const float* a;
+        const float* c;
+        F mean, rstd;
+        // its channels `i` to `i + W`, `v`, normalized
+        F operator()(F v, int i) const {
+            if (TYPE == NORM_CHANNEL)
+                return Lanes::fma(Lanes::mul(Lanes::sub(v, mean), rstd), Lanes::load(a + i), Lanes::load(c + i));
+            if (TYPE == NORM_AFFINE) return Lanes::fma(v, Lanes::load(a + i), Lanes::load(c + i));
+            return v;
+        }
+    };
+    Square square(int s) const {
+        if (TYPE == NORM_CHANNEL) return {a, c, Lanes::set1(mean[s]), Lanes::set1(rstd[s])};
+        return {a, c, Lanes::zero(), Lanes::zero()};
+    }
+    // channel `i` of squares `s` to `s + W`, `v`, normalized
+    F column(F v, int s, int i) const {
+        if (TYPE == NORM_CHANNEL)
+            return Lanes::fma(Lanes::mul(Lanes::sub(v, Lanes::load(mean + s)), Lanes::load(rstd + s)), Lanes::set1(a[i]),
+                              Lanes::set1(c[i]));
+        if (TYPE == NORM_AFFINE) return Lanes::fma(v, Lanes::set1(a[i]), Lanes::set1(c[i]));
+        return v;
+    }
+};
+
+// `f` called with the `Normalizer` of `n`, for `x`, (64, stride), its first `ch` (a multiple of W)
+// channels
+template <class Fn>
+inline void with_norm(const Norm& n, const float* x, int stride, int ch, Fn f) {
+    if (n.type == NORM_CHANNEL) f(Normalizer<NORM_CHANNEL>(n, x, stride, ch));
+    else if (n.type == NORM_AFFINE) f(Normalizer<NORM_AFFINE>(n, x, stride, ch));
+    else f(Normalizer<NORM_NONE>(n, x, stride, ch));
+}
+
+// `n` of each square's first `ch` (a multiple of W) channels of `x`, (64, stride), in place, then a
+// ReLU if `relu`
+inline void normalize(const Norm& n, float* x, int stride, int ch, bool relu) {
+    if (n.type == NORM_NONE && !relu) return;
+    with_norm(n, x, stride, ch, [&](const auto& norm) {
+        for (int s = 0; s < SQUARES; s++) {
+            const auto square = norm.square(s);
+            float* v = x + s * stride;
+            for (int i = 0; i < ch; i += W) {
+                F out = square(Lanes::load(v + i), i);
+                Lanes::store(v + i, relu ? Lanes::relu(out) : out);
+            }
+        }
+    });
+}
+
+// relu(n(x)), each square's `c.cin` (a multiple of 16) channels of `x`, (64, stride), quantized for `c`
+// into `padded`; and kept in `keep` too if given
+inline void normalize_quantize(const Norm& n, const float* x, int stride, const Conv& c, Activation* padded,
+                               float* keep = nullptr) {
+    border(c, padded);
+    const Quantizer quantize(c);
+    const int cin = c.cin;
+    with_norm(n, x, stride, cin, [&](const auto& norm) {
+        for (int s = 0; s < SQUARES; s++) {
+            const auto square = norm.square(s);
+            const float* v = x + s * stride;
+            Activation* q = padded_square(padded, s, cin);
+            for (int i = 0; i < cin; i += 16) {
+                F out[G];
+                for (int g = 0; g < G; g++) {
+                    out[g] = Lanes::relu(square(Lanes::load(v + i + g * W), i + g * W));
+                    if (keep) Lanes::store(keep + s * stride + i + g * W, out[g]);
+                }
+                quantize.group(out, i, q);
+            }
+        }
+    });
+}
+
+// the post layout's residual: x = max(x + n(y), 0), each square's `c.cin` channels of `x` and `y`,
+// (64, stride), quantized for `c`, the next convolution, into `padded`
+inline void residual_quantize(const Norm& n, const float* y, float* x, int stride, const Conv& c, Activation* padded) {
+    border(c, padded);
+    const Quantizer quantize(c);
+    const int cin = c.cin;
+    with_norm(n, y, stride, cin, [&](const auto& norm) {
+        for (int s = 0; s < SQUARES; s++) {
+            const auto square = norm.square(s);
+            float* v = x + s * stride;
+            Activation* q = padded_square(padded, s, cin);
+            for (int i = 0; i < cin; i += 16) {
+                F out[G];
+                for (int g = 0; g < G; g++) {
+                    const int j = i + g * W;
+                    out[g] = Lanes::relu_sum(Lanes::add(Lanes::load(v + j), square(Lanes::load(y + s * stride + j), j)));
+                    Lanes::store(v + j, out[g]);
+                }
+                quantize.group(out, i, q);
+            }
+        }
+    });
+}
+
+// each square's first `c.cin` channels of `x`, (64, stride), plus `bias`, (c.cin), then a ReLU if
+// `relu_after`, quantized for `c` into `padded`
+inline void add_quantize(const float* x, int stride, const float* bias, bool relu_after, const Conv& c,
+                         Activation* padded) {
+    border(c, padded);
+    const Quantizer quantize(c);
+    const int cin = c.cin;
+    const int whole = cin & ~15;
     for (int s = 0; s < SQUARES; s++) {
-        float* v = x + s * stride;
-#pragma omp simd
-        for (int i = 0; i < cols; i++) {
-            float out = v[i] + b[i];
-            v[i] = relu_after ? std::max(out, 0.0f) : out;
+        const float* v = x + s * stride;
+        Activation* q = padded_square(padded, s, cin);
+        for (int i = 0; i < whole; i += 16) {
+            F out[G];
+            for (int g = 0; g < G; g++) {
+                out[g] = Lanes::add(Lanes::load(v + i + g * W), Lanes::load(bias + i + g * W));
+                if (relu_after) out[g] = Lanes::relu_sum(out[g]);
+            }
+            quantize.group(out, i, q);
+        }
+        for (int i = whole; i < cin; i += W) {
+            const int m = cin - i;
+            F out = Lanes::add(Lanes::load(v + i, m), Lanes::load(bias + i, m));
+            quantize(relu_after ? Lanes::relu_sum(out) : out, i, q, m);
         }
     }
 }
 
-// x += y, then a ReLU if `relu_after`, over `count` values
-inline void residual(float* x, const float* y, int count, bool relu_after) {
-#pragma omp simd
-    for (int i = 0; i < count; i++) {
-        float out = x[i] + y[i];
-        x[i] = relu_after ? std::max(out, 0.0f) : out;
-    }
+// relu(n(x)) of each square's `ch` (a multiple of 16) channels of `x`, (64, stride), pooled as
+// `board_pool` pools them, to (2 * ch); x as it was
+inline void normalize_pool(const Norm& n, const float* x, int stride, int ch, float* out) {
+    with_norm(n, x, stride, ch, [&](const auto& norm) {
+        for (int first = 0; first < ch; first += 16) {
+            F sum[G], most[G];
+            for (int g = 0; g < G; g++) {
+                sum[g] = Lanes::zero();
+                most[g] = Lanes::set1(-INFINITY);
+            }
+            for (int s = 0; s < SQUARES; s++) {
+                const auto square = norm.square(s);
+                for (int g = 0; g < G; g++) {
+                    const int i = first + g * W;
+                    F v = Lanes::relu(square(Lanes::load(x + s * stride + i), i));
+                    sum[g] = Lanes::add(sum[g], v);
+                    most[g] = Lanes::most(most[g], v);
+                }
+            }
+            for (int g = 0; g < G; g++) {
+                Lanes::store(out + first + g * W, Lanes::mul(sum[g], Lanes::set1(1.0f / SQUARES)));
+                Lanes::store(out + ch + first + g * W, most[g]);
+            }
+        }
+    });
 }
 
+#if NET_ISA != 3
+// the policy's logit of each square: the sum, in order onto 0, of std::max(p + bias, 0) * square_w, the
+// products rounded on their own, over p = n(h), the square's first H (a multiple of W) channels of h,
+// (64, stride); as the compiler's loop summed one square, here W squares a lane each, their channels
+// transposed
+inline void policy_logits(const Norm& n, const float* h, int stride, int H, const float* bias, const float* square_w,
+                          float* logits) {
+    with_norm(n, h, stride, H, [&](const auto& norm) {
+        for (int s0 = 0; s0 < SQUARES; s0 += W) {
+            F logit = Lanes::zero();
+            for (int i0 = 0; i0 < H; i0 += W) {
+                F column[W];
+                for (int s = 0; s < W; s++) column[s] = Lanes::load(h + (s0 + s) * stride + i0);
+                Lanes::transpose(column);
+                for (int j = 0; j < W; j++) {
+                    const int i = i0 + j;
+                    F p = Lanes::add(norm.column(column[j], s0, i), Lanes::set1(bias[i]));
+                    logit = Lanes::add(logit, Lanes::product(Lanes::max0(p), Lanes::set1(square_w[i])));
+                }
+            }
+            Lanes::store(logits + s0, logit);
+        }
+    });
+}
 #endif
+
+// a ReLU of each square's `count` channels from `first` of `x`, (64, stride)
+inline void relu_columns(float* x, int stride, int first, int count) {
+    for (int s = 0; s < SQUARES; s++)
+        for (int i = 0; i < count; i += W) {
+            float* v = x + s * stride + first + i;
+            Lanes::store(v, Lanes::relu(Lanes::load(v, count - i)), count - i);
+        }
+}
+
+// The stem's convolution of the board, `obs`, (2, 8, 8), its discs 0 or 1, to `out`, (64, c.cout): each
+// square's sums are those of its 3 rows of 3 squares' discs' weights, looked up (`stem_table`). The
+// same integers as the convolution kernels sum, scaled the same way, so the same floats.
+inline void stem(const Conv& c, const float* obs, float* out) {
+    // each side's discs, a bit a square
+    uint64_t discs[2] = {0, 0};
+    for (int p = 0; p < 2; p++)
+        for (int sq = 0; sq < SQUARES; sq += W) discs[p] |= Lanes::bits(obs + p * SQUARES + sq) << sq;
+    // each square's 3 squares of its row, the one it's centred on: 6 bits as `stem_table` takes them;
+    // and rows of none above and below the board
+    int patterns[10][8] = {};
+    for (int y = 0; y < 8; y++) {
+        // the row's discs, from bit 1 (bit 0 and 9 off the board)
+        const int mine = (int)((discs[0] >> (8 * y)) & 0xff) << 1, theirs = (int)((discs[1] >> (8 * y)) & 0xff) << 1;
+        for (int x = 0; x < 8; x++) patterns[y + 1][x] = ((mine >> x) & 7) | ((theirs >> x) & 7) << 3;
+    }
+    const int C = c.cout;
+    const float* scale = c.scale.data();
+    const float* bias = c.bias.data();
+    const int16_t* table = c.table.data();
+    for (int sq = 0; sq < SQUARES; sq++) {
+        const int y = sq / 8, x = sq % 8;
+        const int16_t* rows[3];
+        for (int dy = 0; dy < 3; dy++) rows[dy] = table + ((size_t)dy * 64 + patterns[y + dy][x]) * C;
+        for (int i = 0; i < C; i += W)
+            Lanes::store(out + sq * C + i, Lanes::fma(Lanes::widen(rows[0] + i, rows[1] + i, rows[2] + i),
+                                                      Lanes::load(scale + i), Lanes::load(bias + i)));
+    }
+}
 
 // One position: `obs`, (2, 8, 8) channels-first, the mover's discs then the opponent's, to (65)
 // policy logits and a value.
@@ -792,77 +1152,81 @@ inline void forward(const Net& n, Scratch& s, const float* obs, float* logits, f
     const int C = n.channels;
     float* x = s.x.data();
     float* y = s.y.data();
-    // the stem's input, its 2 planes padded to 4 channels
-    std::fill(s.padded.begin(), s.padded.begin() + (size_t)PADDED * 4, (Activation)-ACTIVATION_SHIFT);
-    for (int sq = 0; sq < SQUARES; sq++)
-        for (int p = 0; p < 2; p++)
-            s.padded[((sq / 8 + 1) * 10 + sq % 8 + 1) * 4 + p] =
-                (Activation)((obs[p * SQUARES + sq] > 0.5f ? 1 : 0) - ACTIVATION_SHIFT);
-    convolve(n.stem, s, x, C);
-    if (!n.pre) normalize(n.stem_norm, x, C, true);
-    for (const Block& b : n.blocks) {
+    Activation* padded = s.padded.data();
+    stem(n.stem, obs, x);
+    NET_STAGE("stem");
+    // what takes the trunk's output next: the next block's first convolution, or the heads'
+    auto next = [&](size_t i) -> const Conv& { return i < n.blocks.size() ? n.blocks[i].conv1 : n.head; };
+    if (!n.pre) normalize_quantize(n.stem_norm, x, C, next(0), padded, x);
+    NET_STAGE("stem norm");
+    for (size_t i = 0; i < n.blocks.size(); i++) {
+        const Block& b = n.blocks[i];
         const int kept = C - b.pool_channels;
-        if (n.pre) {
-            // y = relu(norm1(x)), quantized for conv1
-            std::memcpy(y, x, sizeof(float) * SQUARES * C);
-            normalize(b.norm1, y, C, true);
-            quantize(b.conv1, y, C, s.padded.data());
-            convolve(b.conv1, s, y, C);
-            normalize(b.norm2, y, C, true);
-        } else {
-            quantize(b.conv1, x, C, s.padded.data());
-            convolve(b.conv1, s, y, C);
-            normalize(b.norm1, y, C, false);
-        }
+        // the post layout's x is quantized for conv1 already
+        if (n.pre) normalize_quantize(b.norm1, x, C, b.conv1, padded);
+        NET_STAGE("norm1 quantize");
+        convolve(b.conv1, s, y, C);
+        NET_STAGE("conv1");
         if (b.pool_channels) {
             float pooled[2 * 512], bias[1024];
             if (n.pre) {
-                board_pool(y, C, kept, b.pool_channels, pooled);
+                normalize(b.norm2, y, C, C, true);
             } else {
                 // of the pooled channels after a ReLU
-                for (int sq = 0; sq < SQUARES; sq++) normalize_square(Norm(), y + sq * C + kept, b.pool_channels, true);
-                board_pool(y, C, kept, b.pool_channels, pooled);
+                normalize(b.norm1, y, C, C, false);
+                relu_columns(y, C, kept, b.pool_channels);
             }
+            board_pool(y, C, kept, b.pool_channels, pooled);
             linear(b.pool, pooled, bias);
-            add_rows(y, C, bias, kept, !n.pre);
-        } else if (!n.pre) {
-            for (int sq = 0; sq < SQUARES; sq++) normalize_square(Norm(), y + sq * C, kept, true);
+            add_quantize(y, C, bias, !n.pre, b.conv2, padded);
+        } else {
+            normalize_quantize(n.pre ? b.norm2 : b.norm1, y, C, b.conv2, padded);
         }
-        quantize(b.conv2, y, C, s.padded.data());
-        convolve(b.conv2, s, y, C);
-        if (!n.pre) normalize(b.norm2, y, C, false);
-        residual(x, y, SQUARES * C, !n.pre);
+        NET_STAGE("norm2 pool quantize");
+        if (n.pre) {
+            convolve(b.conv2, s, x, C, true);
+            NET_STAGE("conv2");
+        } else {
+            convolve(b.conv2, s, y, C);
+            NET_STAGE("conv2");
+            residual_quantize(b.norm2, y, x, C, next(i + 1), padded);
+            NET_STAGE("residual quantize");
+        }
     }
-    if (n.pre) normalize(n.final_norm, x, C, true);
+    if (n.pre) normalize_quantize(n.final_norm, x, C, n.head, padded);
+    NET_STAGE("final norm quantize");
 
     // the heads: the three 1x1 convolutions at once, then in float
     const int H = n.head_channels, H3 = 3 * H;
     float* h = s.h.data();
-    quantize(n.head, x, C, s.padded.data());
     convolve(n.head, s, h, H3);
-    // each part's normalization, of its own channels
-    auto part = [&](const Norm& norm, int first, bool relu_after) {
-        for (int sq = 0; sq < SQUARES; sq++) normalize_square(norm, h + sq * H3 + first, H, relu_after);
-    };
-    part(n.policy_norm, 0, false);
-    part(n.pool_norm, H, true);
-    part(n.value_norm, 2 * H, true);
-    float pooled[256], bias[128], hidden[1024], out[1];
-    board_pool(h, H3, H, H, pooled);
+    NET_STAGE("head conv");
+    // each part normalized, of its own channels: the pooled part's and the value's pooled as they go
+    // (out: a vector of outputs, as `linear` writes them, though it takes 1)
+    float pooled[256], bias[128], hidden[1024], out[16];
+    normalize_pool(n.pool_norm, h + H, H3, H, pooled);
     linear(n.pool_linear, pooled, bias);
+    NET_STAGE("head policy pool");
+#if NET_ISA != 3
+    policy_logits(n.policy_norm, h, H3, H, bias, n.square_w.data(), logits);
+#else
+    normalize(n.policy_norm, h, H3, H, false);
     for (int sq = 0; sq < SQUARES; sq++) {
         float* v = h + sq * H3;
         float logit = 0;
         for (int i = 0; i < H; i++) logit += std::max(v[i] + bias[i], 0.0f) * n.square_w[i];
         logits[sq] = logit;
     }
+#endif
+    NET_STAGE("head square logits");
     linear(n.pass_linear, pooled, out);
     logits[SQUARES] = out[0];
-    board_pool(h, H3, 2 * H, H, pooled);
+    normalize_pool(n.value_norm, h + 2 * H, H3, H, pooled);
     linear(n.value_hidden, pooled, hidden);
     relu(hidden, n.value_hidden.out);
     linear(n.value_out, hidden, out);
     *value = std::tanh(out[0]);
+    NET_STAGE("head pass and value");
 }
 
 #else
@@ -876,6 +1240,22 @@ inline void forward(const Net&, Scratch&, const float*, float*, float*) {
 // bits, [cout / 16][cin / 2][2][8 outputs][2 inputs] for 1x1, and for 3x3 the same of each of the 16
 // transformed values, [cout / 16][16][cin / 2][2][8][2], 2G g 2G^T; for NEON, [cout / 8][k * k][cin / 4]
 // [8 outputs][4 inputs].
+// The stem's sums, for `stem`, from its weights `q`, (cout, 4, 3, 3), the last 2 input channels padding:
+// for each row of the 3 rows of 3 squares a square's sums take in (above, its own, below) and each
+// pattern of discs on that row's squares (6 bits: the mover's from the left, then the opponent's), the
+// sum of those discs' weights, (3, 64, cout), within 16 bits (and 3 rows' too: 18 weights of at most 127).
+inline void stem_table(Conv& c, const int8_t* q) {
+    c.table.assign((size_t)3 * 64 * c.cout, 0);
+    for (int dy = 0; dy < 3; dy++)
+        for (int pattern = 0; pattern < 64; pattern++)
+            for (int o = 0; o < c.cout; o++) {
+                int sum = 0;
+                for (int k = 0; k < 6; k++)
+                    if (pattern >> k & 1) sum += q[(((size_t)o * c.cin + k / 3) * 3 + dy) * 3 + k % 3];
+                c.table[((size_t)dy * 64 + pattern) * c.cout + o] = (int16_t)sum;
+            }
+}
+
 inline void pack(Conv& c, const int8_t* q) {
     const int c4n = c.cin / 4, taps = c.k * c.k;
 #if NET_ISA == 3 && defined(__ARM_FEATURE_MATMUL_INT8)
