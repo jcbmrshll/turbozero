@@ -42,6 +42,7 @@ import socket
 import subprocess
 import time
 import urllib.parse
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -68,7 +69,7 @@ from xot import load_xot, make_xot_init_fn
 
 from core.memory.move_log import ENDED, GOES_ON, emptied
 from core.memory.replay_memory import EpisodeReplayBuffer
-from core.networks.utils import apply_nn
+from core.networks.utils import BATCH_AXIS, apply_nn
 from core.training.endgame_solve import EndgameSolve
 from core.training.loss_fns import az_default_loss_fn
 from core.training.resignation import Resignation
@@ -110,6 +111,13 @@ DECIDED = 0.9
 CHUNK_STEPS = 4
 # stored positions per count of empty squares that pair distances are measured among, at most
 PAIR_SAMPLE = 384
+# the scales of the soft collisions, exp(-distance / scale), in each distance's units: squares,
+# and the reference network's cosine distance
+SOFT_SCALES = {
+    "disc": (2.0, 4.0, 8.0),
+    "occupancy": (1.0, 2.0, 4.0),
+    "feature": (0.03, 0.1, 0.3),
+}
 
 
 def parse_config(text: str, net: str) -> tuple[str, list[str], argparse.Namespace]:
@@ -484,23 +492,52 @@ def symmetric_bitboards(observations: np.ndarray) -> np.ndarray:
     return np.stack(out).transpose(0, 1, 3, 2).copy().view("<u8")[..., 0]
 
 
-def pair_distances(
+def symmetric_observations(observations: np.ndarray) -> np.ndarray:
+    """Each position's 8 symmetries as the network's input: (8, n, 8, 8, 2), in the order of
+    `symmetric_bitboards`."""
+    obs = np.asarray(observations, dtype=bool)
+    out = []
+    for transpose in (False, True):
+        board = np.swapaxes(obs, 1, 2) if transpose else obs
+        for turns in range(4):
+            out.append(np.rot90(board, turns, axes=(1, 2)))
+    return np.stack(out)
+
+
+# positions' features in each of their 8 symmetries, (8, n, features), each of unit length
+FeatureFn = Callable[[np.ndarray], np.ndarray]
+
+
+def pair_statistics(
     observations: np.ndarray,
     empties: np.ndarray,
     rng: np.random.Generator,
     groups: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
+    features: FeatureFn | None = None,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     """How far apart positions are, where nearly all are distinct: each of up to PAIR_SAMPLE
     positions per count of empty squares (drawn at random), its mean distance to the others drawn
-    with as many empties. The distance is the squares whose contents differ (empty, the player to
-    move's, the opponent's), in the closest of the other's 8 symmetries, which training treats as
-    one position. A mean over pairs, so it doesn't depend on how many positions there are. With
-    `groups` (e.g. each position's opening), only positions of the same group are compared.
+    with as many empties, by each of these distances, each in the closest of the other's 8
+    symmetries, which training treats as one position:
+
+    - disc (`pair_distance`): the squares whose contents differ (empty, the player to move's,
+      the opponent's)
+    - occupancy (`occupancy_distance`): the squares filled in one and empty in the other, the
+      shape of the filled region whatever its colours, which change every move
+    - feature (`feature_distance`, with `features`): the cosine distance between a reference
+      network's trunk features, positions as that network sees them
+
+    And for each, soft collisions `soft_collision_<distance>_<scale>`: the mean of
+    exp(-distance / scale) for the scales of SOFT_SCALES, the chance two positions are the same
+    with near-misses counting in part (at a small scale, the exact collision). Means over pairs,
+    so none depends on how many positions there are. With `groups` (e.g. each position's
+    opening), only positions of the same group are compared.
 
     Returns:
-        the rows drawn, and each one's mean distance
+        the rows drawn, and each statistic's value for each of them
     """
-    rows, means = [], []
+    rows: list[np.ndarray] = []
+    values: dict[str, list[np.ndarray]] = {}
     keys = np.asarray(empties, np.int64)
     if groups is not None:
         _, group = np.unique(groups, return_inverse=True)
@@ -514,16 +551,60 @@ def pair_distances(
         boards = symmetric_bitboards(observations[level])
         me, opp = boards[0, :, 0], boards[0, :, 1]
         # (8, m, m): row i against each symmetry of row j
-        differ = (me[None, :, None] ^ boards[:, None, :, 0]) | (
-            opp[None, :, None] ^ boards[:, None, :, 1]
-        )
-        distance = np.bitwise_count(differ).min(0).astype(float)
-        np.fill_diagonal(distance, 0.0)
+        sym_me, sym_opp = boards[:, None, :, 0], boards[:, None, :, 1]
+        distances = {
+            "disc": (me[None, :, None] ^ sym_me) | (opp[None, :, None] ^ sym_opp),
+            "occupancy": (me | opp)[None, :, None] ^ (sym_me | sym_opp),
+        }
+        distances = {
+            name: np.bitwise_count(bits).min(0).astype(float)
+            for name, bits in distances.items()
+        }
+        if features is not None:
+            f = features(observations[level])
+            distances["feature"] = np.maximum(
+                1.0 - np.einsum("id,sjd->sij", f[0], f), 0.0
+            ).min(0)
+        off = ~np.eye(len(level), dtype=bool)
         rows.append(level)
-        means.append(distance.sum(1) / (len(level) - 1))
+        for name, distance in distances.items():
+            stat = {"disc": "pair_distance"}.get(name, f"{name}_distance")
+            values.setdefault(stat, []).append(
+                np.where(off, distance, 0.0).sum(1) / (len(level) - 1)
+            )
+            for scale in SOFT_SCALES[name]:
+                kernel = np.where(off, np.exp(-distance / scale), 0.0)
+                values.setdefault(f"soft_collision_{name}_{scale:g}", []).append(
+                    kernel.sum(1) / (len(level) - 1)
+                )
     if not rows:
-        return np.zeros(0, int), np.zeros(0)
-    return np.concatenate(rows), np.concatenate(means)
+        return np.zeros(0, int), {}
+    return np.concatenate(rows), {k: np.concatenate(v) for k, v in values.items()}
+
+
+def reference_features(network: Any, params: Any) -> FeatureFn:
+    """A reference network's trunk features of positions in each of their 8 symmetries, flattened
+    and of unit length (see `pair_statistics`)."""
+    nn_params, nn_state = params
+    static = eqx.filter(network, eqx.is_inexact_array, inverse=True)
+
+    @jax.jit
+    def forward(x):
+        net = eqx.nn.inference_mode(eqx.combine(nn_params, static))
+        trunk = jax.vmap(net.trunk, axis_name=BATCH_AXIS, in_axes=(0, None))
+        out = trunk(x, nn_state)[0].astype(jnp.float32).reshape(len(x), -1)
+        return out / jnp.maximum(jnp.linalg.norm(out, axis=1, keepdims=True), 1e-12)
+
+    def features(observations: np.ndarray) -> np.ndarray:
+        sym = symmetric_observations(observations)
+        flat = sym.reshape(-1, *sym.shape[2:])
+        # padded to a power of two, so that few sizes compile
+        size = 1 << max(int(len(flat) - 1).bit_length(), 4)
+        padded = np.concatenate([flat, np.repeat(flat[:1], size - len(flat), 0)])
+        out = np.asarray(forward(jnp.asarray(padded)))[: len(flat)]
+        return out.reshape(8, len(observations), -1)
+
+    return features
 
 
 def bitboards(observations: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -764,9 +845,11 @@ def selfplay_metrics(
     args: argparse.Namespace,
     timing: dict[str, float],
     games_per_opening: int,
+    features: FeatureFn | None = None,
 ) -> tuple[dict[str, Any], Stats]:
     """The self-play pass's metrics (see the module's docstring), and their inputs. The
-    bootstrap's unit is the opening: its games are resampled together."""
+    bootstrap's unit is the opening: its games are resampled together. With `features`, the
+    stored positions' distances include a reference network's (see `pair_statistics`)."""
     stats = Stats()
     obs, policy, value = moves["observation"], moves["policy"], moves["value"]
     full, env, action = moves["full"].astype(bool), moves["env"], moves["action"]
@@ -805,22 +888,23 @@ def selfplay_metrics(
             "decided_share": np.abs(value[train]) > DECIDED,
         }
         both = train & known
-        drawn, distance = pair_distances(
-            obs[train], empties[train], np.random.default_rng(args.seed)
+        drawn, pairs = pair_statistics(
+            obs[train], empties[train], np.random.default_rng(args.seed), None, features
         )
-        same, same_distance = pair_distances(
-            obs[train], empties[train], np.random.default_rng(args.seed), ids
+        same, same_pairs = pair_statistics(
+            obs[train], empties[train], np.random.default_rng(args.seed), ids, features
         )
         phases[phase] = {
             "training_positions": stored,
             **{k: stats.mean(f"{prefix}.{k}", ids, v) for k, v in per_row.items()},
-            "pair_distance": stats.mean(
-                f"{prefix}.pair_distance", ids[drawn], distance
-            ),
+            **{k: stats.mean(f"{prefix}.{k}", ids[drawn], v) for k, v in pairs.items()},
             # the same among the stored positions of one opening: how far its games spread
-            "pair_distance_same_opening": stats.mean(
-                f"{prefix}.pair_distance_same_opening", ids[same], same_distance
-            ),
+            **{
+                f"{k}_same_opening": stats.mean(
+                    f"{prefix}.{k}_same_opening", ids[same], v
+                )
+                for k, v in same_pairs.items()
+            },
             **stats.value(prefix, opening[both], value[both], z[both], name="stored_"),
         }
     # the moves sampled rather than played greedily: with a move temperature, all of them
@@ -946,6 +1030,13 @@ def run(args: argparse.Namespace) -> None:
     results.mkdir(parents=True, exist_ok=True)
     sha = file_sha256(args.ckpt)
     threads = args.solve_threads or default_threads()
+    features = None
+    if args.reference_ckpt is not None:
+        if args.reference_net is None:
+            raise SystemExit("--reference-ckpt needs its --reference-net")
+        features = reference_features(
+            *load_checkpoint(args.reference_ckpt, args.reference_net)
+        )
     for name, flags, config in configs:
         print(f"== {model} / {name}: {shlex.join(flags)}", flush=True)
         network, params = load_checkpoint(args.ckpt, net, config.inference_dtype)
@@ -977,7 +1068,7 @@ def run(args: argparse.Namespace) -> None:
         prior = masked_softmax(logits, moves["legal"].astype(bool))
         sample = args.games_per_opening or max(2, args.games // args.openings // 2)
         selfplay, selfplay_stats = selfplay_metrics(
-            moves, z, prior, config, timing, sample
+            moves, z, prior, config, timing, sample, features
         )
         stats.inputs.update(selfplay_stats.inputs)
         result = {
@@ -999,6 +1090,13 @@ def run(args: argparse.Namespace) -> None:
                 "openings": args.openings,
                 "probe_per_phase": args.probe,
                 "engine_set": str(args.engine_set),
+                "reference": None
+                if args.reference_ckpt is None
+                else {
+                    "checkpoint": str(args.reference_ckpt),
+                    "net": args.reference_net,
+                    "sha256": file_sha256(args.reference_ckpt),
+                },
                 "seed": args.seed,
                 "phases": PHASES,
             },
@@ -1134,6 +1232,15 @@ def main() -> None:
         "--probe-batch", type=int, default=512, help="probe positions searched at once"
     )
     run_parser.add_argument("--engine-set", default=str(DEFAULT_ENGINE_SET))
+    run_parser.add_argument(
+        "--reference-ckpt",
+        default=None,
+        help="a fixed network whose trunk features measure how alike stored positions are "
+        "(feature_distance, soft_collision_feature_*): the same one for every model compared",
+    )
+    run_parser.add_argument(
+        "--reference-net", default=None, help="its network, as train.py's --net"
+    )
     run_parser.add_argument(
         "--solve-threads", type=int, default=None, help="exact solver's threads"
     )
