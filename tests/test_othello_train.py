@@ -622,3 +622,17 @@ def test_policy_target_reaches_self_play(monkeypatch, choice, target):
     if choice == "pruned-visits":
         # measured against the search's own selection rule
         assert evaluator.policy_target.selector is evaluator.action_selector
+
+
+def test_store_until_offline_reaches_self_play_exploration(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, "--sampling-moves", "50", "--store-until-offline", "30")
+    exploration = built.value.kwargs["exploration"]
+    assert exploration.num_sampling_moves == 50
+    assert exploration.store_until_offline == 30
+
+
+def test_store_until_offline_is_off_by_default(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch)
+    assert built.value.kwargs["exploration"].store_until_offline is None

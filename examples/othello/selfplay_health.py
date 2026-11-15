@@ -93,6 +93,7 @@ SELFPLAY_ARGS = (
     "advance_every",
     "sampling_moves",
     "move_temperature",
+    "store_until_offline",
     "dirichlet_alpha",
     "dirichlet_epsilon",
     "resign",
@@ -939,6 +940,31 @@ def novelty(
     }
 
 
+def after_offline(moves: dict[str, np.ndarray], start: int) -> np.ndarray:
+    """Which logged moves come after their game went off line (see train.py's
+    --store-until-offline): after a move at or past ply `start` that isn't the target's top one.
+    Training stores none of those positions."""
+    env, ply, action, policy = (
+        moves["env"],
+        moves["ply"],
+        moves["action"],
+        moves["policy"],
+    )
+    legal = moves["legal"].astype(bool)
+    played = action >= 0
+    weights = np.where(legal, policy, -np.inf)
+    top = np.take_along_axis(weights, np.maximum(action, 0)[:, None], 1)[
+        :, 0
+    ] == weights.max(1)
+    offline = played & (ply >= start) & ~top
+    starts = np.r_[True, (env[1:] != env[:-1]) | (ply[1:] <= ply[:-1])]
+    # an off-line move's game stores nothing after it: off-line moves so far, this one aside,
+    # within each game
+    before = np.cumsum(offline) - offline
+    so_far = before - before[np.flatnonzero(starts)][np.cumsum(starts) - 1]
+    return so_far > 0
+
+
 def selfplay_metrics(
     moves: dict[str, np.ndarray],
     z: np.ndarray,
@@ -961,6 +987,8 @@ def selfplay_metrics(
     obs, policy, value = moves["observation"], moves["policy"], moves["value"]
     full, env, action = moves["full"].astype(bool), moves["env"], moves["action"]
     n = len(env)
+    if args.store_until_offline is not None:
+        full = full & ~after_offline(moves, args.store_until_offline)
     empties = 64 - obs.reshape(n, -1).sum(-1)
     keys = symmetry_keys(obs)
     groups = bands(empties)

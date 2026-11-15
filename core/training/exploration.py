@@ -78,6 +78,12 @@ class Exploration:
             schedule, sharpening through the game without ever turning greedy. The policy weights
             are the evaluator's target (for MCTS by default the root's visits), whatever move it
             chose itself.
+        store_until_offline: if set, a game stops storing positions for training once it has
+            played a move other than the policy weights' top one at or after this move (counted as
+            `StepMetadata.step` is); its later positions are played and count towards its outcome,
+            but aren't stored. Separates what late off-line moves do to the outcomes stored before
+            them (kept) from the lopsided positions they lead to (not stored). Applied by the
+            `Trainer`.
 
     All are applied with traced arithmetic, so a schedule or adaptive controller can later
     pass them in as traced values. Changing the attributes of a `Trainer`'s instance between
@@ -87,10 +93,23 @@ class Exploration:
     num_sampling_moves: int | None = None
     random_move_prob: float = 0.0
     temperature: MoveTemperature | None = None
+    store_until_offline: int | None = None
 
     def __post_init__(self):
         if self.temperature is not None and self.num_sampling_moves is not None:
             raise ValueError("pass num_sampling_moves or temperature, not both")
+        if self.store_until_offline is not None and self.store_until_offline < 0:
+            raise ValueError("store_until_offline must be at least 0")
+
+    def goes_offline(self, output: EvalOutput, metadata: StepMetadata) -> jax.Array:
+        """Whether the move `output` played (its `action`, as `choose_action` chose it) from the
+        position of `metadata` takes its game off line: with `store_until_offline`, a move at or
+        after it that isn't the policy weights' top one (any of them, on ties). False without."""
+        if self.store_until_offline is None:
+            return jnp.array(False)
+        weights = jnp.where(metadata.action_mask, output.policy_weights, -jnp.inf)
+        top = weights[output.action] == weights.max()
+        return (metadata.step >= self.store_until_offline) & ~top
 
     def choose_action(
         self, key: jax.Array, output: EvalOutput, metadata: StepMetadata
@@ -141,4 +160,5 @@ class Exploration:
             "temperature": None
             if self.temperature is None
             else self.temperature.get_config(),
+            "store_until_offline": self.store_until_offline,
         }

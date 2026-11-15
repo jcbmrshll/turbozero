@@ -439,6 +439,17 @@ def make_parser() -> argparse.ArgumentParser:
         "opening's 8 moves. 0 samples none; one past a game's length, every move",
     )
     parser.add_argument(
+        "--store-until-offline",
+        type=int,
+        default=None,
+        metavar="MOVE",
+        help="a self-play game stops storing positions for training once it plays a move other "
+        "than the search's most visited at or after MOVE (counted from the standard start, as "
+        "--sampling-moves'); it plays on, its later positions counting towards its outcome but "
+        "not stored. E.g. with --sampling-moves 50: sampled moves late in the game without the "
+        "lopsided positions they lead to (default: every position stored)",
+    )
+    parser.add_argument(
         "--move-temperature",
         type=move_temperature,
         default=None,
@@ -997,6 +1008,8 @@ def check_selfplay_args(
         parser.error("--dirichlet-alpha must be positive")
     if not 0 <= args.dirichlet_epsilon <= 1:
         parser.error("--dirichlet-epsilon must be between 0 and 1")
+    if args.store_until_offline is not None and args.store_until_offline < 0:
+        parser.error("--store-until-offline must be at least 0")
     if args.move_temperature is not None and args.sampling_moves != parser.get_default(
         "sampling_moves"
     ):
@@ -1010,10 +1023,16 @@ def check_selfplay_args(
 
 def make_exploration(args: argparse.Namespace) -> Exploration:
     """How self-play chooses the move to play from a search (see --sampling-moves and
-    --move-temperature)."""
+    --move-temperature), and which of its positions it stores (--store-until-offline)."""
     if args.move_temperature is not None:
-        return Exploration(temperature=args.move_temperature)
-    return Exploration(num_sampling_moves=args.sampling_moves)
+        return Exploration(
+            temperature=args.move_temperature,
+            store_until_offline=args.store_until_offline,
+        )
+    return Exploration(
+        num_sampling_moves=args.sampling_moves,
+        store_until_offline=args.store_until_offline,
+    )
 
 
 def make_selfplay(network, args: argparse.Namespace) -> EvaluatorSchedule:

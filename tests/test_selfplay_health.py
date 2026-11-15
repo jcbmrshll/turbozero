@@ -253,3 +253,20 @@ def test_label_cache_scores_each_position_once_and_keeps_them(tmp_path):
     np.testing.assert_array_equal(first[0], first[2])
     np.testing.assert_array_equal(again[0], first[1])
     assert (first[0] != health.ILLEGAL).sum() == 3
+
+
+def test_after_offline_marks_a_games_moves_after_its_first_off_line_one():
+    # two games of four moves (ply 8-11); the top move is 0. Game 1 goes off line at ply 9 (before
+    # the start, ignored) and ply 10; game 2 stays on line
+    policy = np.tile(np.eye(65)[0], (8, 1))
+    moves = {
+        "env": np.array([0, 0, 0, 0, 1, 1, 1, 1]),
+        "ply": np.array([8, 9, 10, 11, 8, 9, 10, 11]),
+        "action": np.array([0, 3, 3, 0, 0, 0, 0, 0]),
+        "policy": policy,
+        "legal": np.ones((8, 65), bool),
+    }
+
+    marked = health.after_offline(moves, start=10)
+
+    np.testing.assert_array_equal(marked, [0, 0, 0, 1, 0, 0, 0, 0])

@@ -1,6 +1,7 @@
 """Self-play exploration: the move self-play plays, chosen from the evaluator's output,
 while the evaluator's policy weights stay the training target."""
 
+from dataclasses import dataclass
 from functools import partial
 
 import jax
@@ -204,3 +205,59 @@ def test_move_temperature_with_no_weights_plays_uniformly_among_legal_moves():
 def test_sampling_moves_and_a_move_temperature_dont_go_together():
     with pytest.raises(ValueError):
         Exploration(num_sampling_moves=20, temperature=MoveTemperature())
+
+
+@dataclass(frozen=True)
+class AlwaysSecond(Exploration):
+    """Plays action 1 every move: off line whenever the policy's top move is another."""
+
+    def choose_action(self, key, output, metadata):
+        return jnp.array(1)
+
+
+def test_store_until_offline_stops_storing_a_game_after_its_first_off_line_move(
+    fixed_length_env, scripted, make_collector, tmp_path
+):
+    # games of 4 moves; the scripted policy's top move is 0, so every move here is off line. From
+    # move 2 on that counts: moves 0, 1 and 2 are stored, 3 isn't, and the next game starts on line
+    env = fixed_length_env(length=4, num_actions=3)
+    collect = make_collector(
+        env,
+        scripted.first_legal,
+        max_episode_steps=4,
+        ckpt_dir=tmp_path,
+        exploration=AlwaysSecond(store_until_offline=2),
+    )
+
+    state = collect(num_steps=8)
+
+    assert int(state.buffer_state.populated.sum()) == 6
+    assert not bool(state.offline[0])
+
+
+def test_store_until_offline_keeps_games_played_on_line_whole(
+    fixed_length_env, scripted, make_collector, tmp_path
+):
+    env = fixed_length_env(length=4, num_actions=3)
+    collect = make_collector(
+        env,
+        scripted.first_legal,
+        max_episode_steps=4,
+        ckpt_dir=tmp_path,
+        exploration=Exploration(num_sampling_moves=0, store_until_offline=0),
+    )
+
+    assert int(collect(num_steps=8).buffer_state.populated.sum()) == 8
+
+
+def test_goes_offline_counts_ties_for_the_top_move_as_on_line():
+    exploration = Exploration(store_until_offline=3)
+    output = eval_output(2, [0.4, 0.2, 0.4])
+
+    assert (
+        bool(exploration.goes_offline(output, step_metadata([1, 1, 1], step=3)))
+        is False
+    )
+    off = eval_output(1, [0.4, 0.2, 0.4])
+    assert bool(exploration.goes_offline(off, step_metadata([1, 1, 1], step=3)))
+    assert not bool(exploration.goes_offline(off, step_metadata([1, 1, 1], step=2)))

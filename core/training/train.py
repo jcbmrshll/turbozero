@@ -100,6 +100,9 @@ class CollectionState:
             `endgame_solve`), None without
         move_log: each environment's moves since the end of the last epoch's self-play (see
             `Trainer`'s `log_moves`), None without. Not part of a saved state
+        offline: whether each environment's game has played an off-line move past the
+            exploration's `store_until_offline`, and stores no more positions; None without it.
+            Not part of a saved state: a run starting or resuming starts every game on line
     """
 
     eval_state: Any
@@ -118,6 +121,7 @@ class CollectionState:
     resign_state: ResignState | None = None
     pending: PendingSolves | None = None
     move_log: MoveLog | None = None
+    offline: jax.Array | None = None
 
 
 @dataclass(frozen=True)
@@ -1367,6 +1371,9 @@ class Trainer:
         # the moves whose positions are trained on (see `Evaluator.trains_on`); the others are
         # played, and count towards their game's length and outcome, without being stored
         stored = done & evaluator.trains_on(state.eval_state)
+        # a game that went off line (see `Exploration.store_until_offline`) stores no more
+        if state.offline is not None:
+            stored = stored & ~state.offline
         evaluate_key, key, tree_key = self.move_keys(state.move_key)
         output = evaluator.search_output(
             evaluate_key,
@@ -1535,6 +1542,12 @@ class Trainer:
                 ),
                 done,
             )
+        offline = state.offline
+        if offline is not None:
+            assert self.exploration is not None
+            # a move played off line takes its game off line; a game that ended starts on line
+            went = done & self.exploration.goes_offline(eval_output, state.metadata)
+            offline = (offline | went) & ~(terminated | truncated | stopped)
         # return new collection state
         state = replace(
             state,
@@ -1554,6 +1567,7 @@ class Trainer:
             resign_state=resign_state,
             pending=pending,
             move_log=move_log,
+            offline=offline,
         )
         # the games that ended: `terminated` counts a resignation, `stopped` a game that
         # stopped for its solves
@@ -2626,7 +2640,9 @@ class Trainer:
         parts = {
             "train_states": state.train_states,
             # without the move log (see `log_moves`)
-            "collection_state": replace(state.collection_state, move_log=None),
+            "collection_state": replace(
+                state.collection_state, move_log=None, offline=None
+            ),
             "test_states": state.test_states,
             # with `averages`, the weight averages and how many epochs they hold
             **({"averages": state.averages} if state.averages else {}),
@@ -3599,6 +3615,10 @@ class Trainer:
             pending=self.init_pending(
                 key, batch_size, env_state, memory_buffer.capacity
             ),
+            offline=jnp.zeros((batch_size,), dtype=bool)
+            if self.exploration is not None
+            and self.exploration.store_until_offline is not None
+            else None,
         )
 
     def init_pending(
@@ -4070,6 +4090,14 @@ class Trainer:
 
         if self.move_log_writer is not None:
             collection_state = replace(collection_state, move_log=self.init_move_log())
+        if (
+            self.exploration is not None
+            and self.exploration.store_until_offline is not None
+        ):
+            collection_state = replace(
+                collection_state,
+                offline=jnp.zeros(collection_state.episodes.shape, dtype=bool),
+            )
         evaluator, collection_state = self.follow_schedule(
             cur_epoch, evaluator, collection_state, playing_now()
         )
