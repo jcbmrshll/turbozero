@@ -1,0 +1,405 @@
+from dataclasses import replace
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+
+from turbozero.memory.replay_memory import (
+    BaseExperience,
+    EpisodeReplayBuffer,
+    transform_randomly,
+)
+
+
+def experience(obs_id):
+    """An experience identified by its observation."""
+    return BaseExperience(
+        reward=jnp.zeros((2,)),
+        policy_weights=jnp.full((3,), 1 / 3),
+        policy_mask=jnp.ones((3,), dtype=jnp.bool_),
+        observation_nn=jnp.array(obs_id, dtype=jnp.float32),
+        cur_player_id=jnp.array(0, dtype=jnp.int32),
+        search_value=jnp.array(0.0),
+    )
+
+
+def init_single(buffer):
+    """Buffer state for a single environment (no batch dimension)."""
+    return jax.tree.map(lambda x: x[0], buffer.init(1, experience(0)))
+
+
+def add(buffer, state, obs_ids):
+    for obs_id in obs_ids:
+        state = buffer.add_experience(state, experience(obs_id))
+    return state
+
+
+def test_add_experience_and_assign_rewards():
+    buffer = EpisodeReplayBuffer(capacity=5)
+    state = add(buffer, init_single(buffer), [1, 2, 3])
+
+    assert state.next_idx == 3
+    np.testing.assert_array_equal(state.buffer.observation_nn, [1, 2, 3, 0, 0])
+    np.testing.assert_array_equal(state.populated, [True, True, True, False, False])
+    np.testing.assert_array_equal(state.has_reward, [False, False, False, True, True])
+
+    state = buffer.assign_rewards(state, jnp.array([1.0, -1.0]))
+
+    assert state.episode_start_idx == 3
+    assert state.has_reward.all()
+    np.testing.assert_array_equal(state.buffer.reward[:3], [[1.0, -1.0]] * 3)
+    np.testing.assert_array_equal(state.buffer.reward[3:], 0.0)
+
+
+def test_add_experience_that_is_not_valid_leaves_the_buffer_as_it_is():
+    buffer = EpisodeReplayBuffer(capacity=3)
+    # the next write wraps around, over a finished entry
+    state = buffer.assign_rewards(
+        add(buffer, init_single(buffer), [1, 2, 3]), jnp.ones(2)
+    )
+
+    after = buffer.add_experience(state, experience(4), valid=False)
+
+    jax.tree.map(np.testing.assert_array_equal, after, state)
+
+
+def test_assign_rewards_wraps_around_mid_episode():
+    buffer = EpisodeReplayBuffer(capacity=5)
+    state = add(buffer, init_single(buffer), [1, 2, 3])
+    state = buffer.assign_rewards(state, jnp.array([1.0, -1.0]))
+
+    # the second episode starts at index 3 and wraps around to overwrite indices 0 and 1
+    state = add(buffer, state, [4, 5, 6, 7])
+    assert state.next_idx == 2
+    np.testing.assert_array_equal(state.buffer.observation_nn, [6, 7, 3, 4, 5])
+
+    state = buffer.assign_rewards(state, jnp.array([-1.0, 1.0]))
+
+    assert state.episode_start_idx == 2
+    np.testing.assert_array_equal(
+        state.buffer.reward,
+        [[-1.0, 1.0], [-1.0, 1.0], [1.0, -1.0], [-1.0, 1.0], [-1.0, 1.0]],
+    )
+
+
+def test_truncate_wraps_around_mid_episode():
+    buffer = EpisodeReplayBuffer(capacity=5)
+    state = add(buffer, init_single(buffer), [1, 2, 3])
+    state = buffer.assign_rewards(state, jnp.array([1.0, -1.0]))
+    state = add(buffer, state, [4, 5, 6, 7])
+
+    state = buffer.truncate(state)
+
+    # only the finished first episode's surviving entry (index 2) is left
+    assert state.next_idx == 3
+    np.testing.assert_array_equal(state.populated, [False, False, True, False, False])
+    assert state.has_reward.all()
+    np.testing.assert_array_equal(state.buffer.reward[2], [1.0, -1.0])
+
+    # the next episode is written from where the truncated one started
+    state = add(buffer, state, [8])
+    assert state.buffer.observation_nn[3] == 8
+
+
+def stacked(obs_ids):
+    """Experiences identified by their observations, stacked along a leading dimension."""
+    return jax.tree.map(lambda *x: jnp.stack(x), *[experience(i) for i in obs_ids])
+
+
+def test_add_experiences_adds_the_valid_ones_ready_to_sample():
+    buffer = EpisodeReplayBuffer(capacity=5)
+    state = init_single(buffer)
+
+    state = buffer.add_experiences(
+        state, stacked([1, 2, 3, 4]), jnp.array([True, False, True, False])
+    )
+
+    # written one after another, without gaps, and they can be sampled at once
+    assert state.next_idx == 2
+    np.testing.assert_array_equal(state.buffer.observation_nn, [1, 3, 0, 0, 0])
+    np.testing.assert_array_equal(
+        buffer.sample_mask(state), [True, True, False, False, False]
+    )
+
+    # wrapping around the end
+    state = buffer.add_experiences(
+        state, stacked([5, 6, 7, 8]), jnp.array([True, True, True, True])
+    )
+    state = buffer.add_experiences(state, stacked([9, 10]), jnp.array([False, True]))
+    assert state.next_idx == 2
+    np.testing.assert_array_equal(state.buffer.observation_nn, [8, 10, 5, 6, 7])
+    assert buffer.sample_mask(state).all()
+
+    # none valid: nothing changes
+    unchanged = buffer.add_experiences(state, stacked([11, 12]), jnp.zeros(2, bool))
+    assert jax.tree.all(jax.tree.map(np.array_equal, unchanged, state))
+
+
+def test_sample_indices_with_replacement_from_fewer_entries():
+    buffer = EpisodeReplayBuffer(capacity=8)
+    mask = jnp.zeros((2, 8), dtype=bool).at[1, 3].set(True)
+
+    indices = buffer.sample_indices(jax.random.PRNGKey(0), mask, 5, replace=True)
+
+    np.testing.assert_array_equal(indices, [8 + 3] * 5)
+
+
+def test_sample_only_returns_finished_populated_entries():
+    buffer = EpisodeReplayBuffer(capacity=4)
+    # two environments, as the trainer stores them (batch, capacity, ...)
+    states = [init_single(buffer), init_single(buffer)]
+    # env 0: a finished episode (1, 2), then an episode in progress (3)
+    states[0] = buffer.assign_rewards(
+        add(buffer, states[0], [1, 2]), jnp.array([1.0, -1.0])
+    )
+    states[0] = add(buffer, states[0], [3])
+    # env 1: a finished episode (4), then a truncated one (5, 6)
+    states[1] = buffer.assign_rewards(
+        add(buffer, states[1], [4]), jnp.array([-1.0, 1.0])
+    )
+    states[1] = buffer.truncate(add(buffer, states[1], [5, 6]))
+    state = jax.tree.map(lambda *x: jnp.stack(x), *states)
+
+    for seed in range(10):
+        sample = buffer.sample(state, jax.random.PRNGKey(seed), 3)
+        assert sorted(sample.observation_nn.tolist()) == [1, 2, 4]
+
+
+def test_sample_before_any_episode_finished_raises():
+    buffer = EpisodeReplayBuffer(capacity=4)
+    state = add(buffer, init_single(buffer), [1, 2])
+    state = jax.tree.map(lambda x: x[None], state)
+
+    with pytest.raises(ValueError):
+        buffer.sample(state, jax.random.PRNGKey(0), 2)
+
+
+def test_count_distinct_observations_counts_only_sampleable_experiences():
+    buffer = EpisodeReplayBuffer(capacity=8)
+    state = add(buffer, init_single(buffer), [1, 2, 1, 3, 2])
+    state = buffer.assign_rewards(state, jnp.array([1.0, -1.0]))
+    # an unfinished episode can't be sampled yet, so its new observation doesn't count
+    state = add(buffer, state, [4])
+
+    distinct, total = buffer.count_distinct_observations(state)
+
+    assert (distinct, total) == (3, 5)
+
+
+def test_count_distinct_observations_across_batch_dimensions():
+    buffer = EpisodeReplayBuffer(capacity=4)
+    template = experience(0)
+    template = replace(template, observation_nn=jnp.zeros((2,), dtype=jnp.bool_))
+    # two devices, two environments each
+    state = jax.tree.map(
+        lambda x: x.reshape(2, 2, *x.shape[1:]), buffer.init(4, template)
+    )
+    obs = jnp.array([[1, 0], [0, 1], [1, 1], [1, 0]], dtype=jnp.bool_)
+    state = replace(
+        state,
+        buffer=replace(
+            state.buffer,
+            # environment i holds observation i in its first slot, and observation 0 in its second
+            observation_nn=state.buffer.observation_nn.at[:, :, 0]
+            .set(obs.reshape(2, 2, 2))
+            .at[:, :, 1]
+            .set(obs[0]),
+        ),
+        populated=state.populated.at[:, :, :2].set(True),
+    )
+
+    distinct, total = jax.jit(buffer.count_distinct_observations)(state)
+
+    # [1, 0] and [0, 1] hold the same values in different places, so they differ
+    assert (distinct, total) == (3, 8)
+
+
+def negate(e):
+    """A data transform: the observation negated."""
+    return replace(e, observation_nn=-e.observation_nn)
+
+
+def test_count_distinct_observations_up_to_transforms():
+    buffer = EpisodeReplayBuffer(capacity=8)
+    state = add(buffer, init_single(buffer), [1, -1, 2, 0, 3, -3, 3])
+    state = buffer.assign_rewards(state, jnp.array([1.0, -1.0]))
+
+    assert buffer.count_distinct_observations(state) == (6, 7)
+    # 1 and -1, and 3 and -3, are one another's images
+    distinct, total = jax.jit(
+        lambda s: buffer.count_distinct_observations(s, transform_fns=[negate])
+    )(state)
+    assert (distinct, total) == (4, 7)
+
+
+def shift(k):
+    """A data transform that adds 10**6 * k to the observation, to show which was drawn, and
+    rolls the policy's actions k places."""
+
+    def transform_fn(e):
+        return replace(
+            e,
+            observation_nn=e.observation_nn + 10**6 * k,
+            policy_weights=jnp.roll(e.policy_weights, k),
+            policy_mask=jnp.roll(e.policy_mask, k),
+        )
+
+    return transform_fn
+
+
+def test_transform_randomly_draws_a_transform_for_each_sample_uniformly():
+    n = 4000
+    keys = jax.random.split(jax.random.PRNGKey(0), 3)
+    experiences = BaseExperience(
+        reward=jax.random.normal(keys[0], (n, 2)),
+        policy_weights=jax.random.uniform(keys[1], (n, 5)),
+        policy_mask=jax.random.bernoulli(keys[2], 0.5, (n, 5)),
+        observation_nn=jnp.arange(n, dtype=jnp.int32),
+        cur_player_id=jnp.arange(n, dtype=jnp.int32) % 2,
+        search_value=jnp.linspace(-1.0, 1.0, n),
+    )
+
+    out = jax.jit(transform_randomly, static_argnums=2)(
+        jax.random.PRNGKey(1), experiences, (shift(1), shift(2), shift(3))
+    )
+
+    drawn = np.asarray(out.observation_nn) // 10**6
+    # the identity, and each of the 3 transforms, about a quarter of the time each
+    np.testing.assert_allclose(np.bincount(drawn) / n, 0.25, atol=0.03)
+    # each sample is its stored experience's exact image under the drawn transform
+    np.testing.assert_array_equal(out.observation_nn - 10**6 * drawn, np.arange(n))
+    # rolled k places: action j holds what action j - k did
+    rolled = (np.arange(5) - drawn[:, None]) % 5
+    for field in ("policy_weights", "policy_mask"):
+        np.testing.assert_array_equal(
+            getattr(out, field),
+            np.take_along_axis(np.asarray(getattr(experiences, field)), rolled, axis=1),
+        )
+    # the value targets and the player to move are left as they are
+    for field in ("reward", "search_value", "cur_player_id"):
+        np.testing.assert_array_equal(getattr(out, field), getattr(experiences, field))
+    # without transforms, the experiences are left as they are
+    same = transform_randomly(jax.random.PRNGKey(1), experiences, ())
+    assert same is experiences
+
+
+def sampleable(buffer, state):
+    """Observations of the entries `sample_mask` marks, sorted."""
+    mask = np.asarray(buffer.sample_mask(state))
+    return sorted(np.asarray(state.buffer.observation_nn)[mask].tolist())
+
+
+def test_sample_needs_enough_finished_entries():
+    buffer = EpisodeReplayBuffer(capacity=8)
+    state = buffer.assign_rewards(
+        add(buffer, init_single(buffer), [1, 2, 3]), jnp.array([1.0, -1.0])
+    )
+    # an episode in progress can't be sampled
+    state = add(buffer, state, [4, 5])
+    state = jax.tree.map(lambda x: x[None], state)
+
+    assert buffer.sample(state, jax.random.PRNGKey(0), 3).observation_nn.shape == (3,)
+    with pytest.raises(ValueError, match="only 3 can be sampled"):
+        buffer.sample(state, jax.random.PRNGKey(0), 4)
+
+
+@pytest.mark.parametrize("capacity", [3, 5, 9])
+def test_resized_keeps_the_newest_entries_oldest_first(capacity):
+    buffer = EpisodeReplayBuffer(capacity=5)
+    # wrapped around: index 0 holds 6, index 1 holds 7
+    state = buffer.assign_rewards(
+        add(buffer, init_single(buffer), [1, 2, 3, 4, 5, 6, 7]), jnp.array([1.0, -1.0])
+    )
+    state = jax.tree.map(lambda x: np.asarray(x)[None], state)
+    resized = EpisodeReplayBuffer(capacity=capacity)
+
+    new_state, (ids,) = resized.resized(state, state.buffer.observation_nn + 100)
+
+    assert sampleable(resized, new_state) == [3, 4, 5, 6, 7][-capacity:]
+    # every array keeps its dtype (e.g. the boolean policy mask)
+    assert [x.dtype for x in jax.tree.leaves(new_state)] == [
+        x.dtype for x in jax.tree.leaves(state)
+    ]
+    np.testing.assert_array_equal(
+        ids[new_state.populated],
+        new_state.buffer.observation_nn[new_state.populated] + 100,
+    )
+    # and it goes on as a buffer of the new capacity
+    new_state = jax.tree.map(lambda x: jnp.asarray(x[0]), new_state)
+    new_state = resized.assign_rewards(
+        add(resized, new_state, [8]), jnp.array([1.0, -1.0])
+    )
+    assert sampleable(resized, new_state) == [3, 4, 5, 6, 7, 8][-capacity:]
+
+
+def batched(state):
+    """A single environment's state as a batch of one, in numpy arrays, as `resized` takes."""
+    return jax.tree.map(lambda x: np.asarray(x)[None], state)
+
+
+def unbatched(state):
+    return jax.tree.map(lambda x: jnp.asarray(x[0]), state)
+
+
+@pytest.mark.parametrize("capacity", [4, 6, 12])
+def test_resized_keeps_an_episode_in_progress(capacity):
+    buffer = EpisodeReplayBuffer(capacity=7)
+    # a finished episode 1-5, then 6-7 in progress
+    state = buffer.assign_rewards(
+        add(buffer, init_single(buffer), [1, 2, 3, 4, 5]), jnp.array([1.0, -1.0])
+    )
+    state = add(buffer, state, [6, 7])
+
+    new_state, _ = EpisodeReplayBuffer(capacity=capacity).resized(batched(state))
+    new_state = unbatched(new_state)
+
+    # the episode in progress can't be sampled, and is kept
+    assert sampleable(buffer, new_state) == [1, 2, 3, 4, 5][-(capacity - 2) :]
+    # when it ends, its entries get its reward
+    ended = buffer.assign_rewards(add(buffer, new_state, [8]), jnp.array([-1.0, 1.0]))
+    assert sampleable(buffer, ended) == [1, 2, 3, 4, 5, 6, 7, 8][-capacity:]
+    rewards = {
+        int(obs): float(r[0])
+        for obs, r, ok in zip(
+            ended.buffer.observation_nn,
+            ended.buffer.reward,
+            ended.populated,
+            strict=True,
+        )
+        if ok
+    }
+    assert {obs: rewards[obs] for obs in (6, 7, 8)} == {6: -1.0, 7: -1.0, 8: -1.0}
+    assert all(rewards[obs] == 1.0 for obs in rewards if obs < 6)
+    # or truncating discards just its entries
+    truncated = buffer.truncate(add(buffer, new_state, [8]))
+    assert sampleable(buffer, truncated) == [1, 2, 3, 4, 5][-(capacity - 3) :]
+    assert int(truncated.populated.sum()) == min(5, capacity - 3)
+
+
+def test_resized_keeps_the_newest_entries_of_an_episode_longer_than_it():
+    buffer = EpisodeReplayBuffer(capacity=6)
+    state = add(buffer, init_single(buffer), [1, 2, 3, 4, 5])
+
+    new_state, _ = EpisodeReplayBuffer(capacity=3).resized(batched(state))
+    new_state = buffer.assign_rewards(
+        add(buffer, unbatched(new_state), [6]), jnp.ones(2)
+    )
+
+    assert sampleable(buffer, new_state) == [4, 5, 6]
+
+
+def test_buffer_operations_take_the_capacity_of_the_state():
+    # a buffer configured for 5 entries, on a state of 3
+    buffer = EpisodeReplayBuffer(capacity=5)
+    state = init_single(EpisodeReplayBuffer(capacity=3))
+
+    state = buffer.assign_rewards(add(buffer, state, [1, 2, 3, 4]), jnp.ones(2))
+    assert state.populated.shape == (3,)
+    assert sampleable(buffer, state) == [2, 3, 4]
+    assert state.next_idx == 1
+    # so do tree positions' writes
+    experiences = jax.tree.map(lambda *x: jnp.stack(x), *map(experience, [5, 6]))
+    state = buffer.add_experiences(state, experiences, jnp.array([True, True]))
+    assert sampleable(buffer, state) == [4, 5, 6]
+    assert state.next_idx == 0
