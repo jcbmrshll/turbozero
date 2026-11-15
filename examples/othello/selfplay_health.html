@@ -11,7 +11,7 @@
   --grid: #ebe9e3; --axis: #c3c2b7; --hover: #efede6; --active: #e6e3da;
   --cell: #f0eee8; --good: #1f9d55; --bad: #d64545;
   --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100;
-  --s5: #e87ba4; --s6: #008300; --s7: #6250d6; --s8: #e34948;
+  --s5: #e87ba4; --s6: #008300; --s7: #6250d6; --s8: #e34948; --other: #a8a7a1;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -21,7 +21,7 @@
     --grid: #262624; --axis: #383835; --hover: #24241f; --active: #2e2e2a;
     --cell: #232321; --good: #2fb56a; --bad: #e25c5c;
     --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
-    --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+    --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767; --other: #6e6d68;
   }
 }
 * { box-sizing: border-box; }
@@ -77,6 +77,16 @@ svg text { fill: var(--text-muted); font-size: 11px; }
 .list tr.item:hover td.nm { background: var(--hover); }
 .list tr.item.cur td.nm { background: var(--active); color: var(--text-primary); font-weight: 600; }
 .list td.cell { width: 34px; height: 20px; border-radius: 3px; }
+.tabs { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.tabs button { font: inherit; border: 0; background: var(--surface-1); color: var(--text-secondary); padding: 4px 12px; cursor: pointer; }
+.tabs button.on { background: var(--active); color: var(--text-primary); font-weight: 600; }
+.axis-pick { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+.axis-pick label { color: var(--text-secondary); font-weight: 600; }
+.axis-pick select { max-width: 420px; }
+.list.wide { max-width: 58vw; }
+.list thead .vt .x { color: var(--text-primary); font-weight: 600; }
+.legend .gl { display: inline-flex; align-items: center; gap: 6px; }
+.tip .cfg { color: var(--text-muted); margin-top: 4px; white-space: pre; font-size: 11px; }
 .tip { position: fixed; pointer-events: none; background: var(--surface-1); border: 1px solid var(--border);
   border-radius: 6px; padding: 6px 8px; box-shadow: 0 2px 8px rgba(0,0,0,.15); display: none; z-index: 10; font-size: 12px; }
 .tip .row { display: flex; align-items: center; gap: 6px; }
@@ -89,11 +99,25 @@ svg text { fill: var(--text-muted); font-size: 11px; }
 <body>
 <header>
   <h1>Self-play health</h1>
+  <span class="tabs"><button id="tab-option" class="on">by option</button><button id="tab-runs">runs</button></span>
   <select id="model"><option value="">all models</option></select>
   <input id="search" type="text" placeholder="filter config" size="22">
   <select id="baseline"></select>
 </header>
-<div class="layout">
+<div class="layout" id="option-view" style="grid-template-columns: minmax(560px, 1fr) auto">
+  <div class="left">
+    <div class="card plot">
+      <div class="axis-pick"><label>x</label><select id="ox"></select><label>y</label><select id="oy"></select></div>
+      <h2 id="otitle"></h2>
+      <div class="sub" id="osub"></div>
+      <div class="desc" id="odesc"></div>
+      <div class="legend" id="olegend"></div>
+      <svg id="omain" height="440"></svg>
+    </div>
+  </div>
+  <div class="card list wide" id="olist" tabindex="0"></div>
+</div>
+<div class="layout" id="runs-view" style="display:none">
   <div class="left">
     <div class="card chips" id="chips"></div>
     <div class="card plot">
@@ -453,7 +477,9 @@ function step(dir) {
   draw();
   const it = document.querySelector(`.item[data-i="${cur}"]`); if (it) it.scrollIntoView({ block: "nearest" });
 }
+let view = "option";
 addEventListener("keydown", ev => {
+  if (view !== "runs") return;
   if (ev.target instanceof HTMLInputElement || ev.target instanceof HTMLSelectElement) return;
   if (ev.key === "ArrowDown" || ev.key === "ArrowRight") { step(1); ev.preventDefault(); }
   if (ev.key === "ArrowUp" || ev.key === "ArrowLeft") { step(-1); ev.preventDefault(); }
@@ -543,12 +569,349 @@ async function load() {
   if (!selected.length) selected = runs.slice().sort((a, b) => a.created < b.created ? 1 : -1).slice(0, 4).map(r => r.id);
   diffKey = "";
   update();
+  optionRefresh();
 }
 
-$("model").onchange = chips;
-$("search").oninput = chips;
+$("model").onchange = () => { chips(); optionRefresh(); };
+$("search").oninput = () => { chips(); optionRefresh(); };
 $("baseline").onchange = () => { baseline = $("baseline").value; update(); };
-addEventListener("resize", draw);
+addEventListener("resize", () => { if (view === "runs") draw(); else optionDraw(); });
+</script>
+<script>
+"use strict";
+// The option view: a measurement against a config option, runs grouped by the other options
+// that vary, and a heatmap of every measurement over the chosen option's values.
+
+let ox = null, oy = null, oDiffs = {}, oDiffKey = "";
+
+// a run's options: its train.py self-play arguments (objects flattened), its model, and its reuse mode
+function runOptions(r) {
+  const out = { model: r.model.name };
+  const args = (r.config && r.config.args) || {};
+  for (const [k, v] of Object.entries(args)) {
+    // folded into `reuse`, or set by other options
+    if (k === "no_persist_tree" || k === "count_reused_visits" || k === "advance_every") continue;
+    if (k === "playout_cap") {
+      out["playout_cap.full_probability"] = v ? v.full_probability : 1;
+      out["playout_cap.fast_sims"] = v ? v.fast_iterations : null;
+    } else if (v && typeof v === "object" && !Array.isArray(v)) {
+      for (const [k2, v2] of Object.entries(v)) out[`${k}.${k2}`] = v2;
+    } else out[k] = v;
+  }
+  out.reuse = args.no_persist_tree ? "no-persist" : args.count_reused_visits ? "count-reused" : "persist";
+  for (const k of ["games", "openings", "probe_per_phase", "seed"]) if (r.settings && k in r.settings) out[k] = r.settings[k];
+  return out;
+}
+const keyOf = v => JSON.stringify(v === undefined ? null : v);
+const showOpt = v => v == null ? "–" : typeof v === "object" ? JSON.stringify(v) : String(v);
+
+// option names as group labels show them
+const SHORT = { "playout_cap.fast_sims": "fast", "playout_cap.full_probability": "full share", dirichlet_epsilon: "eps",
+  dirichlet_alpha: "alpha", sampling_moves: "sampled", min_iterations: "min it", solve_empties: "solve", solve_play_past: "past",
+  tree_factor: "tree", move_temperature: "temp", policy_target: "target" };
+const shortName = k => SHORT[k] || k.replaceAll("_", " ");
+
+// the options that vary among the runs, numeric where every run has a number
+function varyingOptions(rs) {
+  const opts = rs.map(runOptions), keys = [...new Set(opts.flatMap(o => Object.keys(o)))];
+  const out = [];
+  for (const k of keys) {
+    const vals = opts.map(o => o[k]);
+    if (new Set(vals.map(keyOf)).size < 2) continue;
+    const numeric = vals.every(v => typeof v === "number" && Number.isFinite(v));
+    const counts = new Map();
+    for (const v of vals) counts.set(keyOf(v), (counts.get(keyOf(v)) || 0) + 1);
+    const mode = [...counts.entries()].sort((a, b) => b[1] - a[1])[0][0];
+    out.push({ key: k, numeric, mode });
+  }
+  const order = ["sims", "playout_cap.fast_sims", "playout_cap.full_probability", "reuse", "dirichlet_epsilon", "dirichlet_alpha", "sampling_moves", "min_iterations", "model"];
+  return out.sort((a, b) => ((order.indexOf(a.key) + 1) || 99) - ((order.indexOf(b.key) + 1) || 99));
+}
+
+// every numeric measurement in the results, with names from the runs view's families where known
+const SKIP = new Set(["probe.positions", "selfplay.novelty.openings_used", "selfplay.novelty.games_per_opening", "timing.calls", "timing.chunk_steps", "timing.timed_moves", "timing.timed_seconds"]);
+function knownMeasurements() {
+  const known = new Map();
+  for (const f of FAMS) {
+    if (f.kind === "curve") continue;
+    for (const g of slots(f)) known.set(pathOf(f, g), { sec: f.sec, name: g ? `${f.name} · ${g}` : f.name, unit: f.unit, good: f.good, desc: f.desc });
+  }
+  return known;
+}
+function leaves(o, prefix, out) {
+  for (const [k, v] of Object.entries(o || {})) {
+    const p = prefix ? `${prefix}.${k}` : k;
+    if ([...SKIP].some(s => p === s || p.startsWith(s + "."))) continue;
+    if (typeof v === "number" && Number.isFinite(v)) out.add(p);
+    else if (v && typeof v === "object" && !Array.isArray(v)) leaves(v, p, out);
+  }
+}
+function measurementCatalog(rs) {
+  const known = knownMeasurements(), present = new Set();
+  for (const r of rs) { leaves(r.probe, "probe", present); leaves(r.selfplay, "selfplay", present); leaves(r.timing, "timing", present); }
+  const out = [...known.entries()].filter(([p]) => present.has(p)).map(([path, m]) => ({ path, ...m }));
+  for (const p of present) if (!known.has(p)) {
+    const parts = p.split("."), phase = PHASES.includes(parts[parts.length - 2]) ? parts[parts.length - 2] : "";
+    const sec = p.startsWith("selfplay.phases") ? "Self-play positions" : p.startsWith("probe") ? "Probe" : p.startsWith("timing") ? "Cost" : "Self-play";
+    out.push({ path: p, sec, name: parts[parts.length - 1].replaceAll("_", " ") + (phase ? ` · ${phase}` : ""), unit: "", good: 0, desc: "" });
+  }
+  const secs = [...new Set(out.map(m => m.sec))];
+  return out.sort((a, b) => secs.indexOf(a.sec) - secs.indexOf(b.sec));
+}
+
+// runs grouped by the other varying options: each group's label lists where it departs from the modal config
+function groupsFor(rs, opts) {
+  const others = opts.filter(o => o.key !== ox);
+  const groups = new Map();
+  for (const r of rs) {
+    const o = runOptions(r);
+    const key = others.map(x => keyOf(o[x.key])).join("|");
+    if (!groups.has(key)) {
+      const parts = others.filter(x => keyOf(o[x.key]) !== x.mode)
+        .sort((a, b) => (b.key === "model") - (a.key === "model"))
+        .map(x => x.key === "model" ? showOpt(o[x.key]) : `${shortName(x.key)} ${showOpt(o[x.key])}`);
+      groups.set(key, { key, label: parts.join(" · ") || "others at mode", runs: [], atMode: !parts.length });
+    }
+    groups.get(key).runs.push(r);
+  }
+  const list = [...groups.values()].sort((a, b) => (b.atMode - a.atMode) || (b.runs.length - a.runs.length) || (a.key < b.key ? -1 : 1));
+  list.forEach((g, i) => { g.color = i < SLOTS ? `var(--s${i + 1})` : "var(--other)"; });
+  return list;
+}
+
+function runTip(ev, r, path, extra) {
+  const v = get(r, path), se = r.se ? r.se[path] : undefined;
+  tip.replaceChildren(div("hd", `${r.model.name} · ${r.config.name}`));
+  const row = div("row"), b = document.createElement("b");
+  b.textContent = fmt(v) + (num(se) ? ` ± ${fmt(2 * se)}` : "") + (extra || "");
+  row.appendChild(b); tip.appendChild(row);
+  const o = runOptions(r);
+  tip.appendChild(div("cfg", Object.entries(o).map(([k, x]) => `${k}  ${showOpt(x)}`).join("\n")));
+  tip.style.display = "block";
+  tip.style.left = Math.min(ev.clientX + 14, innerWidth - tip.offsetWidth - 8) + "px";
+  tip.style.top = Math.max(8, Math.min(ev.clientY + 14, innerHeight - tip.offsetHeight - 8)) + "px";
+}
+
+function optionDraw() {
+  const svg = $("omain"); svg.replaceChildren();
+  const rs = shown(), opts = varyingOptions(rs), cat = measurementCatalog(rs);
+  const opt = opts.find(o => o.key === ox), m = cat.find(c => c.path === oy);
+  $("otitle").textContent = m ? m.name : "";
+  $("osub").textContent = m ? [m.sec, m.unit].filter(Boolean).join(" · ") : "";
+  $("odesc").textContent = m ? m.desc : "";
+  const legend = $("olegend"); legend.replaceChildren();
+  if (!opt || !m) return;
+  const groups = groupsFor(rs, opts);
+  const coloured = groups.slice(0, SLOTS), rest = groups.slice(SLOTS);
+  for (const g of coloured) {
+    const s = document.createElement("span"); s.className = "gl";
+    const i = document.createElement("i"); i.style.background = g.color;
+    s.append(i, document.createTextNode(g.label)); legend.appendChild(s);
+  }
+  if (rest.length) {
+    const s = document.createElement("span"); s.className = "gl";
+    const i = document.createElement("i"); i.style.background = "var(--other)";
+    s.append(i, document.createTextNode(`other (${rest.length})`)); legend.appendChild(s);
+  }
+  const H = +svg.getAttribute("height"), W = svg.clientWidth || 700, mg = { l: 60, r: 16, t: 12, b: 36 };
+  const pts = groups.flatMap(g => g.runs.map(r => {
+    const v = get(r, m.path), se = r.se ? r.se[m.path] : undefined;
+    return { g, r, x: runOptions(r)[ox], v, lo: num(se) ? v - 2 * se : v, hi: num(se) ? v + 2 * se : v };
+  })).filter(p => num(p.v));
+  if (!pts.length) return;
+  const bars = !opt.numeric;
+  let lo = Math.min(...pts.map(p => p.lo)), hi = Math.max(...pts.map(p => p.hi));
+  if (bars) { lo = Math.min(lo, 0); hi = Math.max(hi, 0); }
+  const { y } = frame(svg, H, mg, lo, hi, [""], bars);
+  svg.appendChild(el("text", { x: W - mg.r, y: H - 2, "text-anchor": "end" }, shortName(ox)));
+  const whisker = (x, p, c) => {
+    if (p.hi === p.lo) return;
+    svg.appendChild(el("line", { x1: x, x2: x, y1: y(p.lo), y2: y(p.hi), stroke: c, "stroke-width": 1.5, "stroke-linecap": "round" }));
+    for (const v of [p.lo, p.hi]) svg.appendChild(el("line", { x1: x - 4, x2: x + 4, y1: y(v), y2: y(v), stroke: c, "stroke-width": 1.5, "stroke-linecap": "round" }));
+  };
+  if (!bars) {
+    const xs = pts.map(p => p.x), xmin = Math.min(...xs), xmax = Math.max(...xs);
+    const log = xmin > 0 && xmax / xmin >= 8;
+    const f = log ? Math.log2 : v => v, a = f(xmin), b = f(xmax), pad = (b - a || 1) * 0.04;
+    const x = v => mg.l + (W - mg.l - mg.r) * (f(v) - a + pad) / (b - a + 2 * pad);
+    const ticks = [...new Set(xs)].sort((p, q) => p - q);
+    const shownTicks = ticks.length <= 14 ? ticks : niceTicks(xmin, xmax).ticks.filter(t => t >= xmin && t <= xmax && (!log || t > 0));
+    // ticks closer than a label's width to the last one drawn are left out
+    let last = -Infinity;
+    for (const t of shownTicks) {
+      if (x(t) - last < 30) continue;
+      svg.appendChild(el("text", { x: x(t), y: H - 16, "text-anchor": "middle" }, fmt(t)));
+      last = x(t);
+    }
+    for (const g of groups) {
+      const gp = pts.filter(p => p.g === g).sort((p, q) => p.x - q.x);
+      if (gp.length > 1) svg.appendChild(el("path", { d: gp.map((p, i) => (i ? "L" : "M") + x(p.x) + "," + y(p.v)).join(""), fill: "none", stroke: g.color, "stroke-width": 2, "stroke-linejoin": "round" }));
+    }
+    for (const p of pts) {
+      whisker(x(p.x), p, p.g.color);
+      svg.appendChild(el("circle", { cx: x(p.x), cy: y(p.v), r: 5, fill: p.g.color, stroke: "var(--surface-1)", "stroke-width": 2 }));
+      const hit = el("circle", { cx: x(p.x), cy: y(p.v), r: 13, fill: "transparent" });
+      hit.addEventListener("pointermove", ev => runTip(ev, p.r, m.path)); hit.addEventListener("pointerleave", hideTip);
+      svg.appendChild(hit);
+    }
+  } else {
+    const cats = [...new Set(pts.map(p => keyOf(p.x)))].sort();
+    const cw = (W - mg.l - mg.r) / cats.length;
+    cats.forEach((c, ci) => {
+      svg.appendChild(el("text", { x: mg.l + cw * (ci + 0.5), y: H - 16, "text-anchor": "middle" }, showOpt(JSON.parse(c))));
+      // a bar per run, in group order, sharing the category's width
+      const here = groups.flatMap(g => pts.filter(p => p.g === g && keyOf(p.x) === c));
+      const inner = Math.min(cw * 0.85, here.length * 40), w = inner / Math.max(here.length, 1);
+      here.forEach((p, j) => {
+          const x0 = mg.l + cw * ci + (cw - inner) / 2 + j * w;
+          const top = y(Math.max(p.v, 0)), bot = y(Math.min(p.v, 0));
+          svg.appendChild(el("rect", { x: x0, y: top, width: Math.max(1, w - 1), height: Math.max(1, bot - top), rx: Math.min(3, w / 2), fill: p.g.color }));
+          whisker(x0 + w / 2, p, "var(--text-secondary)");
+          const hit = el("rect", { x: x0 - 2, y: mg.t, width: w + 4, height: H - mg.t - mg.b, fill: "transparent" });
+          hit.addEventListener("pointermove", ev => runTip(ev, p.r, m.path)); hit.addEventListener("pointerleave", hideTip);
+          svg.appendChild(hit);
+      });
+    });
+  }
+}
+
+// the heatmap's columns: each group's runs in order of the chosen option
+function heatColumns(rs, opts) {
+  const groups = groupsFor(rs, opts), numeric = (opts.find(o => o.key === ox) || {}).numeric;
+  const cols = [];
+  for (const g of groups) {
+    const sorted = g.runs.slice().sort((a, b) => {
+      const x = runOptions(a)[ox], y2 = runOptions(b)[ox];
+      return numeric ? x - y2 : keyOf(x) < keyOf(y2) ? -1 : keyOf(x) > keyOf(y2) ? 1 : 0;
+    });
+    for (const r of sorted) cols.push({ r, g, x: runOptions(r)[ox] });
+  }
+  // the reference: a run with every option at its mode, else the first column
+  const ref = (cols.find(c => c.g.atMode && keyOf(c.x) === (opts.find(o => o.key === ox) || {}).mode) || cols.find(c => c.g.atMode) || cols[0] || {}).r;
+  return { cols, ref };
+}
+
+async function fetchOptionDiffs(ref, cols) {
+  const ids = cols.map(c => c.r.id).filter(id => id !== ref.id);
+  const key = ref.id + "|" + ids.join(",");
+  if (key === oDiffKey) return;
+  oDiffKey = key; oDiffs = {};
+  if (!ids.length) return;
+  const got = await (await fetch(`compare?base=${encodeURIComponent(ref.id)}&ids=${ids.map(encodeURIComponent).join(",")}`, { cache: "no-store" })).json();
+  if (oDiffKey === key) { oDiffs = got; optionList(); }
+}
+
+function optionList() {
+  const box = $("olist"); box.replaceChildren();
+  const rs = shown(), opts = varyingOptions(rs), cat = measurementCatalog(rs);
+  const { cols, ref } = heatColumns(rs, opts);
+  if (!cols.length) return;
+  const table = document.createElement("table"), thead = document.createElement("thead"), hr = document.createElement("tr");
+  hr.appendChild(document.createElement("th"));
+  for (const c of cols) {
+    const th = document.createElement("th"); th.className = "run";
+    const vt = document.createElement("span"); vt.className = "vt";
+    const x = document.createElement("span"); x.className = "x"; x.textContent = showOpt(c.x) + (c.r === ref ? " ·ref" : "");
+    const g = document.createElement("span"); g.className = "m"; g.textContent = c.g.label;
+    vt.append(x, document.createElement("br"), g);
+    const sw = document.createElement("span"); sw.className = "sw"; sw.style.background = c.g.color;
+    th.append(vt, sw);
+    th.addEventListener("pointermove", ev => runTip(ev, c.r, oy || "", "")); th.addEventListener("pointerleave", hideTip);
+    hr.appendChild(th);
+  }
+  thead.appendChild(hr); table.appendChild(thead);
+  const tbody = document.createElement("tbody");
+  let sec = null;
+  for (const m of cat) {
+    if (m.sec !== sec) {
+      sec = m.sec;
+      const tr = document.createElement("tr"), td = document.createElement("td");
+      td.className = "sec"; td.colSpan = cols.length + 1; td.textContent = sec; tr.appendChild(td); tbody.appendChild(tr);
+    }
+    const tr = document.createElement("tr"); tr.className = "item" + (m.path === oy ? " cur" : ""); tr.dataset.path = m.path;
+    const nm = document.createElement("td"); nm.className = "nm"; nm.textContent = m.name; tr.appendChild(nm);
+    // each column's difference from the reference in standard errors (paired once the server's
+    // comparisons arrive), less the columns' mean
+    const zs = cols.map(c => {
+      if (c.r === ref) return num(get(ref, m.path)) ? 0 : null;
+      const d = oDiffs[c.r.id] && oDiffs[c.r.id][m.path];
+      if (d) return d[1] > 0 ? d[0] / d[1] : d[0] === 0 ? 0 : Math.sign(d[0]) * 99;
+      const v = get(c.r, m.path), b = get(ref, m.path);
+      if (!num(v) || !num(b)) return null;
+      const se = Math.hypot((c.r.se || {})[m.path] || 0, (ref.se || {})[m.path] || 0);
+      return se > 0 ? (v - b) / se : b !== 0 ? (v - b) / Math.abs(b) / 0.05 : 0;
+    });
+    const known = zs.filter(num), mean = known.length ? known.reduce((a, b) => a + b) / known.length : 0;
+    cols.forEach((c, k) => {
+      const td = document.createElement("td"); td.className = "cell";
+      td.style.background = num(zs[k]) && known.length > 1 ? cellColor(m, zs[k] - mean) : "var(--cell)";
+      td.addEventListener("pointermove", ev => runTip(ev, c.r, m.path, `   ${m.name}`)); td.addEventListener("pointerleave", hideTip);
+      tr.appendChild(td);
+    });
+    tr.onclick = () => { oy = m.path; $("oy").value = oy; optionDraw(); markRow(); };
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody); box.appendChild(table);
+  fetchOptionDiffs(ref, cols);
+}
+
+function markRow() {
+  for (const tr of document.querySelectorAll("#olist tr.item")) tr.classList.toggle("cur", tr.dataset.path === oy);
+  const cur = document.querySelector(`#olist tr.item[data-path="${CSS.escape(oy)}"]`);
+  if (cur) cur.scrollIntoView({ block: "nearest" });
+}
+
+function optionRefresh() {
+  if (view !== "option") return;
+  const rs = shown(), opts = varyingOptions(rs), cat = measurementCatalog(rs);
+  if (!opts.some(o => o.key === ox)) ox = opts.length ? opts[0].key : null;
+  if (!cat.some(c => c.path === oy)) oy = (cat.find(c => c.path === "selfplay.phases.all.target_entropy") || cat[0] || {}).path || null;
+  const xs = $("ox"); xs.replaceChildren();
+  for (const o of opts) { const e = document.createElement("option"); e.value = o.key; e.textContent = shortName(o.key); xs.appendChild(e); }
+  if (ox) xs.value = ox;
+  const ys = $("oy"); ys.replaceChildren();
+  let group = null;
+  for (const c of cat) {
+    if (!group || group.label !== c.sec) { group = document.createElement("optgroup"); group.label = c.sec; ys.appendChild(group); }
+    const e = document.createElement("option"); e.value = c.path; e.textContent = c.name + (c.unit ? ` (${c.unit})` : ""); group.appendChild(e);
+  }
+  if (oy) ys.value = oy;
+  optionList(); optionDraw();
+}
+
+$("ox").onchange = () => { ox = $("ox").value; optionList(); optionDraw(); };
+$("oy").onchange = () => { oy = $("oy").value; optionDraw(); markRow(); };
+addEventListener("keydown", ev => {
+  if (view !== "option") return;
+  if (ev.target instanceof HTMLInputElement || ev.target instanceof HTMLSelectElement) return;
+  const vert = { ArrowDown: 1, ArrowUp: -1 }[ev.key], horiz = { ArrowRight: 1, ArrowLeft: -1 }[ev.key];
+  if (vert) {
+    const paths = [...document.querySelectorAll("#olist tr.item")].map(tr => tr.dataset.path);
+    if (!paths.length) return;
+    const i = paths.indexOf(oy);
+    oy = paths[(i < 0 ? 0 : i + vert + paths.length) % paths.length];
+    $("oy").value = oy; optionDraw(); markRow(); ev.preventDefault();
+  } else if (horiz) {
+    const keys = [...$("ox").options].map(o => o.value);
+    if (!keys.length) return;
+    const i = keys.indexOf(ox);
+    ox = keys[(i < 0 ? 0 : i + horiz + keys.length) % keys.length];
+    $("ox").value = ox; optionList(); optionDraw(); ev.preventDefault();
+  }
+});
+</script>
+<script>
+function setView(v) {
+  view = v;
+  $("tab-option").classList.toggle("on", v === "option"); $("tab-runs").classList.toggle("on", v === "runs");
+  $("option-view").style.display = v === "option" ? "" : "none";
+  $("runs-view").style.display = v === "runs" ? "" : "none";
+  $("baseline").style.display = v === "runs" ? "" : "none";
+  if (v === "runs") update(); else optionRefresh();
+}
+$("tab-option").onclick = () => setView("option");
+$("tab-runs").onclick = () => setView("runs");
+$("baseline").style.display = "none";
 load();
 </script>
 </body>

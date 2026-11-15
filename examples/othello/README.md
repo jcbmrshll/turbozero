@@ -517,8 +517,11 @@ Two passes a config, both built from train.py's own self-play code (`make_selfpl
 Each (model, config) is a JSON file in ~/.cache/turbozero/othello/selfplay-health, with every
 metric's bootstrap standard error (probe positions resampled, or openings with all their games),
 and an .npz of the metrics' inputs beside it, so that two runs compare paired: the same positions
-and openings, resampled alike. `serve` shows them all: up to 8 runs at a time, each metric's plot
-in turn (arrow keys), and each run's difference from a baseline run with ±2 standard errors.
+and openings, resampled alike. `serve` shows them two ways: any measurement against any config
+option (train.py's self-play flags as each run recorded them, the model, the reuse mode), runs
+grouped by the other options that vary, beside a heatmap of every measurement over that option's
+values; or up to 8 runs at a time, each measurement in turn, with each run's paired difference from
+a baseline run.
 
 ### The run controller
 

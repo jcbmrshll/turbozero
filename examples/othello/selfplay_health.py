@@ -1043,15 +1043,25 @@ def serve(args: argparse.Namespace) -> None:
             loaded[run_id] = (mtime, Stats.load(path))
         return loaded[run_id][1]
 
+    # each pair's comparison, until either run's file changes
+    compared: dict[tuple[str, str], tuple[float, float, dict]] = {}
+
     def comparisons(query: dict[str, list[str]]) -> dict[str, Any]:
-        base = stats_of(query.get("base", [""])[0])
+        base_id = query.get("base", [""])[0]
+        base = stats_of(base_id)
         out: dict[str, Any] = {}
         if base is None:
             return out
         for run_id in ",".join(query.get("ids", [])).split(","):
             other = stats_of(run_id) if run_id else None
-            if other is not None:
-                out[run_id] = compare(base, other)
+            if other is None:
+                continue
+            mtimes = (loaded[base_id][0], loaded[run_id][0])
+            cached = compared.get((base_id, run_id))
+            if cached is None or cached[:2] != mtimes:
+                cached = (*mtimes, compare(base, other))
+                compared[(base_id, run_id)] = cached
+            out[run_id] = cached[2]
         return out
 
     class Handler(http.server.BaseHTTPRequestHandler):
