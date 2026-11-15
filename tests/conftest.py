@@ -6,11 +6,6 @@ import os
 # JAX_PLATFORMS=cuda; without preallocation the pytest-xdist workers share a GPU
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-# pytest-xdist gives each worker a core, so each runs XLA single-threaded
-if "PYTEST_XDIST_WORKER" in os.environ:
-    os.environ["XLA_FLAGS"] = (
-        os.environ.get("XLA_FLAGS", "") + " --xla_cpu_multi_thread_eigen=false"
-    ).strip()
 
 import jax
 
