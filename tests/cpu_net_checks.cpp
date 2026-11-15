@@ -131,20 +131,18 @@ static void check_transpose() {
 // a vector of outputs at a time against one at a time
 static void check_linear() {
     for (int in : {16, 64}) {
+        const int out = 3 * W + 5;
+        std::vector<float> w((size_t)in * out), b(out);
+        for (auto& v : w) v = any_float();
+        for (auto& v : b) v = any_float();
         Linear l;
-        l.in = in;
-        l.out = 3 * W + 5;
-        for (int i = 0; i < l.in * l.out; i++) l.w.push_back(any_float());
-        for (int o = 0; o < l.out; o++) l.b.push_back(any_float());
+        set_linear(l, in, out, w.data(), b.data());
         std::vector<float> x(in), got(l.out);
         for (auto& v : x) v = any_float();
         linear(l, x.data(), got.data());
         for (int o = 0; o < l.out; o++) {
             Linear one;
-            one.in = in;
-            one.out = 1;
-            one.w.assign(l.w.begin() + (size_t)o * in, l.w.begin() + (size_t)(o + 1) * in);
-            one.b.assign(1, l.b[o]);
+            set_linear(one, in, 1, w.data() + (size_t)o * in, b.data() + o);
             float want;
             linear(one, x.data(), &want);
             expect(same(got[o], want), "linear", o);

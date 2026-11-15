@@ -909,10 +909,7 @@ int net_set_linear(net::Net* n, const char* where, int block, int in, int out, c
                      : name == "value_out"        ? &n->value_out
                                                   : nullptr;
     if (!l) return -1;
-    l->in = in;
-    l->out = out;
-    l->w.assign(w, w + (size_t)in * out);
-    l->b.assign(b, b + out);
+    net::set_linear(*l, in, out, w, b);
     return 0;
 }
 
