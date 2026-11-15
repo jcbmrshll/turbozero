@@ -1,4 +1,5 @@
 import random
+import re
 from dataclasses import dataclass
 
 import jax
@@ -73,6 +74,25 @@ def test_set_child_under_vmap_matches_each_tree_alone():
     for i, tree in enumerate(trees):
         assert_trees_equal(
             jax.tree.map(lambda x, i=i: x[i], out), tree.set_child(0, 1, node(9.0))
+        )
+
+
+def test_set_child_under_vmap_evicts_in_each_tree_as_alone():
+    # a full tree evicting, a full tree with nothing to evict, a tree with room
+    trees = [
+        full_tree(),
+        full_tree(),
+        empty_tree().set_root(node(1.0)).set_child(0, 0, node(2.0)),
+    ]
+    evict = jnp.array([2, Tree.NULL_INDEX, 1])
+    batch = jax.tree.map(lambda *xs: jnp.stack(xs), *trees)
+
+    out = jax.vmap(lambda t, v: t.set_child(0, 2, node(9.0), evict=v))(batch, evict)
+
+    for i, tree in enumerate(trees):
+        assert_trees_equal(
+            jax.tree.map(lambda x, i=i: x[i], out),
+            tree.set_child(0, 2, node(9.0), evict=evict[i]),
         )
 
 
@@ -416,6 +436,15 @@ def test_get_subtree_after_evictions_matches_reference(get_subtree, seed):
     assert_trees_equal(tree, build_tree(num_nodes, parents, edge_map, values))
 
     assert_subtree_matches_reference(get_subtree, num_nodes, parents, edge_map, values)
+    # the paths up and the leaves, with nodes no longer in the order they were added
+    for index in range(num_nodes):
+        np.testing.assert_array_equal(
+            path_to_root(tree, index), reference_path(parents, index)
+        )
+    has_child = {p for p in parents if p != Tree.NULL_INDEX}
+    np.testing.assert_array_equal(
+        tree.leaves(), [i not in has_child for i in range(max_nodes)]
+    )
 
 
 # path_to_root vs. following parents one at a time
@@ -477,3 +506,70 @@ def test_root_subtrees_match_reference(seed):
 
     expected = [root_child(i) if i < num_nodes else i for i in range(capacity)]
     np.testing.assert_array_equal(build_tree(*tree).root_subtrees(), expected)
+
+
+def test_init_tree_takes_python_scalar_template_leaves():
+    # e.g. a turn counter in an environment's state
+    tree = init_tree(
+        4, 3, {"turn": 0, "score": 0.0, "board": jnp.ones((2, 2), jnp.int8)}
+    )
+
+    assert tree.data["turn"].shape == (4,)
+    assert tree.data["turn"].dtype == jnp.result_type(0)
+    assert tree.data["score"].dtype == jnp.result_type(0.0)
+    assert tree.data["board"].shape == (4, 2, 2)
+    assert tree.data["board"].dtype == jnp.int8
+    assert tree.capacity == 4 and tree.branching_factor == 3
+    assert_trees_equal(tree.reset(), tree)
+
+
+# writing in place in a loop
+
+
+def copies_in_loop(hlo: str, shape: str) -> list[str]:
+    """Copies of arrays whose shape starts with `shape` (e.g. "5,24") in the bodies
+    of the outermost while loops of compiled `hlo` with a known trip count."""
+    computations = re.split(r"\n(?=\S)", hlo)
+    (entry,) = [c for c in computations if c.startswith("ENTRY")]
+    bodies = {
+        body
+        for line in entry.splitlines()
+        if " while(" in line and "known_trip_count" in line
+        for body in re.findall(r"body=%?([\w.-]+)", line)
+    }
+    return [
+        copy
+        for c in computations
+        if c.split(" ", 1)[0].lstrip("%") in bodies
+        for copy in re.findall(rf"= \w+\[{shape}[,\]]\S* copy\(.*", c)
+    ]
+
+
+def test_set_child_in_a_loop_writes_the_trees_in_place():
+    # like a search cycle: read a parent from the tree, write its child (evicting a
+    # leaf once full), update the root from what's stored. Without the barrier in
+    # set_child, XLA copies whole arrays of the trees' nodes every iteration
+    batch, capacity = 5, 24
+    trees = jax.vmap(lambda _: empty_tree(capacity, BRANCHING).set_root(node(1.0)))(
+        jnp.arange(batch)
+    )
+
+    def cycle(k, tree):
+        index = jnp.arange(tree.capacity)
+        used = index < tree.next_free_idx
+        parent = jnp.argmax(jnp.where(used, tree.data.value, -jnp.inf))
+        leaves = tree.leaves() & (index != tree.ROOT_INDEX) & (index != parent)
+        evict = jnp.where(leaves.any(), jnp.argmax(leaves), Tree.NULL_INDEX)
+        child = tree.data_at(parent)
+        tree = tree.set_child(
+            parent, k % BRANCHING, NodeData(child.value * 0.5, -child.vec), evict
+        )
+        root = tree.data_at(tree.ROOT_INDEX)
+        q = tree.get_child_data("value", tree.ROOT_INDEX).sum()
+        return tree.set_root(NodeData(root.value + q, root.vec))
+
+    run = jax.vmap(lambda tree: jax.lax.fori_loop(0, 40, cycle, tree))
+    hlo = jax.jit(run).lower(trees).compile().as_text()
+
+    assert hlo is not None
+    assert copies_in_loop(hlo, f"{batch},{capacity}") == []
