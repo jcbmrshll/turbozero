@@ -268,51 +268,15 @@ class Tree[NodeType]:
             subtrees = subtrees[subtrees]
         return subtrees
 
-    def _get_translation(
-        self, child_index: ArrayLike
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """Extracts mapping of node_idxs in a particular root subtree (with root at `child_index`) to collapsed indices.
-
-        Args:
-            child_index: the index of the child node to use as the root of the subtree.
-
-        Returns:
-            Tuple[jax.Array, jax.Array, jax.Array]:
-                - old_subtree_idxs: the indices of the nodes in the subtree rooted at `child_index`.
-                - translation: the mapping from the old indices to the new indices after collapsing the subtree.
-                - erase_idxs: the indices of the nodes that will be erased after collapsing the subtree.
-        """
-        subtrees = self.root_subtrees()
-
-        # get idx of subtree
-        subtree_idx = self.edge_map[self.ROOT_INDEX, child_index]
-        # get nodes that are part of the subtree
-        nodes_to_retain = subtrees == subtree_idx
-        slots_aranged = jnp.arange(self.capacity)
-        old_subtree_idxs = nodes_to_retain * slots_aranged
-        # get translation of old indices to new indices (collapsed): the new root first, then the
-        # rest in their old order (a node can come before the new root, when it took an evicted
-        # node's slot, see `set_child`)
-        is_new_root = slots_aranged == subtree_idx
-        cumsum = jnp.cumsum(nodes_to_retain & ~is_new_root)
-        new_next_node_index = nodes_to_retain.sum()
-        translation = jnp.where(
-            is_new_root, 0, jnp.where(nodes_to_retain, cumsum, self.NULL_INDEX)
-        )
-        # get indices of nodes that will be erased
-        erase_idxs = slots_aranged >= new_next_node_index
-
-        return old_subtree_idxs, translation, erase_idxs
-
     def get_subtree(
         self,
-        subtree_index: ArrayLike,
+        edge_index: ArrayLike,
         reset: ArrayLike = False,
         active: ArrayLike = True,
     ) -> Self:
-        """Extracts a subtree rooted at a specific node index.
-
-        Collapses subtree into a new tree with the root node at index 0, and children in subsequent indices.
+        """The subtree under the root's child along `edge_index`, collapsed into a new tree with
+        that child as the root, at index 0, and its descendants after it in their old order (empty
+        if the root has no such child).
 
         Every array is gathered from its new index's old one in a single pass, rather than scattered
         to it (which needs a copy of the array first, to scatter from); `reset` and `active` fold
@@ -320,15 +284,23 @@ class Tree[NodeType]:
         between them would read and write every tree again.
 
         Args:
-            subtree_index: the edge index (from the root node) of the node to use as the new root.
+            edge_index: the edge from the root to the new root.
             reset: (optional) return an empty tree instead, as `reset` does.
             active: (optional) if not, return the tree as it is.
-
-        Returns:
-            Self: the subtree rooted at the specified node index.
         """
-        _, translation, erase = self._get_translation(subtree_index)
-        index = jnp.arange(self.capacity, dtype=translation.dtype)
+        subtrees = self.root_subtrees()
+        new_root = self.edge_map[self.ROOT_INDEX, edge_index]
+        kept = subtrees == new_root
+        index = jnp.arange(self.capacity)
+        # each kept node's new index: the new root first, then the rest in their old order (a node
+        # can come before the new root, when it took an evicted node's slot, see `set_child`)
+        is_new_root = index == new_root
+        translation = jnp.where(
+            is_new_root,
+            0,
+            jnp.where(kept, jnp.cumsum(kept & ~is_new_root), self.NULL_INDEX),
+        )
+        erase = index >= kept.sum()
         # the old index of each new one (nodes past the subtree's are erased, whatever it is)
         source = (
             jnp.zeros_like(index)
