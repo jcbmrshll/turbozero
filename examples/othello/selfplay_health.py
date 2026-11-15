@@ -504,8 +504,21 @@ def symmetric_observations(observations: np.ndarray) -> np.ndarray:
     return np.stack(out)
 
 
-# positions' features in each of their 8 symmetries, (8, n, features), each of unit length
+# positions' feature maps, (n, channels, *board), equivariant: a symmetry of a position has the
+# same symmetry of its map (see `reference_features`)
 FeatureFn = Callable[[np.ndarray], np.ndarray]
+
+
+def symmetric_maps(maps: np.ndarray) -> np.ndarray:
+    """Feature maps (n, channels, *board) in each of the 8 symmetries, flattened and of unit
+    length: (8, n, features), in the order of `symmetric_bitboards`."""
+    out = []
+    for transpose in (False, True):
+        board = np.swapaxes(maps, -2, -1) if transpose else maps
+        for turns in range(4):
+            out.append(np.rot90(board, turns, axes=(-2, -1)).reshape(len(maps), -1))
+    flat = np.stack(out).astype(np.float32)
+    return flat / np.maximum(np.linalg.norm(flat, axis=-1, keepdims=True), 1e-12)
 
 
 def pair_statistics(
@@ -513,7 +526,7 @@ def pair_statistics(
     empties: np.ndarray,
     rng: np.random.Generator,
     groups: np.ndarray | None = None,
-    features: FeatureFn | None = None,
+    features: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     """How far apart positions are, where nearly all are distinct: each of up to PAIR_SAMPLE
     positions per count of empty squares (drawn at random), its mean distance to the others drawn
@@ -524,8 +537,9 @@ def pair_statistics(
       the opponent's)
     - occupancy (`occupancy_distance`): the squares filled in one and empty in the other, the
       shape of the filled region whatever its colours, which change every move
-    - feature (`feature_distance`, with `features`): the cosine distance between a reference
-      network's trunk features, positions as that network sees them
+    - feature (`feature_distance`, with `features`, the positions' equivariant feature maps, see
+      `reference_features`): the cosine distance between a reference network's trunk features,
+      positions as that network sees them
 
     And for each, soft collisions `soft_collision_<distance>_<scale>`: the mean of
     exp(-distance / scale) for the scales of SOFT_SCALES, the chance two positions are the same
@@ -561,9 +575,9 @@ def pair_statistics(
             for name, bits in distances.items()
         }
         if features is not None:
-            f = features(observations[level])
+            f = symmetric_maps(features[level])
             distances["feature"] = np.maximum(
-                1.0 - np.einsum("id,sjd->sij", f[0], f), 0.0
+                1.0 - f[0][None] @ f.transpose(0, 2, 1), 0.0
             ).min(0)
         off = ~np.eye(len(level), dtype=bool)
         rows.append(level)
@@ -582,9 +596,10 @@ def pair_statistics(
     return np.concatenate(rows), {k: np.concatenate(v) for k, v in values.items()}
 
 
-def reference_features(network: Any, params: Any) -> FeatureFn:
-    """A reference network's trunk features of positions in each of their 8 symmetries, flattened
-    and of unit length (see `pair_statistics`)."""
+def reference_features(network: Any, params: Any, batch: int = 4096) -> FeatureFn:
+    """A reference network's trunk feature maps of positions (see `pair_statistics`), averaged
+    over the 8 symmetries, each turned back: exactly equivariant, so a position's symmetries'
+    maps are its own map's symmetries, whether or not the network is."""
     nn_params, nn_state = params
     static = eqx.filter(network, eqx.is_inexact_array, inverse=True)
 
@@ -592,19 +607,27 @@ def reference_features(network: Any, params: Any) -> FeatureFn:
     def forward(x):
         net = eqx.nn.inference_mode(eqx.combine(nn_params, static))
         trunk = jax.vmap(net.trunk, axis_name=BATCH_AXIS, in_axes=(0, None))
-        out = trunk(x, nn_state)[0].astype(jnp.float32).reshape(len(x), -1)
-        return out / jnp.maximum(jnp.linalg.norm(out, axis=1, keepdims=True), 1e-12)
+        return trunk(x, nn_state)[0].astype(jnp.float32)
 
-    def features(observations: np.ndarray) -> np.ndarray:
-        sym = symmetric_observations(observations)
-        flat = sym.reshape(-1, *sym.shape[2:])
-        # padded to a power of two, so that few sizes compile
-        size = 1 << max(int(len(flat) - 1).bit_length(), 4)
-        padded = np.concatenate([flat, np.repeat(flat[:1], size - len(flat), 0)])
-        out = np.asarray(forward(jnp.asarray(padded)))[: len(flat)]
-        return out.reshape(8, len(observations), -1)
+    def maps(observations: np.ndarray) -> np.ndarray:
+        out = []
+        for start in range(0, len(observations), batch):
+            chunk = observations[start : start + batch]
+            padded = np.concatenate(
+                [chunk, np.repeat(chunk[:1], batch - len(chunk), 0)]
+            )
+            total = None
+            for k, sym in enumerate(symmetric_observations(padded)):
+                turned = np.asarray(forward(jnp.asarray(sym)))[: len(chunk)]
+                # undo the symmetry: turns back, then the transpose
+                back = np.rot90(turned, -(k % 4), axes=(-2, -1))
+                back = np.swapaxes(back, -2, -1) if k >= 4 else back
+                total = back if total is None else total + back
+            assert total is not None
+            out.append(total / 8)
+        return np.concatenate(out)
 
-    return features
+    return maps
 
 
 def bitboards(observations: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -888,11 +911,12 @@ def selfplay_metrics(
             "decided_share": np.abs(value[train]) > DECIDED,
         }
         both = train & known
+        maps = None if features is None else features(obs[train])
         drawn, pairs = pair_statistics(
-            obs[train], empties[train], np.random.default_rng(args.seed), None, features
+            obs[train], empties[train], np.random.default_rng(args.seed), None, maps
         )
         same, same_pairs = pair_statistics(
-            obs[train], empties[train], np.random.default_rng(args.seed), ids, features
+            obs[train], empties[train], np.random.default_rng(args.seed), ids, maps
         )
         phases[phase] = {
             "training_positions": stored,
