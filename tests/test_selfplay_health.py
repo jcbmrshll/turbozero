@@ -147,15 +147,9 @@ def test_copies_of_a_position_collide_fully():
             np.testing.assert_allclose(stats[f"soft_collision_{name}_{scale:g}"], 1.0)
 
 
-def occupancy_features(observations):
-    """A stand-in reference network: each symmetry's filled squares, of unit length."""
-    sym = (
-        health.symmetric_observations(observations)
-        .any(-1)
-        .reshape(8, len(observations), 64)
-    )
-    sym = sym.astype(float) + 1.0
-    return sym / np.linalg.norm(sym, axis=-1, keepdims=True)
+def occupancy_maps(observations):
+    """A stand-in reference network's maps, equivariant: each position's filled squares."""
+    return observations.any(-1)[:, None].astype(float) + 1.0
 
 
 def test_feature_distance_is_the_closest_symmetrys_cosine_distance():
@@ -166,27 +160,44 @@ def test_feature_distance_is_the_closest_symmetrys_cosine_distance():
         variants,
         np.zeros(5, int),
         np.random.default_rng(0),
-        features=occupancy_features,
+        features=occupancy_maps(variants),
     )
 
-    f = occupancy_features(variants)
+    f = health.symmetric_maps(occupancy_maps(variants))
     by_row = dict(zip(rows.tolist(), stats["feature_distance"]))
     for i in range(5):
         expected = np.mean(
-            [min(1 - f[0, i] @ f[s, j] for s in range(8)) for j in range(5) if j != i]
+            [
+                max(min(1 - f[0, i] @ f[s, j] for s in range(8)), 0.0)
+                for j in range(5)
+                if j != i
+            ]
         )
-        assert by_row[i] == pytest.approx(expected, abs=1e-12)
+        assert by_row[i] == pytest.approx(expected, abs=1e-6)
+    # a position and its rotation are no distance apart
+    _, pair = health.pair_statistics(
+        variants[[0, 4]],
+        np.zeros(2, int),
+        np.random.default_rng(0),
+        features=occupancy_maps(variants[[0, 4]]),
+    )
+    np.testing.assert_allclose(pair["feature_distance"], 0.0, atol=1e-6)
     assert all(
         f"soft_collision_feature_{s:g}" in stats for s in health.SOFT_SCALES["feature"]
     )
 
 
-def test_reference_features_are_unit_length_for_every_symmetry():
+def test_reference_feature_maps_are_equivariant():
     game = load_example("othello", "game")[0]
     network, state = game.make_network("resnet:1x4", seed=0)
     params = (eqx.filter(network, eqx.is_inexact_array), state)
+    maps = health.reference_features(network, params, batch=8)
+    obs = random_boards(3)
 
-    features = health.reference_features(network, params)(random_boards(3))
+    plain = maps(obs)
+    turned = maps(np.rot90(np.swapaxes(obs, 1, 2), 3, axes=(1, 2)))
 
-    assert features.shape == (8, 3, 4 * 64)
-    np.testing.assert_allclose(np.linalg.norm(features, axis=-1), 1.0, rtol=1e-5)
+    assert plain.shape == (3, 4, 8, 8)
+    np.testing.assert_allclose(
+        turned, np.rot90(np.swapaxes(plain, -2, -1), 3, axes=(-2, -1)), atol=1e-5
+    )
