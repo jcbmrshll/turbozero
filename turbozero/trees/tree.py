@@ -44,16 +44,6 @@ class Tree[NodeType]:
         """
         return jax.tree_util.tree_map(lambda x: x[index], self.data)
 
-    def check_data_type(self, data: NodeType) -> None:
-        """Checks if the data type matches the tree's data type.
-
-        Args:
-            data: the data to check.
-        """
-        assert isinstance(data, type(self.data)), (
-            f"data type mismatch, tree contains {type(self.data)} data, but got {type(data)} data."
-        )
-
     def is_edge(self, parent_index: ArrayLike, edge_index: ArrayLike) -> jax.Array:
         """Checks if an edge exists from a parent node along a specific edge.
 
@@ -77,8 +67,6 @@ class Tree[NodeType]:
         Returns:
             jax.Array: the extracted data field for all children of the parent node
         """
-        assert hasattr(self.data, x), f"field {x} not found in node data."
-
         mapping = self.edge_map[index]
         child_data = getattr(self.data, x)[mapping]
 
@@ -118,7 +106,6 @@ class Tree[NodeType]:
         Returns:
             Self: tree with the child's data stored.
         """
-        self.check_data_type(data)
         child = self.edge_map[parent_index, edge_index]
         evict_parent = self.parents[evict]
         evict_edge = jnp.argmax(self.edge_map[evict_parent] == evict)
@@ -189,7 +176,6 @@ class Tree[NodeType]:
         Returns:
             Self: tree with the root node data set.
         """
-        self.check_data_type(data)
         # `data` (which the caller can read from the tree), then the writes (see `set_child`)
         data, tree_data = jax.lax.optimization_barrier((data, self.data))
         # out of bounds, so dropped, when not writing
