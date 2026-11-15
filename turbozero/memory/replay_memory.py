@@ -68,12 +68,15 @@ class ReplayBufferState:
 
 
 class EpisodeReplayBuffer:
-    """Stores self-play episodes' experiences for training, overwriting the
-    oldest. `capacity` is that of the states `init` makes; the other methods
-    take the capacity of the state they're given, so they work on a state
-    `resize`d to another. Writing and resizing take a single environment's
-    state, so self-play vmaps them over environments; sampling takes the
-    stacked states of every environment, and draws across all of them.
+    """Stores self-play experiences for training: each environment's newest
+    entries, in a ring that overwrites the oldest.
+
+    Writing and resizing work on one environment's state; vmap them over
+    environments. Sampling works on all environments' states stacked, and
+    draws from all of them at once.
+
+    `capacity` is the size of the states `init` makes. The other methods read
+    the size from the state, so a resized state keeps its new size.
     """
 
     def __init__(self, capacity: int):
