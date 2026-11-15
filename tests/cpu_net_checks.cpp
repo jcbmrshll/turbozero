@@ -160,7 +160,6 @@ static void check_convolve() {
                 }
 }
 
-#if NET_ISA != 3
 static void check_transpose() {
     alignas(64) float x[W][W], got[W];
     F r[W];
@@ -229,18 +228,15 @@ static void check_policy_logits() {
         expect(same(got[s], logit), "policy logits", s);
     }
 }
-#endif
 
 int main() {
     check_reduce();
     check_norm_stats();
     check_stem();
     check_convolve();
-#if NET_ISA != 3
     check_transpose();
     check_linear();
     check_policy_logits();
-#endif
     std::printf("%d failures\n", failures);
     return failures ? 1 : 0;
 }
