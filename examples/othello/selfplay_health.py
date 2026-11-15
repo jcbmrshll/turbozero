@@ -81,6 +81,9 @@ PAGE = Path(__file__).with_name("selfplay_health.html")
 # bands of empty squares metrics are reported for, all above the usual solve point (20); the
 # opening band starts at an XOT opening's 52
 PHASES = {"opening": (40, 52), "midgame": (30, 39), "late": (21, 29)}
+# bands of empties the probe also reports, outside "all": positions at or below the usual solve
+# point (20), which a search from a few more empties reaches as leaves
+PROBE_ONLY = {"endgame": (13, 20)}
 # the train.py arguments that make up a self-play config, recorded with each result
 SELFPLAY_ARGS = (
     "sims",
@@ -377,10 +380,11 @@ def search_positions(
 
 
 def probe_set(engine_set: EngineSet, per_phase: int) -> np.ndarray:
-    """The probe positions: up to `per_phase` of each of PHASES, the same for every run."""
+    """The probe positions: up to `per_phase` of each of PHASES and PROBE_ONLY, the same for
+    every run (PHASES' drawn first, as before PROBE_ONLY was added)."""
     rng = np.random.default_rng(0)
     chosen = []
-    for low, high in PHASES.values():
+    for low, high in [*PHASES.values(), *PROBE_ONLY.values()]:
         idx = np.flatnonzero((engine_set.empties >= low) & (engine_set.empties <= high))
         chosen.append(np.sort(rng.permutation(idx)[:per_phase]))
     return np.concatenate(chosen)
@@ -404,6 +408,8 @@ def probe(
     loss = np.where(legal, best[:, None] - scores, 0.0)
     z = np.sign(best)
     groups = bands(empties)
+    for name, (low, high) in PROBE_ONLY.items():
+        groups[name] = (empties >= low) & (empties <= high)
 
     logits, raw_value = raw_outputs(network, params, observations)
     outputs = {"raw": (masked_softmax(logits, legal), raw_value)}

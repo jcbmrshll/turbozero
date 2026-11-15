@@ -1,5 +1,7 @@
 """selfplay_health.py's diversity measures of stored positions, on hand-made boards."""
 
+from types import SimpleNamespace
+
 import equinox as eqx
 import numpy as np
 import pytest
@@ -270,3 +272,17 @@ def test_after_offline_marks_a_games_moves_after_its_first_off_line_one():
     marked = health.after_offline(moves, start=10)
 
     np.testing.assert_array_equal(marked, [0, 0, 0, 1, 0, 0, 0, 0])
+
+
+def test_the_probe_only_band_adds_endgame_positions_without_changing_the_others(
+    monkeypatch,
+):
+    fake = SimpleNamespace(empties=np.random.default_rng(0).integers(5, 53, 2000))
+
+    with_endgame = health.probe_set(fake, per_phase=50)
+    monkeypatch.setattr(health, "PROBE_ONLY", {})
+    without = health.probe_set(fake, per_phase=50)
+
+    np.testing.assert_array_equal(with_endgame[: len(without)], without)
+    extra = fake.empties[with_endgame[len(without) :]]
+    assert len(extra) == 50 and ((extra >= 13) & (extra <= 20)).all()
