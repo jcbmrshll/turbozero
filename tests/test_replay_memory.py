@@ -168,64 +168,6 @@ def test_sampling_draws_only_finished_populated_entries():
         assert sorted(sample.tolist()) == [1, 2, 4]
 
 
-def test_count_distinct_observations_counts_only_sampleable_experiences():
-    buffer = EpisodeReplayBuffer(capacity=8)
-    state = add(buffer, init_single(buffer), [1, 2, 1, 3, 2])
-    state = buffer.assign_rewards(state, jnp.array([1.0, -1.0]))
-    # an unfinished episode can't be sampled yet, so its new observation doesn't count
-    state = add(buffer, state, [4])
-
-    distinct, total = buffer.count_distinct_observations(state)
-
-    assert (distinct, total) == (3, 5)
-
-
-def test_count_distinct_observations_across_batch_dimensions():
-    buffer = EpisodeReplayBuffer(capacity=4)
-    template = experience(0)
-    template = replace(template, observation_nn=jnp.zeros((2,), dtype=jnp.bool_))
-    # two devices, two environments each
-    state = jax.tree.map(
-        lambda x: x.reshape(2, 2, *x.shape[1:]), buffer.init(4, template)
-    )
-    obs = jnp.array([[1, 0], [0, 1], [1, 1], [1, 0]], dtype=jnp.bool_)
-    state = replace(
-        state,
-        buffer=replace(
-            state.buffer,
-            # environment i holds observation i in its first slot, and observation 0 in its second
-            observation_nn=state.buffer.observation_nn.at[:, :, 0]
-            .set(obs.reshape(2, 2, 2))
-            .at[:, :, 1]
-            .set(obs[0]),
-        ),
-        populated=state.populated.at[:, :, :2].set(True),
-    )
-
-    distinct, total = jax.jit(buffer.count_distinct_observations)(state)
-
-    # [1, 0] and [0, 1] hold the same values in different places, so they differ
-    assert (distinct, total) == (3, 8)
-
-
-def negate(e):
-    """A data transform: the observation negated."""
-    return replace(e, observation_nn=-e.observation_nn)
-
-
-def test_count_distinct_observations_up_to_transforms():
-    buffer = EpisodeReplayBuffer(capacity=8)
-    state = add(buffer, init_single(buffer), [1, -1, 2, 0, 3, -3, 3])
-    state = buffer.assign_rewards(state, jnp.array([1.0, -1.0]))
-
-    assert buffer.count_distinct_observations(state) == (6, 7)
-    # 1 and -1, and 3 and -3, are one another's images
-    distinct, total = jax.jit(
-        lambda s: buffer.count_distinct_observations(s, transform_fns=[negate])
-    )(state)
-    assert (distinct, total) == (4, 7)
-
-
 def shift(k):
     """A data transform that adds 10**6 * k to the observation, to show which was drawn, and
     rolls the policy's actions k places."""

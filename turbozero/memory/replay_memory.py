@@ -215,63 +215,6 @@ class EpisodeReplayBuffer:
             key, mask.size, shape=(sample_size,), replace=replace, p=mask / mask.sum()
         )
 
-    def count_distinct_observations(
-        self,
-        state: ReplayBufferState,
-        transform_fns: Sequence[DataTransformFn] = (),
-    ) -> tuple[jax.Array, jax.Array]:
-        """(distinct observations, experiences) among the experiences that can
-        be sampled: a measure of how varied the replay data is. Works with any
-        batch dimensions in front of the capacity dimension.
-
-        Observations are compared by a 64-bit hash of their contents, so
-        collisions are possible but vanishingly rare at buffer sizes. With
-        `transform_fns` (those training applies to sampled experiences),
-        observations that one maps to another count as one: each is compared by
-        the least hash of its images under the identity and the transforms,
-        which must form a group.
-        """
-        valid = self.sample_mask(state).reshape(-1)
-        experiences = jax.tree.map(
-            lambda x: x.reshape(valid.shape[0], *x.shape[state.populated.ndim :]),
-            state.buffer,
-        )
-
-        def hashes(obs: jax.Array) -> tuple[jax.Array, jax.Array]:
-            obs = obs.reshape(valid.shape[0], -1)
-            # compare raw bits: floats as float32, everything else as int32
-            if jnp.issubdtype(obs.dtype, jnp.floating):
-                bits = jax.lax.bitcast_convert_type(obs.astype(jnp.float32), jnp.uint32)
-            else:
-                bits = jax.lax.bitcast_convert_type(obs.astype(jnp.int32), jnp.uint32)
-            position = jnp.arange(1, bits.shape[1] + 1, dtype=jnp.uint32)
-
-            def hash_rows(seed: int) -> jax.Array:
-                # mix each element with a constant for its position (murmur3's
-                # finalizer), then sum (mod 2^32), so the hash depends on every
-                # element and where it is
-                h = bits ^ (position * jnp.uint32(0x9E3779B9) + jnp.uint32(seed))
-                h = (h ^ (h >> 16)) * jnp.uint32(0x85EBCA6B)
-                h = (h ^ (h >> 13)) * jnp.uint32(0xC2B2AE35)
-                return (h ^ (h >> 16)).sum(axis=-1, dtype=jnp.uint32)
-
-            return hash_rows(0x2545F491), hash_rows(0x6C8E9CF5)
-
-        h1, h2 = hashes(experiences.observation_nn)
-        for transform_fn in transform_fns:
-            t1, t2 = hashes(jax.vmap(transform_fn)(experiences).observation_nn)
-            # keep the least (h1, h2) pair
-            less = (t1 < h1) | ((t1 == h1) & (t2 < h2))
-            h1, h2 = jnp.where(less, t1, h1), jnp.where(less, t2, h2)
-        # valid experiences first, then by hash, so equal observations are
-        # adjacent
-        order = jnp.lexsort((h2, h1, ~valid))
-        valid, h1, h2 = valid[order], h1[order], h2[order]
-        new = jnp.concatenate(
-            [jnp.array([True]), (h1[1:] != h1[:-1]) | (h2[1:] != h2[:-1])]
-        )
-        return (valid & new).sum(), valid.sum()
-
     def init(
         self, batch_size: int, template_experience: BaseExperience
     ) -> ReplayBufferState:
