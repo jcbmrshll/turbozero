@@ -821,6 +821,23 @@ class AZResnet(eqx.Module):
     def __call__(
         self, x: jax.Array, state: eqx.nn.State
     ) -> tuple[tuple[jax.Array, jax.Array], eqx.nn.State]:
+        x, state = self.trunk(x, state)
+        dtype = jnp.dtype(self.inference_dtype if self.inference else self.train_dtype)
+        return self.heads(x, state, dtype)
+
+    def trunk(
+        self, x: jax.Array, state: eqx.nn.State
+    ) -> tuple[jax.Array, eqx.nn.State]:
+        """The trunk's output, the features the heads read: (channels, *board), e.g. to compare
+        positions as the network sees them.
+
+        Args:
+            x: one input, channels last
+            state: the network's state
+
+        Returns:
+            the features, and the network's state
+        """
         # the convolutions compute in the inference dtype in inference mode (and so do the activations
         # between them), in the train dtype in training
         dtype = jnp.dtype(self.inference_dtype if self.inference else self.train_dtype)
@@ -844,4 +861,4 @@ class AZResnet(eqx.Module):
 
         if self.final_norm is not None:
             x, state = norm_act(self.final_norm, x, state, dtype)
-        return self.heads(x, state, dtype)
+        return x, state
