@@ -82,11 +82,11 @@ struct Aligned {
 struct Conv {
     int cin = 0, cout = 0, k = 3;
     // the weights for the kernel (see `pack`)
-    std::vector<int8_t> packed;
-    std::vector<int16_t> packed16;
+    std::vector<int8_t, Aligned<int8_t>> packed;
+    std::vector<int16_t, Aligned<int16_t>> packed16;
     std::vector<float> scale, bias;  // of each output: acc * scale + bias
     std::vector<int32_t> offset;  // NEON: 128 times each output's weights' sum
-    std::vector<int16_t> table;  // the stem's, in place of the packed weights (see `stem_table`)
+    std::vector<int16_t, Aligned<int16_t>> table;  // the stem's, in place of the packed weights (see `stem_table`)
     std::vector<float> inverse;  // of each input channel: its quantization is round(x * inverse) + zero_point
     int zero_point = 0;
 };
@@ -155,11 +155,11 @@ inline void set_linear(Linear& l, int in, int out, const float* w, const float* 
 
 // what a forward pass writes as it goes, one to a thread
 struct Scratch {
-    std::vector<Activation> padded;  // (100, max channels), a convolution's input
-    std::vector<float> x, y, h;   // (64, max channels): the trunk, a block's middle, the heads
-    std::vector<int16_t> winograd;  // (16, 16 tiles, max channels): AVX2's transformed input
+    std::vector<Activation, Aligned<Activation>> padded;  // (100, max channels), a convolution's input
+    std::vector<float, Aligned<float>> x, y, h;   // (64, max channels): the trunk, a block's middle, the heads
+    std::vector<int16_t, Aligned<int16_t>> winograd;  // (16, 16 tiles, max channels): AVX2's transformed input
     // i8mm: the padded input in pairs of neighbouring squares, from even and from odd columns
-    std::vector<int8_t> pairs;
+    std::vector<int8_t, Aligned<int8_t>> pairs;
     explicit Scratch(const Net& n) {
         int c = std::max(n.channels, 4);
         // and room for NEON's loads of 16 channels past the last square's
@@ -183,27 +183,35 @@ inline int32_t load_u32(const void* p) {
 // One output row of a convolution, `RO` blocks of 16 outputs from `o`, for the 8 squares of row `y`.
 // The tile is the board's row by two blocks: 16 sums, 8 broadcast inputs and 2 weight vectors, 26 of
 // AVX-512's 32 registers, each weight used 8 times. It follows from the instruction set, not from
-// any one CPU's caches or timings.
+// any one CPU's caches or timings. A kernel row's three taps and all their channels are one run of
+// both the padded input (3 squares of `cin`) and the packed weights, so each is one loop. Out of
+// line: GCC's copies inlined into `forward` keep some sums on the stack.
 template <int K, int RO>
-inline void conv_row(const Conv& c, const int8_t* w, const uint8_t* in, int y, int o, float* out, int out_stride,
-                     bool add) {
-    const int c4n = c.cin / 4;
+__attribute__((noinline)) void conv_row(const Conv& c, const int8_t* w, const uint8_t* in, int y, int o, float* out,
+                                        int out_stride, bool add) {
+    const int cin = c.cin;
+    const int steps = K * cin / 4;  // a kernel row's 4 channels at a time
     __m512i acc[8][RO];
     for (int i = 0; i < 8; i++)
         for (int r = 0; r < RO; r++) acc[i][r] = _mm512_setzero_si512();
-    for (int t = 0; t < K * K; t++) {
-        int dy = K == 3 ? t / 3 : 1, dx = K == 3 ? t % 3 : 1;
-        const uint8_t* row = in + ((y + dy) * 10 + dx) * c.cin;
-        const int8_t* wt = w + (size_t)t * c4n * RO * 64;
-#pragma GCC unroll 2
-        for (int c4 = 0; c4 < c4n; c4++) {
-            __m512i a[8];
-            for (int i = 0; i < 8; i++) a[i] = _mm512_set1_epi32(load_u32(row + i * c.cin + c4 * 4));
-            for (int r = 0; r < RO; r++) {
-                __m512i wv = _mm512_loadu_si512(wt + (c4 * RO + r) * 64);
-                for (int i = 0; i < 8; i++) acc[i][r] = _mm512_dpbusd_epi32(acc[i][r], a[i], wv);
-            }
+    auto step = [&](const uint8_t* row, const int8_t* wt, int j) {
+        __m512i a[8];
+        for (int i = 0; i < 8; i++) a[i] = _mm512_set1_epi32(load_u32(row + i * cin + 4 * j));
+        for (int r = 0; r < RO; r++) {
+            __m512i wv = _mm512_loadu_si512(wt + (j * RO + r) * 64);
+            for (int i = 0; i < 8; i++) acc[i][r] = _mm512_dpbusd_epi32(acc[i][r], a[i], wv);
         }
+    };
+    for (int dy = 0; dy < K; dy++) {
+        // the 1x1's one tap is the 3x3's middle
+        const uint8_t* row = in + ((y + (K == 3 ? dy : 1)) * 10 + (K == 3 ? 0 : 1)) * cin;
+        const int8_t* wt = w + (size_t)dy * steps * RO * 64;
+        int j = 0;
+        for (; j + 2 <= steps; j += 2) {
+            step(row, wt, j);
+            step(row, wt, j + 1);
+        }
+        if (j < steps) step(row, wt, j);
     }
     for (int r = 0; r < RO; r++) {
         __m512 m = _mm512_loadu_ps(c.scale.data() + o + 16 * r);
@@ -477,20 +485,23 @@ inline void convolve(const Conv& c, Scratch& s, float* out, int out_stride, bool
 template <int K>
 inline void conv_row(const Conv& c, const int8_t* w, const int8_t* in, int y, int o, float* out, int out_stride,
                      bool add) {
-    const int c4n = c.cin / 4;
+    const int cin = c.cin;
+    // a kernel row's three taps and all their channels are one run of both the padded input (3
+    // squares of `cin`) and the packed weights, so each is one loop, 4 channels a step
+    const int steps = K * cin / 4;
     int32x4_t acc[8][2];
     for (int i = 0; i < 8; i++) acc[i][0] = acc[i][1] = vdupq_n_s32(0);
-    for (int t = 0; t < K * K; t++) {
-        int dy = K == 3 ? t / 3 : 1, dx = K == 3 ? t % 3 : 1;
-        const int8_t* row = in + ((y + dy) * 10 + dx) * c.cin;
-        const int8_t* wt = w + (size_t)t * c4n * 32;
-        for (int c4 = 0; c4 < c4n; c4 += 4) {
+    for (int dy = 0; dy < K; dy++) {
+        // the 1x1's one tap is the 3x3's middle
+        const int8_t* row = in + ((y + (K == 3 ? dy : 1)) * 10 + (K == 3 ? 0 : 1)) * cin;
+        const int8_t* wt = w + (size_t)dy * steps * 32;
+        for (int j = 0; j < steps; j += 4) {
             int8x16_t a[8];
-            for (int i = 0; i < 8; i++) a[i] = vld1q_s8(row + i * c.cin + 4 * c4);
+            for (int i = 0; i < 8; i++) a[i] = vld1q_s8(row + i * cin + 4 * j);
             // the lane must be a constant; channels come in fours, so the last group may be short
 #define NET_LANE(L)                                                                  \
-            if (c4 + L < c4n) {                                                      \
-                int8x16_t w0 = vld1q_s8(wt + (c4 + L) * 32), w1 = vld1q_s8(wt + (c4 + L) * 32 + 16); \
+            if (j + L < steps) {                                                     \
+                int8x16_t w0 = vld1q_s8(wt + (j + L) * 32), w1 = vld1q_s8(wt + (j + L) * 32 + 16); \
                 for (int i = 0; i < 8; i++) {                                        \
                     acc[i][0] = vdotq_laneq_s32(acc[i][0], w0, a[i], L);             \
                     acc[i][1] = vdotq_laneq_s32(acc[i][1], w1, a[i], L);             \
