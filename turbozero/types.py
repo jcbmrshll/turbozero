@@ -36,18 +36,14 @@ class TrainState:
         params: trainable parameters, the floating point arrays of the network (`eqx.filter(nn, eqx.is_inexact_array)`)
         nn_state: state of the network (e.g. BatchNorm statistics), None for stateless networks
         opt_state: optimizer state
-        step: number of training steps taken
     """
 
     params: Any
     nn_state: eqx.nn.State | None
     opt_state: optax.OptState
-    step: jax.Array
 
 
 EnvStepFn = Callable[[Any, jax.Array], tuple[Any, StepMetadata]]
 EnvInitFn = Callable[[jax.Array], tuple[Any, StepMetadata]]
-Params = Any
-EvalFn = Callable[[Any, Params, jax.Array], tuple[jax.Array, jax.Array]]
-ExtractModelParamsFn = Callable[[TrainState], Any]
+EvalFn = Callable[[Any, Any, jax.Array], tuple[jax.Array, jax.Array]]
 StateToNNInputFn = Callable[[Any], jax.Array]
