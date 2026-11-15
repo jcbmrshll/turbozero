@@ -52,7 +52,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from engine_set import DEFAULT_PATH as DEFAULT_ENGINE_SET
-from engine_set import EngineSet
+from engine_set import ILLEGAL, EngineSet, boards
 from engines import CACHE_DIR
 from exact_labels import default_threads, stops_at
 from game import (
@@ -64,6 +64,7 @@ from game import (
     state_to_nn_input,
     step_fn,
 )
+from label_positions import AnalystFactory, edax_analyst, label
 from train import check_selfplay_args, make_exploration, make_parser, make_selfplay
 from xot import load_xot, make_xot_init_fn
 
@@ -111,6 +112,8 @@ DECIDED = 0.9
 CHUNK_STEPS = 4
 # stored positions per count of empty squares that pair distances are measured among, at most
 PAIR_SAMPLE = 384
+# Edax's labels of stored positions (--label-stored), by level, kept for every run to reuse
+LABELS_DIR = RESULTS_DIR / "labels"
 # the scales of the soft collisions, exp(-distance / scale), in each distance's units: squares,
 # and the reference network's cosine distance
 SOFT_SCALES = {
@@ -638,6 +641,77 @@ def bitboards(observations: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return me, opp
 
 
+# Edax's scores of every legal move of positions given as the network's input, (n, 65) int16,
+# ILLEGAL where illegal, from the player to move's side
+LabelFn = Callable[[np.ndarray], np.ndarray]
+
+
+class LabelCache:
+    """Edax's scores of positions' moves (see `label_positions.label`), kept in `directory` as
+    edax-L<level>.npz by position, so a position is scored once whichever run stores it (exactly,
+    not up to symmetry: the scores are per move)."""
+
+    def __init__(
+        self,
+        directory: str | Path,
+        level: int,
+        workers: int,
+        factory: AnalystFactory = edax_analyst,
+    ):
+        self.path = Path(directory) / f"edax-L{level}.npz"
+        self.level, self.workers, self.factory = level, workers, factory
+        self.scores: dict[tuple[int, int], np.ndarray] = {}
+        if self.path.exists():
+            with np.load(self.path) as saved:
+                for me, opp, row in zip(saved["me"], saved["opp"], saved["scores"]):
+                    self.scores[(int(me), int(opp))] = row
+
+    def __call__(self, observations: np.ndarray) -> np.ndarray:
+        me, opp = bitboards(observations)
+        keys = list(zip(me.tolist(), opp.tolist()))
+        missing = sorted({k for k in keys if k not in self.scores})
+        if missing:
+            index = {k: i for i, k in enumerate(keys)}
+            rows = observations[[index[k] for k in missing]]
+            scores, _ = label(boards(rows), self.level, self.workers, self.factory)
+            self.scores.update(zip(missing, scores))
+            self.save()
+        return np.stack([self.scores[k] for k in keys])
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        keys = np.array(list(self.scores), dtype=np.uint64).reshape(-1, 2)
+        tmp = self.path.with_name(self.path.name + ".tmp.npz")
+        np.savez(
+            tmp,
+            me=keys[:, 0],
+            opp=keys[:, 1],
+            scores=np.stack(list(self.scores.values())).astype(np.int16),
+        )
+        tmp.replace(self.path)
+
+
+def label_metrics(
+    scores: np.ndarray,
+    policy: np.ndarray,
+    prior: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """How good stored targets are on the positions stored, by Edax's scores of their moves
+    (`LabelFn`'s): each row's expected regret in discs (the best move's score less the move's)
+    of the policy target and of the network's prior, and whether the target's top move is a best
+    one."""
+    legal = scores != ILLEGAL
+    s = scores.astype(np.float64)
+    best = np.max(np.where(legal, s, -np.inf), axis=1)
+    loss = np.where(legal, best[:, None] - s, 0.0)
+    top = np.argmax(np.where(legal, policy, -1.0), axis=1)
+    return {
+        "edax_target_regret": np.sum(policy * loss, axis=1),
+        "edax_prior_regret": np.sum(prior * loss, axis=1),
+        "edax_target_top1": np.take_along_axis(loss, top[:, None], 1)[:, 0] == 0,
+    }
+
+
 def play_games(
     network: Any,
     params: Any,
@@ -869,10 +943,15 @@ def selfplay_metrics(
     timing: dict[str, float],
     games_per_opening: int,
     features: FeatureFn | None = None,
+    labels: LabelFn | None = None,
+    label_per_phase: int = 0,
 ) -> tuple[dict[str, Any], Stats]:
     """The self-play pass's metrics (see the module's docstring), and their inputs. The
     bootstrap's unit is the opening: its games are resampled together. With `features`, the
-    stored positions' distances include a reference network's (see `pair_statistics`)."""
+    stored positions' distances include a reference network's (see `pair_statistics`). With
+    `labels`, up to `label_per_phase` stored positions of each phase (with a choice of moves) are
+    scored by Edax: the targets' regret where self-play actually went, and the stored values and
+    outcomes against Edax's result (`edax_z_*`, `edax_q_*`)."""
     stats = Stats()
     obs, policy, value = moves["observation"], moves["policy"], moves["value"]
     full, env, action = moves["full"].astype(bool), moves["env"], moves["action"]
@@ -931,6 +1010,35 @@ def selfplay_metrics(
             },
             **stats.value(prefix, opening[both], value[both], z[both], name="stored_"),
         }
+        if labels is not None and label_per_phase > 0:
+            choice = np.flatnonzero(both & (moves["legal"][:, :64].sum(1) >= 2))
+            if len(choice) > label_per_phase:
+                choice = np.sort(
+                    np.random.default_rng(args.seed).choice(
+                        choice, label_per_phase, replace=False
+                    )
+                )
+            scored = labels(obs[choice])
+            best = np.max(np.where(scored != ILLEGAL, scored, -9999), axis=1)
+            edax_z = np.sign(best).astype(np.float64)
+            phases[phase].update(
+                {
+                    k: stats.mean(f"{prefix}.{k}", opening[choice], v)
+                    for k, v in label_metrics(
+                        scored, policy[choice], prior[choice]
+                    ).items()
+                }
+            )
+            phases[phase]["edax_labelled"] = len(choice)
+            # the stored outcome (the value target) and search value against Edax's result
+            phases[phase].update(
+                stats.value(prefix, opening[choice], z[choice], edax_z, name="edax_z_")
+            )
+            phases[phase].update(
+                stats.value(
+                    prefix, opening[choice], value[choice], edax_z, name="edax_q_"
+                )
+            )
     # the moves sampled rather than played greedily: with a move temperature, all of them
     sample_until = 60 if args.move_temperature is not None else args.sampling_moves
     sampled = (action >= 0) & (moves["ply"] < sample_until)
@@ -1061,6 +1169,11 @@ def run(args: argparse.Namespace) -> None:
         features = reference_features(
             *load_checkpoint(args.reference_ckpt, args.reference_net)
         )
+    labels = (
+        LabelCache(args.label_dir, args.label_level, args.label_workers)
+        if args.label_stored > 0
+        else None
+    )
     for name, flags, config in configs:
         print(f"== {model} / {name}: {shlex.join(flags)}", flush=True)
         network, params = load_checkpoint(args.ckpt, net, config.inference_dtype)
@@ -1092,7 +1205,7 @@ def run(args: argparse.Namespace) -> None:
         prior = masked_softmax(logits, moves["legal"].astype(bool))
         sample = args.games_per_opening or max(2, args.games // args.openings // 2)
         selfplay, selfplay_stats = selfplay_metrics(
-            moves, z, prior, config, timing, sample, features
+            moves, z, prior, config, timing, sample, features, labels, args.label_stored
         )
         stats.inputs.update(selfplay_stats.inputs)
         result = {
@@ -1123,6 +1236,12 @@ def run(args: argparse.Namespace) -> None:
                 },
                 "seed": args.seed,
                 "phases": PHASES,
+                "edax_labels": {
+                    "per_phase": args.label_stored,
+                    "level": args.label_level,
+                }
+                if args.label_stored > 0
+                else None,
             },
             "created": datetime.datetime.now()
             .astimezone()
@@ -1265,6 +1384,29 @@ def main() -> None:
     run_parser.add_argument(
         "--reference-net", default=None, help="its network, as train.py's --net"
     )
+    run_parser.add_argument(
+        "--label-stored",
+        type=int,
+        default=0,
+        metavar="N",
+        help="score up to N stored positions of each phase with Edax (edax_* metrics: the "
+        "targets' regret where self-play went, the value targets against Edax's result); "
+        "labels are kept in --label-dir for every run",
+    )
+    run_parser.add_argument(
+        "--label-level",
+        type=int,
+        default=8,
+        help="with --label-stored, Edax's level: at 8 a position takes about 17 ms of a core, "
+        "and its best move loses about 0.5 discs by level 24's scores",
+    )
+    run_parser.add_argument(
+        "--label-workers",
+        type=int,
+        default=8,
+        help="with --label-stored, Edax processes",
+    )
+    run_parser.add_argument("--label-dir", default=str(LABELS_DIR))
     run_parser.add_argument(
         "--solve-threads", type=int, default=None, help="exact solver's threads"
     )
