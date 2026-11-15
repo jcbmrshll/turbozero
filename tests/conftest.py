@@ -2,9 +2,9 @@
 
 import os
 
-# tests always run on CPU, never the GPU
+# tests always run on the CPU, never the GPU
 os.environ["JAX_PLATFORMS"] = "cpu"
-# pytest-xdist workers already use one core each, so each runs XLA single-threaded
+# pytest-xdist gives each worker a core, so each runs XLA single-threaded
 if "PYTEST_XDIST_WORKER" in os.environ:
     os.environ["XLA_FLAGS"] = (
         os.environ.get("XLA_FLAGS", "") + " --xla_cpu_multi_thread_eigen=false"
@@ -12,8 +12,8 @@ if "PYTEST_XDIST_WORKER" in os.environ:
 
 import jax
 
-# compiling dominates the suite's runtime, so compiled programs persist across runs (and
-# worktrees); JAX_COMPILATION_CACHE_DIR overrides where
+# compiling dominates the suite's runtime, so compiled programs persist across
+# runs and worktrees; JAX_COMPILATION_CACHE_DIR overrides where
 if jax.config.jax_compilation_cache_dir is None:
     jax.config.update(
         "jax_compilation_cache_dir",

@@ -25,11 +25,9 @@ packages = ["turbozero"]
 
 [tool.pyright]
 include = ["turbozero", "tests"]
+# for editors that run pyright outside `uv run`
 venvPath = "."
 venv = ".venv"
-
-[tool.ruff]
-# `ruff check` uses ruff's default rule set (no select/ignore); `ruff format` uses its defaults (line length 88)
 
 [dependency-groups]
 dev = [
@@ -42,7 +40,6 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# summarise xfails/xpasses/skips at the end of the run; run the tests in parallel, on up
-# to 8 processes (`-n0` runs them in this one, e.g. to debug with --pdb)
+# -ra summarises xfails and skips; -n0 runs in one process, e.g. for --pdb
 addopts = "-ra -n auto --maxprocesses 8 --dist worksteal"
 xfail_strict = true
