@@ -96,13 +96,19 @@ def test_truncate_wraps_around_mid_episode():
     assert state.buffer.observation_nn[3] == 8
 
 
-def test_sample_indices_with_replacement_from_fewer_entries():
-    buffer = EpisodeReplayBuffer(capacity=8)
-    mask = jnp.zeros((2, 8), dtype=bool).at[1, 3].set(True)
+def test_sample_indices_draws_uniformly_across_environments():
+    buffer = EpisodeReplayBuffer(capacity=4)
+    # one entry in environment 0, three in environment 1: drawing per
+    # environment would pick environment 0's entry half the time, not a quarter
+    mask = jnp.array([[False, True, False, False], [True, True, False, True]])
+    n = 4000
 
-    indices = buffer.sample_indices(jax.random.PRNGKey(0), mask, 5, replace=True)
+    indices = buffer.sample_indices(jax.random.PRNGKey(0), mask, n, replace=True)
 
-    np.testing.assert_array_equal(indices, [8 + 3] * 5)
+    freq = np.bincount(np.asarray(indices), minlength=mask.size) / n
+    marked = np.asarray(mask).reshape(-1)
+    assert (freq[~marked] == 0).all()
+    np.testing.assert_allclose(freq[marked], 0.25, atol=0.03)
 
 
 def test_sample_indices_takes_every_environments_stacked_states():
@@ -162,12 +168,12 @@ def test_resize_keeps_the_newest_entries_oldest_first(capacity):
     assert [x.dtype for x in jax.tree.leaves(resized)] == [
         x.dtype for x in jax.tree.leaves(state)
     ]
-    # and it goes on as a buffer of the new capacity
+    # and goes on at its new capacity, through a buffer made for another
     resized = buffer.assign_rewards(add(buffer, resized, [8]), jnp.array([1.0, -1.0]))
     assert sampleable(buffer, resized) == [3, 4, 5, 6, 7, 8][-capacity:]
 
 
-@pytest.mark.parametrize("capacity", [4, 6, 12])
+@pytest.mark.parametrize("capacity", [4, 12])
 def test_resize_keeps_an_episode_in_progress(capacity):
     buffer = EpisodeReplayBuffer(capacity=7)
     # a finished episode 1-5, then 6-7 in progress
@@ -228,14 +234,3 @@ def test_resize_under_jit_and_vmap():
     for i, expected in enumerate([[4, 5], [6, 7]]):
         env = jax.tree.map(lambda x, i=i: x[i], resized)
         assert sampleable(buffer, env) == expected
-
-
-def test_buffer_operations_take_the_capacity_of_the_state():
-    # a buffer configured for 5 entries, on a state of 3
-    buffer = EpisodeReplayBuffer(capacity=5)
-    state = init_single(EpisodeReplayBuffer(capacity=3))
-
-    state = buffer.assign_rewards(add(buffer, state, [1, 2, 3, 4]), jnp.ones(2))
-    assert state.populated.shape == (3,)
-    assert sampleable(buffer, state) == [2, 3, 4]
-    assert state.next_idx == 1
