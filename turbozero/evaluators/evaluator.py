@@ -2,7 +2,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import jax
-import jax.numpy as jnp
 from jax.typing import ArrayLike
 
 from turbozero.pytree import where_tree
@@ -44,13 +43,6 @@ class Evaluator:
         """Initializes the internal state of the Evaluator."""
         raise NotImplementedError()
 
-    def init_batched(self, batch_size: int, *args, **kwargs) -> Any:
-        """Initializes the internal state of the Evaluator across a batch dimension."""
-        tree = self.init(*args, **kwargs)
-        return jax.tree.map(
-            lambda x: jnp.broadcast_to(x, (batch_size,) + x.shape), tree
-        )
-
     def reset(self, state: Any) -> Any:
         """Resets the internal state of the Evaluator."""
         raise NotImplementedError()
@@ -76,39 +68,14 @@ class Evaluator:
     # A search can also run a cycle at a time, as self-play runs it (see
     # `core.training.train.Trainer.collect_steps`): environments at different points of their
     # searches then make their network evaluations together, a cycle at a time. A move's search is
-    # `start_search`, then `search_cycle` until `search_done` and its move is played (self-play
+    # `start_search`, then `search_cycles()` of `search_cycle` until its move is played (self-play
     # checks for those every few cycles, and a search done in between goes on), then
     # `search_output`, all with the move's key. An evaluator that doesn't search does all of it in
     # `search_output`.
 
     def search_cycles(self) -> int:
-        """The most cycles a move's search takes: self-play's unit of compute."""
+        """The cycles a move's search takes: self-play's unit of compute."""
         return 1
-
-    def search_done(self, state: Any, cycles: jax.Array) -> jax.Array:  # pylint: disable=unused-argument
-        """Whether the search in `state`, which has run `cycles` cycles, is done.
-
-        Args:
-            state: The internal state of the Evaluator.
-            cycles: the cycles the search has run so far
-
-        Returns:
-            jax.Array: whether to stop searching and play a move
-        """
-        return jnp.array(True)
-
-    def trains_on(self, state: Any) -> jax.Array:  # pylint: disable=unused-argument
-        """Whether the search in `state` makes a training position (self-play stores its
-        position in the replay buffer): always, unless an evaluator says otherwise (e.g. MCTS's
-        fast searches, see `PlayoutCap`).
-
-        Args:
-            state: The internal state of the Evaluator, during or after a search.
-
-        Returns:
-            jax.Array: whether to store the position searched
-        """
-        return jnp.array(True)
 
     def start_search(self, key: jax.Array, state: Any, active: ArrayLike = True) -> Any:  # pylint: disable=unused-argument
         """What a search does once before its cycles, rather than in each (under vmap, all of a
@@ -139,7 +106,7 @@ class Evaluator:
         Args:
             key: rng, the move's (as `evaluate`'s)
             state: The internal state of the Evaluator.
-            cycle: the cycles the search has run so far, possibly past `search_done`
+            cycle: the cycles the search has run so far, possibly past `search_cycles()`
             env_state: the environment state to evaluate
             root_metadata: its metadata
             params: nn parameters
@@ -159,7 +126,7 @@ class Evaluator:
         params: Any,
         env_step_fn: EnvStepFn,
     ) -> EvalOutput:
-        """The output of a search that `search_done`, as `evaluate`'s.
+        """The output of a search after its `search_cycles()`, as `evaluate`'s.
 
         Args:
             key: rng, the move's (as `evaluate`'s)
@@ -225,18 +192,6 @@ class Evaluator:
             jax.Array: The value estimate.
         """
         raise NotImplementedError()
-
-    def search_record(self, state: Any) -> Any:  # pylint: disable=unused-argument
-        """What the evaluation that left `state` explored, for the monitor to show (see
-        `core.evaluators.mcts.state.SearchRecord`), or None for an evaluator that doesn't search.
-
-        Args:
-            state: The internal state of the Evaluator, as an evaluation left it (before `step`).
-
-        Returns:
-            pytree: The record, or None.
-        """
-        return None
 
     def get_config(self) -> dict:
         """Returns the configuration of the Evaluator. Used for logging."""
