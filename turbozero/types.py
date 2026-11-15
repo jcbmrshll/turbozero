@@ -6,8 +6,6 @@ import equinox as eqx
 import jax
 import optax
 
-from turbozero.memory.replay_memory import BaseExperience
-
 
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
@@ -51,9 +49,5 @@ EnvStepFn = Callable[[Any, jax.Array], tuple[Any, StepMetadata]]
 EnvInitFn = Callable[[jax.Array], tuple[Any, StepMetadata]]
 Params = Any
 EvalFn = Callable[[Any, Params, jax.Array], tuple[jax.Array, jax.Array]]
-LossFn = Callable[
-    [Any, eqx.nn.State | None, BaseExperience],
-    tuple[jax.Array, tuple[dict, eqx.nn.State | None]],
-]
 ExtractModelParamsFn = Callable[[TrainState], Any]
 StateToNNInputFn = Callable[[Any], jax.Array]
