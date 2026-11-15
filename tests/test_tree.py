@@ -32,9 +32,9 @@ def assert_trees_equal(a, b):
         np.testing.assert_array_equal(x, y)
 
 
-def test_add_node_sets_parent_edge_and_data():
+def test_set_child_adds_a_missing_child():
     tree = empty_tree().set_root(node(1.0))
-    tree = tree.add_node(parent_index=0, edge_index=2, data=node(5.0))
+    tree = tree.set_child(parent_index=0, edge_index=2, data=node(5.0))
 
     assert tree.next_free_idx == 2
     assert tree.parents[1] == 0
@@ -44,32 +44,14 @@ def test_add_node_sets_parent_edge_and_data():
     assert_trees_equal(tree.data_at(1), node(5.0))
 
 
-def test_add_node_is_a_noop_when_full():
-    tree = empty_tree(max_nodes=3).set_root(node(1.0))
-    tree = tree.add_node(0, 0, node(2.0))
-    full = tree.add_node(0, 1, node(3.0))
-    assert full.next_free_idx == full.capacity
-
-    after = full.add_node(0, 2, node(4.0))
-
-    assert after.edge_map[0, 2] == Tree.NULL_INDEX
-    assert_trees_equal(after, full)
-
-
-def test_set_child_adds_a_missing_child_like_add_node():
-    tree = empty_tree().set_root(node(1.0))
-
-    assert_trees_equal(tree.set_child(0, 2, node(5.0)), tree.add_node(0, 2, node(5.0)))
-
-
 def test_set_child_updates_an_existing_child_in_place():
-    tree = empty_tree().set_root(node(1.0)).add_node(0, 2, node(5.0))
+    tree = empty_tree().set_root(node(1.0)).set_child(0, 2, node(5.0))
 
     assert_trees_equal(tree.set_child(0, 2, node(7.0)), tree.update_node(1, node(7.0)))
 
 
 def test_set_child_is_a_noop_for_a_missing_child_of_a_full_tree():
-    tree = empty_tree(max_nodes=2).set_root(node(1.0)).add_node(0, 0, node(2.0))
+    tree = empty_tree(max_nodes=2).set_root(node(1.0)).set_child(0, 0, node(2.0))
     assert tree.next_free_idx == tree.capacity
 
     assert_trees_equal(tree.set_child(0, 1, node(9.0)), tree)
@@ -80,9 +62,9 @@ def test_set_child_is_a_noop_for_a_missing_child_of_a_full_tree():
 def test_set_child_under_vmap_matches_each_tree_alone():
     # one tree has the child already, one doesn't, one is full
     trees = [
-        empty_tree(max_nodes=2).set_root(node(1.0)).add_node(0, 1, node(2.0)),
+        empty_tree(max_nodes=2).set_root(node(1.0)).set_child(0, 1, node(2.0)),
         empty_tree(max_nodes=2).set_root(node(1.0)),
-        empty_tree(max_nodes=2).set_root(node(1.0)).add_node(0, 0, node(2.0)),
+        empty_tree(max_nodes=2).set_root(node(1.0)).set_child(0, 0, node(2.0)),
     ]
     batch = jax.tree.map(lambda *xs: jnp.stack(xs), *trees)
 
@@ -99,7 +81,7 @@ def test_set_child_under_vmap_matches_each_tree_alone():
     [
         empty_tree(),
         empty_tree().set_root(node(1.0)),
-        empty_tree().set_root(node(1.0)).add_node(0, 2, node(5.0)),
+        empty_tree().set_root(node(1.0)).set_child(0, 2, node(5.0)),
     ],
     ids=["empty", "missing child", "existing child"],
 )
@@ -139,8 +121,8 @@ def test_get_subtree_under_vmap_steps_resets_or_keeps_each_tree():
 def full_tree():
     """A full tree: the root with children on edges 0 and 1, and a grandchild under edge 0's."""
     tree = empty_tree(max_nodes=4).set_root(node(1.0))
-    tree = tree.add_node(0, 0, node(2.0)).add_node(1, 0, node(3.0))
-    return tree.add_node(0, 1, node(4.0))
+    tree = tree.set_child(0, 0, node(2.0)).set_child(1, 0, node(3.0))
+    return tree.set_child(0, 1, node(4.0))
 
 
 def test_set_child_evicts_a_leaf_for_a_missing_child_of_a_full_tree():
@@ -163,7 +145,7 @@ def test_set_child_evicts_a_leaf_for_a_missing_child_of_a_full_tree():
 
 def test_set_child_ignores_evict_unless_the_tree_is_full():
     # room left: the child goes in the next free slot, as without `evict`
-    tree = empty_tree().set_root(node(1.0)).add_node(0, 0, node(2.0))
+    tree = empty_tree().set_root(node(1.0)).set_child(0, 0, node(2.0))
     assert_trees_equal(
         tree.set_child(0, 1, node(9.0), evict=1), tree.set_child(0, 1, node(9.0))
     )
@@ -184,28 +166,21 @@ def test_leaves():
     np.testing.assert_array_equal(tree.leaves(), [True, False, False, False])
 
 
-def test_get_child_data_fills_missing_children_with_null_value():
+def test_get_child_data_fills_missing_children_with_zeros():
     tree = empty_tree().set_root(node(1.0))
-    tree = tree.add_node(0, 0, node(2.0))
-    tree = tree.add_node(0, 2, node(3.0))
+    tree = tree.set_child(0, 0, node(2.0))
+    tree = tree.set_child(0, 2, node(3.0))
 
+    np.testing.assert_array_equal(tree.get_child_data("value", 0), [2.0, 0.0, 3.0])
     np.testing.assert_array_equal(
-        tree.get_child_data("value", 0), [2.0, Tree.NULL_VALUE, 3.0]
-    )
-    np.testing.assert_array_equal(
-        tree.get_child_data("value", 0, null_value=-7.0), [2.0, -7.0, 3.0]
-    )
-    np.testing.assert_array_equal(
-        tree.get_child_data("vec", 0), [[2.0, -2.0], [Tree.NULL_VALUE] * 2, [3.0, -3.0]]
+        tree.get_child_data("vec", 0), [[2.0, -2.0], [0.0] * 2, [3.0, -3.0]]
     )
     # a leaf has no children at all
-    np.testing.assert_array_equal(
-        tree.get_child_data("value", 1), [Tree.NULL_VALUE] * 3
-    )
+    np.testing.assert_array_equal(tree.get_child_data("value", 1), [0.0] * 3)
 
 
 def test_reset_empties_the_tree():
-    tree = empty_tree().set_root(node(1.0)).add_node(0, 1, node(2.0))
+    tree = empty_tree().set_root(node(1.0)).set_child(0, 1, node(2.0))
 
     assert_trees_equal(tree.reset(), empty_tree())
 
@@ -301,7 +276,7 @@ def test_get_subtree_matches_reference(get_subtree, seed):
 
 def test_get_subtree_of_unexpanded_child_is_empty(get_subtree):
     tree = empty_tree(MAX_NODES, BRANCHING).set_root(node(1.0))
-    tree = tree.add_node(0, 0, node(2.0)).add_node(1, 1, node(3.0))
+    tree = tree.set_child(0, 0, node(2.0)).set_child(1, 1, node(3.0))
 
     assert_trees_equal(get_subtree(tree, 2), empty_tree(MAX_NODES, BRANCHING))
 
@@ -360,9 +335,9 @@ def test_get_subtree_of_unexpanded_child_of_full_tree_is_empty(get_subtree):
     max_nodes = 16
     # root has children on edges 0 and 1 only; edge 2 is never expanded
     tree = empty_tree(max_nodes, BRANCHING).set_root(node(1.0))
-    tree = tree.add_node(0, 0, node(2.0)).add_node(0, 1, node(3.0))
+    tree = tree.set_child(0, 0, node(2.0)).set_child(0, 1, node(3.0))
     for idx in range(3, max_nodes):
-        tree = tree.add_node(idx - 1, 0, node(float(idx + 1)))
+        tree = tree.set_child(idx - 1, 0, node(float(idx + 1)))
     assert tree.next_free_idx == tree.capacity
 
     assert_trees_equal(get_subtree(tree, 2), empty_tree(max_nodes, BRANCHING))
@@ -396,7 +371,7 @@ def test_get_subtree_reused_over_several_steps(get_subtree, seed):
             num_nodes, min(max_nodes, num_nodes + rng.randint(0, max_nodes // 2))
         ):
             p, e, v = grow(rng, parents, edge_map, values, idx)
-            tree = tree.add_node(p, e, node(v))
+            tree = tree.set_child(p, e, node(v))
             num_nodes = idx + 1
         assert_trees_equal(tree, build_tree(num_nodes, parents, edge_map, values))
 

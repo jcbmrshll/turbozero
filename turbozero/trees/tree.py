@@ -21,7 +21,6 @@ class Tree[NodeType]:
     data: NodeType  # structured data with leaves of shape (N, ...)
 
     NULL_INDEX: ClassVar[int] = -1
-    NULL_VALUE: ClassVar[int] = 0
     ROOT_INDEX: ClassVar[int] = 0
 
     @property
@@ -67,67 +66,26 @@ class Tree[NodeType]:
         """
         return self.edge_map[parent_index, edge_index] != self.NULL_INDEX
 
-    def get_child_data(self, x: str, index: ArrayLike, null_value=None) -> jax.Array:
-        """Returns a specified data field for all children of a node.
+    def get_child_data(self, x: str, index: ArrayLike) -> jax.Array:
+        """Returns a specified data field for all children of a node, 0 for children that do not
+        exist.
 
         Args:
             x: the data field to extract from child nodes
             index: the index of the parent node
-            null_value: the value to use for children that do not exist
 
         Returns:
             jax.Array: the extracted data field for all children of the parent node
         """
         assert hasattr(self.data, x), f"field {x} not found in node data."
 
-        if null_value is None:
-            null_value = self.NULL_VALUE
         mapping = self.edge_map[index]
         child_data = getattr(self.data, x)[mapping]
 
         return jnp.where(
             (mapping == self.NULL_INDEX).reshape((-1,) + (1,) * (child_data.ndim - 1)),
-            null_value,
+            0,
             child_data,
-        )
-
-    def add_node(
-        self, parent_index: ArrayLike, edge_index: ArrayLike, data: NodeType
-    ) -> Self:
-        """Adds a new node to the tree at the next free index, if the tree has capacity left.
-
-        Is a no-op if the tree is full.
-
-        Args:
-            parent_index: the index of the parent node to attach the new node to.
-            edge_index: the index of the parent edge to attach the new node to.
-            data: the data to store at the new node.
-
-        Returns:
-            Self: tree with the new node added.
-        """
-        # check types
-        self.check_data_type(data)
-        # if the tree is full, tree.next_free_idx will be out of bounds
-        in_bounds = self.next_free_idx < self.capacity
-        # updating data at this index will be a no-op
-        # e.g. tree.parents.at[tree.next_free_idx].set(parent_index)
-        # will do nothing
-        # BUT
-        # we don't want to modify edge_map to point to this index
-        # so we set it to NULL_INDEX instead when the tree is full
-        edge_map_index = jnp.where(in_bounds, self.next_free_idx, self.NULL_INDEX)
-        # ...
-        return replace(
-            self,
-            next_free_idx=jnp.where(
-                in_bounds, self.next_free_idx + 1, self.next_free_idx
-            ),
-            parents=self.parents.at[self.next_free_idx].set(parent_index),
-            edge_map=self.edge_map.at[parent_index, edge_index].set(edge_map_index),
-            data=jax.tree.map(
-                lambda x, y: x.at[self.next_free_idx].set(y), self.data, data
-            ),
         )
 
     def set_child(
@@ -139,11 +97,11 @@ class Tree[NodeType]:
         write: ArrayLike = True,
     ) -> Self:
         """Stores `data` at the child of a node along an edge: updates the child if the edge exists,
-        otherwise adds it as a new node, like `add_node`. If the tree is full, the new node takes the
+        otherwise adds it as a new node at the next free index. If the tree is full, the new node takes the
         slot of the leaf `evict`, which is removed from the tree; a no-op if `evict` is NULL_INDEX.
         A no-op too if not `write`.
 
-        Equivalent to a `lax.cond` between `update_node` and `add_node`, but writes a single node either
+        Equivalent to a `lax.cond` between updating and adding a node, but writes a single node either
         way. Under vmap, where whether the edge exists differs across trees, such a cond becomes a
         select between two whole copies of every tree.
 
