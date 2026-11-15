@@ -107,6 +107,8 @@ SELFPLAY_ARGS = (
 DECIDED = 0.9
 # moves' compute per self-play call between reads of the move log
 CHUNK_STEPS = 4
+# stored positions per count of empty squares that pair distances are measured among, at most
+PAIR_SAMPLE = 384
 
 
 def parse_config(text: str, net: str) -> tuple[str, list[str], argparse.Namespace]:
@@ -466,6 +468,63 @@ def symmetry_keys(observations: np.ndarray) -> np.ndarray:
     return keys
 
 
+def symmetric_bitboards(observations: np.ndarray) -> np.ndarray:
+    """Each position's 8 symmetries as bitboards: (8, n, 2), the player to move's discs, then the
+    opponent's."""
+    obs = np.asarray(observations, dtype=bool)
+    out = []
+    for transpose in (False, True):
+        board = np.swapaxes(obs, 1, 2) if transpose else obs
+        for turns in range(4):
+            turned = np.rot90(board, turns, axes=(1, 2)).reshape(len(obs), 64, 2)
+            packed = np.packbits(turned, axis=1, bitorder="little")
+            out.append(np.stack([packed[:, :8, 0], packed[:, :8, 1]], -1).copy())
+    # (8, n, 8 bytes, 2) -> (8, n, 2) uint64
+    return np.stack(out).transpose(0, 1, 3, 2).copy().view("<u8")[..., 0]
+
+
+def pair_distances(
+    observations: np.ndarray,
+    empties: np.ndarray,
+    rng: np.random.Generator,
+    groups: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """How far apart positions are, where nearly all are distinct: each of up to PAIR_SAMPLE
+    positions per count of empty squares (drawn at random), its mean distance to the others drawn
+    with as many empties. The distance is the squares whose contents differ (empty, the player to
+    move's, the opponent's), in the closest of the other's 8 symmetries, which training treats as
+    one position. A mean over pairs, so it doesn't depend on how many positions there are. With
+    `groups` (e.g. each position's opening), only positions of the same group are compared.
+
+    Returns:
+        the rows drawn, and each one's mean distance
+    """
+    rows, means = [], []
+    keys = np.asarray(empties, np.int64)
+    if groups is not None:
+        _, group = np.unique(groups, return_inverse=True)
+        keys = keys * (int(group.max()) + 1) + group
+    for key in np.unique(keys):
+        level = np.flatnonzero(keys == key)
+        if len(level) < 2:
+            continue
+        if len(level) > PAIR_SAMPLE:
+            level = np.sort(rng.choice(level, PAIR_SAMPLE, replace=False))
+        boards = symmetric_bitboards(observations[level])
+        me, opp = boards[0, :, 0], boards[0, :, 1]
+        # (8, m, m): row i against each symmetry of row j
+        differ = (me[None, :, None] ^ boards[:, None, :, 0]) | (
+            opp[None, :, None] ^ boards[:, None, :, 1]
+        )
+        distance = np.bitwise_count(differ).min(0).astype(float)
+        np.fill_diagonal(distance, 0.0)
+        rows.append(level)
+        means.append(distance.sum(1) / (len(level) - 1))
+    if not rows:
+        return np.zeros(0, int), np.zeros(0)
+    return np.concatenate(rows), np.concatenate(means)
+
+
 def bitboards(observations: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """The player to move's and the opponent's discs, as bitboards."""
     flat = np.asarray(observations, dtype=bool).reshape(len(observations), 64, 2)
@@ -731,8 +790,13 @@ def selfplay_metrics(
         _, inverse, counts = np.unique(
             keys[train], return_inverse=True, return_counts=True
         )
+        stored = int(train.sum())
         per_row = {
             "duplicate_rate": 1 - 1 / counts[inverse],
+            # the other stored positions that are this one: its mean is the chance that two
+            # stored positions drawn at random are the same, whatever their number (Simpson's
+            # index; its inverse, the effective number of distinct positions)
+            "collision": (counts[inverse] - 1) / max(stored - 1, 1),
             "target_entropy": entropy(policy[train]),
             "prior_entropy": entropy(prior[train]),
             "kl_target_prior": kl(policy[train], prior[train]),
@@ -740,9 +804,22 @@ def selfplay_metrics(
             "decided_share": np.abs(value[train]) > DECIDED,
         }
         both = train & known
+        drawn, distance = pair_distances(
+            obs[train], empties[train], np.random.default_rng(args.seed)
+        )
+        same, same_distance = pair_distances(
+            obs[train], empties[train], np.random.default_rng(args.seed), ids
+        )
         phases[phase] = {
-            "training_positions": int(train.sum()),
+            "training_positions": stored,
             **{k: stats.mean(f"{prefix}.{k}", ids, v) for k, v in per_row.items()},
+            "pair_distance": stats.mean(
+                f"{prefix}.pair_distance", ids[drawn], distance
+            ),
+            # the same among the stored positions of one opening: how far its games spread
+            "pair_distance_same_opening": stats.mean(
+                f"{prefix}.pair_distance_same_opening", ids[same], same_distance
+            ),
             **stats.value(prefix, opening[both], value[both], z[both], name="stored_"),
         }
     sampled = (action >= 0) & (moves["ply"] < args.sampling_moves)
