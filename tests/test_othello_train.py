@@ -624,6 +624,26 @@ def test_policy_target_reaches_self_play(monkeypatch, choice, target):
         assert evaluator.policy_target.selector is evaluator.action_selector
 
 
+def test_sample_decided_reaches_the_trainer(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, "--sample-decided", "0.5:0.25")
+    assert built.value.kwargs["sample_weighting"] == train.SearchValueWeighting(
+        0.5, 0.25
+    )
+
+
+def test_training_samples_uniformly_by_default(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch)
+    assert built.value.kwargs["sample_weighting"] is None
+
+
+@pytest.mark.parametrize("setting", ["0.5", "0.5:0.25:1", "1.0:0.25", "0.5:2"])
+def test_bad_sample_decided_settings_are_refused(monkeypatch, setting):
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, "--sample-decided", setting)
+
+
 def test_store_until_offline_reaches_self_play_exploration(monkeypatch):
     with pytest.raises(BuiltTrainer) as built:
         run_main(monkeypatch, "--sampling-moves", "50", "--store-until-offline", "30")

@@ -91,6 +91,41 @@ def buffer_capacity(state: ReplayBufferState) -> int:
     return state.populated.shape[-1]
 
 
+@dataclass(frozen=True)
+class SearchValueWeighting:
+    """Samples decided positions less often: an entry whose stored search value is decided,
+    `|search_value| > decided_value`, gets sampling weight `decided_weight`, the rest weight 1.
+
+    Attributes:
+        decided_value: |search value| above which a position counts as decided, in [0, 1)
+        decided_weight: sampling weight of a decided position, relative to a close one's, in [0, 1]
+    """
+
+    decided_value: float
+    decided_weight: float
+
+    def __post_init__(self):
+        if not 0 <= self.decided_value < 1:
+            raise ValueError(
+                f"decided_value must be in [0, 1), got {self.decided_value}"
+            )
+        if not 0 <= self.decided_weight <= 1:
+            raise ValueError(
+                f"decided_weight must be in [0, 1], got {self.decided_weight}"
+            )
+
+    def weights(self, buffer: BaseExperience, mask: jax.Array) -> jax.Array:
+        """Sampling weights of the entries `mask` marks (0 elsewhere), the shape of `mask`."""
+        decided = jnp.abs(buffer.search_value) > self.decided_value
+        return jnp.where(mask, jnp.where(decided, self.decided_weight, 1.0), 0.0)
+
+    def get_config(self) -> dict:
+        return {
+            "decided_value": self.decided_value,
+            "decided_weight": self.decided_weight,
+        }
+
+
 class EpisodeReplayBuffer:
     """Replay buffer, stores trajectories from episodes for training.
 
@@ -371,14 +406,16 @@ class EpisodeReplayBuffer:
     def sample_indices(
         self, key: jax.Array, mask: jax.Array, sample_size: int, replace: bool = False
     ) -> jax.Array:
-        """Samples entries uniformly (by default without replacement) from those marked in `mask`.
+        """Samples entries (by default without replacement) from those marked in `mask`, uniformly,
+        or in proportion to `mask` when it holds weights (e.g. from `SearchValueWeighting`).
 
         Compatible with `jax.jit`. Without replacement, `mask` must mark at least `sample_size` entries,
         else unmarked ones fill the rest of the sample; use `check_can_sample` to check.
 
         Args:
             key: rng
-            mask: mask of entries that can be sampled (see `sample_mask`), any shape
+            mask: mask of entries that can be sampled (see `sample_mask`), or their nonnegative
+                sampling weights, any shape
             sample_size: number of entries to sample
             replace: sample with replacement instead (default: False)
 

@@ -36,6 +36,7 @@ from core.memory.move_log import ENDED, GOES_ON, read_meta, read_moves, unpack
 from core.memory.replay_memory import (
     BaseExperience,
     EpisodeReplayBuffer,
+    SearchValueWeighting,
     buffer_capacity,
 )
 from core.monitoring import DECLARED
@@ -494,6 +495,39 @@ def test_a_schedule_needs_a_test_evaluator(env, tmp_path):
 def test_tree_positions_need_mcts_self_play(env, tmp_path):
     with pytest.raises(ValueError, match="needs MCTS"):
         make_trainer(env, tmp_path, tree_positions=TREE_POSITIONS)
+
+
+def test_training_samples_by_the_weighting_of_search_values(env, tmp_path):
+    weighting = SearchValueWeighting(decided_value=0.5, decided_weight=0.25)
+    trainer = make_trainer(env, tmp_path, sample_weighting=weighting)
+    template = BaseExperience(
+        reward=jnp.zeros((2,)),
+        policy_weights=jnp.zeros((env.num_actions,)),
+        policy_mask=jnp.ones((env.num_actions,), dtype=bool),
+        observation_nn=jnp.zeros((2,)),
+        cur_player_id=jnp.zeros((), dtype=jnp.int32),
+        search_value=jnp.zeros(()),
+    )
+    state = trainer.memory_buffer.init(1, template)
+    state = replace(
+        state,
+        populated=state.populated.at[0, :3].set(True),
+        has_reward=state.has_reward.at[0, :3].set(True),
+        buffer=replace(
+            state.buffer,
+            search_value=state.buffer.search_value.at[0, :3].set([0.1, -0.8, 0.9]),
+        ),
+    )
+
+    weights = trainer.training_sample_weights(state)
+
+    np.testing.assert_allclose(weights[0, :4], [1, 0.25, 0.25, 0])
+    assert trainer.get_config()["sample_weighting"] == weighting.get_config()
+    uniform = make_trainer(env, tmp_path)
+    np.testing.assert_array_equal(
+        uniform.training_sample_weights(state), uniform.memory_buffer.sample_mask(state)
+    )
+    assert "sample_weighting" not in uniform.get_config()
 
 
 def test_config_lists_the_schedule_and_grad_accum_only_when_used(env, tmp_path):

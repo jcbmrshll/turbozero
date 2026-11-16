@@ -82,7 +82,7 @@ from core.evaluators.mcts.policy_targets import (
     PrunedVisitCounts,
     VisitCounts,
 )
-from core.memory.replay_memory import EpisodeReplayBuffer
+from core.memory.replay_memory import EpisodeReplayBuffer, SearchValueWeighting
 from core.monitoring import DEFAULT_URL, Monitor
 from core.testing.scored_positions import ScoredPositionsTester
 from core.testing.tester import BaseTester
@@ -196,6 +196,17 @@ def playout_cap(text: str) -> PlayoutCap:
             f"{text!r}: the probability is in (0, 1], the fast sims positive"
         )
     return cap
+
+
+def sample_decided(text: str) -> SearchValueWeighting:
+    """Parses --sample-decided, VALUE:WEIGHT, e.g. 0.5:0.25."""
+    try:
+        value, weight = text.split(":")
+        return SearchValueWeighting(float(value), float(weight))
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{text!r}: expected VALUE:WEIGHT, VALUE in [0, 1), WEIGHT in [0, 1], e.g. 0.5:0.25"
+        ) from None
 
 
 def move_temperature(text: str) -> MoveTemperature:
@@ -437,6 +448,15 @@ def make_parser() -> argparse.ArgumentParser:
         "moves of a game, then plays the most-visited move, as AlphaZero (30) and "
         "OLIVAW (20) did. N counts from the standard start, so it includes an XOT "
         "opening's 8 moves. 0 samples none; one past a game's length, every move",
+    )
+    parser.add_argument(
+        "--sample-decided",
+        type=sample_decided,
+        default=None,
+        metavar="VALUE:WEIGHT",
+        help="training samples a stored position whose search value is decided, |value| above "
+        "VALUE (values in [-1, 1]), WEIGHT times as often as a close one, e.g. 0.5:0.25 "
+        "(default: every position equally often)",
     )
     parser.add_argument(
         "--store-until-offline",
@@ -1333,6 +1353,7 @@ def main():
         evaluator=evaluator,
         # stores `capacity` positions for each of the `batch_size` environments
         memory_buffer=EpisodeReplayBuffer(capacity=args.buffer),
+        sample_weighting=args.sample_decided,
         max_episode_steps=80,
         env_step_fn=step_fn,
         env_init_fn=selfplay_init_fn,
@@ -1369,7 +1390,9 @@ def main():
         # every argument but how the run starts (a fork or branch records its parent)
         extra_config={
             "args": {
-                k: v.get_config() if isinstance(v, PlayoutCap | MoveTemperature) else v
+                k: v.get_config()
+                if isinstance(v, PlayoutCap | MoveTemperature | SearchValueWeighting)
+                else v
                 for k, v in vars(args).items()
                 if k
                 not in (

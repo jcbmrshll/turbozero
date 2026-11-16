@@ -8,6 +8,7 @@ import pytest
 from core.memory.replay_memory import (
     BaseExperience,
     EpisodeReplayBuffer,
+    SearchValueWeighting,
     transform_randomly,
 )
 
@@ -143,6 +144,44 @@ def test_sample_indices_with_replacement_from_fewer_entries():
     indices = buffer.sample_indices(jax.random.PRNGKey(0), mask, 5, replace=True)
 
     np.testing.assert_array_equal(indices, [8 + 3] * 5)
+
+
+def test_search_value_weighting_weights_decided_entries_less():
+    weighting = SearchValueWeighting(decided_value=0.5, decided_weight=0.25)
+    values = jnp.array([[0.0, 0.5, -0.6, 0.9], [-0.4, 1.0, 0.2, -1.0]])
+    buffer = replace(experience(0), search_value=values)
+    mask = jnp.ones((2, 4), dtype=bool).at[0, 0].set(False)
+
+    np.testing.assert_allclose(
+        weighting.weights(buffer, mask), [[0, 1, 0.25, 0.25], [1, 0.25, 1, 0.25]]
+    )
+
+
+def test_sample_indices_in_proportion_to_weights():
+    buffer = EpisodeReplayBuffer(capacity=4)
+    weights = jnp.array([[1.0, 0.25, 0.0, 1.0]])
+
+    indices = buffer.sample_indices(jax.random.PRNGKey(0), weights, 20000, replace=True)
+
+    shares = np.bincount(np.asarray(indices), minlength=4) / 20000
+    np.testing.assert_allclose(shares, [1 / 2.25, 0.25 / 2.25, 0, 1 / 2.25], atol=0.01)
+
+
+def test_sample_indices_without_replacement_skips_zero_weights():
+    buffer = EpisodeReplayBuffer(capacity=4)
+    weights = jnp.array([0.5, 0.0, 1.0, 0.25])
+
+    indices = buffer.sample_indices(jax.random.PRNGKey(0), weights, 3)
+
+    assert sorted(np.asarray(indices).tolist()) == [0, 2, 3]
+
+
+@pytest.mark.parametrize(
+    "value, weight", [(-0.1, 0.5), (1.0, 0.5), (0.5, -0.1), (0.5, 1.5)]
+)
+def test_search_value_weighting_refuses_bad_settings(value, weight):
+    with pytest.raises(ValueError):
+        SearchValueWeighting(value, weight)
 
 
 def test_sample_only_returns_finished_populated_entries():

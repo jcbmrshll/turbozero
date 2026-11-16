@@ -38,6 +38,7 @@ from core.memory.replay_memory import (
     DataTransformFn,
     EpisodeReplayBuffer,
     ReplayBufferState,
+    SearchValueWeighting,
     buffer_capacity,
     transform_randomly,
 )
@@ -667,6 +668,7 @@ class Trainer:
         episode_metrics_fn: Callable[[jax.Array], dict[str, jax.Array]] | None = None,
         data_transform_fns: Sequence[DataTransformFn] = (),
         tree_positions: TreePositions | None = None,
+        sample_weighting: SearchValueWeighting | None = None,
         advance_every: int | None = None,
         moves_at_once: int = 32,
         extract_model_params_fn: ExtractModelParamsFn = extract_params,
@@ -770,6 +772,9 @@ class Trainer:
                 (see core.training.tree_positions). They're kept in a replay buffer of their own, and make up
                 a share of each training batch, sampled from those stored in the replay buffer's span of
                 self-play (see `tree_sample_mask`). Needs MCTS self-play evaluators.
+            sample_weighting: (optional) training samples the replay buffer's positions by these
+                weights of their stored search values, e.g. close positions more often than decided
+                ones (see core.memory.replay_memory.SearchValueWeighting). If not provided, uniformly.
             advance_every: (optional) self-play plays the moves whose searches are done every this many
                 cycles (see `collect_steps`). Playing a move is computed for every environment,
                 whether its search is done or not (under vmap, a select), all but moving the
@@ -910,6 +915,7 @@ class Trainer:
             raise ValueError(f"moves_at_once must be positive, got {moves_at_once}")
         self.moves_at_once = moves_at_once
         self.exploration = exploration
+        self.sample_weighting = sample_weighting
         self.resignation = resignation
         if endgame_solve is not None and resignation is not None:
             raise ValueError("endgame_solve doesn't go with resignation")
@@ -1204,6 +1210,11 @@ class Trainer:
             else None,
             "memory_buffer": self.memory_buffer.__class__.__name__,
             "memory_buffer_config": self.memory_buffer.get_config(),
+            **(
+                {"sample_weighting": self.sample_weighting.get_config()}
+                if self.sample_weighting is not None
+                else {}
+            ),
             "tree_positions": self.tree_positions.get_config()
             if self.tree_positions is not None
             else None,
@@ -1994,7 +2005,7 @@ class Trainer:
         if batch_size is None:
             batch_size = self.train_batch_size
         # the buffer doesn't change while training, so find which entries can be sampled once per epoch
-        mask = self.memory_buffer.sample_mask(buffer_state)
+        mask = self.training_sample_weights(buffer_state)
         add_tree_positions = (
             self.tree_position_sampler(
                 tree_buffer_state, tree_mask, num_tree, batch_size
@@ -2140,6 +2151,14 @@ class Trainer:
         age = state.moves[..., None] - state.tree_written_at
         return self.tree_buffer.sample_mask(state.tree_buffer_state) & (age <= moves)
 
+    def training_sample_weights(self, buffer_state: ReplayBufferState) -> jax.Array:
+        """What training samples the replay buffer by: its sample mask, or with `sample_weighting`,
+        the sampling weights of the entries it marks."""
+        mask = self.memory_buffer.sample_mask(buffer_state)
+        if self.sample_weighting is None:
+            return mask
+        return self.sample_weighting.weights(buffer_state.buffer, mask)
+
     def tree_position_sampler(
         self,
         tree_buffer_state: ReplayBufferState,
@@ -2197,7 +2216,7 @@ class Trainer:
 
         In chunks of up to 16 micro-batches: each chunk's samples are gathered by one compiled
         function and their gradients summed by another, so neither holds more than a chunk."""
-        mask = self.memory_buffer.sample_mask(buffer_state)
+        mask = self.training_sample_weights(buffer_state)
         chunk = min(16, num_micro)
         total, micro_sq = None, jnp.zeros((), jnp.float32)
         for start in range(0, num_micro, chunk):
