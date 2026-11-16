@@ -11,6 +11,12 @@ Its cores go to the games it's moving in at the time, split evenly: an `Engine` 
 workers for each search under way. In a synchro match the games move in rounds and each player
 moves in one of the two games a round (see ggs_client.py), so a lone match gets all of them.
 
+With `ponder=1`, the cores no search of ours is using search the trees of the games where the
+opponent is to move (split evenly between them), each on a thread of its own until the game
+changes or one of our searches starts: the opponent's move, when it comes, is played into a tree
+that has already looked at it. A ponder stops at once (`Search.halt`), finishing only the
+batches in flight.
+
 A move's eval goes to the server in discs, for the player moving: a solve's margin, or the
 search's root value turned into discs by `value_discs`.
 """
@@ -249,9 +255,57 @@ class EnginePool:
             self.idle.setdefault(cores, []).append(engine)
 
 
+# a ponder searches in slices of this many seconds, checking its tree's size between them
+PONDER_SLICE = 0.5
+# traversals in a row that end the game after which a ponder stops: its tree has nothing left
+# to evaluate (`cpu_match.ENDED_VISITS`)
+PONDER_STOP_ENDED = 64
+
+
+class _Ponder:
+    """A game's tree searched by an engine on a thread of its own, until `stop` (or the tree has
+    `max_nodes` nodes, or nothing left to evaluate)."""
+
+    def __init__(self, game: "_Game", engine: Any, cores: int, max_nodes: int = 0):
+        self.game = game
+        self.engine = engine
+        self.cores = cores
+        self.max_nodes = max_nodes
+        self.leaves = 0
+        self.stopping = False
+        self.thread = threading.Thread(target=self._run, name="ponder", daemon=True)
+        self.thread.start()
+
+    def _run(self) -> None:
+        search = self.game.player.search
+        while not self.stopping:
+            if self.max_nodes and search.num_nodes() >= self.max_nodes:
+                break
+            leaves = self.engine.search(
+                search, seconds=PONDER_SLICE, stop_ended=PONDER_STOP_ENDED
+            )
+            self.leaves += leaves
+            if leaves == 0:
+                # halted, or the tree's all games' ends
+                break
+
+    def stop(self) -> int:
+        """Stops it, the batches in flight finished. Returns the leaves it evaluated."""
+        self.stopping = True
+        search = self.game.player.search
+        search.halt(True)
+        self.thread.join()
+        search.halt(False)
+        return self.leaves
+
+
 class PlayerBridge:
     """`Bridge` for players like `cpu_match.NetPlayer`, made by `new_player(seed)`, each
-    searching with an engine of `make_engine(cores)` (set as its `evaluate` for each move)."""
+    searching with an engine of `make_engine(cores)` (set as its `evaluate` for each move).
+
+    With `ponder`, the games where the opponent is to move are searched meanwhile (see the
+    module's doc): a thread of its own starts and stops the ponders, so `observe` returns at
+    once, and a `decide` stops them all before it searches."""
 
     def __init__(
         self,
@@ -261,9 +315,12 @@ class PlayerBridge:
         taper: int = 0,
         time_policy: TimePolicy | None = None,
         solve_from: int = 0,
+        ponder: bool = False,
+        ponder_nodes: int = 0,
     ):
         """`solve_from`: the empties from which the player solves the endgame (its `solve`),
-        which the clock is planned to reach."""
+        which the clock is planned to reach; no ponder then, the next move of ours solved.
+        `ponder_nodes`: a ponder stops once its game's tree has this many nodes (0: never)."""
         self.new_player = new_player
         self.solve_from = solve_from
         self.pool = EnginePool(make_engine)
@@ -272,6 +329,80 @@ class PlayerBridge:
         self.time = time_policy or TimePolicy()
         self.players: dict[str, _Game] = {}
         self.seed = 0
+        self.ponders = ponder
+        self.ponder_nodes = ponder_nodes
+        # guards the games, the ponders and what's being decided; held only briefly (a ponder
+        # stops within a batch)
+        self.lock = threading.RLock()
+        # games a decide has under way
+        self.deciding: set[str] = set()
+        # games whose player is at the opponent's turn, told every move: those to ponder
+        self.ready: set[str] = set()
+        self.pondering: dict[str, _Ponder] = {}
+        self.wake = threading.Event()
+        self.closed = False
+        if ponder:
+            self.scheduler = threading.Thread(
+                target=self._schedule_loop, name="ponder-scheduler", daemon=True
+            )
+            self.scheduler.start()
+
+    # -- pondering
+
+    def _schedule_loop(self) -> None:
+        while True:
+            self.wake.wait()
+            self.wake.clear()
+            if self.closed:
+                return
+            with self.lock:
+                self._schedule()
+
+    def _worth_pondering(self, game: "_Game") -> bool:
+        """Not if our next move is solved, or the game's over."""
+        me, opp, _, terminated = game.player.search.position()
+        if terminated:
+            return False
+        # the depth the game plans to solve from, once its first move has seen the clock
+        solve_from = getattr(game.player, "solve_from", None)
+        if solve_from is None:
+            solve_from = self.solve_from
+        empties = 64 - (me | opp).bit_count()
+        return not (solve_from and empties - 1 <= solve_from)
+
+    def _schedule(self) -> None:
+        """Ponders the games ready, the cores split between them, unless we're deciding."""
+        if self.deciding or self.closed:
+            self._stop_all()
+            return
+        # a game pondering now was worth it when it started, its root the same since (and
+        # its tree not to be read while an engine searches it)
+        wanted = sorted(
+            gid
+            for gid in self.ready
+            if gid in self.players
+            and (gid in self.pondering or self._worth_pondering(self.players[gid]))
+        )[: self.cores]
+        share = max(1, self.cores // max(len(wanted), 1))
+        for gid, ponder in list(self.pondering.items()):
+            if gid not in wanted or ponder.cores != share:
+                self._stop(gid)
+        for gid in wanted:
+            if gid not in self.pondering:
+                game = self.players[gid]
+                engine = self.pool.acquire(share)
+                game.player.evaluate = engine
+                self.pondering[gid] = _Ponder(game, engine, share, self.ponder_nodes)
+
+    def _stop(self, game_id: str) -> None:
+        ponder = self.pondering.pop(game_id, None)
+        if ponder is not None:
+            ponder.game.pondered += ponder.stop()
+            self.pool.release(ponder.cores, ponder.engine)
+
+    def _stop_all(self) -> None:
+        for gid in list(self.pondering):
+            self._stop(gid)
 
     def _game(self, view: GameView) -> "_Game":
         """The game's player, told every move so far: its tree kept if what it was told before
@@ -301,51 +432,89 @@ class PlayerBridge:
         return game
 
     def decide(self, view: GameView, cores: int) -> Decision:
+        from cpu_match import move_budget
+
         start = time.perf_counter()
         board = Board.at(view.black, view.white, view.color)
         legal = board.legal()
         if not legal:
             return Decision(PASS, 0.0, time.perf_counter() - start, {"pass": True})
-        game = self._game(view)
+        with self.lock:
+            # every core to our searches: no ponder while one's under way
+            self.deciding.add(view.game_id)
+            self.ready.discard(view.game_id)
+            self._stop_all()
+            game = self._game(view)
+        pondered, game.pondered = game.pondered, 0
+        # the visits below the root when our search starts: what reuse and pondering kept
+        carried = int(game.player.search.visits().sum()) if self.ponders else 0
         cores = max(1, min(cores, self.cores))
         engine = self.pool.acquire(cores)
         try:
             game.player.evaluate = engine
             if view.extended:
-                # on the extension: a fixed share of it a move, which `move_budget` gives
-                # from this much over the moves left, untapered
-                game.player.taper = 0
-                per_move = self.time.extension_move(view)
-                move = game.player.move(
-                    view.color, per_move * (view.empties + 1) / 2 / 0.95
-                )
+                # on the extension: a fixed share of it a move; a solve may take the rest
+                budget = self.time.extension_move(view)
+                left = max(view.extension - self.time.reserve, 0.0)
             else:
-                if self.solve_from:
-                    # planned to the solve, evenly (see `TimePolicy.planned_left`)
-                    game.player.taper = 0
-                    left = self.time.planned_left(view, self.solve_from)
-                else:
-                    game.player.taper = self.taper
-                    left = self.time.seconds_left(view)
-                move = game.player.move(view.color, left)
+                # the clock planned to the solve, evenly (see `TimePolicy.planned_left`), or
+                # with none, tapered to the end; the player's own plan only bounds its solve
+                left = self.time.seconds_left(view)
+                taper = 0 if self.solve_from else self.taper
+                budget = move_budget(
+                    self.time.planned_left(view, self.solve_from), view.empties, taper
+                )
+            move = game.player.move(view.color, left, budget)
         finally:
             self.pool.release(cores, engine)
+            with self.lock:
+                self.deciding.discard(view.game_id)
+            self.wake.set()
         game.told += 1
         game.moves = list(view.moves) + [move]
         value = game.player.last_value
         game.last_eval = eval_discs(value, game.last_eval)
         info = {"cores": cores, "value": value, "desyncs": game.desyncs}
+        if self.ponders:
+            info["pondered"] = pondered
+            info["carried"] = carried
+            with self.lock:
+                if self.players.get(view.game_id) is game:
+                    # the opponent's turn now, in the player's tree: ponder it
+                    self.ready.add(view.game_id)
+            self.wake.set()
         return Decision(move, game.last_eval, time.perf_counter() - start, info)
 
     def observe(self, view: GameView) -> None:
-        """Nothing: the CPU player doesn't ponder (its cores are the opponent's meanwhile, in
-        a contest on one machine; on GGS, the move it's told is played in its tree)."""
+        """With `ponder`, a game where the opponent's to move is told its moves, to be pondered;
+        one where it's our turn isn't pondered any more. Returns at once (a ponder stops within
+        a batch). Without, nothing: the move it's told is played in its tree at our turn (and
+        its cores are the opponent's meanwhile, in a contest on one machine)."""
+        if not self.ponders:
+            return
+        with self.lock:
+            if view.game_id in self.deciding:
+                return
+            self._stop(view.game_id)
+            if view.mine is None or view.komi or view.color == view.mine:
+                self.ready.discard(view.game_id)
+            else:
+                self._game(view)
+                self.ready.add(view.game_id)
+        self.wake.set()
 
     def forget(self, game_id: str) -> None:
-        self.players.pop(game_id, None)
+        with self.lock:
+            self._stop(game_id)
+            self.ready.discard(game_id)
+            self.players.pop(game_id, None)
 
     def close(self) -> None:
-        self.players.clear()
+        with self.lock:
+            self.closed = True
+            self._stop_all()
+            self.players.clear()
+        self.wake.set()
 
 
 class NetBridge(PlayerBridge):
@@ -368,6 +537,8 @@ class NetBridge(PlayerBridge):
         options.pop("engine", None)
         cores = cores or int(options.pop("threads", len(os.sched_getaffinity(0))))
         options.pop("threads", None)
+        ponder = bool(int(options.pop("ponder", 0)))
+        ponder_nodes = int(options.pop("ponder_nodes", 0))
         solving = None
         if "solve" in options:
             solving = Solving(
@@ -393,9 +564,16 @@ class NetBridge(PlayerBridge):
             taper,
             time_policy,
             solve_from=solving.empties if solving else 0,
+            ponder=ponder,
+            ponder_nodes=ponder_nodes,
         )
         # an engine of every core, made now: the first move shouldn't wait for it
         self.pool.release(cores, self.pool.acquire(cores))
+        if ponder and cores > 1:
+            # and two of half of them: two games pondered at once (a synchro match)
+            halves = [self.pool.acquire(cores // 2) for _ in range(2)]
+            for engine in halves:
+                self.pool.release(cores // 2, engine)
 
 
 @dataclass
@@ -407,6 +585,8 @@ class _Game:
     told: int = 0
     last_eval: float = 0.0
     desyncs: int = 0
+    # leaves pondered since our last move
+    pondered: int = 0
 
 
 def make_bridge(options: dict[str, str], cores: int) -> Bridge:

@@ -25,6 +25,7 @@ Logs, transcripts and the server's runtime are left in the run directory it prin
 import argparse
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -81,16 +82,24 @@ class EdaxBot(Process):
     to the server, so it asks for our matches. It sets `open` to 1 itself, too few for a
     synchro match, so each ask raises it first."""
 
-    def __init__(self, port: int, password: str, cores: str, threads: int, log: Path):
+    def __init__(
+        self, port: int, password: str, cores: str, threads: int, log: Path, home: Path
+    ):
+        """`home`: a copy of Edax's binary and data of the run's own. In `-ggs` mode it
+        writes there (data/game.ggf, the book), which the shared engine directory must not
+        see: `engines.build_digest` hashes it, so every match there would be a new build."""
+        home.mkdir(parents=True, exist_ok=True)
+        for part in ("bin", "data"):
+            shutil.copytree(EDAX_DIR / part, home / part, dirs_exist_ok=True)
         command = [
-            "taskset", "-c", cores, str(EDAX_DIR / "bin/edax"), "-ggs",
+            "taskset", "-c", cores, str(home / "bin/edax"), "-ggs",
             "-ggs-host", "127.0.0.1", "-ggs-port", str(port), "-ggs-login", EDAX,
             "-ggs-password", password, "-ggs-open", "on", "-n", str(threads),
             "-book-usage", "off",
             # it plays on the game's clock (any time here does: it takes the server's)
             "-game-time", "1:00",
         ]  # fmt: skip
-        super().__init__(command, log, cwd=EDAX_DIR, stdin=subprocess.PIPE, text=True)
+        super().__init__(command, log, cwd=home, stdin=subprocess.PIPE, text=True)
 
     def ask(self, match: str, rated: bool) -> None:
         stdin = self.popen.stdin
@@ -221,8 +230,9 @@ def main() -> None:
 
         client = start_client()
         edax = EdaxBot(
-            port, passwords[EDAX], args.edax_cores, args.edax_threads, run / "edax.log"
-        )
+            port, passwords[EDAX], args.edax_cores, args.edax_threads, run / "edax.log",
+            run / "edax",
+        )  # fmt: skip
         processes.append(edax)
         time.sleep(5)
 

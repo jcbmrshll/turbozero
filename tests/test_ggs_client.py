@@ -8,6 +8,7 @@ what it received must send the same moves.
 """
 
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -566,8 +567,10 @@ class FakeNetPlayer:
             self.board.black_to_move = not self.board.black_to_move
         self.board.play(move)
 
-    def move(self, color: str, seconds_left: float) -> int:
-        self.calls.append(("move", color, round(seconds_left, 6), self.evaluate))
+    def move(self, color: str, seconds_left: float, budget=None) -> int:
+        self.calls.append(
+            ("move", color, round(seconds_left, 6), self.evaluate, budget)
+        )
         if color != self.board.color:
             self.board.black_to_move = not self.board.black_to_move
         move = self.board.legal()[0]
@@ -655,16 +658,42 @@ def test_bridge_passes_without_searching():
 def test_bridge_time_and_cores():
     bridge, players, engines = fake_bridge(cores=8)
     view = view_after([], seconds=60.0)
+    from cpu_match import move_budget
+
     bridge.decide(view, 3)
-    assert players[0].calls[-1][2] == pytest.approx(bridge.time.seconds_left(view))
-    assert players[0].calls[-1][3] == "engine1x3" and engines == [3]
+    _, _, left, engine, budget = players[0].calls[-1]
+    assert left == pytest.approx(bridge.time.seconds_left(view))
+    assert budget == pytest.approx(move_budget(left, view.empties))
+    assert engine == "engine1x3" and engines == [3]
     bridge.decide(
         view_after([], game_id=".2.0", seconds=0.0, extension=100.0, extended=True), 16
     )
-    seconds = players[-1].calls[-1][2]
-    # move_budget's share of that over the moves left is a tenth of the extension, less reserve
-    assert seconds == pytest.approx((100 - 1.5) * 0.1 * 61 / 2 / 0.95)
+    # on the extension: a tenth of it a move, less reserve; a solve may take the rest
+    _, _, left, _, budget = players[-1].calls[-1]
+    assert budget == pytest.approx((100 - 1.5) * 0.1) and left == pytest.approx(98.5)
     assert engines == [3, 8]
+
+
+def test_bridge_plans_the_clock_to_the_solve():
+    """With the endgame solved from 20 empties, each search's budget is its share of the clock
+    over our moves until then, the solve's reserve kept; the player's own clock is the real
+    one (its solve's bound), not the plan scaled up to the game's end."""
+    from ggs_player import PlayerBridge
+
+    players: list[FakeNetPlayer] = []
+
+    def new_player(seed):
+        players.append(FakeNetPlayer(seed))
+        return players[-1]
+
+    bridge = PlayerBridge(new_player, lambda n: n, 4, solve_from=20)
+    view = view_after([], seconds=60.0)
+    bridge.decide(view, 4)
+    _, _, left, _, budget = players[0].calls[-1]
+    usable = bridge.time.seconds_left(view)
+    assert left == pytest.approx(usable)
+    # 20 of our moves from 60 empties to 20
+    assert budget == pytest.approx(0.95 * (usable - bridge.time.solve_reserve) / 20)
 
 
 def test_observe_sees_every_board():
@@ -702,3 +731,170 @@ def test_clock_planned_to_the_solve():
     assert late.empties == 19 and policy.planned_left(late, 20) == policy.seconds_left(
         late
     )
+
+
+# --- pondering --------------------------------------------------------------------------------
+
+
+class FakeSearch:
+    """What a ponder uses of `cpu_search.Search`: the position, the tree's size, `halt`."""
+
+    def __init__(self, player: "PonderingPlayer"):
+        self.player = player
+        self.halted = False
+        self.nodes = 1
+
+    def position(self):
+        board = self.player.board
+        me, opp = board.discs if board.color == "b" else board.discs[::-1]
+        return me, opp, False, False
+
+    def num_nodes(self) -> int:
+        return self.nodes
+
+    def visits(self):
+        import numpy as np
+
+        return np.array([self.nodes])
+
+    def halt(self, halted: bool = True) -> None:
+        self.halted = halted
+
+
+# the fake searches a `FakeEngine` is searching now
+SEARCHING: list[FakeSearch] = []
+
+
+class PonderingPlayer(FakeNetPlayer):
+    """`FakeNetPlayer` with a `FakeSearch`; its move asserts nothing is pondering."""
+
+    def __init__(self, seed: int):
+        super().__init__(seed)
+        self.search = FakeSearch(self)
+        self.solve_from = None
+
+    def move(self, color: str, seconds_left: float, budget=None) -> int:
+        assert not SEARCHING, "a ponder ran during our search"
+        return super().move(color, seconds_left, budget)
+
+
+class FakeEngine:
+    """An engine whose search runs until halted, a leaf a millisecond."""
+
+    def __init__(self, cores: int):
+        self.cores = cores
+        self.searched: list[FakeSearch] = []
+        self.current: FakeSearch | None = None
+
+    def search(self, search, visits=0, seconds=0.0, stop_ended=0) -> int:
+        self.searched.append(search)
+        self.current = search
+        SEARCHING.append(search)
+        leaves = 0
+        deadline = time.monotonic() + seconds
+        try:
+            while not search.halted and time.monotonic() < deadline:
+                time.sleep(0.001)
+                leaves += 1
+                search.nodes += 1
+        finally:
+            self.current = None
+            SEARCHING.remove(search)
+        return leaves
+
+
+def pondering_bridge(cores=4, solve_from=0, ponder_nodes=0):
+    players: list[PonderingPlayer] = []
+    engines: list[FakeEngine] = []
+
+    def new_player(seed):
+        players.append(PonderingPlayer(seed))
+        return players[-1]
+
+    def make_engine(n):
+        engines.append(FakeEngine(n))
+        return engines[-1]
+
+    from ggs_player import PlayerBridge
+
+    bridge = PlayerBridge(
+        new_player, make_engine, cores, solve_from=solve_from, ponder=True,
+        ponder_nodes=ponder_nodes,
+    )  # fmt: skip
+    return bridge, players, engines
+
+
+def wait_for(condition, seconds=5.0):
+    deadline = time.monotonic() + seconds
+    while not condition():
+        assert time.monotonic() < deadline, "timed out"
+        time.sleep(0.005)
+
+
+def pondering(players, i=0) -> bool:
+    return players[i].search in SEARCHING
+
+
+def test_ponders_the_opponents_turn_until_its_move():
+    bridge, players, engines = pondering_bridge()
+    try:
+        d = bridge.decide(view_after([]), 4)
+        assert d.info["pondered"] == 0
+        wait_for(lambda: pondering(players))
+        assert engines[-1].cores == 4
+        time.sleep(0.05)
+        reply = replay(view_after([]).start, [d.square]).legal()[0]
+        # the opponent's move: our turn, no ponder
+        bridge.observe(view_after([d.square, reply], mine="b"))
+        assert not SEARCHING
+        d2 = bridge.decide(view_after([d.square, reply], mine="b"), 4)
+        assert d2.info["pondered"] > 0
+        # the tree kept: told the opponent's move, never started again
+        assert len(players) == 1
+        assert ("play", "w", reply) in players[0].calls
+        wait_for(lambda: pondering(players))
+    finally:
+        bridge.close()
+    assert not SEARCHING
+
+
+def test_observe_ponders_and_two_games_share_the_cores():
+    bridge, players, engines = pondering_bridge(cores=4)
+    try:
+        # game 1: we're white, black (the opponent) to move
+        bridge.observe(view_after([], game_id=".1.0", mine="w"))
+        wait_for(lambda: pondering(players, 0))
+        assert engines[-1].cores == 4
+        # game 2, our move (no ponder meanwhile: PonderingPlayer.move checks)
+        bridge.observe(view_after([], game_id=".1.1", mine="b"))
+        bridge.decide(view_after([], game_id=".1.1", mine="b"), 4)
+        # both now the opponent's: two cores each
+        wait_for(lambda: pondering(players, 0) and pondering(players, 1))
+        assert sorted(e.cores for e in engines if e.current) == [2, 2]
+        bridge.forget(".1.0")
+        wait_for(lambda: not pondering(players, 0))
+    finally:
+        bridge.close()
+
+
+def test_no_ponder_on_our_turn_in_a_komi_game_or_before_a_solve():
+    bridge, _, _ = pondering_bridge(solve_from=59)
+    try:
+        bridge.observe(view_after([], game_id=".1", mine="b"))
+        bridge.observe(view_after([], game_id=".2", mine="w", komi=True))
+        # the opponent to move at 60 empties, ours at 59 solved
+        bridge.observe(view_after([], game_id=".3", mine="w"))
+        time.sleep(0.05)
+        assert not SEARCHING
+    finally:
+        bridge.close()
+
+
+def test_a_ponder_stops_at_its_tree_size():
+    bridge, players, _ = pondering_bridge(ponder_nodes=20)
+    try:
+        bridge.observe(view_after([], mine="w"))
+        wait_for(lambda: players and players[0].search.nodes >= 20)
+        wait_for(lambda: not SEARCHING)
+    finally:
+        bridge.close()

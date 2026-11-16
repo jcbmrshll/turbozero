@@ -44,8 +44,9 @@ dropped mid-game; one where our client is killed mid-game and started again; and
 (`8k`). It passes if every match finished with a result and the client saw no protocol errors,
 no timeouts of its own and no board that disagreed with its replay of the moves; about 15
 minutes. `--fake-player` plays the first legal move instead of the network: the protocol alone,
-in about 2 minutes. Everything (transcripts, logs, the server's runtime) stays in the directory
-it prints.
+in about 2 minutes. Everything (transcripts, logs, the server's runtime, and the copy of Edax it runs: in GGS
+mode Edax writes its data directory, which `engines.build_digest` hashes) stays in the
+directory it prints.
 
 To run the pieces by hand:
 
@@ -102,7 +103,7 @@ Not done yet: logging in claims a name there, and that's for us to decide.
 |---|---|---|
 | `--host`, `--port` | 127.0.0.1, 5000 | The server (plain port; the public one is `skatgame.net 5000`) |
 | `--login`, `--password-file` | | The login, and a file holding its password (mode 600) |
-| `--player` | | The player: `net=NAME` (a network of the league's store, quantized for the native engine), `device` (`cpu`, the default; `gpu`, the GPU player of `../gpu_play.py`, its own options added), and `clock_match.py`'s `net:` options: `batch` (leaves each worker evaluates at once), `solve=N` (solve exactly from N empties), `solve_exact` (here 1 by default: GGS scores discs, so a won endgame should win by the most), `solve_share`, `taper`, and the search's (`c_init`, `virtual_loss`, ...) |
+| `--player` | | The player: `net=NAME` (a network of the league's store, quantized for the native engine), `device` (`cpu`, the default; `gpu`, the GPU player of `../gpu_play.py`, its own options added), and `clock_match.py`'s `net:` options: `batch` (leaves each worker evaluates at once), `solve=N` (solve exactly from N empties), `solve_exact` (here 1 by default: GGS scores discs, so a won endgame should win by the most), `solve_share`, `taper`, `ponder=1` (search the opponent's turn, see below), `ponder_nodes` (a ponder stops at a tree of so many nodes; 0, the default, never), and the search's (`c_init`, `virtual_loss`, ...) |
 | `--cores` | all it may run on | Cores the player uses (run it under `taskset`) |
 | `--types` | `s8r14,s8r16,s8r18,8` | Match types it accepts; 8x8 non-anti only, whatever this says |
 | `--min-seconds`, `--max-seconds` | 60, 900 | Our clock's initial time, accepted range |
@@ -143,6 +144,15 @@ search's root value, a solve's margin when solved.
   empties are solved exactly (`solve_share` of the clock). Planning to the end of the game
   instead left 26 of 60 s unused at `01:00//02:00` (from 20 empties a solve takes about a
   second); planned to the solve, about 6.
+- **Pondering** (`ponder=1`, off by default on the CPU). Cores none of our searches is using
+  search the trees of the games where the opponent is to move, split evenly between them, until
+  the opponent's move comes (then played into a tree that has already looked at it) or one of
+  our searches starts (which takes every core: a ponder stops within a batch, `Search.halt`).
+  Not when our next move is solved. Each move's log line gives the leaves `pondered` on its
+  game since our last move there. In a synchro match the window is the time the opponent
+  takes beyond ours in a round: its move in the other game shows only once both moves are in,
+  so against a faster opponent there is almost none; in a plain game it's the opponent's
+  whole move.
 - **Komi games** (`K`): before colours are set, both players send a first move with the result
   they expect for the player to move; ours is the search's eval, in discs.
 - **Offers.** Undo, abort and score offers are left unanswered, which declines them.
@@ -154,7 +164,7 @@ move (on a thread a game), `observe(view)` for every board of our games, whoever
 ponder; it must return at once), `forget(game_id)` at a game's end, `close()`. A `GameView` is a
 game as the server has it: its start, every move since, the position, our colour and clock.
 `make_bridge` picks it from `--player`: the CPU's `NetBridge` (a `cpu_match.NetPlayer` a game,
-driven by `PlayerBridge`, which doesn't ponder), or with `device=gpu`,
+driven by `PlayerBridge`, which ponders with `ponder=1`), or with `device=gpu`,
 `gpu_play.make_ggs_bridge`, whose trees share one batch stream on the GPU and ponder the game
 the opponent's moving in.
 

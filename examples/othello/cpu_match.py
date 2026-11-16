@@ -281,8 +281,10 @@ class NetPlayer:
         self.solved += 1
         return solved.move
 
-    def move(self, color: str, seconds_left: float) -> int:
-        """Our move, which it also plays. A position with one legal move takes no time."""
+    def move(self, color: str, seconds_left: float, budget: float | None = None) -> int:
+        """Our move, which it also plays. A position with one legal move takes no time.
+        `budget`, if given, is the search's seconds, the caller's plan; else `move_budget`'s
+        share of `seconds_left`, which plans the solve and bounds it either way."""
         self.sync(color)
         me, opp, _, _ = self.search.position()
         empties = 64 - (me | opp).bit_count()
@@ -308,8 +310,12 @@ class NetPlayer:
                 if self.solving is not None and solve_from
                 else 0.0
             )
-            seconds = move_budget(
-                max(seconds_left, 0.0), empties, self.taper, solve_from, reserve
+            seconds = (
+                budget
+                if budget is not None
+                else move_budget(
+                    max(seconds_left, 0.0), empties, self.taper, solve_from, reserve
+                )
             )
             if isinstance(self.evaluate, Engine):
                 self.evaluate.search(

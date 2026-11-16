@@ -125,6 +125,7 @@ def load_library() -> ctypes.CDLL:
         "search_legal": (None, [Search, ints]),
         "search_root_q": (ctypes.c_float, [Search]),
         "search_play": (None, [Search, ctypes.c_int]),
+        "search_halt": (None, [Search, ctypes.c_int]),
         "search_position": (None, [Search, u64, u64, c_int, c_int]),
         "search_reward": (ctypes.c_float, [Search]),
         "search_collisions": (ctypes.c_long, [Search]),
@@ -346,6 +347,11 @@ class Search:
 
     def play(self, action: int) -> None:
         LIB.search_play(self.handle, action)
+
+    def halt(self, halted: bool = True) -> None:
+        """Ends an `Engine`'s search of this tree under way, from another thread, and any
+        started until `halt(False)`; it finishes the batches in flight first."""
+        LIB.search_halt(self.handle, int(halted))
 
     def set_position(self, me: int, opp: int) -> None:
         """Starts the tree afresh from a position given whole: the discs of the player to move,
