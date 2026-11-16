@@ -879,7 +879,10 @@ def test_a_timed_search_stops_at_its_time(tiny_model):
     assert search.total_visits() > 10
 
 
-def test_a_solved_tree_stops_its_search_early(tiny_model):
+def test_a_timed_search_takes_its_time_with_nothing_left_to_evaluate(tiny_model):
+    import time
+
+    from cpu_match import timed_move
     from cpu_search import Engine, Search, SearchSettings
 
     # a random game to a few empty squares: the whole tree below is soon all games' ends
@@ -891,9 +894,14 @@ def test_a_solved_tree_stops_its_search_early(tiny_model):
             break
         search.play(int(rng.choice(np.flatnonzero(search.legal()))))
     assert not search.terminated()
-    Engine.openvino(tiny_model, 2, 2).search(search, seconds=5.0, stop_ended=64)
-    # far fewer than 5 s of visits
-    assert search.total_visits() < 100_000
+    # a search on a clock spends its time: the next moves search the same tree, which has
+    # nothing to spend it on either
+    start = time.perf_counter()
+    Engine.openvino(tiny_model, 2, 2).search(search, seconds=0.1)
+    assert time.perf_counter() - start >= 0.1
+    start = time.perf_counter()
+    timed_move(search, 0.1, np.empty((2, 2, 8, 8), np.float32), fake_eval)
+    assert time.perf_counter() - start >= 0.1
 
 
 def test_an_engine_player_plays_a_game_through_the_clock_driver(tiny_model):

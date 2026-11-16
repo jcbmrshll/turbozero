@@ -118,7 +118,6 @@ def load_library() -> ctypes.CDLL:
             ctypes.c_int,
             [Search, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p],
         ),
-        "search_ended_in_a_row": (ctypes.c_int, [Search]),
         "search_num_legal": (ctypes.c_int, [Search]),
         "search_first_legal": (ctypes.c_int, [Search]),
         "search_best_action": (ctypes.c_int, [Search]),
@@ -175,7 +174,7 @@ def load_library() -> ctypes.CDLL:
         ),
         "engine_search": (
             ctypes.c_long,
-            [ctypes.c_void_p, Search, ctypes.c_int, ctypes.c_double, ctypes.c_int],
+            [ctypes.c_void_p, Search, ctypes.c_int, ctypes.c_double],
         ),
         "engine_stats": (None, [ctypes.c_void_p, ctypes.POINTER(ctypes.c_double)]),
     }
@@ -334,10 +333,6 @@ class Search:
             logits.ctypes.data_as(ctypes.c_void_p),
             values.ctypes.data_as(ctypes.c_void_p),
         )
-
-    def ended_in_a_row(self) -> int:
-        """Traversals in a row, to now, that ended the game with no leaf between."""
-        return LIB.search_ended_in_a_row(self.handle)
 
     def best_action(self) -> int:
         """The most visited action."""
@@ -506,18 +501,11 @@ class Engine:
         if getattr(self, "handle", None):
             LIB.engine_free(self.handle)
 
-    def search(
-        self,
-        search: "Search",
-        visits: int = 0,
-        seconds: float = 0.0,
-        stop_ended: int = 0,
-    ) -> int:
-        """`visits` visits of `search`'s tree, or with none, as many as `seconds` allow; stopping
-        early once `stop_ended` traversals in a row end the game. Returns the leaves evaluated."""
-        return LIB.engine_search(
-            self.handle, search.handle, visits, seconds, stop_ended
-        )
+    def search(self, search: "Search", visits: int = 0, seconds: float = 0.0) -> int:
+        """`visits` visits of `search`'s tree, or with none, as many as `seconds` allow, all of
+        them: on a clock, time a search leaves is worth little to the moves after it, as a tree
+        with nothing left to evaluate is theirs too. Returns the leaves evaluated."""
+        return LIB.engine_search(self.handle, search.handle, visits, seconds)
 
     def stats(self) -> dict[str, float]:
         """Calls of the network, leaves and seconds inferring summed over workers, so far."""

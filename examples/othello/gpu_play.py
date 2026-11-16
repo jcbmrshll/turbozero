@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 import numpy as np
-from cpu_match import ENDED_VISITS, Solving, move_budget
+from cpu_match import Solving, move_budget
 from cpu_search import PASS, Batch, Search, SearchSettings
 
 # the most leaves one call of the network evaluates, by default
@@ -56,8 +56,7 @@ class Network(Protocol):
 @dataclass(eq=False)
 class Job:
     """A search under way in a `Stream`: `visits` visits of `search`'s tree, or with none, until
-    `deadline` (`time.perf_counter()`'s) or until cancelled; either way stopping once
-    `stop_ended` traversals in a row end the game (0 for never). Each call carries up to `batch`
+    `deadline` (`time.perf_counter()`'s) or until cancelled. Each call carries up to `batch`
     of its leaves, with up to `inflight` calls of them out at once. Higher `priority` fills calls
     first."""
 
@@ -66,7 +65,6 @@ class Job:
     inflight: int = 2
     visits: int = 0
     deadline: float | None = None
-    stop_ended: int = 0
     priority: int = 0
     # filled in by the stream
     leaves: int = 0
@@ -84,7 +82,6 @@ class Job:
             self.cancelled
             or search.remaining <= 0
             or (self.deadline is not None and now >= self.deadline)
-            or (self.stop_ended > 0 and search.ended_in_a_row() >= self.stop_ended)
         )
 
     def cancel(self) -> None:
@@ -353,7 +350,6 @@ class GpuPlayer:
             self.settings.inflight,
             visits=visits,
             deadline=None if visits else time.perf_counter() + seconds,
-            stop_ended=0 if visits else ENDED_VISITS,
             priority=priority,
         )
         self.last_job = self.stream.run(job)
@@ -398,7 +394,6 @@ class GpuPlayer:
                 self.search,
                 batch or self.settings.batch,
                 self.settings.inflight,
-                stop_ended=ENDED_VISITS,
                 priority=priority,
             )
         )
