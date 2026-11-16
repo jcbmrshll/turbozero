@@ -290,7 +290,6 @@ static void check_quantize() {
     }
 }
 
-#if NET_ISA != 3
 static void check_transpose() {
     alignas(64) float x[W][W], got[W];
     F r[W];
@@ -359,7 +358,6 @@ static void check_policy_logits() {
         expect(same(got[s], logit), "policy logits", s);
     }
 }
-#endif
 
 // a 1x1 convolution (the heads') against its sums done one by one, with the same rounding: every
 // input value and weight, 16 to 128 channels, the heads' 48 to 144 outputs
@@ -403,11 +401,9 @@ int main() {
     check_conv_1x1();
     check_quantize();
     check_pool_bias_quantize();
-#if NET_ISA != 3
     check_transpose();
     check_linear();
     check_policy_logits();
-#endif
     std::printf("%d failures\n", failures);
     return failures ? 1 : 0;
 }
