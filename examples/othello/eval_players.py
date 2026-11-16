@@ -19,7 +19,11 @@ A network is one of the league store's, by `net`, or any checkpoint, by `checkpo
   visits only, against engines at a level or other such networks
 
 On every device `prior_temperature` (default 2, `game.PLAY_PRIOR_TEMPERATURE`) is the softmax
-temperature of the search's prior: above 1 flatter than the network's policy.
+temperature of the search's prior: above 1 flatter than the network's policy. On `cpu` at fixed
+`visits`, a move's visits left once its move is decided go on under that move, for the
+next search to keep, and on down the tree at our later moves (`descend=2`, see
+`cpu_search.SearchSettings`): on by default, `descend=1` at the root only, `descend=0` for the
+players from before it.
 
 Everything that decides how a player plays is in its config, defaults filled in, and its id is the
 config's digest (`core.evals.store.player_id`): a network's checkpoint by its sha256, and a
@@ -256,6 +260,16 @@ def resolve_net(
             search["solve_cost"] = _typed(
                 "solve_cost", options.pop("solve_cost", SOLVE_COST), float
             )
+    if device == "cpu":
+        descend = _typed("descend", options.pop("descend", None), int)
+        if descend not in (None, 0, 1, 2):
+            raise ValueError(f"descend={descend}: 0, 1 or 2")
+        if descend and "visits" not in budget:
+            raise ValueError("descend needs fixed visits: on a clock it does nothing")
+        # 2 at fixed visits unless said, and in the config only when on: the players from before
+        # it, off, keep their ids
+        if "visits" in budget and descend != 0:
+            search["descend"] = 2 if descend is None else descend
     if options:
         raise ValueError(f"unknown options for a {device} network: {sorted(options)}")
     config: dict[str, Any] = {
@@ -279,6 +293,7 @@ def resolve_net(
     )
     where = device + (f"/{search['backend']}" if device == "cpu" else "")
     solve = f" solve{search['solve']}" if "solve" in search else ""
+    solve += {0: "", 1: " descend", 2: " descend-recursive"}[search.get("descend", 0)]
     temperature = search.get("prior_temperature")
     prior = f" T{temperature:g}" if temperature != known["prior_temperature"][1] else ""
     relative = _relative(checkpoint)

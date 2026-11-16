@@ -16,7 +16,7 @@ import os
 import subprocess
 import tempfile
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -93,6 +93,7 @@ def load_library() -> ctypes.CDLL:
                 ctypes.c_int,
                 ctypes.c_int,
                 ctypes.c_int,
+                ctypes.c_int,
                 ctypes.c_uint64,
             ],
         ),
@@ -130,7 +131,12 @@ def load_library() -> ctypes.CDLL:
         "search_collisions": (ctypes.c_long, [Search]),
         "search_total_visits": (ctypes.c_long, [Search]),
         "search_num_nodes": (ctypes.c_long, [Search]),
+        "search_subtree_nodes": (ctypes.c_long, [Search]),
+        "search_clone": (Search, [Search, ctypes.c_int]),
         "search_reused": (ctypes.c_long, [Search]),
+        "search_descended": (ctypes.c_long, [Search]),
+        "search_descended_deeper": (ctypes.c_long, [Search]),
+        "search_set_solved_from": (None, [Search, ctypes.c_int]),
         "search_symmetric_bits": (ctypes.c_uint64, [ctypes.c_uint64, ctypes.c_int]),
         "search_symmetric_action": (ctypes.c_int, [ctypes.c_int, ctypes.c_int]),
         "engine_new": (
@@ -204,6 +210,16 @@ class SearchSettings:
             cache of evaluations, here the tree itself): about 14-17% of leaves at 1000-4000
             visits, more near the end. Without `random_symmetry` the search is the same, only
             cheaper.
+        descend: with a fixed number of visits a move: 1, once the move is decided (its visits
+            more than any other's could reach with the visits left), spend the rest under it:
+            the next search keeps them, where visits to moves that can't be played are lost.
+            The move played is the same. 2, that, and on down the tree: under a decided move,
+            at each of our moves a turn on (after the opponent's reply), take its decided move
+            too, against the visits left now and every search's up to it, as long as each of
+            ours on the way is decided; never in a position the player solves rather than
+            searches (`solved_from`). This one changes the values PUCT sees between the opponent's
+            replies, so not only where visits go. 0, neither. No effect on a clock. Off here,
+            so the search is core's; evaluation players take 2 at fixed visits (`eval_players`).
     """
 
     batch: int = 1
@@ -215,8 +231,11 @@ class SearchSettings:
     max_collisions: int | None = None
     random_symmetry: bool = False
     reuse: bool = True
+    descend: int = 0
 
     def __post_init__(self) -> None:
+        if self.descend not in (0, 1, 2):
+            raise ValueError(f"descend must be 0, 1 or 2, got {self.descend}")
         if self.prior_temperature <= 0:
             raise ValueError(
                 f"prior_temperature must be positive, got {self.prior_temperature}"
@@ -239,6 +258,7 @@ class Search:
             settings.batch if collisions is None else collisions,
             settings.random_symmetry,
             settings.reuse,
+            settings.descend,
             seed,
         )
         LIB.search_reset(self.handle)
@@ -382,10 +402,43 @@ class Search:
     def num_nodes(self) -> int:
         return LIB.search_num_nodes(self.handle)
 
+    def subtree_nodes(self) -> int:
+        """The nodes under the root, its own included: what the next search starts with."""
+        return LIB.search_subtree_nodes(self.handle)
+
+    def clone(self, descend: int | None = None) -> "Search":
+        """A copy, tree and all, that goes on by itself; with `descend`, that setting changed."""
+        settings = (
+            self.settings
+            if descend is None
+            else replace(self.settings, descend=descend)
+        )
+        copy = Search.__new__(Search)
+        copy.settings = settings
+        copy.handle = LIB.search_clone(
+            self.handle, -1 if descend is None else int(descend)
+        )
+        return copy
+
     def reused(self) -> int:
         """Leaves that took an evaluation from elsewhere in the tree, of the same position reached
         by another order of moves, rather than the network's."""
         return LIB.search_reused(self.handle)
+
+    def descended(self) -> int:
+        """Visits, over the game, that went under a move already decided at the root
+        (`descend`)."""
+        return LIB.search_descended(self.handle)
+
+    def descended_deeper(self) -> int:
+        """Visits, over the game, that also took a decided move of ours below the root
+        (`descend` 2)."""
+        return LIB.search_descended_deeper(self.handle)
+
+    def set_solved_from(self, empties: int) -> None:
+        """Positions with `empties` or fewer are solved rather than searched: `descend` 2 never
+        takes their move as decided."""
+        LIB.search_set_solved_from(self.handle, empties)
 
 
 def pack(x: np.ndarray) -> np.ndarray:
