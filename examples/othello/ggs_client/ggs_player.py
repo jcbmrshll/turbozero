@@ -80,14 +80,10 @@ class Bridge(Protocol):
     games; it keeps their trees, by `game_id`.
 
     `decide` is our move, called on a thread of its own for each game (two can overlap, with
-    two matches); `cores` is the CPU share the client gives the search. `observe` is told every
-    board of our games as the server shows it, whoever's to move, on the client's thread: it
-    must return at once (a player that ponders queues it). `forget` is a game's end.
+    two matches); `cores` is the CPU share the client gives the search. `forget` is a game's end.
     """
 
     def decide(self, view: GameView, cores: int) -> Decision: ...
-
-    def observe(self, view: GameView) -> None: ...
 
     def forget(self, game_id: str) -> None: ...
 
@@ -215,9 +211,6 @@ class FirstLegal:
         legal = Board.at(view.black, view.white, view.color).legal()
         return Decision(legal[0] if legal else PASS, 0.0, self.seconds)
 
-    def observe(self, view: GameView) -> None:
-        pass
-
     def forget(self, game_id: str) -> None:
         self.forgotten.append(game_id)
 
@@ -337,10 +330,6 @@ class PlayerBridge:
         info = {"cores": cores, "value": value, "desyncs": game.desyncs}
         return Decision(move, game.last_eval, time.perf_counter() - start, info)
 
-    def observe(self, view: GameView) -> None:
-        """Nothing: the CPU player doesn't ponder (its cores are the opponent's meanwhile, in
-        a contest on one machine; on GGS, the move it's told is played in its tree)."""
-
     def forget(self, game_id: str) -> None:
         self.players.pop(game_id, None)
 
@@ -410,20 +399,9 @@ class _Game:
 
 
 def make_bridge(options: dict[str, str], cores: int) -> Bridge:
-    """The player `--player` names: `net=NAME,...` on the CPU's native engine (`NetBridge`), or
-    with `device=gpu`, the GPU player's bridge (see the README)."""
+    """The player `--player` names: `net=NAME,...` on the CPU's native engine (`NetBridge`)."""
     options = dict(options)
     device = options.pop("device", "cpu")
     if device == "cpu":
         return NetBridge(options, cores)
-    if device == "gpu":
-        # the GPU player (examples/othello/gpu_play.py), its trees' leaves batched on one
-        # stream, pondering the game the opponent's moving in; it takes our types so as not to
-        # import this module
-        import importlib
-
-        gpu_play = importlib.import_module("gpu_play")
-        return gpu_play.make_ggs_bridge(
-            options, cores, decision=Decision, time_policy=TimePolicy()
-        )
     raise ValueError(f"no GGS player for device={device}")

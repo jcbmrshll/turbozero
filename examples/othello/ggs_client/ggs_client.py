@@ -37,7 +37,7 @@ from pathlib import Path
 sys.path.insert(1, str(Path(__file__).resolve().parent.parent))
 
 # the CPU player's JAX (loading a network) would otherwise take the GPU, and the league with it
-if __name__ == "__main__" and "device=gpu" not in " ".join(sys.argv):
+if __name__ == "__main__":
     os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import ggs_protocol as gp
@@ -207,7 +207,6 @@ class Session:
         send: Callable[[str], None],
         ask_move: Callable[[Job], None],
         forget_game: Callable[[str], None] = lambda game_id: None,
-        observe: Callable[[GameView], None] = lambda view: None,
         clock: Callable[[], float] = time.monotonic,
         aform: str | None = None,
         keepalive: float = 60.0,
@@ -220,7 +219,6 @@ class Session:
         self._send = send
         self.ask_move = ask_move
         self.forget_game = forget_game
-        self.observe = observe
         self.clock = clock
         self.aform = aform
         self.keepalive = keepalive
@@ -464,8 +462,6 @@ class Session:
                 self.resync(msg.match_id, now)
         if game.our_turn and game.turn_number != game.number:
             game.turn_since, game.turn_number = now, game.number
-        if not game.finished and not game.over:
-            self.observe(self.view(game))
         held = self.pending.pop(game.id, None)
         if held is not None:
             self.decided(*held)
@@ -902,7 +898,6 @@ def main() -> None:
         send=lambda command: None,
         ask_move=scheduler.submit,
         forget_game=bridge.forget,
-        observe=bridge.observe,
         aform=args.aform,
         keepalive=args.keepalive,
         asks=tuple(args.ask),

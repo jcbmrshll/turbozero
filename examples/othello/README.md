@@ -680,9 +680,8 @@ any checkpoint by `checkpoint=PATH,spec=NET`; or an engine, `edax`, `egaroucid`,
 `neural-reversi`, `ymatioun` or `edax-fm`. Each side has its own budget: a network `visits` a move
 or a `clock`, an engine a `level` or a `clock`, a contest's seconds for the whole game (`10`) or
 GGS's (`01:00//02:00`). A network plays on a `device`: `cpu` (`cpu_search.py`, with `engine`,
-`backend`, `batch` and the rest, see [Playing on CPU](#playing-on-cpu)), `gpu` (a game at a time,
-its leaves batched on the GPU, `gpu_play.py`) or `gpu-batched` (core's MCTS, many games moving in
-step, at fixed visits against engines at a level or other such networks, with a tree of 4 x visits
+`backend`, `batch` and the rest, see [Playing on CPU](#playing-on-cpu)) or `gpu-batched` (core's
+MCTS, many games moving in step, at fixed visits against engines at a level or other such networks, with a tree of 4 x visits
 nodes). On every device `prior_temperature` is the softmax temperature of the search's prior,
 default 2: flatter than the network's policy, which self-play trains at 1.
 Engines get `threads` (all the cores by default, one in batched games) and `args`.
