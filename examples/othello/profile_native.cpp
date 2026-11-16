@@ -112,11 +112,13 @@ Net make_net(int blocks, int channels, bool pre, int norm, int pool_channels, in
     n.stem_norm = make_norm(pre ? NORM_NONE : after, channels);
     for (int i = 0; i < blocks; i++) {
         Block b;
+        // a pooling bias's block: its second convolution takes the channels not pooled
+        const bool pooled = (i + 1) % 2 == 0;
         b.conv1 = make_conv(channels, channels, 3, pre ? 0 : 0);
-        b.conv2 = make_conv(channels, channels, 3, pre ? 40 : 0);
+        b.conv2 = make_conv(pooled ? channels - pool_channels : channels, channels, 3, pre ? 40 : 0);
         b.norm1 = make_norm(pre ? before : after, channels);
         b.norm2 = make_norm(pre ? before : after, channels);
-        if ((i + 1) % 2 == 0) {
+        if (pooled) {
             b.pool_channels = pool_channels;
             b.pool = make_linear(2 * pool_channels, channels - pool_channels);
         }
