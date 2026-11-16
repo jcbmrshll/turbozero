@@ -160,7 +160,7 @@ def load_library() -> ctypes.CDLL:
         ),
         "engine_search": (
             ctypes.c_long,
-            [ctypes.c_void_p, Search, ctypes.c_int, ctypes.c_double, ctypes.c_int],
+            [ctypes.c_void_p, Search, ctypes.c_int, ctypes.c_double],
         ),
         "engine_stats": (None, [ctypes.c_void_p, ctypes.POINTER(ctypes.c_double)]),
     }
@@ -422,18 +422,11 @@ class Engine:
         if getattr(self, "handle", None):
             LIB.engine_free(self.handle)
 
-    def search(
-        self,
-        search: "Search",
-        visits: int = 0,
-        seconds: float = 0.0,
-        stop_ended: int = 0,
-    ) -> int:
-        """`visits` visits of `search`'s tree, or with none, as many as `seconds` allow; stopping
-        early once `stop_ended` traversals in a row end the game. Returns the leaves evaluated."""
-        return LIB.engine_search(
-            self.handle, search.handle, visits, seconds, stop_ended
-        )
+    def search(self, search: "Search", visits: int = 0, seconds: float = 0.0) -> int:
+        """`visits` visits of `search`'s tree, or with none, as many as `seconds` allow, all of
+        them: on a clock, time a search leaves is worth little to the moves after it, as a tree
+        with nothing left to evaluate is theirs too. Returns the leaves evaluated."""
+        return LIB.engine_search(self.handle, search.handle, visits, seconds)
 
     def stats(self) -> dict[str, float]:
         """Calls of the network, leaves and seconds inferring summed over workers, so far."""

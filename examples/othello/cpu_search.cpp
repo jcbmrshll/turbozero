@@ -292,8 +292,6 @@ struct Search {
     // of our moves below it
     long descended_total;
     long descended_deeper_total;
-    // traversals in a row that ended the game, with no leaf between
-    int ended_in_a_row;
 };
 
 inline float edge_q(const Search& s, const Edge& e) {
@@ -482,12 +480,10 @@ int collect(Search& s, Batch& b, int batch, float* out) {
         if (outcome == END) {
             back_up(s, b.path.data(), (int)b.path.size(), s.nodes[index].position.reward, false);
             visits++;
-            s.ended_in_a_row++;
         } else if (outcome == LEAF && s.reuse && reuse_evaluation(s, index)) {
             back_up(s, b.path.data(), (int)b.path.size(), s.nodes[index].value, false);
             visits++;
             s.reused_total++;
-            s.ended_in_a_row = 0;
         } else if (outcome == LEAF) {
             fly(s, b.path, 1);
             b.paths.insert(b.paths.end(), b.path.begin(), b.path.end());
@@ -499,7 +495,6 @@ int collect(Search& s, Batch& b, int batch, float* out) {
                               out + (size_t)leaves * 128);
             leaves++;
             visits++;
-            s.ended_in_a_row = 0;
         } else {
             fly(s, b.path, 1);
             b.collisions.insert(b.collisions.end(), b.path.begin(), b.path.end());
@@ -581,7 +576,6 @@ Search* search_new(int mode, float weight, float c_init, float prior_temperature
     s->remaining = 0;
     s->collisions_total = 0;
     s->visits_total = 0;
-    s->ended_in_a_row = 0;
     s->reused_total = 0;
     return s;
 }
@@ -618,7 +612,6 @@ void search_reset(Search* s) { search_set_position(s, (1ULL << 28) | (1ULL << 35
 void search_begin(Search* s, int visits) {
     s->remaining = visits;
     s->budget = visits;
-    s->ended_in_a_row = 0;
     s->decided = -1;
 }
 
@@ -830,17 +823,14 @@ Engine* engine_new_net(const net::Net* n, int threads, int batch) {
 void engine_free(Engine* engine) { delete engine; }
 
 // Searches `s`'s tree with all the engine's workers: `visits` visits, or with none, until `seconds`
-// pass, or, either way, until `stop_ended` traversals in a row end the game with no leaf between (the
-// tree has nothing left to evaluate), 0 for never. Batches in flight then are finished. Returns the
-// leaves evaluated.
-long engine_search(Engine* engine, Search* s, int visits, double seconds, int stop_ended) {
+// pass. Batches in flight then are finished. Returns the leaves evaluated.
+long engine_search(Engine* engine, Search* s, int visits, double seconds) {
     using clock = std::chrono::steady_clock;
     auto start = clock::now();
     auto deadline = start + std::chrono::duration_cast<clock::duration>(std::chrono::duration<double>(seconds));
     bool timed = visits <= 0;
     s->remaining = timed ? INT_MAX : visits;
     s->budget = timed ? 0 : visits;
-    s->ended_in_a_row = 0;
     s->decided = -1;
     std::mutex lock;
     std::condition_variable applied;
@@ -852,8 +842,7 @@ long engine_search(Engine* engine, Search* s, int visits, double seconds, int st
         double inferring = 0;
         std::unique_lock<std::mutex> held(lock);
         while (true) {
-            if (stop || s->remaining <= 0 || (timed && clock::now() >= deadline) ||
-                (stop_ended > 0 && s->ended_in_a_row >= stop_ended)) {
+            if (stop || s->remaining <= 0 || (timed && clock::now() >= deadline)) {
                 stop = true;
                 applied.notify_all();
                 break;
