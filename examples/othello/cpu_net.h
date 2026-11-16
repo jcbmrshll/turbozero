@@ -816,10 +816,26 @@ struct Lanes {
         for (int i = 0; i < W; i++) b |= (uint64_t)(p[i] > 0.5f) << i;
         return b;
     }
+    // a * b, rounded on its own (see AVX-512's; GCC's NEON intrinsics fuse as its x86 ones do)
+    static F product(F a, F b) {
+        F p = vmulq_f32(a, b);
+        asm("" : "+w"(p));
+        return p;
+    }
     // a normalization's ReLU, max(v, 0); and a sum's, std::max(v, 0.0f) as the compiler's loops took
     // it, which keeps a -0
     static F relu(F v) { return vmaxq_f32(v, zero()); }
     static F relu_sum(F v) { return vbslq_f32(vcltq_f32(v, zero()), zero(), v); }
+    static F max0(F v) { return relu_sum(v); }
+    // 4 vectors as a 4 by 4 matrix, transposed in place: r[j] lane i to r[i] lane j
+    static void transpose(F* r) {
+        const float64x2_t t0 = vreinterpretq_f64_f32(vtrn1q_f32(r[0], r[1])), t1 = vreinterpretq_f64_f32(vtrn2q_f32(r[0], r[1]));
+        const float64x2_t t2 = vreinterpretq_f64_f32(vtrn1q_f32(r[2], r[3])), t3 = vreinterpretq_f64_f32(vtrn2q_f32(r[2], r[3]));
+        r[0] = vreinterpretq_f32_f64(vtrn1q_f64(t0, t2));
+        r[1] = vreinterpretq_f32_f64(vtrn1q_f64(t1, t3));
+        r[2] = vreinterpretq_f32_f64(vtrn2q_f64(t0, t2));
+        r[3] = vreinterpretq_f32_f64(vtrn2q_f64(t1, t3));
+    }
     // the sums of 4 vectors' lanes, lane s v[s]'s, each added as `vaddvq_f32` adds them, in pairs:
     // (lane 0 + lane 1) + (lane 2 + lane 3)
     static F reduce(const F* v) { return vpaddq_f32(vpaddq_f32(v[0], v[1]), vpaddq_f32(v[2], v[3])); }
@@ -1144,15 +1160,14 @@ inline void normalize_pool(const Norm& n, const float* x, int stride, int ch, fl
     });
 }
 
-#if NET_ISA != 3
 // the policy's logit of each square: the sum, in order onto 0, of std::max(p + bias, 0) * square_w, the
 // products rounded on their own, over p = n(h), the square's first H (a multiple of W) channels of h,
 // (64, stride); as the compiler's loop summed one square, here W squares a lane each, their channels
 // transposed. K groups of W squares at a time, so that their sums don't wait on each other (AVX-512's
-// 32 registers hold 4 groups' columns; AVX2's 16 only one group's).
+// and NEON's 32 registers hold 4 groups' columns; AVX2's 16 only one group's).
 inline void policy_logits(const Norm& n, const float* h, int stride, int H, const float* bias, const float* square_w,
                           float* logits) {
-    constexpr int K = NET_ISA == 2 ? 4 : 1;
+    constexpr int K = NET_ISA == 1 ? 1 : 4;
     with_norm(n, h, stride, H, [&](const auto& norm) {
         for (int s0 = 0; s0 < SQUARES; s0 += K * W) {
             F logit[K];
@@ -1176,7 +1191,6 @@ inline void policy_logits(const Norm& n, const float* h, int stride, int H, cons
         }
     });
 }
-#endif
 
 // The stem's convolution of the board, `obs`, (2, 8, 8), its discs 0 or 1, to `out`, (64, c.cout): each
 // square's sums are those of its 3 rows of 3 squares' discs' weights, looked up (`stem_table`). The
@@ -1217,17 +1231,7 @@ inline void heads(const Net& n, float* h, float* logits, float* value) {
     normalize_pool(n.pool_norm, h + H, H3, H, pooled);
     linear(n.pool_linear, pooled, bias);
     NET_STAGE("head policy pool");
-#if NET_ISA != 3
     policy_logits(n.policy_norm, h, H3, H, bias, n.square_w.data(), logits);
-#else
-    normalize(n.policy_norm, h, H3, H, false);
-    for (int sq = 0; sq < SQUARES; sq++) {
-        float* v = h + sq * H3;
-        float logit = 0;
-        for (int i = 0; i < H; i++) logit += std::max(v[i] + bias[i], 0.0f) * n.square_w[i];
-        logits[sq] = logit;
-    }
-#endif
     NET_STAGE("head square logits");
     linear(n.pass_linear, pooled, out);
     logits[SQUARES] = out[0];

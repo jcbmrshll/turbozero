@@ -289,7 +289,6 @@ static void check_quantize() {
     }
 }
 
-#if NET_ISA != 3
 static void check_transpose() {
     alignas(64) float x[W][W], got[W];
     F r[W];
@@ -358,7 +357,6 @@ static void check_policy_logits() {
         expect(same(got[s], logit), "policy logits", s);
     }
 }
-#endif
 
 int main() {
     check_reduce();
@@ -367,11 +365,9 @@ int main() {
     check_convolve();
     check_quantize();
     check_pool_bias_quantize();
-#if NET_ISA != 3
     check_transpose();
     check_linear();
     check_policy_logits();
-#endif
     std::printf("%d failures\n", failures);
     return failures ? 1 : 0;
 }
