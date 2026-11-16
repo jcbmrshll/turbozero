@@ -35,6 +35,7 @@ import argparse
 import datetime
 import hashlib
 import http.server
+import itertools
 import json
 import re
 import shlex
@@ -120,6 +121,12 @@ LABELS_DIR = RESULTS_DIR / "labels"
 # outcome is hard to get right whatever the labels' noise, so label quality is compared within
 # close positions and within clear ones (lopsided positions are easy to label)
 EDAX_CLOSE = 6
+# --coverage: stored positions per count of empty squares a reference position is compared with, at most
+# (drawn at random), so that a config storing more positions isn't favoured
+COVERAGE_SAMPLE = 400
+# --coverage: buckets of disc distance to the nearest stored position that the network's error is
+# reported by: [0, 2], [3, 4], [5, 6], [7, 8], 9 or more
+COVERAGE_BUCKETS = (0, 3, 5, 7, 9, 65)
 # the scales of the soft collisions, exp(-distance / scale), in each distance's units: squares,
 # and the reference network's cosine distance
 SOFT_SCALES = {
@@ -721,6 +728,131 @@ def label_metrics(
     }
 
 
+def nearest_stored(
+    targets: np.ndarray,
+    target_empties: np.ndarray,
+    stored: np.ndarray,
+    stored_empties: np.ndarray,
+    rng: np.random.Generator,
+    features: FeatureFn | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """How close a config's stored positions come to reference positions (e.g. from games against
+    strong opponents): for each reference position, the distance to its nearest stored position with
+    as many empties, in squares (the closest of the stored one's 8 symmetries, as `pair_statistics`)
+    and, with `features`, in the reference network's cosine distance. Up to COVERAGE_SAMPLE stored
+    positions per count of empties are compared, drawn at random, whatever the config stores.
+
+    Returns:
+        disc and feature distances, (n,) each; NaN where no position with as many empties is stored
+    """
+    disc = np.full(len(targets), np.nan)
+    feature = np.full(len(targets), np.nan)
+    for count in np.unique(target_empties):
+        rows = np.flatnonzero(target_empties == count)
+        pool = np.flatnonzero(stored_empties == count)
+        if not len(pool):
+            continue
+        if len(pool) > COVERAGE_SAMPLE:
+            pool = rng.choice(pool, COVERAGE_SAMPLE, replace=False)
+        mine = symmetric_bitboards(targets[rows])[0]
+        theirs = symmetric_bitboards(stored[pool])
+        # (8, rows, pool): each reference position against each symmetry of each stored one
+        differ = (mine[None, :, None, 0] ^ theirs[:, None, :, 0]) | (
+            mine[None, :, None, 1] ^ theirs[:, None, :, 1]
+        )
+        disc[rows] = np.bitwise_count(differ).min(0).min(1)
+        if features is not None:
+            a = symmetric_maps(features(targets[rows]))[0]
+            b = symmetric_maps(features(stored[pool]))
+            cosine = a[None] @ b.transpose(0, 2, 1)
+            feature[rows] = np.maximum(1.0 - cosine, 0.0).min(0).min(1)
+    return disc, feature
+
+
+def coverage_metrics(
+    targets: dict[str, np.ndarray],
+    stored: np.ndarray,
+    stored_empties: np.ndarray,
+    rng: np.random.Generator,
+    raw: tuple[np.ndarray, np.ndarray],
+    features: FeatureFn | None = None,
+) -> dict[str, Any]:
+    """`nearest_stored` for each reference set and phase (PHASES, by the reference positions'
+    empties), with the network's raw accuracy on those positions by Edax's scores of their moves
+    (value against the sign of the best score, the policy's expected regret and top-1), also within
+    close and clear positions (EDAX_CLOSE) and by disc distance to the nearest stored position
+    (COVERAGE_BUCKETS): where the data reaches the positions those games visit, and what being
+    far from it costs the network.
+
+    Args:
+        targets: the reference positions: obs (n, 8, 8, 2), set (n,) names, empties (n,), scores
+            (n, 65) Edax's scores of their moves (ILLEGAL where illegal)
+        stored: the config's stored positions (m, 8, 8, 2), and their empties
+        raw: the network's raw policy (n, 65) and value (n,) on the reference positions
+    """
+    obs, names, empties, scores = (
+        targets["obs"],
+        targets["set"],
+        targets["empties"],
+        targets["scores"],
+    )
+    disc, feature = nearest_stored(obs, empties, stored, stored_empties, rng, features)
+    policy, value = raw
+    legal = scores != ILLEGAL
+    s = scores.astype(np.float64)
+    best = np.max(np.where(legal, s, -np.inf), axis=1)
+    loss = np.where(legal, best[:, None] - s, 0.0)
+    top = np.argmax(np.where(legal, policy, -1.0), axis=1)
+    per_row = {
+        "value_error": (value - np.sign(best)) ** 2,
+        "exp_regret": np.sum(policy * loss, axis=1),
+        "top1": np.take_along_axis(loss, top[:, None], 1)[:, 0] == 0,
+    }
+    close = np.abs(best) <= EDAX_CLOSE
+
+    def summary(sel: np.ndarray) -> dict[str, Any]:
+        sel = sel & ~np.isnan(disc)
+        if not sel.any():
+            return {"positions": 0}
+        out: dict[str, Any] = {
+            "positions": int(sel.sum()),
+            "nearest_disc": float(disc[sel].mean()),
+            "within_2": float((disc[sel] <= 2).mean()),
+            "within_4": float((disc[sel] <= 4).mean()),
+            "close_share": float(close[sel].mean()),
+            **{k: float(np.mean(v[sel])) for k, v in per_row.items()},
+        }
+        if features is not None:
+            out["nearest_feature"] = float(np.nanmean(feature[sel]))
+        for part, mask in (("close", close), ("clear", ~close)):
+            both = sel & mask
+            if both.any():
+                out[f"nearest_disc_{part}"] = float(disc[both].mean())
+                out[f"value_error_{part}"] = float(per_row["value_error"][both].mean())
+        buckets = {}
+        for low, high in itertools.pairwise(COVERAGE_BUCKETS):
+            both = sel & (disc >= low) & (disc < high)
+            buckets[f"{low}-{high - 1}"] = {
+                "positions": int(both.sum()),
+                "value_error": float(per_row["value_error"][both].mean())
+                if both.any()
+                else None,
+                "exp_regret": float(per_row["exp_regret"][both].mean())
+                if both.any()
+                else None,
+            }
+        out["by_distance"] = buckets
+        return out
+
+    result: dict[str, Any] = {}
+    for name in sorted(set(names.tolist())):
+        mine = names == name
+        result[name] = {"all": summary(mine)}
+        for phase, (low, high) in PHASES.items():
+            result[name][phase] = summary(mine & (empties >= low) & (empties <= high))
+    return result
+
+
 def play_games(
     network: Any,
     params: Any,
@@ -1199,6 +1331,17 @@ def run(args: argparse.Namespace) -> None:
         if args.label_stored > 0
         else None
     )
+    targets = None
+    if args.coverage is not None:
+        if args.coverage_labels is None:
+            raise SystemExit("--coverage needs its --coverage-labels")
+        with np.load(args.coverage) as saved:
+            targets = {k: saved[k] for k in ("obs", "set", "empties")}
+        targets["obs"] = targets["obs"].astype(bool)
+        targets["scores"] = np.load(args.coverage_labels)
+        if args.coverage_sets:
+            keep = np.isin(targets["set"], args.coverage_sets.split(","))
+            targets = {k: v[keep] for k, v in targets.items()}
     for name, flags, config in configs:
         print(f"== {model} / {name}: {shlex.join(flags)}", flush=True)
         network, params = load_checkpoint(args.ckpt, net, config.inference_dtype)
@@ -1233,6 +1376,19 @@ def run(args: argparse.Namespace) -> None:
             moves, z, prior, config, timing, sample, features, labels, args.label_stored
         )
         stats.inputs.update(selfplay_stats.inputs)
+        if targets is not None:
+            stored_obs = moves["observation"][moves["full"].astype(bool)].astype(bool)
+            stored_empties = 64 - stored_obs.reshape(len(stored_obs), -1).sum(-1)
+            target_logits, target_value = raw_outputs(network, params, targets["obs"])
+            target_policy = masked_softmax(target_logits, targets["scores"] != ILLEGAL)
+            selfplay["coverage"] = coverage_metrics(
+                targets,
+                stored_obs,
+                stored_empties,
+                np.random.default_rng(args.seed),
+                (target_policy, target_value),
+                features,
+            )
         result = {
             "id": f"{slug(model)}__{slug(name)}",
             "model": {
@@ -1442,6 +1598,25 @@ def main() -> None:
         help="with --label-stored, Edax processes",
     )
     run_parser.add_argument("--label-dir", default=str(LABELS_DIR))
+    run_parser.add_argument(
+        "--coverage",
+        default=None,
+        metavar="NPZ",
+        help="reference positions (obs, set, empties: e.g. from games against strong opponents) "
+        "to measure how close each config's stored positions come, and the network's raw "
+        "accuracy on them by that distance (selfplay.coverage)",
+    )
+    run_parser.add_argument(
+        "--coverage-labels",
+        default=None,
+        metavar="NPY",
+        help="with --coverage, Edax's scores of every move of its positions, (n, 65)",
+    )
+    run_parser.add_argument(
+        "--coverage-sets",
+        default=None,
+        help="with --coverage, only these of its sets, comma-separated (default all)",
+    )
     run_parser.add_argument(
         "--solve-threads", type=int, default=None, help="exact solver's threads"
     )

@@ -269,3 +269,83 @@ def test_the_probe_only_band_adds_endgame_positions_without_changing_the_others(
     np.testing.assert_array_equal(with_endgame[: len(without)], without)
     extra = fake.empties[with_endgame[len(without) :]]
     assert len(extra) == 50 and ((extra >= 13) & (extra <= 20)).all()
+
+
+def test_nearest_stored_is_the_closest_symmetrys_distance_among_as_many_empties():
+    targets = random_boards(4, seed=11)
+    stored = random_boards(6, seed=12)
+    target_empties = np.array([30, 30, 31, 32])
+    stored_empties = np.array([30, 30, 30, 31, 31, 33])
+
+    disc, feature = health.nearest_stored(
+        targets, target_empties, stored, stored_empties, np.random.default_rng(0)
+    )
+
+    for i in range(3):
+        same = [j for j in range(6) if stored_empties[j] == target_empties[i]]
+        assert disc[i] == min(brute_force_distance(targets[i], stored[j]) for j in same)
+    # nothing stored with 32 empties
+    assert np.isnan(disc[3])
+    assert np.isnan(feature).all()
+
+
+def test_a_stored_symmetry_of_a_reference_position_covers_it_exactly():
+    targets = random_boards(1, seed=13)
+    stored = np.concatenate(
+        [random_boards(3, seed=14), np.rot90(targets, 1, axes=(1, 2))]
+    )
+
+    disc, feature = health.nearest_stored(
+        targets,
+        np.zeros(1, int),
+        stored,
+        np.zeros(4, int),
+        np.random.default_rng(0),
+        features=occupancy_maps,
+    )
+
+    assert disc[0] == 0
+    assert feature[0] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_nearest_stored_compares_at_most_a_sample_of_stored_positions(monkeypatch):
+    monkeypatch.setattr(health, "COVERAGE_SAMPLE", 2)
+    targets = random_boards(1, seed=15)
+    # the only exact copy is one of 50 stored positions: a sample of 2 almost surely misses it
+    stored = np.concatenate([random_boards(49, seed=16), targets])
+
+    disc, _ = health.nearest_stored(
+        targets, np.zeros(1, int), stored, np.zeros(50, int), np.random.default_rng(0)
+    )
+
+    assert disc[0] > 0
+
+
+def test_coverage_metrics_by_set_phase_and_distance():
+    obs = random_boards(4, seed=17)
+    scores = np.full((4, 65), health.ILLEGAL, np.int16)
+    scores[:, [0, 1]] = [[10, 2], [3, 1], [-8, -20], [0, -4]]
+    targets = {
+        "obs": obs,
+        "set": np.array(["E", "E", "H", "H"]),
+        "empties": np.array([45, 35, 45, 25]),
+        "scores": scores,
+    }
+    policy = np.zeros((4, 65))
+    policy[:, 0] = 1.0
+    value = np.array([1.0, 0.0, -1.0, 0.0])
+
+    result = health.coverage_metrics(
+        targets, obs, targets["empties"], np.random.default_rng(0), (policy, value)
+    )
+
+    # every reference position is stored itself: distance 0, the best move played, values exact
+    # but for the second (best +3, value 0: error 1)
+    assert set(result) == {"E", "H"}
+    assert result["E"]["all"]["positions"] == 2
+    assert result["E"]["all"]["nearest_disc"] == 0
+    assert result["E"]["all"]["value_error"] == pytest.approx(0.5)
+    assert result["E"]["all"]["top1"] == 1.0
+    assert result["E"]["opening"]["positions"] == 1
+    assert result["H"]["late"]["positions"] == 1
+    assert result["E"]["all"]["by_distance"]["0-2"]["positions"] == 2
