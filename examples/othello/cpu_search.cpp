@@ -34,6 +34,17 @@ enum VirtualLoss {
     VL_DRAW = 2,
 };
 
+// what a fixed number of visits does once a move is decided (see `leading_edge`)
+enum Descend {
+    // nothing: PUCT chooses every edge
+    DESCEND_OFF = 0,
+    // at the root: the rest of the search goes on under the move it plays
+    DESCEND_ROOT = 1,
+    // at the root, and then at each of our moves below it, a turn on, whose move the visits left now
+    // and every search up to it can't change
+    DESCEND_RECURSIVE = 2,
+};
+
 constexpr uint64_t NOT_A = 0xfefefefefefefefeULL;  // no square in the first column
 constexpr uint64_t NOT_H = 0x7f7f7f7f7f7f7f7fULL;  // no square in the last column
 
@@ -256,6 +267,16 @@ struct Search {
     bool random_symmetry;
     // whether a leaf may take an evaluation of its position from elsewhere in the tree
     bool reuse;
+    // a `Descend`: whether a fixed number of visits, once its move is decided, goes on under that
+    // move only (see `leading_edge`)
+    int descend;
+    // the root's edge the search's move is decided on, -1 until it is
+    int32_t decided;
+    // the visits of this search, and so of each search to come (0 on a clock)
+    int budget;
+    // positions with so many empties or fewer the player solves rather than searches: their move
+    // isn't the most visited, so `DESCEND_RECURSIVE` never takes it as decided
+    int solved_from;
     uint64_t rng;  // splitmix64's state
     int32_t root;
     int remaining;
@@ -267,6 +288,10 @@ struct Search {
     int visits_total;
     // leaves that took an evaluation from the tree
     long reused_total;
+    // visits sent down a decided move's edge rather than chosen by PUCT: at the root, and at one
+    // of our moves below it
+    long descended_total;
+    long descended_deeper_total;
     // traversals in a row that ended the game, with no leaf between
     int ended_in_a_row;
 };
@@ -300,6 +325,35 @@ inline int select(const Search& s, const Node& node) {
     }
     return best;
 }
+
+// The edge of `node` the move from it is decided on: its visits more than any other edge's could reach
+// with `extra` more visits and every traversal in flight, so that it stays the most visited
+// (`search_best_action`'s choice) however they go. -1 if none is. Once every traversal through the
+// node takes it, no other edge gains, and the decision holds.
+int leading_edge(const Search& s, const Node& node, long extra) {
+    int top = node.first_edge;
+    for (int i = node.first_edge + 1; i < node.first_edge + node.num_edges; i++) {
+        const Edge& e = s.edges[i];
+        if (e.n > s.edges[top].n || (e.n == s.edges[top].n && e.prior > s.edges[top].prior)) top = i;
+    }
+    long most = s.edges[top].n;
+    for (int i = node.first_edge; i < node.first_edge + node.num_edges; i++) {
+        const Edge& e = s.edges[i];
+        if (i != top && (long)e.n + e.in_flight + extra >= most) return -1;
+    }
+    return top;
+}
+
+// With `descend`, the root's edge once the search's move is decided, against the `left` visits still
+// to come. The search's visits then go on under it, where the tree the next search starts from keeps
+// them, rather than to moves that can't be played. -1 until then, and always without a fixed number
+// of visits (`remaining` then is unbounded).
+int decided_edge(Search& s, const Node& root, int left) {
+    if (s.decided < 0 && s.descend != DESCEND_OFF) s.decided = leading_edge(s, root, left);
+    return s.decided;
+}
+
+inline int empties(const Position& p) { return 64 - __builtin_popcountll(p.me | p.opp); }
 
 int32_t new_node(Search& s, const Position& p) {
     Node node{};
@@ -383,6 +437,11 @@ int collect(Search& s, Batch& b, int batch, float* out, uint64_t* bits = nullptr
         int32_t index = s.root;
         b.path.push_back({index, -1});
         enum { LEAF, END, COLLISION } outcome;
+        // whether the path so far took a decided move at each of our turns (see `Descend`); and
+        // whether it did at the root, and below it
+        bool chain = s.descend != DESCEND_OFF;
+        bool descended = false, deeper = false;
+        int depth = 0;
         while (true) {
             Node& node = s.nodes[index];
             if (node.position.terminated) {
@@ -393,7 +452,22 @@ int collect(Search& s, Batch& b, int batch, float* out, uint64_t* bits = nullptr
                 outcome = node.in_flight > 0 ? COLLISION : LEAF;
                 break;
             }
-            int e = select(s, node);
+            int e = -1;
+            if (chain && depth == 0) {
+                e = decided_edge(s, node, s.remaining - visits);
+                descended = e >= 0;
+                chain = descended;
+            } else if (chain && depth % 2 == 0) {
+                // our move `depth / 2` turns on, decided against this search's visits left and the
+                // whole of each search up to it: their root rule keeps it, so visits to its other
+                // moves would be lost by then
+                if (s.descend == DESCEND_RECURSIVE && empties(node.position) > s.solved_from)
+                    e = leading_edge(s, node, (long)(s.remaining - visits) + (long)(depth / 2) * s.budget);
+                deeper = deeper || e >= 0;
+                chain = e >= 0;
+            }
+            depth++;
+            if (e < 0) e = select(s, node);
             int32_t child = s.edges[e].child;
             if (child < 0) {
                 Position next = play(node.position, s.edges[e].action);
@@ -404,6 +478,8 @@ int collect(Search& s, Batch& b, int batch, float* out, uint64_t* bits = nullptr
             index = child;
             b.path.push_back({index, e});
         }
+        if (outcome != COLLISION && descended) s.descended_total++;
+        if (outcome != COLLISION && deeper) s.descended_deeper_total++;
         if (outcome == END) {
             back_up(s, b.path.data(), (int)b.path.size(), s.nodes[index].position.reward, false);
             visits++;
@@ -491,7 +567,7 @@ void apply(Search& s, Batch& b, const float* logits, const float* values) {
 extern "C" {
 
 Search* search_new(int mode, float weight, float c_init, float prior_temperature, int max_collisions,
-                   int random_symmetry, int reuse, uint64_t seed) {
+                   int random_symmetry, int reuse, int descend, uint64_t seed) {
     Search* s = new Search();
     s->mode = mode;
     s->weight = weight;
@@ -500,6 +576,12 @@ Search* search_new(int mode, float weight, float c_init, float prior_temperature
     s->max_collisions = max_collisions;
     s->random_symmetry = random_symmetry != 0;
     s->reuse = reuse != 0;
+    s->descend = descend;
+    s->decided = -1;
+    s->budget = 0;
+    s->solved_from = 0;
+    s->descended_total = 0;
+    s->descended_deeper_total = 0;
     s->rng = seed;
     s->root = -1;
     s->remaining = 0;
@@ -521,7 +603,19 @@ void search_set_position(Search* s, uint64_t me, uint64_t opp) {
     p.me = me;
     p.opp = opp;
     s->root = new_node(*s, p);
+    s->decided = -1;
 }
+
+// A copy of the search, tree and settings, that goes on by itself; with `descend` a `Descend`, that
+// setting changed (-1 keeps it).
+Search* search_clone(const Search* s, int descend) {
+    Search* copy = new Search(*s);
+    if (descend >= 0) copy->descend = descend;
+    return copy;
+}
+
+// Positions with `empties` or fewer the player solves rather than searches (see `Search::solved_from`).
+void search_set_solved_from(Search* s, int empties) { s->solved_from = empties; }
 
 // the game's start: black to move
 void search_reset(Search* s) { search_set_position(s, (1ULL << 28) | (1ULL << 35), (1ULL << 27) | (1ULL << 36)); }
@@ -529,7 +623,9 @@ void search_reset(Search* s) { search_set_position(s, (1ULL << 28) | (1ULL << 35
 // the search for a move: `visits` more of the tree, each a leaf to evaluate or a game's end reached
 void search_begin(Search* s, int visits) {
     s->remaining = visits;
+    s->budget = visits;
     s->ended_in_a_row = 0;
+    s->decided = -1;
 }
 
 int search_remaining(const Search* s) { return s->remaining; }
@@ -615,6 +711,7 @@ float search_root_q(const Search* s) {
 
 // Moves the root down the tree, keeping what it searched under the action.
 void search_play(Search* s, int action) {
+    s->decided = -1;
     Node& root = s->nodes[s->root];
     for (int i = root.first_edge; i < root.first_edge + root.num_edges; i++) {
         if (s->edges[i].action == action && s->edges[i].child >= 0) {
@@ -645,7 +742,25 @@ long search_total_visits(const Search* s) { return s->visits_total; }
 // leaves that took an evaluation from the tree rather than the network
 long search_reused(const Search* s) { return s->reused_total; }
 
+// visits a decided move took at the root (see `decided_edge`), and visits one took below it
+long search_descended(const Search* s) { return s->descended_total; }
+long search_descended_deeper(const Search* s) { return s->descended_deeper_total; }
+
 long search_num_nodes(const Search* s) { return (long)s->nodes.size(); }
+
+// the nodes of the tree under the root, the root's own included: what a search from it starts with
+long search_subtree_nodes(const Search* s) {
+    long count = 0;
+    std::vector<int32_t> stack{s->root};
+    while (!stack.empty()) {
+        const Node& node = s->nodes[stack.back()];
+        stack.pop_back();
+        count++;
+        for (int i = node.first_edge; i < node.first_edge + node.num_edges; i++)
+            if (s->edges[i].child >= 0) stack.push_back(s->edges[i].child);
+    }
+    return count;
+}
 
 void search_legal(const Search* s, int32_t* out) {
     const Position& p = s->nodes[s->root].position;
@@ -754,7 +869,9 @@ long engine_search(Engine* engine, Search* s, int visits, double seconds, int st
     auto deadline = start + std::chrono::duration_cast<clock::duration>(std::chrono::duration<double>(seconds));
     bool timed = visits <= 0;
     s->remaining = timed ? INT_MAX : visits;
+    s->budget = timed ? 0 : visits;
     s->ended_in_a_row = 0;
+    s->decided = -1;
     std::mutex lock;
     std::condition_variable applied;
     long generation = 0;

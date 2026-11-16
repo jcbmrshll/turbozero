@@ -70,6 +70,7 @@ class Player:
             else None,
             random_symmetry=bool(int(fields.pop("random_symmetry", 0))),
             reuse=bool(int(fields.pop("reuse", 1))),
+            descend=int(fields.pop("descend", 0)),
         )
         return cls(net, backend, visits, settings)
 
@@ -293,6 +294,8 @@ class NetPlayer:
                 if self.visits
                 else self.solving.depth(seconds_left)
             )
+            # those positions' moves aren't the most visited (`SearchSettings.descend`)
+            self.search.set_solved_from(self.solve_from)
         solve_from = self.solve_from or 0
         action = None
         self.last_value = None

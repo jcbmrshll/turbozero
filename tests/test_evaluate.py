@@ -167,6 +167,28 @@ def test_a_network_is_its_checkpoint_by_content_and_its_search(tmp_path):
     assert resolve(f"net:checkpoint={two},{spec}", cores=8).id != a.id
 
 
+def test_descend_is_on_at_fixed_visits_and_off_is_the_player_from_before(tmp_path):
+    checkpoint = tmp_path / "1.eqx"
+    checkpoint.write_bytes(b"params")
+    base = f"net:checkpoint={checkpoint},spec=s"
+    on = resolve(f"{base},visits=100", 8)
+    assert on.config["search"]["descend"] == 2
+    assert on.label.endswith(" descend-recursive")
+    assert resolve(f"{base},visits=100,descend=2", 8).id == on.id
+    root = resolve(f"{base},visits=100,descend=1", 8)
+    assert root.config["search"]["descend"] == 1 and root.label.endswith(" descend")
+    assert root.id != on.id
+    # off is the player from before the option: not in its config
+    off = resolve(f"{base},visits=100,descend=0", 8)
+    assert "descend" not in off.config["search"] and off.id not in (on.id, root.id)
+    # on a clock it does nothing, so it's no part of the player
+    assert "descend" not in resolve(f"{base},clock=10", 8).config["search"]
+    with pytest.raises(ValueError, match="fixed visits"):
+        resolve(f"{base},clock=10,descend=1", 8)
+    with pytest.raises(ValueError, match="descend=3"):
+        resolve(f"{base},visits=100,descend=3", 8)
+
+
 def test_a_clock_is_a_contests_or_ggss(tmp_path):
     checkpoint = tmp_path / "1.eqx"
     checkpoint.write_bytes(b"params")
