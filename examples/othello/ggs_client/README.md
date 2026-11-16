@@ -102,7 +102,7 @@ Not done yet: logging in claims a name there, and that's for us to decide.
 |---|---|---|
 | `--host`, `--port` | 127.0.0.1, 5000 | The server (plain port; the public one is `skatgame.net 5000`) |
 | `--login`, `--password-file` | | The login, and a file holding its password (mode 600) |
-| `--player` | | The player: `net=NAME` (a network of the league's store, quantized for the native engine), `device` (`cpu`, the default; `gpu`, the GPU player of `../gpu_play.py`, its own options added), and `clock_match.py`'s `net:` options: `batch` (leaves each worker evaluates at once), `solve=N` (solve exactly from N empties), `solve_exact` (here 1 by default: GGS scores discs, so a won endgame should win by the most), `solve_share`, `taper`, and the search's (`c_init`, `virtual_loss`, ...) |
+| `--player` | | The player: `net=NAME` (a network of the league's store, quantized for the native engine) and `clock_match.py`'s `net:` options: `batch` (leaves each worker evaluates at once), `solve=N` (solve exactly from N empties), `solve_exact` (here 1 by default: GGS scores discs, so a won endgame should win by the most), `solve_share`, `taper`, and the search's (`c_init`, `virtual_loss`, ...) |
 | `--cores` | all it may run on | Cores the player uses (run it under `taskset`) |
 | `--types` | `s8r14,s8r16,s8r18,8` | Match types it accepts; 8x8 non-anti only, whatever this says |
 | `--min-seconds`, `--max-seconds` | 60, 900 | Our clock's initial time, accepted range |
@@ -150,13 +150,10 @@ search's root value, a solve's margin when solved.
 ## Another player
 
 The client sees its player only through `ggs_player.Bridge`: `decide(view, cores)` for our
-move (on a thread a game), `observe(view)` for every board of our games, whoever's to move (to
-ponder; it must return at once), `forget(game_id)` at a game's end, `close()`. A `GameView` is a
+move (on a thread a game), `forget(game_id)` at a game's end, `close()`. A `GameView` is a
 game as the server has it: its start, every move since, the position, our colour and clock.
-`make_bridge` picks it from `--player`: the CPU's `NetBridge` (a `cpu_match.NetPlayer` a game,
-driven by `PlayerBridge`, which doesn't ponder), or with `device=gpu`,
-`gpu_play.make_ggs_bridge`, whose trees share one batch stream on the GPU and ponder the game
-the opponent's moving in.
+`make_bridge` makes it from `--player`: the CPU's `NetBridge` (a `cpu_match.NetPlayer` a game,
+driven by `PlayerBridge`).
 
 ## Tests
 

@@ -103,9 +103,8 @@ class EdaxBot(Process):
 class Client(Process):
     def __init__(self, args: list[str], cores: str, log: Path):
         env = dict(os.environ)
-        if "device=gpu" not in " ".join(args):
-            # JAX would otherwise take the GPU
-            env["JAX_PLATFORMS"] = "cpu"
+        # JAX would otherwise take the GPU
+        env["JAX_PLATFORMS"] = "cpu"
         command = [
             "taskset",
             "-c",

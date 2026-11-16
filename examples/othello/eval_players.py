@@ -14,7 +14,6 @@ A network is one of the league store's, by `net`, or any checkpoint, by `checkpo
 
 - `cpu` (the default): `cpu_search.py`'s search, its leaves evaluated by `backend` (bf16, f32, ort,
   native, int8-VARIANT), with `engine=1` by a thread a core (see `clock_match.net_player`)
-- `gpu`: a tree on the host, leaves evaluated on the GPU a batch at a time (`gpu_play.py`)
 - `gpu-batched`: core's MCTS, many games at once on the GPU, as the Elo league plays: fixed
   visits only, against engines at a level or other such networks
 
@@ -54,7 +53,7 @@ from core.evals.store import player_id
 
 LEAGUE_STORE = CACHE_DIR / "league" / "league.db"
 QUANTIZED_DIR = CACHE_DIR / "quantized"
-DEVICES = ("cpu", "gpu", "gpu-batched")
+DEVICES = ("cpu", "gpu-batched")
 
 # a network's options on each device: (type, default); None for a default of the machine's cores.
 # They're all in its config, so a changed default here is a new player, never the same one
@@ -76,16 +75,6 @@ OPTIONS: dict[str, dict[str, tuple[type, Any]]] = {
         "backend": (str, "bf16"),
         "batch": (int, 1),
         **SEARCH,
-        "threads": (int, None),
-    },
-    "gpu": {
-        "batch": (int, 256),
-        "inflight": (int, 2),
-        "max_call": (int, 1024),
-        "calls": (int, 2),
-        "dtype": (str, "bfloat16"),
-        **SEARCH,
-        "ponder": (int, 0),
         "threads": (int, None),
     },
     # a tree of 4 x visits nodes, no root noise, temperature 0 (`elo_league.Othello`), the prior
