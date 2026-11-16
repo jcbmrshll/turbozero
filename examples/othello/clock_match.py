@@ -4,8 +4,8 @@ standard start, an opening's moves or a position given whole; with `solve_at`, s
 empties and solved for the result (`GameRun`). GGS's synchro pairs are two games in lockstep
 (`play_synchro`).
 
-A player (`player_maker`) is a network (`net_player`: `cpu_match.NetPlayer` on the CPU, or
-`gpu_play.py`'s on the GPU), or an engine at a level (`LevelEngine`) or on its clock
+A player (`player_maker`) is a network (`net_player`: `cpu_match.NetPlayer` on the CPU), or an
+engine at a level (`LevelEngine`) or on its clock
 (`engines.ClockedEngine`).
 
 On a contest's clock, who runs out of time, by more than `GRACE`, loses, and the game is played out
@@ -354,21 +354,11 @@ def net_player(options: dict[str, str]) -> Callable[[], Player]:
     fewer empties are solved on the same cores (see `cpu_match.Solving`), `solve_exact=1` for the
     best margin, `solve_share` what of the game's clock a solve may be expected to take,
     `solve_cost` its expected seconds at 24 empties on 8 threads (on a clock, it solves from as
-    many empties as that affords).
-
-    With `device=gpu`, a GGS-only player (engine comparisons stay on CPU vector units): its tree
-    on the host, its leaves evaluated on the GPU many at a time (see `gpu_play.player_factory`
-    for its options), the endgame solved on `threads` CPU cores; all its games share one GPU
-    stream, as a synchro pair's two do."""
+    many empties as that affords)."""
     from cpu_match import NetPlayer, Solving, make_engine, make_eval
     from cpu_match import Player as NetSpec
 
     options = dict(options)
-    if options.get("device", "cpu") == "gpu":
-        from gpu_play import player_factory
-
-        cores = int(options.pop("threads", len(cpus())))
-        return player_factory(options, cores)
     options.pop("device", None)
     native = bool(int(options.pop("engine", 0)))
     cores = int(options.pop("threads", len(cpus())))

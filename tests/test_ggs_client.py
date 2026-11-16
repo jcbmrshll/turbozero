@@ -667,23 +667,6 @@ def test_bridge_time_and_cores():
     assert engines == [3, 8]
 
 
-def test_observe_sees_every_board():
-    """A player that ponders is shown each board of our games, whoever's to move."""
-    seen: list[GameView] = []
-    session, _, jobs = make_session(observe=seen.append)
-    session.logged_in = True
-    start_game(session, me="O")  # the opponent to move
-    assert len(seen) == 1 and seen[0].mine == "w" and seen[0].color == "b" and not jobs
-    board = Board()
-    board.play(19)
-    session.receive(
-        board_message(
-            number=1, to_move="O", me="O", board=board.text()[:64], last=gp.MoveInfo(19)
-        )
-    )
-    assert len(seen) == 2 and seen[1].moves == (19,) and len(jobs) == 1
-
-
 def test_clock_planned_to_the_solve():
     """With the endgame solved from 20 empties, the clock goes to our moves before it."""
     from cpu_match import move_budget

@@ -572,10 +572,10 @@ def test_jax_stays_off_the_gpu_unless_a_player_is_on_it(tmp_path):
     assert not evaluate.wants_gpu(["run", "--config", str(config)])
     assert not evaluate.wants_gpu(["run", "--a", "net:net=x,device=cpu,visits=1"])
     assert evaluate.wants_gpu(["run", "--a", "net:net=x,device=gpu-batched,visits=1"])
-    config.write_text('[a]\nkind = "net"\ndevice = "gpu"\n')
+    config.write_text('[a]\nkind = "net"\ndevice = "gpu-batched"\n')
     assert evaluate.wants_gpu(["run", "--config", str(config)])
     match = tmp_path / "match.json"
-    match.write_text(json.dumps({"spec": {"a": {"config": {"device": "gpu"}}}}))
+    match.write_text(json.dumps({"spec": {"a": {"config": {"device": "gpu-batched"}}}}))
     assert evaluate.wants_gpu(["play", "--match", f"@{match}"])
     assert evaluate.wants_gpu(["play", "--match", match.read_text()])
 

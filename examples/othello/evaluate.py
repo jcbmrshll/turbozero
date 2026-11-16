@@ -110,7 +110,7 @@ def parse_cores(text: str) -> list[int]:
 
 def check_devices(spec: MatchSpec) -> None:
     """Refuses a GPU player when JAX was kept to the CPU (see `wants_gpu`)."""
-    if spec.uses_gpu and os.environ.get("JAX_PLATFORMS") == "cpu":
+    if spec.batched and os.environ.get("JAX_PLATFORMS") == "cpu":
         raise SystemExit("a player is on the GPU, and JAX_PLATFORMS is cpu")
 
 
@@ -256,7 +256,7 @@ def play_here_in_jobs(
     import subprocess
     import tempfile
 
-    if spec.uses_gpu:
+    if spec.batched:
         raise SystemExit("--jobs here is for CPU players: GPU players share one GPU")
     cores = sorted(os.sched_getaffinity(0))
     if len(cores) < jobs:
@@ -885,8 +885,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--parallel",
         type=int,
         default=1,
-        help="games at once in a process, each in a thread on the same cores: for engines and "
-        "networks on the GPU (whose games share one stream). Same moves at fixed budgets",
+        help="games at once in a process, each in a thread on the same cores: for engines. "
+        "Same moves at fixed budgets",
     )
     p.add_argument(
         "--jobs",
