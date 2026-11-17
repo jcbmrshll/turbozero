@@ -862,9 +862,7 @@ __attribute__((noinline)) void conv1x1_tile(const Conv& c, const int8_t* in, int
                 lo = vreinterpretq_s32_s64(vzip2q_s64(vreinterpretq_s64_s32(acc[i][0]), vreinterpretq_s64_s32(acc[i][1])));
                 hi = vreinterpretq_s32_s64(vzip2q_s64(vreinterpretq_s64_s32(acc[i][2]), vreinterpretq_s64_s32(acc[i][3])));
             }
-            const int s = 2 * (p0 + i) + sq;
-            out.put(s, o, vfmaq_f32(b0, vcvtq_f32_s32(lo), m0));
-            out.put(s, o + 4, vfmaq_f32(b1, vcvtq_f32_s32(hi), m1));
+            out.put8(2 * (p0 + i) + sq, o, vfmaq_f32(b0, vcvtq_f32_s32(lo), m0), vfmaq_f32(b1, vcvtq_f32_s32(hi), m1));
         }
 }
 
@@ -952,11 +950,12 @@ __attribute__((noinline)) void conv1x1_tile(const Conv& c, const int8_t* in, int
         NET_LANE(0) NET_LANE(1) NET_LANE(2) NET_LANE(3)
 #undef NET_LANE
     }
-    for (int r = 0; r < 2; r++) {
-        const int32x4_t offset = vld1q_s32(c.offset.data() + o + 4 * r);
-        const float32x4_t m = vld1q_f32(c.scale.data() + o + 4 * r), b = vld1q_f32(bias + o + 4 * r);
-        for (int i = 0; i < 8; i++) out.put(s0 + i, o + 4 * r, vfmaq_f32(b, vcvtq_f32_s32(vaddq_s32(acc[i][r], offset)), m));
-    }
+    const int32x4_t f0 = vld1q_s32(c.offset.data() + o), f1 = vld1q_s32(c.offset.data() + o + 4);
+    const float32x4_t m0 = vld1q_f32(c.scale.data() + o), m1 = vld1q_f32(c.scale.data() + o + 4);
+    const float32x4_t b0 = vld1q_f32(bias + o), b1 = vld1q_f32(bias + o + 4);
+    for (int i = 0; i < 8; i++)
+        out.put8(s0 + i, o, vfmaq_f32(b0, vcvtq_f32_s32(vaddq_s32(acc[i][0], f0)), m0),
+                 vfmaq_f32(b1, vcvtq_f32_s32(vaddq_s32(acc[i][1], f1)), m1));
 }
 
 template <class Out>
@@ -1305,6 +1304,10 @@ struct Quantizer {
         int8x8_t b = vqmovn_s16(vcombine_s16(vqmovn_s32(integers(v, ch)), vdup_n_s16(0)));
         vst1_lane_s32((int32_t*)at, vreinterpret_s32_s8(b), 0);
     }
+    // 8 channels from `ch`, `v0` and `v1`, to `at`
+    void put8(float32x4_t v0, float32x4_t v1, int ch, Activation* at) const {
+        vst1_s8(at, vqmovn_s16(vqmovn_high_s32(vqmovn_s32(integers(v0, ch)), integers(v1, ch + 4))));
+    }
     // 16 channels from `ch`, `v[4]`
     void group(const float32x4_t* v, int ch, Activation* q) const {
         int16x8_t lo = vqmovn_high_s32(vqmovn_s32(integers(v[0], ch)), integers(v[1], ch + 4));
@@ -1647,6 +1650,12 @@ struct ExpandOut {
     Input1* in;
     int cin;
     NET_INLINE void put(int s, int o, F v) const { quantize1(quantize, Lanes::relu(v), s, o, cin, in); }
+#if NET_ISA == 3
+    // NEON: 8 outputs from `o`, two vectors, narrowed together
+    NET_INLINE void put8(int s, int o, F v0, F v1) const {
+        quantize.put8(Lanes::relu(v0), Lanes::relu(v1), o, in + input1_at(s, o, cin));
+    }
+#endif
 };
 
 // project's outputs, added to the trunk `x`, (64, channels)
@@ -1656,6 +1665,10 @@ struct ProjectOut {
     NET_INLINE void put(int s, int o, F v) const {
         float* at = x + (size_t)s * channels + o;
         Lanes::store(at, Lanes::add(Lanes::load(at), v));
+    }
+    NET_INLINE void put8(int s, int o, F v0, F v1) const {
+        put(s, o, v0);
+        put(s, o + 4, v1);
     }
 };
 
