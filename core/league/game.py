@@ -8,6 +8,7 @@ import numpy as np
 
 from core.evaluators.evaluator import Evaluator
 from core.league.store import (
+    DEFAULT_C_INIT,
     DEFAULT_PRIOR_TEMPERATURE,
     DEFAULT_TREE_FACTOR,
     Player,
@@ -107,10 +108,12 @@ class LeagueGame(ABC):
         sims: int,
         tree_factor: int = DEFAULT_TREE_FACTOR,
         prior_temperature: float = DEFAULT_PRIOR_TEMPERATURE,
+        c_init: float = DEFAULT_C_INIT,
     ) -> Evaluator:
         """The evaluator of `network`, as it plays at full strength: `sims` iterations a
         move, temperature 0, no root noise, with a tree of `tree_factor` * `sims` nodes and its
-        prior the policy's softmax at `prior_temperature` (see `MCTS`). Called once per player
+        prior the policy's softmax at `prior_temperature` (see `MCTS`), exploring with PUCT's
+        `c_init` (see `PUCTSelector`). Called once per player
         in a batch."""
 
     @abstractmethod

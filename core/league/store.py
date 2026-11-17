@@ -161,6 +161,8 @@ TOP_MOVES = 4
 DEFAULT_TREE_FACTOR = 2
 # a network's prior is its policy's softmax at this temperature, unless its settings say
 DEFAULT_PRIOR_TEMPERATURE = 1.0
+# a network's search explores with PUCT's c_init (see `PUCTSelector`), unless its settings say
+DEFAULT_C_INIT = 1.25
 # settings recorded that can't change a move: a traversal's checks only say when to stop looking
 # (see `MCTS`), and a policy target is for training
 NOT_PLAY_SETTINGS = frozenset({"traversal_steps", "policy_target_config"})
@@ -218,6 +220,11 @@ class Player:
     def prior_temperature(self) -> float:
         """The softmax temperature of its search's prior (see `MCTS`)."""
         return self.settings.get("prior_temperature", DEFAULT_PRIOR_TEMPERATURE)
+
+    @property
+    def c_init(self) -> float:
+        """Its search's exploration constant (see `PUCTSelector`)."""
+        return self.settings.get("c_init", DEFAULT_C_INIT)
 
     @property
     def tree_nodes(self) -> int:
