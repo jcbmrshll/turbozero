@@ -24,9 +24,19 @@ class AZResnetConfig:
             KataGo's nested bottleneck block: a 1x1 convolution down to `bottleneck_channels`,
             `bottleneck_inner` basic blocks at that width, and a 1x1 convolution back up. At half
             the width with one inner block it takes about 5.5 d^2 multiply-adds per square, against
-            the basic block's 18 d^2 (d channels)
+            the basic block's 18 d^2 (d channels). Or "convnext", ConvNeXt's block (see
+            `PreActConvNeXt`), in the "pre" layout only: a depthwise filter of each channel on its
+            own, the block's only step between squares, a normalization, then a per-square MLP of
+            1x1 convolutions through `expand` times the width: 2 * expand * d^2 + taps * d
+            multiply-adds per square
         bottleneck_channels: the bottleneck blocks' inner width, by default half of `num_channels`
         bottleneck_inner: basic blocks inside each bottleneck block
+        expand: the ConvNeXt blocks' hidden width, in multiples of `num_channels`
+        dw_kernel: the ConvNeXt blocks' depthwise filters' size: every square within
+            `dw_kernel // 2` rows and columns (odd)
+        dw_taps: the depthwise filters' taps instead, as (row, column) offsets from the square
+            filtered (see `Depthwise`): a sparse filter of long reach, e.g. along chosen lines.
+            Not settable in a spec: an application names its own sets and passes them in
         pool_every: every `pool_every`-th basic block (counting those inside bottleneck blocks) has
             KataGo's global pooling bias: `pool_channels` of its first convolution's channels are
             pooled over the board (mean and max), and a linear map of them biases the others, which
@@ -85,9 +95,12 @@ class AZResnetConfig:
     policy_head_out_size: int
     num_blocks: int
     num_channels: int
-    block: Literal["basic", "bottleneck"] = "basic"
+    block: Literal["basic", "bottleneck", "convnext"] = "basic"
     bottleneck_channels: int | None = None
     bottleneck_inner: int = 1
+    expand: int = 4
+    dw_kernel: int = 7
+    dw_taps: tuple[tuple[int, int], ...] | None = None
     pool_every: int = 0
     pool_channels: int = 32
     heads: Literal["alphazero", "pooled"] = "alphazero"
@@ -338,11 +351,15 @@ def conv_norm(
 
 
 def norm_act(
-    norm: Norm, x: jax.Array, state: eqx.nn.State, dtype: jnp.dtype
+    norm: Norm,
+    x: jax.Array,
+    state: eqx.nn.State,
+    dtype: jnp.dtype,
+    relu: bool = True,
 ) -> tuple[jax.Array, eqx.nn.State]:
-    """A normalization of `x`, (channels, height, width), then a ReLU, as the "pre" layout puts
-    before each convolution (see `AZResnetConfig.layout`): in float32 in training, `dtype` in
-    inference mode."""
+    """A normalization of `x`, (channels, height, width), then a ReLU (unless not `relu`), as the
+    "pre" layout puts before each convolution (see `AZResnetConfig.layout`): in float32 in
+    training, `dtype` in inference mode."""
     if isinstance(norm, FixedScale):
         raise TypeError("fixed scales go after a convolution, not before")
     if isinstance(norm, eqx.nn.BatchNorm) and norm.inference:
@@ -352,7 +369,8 @@ def norm_act(
         y, state = norm(x.astype(jnp.float32), state)
     else:
         y = norm(x)
-    y = jax.nn.relu(y)
+    if relu:
+        y = jax.nn.relu(y)
     return (y.astype(dtype) if norm.inference else y), state
 
 
@@ -580,7 +598,124 @@ class PreActBottleneck(eqx.Module):
         return x + y.astype(x.dtype), state
 
 
-Block = ResidualBlock | BottleneckBlock | PreActBlock | PreActBottleneck
+def square_taps(kernel: int) -> tuple[tuple[int, int], ...]:
+    """Every (row, column) offset of a `kernel` x `kernel` filter (odd) from its centre."""
+    if kernel % 2 == 0:
+        raise ValueError(f"depthwise filters have an odd size, not {kernel}")
+    r = range(-(kernel // 2), kernel // 2 + 1)
+    return tuple((dy, dx) for dy in r for dx in r)
+
+
+class Depthwise(eqx.Module):
+    """A depthwise convolution of (channels, height, width) inputs: each channel filtered on its
+    own, y[c, i, j] = sum over taps t of weight[c, t] * x[c, i + dy_t, j + dx_t], zero outside,
+    by a filter with weights only at its `taps`' (dy, dx) offsets. Every offset of a k x k square
+    makes the usual depthwise convolution; a sparse set reaches far for few weights. No bias."""
+
+    weight: jax.Array
+    taps: tuple[tuple[int, int], ...] = eqx.field(static=True)
+
+    def __init__(
+        self, channels: int, taps: tuple[tuple[int, int], ...], *, key: jax.Array
+    ):
+        self.taps = tuple((int(dy), int(dx)) for dy, dx in taps)
+        if len(set(self.taps)) != len(self.taps) or not self.taps:
+            raise ValueError(f"taps are distinct offsets, at least one: {taps}")
+        # as equinox initializes a convolution: uniform in +-1/sqrt(fan in), the fan in the taps
+        bound = 1 / math.sqrt(len(self.taps))
+        self.weight = jax.random.uniform(
+            key, (channels, len(self.taps)), minval=-bound, maxval=bound
+        )
+
+    @property
+    def kernel_size(self) -> int:
+        """The side of the smallest square filter, centred, that holds every tap."""
+        return 2 * max(max(abs(dy), abs(dx)) for dy, dx in self.taps) + 1
+
+    def dense(self) -> jax.Array:
+        """The filters as a grouped convolution's (channels, 1, k, k) kernel, zero off the taps."""
+        r = self.kernel_size // 2
+        rows, cols = (np.array(a) + r for a in zip(*self.taps, strict=True))
+        k = self.kernel_size
+        kernel = jnp.zeros((self.weight.shape[0], k, k), self.weight.dtype)
+        return kernel.at[:, rows, cols].set(self.weight)[:, None]
+
+    def __call__(self, x: jax.Array, dtype: jnp.dtype) -> jax.Array:
+        """The filters applied to `x`, computing in `dtype`."""
+        y = jax.lax.conv_general_dilated(
+            x[None].astype(dtype),
+            self.dense().astype(dtype),
+            window_strides=(1, 1),
+            padding="SAME",
+            feature_group_count=x.shape[0],
+        )
+        return y[0]
+
+
+class PreActConvNeXt(eqx.Module):
+    """ConvNeXt's block: x + project(relu(expand(norm(depthwise(x))))), a depthwise filter of the
+    trunk itself (see `Depthwise`), one normalization, then a per-square MLP of 1x1 convolutions
+    through `hidden` channels. With global pooling, the last `pool_channels` of the normalized
+    features, pooled over the board, bias the hidden channels. project starts at zero (see
+    `zeroed`)."""
+
+    dw: Depthwise
+    norm: Norm
+    expand: eqx.nn.Conv2d
+    pool_linear: eqx.nn.Linear | None
+    project: eqx.nn.Conv2d
+    pool_channels: int = eqx.field(static=True)
+
+    def __init__(
+        self,
+        channels: int,
+        hidden: int,
+        taps: tuple[tuple[int, int], ...],
+        pool_channels: int = 0,
+        *,
+        key: jax.Array,
+        make_norm: NormMaker,
+        stats: Stats,
+    ):
+        """
+        Args:
+            channels: number of channels
+            hidden: the MLP's hidden channels
+            taps: the depthwise filters' offsets (see `Depthwise`)
+            pool_channels: normalized channels pooled over the board to bias the hidden ones, 0
+                for no global pooling bias
+            key: rng used to initialize parameters
+            make_norm: makes the normalization (see `norm_maker`)
+            stats: unused: the normalization needs none
+        """
+        keys = jax.random.split(key, 4)
+        self.dw = Depthwise(channels, taps, key=keys[0])
+        self.norm = make_norm(channels, stats, self.dw.kernel_size)
+        self.expand = conv(channels, hidden, 1, keys[1])
+        self.pool_linear = (
+            eqx.nn.Linear(2 * pool_channels, hidden, key=keys[2])
+            if pool_channels
+            else None
+        )
+        self.project = zeroed(conv(hidden, channels, 1, keys[3]))
+        self.pool_channels = pool_channels
+
+    def __call__(
+        self, x: jax.Array, state: eqx.nn.State, dtype: jnp.dtype
+    ) -> tuple[jax.Array, eqx.nn.State]:
+        y = self.dw(x, dtype)
+        y, state = norm_act(self.norm, y, state, dtype, relu=False)
+        h = convolve(self.expand, y, dtype)
+        if self.pool_linear is not None:
+            bias = self.pool_linear(board_pool(y[-self.pool_channels :]))
+            h = h + bias.reshape(-1, 1, 1).astype(h.dtype)
+        y = convolve(self.project, jax.nn.relu(h), dtype)
+        return x + y.astype(x.dtype), state
+
+
+Block = (
+    ResidualBlock | BottleneckBlock | PreActBlock | PreActBottleneck | PreActConvNeXt
+)
 
 
 def checkpointed(
@@ -755,7 +890,7 @@ class AZResnet(eqx.Module):
 
         # residual blocks: the global pooling channels of each basic block, counting those inside
         # bottleneck blocks
-        inner = 1 if config.block == "basic" else config.bottleneck_inner
+        inner = config.bottleneck_inner if config.block == "bottleneck" else 1
         pool_channels = [
             config.pool_channels
             if config.pool_every and (i + 1) % config.pool_every == 0
@@ -766,7 +901,25 @@ class AZResnet(eqx.Module):
         basic, bottleneck = (
             (PreActBlock, PreActBottleneck) if pre else (ResidualBlock, BottleneckBlock)
         )
-        if config.block == "basic":
+        if config.block == "convnext":
+            if not pre:
+                raise ValueError('block="convnext" needs layout="pre"')
+            taps = config.dw_taps or square_taps(config.dw_kernel)
+            self.blocks = [
+                PreActConvNeXt(
+                    channels,
+                    config.expand * channels,
+                    taps,
+                    pool,
+                    key=k,
+                    make_norm=make_norm,
+                    stats=block_stats,
+                )
+                for pool, k, block_stats in zip(
+                    pool_channels, block_keys, stats[:-1], strict=True
+                )
+            ]
+        elif config.block == "basic":
             self.blocks = [
                 basic(channels, pool, key=k, make_norm=make_norm, stats=block_stats)
                 for pool, k, block_stats in zip(

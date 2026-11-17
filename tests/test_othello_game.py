@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "examples" / "othello"))
 
 from game import (
     PASS,
+    RAY_TAPS,
     SYMMETRY_TRANSFORM_FNS,
     WEIGHT_DECAY,
     env,
@@ -23,6 +24,7 @@ from game import (
 )
 
 from core.memory.replay_memory import BaseExperience
+from core.networks.azresnet import AZResnet, Depthwise, PreActConvNeXt
 
 
 def save_checkpoint(path: Path, net: str):
@@ -174,3 +176,85 @@ def test_constant_rate_is_the_cosine_to_itself_and_its_program_ignores_run_lengt
         assert jax.tree.structure(state) == jax.tree.structure(expected_state)
         for a, b in zip(jax.tree.leaves(p), jax.tree.leaves(expected), strict=True):
             np.testing.assert_array_equal(a, b)
+
+
+def on_a_line(dy: int, dx: int) -> bool:
+    return dy == 0 or dx == 0 or abs(dy) == abs(dx)
+
+
+def test_ray_taps_are_the_lines_through_a_square():
+    taps = set(RAY_TAPS)
+    assert len(taps) == len(RAY_TAPS) == 57
+    assert taps == {
+        (dy, dx) for dy in range(-7, 8) for dx in range(-7, 8) if on_a_line(dy, dx)
+    }
+
+
+RAY_NET = (
+    "resnet:2x8,heads=pooled,layout=pre,block=convnext,expand=2,"
+    "pool_every=2,pool_channels=4,dw_taps=rays"
+)
+
+
+def test_a_spec_names_the_ray_taps():
+    network, state = make_network(RAY_NET)
+    assert isinstance(network, AZResnet)
+    for block in network.blocks:
+        assert isinstance(block, PreActConvNeXt) and block.dw.taps == RAY_TAPS
+    obs = jnp.zeros((3, 8, 8, 2), bool)
+    (policy, value), _ = jax.vmap(lambda o: network(o, state), axis_name="batch")(obs)
+    assert policy.shape == (3, 65) and value.shape == (3, 1)
+    with pytest.raises(ValueError, match="rays"):
+        make_network(RAY_NET.replace("=rays", "=knights"))
+
+
+def ray_filter(channels: int = 2, seed: int = 0) -> Depthwise:
+    """A filter of the ray taps, every weight random and nonzero."""
+    dw = Depthwise(channels, RAY_TAPS, key=jax.random.PRNGKey(seed))
+    weight = np.random.default_rng(seed).uniform(0.5, 1.5, dw.weight.shape)
+    return eqx.tree_at(lambda d: d.weight, dw, jnp.asarray(weight, jnp.float32))
+
+
+def test_ray_filters_reach_a_square_from_exactly_its_lines():
+    dw = ray_filter()
+    for i, j in [(0, 0), (3, 4), (7, 2)]:
+        x = np.zeros((2, 8, 8), np.float32)
+        x[:, i, j] = 1
+        y = np.asarray(dw(jnp.asarray(x), jnp.dtype("float32")))
+        reached = {(a, b) for a, b in zip(*np.nonzero(y[0]), strict=True)}
+        assert reached == {
+            (a, b) for a in range(8) for b in range(8) if on_a_line(a - i, b - j)
+        }
+
+
+@pytest.mark.parametrize("transpose", [False, True])
+@pytest.mark.parametrize("quarter_turns", range(4))
+def test_a_symmetry_of_a_ray_filter_is_a_ray_filter(quarter_turns, transpose):
+    # training maps positions through the board's symmetries (SYMMETRY_TRANSFORM_FNS): a ray
+    # filter on the image of a board is the image of another ray filter on the board, its weights
+    # the same, moved to the image's taps. The set of taps is the same under every symmetry; the
+    # weights aren't tied, so the net isn't invariant, but the augmentation stays in its family
+    def image(a):
+        a = np.swapaxes(a, -2, -1) if transpose else a
+        return np.rot90(a, quarter_turns, axes=(-2, -1))
+
+    dw = ray_filter(seed=1)
+    kernel = image(np.asarray(dw.dense())[:, 0])
+    r = dw.kernel_size // 2
+    off_taps = np.ones(kernel.shape[1:], bool)
+    for dy, dx in RAY_TAPS:
+        off_taps[dy + r, dx + r] = False
+    assert not kernel[:, off_taps].any()
+    moved = eqx.tree_at(
+        lambda d: d.weight,
+        dw,
+        jnp.asarray(np.stack([kernel[:, dy + r, dx + r] for dy, dx in RAY_TAPS], 1)),
+    )
+    x = np.random.default_rng(0).normal(size=(2, 8, 8)).astype(np.float32)
+    f32 = jnp.dtype("float32")
+
+    np.testing.assert_allclose(
+        moved(jnp.asarray(image(x).copy()), f32),
+        image(np.asarray(dw(jnp.asarray(x), f32))),
+        atol=1e-5,
+    )
