@@ -395,15 +395,20 @@ ALPHA = 0.75
 
 
 def quantize_conv(
-    c: Conv, low: np.ndarray, high: np.ndarray, smooth: bool = True
+    c: Conv,
+    low: np.ndarray,
+    high: np.ndarray,
+    smooth: bool = True,
+    alpha: float = ALPHA,
 ) -> QuantizedConv:
     """`c`, its input's channels ranging from `low` to `high`: each channel divided by a scale of
-    its own, folded into the weights, and then the whole input by one scale and zero point."""
+    its own (SmoothQuant's, `alpha`), folded into the weights, and then the whole input by one scale
+    and zero point."""
     w = c.w
     if smooth:
         reach = np.maximum(np.maximum(-low, high), 1e-3)
         weights = np.maximum(np.abs(w).max((0, 2, 3)), 1e-6)
-        channel = reach**ALPHA / weights ** (1 - ALPHA)
+        channel = reach**alpha / weights ** (1 - alpha)
         channel = f32(channel / channel.max())
     else:
         channel = np.ones(w.shape[1], np.float32)
@@ -425,9 +430,60 @@ def quantize_conv(
     return QuantizedConv(q, scale, bias, inverse, zero_point)
 
 
+def pointwise(qc: QuantizedConv, x: np.ndarray) -> np.ndarray:
+    """A quantized 1x1 convolution of (n, cin) inputs, as the C++ computes it."""
+    if x.shape[-1] % 4:
+        x = np.pad(x, ((0, 0), (0, -x.shape[-1] % 4)))
+    u = np.clip(np.rint(x * qc.inverse) + qc.zero_point, 0, 255)
+    return f32(u @ qc.q[:, :, 0, 0].T.astype(np.float32)) * qc.scale + qc.bias
+
+
+# what `searched_conv` tries: SmoothQuant's alpha, and the share of each channel's calibration range
+# that the quantization covers (beyond it, values saturate)
+ALPHAS = (0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.0)
+CLIPS = (1.0, 0.9, 0.8, 0.7, 0.6, 0.5)
+
+
+def searched_conv(
+    c: Conv, low: np.ndarray, high: np.ndarray, x: np.ndarray
+) -> QuantizedConv:
+    """`c`, a 1x1 convolution, quantized with the alpha and clip (`ALPHAS`, `CLIPS`) whose outputs on
+    `x`, (n, cin) samples of its input, are nearest the float convolution's (least squared error).
+    A ConvNeXt block's expand takes the depthwise filter's output, signed, with channels' ranges
+    many times apart and set by rare outliers, which no one setting suited: the value's error on
+    two ray-filter nets was least at alpha 1.0 for one and 0.9 for the other."""
+    want = x @ c.w[:, :, 0, 0].T + c.b
+    best, best_error = None, np.inf
+    for alpha in ALPHAS:
+        for clip in CLIPS:
+            qc = quantize_conv(c, low * clip, high * clip, alpha=alpha)
+            error = float(np.square(pointwise(qc, x) - want).mean())
+            if error < best_error:
+                best, best_error = qc, error
+    assert best is not None
+    return best
+
+
+def layer_inputs(
+    p: Program, positions: np.ndarray, names: set[str], rows: int = 16384, seed: int = 0
+) -> dict[str, np.ndarray]:
+    """Up to `rows` squares' inputs, (rows, cin), to each convolution of `names`, from `positions`."""
+    rng = np.random.default_rng(seed)
+    pick = np.sort(rng.permutation(len(positions) * 64)[:rows])
+    seen: dict[str, np.ndarray] = {}
+
+    def record(name, x):
+        if name in names:
+            seen[name] = x.reshape(-1, x.shape[-1])[pick]
+
+    float_forward(p, positions, record)
+    return seen
+
+
 def quantize(p: Program, positions: np.ndarray) -> dict[str, QuantizedConv]:
     """The convolutions quantized, by name, their inputs' ranges from `positions`, (n, 2, 8,
-    8) observations (best the leaves of the network's own searches)."""
+    8) observations (best the leaves of the network's own searches). A ConvNeXt block's 1x1s
+    search their quantization's settings on those inputs (`searched_conv`)."""
     ranges = input_ranges(p, positions)
     convs = {"stem": p.stem, "head": p.head}
     for i, b in enumerate(p.blocks):
@@ -435,8 +491,17 @@ def quantize(p: Program, positions: np.ndarray) -> dict[str, QuantizedConv]:
             convs[f"{i}.expand"], convs[f"{i}.project"] = b.expand, b.project
         else:
             convs[f"{i}.conv1"], convs[f"{i}.conv2"] = b.conv1, b.conv2
+    searched = {
+        f"{i}.{part}"
+        for i, b in enumerate(p.blocks)
+        if isinstance(b, ConvNeXtBlock)
+        for part in ("expand", "project")
+    }
+    samples = layer_inputs(p, positions[:256], searched) if searched else {}
     quantized = {
-        name: quantize_conv(c, *ranges[name])
+        name: searched_conv(c, *ranges[name], samples[name])
+        if name in searched
+        else quantize_conv(c, *ranges[name])
         for name, c in convs.items()
         if name != "stem"
     }
