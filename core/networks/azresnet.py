@@ -645,15 +645,14 @@ class Depthwise(eqx.Module):
         the squares to the squares (see `tap_index`), all channels one batched matrix product. A
         grouped convolution with a kernel as large as the grid ran 8x slower on a GPU."""
         channels, height, width = x.shape
-        index = tap_index(self.taps, height, width)
-        # one more weight, zero, for the pairs of squares no tap joins
-        weight = jnp.pad(self.weight, ((0, 0), (0, 1)))[:, index]
-        y = jnp.einsum(
-            "cpq,cq->cp",
-            weight.astype(dtype),
-            x.reshape(channels, height * width).astype(dtype),
-        )
-        return y.reshape(channels, height, width)
+        r = self.kernel_size // 2
+        padded = jnp.pad(x.astype(dtype), ((0, 0), (r, r), (r, r)))
+        weight = self.weight.astype(dtype)
+        y = jnp.zeros((channels, height, width), dtype)
+        for t, (dy, dx) in enumerate(self.taps):
+            shifted = padded[:, r + dy : r + dy + height, r + dx : r + dx + width]
+            y = y + weight[:, t, None, None] * shifted
+        return y
 
 
 @functools.cache
