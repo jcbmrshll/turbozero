@@ -32,6 +32,7 @@ from engines import (
     Egaroucid,
     GTPEngine,
     default_dir,
+    solve_exactly,
 )
 from ggs import (
     Clock,
@@ -116,17 +117,14 @@ Solve = Callable[[int, int], int]
 UNTIMED = Clock.contest(1e9)
 
 
-def endgame_solve(exact: bool) -> Solve:
-    """Our solver (`endgame.py`) on all the cores we may run on, for a position's final margin,
-    or with `exact` False, about ten times faster, a margin whose sign alone is right."""
-    from endgame import Solver
-
-    solver = Solver(threads=len(cpus()))
+def endgame_solve() -> Solve:
+    """What a match's games stopped at a depth are scored by: Neural Reversi's exact solver
+    (`engines.solve_exactly`, the fastest public one) on all the cores we may run on, for a
+    position's final margin with perfect play."""
+    threads = len(cpus())
 
     def solve(me: int, opp: int) -> int:
-        solved = solver.solve(me, opp, exact=exact)
-        assert solved is not None
-        return solved.margin
+        return solve_exactly([(me, opp)], threads)[0]
 
     return solve
 

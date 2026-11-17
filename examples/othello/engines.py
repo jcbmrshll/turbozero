@@ -1049,6 +1049,43 @@ class NeuralReversi(GTPEngine):
         return black.bit_count(), white.bit_count()
 
 
+# a row of `cli solve`'s table, "|     2 |   15   |  +00  |    0:00.002 | ...": the position's
+# number, from 1, and its exact score for the player to move
+_SOLVE_ROW = re.compile(r"\|\s*(\d+)\s*\|\s*\d+\s*\|\s*([+-]\d+)\s*\|")
+
+
+def solve_scores(text: str, positions: int) -> list[int]:
+    """The scores, in order, of `positions` positions in `cli solve`'s output."""
+    scores = {int(m[1]): int(m[2]) for m in _SOLVE_ROW.finditer(text)}
+    if sorted(scores) != list(range(1, positions + 1)):
+        raise RuntimeError(
+            f"cli solve gave {len(scores)} of {positions} scores: {text[-500:]}"
+        )
+    return [scores[i] for i in range(1, positions + 1)]
+
+
+def solve_exactly(
+    positions: Sequence[tuple[int, int]], threads: int, engine_dir: Path | None = None
+) -> list[int]:
+    """Neural Reversi's exact solves (`cli solve --exact`, the fastest public endgame solver) of
+    positions given as (the mover's discs, the opponent's): each one's final margin for the
+    player to move, with perfect play by both."""
+    engine_dir = engine_dir or NeuralReversi.default_dir()
+    with tempfile.TemporaryDirectory(prefix="nr-solve-") as tmp:
+        obf = Path(tmp) / "positions.obf"
+        obf.write_text(
+            "".join(
+                f"{board_string(me, opp, 'X', 'O', '-')} X\n" for me, opp in positions
+            )
+        )
+        done = subprocess.run(
+            [str(engine_dir / "target" / "release" / "cli"), "solve", str(obf), "--exact",
+             "--threads", str(threads), "--hash-size", "1024"],
+            cwd=engine_dir, capture_output=True, text=True, check=True,
+        )  # fmt: skip
+    return solve_scores(done.stdout, len(positions))
+
+
 class ClockedNeuralReversi(ClockedEngine):
     """Neural Reversi over GTP, on a clock of the game's seconds and no increment, told what's
     left of it before each move, in whole seconds (its `time_left` takes no fraction)."""
