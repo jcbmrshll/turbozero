@@ -70,9 +70,23 @@ using Activation = int8_t;
 using Activation = int16_t;
 #endif
 constexpr int ACTIVATION_SHIFT = NET_ISA == 3 ? 128 : 0;
+// AVX2's ConvNeXt 1x1s in bytes, as AVX-VNNI's: with AVX-VNNI, or with NET_SEVEN_BIT (level v3-7bit),
+// their inputs quantized to 0..127 so that vpmaddubsw's sums of two products never saturate (see
+// `seven_bit`)
+#if NET_ISA == 1 && (defined(__AVXVNNI__) || defined(NET_SEVEN_BIT))
+#define NET_BYTES1 1
+#else
+#define NET_BYTES1 0
+#endif
 // a ConvNeXt block's 1x1 convolutions' input, unpadded: bytes where the level multiplies bytes
-// (VNNI, AVX-VNNI, NEON's signed ones), else AVX2's 16 bits
-#if NET_ISA == 2 || (NET_ISA == 1 && defined(__AVXVNNI__))
+// (VNNI, AVX-VNNI, 7-bit AVX2, NEON's signed ones), else AVX2's 16 bits
+// the largest value a 1x1's quantized input takes
+#if NET_ISA == 1 && defined(NET_SEVEN_BIT) && !defined(__AVXVNNI__)
+constexpr int INPUT1_TOP = 127;
+#else
+constexpr int INPUT1_TOP = 255;
+#endif
+#if NET_ISA == 2 || NET_BYTES1
 using Input1 = uint8_t;
 #elif NET_ISA == 3
 using Input1 = int8_t;
@@ -115,6 +129,7 @@ struct Conv {
     std::vector<int16_t, Aligned<int16_t>> table;  // the stem's, in place of the packed weights (see `stem_table`)
     std::vector<float> inverse;  // of each input channel: its quantization is round(x * inverse) + zero_point
     int zero_point = 0;
+    int top = 255;  // the quantized input's largest value (127 for `seven_bit`'s)
 };
 
 enum NormType { NORM_NONE = 0, NORM_AFFINE = 1, NORM_CHANNEL = 2 };
@@ -636,11 +651,21 @@ inline void convolve(const Conv& c, Scratch& s, float* out, int out_stride, bool
 #endif
 }
 
+// 4 products a lane, unsigned bytes by signed bytes, added to `acc`: AVX-VNNI's vpdpbusd, or 7-bit
+// AVX2's vpmaddubsw (its inputs within 0..127, so its sums of pairs never saturate) and vpmaddwd
+NET_INLINE __m256i dot4(__m256i acc, __m256i a, __m256i w) {
+#ifdef __AVXVNNI__
+    return _mm256_dpbusd_avx_epi32(acc, a, w);
+#else
+    return _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(a, w), _mm256_set1_epi16(1)));
+#endif
+}
+
 // A ConvNeXt block's 1x1 convolution (expand or project), of `in`, its unpadded input: `S` squares
 // from `s0` by 16 outputs from `o` (2S sums, 2 weight vectors, an input broadcast at a time), each
-// output vector, acc * scale + `bias`, to `out.put(square, output, v)`. With AVX-VNNI in bytes,
-// weights [cout / 16][cin / 4][2][8 outputs][4 inputs]; without, in 16 bits (vpmaddwd), [cout /
-// 16][cin / 2][2][8][2].
+// output vector, acc * scale + `bias`, to `out.put(square, output, v)`. In bytes (`NET_BYTES1`),
+// weights [cout / 16][cin / 4][2][8 outputs][4 inputs]; else in 16 bits (vpmaddwd), [cout / 16][cin
+// / 2][2][8][2].
 template <int S, class Out>
 __attribute__((noinline)) void conv1x1_tile(const Conv& c, const Input1* in, int s0, int o, const float* bias,
                                             const Out& out) {
@@ -648,7 +673,7 @@ __attribute__((noinline)) void conv1x1_tile(const Conv& c, const Input1* in, int
     __m256i acc[S][2];
     NET_UNROLL for (int i = 0; i < S; i++) acc[i][0] = acc[i][1] = _mm256_setzero_si256();
     const Input1* row = in + (size_t)s0 * cin;
-#ifdef __AVXVNNI__
+#if NET_BYTES1
     const int8_t* w = c.packed.data() + (size_t)o * cin;
 #pragma GCC unroll 2
     for (int c4 = 0; c4 < cin / 4; c4++) {
@@ -656,8 +681,8 @@ __attribute__((noinline)) void conv1x1_tile(const Conv& c, const Input1* in, int
         const __m256i w1 = _mm256_loadu_si256((const __m256i*)(w + c4 * 64 + 32));
         NET_UNROLL for (int i = 0; i < S; i++) {
             const __m256i a = _mm256_set1_epi32(load_u32(row + i * cin + 4 * c4));
-            acc[i][0] = _mm256_dpbusd_avx_epi32(acc[i][0], a, w0);
-            acc[i][1] = _mm256_dpbusd_avx_epi32(acc[i][1], a, w1);
+            acc[i][0] = dot4(acc[i][0], a, w0);
+            acc[i][1] = dot4(acc[i][1], a, w1);
         }
     }
 #else
@@ -679,8 +704,9 @@ __attribute__((noinline)) void conv1x1_tile(const Conv& c, const Input1* in, int
     }
 }
 
-// squares a tile: with AVX-VNNI 6 (12 sums); without, 4, as vpmaddwd's products take registers of
-// their own before they're added (6 spilled sums to the stack: 1x1s 30% slower on Zen 5)
+// squares a tile: with AVX-VNNI 6 (12 sums); without, 4, as vpmaddwd's (or vpmaddubsw's) products
+// take registers of their own before they're added (6 spilled sums to the stack: 1x1s 30% slower on
+// Zen 5; 7-bit timed the same at 3 to 6)
 #ifdef __AVXVNNI__
 constexpr int TILE1 = 6;
 #else
@@ -1175,7 +1201,7 @@ struct Quantizer {
     // rounding and then clamping to 0 to 255 does (rounding keeps the order, and the bounds are whole),
     // infinities included; a NaN, which max takes as its second operand, to 0
     explicit Quantizer(const Conv& c)
-        : inverse(c.inverse.data()), low(_mm256_set1_ps((float)-c.zero_point)), high(_mm256_set1_ps(255.0f - c.zero_point)),
+        : inverse(c.inverse.data()), low(_mm256_set1_ps((float)-c.zero_point)), high(_mm256_set1_ps((float)(c.top - c.zero_point))),
           zero_point(_mm256_set1_epi32(c.zero_point)) {}
     __m256i integers(__m256 v, int ch, int n = 8) const {
         __m256 t = _mm256_mul_ps(v, load8(inverse + ch, n));
@@ -2032,7 +2058,7 @@ inline void pack1x1(Conv& c, const int8_t* q) {
                     for (int k = 0; k < 4; k++) c.packed.push_back(weight(o0 + 16 * r + o, 4 * c4 + k));
         o0 += 16 * ro;
     }
-#elif NET_ISA == 1 && defined(__AVXVNNI__)
+#elif NET_BYTES1
     c.packed.clear();
     for (int o0 = 0; o0 < c.cout; o0 += 16)
         for (int c4 = 0; c4 < cin / 4; c4++)
@@ -2049,6 +2075,25 @@ inline void pack1x1(Conv& c, const int8_t* q) {
 #else
     (void)weight;
 #endif
+}
+
+// A ConvNeXt 1x1's input quantized to 0..127 instead of 0..255 (level v3-7bit, see `NET_BYTES1`): its
+// inverse, zero point, scale and bias for that grid, from those for 255 levels; `q`, (cout, cin), its
+// weights
+inline void seven_bit(Conv& c, const int8_t* q) {
+    const float r = 127.0f / 255.0f;
+    const int zero_point = (int)std::lround(c.zero_point * r);
+    for (auto& v : c.inverse) v *= r;
+    for (int o = 0; o < c.cout; o++) {
+        int sum = 0;
+        for (int i = 0; i < c.cin; i++) sum += q[(size_t)o * c.cin + i];
+        // the float bias, b - scale * zero point * sum, for the new scale and zero point
+        const float scale = c.scale[o] / r;
+        c.bias[o] = c.bias[o] + c.scale[o] * (float)c.zero_point * sum - scale * (float)zero_point * sum;
+        c.scale[o] = scale;
+    }
+    c.zero_point = zero_point;
+    c.top = 127;
 }
 
 }  // namespace net

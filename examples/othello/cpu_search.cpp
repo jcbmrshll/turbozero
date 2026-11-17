@@ -952,6 +952,9 @@ int net_set_conv(net::Net* n, const char* where, int block, int cin, int cout, i
     c->bias.assign(bias, bias + cout);
     c->inverse.assign(inverse, inverse + cin);
     c->zero_point = zero_point;
+#ifdef NET_SEVEN_BIT
+    if (name == "expand" || name == "project") net::seven_bit(*c, q);
+#endif
     return 0;
 }
 

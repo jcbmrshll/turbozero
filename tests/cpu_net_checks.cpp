@@ -457,7 +457,7 @@ static void check_conv1x1() {
             std::vector<int> value((size_t)SQUARES * cin);
             for (int sq = 0; sq < SQUARES; sq++)
                 for (int i = 0; i < cin; i++) {
-                    value[(size_t)sq * cin + i] = (int)(rng() % 256);
+                    value[(size_t)sq * cin + i] = (int)(rng() % (INPUT1_TOP + 1));
                     in[input1_at(sq, i, cin)] = (Input1)(value[(size_t)sq * cin + i] - ACTIVATION_SHIFT);
                 }
             std::vector<float> x((size_t)SQUARES * cout), want(x.size());

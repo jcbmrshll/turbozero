@@ -11,6 +11,8 @@ LEVELS = {
     # x86-64-v3 and AVX-VNNI (Intel's client chips from Alder Lake, which have no AVX-512)
     "v3-vnni": ["-march=x86-64-v3", "-mavxvnni", "-mtune=generic"],
     "v3": ["-march=x86-64-v3", "-mtune=generic"],
+    # v3 with ConvNeXt blocks' 1x1 inputs in 7 bits, in bytes (vpmaddubsw): never picked by itself
+    "v3-7bit": ["-march=x86-64-v3", "-mtune=generic", "-DNET_SEVEN_BIT"],
     "v2": ["-march=x86-64-v2", "-mtune=generic"],
     # ARMv8.2 with the dot product and the 8-bit matrix multiply: Apple's M2 on, AWS Graviton 3 on,
     # Google's Axion
@@ -33,6 +35,8 @@ NEEDS = {
         },
         "v3-vnni": V3 | {"avx_vnni"},
         "v3": V3,
+        # after v3, which needs as much: picked only by $TURBOZERO_CPU_LEVEL
+        "v3-7bit": V3,
         "v2": set(),
     },
     "arm": {"arm-i8mm": {"asimddp", "i8mm"}, "arm-dotprod": {"asimddp"}, "arm": set()},

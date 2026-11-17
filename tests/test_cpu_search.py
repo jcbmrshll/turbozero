@@ -1030,7 +1030,9 @@ def test_the_native_network_computes_its_quantized_layers(
     assert np.abs(logits - float_logits).mean() < 0.05
 
 
-@pytest.mark.parametrize("level", ["v4", "v3-vnni", "v3", "arm-i8mm", "arm-dotprod"])
+@pytest.mark.parametrize(
+    "level", ["v4", "v3-vnni", "v3", "v3-7bit", "arm-i8mm", "arm-dotprod"]
+)
 def test_the_native_networks_pieces_compute_as_plainer_code_does(level, tmp_path):
     # its sums of many squares or outputs at once, bit for bit as one at a time, the stem's table as
     # its convolution, and its 3x3 convolutions as their sums taken directly (`cpu_net_checks.cpp`)
@@ -1068,6 +1070,29 @@ def test_avx_vnni_sums_as_avx2_does(spec, monkeypatch):
         cpu_net.NativeNet(program, quantized, lib).forward(x) for lib in libs
     ]
     assert np.array_equal(logits, want_logits) and np.array_equal(values, want_values)
+
+
+@pytest.mark.parametrize("spec", NATIVE_SPECS[1:2] + CONVNEXT_SPECS)
+def test_seven_bit_avx2_changes_only_convnext_blocks(spec, monkeypatch):
+    import cpu_net
+
+    # level v3-7bit: ConvNeXt blocks' 1x1 inputs on half the grid (for vpmaddubsw), close to the
+    # float network still; basic blocks as v3's, bit for bit
+    libs = [library(level, monkeypatch) for level in ("v3-7bit", "v3")]
+    program = cpu_net.extract(*random_network(spec))
+    x = (np.random.default_rng(0).random((48, 2, 8, 8)) < 0.3).astype(np.float32)
+    quantized = cpu_net.quantize(program, x)
+    (logits, values), (want_logits, want_values) = [
+        cpu_net.NativeNet(program, quantized, lib).forward(x) for lib in libs
+    ]
+    if spec in NATIVE_SPECS:
+        assert np.array_equal(logits, want_logits)
+        assert np.array_equal(values, want_values)
+        return
+    float_logits, float_values = cpu_net.float_forward(program, x)
+    eight_bit = np.abs(want_logits - float_logits).mean()
+    assert np.abs(logits - float_logits).mean() < max(3 * eight_bit, 0.02)
+    assert np.abs(values - float_values).mean() < 0.05
 
 
 def test_an_engine_of_the_native_network_searches_as_a_batch_of_one():
