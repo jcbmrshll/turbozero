@@ -4,6 +4,10 @@ training on calibration positions (`quantize`), and saved, so that play needs ne
 OpenVINO.
 
     uv run examples/othello/cpu_net.py --net 8x128-128s-8p-w1125-274m --positions LEAVES.npy
+    uv run examples/othello/cpu_net.py --checkpoint RUN/avg4/210.eqx --spec SPEC --positions LEAVES.npy
+
+A checkpoint outside the league is saved under the name evaluate.py's checkpoint= player looks for
+(its directory and file names, avg4-210), or --name, as its net= gives it.
 
 Each convolution of the trunk takes 8-bit inputs, scaled for the whole tensor by the minimum and
 maximum seen in calibration (with a zero point when the minimum is below 0), and 8-bit weights
@@ -736,7 +740,10 @@ def load_native(name: str) -> NativeNet:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
-    parser.add_argument("--net", nargs="+", required=True)
+    parser.add_argument("--net", nargs="+", default=[], help="the league's networks")
+    parser.add_argument("--checkpoint", type=Path, help="or a checkpoint, of --spec")
+    parser.add_argument("--spec")
+    parser.add_argument("--name", help="the checkpoint's name (see above)")
     parser.add_argument(
         "--positions", type=Path, required=True, help="calibration .npy"
     )
@@ -744,9 +751,17 @@ def main() -> None:
     args = parser.parse_args()
     from bench_cpu_backends import network_path
 
+    nets = [(name, *network_path(name)) for name in args.net]
+    if args.checkpoint is not None:
+        if args.spec is None:
+            parser.error("--checkpoint needs its network's --spec")
+        checkpoint = args.checkpoint.expanduser()
+        name = args.name or f"{checkpoint.parent.name}-{checkpoint.stem}"
+        nets.append((name, str(checkpoint), args.spec))
+    if not nets:
+        parser.error("--net or --checkpoint")
     positions = np.load(args.positions)[: args.calibration]
-    for name in args.net:
-        path, net = network_path(name)
+    for name, path, net in nets:
         program = extract_checkpoint(path, net)
         save(native_path(name), program, quantize(program, positions))
         print(native_path(name), flush=True)
