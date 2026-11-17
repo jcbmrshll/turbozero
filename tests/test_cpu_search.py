@@ -617,6 +617,9 @@ def test_a_player_parses_random_symmetry():
         "fixed",
         "ws",
         *(f"{norm},layout=pre" for norm in ("batch", "layer", "channel", "rms")),
+        # ConvNeXt blocks: BatchNorm folded into the ray filters, or a normalization after them
+        "batch,layout=pre,block=convnext,dw_taps=rays",
+        "layer,layout=pre,block=convnext,dw_kernel=3,expand=3",
     ],
 )
 def test_export_matches_the_network(norm):
@@ -973,9 +976,15 @@ NATIVE_SPECS = [
     # and the post layout's residual normalized
     "resnet:2x48,pool_every=2,heads=pooled,pool_channels=24,head_channels=16,norm=channel",
 ]
+# ConvNeXt blocks: Othello's ray filters, and a square filter at a width off multiples of 32 with
+# pooled channels off multiples of 16
+CONVNEXT_SPECS = [
+    "resnet:3x64,pool_every=2,heads=pooled,pool_channels=16,layout=pre,block=convnext,expand=2,dw_taps=rays",
+    "resnet:2x48,pool_every=1,heads=pooled,pool_channels=8,head_channels=16,layout=pre,block=convnext,expand=3,dw_kernel=5",
+]
 
 
-@pytest.mark.parametrize("spec", NATIVE_SPECS)
+@pytest.mark.parametrize("spec", NATIVE_SPECS + CONVNEXT_SPECS)
 def test_the_native_networks_layers_compute_the_network(spec):
     import cpu_net
     from cpu_search import ort_eval, ort_session
@@ -995,7 +1004,7 @@ def test_the_native_networks_layers_compute_the_network(spec):
 # each convolution kernel: AVX-512 VNNI's, AVX-VNNI's, AVX2's Winograd, and NEON's with
 # i8mm and with the dot product alone
 @pytest.mark.parametrize("level", ["v4", "v3-vnni", "v3", "arm-i8mm", "arm-dotprod"])
-@pytest.mark.parametrize("spec", NATIVE_SPECS)
+@pytest.mark.parametrize("spec", NATIVE_SPECS + CONVNEXT_SPECS)
 def test_the_native_network_computes_its_quantized_layers(
     spec, level, tmp_path, monkeypatch
 ):
@@ -1046,7 +1055,7 @@ def test_the_native_networks_pieces_compute_as_plainer_code_does(level, tmp_path
     assert result.returncode == 0, result.stdout
 
 
-@pytest.mark.parametrize("spec", NATIVE_SPECS)
+@pytest.mark.parametrize("spec", NATIVE_SPECS + CONVNEXT_SPECS)
 def test_avx_vnni_sums_as_avx2_does(spec, monkeypatch):
     import cpu_net
 

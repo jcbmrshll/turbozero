@@ -70,6 +70,24 @@ using Activation = int8_t;
 using Activation = int16_t;
 #endif
 constexpr int ACTIVATION_SHIFT = NET_ISA == 3 ? 128 : 0;
+// a ConvNeXt block's 1x1 convolutions' input, unpadded: bytes where the level multiplies bytes
+// (VNNI, AVX-VNNI, NEON's signed ones), else AVX2's 16 bits
+#if NET_ISA == 2 || (NET_ISA == 1 && defined(__AVXVNNI__))
+using Input1 = uint8_t;
+#elif NET_ISA == 3
+using Input1 = int8_t;
+#else
+using Input1 = int16_t;
+#endif
+// where square `s`'s channel `ch` goes in such an input of `cin` channels: (64, cin), or for i8mm in
+// pairs of neighbouring squares, (32 pairs, cin / 8, 2 squares, 8 channels), as smmla takes them
+inline size_t input1_at(int s, int ch, int cin) {
+#if NET_ISA == 3 && defined(__ARM_FEATURE_MATMUL_INT8)
+    return ((size_t)(s >> 1) * (cin >> 3) + (ch >> 3)) * 16 + (s & 1) * 8 + (ch & 7);
+#else
+    return (size_t)s * cin + ch;
+#endif
+}
 
 // an allocator of memory 64-byte aligned, for vector loads that don't straddle cache lines
 template <class T>
@@ -119,11 +137,24 @@ struct Linear {
     std::vector<float, Aligned<float>> packed;
 };
 
+// a depthwise filter in float, each channel on its own (a ConvNeXt block's, its BatchNorm folded
+// in): y = bias + the taps' products in order, those off the board adding nothing
+struct Depthwise {
+    std::vector<int> dy, dx;  // each tap's offset, in order of dy, then dx
+    std::vector<float, Aligned<float>> w;  // (taps, channels)
+    std::vector<float, Aligned<float>> bias;  // (channels)
+};
+
+// A basic block (conv1, conv2), or with `convnext` ConvNeXt's (pre layout only): x + project(relu(
+// expand(y) + pool bias)), y = dw(x), the pool bias from the last `pool_channels` of y.
 struct Block {
     Conv conv1, conv2;
     Norm norm1, norm2;
     int pool_channels = 0;
     Linear pool;
+    bool convnext = false;
+    Depthwise dw;
+    Conv expand, project;
 };
 
 struct Net {
@@ -169,8 +200,13 @@ struct Scratch {
     std::vector<uint8_t, Aligned<uint8_t>> bytes;  // AVX-VNNI: `padded` as bytes
     // i8mm: the padded input in pairs of neighbouring squares, from even and from odd columns
     std::vector<int8_t, Aligned<int8_t>> pairs;
+    // a ConvNeXt block's expand's and project's inputs (see `input1`)
+    std::vector<Input1, Aligned<Input1>> expand_in, project_in;
     explicit Scratch(const Net& n) {
-        int c = std::max(n.channels, 4);
+        int c = std::max(n.channels, 4), hidden = 0;
+        for (const Block& b : n.blocks) hidden = std::max(hidden, b.expand.cout);
+        expand_in.assign((size_t)SQUARES * c + 64, 0);
+        project_in.assign((size_t)SQUARES * hidden + 64, 0);
         // and room for NEON's loads of 16 channels past the last square's
         padded.assign((size_t)PADDED * c + 16, 0);
 #if NET_ISA == 1 && defined(__AVXVNNI__)
@@ -294,6 +330,42 @@ inline void convolve(const Conv& c, Scratch& s, float* out, int out_stride, bool
         const int8_t* w = c.packed.data() + (size_t)pairs * taps * c4n * 128;
         for (int y = 0; y < 8; y++) conv_row<3, 1>(c, w, in, y, 32 * pairs, out, out_stride, add);
     }
+}
+
+// A ConvNeXt block's 1x1 convolution (expand or project), of `in`, its unpadded input (`input1_at`):
+// `S` squares from `s0` by `RO` blocks of 16 outputs from `o`, as the 3x3's tile (8 squares by 2
+// blocks: 16 sums, 8 broadcast inputs, 2 weight vectors). Each output vector, acc * scale + `bias`,
+// goes to `out.put(square, output, v)`. Weights [cout / 32][cin / 4][2][16][4], the last 16 alone.
+template <int S, int RO, class Out>
+__attribute__((noinline)) void conv1x1_tile(const Conv& c, const int8_t* w, const uint8_t* in, int s0, int o,
+                                            const float* bias, const Out& out) {
+    const int cin = c.cin;
+    __m512i acc[S][RO];
+    NET_UNROLL for (int i = 0; i < S; i++) NET_UNROLL for (int r = 0; r < RO; r++) acc[i][r] = _mm512_setzero_si512();
+    const uint8_t* row = in + (size_t)s0 * cin;
+#pragma GCC unroll 2
+    for (int c4 = 0; c4 < cin / 4; c4++) {
+        __m512i wv[RO];
+        NET_UNROLL for (int r = 0; r < RO; r++) wv[r] = _mm512_loadu_si512(w + (c4 * RO + r) * 64);
+        NET_UNROLL for (int i = 0; i < S; i++) {
+            const __m512i a = _mm512_set1_epi32(load_u32(row + i * cin + 4 * c4));
+            NET_UNROLL for (int r = 0; r < RO; r++) acc[i][r] = _mm512_dpbusd_epi32(acc[i][r], a, wv[r]);
+        }
+    }
+    NET_UNROLL for (int r = 0; r < RO; r++) {
+        const __m512 m = _mm512_loadu_ps(c.scale.data() + o + 16 * r), b = _mm512_loadu_ps(bias + o + 16 * r);
+        NET_UNROLL for (int i = 0; i < S; i++)
+            out.put(s0 + i, o + 16 * r, _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc[i][r]), m, b));
+    }
+}
+
+template <class Out>
+inline void conv1x1(const Conv& c, const Input1* in, const float* bias, const Out& out) {
+    int o = 0;
+    for (; o + 32 <= c.cout; o += 32)
+        for (int s0 = 0; s0 < SQUARES; s0 += 8) conv1x1_tile<8, 2>(c, c.packed.data() + (size_t)o * c.cin, in, s0, o, bias, out);
+    if (o < c.cout)
+        for (int s0 = 0; s0 < SQUARES; s0 += 8) conv1x1_tile<8, 1>(c, c.packed.data() + (size_t)o * c.cin, in, s0, o, bias, out);
 }
 #elif NET_ISA == 1
 // AVX2: 3x3 convolutions by Winograd's F(2x2, 3x3) in integers (but see AVX-VNNI's below), the 1x1
@@ -550,6 +622,57 @@ inline void convolve(const Conv& c, Scratch& s, float* out, int out_stride, bool
     }
 #endif
 }
+
+// A ConvNeXt block's 1x1 convolution (expand or project), of `in`, its unpadded input: `S` squares
+// from `s0` by 16 outputs from `o` (2S sums, 2 weight vectors, an input broadcast at a time), each
+// output vector, acc * scale + `bias`, to `out.put(square, output, v)`. With AVX-VNNI in bytes,
+// weights [cout / 16][cin / 4][2][8 outputs][4 inputs]; without, in 16 bits (vpmaddwd), [cout /
+// 16][cin / 2][2][8][2].
+template <int S, class Out>
+__attribute__((noinline)) void conv1x1_tile(const Conv& c, const Input1* in, int s0, int o, const float* bias,
+                                            const Out& out) {
+    const int cin = c.cin;
+    __m256i acc[S][2];
+    NET_UNROLL for (int i = 0; i < S; i++) acc[i][0] = acc[i][1] = _mm256_setzero_si256();
+    const Input1* row = in + (size_t)s0 * cin;
+#ifdef __AVXVNNI__
+    const int8_t* w = c.packed.data() + (size_t)o * cin;
+#pragma GCC unroll 2
+    for (int c4 = 0; c4 < cin / 4; c4++) {
+        const __m256i w0 = _mm256_loadu_si256((const __m256i*)(w + c4 * 64));
+        const __m256i w1 = _mm256_loadu_si256((const __m256i*)(w + c4 * 64 + 32));
+        NET_UNROLL for (int i = 0; i < S; i++) {
+            const __m256i a = _mm256_set1_epi32(load_u32(row + i * cin + 4 * c4));
+            acc[i][0] = _mm256_dpbusd_avx_epi32(acc[i][0], a, w0);
+            acc[i][1] = _mm256_dpbusd_avx_epi32(acc[i][1], a, w1);
+        }
+    }
+#else
+    const int16_t* w = c.packed16.data() + (size_t)o * cin;
+#pragma GCC unroll 2
+    for (int c2 = 0; c2 < cin / 2; c2++) {
+        const __m256i w0 = load16(w + c2 * 32), w1 = load16(w + c2 * 32 + 16);
+        NET_UNROLL for (int i = 0; i < S; i++) {
+            const __m256i a = _mm256_set1_epi32(load_u32(row + i * cin + 2 * c2));
+            acc[i][0] = multiply_add(acc[i][0], a, w0);
+            acc[i][1] = multiply_add(acc[i][1], a, w1);
+        }
+    }
+#endif
+    NET_UNROLL for (int r = 0; r < 2; r++) {
+        const __m256 m = _mm256_loadu_ps(c.scale.data() + o + 8 * r), b = _mm256_loadu_ps(bias + o + 8 * r);
+        NET_UNROLL for (int i = 0; i < S; i++)
+            out.put(s0 + i, o + 8 * r, _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc[i][r]), m, b));
+    }
+}
+
+template <class Out>
+inline void conv1x1(const Conv& c, const Input1* in, const float* bias, const Out& out) {
+    for (int o = 0; o < c.cout; o += 16) {
+        for (int s0 = 0; s0 < 60; s0 += 6) conv1x1_tile<6>(c, in, s0, o, bias, out);
+        conv1x1_tile<4>(c, in, 60, o, bias, out);
+    }
+}
 #elif NET_ISA == 3 && defined(__ARM_FEATURE_MATMUL_INT8)
 // NEON with i8mm (ARMv8.6; Apple's M2 on, Graviton 3 on, Axion): smmla multiplies a 2x8 block of
 // inputs, two neighbouring squares' 8 channels, by a 2x8 block of weights, two outputs' 8 channels,
@@ -655,6 +778,54 @@ inline void convolve(const Conv& c, Scratch& s, float* out, int out_stride, bool
     for (int g = 0; g < c.cout / 8; g++)
         for (int y = 0; y < 8; y++) conv_row<3>(c, c.packed.data() + g * group, pairs, y, 8 * g, out, out_stride, add);
 }
+
+// A ConvNeXt block's 1x1 convolution (expand or project), of `in`, its input in pairs of squares
+// (`input1_at`): 4 pairs from `p0` by 8 outputs from `o`, as the 3x3's tile, the sums starting at
+// the offsets; each output vector, acc * scale + `bias`, to `out.put(square, output, v)`. Weights as
+// `pack`'s 1x1, [cout / 8][cin / 8][4][2][8].
+template <class Out>
+__attribute__((noinline)) void conv1x1_tile(const Conv& c, const int8_t* in, int p0, int o, const float* bias,
+                                            const Out& out) {
+    const int e = c.cin / 8;
+    const int8_t* w = c.packed.data() + (size_t)o * c.cin;
+    int32x4_t acc[4][4];
+    for (int r = 0; r < 4; r++) {
+        int64_t pair;
+        std::memcpy(&pair, c.offset.data() + o + 2 * r, 8);
+        const int32x4_t f = vreinterpretq_s32_s64(vdupq_n_s64(pair));
+        for (int i = 0; i < 4; i++) acc[i][r] = f;
+    }
+    const int8_t* row = in + (size_t)p0 * e * 16;
+    for (int k = 0; k < e; k++) {
+        int8x16_t a[4], b[4];
+        for (int i = 0; i < 4; i++) a[i] = vld1q_s8(row + ((size_t)i * e + k) * 16);
+        for (int r = 0; r < 4; r++) b[r] = vld1q_s8(w + k * 64 + r * 16);
+        for (int i = 0; i < 4; i++)
+            for (int r = 0; r < 4; r++) acc[i][r] = vmmlaq_s32(acc[i][r], a[i], b[r]);
+    }
+    const float32x4_t m0 = vld1q_f32(c.scale.data() + o), m1 = vld1q_f32(c.scale.data() + o + 4);
+    const float32x4_t b0 = vld1q_f32(bias + o), b1 = vld1q_f32(bias + o + 4);
+    for (int i = 0; i < 4; i++)
+        for (int sq = 0; sq < 2; sq++) {
+            int32x4_t lo, hi;
+            if (sq == 0) {
+                lo = vreinterpretq_s32_s64(vzip1q_s64(vreinterpretq_s64_s32(acc[i][0]), vreinterpretq_s64_s32(acc[i][1])));
+                hi = vreinterpretq_s32_s64(vzip1q_s64(vreinterpretq_s64_s32(acc[i][2]), vreinterpretq_s64_s32(acc[i][3])));
+            } else {
+                lo = vreinterpretq_s32_s64(vzip2q_s64(vreinterpretq_s64_s32(acc[i][0]), vreinterpretq_s64_s32(acc[i][1])));
+                hi = vreinterpretq_s32_s64(vzip2q_s64(vreinterpretq_s64_s32(acc[i][2]), vreinterpretq_s64_s32(acc[i][3])));
+            }
+            const int s = 2 * (p0 + i) + sq;
+            out.put(s, o, vfmaq_f32(b0, vcvtq_f32_s32(lo), m0));
+            out.put(s, o + 4, vfmaq_f32(b1, vcvtq_f32_s32(hi), m1));
+        }
+}
+
+template <class Out>
+inline void conv1x1(const Conv& c, const Input1* in, const float* bias, const Out& out) {
+    for (int o = 0; o < c.cout; o += 8)
+        for (int p0 = 0; p0 < SQUARES / 2; p0 += 4) conv1x1_tile(c, in, p0, o, bias, out);
+}
 #else
 // NEON with the dot product: the board's row of 8 squares by 8 outputs, 16 sums, 8 squares' inputs of 16
 // channels and 2 weight vectors, 26 of its 32 registers, each weight used 8 times. An sdot multiplies 4
@@ -707,6 +878,44 @@ inline void convolve(const Conv& c, Scratch& s, float* out, int out_stride, bool
             if (c.k == 3) conv_row<3>(c, c.packed.data() + g * group, in, y, 8 * g, out, out_stride, add);
             else conv_row<1>(c, c.packed.data() + g * group, in, y, 8 * g, out, out_stride, add);
         }
+}
+
+// A ConvNeXt block's 1x1 convolution (expand or project), of `in`, its unpadded input: 8 squares
+// from `s0` by 8 outputs from `o`, as the 3x3's tile; each output vector, acc * scale + `bias`, to
+// `out.put(square, output, v)`. Weights as `pack`'s, [cout / 8][cin / 4][8][4]; cin a multiple of 16.
+template <class Out>
+__attribute__((noinline)) void conv1x1_tile(const Conv& c, const int8_t* in, int s0, int o, const float* bias,
+                                            const Out& out) {
+    const int cin = c.cin, steps = cin / 4;
+    const int8_t* w = c.packed.data() + (size_t)o * cin;
+    const int8_t* row = in + (size_t)s0 * cin;
+    int32x4_t acc[8][2];
+    for (int i = 0; i < 8; i++) acc[i][0] = acc[i][1] = vdupq_n_s32(0);
+    for (int j = 0; j < steps; j += 4) {
+        int8x16_t a[8];
+        for (int i = 0; i < 8; i++) a[i] = vld1q_s8(row + i * cin + 4 * j);
+#define NET_LANE(L)                                                                              \
+        {                                                                                        \
+            const int8x16_t w0 = vld1q_s8(w + (j + L) * 32), w1 = vld1q_s8(w + (j + L) * 32 + 16); \
+            for (int i = 0; i < 8; i++) {                                                        \
+                acc[i][0] = vdotq_laneq_s32(acc[i][0], w0, a[i], L);                             \
+                acc[i][1] = vdotq_laneq_s32(acc[i][1], w1, a[i], L);                             \
+            }                                                                                    \
+        }
+        NET_LANE(0) NET_LANE(1) NET_LANE(2) NET_LANE(3)
+#undef NET_LANE
+    }
+    for (int r = 0; r < 2; r++) {
+        const int32x4_t offset = vld1q_s32(c.offset.data() + o + 4 * r);
+        const float32x4_t m = vld1q_f32(c.scale.data() + o + 4 * r), b = vld1q_f32(bias + o + 4 * r);
+        for (int i = 0; i < 8; i++) out.put(s0 + i, o + 4 * r, vfmaq_f32(b, vcvtq_f32_s32(vaddq_s32(acc[i][r], offset)), m));
+    }
+}
+
+template <class Out>
+inline void conv1x1(const Conv& c, const Input1* in, const float* bias, const Out& out) {
+    for (int o = 0; o < c.cout; o += 8)
+        for (int s0 = 0; s0 < SQUARES; s0 += 8) conv1x1_tile(c, in, s0, o, bias, out);
 }
 #endif
 
@@ -810,12 +1019,14 @@ struct Quantizer {
     __m512i zero_point;
     explicit Quantizer(const Conv& c) : inverse(c.inverse.data()), zero_point(_mm512_set1_epi32(c.zero_point)) {}
     // the first `n` lanes of `v`, channels `ch` on, into the square's place `q`
-    void operator()(__m512 v, int ch, Activation* q, int n = 16) const {
+    void operator()(__m512 v, int ch, Activation* q, int n = 16) const { put(v, ch, q + ch, n); }
+    // the same, to `at`
+    void put(__m512 v, int ch, Activation* at, int n = 16) const {
         __m512i i = _mm512_add_epi32(_mm512_cvtps_epi32(_mm512_mul_ps(v, load(inverse + ch, n))), zero_point);
         // at least 0, then at most 255 as it narrows
         __m128i b = _mm512_cvtusepi32_epi8(_mm512_max_epi32(i, _mm512_setzero_si512()));
-        if (n >= 16) _mm_storeu_si128((__m128i*)(q + ch), b);
-        else _mm_mask_storeu_epi8(q + ch, lanes(n), b);
+        if (n >= 16) _mm_storeu_si128((__m128i*)at, b);
+        else _mm_mask_storeu_epi8(at, lanes(n), b);
     }
     // 16 channels from `ch`, `v[1]`
     void group(const __m512* v, int ch, Activation* q) const { (*this)(v[0], ch, q); }
@@ -953,11 +1164,19 @@ struct Quantizer {
     }
     // the first `n` lanes of `v` (8, or 4: channels come in fours), channels `ch` on, into the square's
     // place `q`
-    void operator()(__m256 v, int ch, Activation* q, int n = 8) const {
+    void operator()(__m256 v, int ch, Activation* q, int n = 8) const { put(v, ch, q + ch, n); }
+    // the same, to `at`
+    void put(__m256 v, int ch, int16_t* at, int n = 8) const {
         __m256i i = integers(v, ch, n);
         __m128i packed = _mm_packs_epi32(_mm256_castsi256_si128(i), _mm256_extracti128_si256(i, 1));
-        if (n >= 8) _mm_storeu_si128((__m128i*)(q + ch), packed);
-        else _mm_storel_epi64((__m128i*)(q + ch), packed);
+        if (n >= 8) _mm_storeu_si128((__m128i*)at, packed);
+        else _mm_storel_epi64((__m128i*)at, packed);
+    }
+    // and as 8 bytes (AVX-VNNI's ConvNeXt 1x1 inputs)
+    void put(__m256 v, int ch, uint8_t* at) const {
+        __m256i i = integers(v, ch);
+        __m128i words = _mm_packs_epi32(_mm256_castsi256_si128(i), _mm256_extracti128_si256(i, 1));
+        _mm_storel_epi64((__m128i*)at, _mm_packus_epi16(words, words));
     }
     // 16 channels from `ch`, `v[2]`: both vectors narrowed at once, each 128-bit lane's 4 of each,
     // then put in order
@@ -1033,9 +1252,11 @@ struct Quantizer {
         return vqaddq_s32(vcvtnq_s32_f32(vmulq_f32(v, vld1q_f32(inverse + ch))), zero_point);
     }
     // `v`, channels `ch` to `ch + 4`, into the square's place `q`
-    void operator()(float32x4_t v, int ch, Activation* q, int = 4) const {
+    void operator()(float32x4_t v, int ch, Activation* q, int = 4) const { put(v, ch, q + ch); }
+    // the same, to `at`
+    void put(float32x4_t v, int ch, Activation* at, int = 4) const {
         int8x8_t b = vqmovn_s16(vcombine_s16(vqmovn_s32(integers(v, ch)), vdup_n_s16(0)));
-        vst1_lane_s32((int32_t*)(q + ch), vreinterpret_s32_s8(b), 0);
+        vst1_lane_s32((int32_t*)at, vreinterpret_s32_s8(b), 0);
     }
     // 16 channels from `ch`, `v[4]`
     void group(const float32x4_t* v, int ch, Activation* q) const {
@@ -1369,6 +1590,90 @@ inline void policy_logits(const Norm& n, const float* h, int stride, int H, cons
     });
 }
 
+// ConvNeXt blocks. Square `s`'s W channels from `ch`, `v`, quantized by `q` into a 1x1's input of
+// `cin` channels, `in` (see `input1_at`)
+NET_INLINE void quantize1(const Quantizer& q, F v, int s, int ch, int cin, Input1* in) { q.put(v, ch, in + input1_at(s, ch, cin)); }
+
+// expand's outputs, after a ReLU, quantized for the project into its input, `in`, of `cin` channels
+struct ExpandOut {
+    Quantizer quantize;
+    Input1* in;
+    int cin;
+    NET_INLINE void put(int s, int o, F v) const { quantize1(quantize, Lanes::relu(v), s, o, cin, in); }
+};
+
+// project's outputs, added to the trunk `x`, (64, channels)
+struct ProjectOut {
+    float* x;
+    int channels;
+    NET_INLINE void put(int s, int o, F v) const {
+        float* at = x + (size_t)s * channels + o;
+        Lanes::store(at, Lanes::add(Lanes::load(at), v));
+    }
+};
+
+// `d` of the trunk `x`, (64, C): each square's y, W channels from `ch` at a time, to `store(square,
+// ch, y)`, and the last `P` channels' means and maxima over the board to `pooled`, (2P). W channels
+// of a row of 8 squares at a time in registers, each tap's weights loaded once for the row; each
+// sum adds its taps in their order, from the bias, those off the board skipped.
+template <class Store>
+inline void depthwise(const Depthwise& d, const float* x, int C, int P, float* pooled, Store store) {
+    const int taps = (int)d.dy.size();
+    for (int ch = 0; ch < C; ch += W) {
+        const bool pool = ch + W > C - P;
+        F sum = Lanes::zero(), most = Lanes::set1(-INFINITY);
+        const F bias = Lanes::load(d.bias.data() + ch);
+        for (int y = 0; y < 8; y++) {
+            F acc[8];
+            NET_UNROLL for (int i = 0; i < 8; i++) acc[i] = bias;
+            for (int t = 0; t < taps; t++) {
+                const int yy = y + d.dy[t], dx = d.dx[t];
+                if (yy < 0 || yy >= 8) continue;
+                const F w = Lanes::load(d.w.data() + (size_t)t * C + ch);
+                NET_UNROLL for (int i = 0; i < 8; i++) if (i + dx >= 0 && i + dx < 8)
+                    acc[i] = Lanes::fma(w, Lanes::load(x + (size_t)(yy * 8 + i + dx) * C + ch), acc[i]);
+            }
+            NET_UNROLL for (int i = 0; i < 8; i++) {
+                store(y * 8 + i, ch, acc[i]);
+                if (pool) {
+                    sum = Lanes::add(sum, acc[i]);
+                    most = Lanes::most(most, acc[i]);
+                }
+            }
+        }
+        if (pool) {
+            alignas(64) float mean[W], top[W];
+            Lanes::store(mean, Lanes::mul(sum, Lanes::set1(1.0f / SQUARES)));
+            Lanes::store(top, most);
+            for (int j = std::max(C - P - ch, 0); j < W; j++) {
+                pooled[ch + j - (C - P)] = mean[j];
+                pooled[P + ch + j - (C - P)] = top[j];
+            }
+        }
+    }
+}
+
+// a ConvNeXt block, `b`, on the trunk `x`, (64, C)
+inline void convnext_block(const Block& b, Scratch& s, float* x, int C) {
+    const int P = b.pool_channels, H = b.expand.cout;
+    Input1* expand_in = s.expand_in.data();
+    Input1* project_in = s.project_in.data();
+    alignas(64) float pooled[2 * 512], bias[1024];
+    const Quantizer quantize(b.expand);
+    depthwise(b.dw, x, C, P, pooled, [&](int sq, int ch, F v) { quantize1(quantize, v, sq, ch, C, expand_in); });
+    NET_STAGE("depthwise");
+    const float* expand_bias = b.expand.bias.data();
+    if (P) {
+        linear(b.pool, pooled, bias);
+        for (int o = 0; o < H; o++) bias[o] += expand_bias[o];
+        expand_bias = bias;
+    }
+    conv1x1(b.expand, expand_in, expand_bias, ExpandOut{Quantizer(b.project), project_in, H});
+    NET_STAGE("expand");
+    conv1x1(b.project, project_in, b.project.bias.data(), ProjectOut{x, C});
+    NET_STAGE("project");
+}
+
 // The stem's convolution of the board, `obs`, (2, 8, 8), its discs 0 or 1, to `out`, (64, c.cout): each
 // square's sums are those of its 3 rows of 3 squares' discs' weights, looked up (`stem_table`). The
 // same integers as the convolution kernels sum, scaled the same way, so the same floats.
@@ -1435,6 +1740,10 @@ inline void forward(const Net& n, Scratch& s, const float* obs, float* logits, f
     NET_STAGE("stem norm");
     for (size_t i = 0; i < n.blocks.size(); i++) {
         const Block& b = n.blocks[i];
+        if (b.convnext) {
+            convnext_block(b, s, x, C);
+            continue;
+        }
         // the post layout's x is quantized for conv1 already
         if (n.pre) normalize_quantize(b.norm1, x, C, b.conv1, padded);
         NET_STAGE("norm1 quantize");
@@ -1495,9 +1804,9 @@ inline void stem_table(Conv& c, const int8_t* q) {
             }
 }
 
-inline void pack(Conv& c, const int8_t* q) {
+inline void pack(Conv& c, const int8_t* q, bool head = true) {
     const int c4n = c.cin / 4, taps = c.k * c.k;
-    if (c.k == 1 && (c.cout % 48 || c.cin % 16))
+    if (head && c.k == 1 && (c.cout % 48 || c.cin % 16))
         throw std::invalid_argument("a 1x1 convolution (the heads') takes 48s of outputs and 16s of inputs");
 #if NET_ISA == 3 && defined(__ARM_FEATURE_MATMUL_INT8)
     // for i8mm, [cout / 8][k * k][cin / 8, rounded up][4 pairs of outputs][2 outputs][8 inputs]
@@ -1596,6 +1905,46 @@ inline void pack(Conv& c, const int8_t* q) {
                         }
         o0 += 16 * ro;
     }
+}
+
+// Packs a ConvNeXt block's 1x1 convolution's weights `q`, (cout, cin), for `conv1x1`: for VNNI [cout
+// / 32][cin / 4][2][16 outputs][4 inputs], the last 16 outputs alone; for AVX-VNNI [cout / 16][cin /
+// 4][2][8][4]; for AVX2 in 16 bits, [cout / 16][cin / 2][2][8][2]; for NEON as `pack`'s.
+inline void pack1x1(Conv& c, const int8_t* q) {
+    if (c.k != 1 || c.cin % 16 || c.cout % 16)
+        throw std::invalid_argument("a ConvNeXt block's 1x1 convolutions take 16s of inputs and outputs");
+    const int cin = c.cin;
+    auto weight = [&](int o, int i) { return q[(size_t)o * cin + i]; };
+#if NET_ISA == 3
+    pack(c, q, false);
+    (void)weight;
+#elif NET_ISA == 2
+    c.packed.clear();
+    for (int o0 = 0; o0 < c.cout;) {
+        const int ro = c.cout - o0 >= 32 ? 2 : 1;
+        for (int c4 = 0; c4 < cin / 4; c4++)
+            for (int r = 0; r < ro; r++)
+                for (int o = 0; o < 16; o++)
+                    for (int k = 0; k < 4; k++) c.packed.push_back(weight(o0 + 16 * r + o, 4 * c4 + k));
+        o0 += 16 * ro;
+    }
+#elif NET_ISA == 1 && defined(__AVXVNNI__)
+    c.packed.clear();
+    for (int o0 = 0; o0 < c.cout; o0 += 16)
+        for (int c4 = 0; c4 < cin / 4; c4++)
+            for (int r = 0; r < 2; r++)
+                for (int o = 0; o < 8; o++)
+                    for (int k = 0; k < 4; k++) c.packed.push_back(weight(o0 + 8 * r + o, 4 * c4 + k));
+#elif NET_ISA == 1
+    c.packed16.clear();
+    for (int o0 = 0; o0 < c.cout; o0 += 16)
+        for (int c2 = 0; c2 < cin / 2; c2++)
+            for (int r = 0; r < 2; r++)
+                for (int o = 0; o < 8; o++)
+                    for (int k = 0; k < 2; k++) c.packed16.push_back(weight(o0 + 8 * r + o, 2 * c2 + k));
+#else
+    (void)weight;
+#endif
 }
 
 }  // namespace net
