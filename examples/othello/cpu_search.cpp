@@ -1012,6 +1012,7 @@ int net_set_depthwise(net::Net* n, int block, int taps, const int* at, const flo
     }
     b.dw.w.assign(w, w + (size_t)taps * n->channels);
     b.dw.bias.assign(bias, bias + n->channels);
+    net::prepare(b.dw);
     return 0;
 }
 

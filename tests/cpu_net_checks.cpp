@@ -412,6 +412,8 @@ static void check_depthwise() {
             }
             for (int i = 0; i < T * C; i++) d.w.push_back(any_float());
             for (int i = 0; i < C; i++) d.bias.push_back(any_float());
+            prepare(d);
+            expect(d.rays == (T == 57), "depthwise rays", T);
             std::vector<float> x((size_t)SQUARES * C), got((size_t)SQUARES * C), pooled(2 * P);
             for (auto& v : x) v = any_float();
             depthwise(d, x.data(), C, P, pooled.data(), [&](int sq, int ch, F v) { Lanes::store(got.data() + (size_t)sq * C + ch, v); });

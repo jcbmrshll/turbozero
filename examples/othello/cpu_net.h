@@ -143,7 +143,20 @@ struct Depthwise {
     std::vector<int> dy, dx;  // each tap's offset, in order of dy, then dx
     std::vector<float, Aligned<float>> w;  // (taps, channels)
     std::vector<float, Aligned<float>> bias;  // (channels)
+    // by `prepare`: whether the taps are the rays (the row, the column and both diagonals, 7
+    // squares each way, 57 taps), which `depthwise` has a kernel of its own for
+    bool rays = false;
 };
+
+// sets `d.rays`
+inline void prepare(Depthwise& d) {
+    std::vector<std::pair<int, int>> rays, taps;
+    for (int dy = -7; dy <= 7; dy++)
+        for (int dx = -7; dx <= 7; dx++)
+            if (dy == 0 || dx == 0 || dy == dx || dy == -dx) rays.emplace_back(dy, dx);
+    for (size_t t = 0; t < d.dy.size(); t++) taps.emplace_back(d.dy[t], d.dx[t]);
+    d.rays = taps == rays;
+}
 
 // A basic block (conv1, conv2), or with `convnext` ConvNeXt's (pre layout only): x + project(relu(
 // expand(y) + pool bias)), y = dw(x), the pool bias from the last `pool_channels` of y.
@@ -666,11 +679,19 @@ __attribute__((noinline)) void conv1x1_tile(const Conv& c, const Input1* in, int
     }
 }
 
+// squares a tile: with AVX-VNNI 6 (12 sums); without, 4, as vpmaddwd's products take registers of
+// their own before they're added (6 spilled sums to the stack: 1x1s 30% slower on Zen 5)
+#ifdef __AVXVNNI__
+constexpr int TILE1 = 6;
+#else
+constexpr int TILE1 = 4;
+#endif
 template <class Out>
 inline void conv1x1(const Conv& c, const Input1* in, const float* bias, const Out& out) {
     for (int o = 0; o < c.cout; o += 16) {
-        for (int s0 = 0; s0 < 60; s0 += 6) conv1x1_tile<6>(c, in, s0, o, bias, out);
-        conv1x1_tile<4>(c, in, 60, o, bias, out);
+        int s0 = 0;
+        for (; s0 + TILE1 <= SQUARES; s0 += TILE1) conv1x1_tile<TILE1>(c, in, s0, o, bias, out);
+        if (s0 < SQUARES) conv1x1_tile<SQUARES % TILE1>(c, in, s0, o, bias, out);
     }
 }
 #elif NET_ISA == 3 && defined(__ARM_FEATURE_MATMUL_INT8)
@@ -1612,45 +1633,128 @@ struct ProjectOut {
     }
 };
 
-// `d` of the trunk `x`, (64, C): each square's y, W channels from `ch` at a time, to `store(square,
-// ch, y)`, and the last `P` channels' means and maxima over the board to `pooled`, (2P). W channels
-// of a row of 8 squares at a time in registers, each tap's weights loaded once for the row; each
-// sum adds its taps in their order, from the bias, those off the board skipped.
-template <class Store>
-inline void depthwise(const Depthwise& d, const float* x, int C, int P, float* pooled, Store store) {
+// The rays' depthwise filter (see `Depthwise::rays`), a row of 8 outputs by `CV` vectors of channels
+// at a time, `acc` (vector c's output i at acc[8c + i]), `row` and `w` at the first vector's
+// channels. From the row D rows away, its 3 taps (dy, -D), (dy, 0) and (dy, D), `w` the first's
+// weights, in that order, the squares off the board skipped as the unrolled loop is compiled
+template <int D, int CV>
+NET_INLINE void ray_row(F* acc, const float* row, int C, const float* w) {
+    NET_UNROLL for (int c = 0; c < CV; c++) {
+        const F w0 = Lanes::load(w + c * W), w1 = Lanes::load(w + C + c * W), w2 = Lanes::load(w + 2 * C + c * W);
+        const float* r = row + c * W;
+        // with 32 registers the row's 8 inputs loaded once (NEON has no memory operands); AVX2's
+        // fmas take them from memory
+        F in[8];
+        if (NET_ISA != 1) NET_UNROLL for (int x = 0; x < 8; x++) in[x] = Lanes::load(r + x * C);
+        auto input = [&](int x) { return NET_ISA != 1 ? in[x] : Lanes::load(r + x * C); };
+        NET_UNROLL for (int i = 0; i < 8; i++) {
+            F& a = acc[8 * c + i];
+            if (i - D >= 0) a = Lanes::fma(w0, input(i - D), a);
+            a = Lanes::fma(w1, input(i), a);
+            if (i + D < 8) a = Lanes::fma(w2, input(i + D), a);
+        }
+    }
+}
+
+// and from the output's own row: its 15 taps (0, -7) to (0, 7), `w` the first's weights, each
+// output's in order, the input square by square
+template <int CV>
+NET_INLINE void ray_middle(F* acc, const float* row, int C, const float* w) {
+    NET_UNROLL for (int x = 0; x < 8; x++) NET_UNROLL for (int c = 0; c < CV; c++) {
+        const F v = Lanes::load(row + x * C + c * W);
+        NET_UNROLL for (int i = 0; i < 8; i++)
+            acc[8 * c + i] = Lanes::fma(Lanes::load(w + (x - i + 7) * C + c * W), v, acc[8 * c + i]);
+    }
+}
+
+// the rays' filter of the board's row `y`, CV vectors of channels from `ch`, into `acc`: only taps on
+// the board
+template <int CV>
+NET_INLINE void ray_filter_row(const Depthwise& d, const float* x, int C, int ch, int y, F* acc) {
+    const float* w = d.w.data() + ch;
+    for (int dy = -7; dy <= 7; dy++) {
+        const int yy = y + dy;
+        if (yy < 0 || yy >= 8) continue;
+        const float* row = x + (size_t)yy * 8 * C + ch;
+        if (dy == 0) {
+            ray_middle<CV>(acc, row, C, w + 21 * C);
+            continue;
+        }
+        // the row's 3 taps: rows above the middle's first, 3 each
+        const float* wt = w + (dy < 0 ? 3 * (dy + 7) : 36 + 3 * (dy - 1)) * C;
+        switch (dy < 0 ? -dy : dy) {
+            case 1: ray_row<1, CV>(acc, row, C, wt); break;
+            case 2: ray_row<2, CV>(acc, row, C, wt); break;
+            case 3: ray_row<3, CV>(acc, row, C, wt); break;
+            case 4: ray_row<4, CV>(acc, row, C, wt); break;
+            case 5: ray_row<5, CV>(acc, row, C, wt); break;
+            case 6: ray_row<6, CV>(acc, row, C, wt); break;
+            default: ray_row<7, CV>(acc, row, C, wt); break;
+        }
+    }
+}
+
+// `CV` vectors of channels from `ch` of `depthwise`'s, each sum adding its taps in their order
+template <int CV, class Store>
+NET_INLINE void depthwise_vectors(const Depthwise& d, const float* x, int C, int P, int ch, float* pooled, Store& store) {
     const int taps = (int)d.dy.size();
-    for (int ch = 0; ch < C; ch += W) {
-        const bool pool = ch + W > C - P;
-        F sum = Lanes::zero(), most = Lanes::set1(-INFINITY);
-        const F bias = Lanes::load(d.bias.data() + ch);
-        for (int y = 0; y < 8; y++) {
-            F acc[8];
-            NET_UNROLL for (int i = 0; i < 8; i++) acc[i] = bias;
-            for (int t = 0; t < taps; t++) {
-                const int yy = y + d.dy[t], dx = d.dx[t];
-                if (yy < 0 || yy >= 8) continue;
-                const F w = Lanes::load(d.w.data() + (size_t)t * C + ch);
+    bool pool[CV];
+    F sum[CV], most[CV], bias[CV];
+    NET_UNROLL for (int c = 0; c < CV; c++) {
+        pool[c] = ch + (c + 1) * W > C - P;
+        sum[c] = Lanes::zero();
+        most[c] = Lanes::set1(-INFINITY);
+        bias[c] = Lanes::load(d.bias.data() + ch + c * W);
+    }
+    for (int y = 0; y < 8; y++) {
+        F acc[8 * CV];
+        NET_UNROLL for (int c = 0; c < CV; c++) NET_UNROLL for (int i = 0; i < 8; i++) acc[8 * c + i] = bias[c];
+        if (d.rays) ray_filter_row<CV>(d, x, C, ch, y, acc);
+        else for (int t = 0; t < taps; t++) {
+            const int yy = y + d.dy[t], dx = d.dx[t];
+            if (yy < 0 || yy >= 8) continue;
+            NET_UNROLL for (int c = 0; c < CV; c++) {
+                const F w = Lanes::load(d.w.data() + (size_t)t * C + ch + c * W);
                 NET_UNROLL for (int i = 0; i < 8; i++) if (i + dx >= 0 && i + dx < 8)
-                    acc[i] = Lanes::fma(w, Lanes::load(x + (size_t)(yy * 8 + i + dx) * C + ch), acc[i]);
-            }
-            NET_UNROLL for (int i = 0; i < 8; i++) {
-                store(y * 8 + i, ch, acc[i]);
-                if (pool) {
-                    sum = Lanes::add(sum, acc[i]);
-                    most = Lanes::most(most, acc[i]);
-                }
+                    acc[8 * c + i] = Lanes::fma(w, Lanes::load(x + (size_t)(yy * 8 + i + dx) * C + ch + c * W), acc[8 * c + i]);
             }
         }
-        if (pool) {
-            alignas(64) float mean[W], top[W];
-            Lanes::store(mean, Lanes::mul(sum, Lanes::set1(1.0f / SQUARES)));
-            Lanes::store(top, most);
-            for (int j = std::max(C - P - ch, 0); j < W; j++) {
-                pooled[ch + j - (C - P)] = mean[j];
-                pooled[P + ch + j - (C - P)] = top[j];
+        NET_UNROLL for (int c = 0; c < CV; c++) NET_UNROLL for (int i = 0; i < 8; i++) {
+            store(y * 8 + i, ch + c * W, acc[8 * c + i]);
+            if (pool[c]) {
+                sum[c] = Lanes::add(sum[c], acc[8 * c + i]);
+                most[c] = Lanes::most(most[c], acc[8 * c + i]);
             }
         }
     }
+    for (int c = 0; c < CV; c++) {
+        if (!pool[c]) continue;
+        const int first = ch + c * W;
+        alignas(64) float mean[W], top[W];
+        Lanes::store(mean, Lanes::mul(sum[c], Lanes::set1(1.0f / SQUARES)));
+        Lanes::store(top, most[c]);
+        for (int j = std::max(C - P - first, 0); j < W; j++) {
+            pooled[first + j - (C - P)] = mean[j];
+            pooled[P + first + j - (C - P)] = top[j];
+        }
+    }
+}
+
+// AVX-512's and NEON's 32 registers hold two vectors' row of sums (16 chains of fmas, and the
+// rows' inputs: 9% faster on Zen 5, 10% on the M4); AVX2's 16 one's
+constexpr int DEPTHWISE_VECTORS = NET_ISA == 1 ? 1 : 2;
+
+// `d` of the trunk `x`, (64, C): each square's y, W channels from `ch` at a time, to `store(square,
+// ch, y)`, and the last `P` channels' means and maxima over the board to `pooled`, (2P). A row of 8
+// squares by `DEPTHWISE_VECTORS` vectors of channels at a time in registers, each tap's weights
+// loaded once for the row; each sum adds its taps in their order, from the bias, those off the
+// board skipped.
+template <class Store>
+inline void depthwise(const Depthwise& d, const float* x, int C, int P, float* pooled, Store store) {
+    constexpr int CV = DEPTHWISE_VECTORS;
+    int ch = 0;
+    for (; ch + CV * W <= C; ch += CV * W) depthwise_vectors<CV>(d, x, C, P, ch, pooled, store);
+    for (; ch < C; ch += W) depthwise_vectors<1>(d, x, C, P, ch, pooled, store);
 }
 
 // a ConvNeXt block, `b`, on the trunk `x`, (64, C)
