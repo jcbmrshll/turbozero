@@ -53,6 +53,7 @@ from core.training.train import (
     CollectionStats,
     Trainer,
     TrainLoopOutput,
+    _move_average,
     average_share,
     checkpoint_epochs,
     extract_params,
@@ -3554,13 +3555,16 @@ class StatelessTester(FakeTester):
 
 
 def offset_from(params, initial):
-    """The one amount every weight of `params` is above `initial`'s (as `fake_loop` trains)."""
+    """The one amount every weight of `params` is above `initial`'s (as `fake_loop` trains),
+    over the 1-dimensional ones: an average rescales the others to its network's norms (see
+    `_move_average`)."""
     gaps = np.concatenate(
         [
             (np.asarray(p, np.float64) - np.asarray(q, np.float64)).ravel()
             for p, q in zip(
                 jax.tree.leaves(params), jax.tree.leaves(initial), strict=True
             )
+            if np.ndim(p) < 2
         ]
     )
     np.testing.assert_allclose(gaps, gaps[0], atol=1e-5)
@@ -3573,6 +3577,25 @@ def test_an_averages_horizon_grows_by_an_epoch_every_warmup_epochs_up_to_its_own
         [1, 1 / 1.5, 1 / 2, 1 / 3, 1 / 4, 1 / 4]
     )
     assert [average_share(n, 1, 10) for n in range(3)] == [1, 1, 1]
+
+
+def test_an_average_follows_the_weights_direction_at_their_norm():
+    # weight decay shrinking the weights: the average's matrices take the weights' norm, in the
+    # moving average's direction; vectors (biases, normalization scales) are the plain average
+    average = {"w": jnp.array([[3.0, 0.0], [0.0, 4.0]]), "b": jnp.array([2.0, 2.0])}
+    params = {"w": jnp.array([[0.0, 1.0], [1.0, 0.0]]), "b": jnp.array([0.0, 4.0])}
+    moved = _move_average(average, params, jnp.float32(0.5))
+
+    np.testing.assert_allclose(moved["b"], [1.0, 3.0])
+    plain = 0.5 * (average["w"] + params["w"])
+    np.testing.assert_allclose(
+        moved["w"],
+        plain * np.linalg.norm(params["w"]) / np.linalg.norm(plain),
+        rtol=1e-6,
+    )
+    # a share of 1 is exactly the weights
+    exact = _move_average(average, params, jnp.float32(1.0))
+    assert all(np.array_equal(exact[k], params[k]) for k in params)
 
 
 def test_a_warmup_of_one_makes_an_average_the_mean_until_its_horizon():
