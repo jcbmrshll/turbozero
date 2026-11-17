@@ -366,7 +366,7 @@ inline void convolve(const Conv& c, Scratch& s, float* out, int out_stride, bool
 // goes to `out.put(square, output, v)`. Weights [cout / 32][cin / 4][2][16][4], the last 16 alone.
 template <int S, int RO, class Out>
 __attribute__((noinline)) void conv1x1_tile(const Conv& c, const int8_t* w, const uint8_t* in, int s0, int o,
-                                            const float* bias, const Out& out) {
+                                            const float* scale, const float* bias, const Out& out) {
     const int cin = c.cin;
     __m512i acc[S][RO];
     NET_UNROLL for (int i = 0; i < S; i++) NET_UNROLL for (int r = 0; r < RO; r++) acc[i][r] = _mm512_setzero_si512();
@@ -381,19 +381,19 @@ __attribute__((noinline)) void conv1x1_tile(const Conv& c, const int8_t* w, cons
         }
     }
     NET_UNROLL for (int r = 0; r < RO; r++) {
-        const __m512 m = _mm512_loadu_ps(c.scale.data() + o + 16 * r), b = _mm512_loadu_ps(bias + o + 16 * r);
+        const __m512 m = _mm512_loadu_ps(scale + o + 16 * r), b = _mm512_loadu_ps(bias + o + 16 * r);
         NET_UNROLL for (int i = 0; i < S; i++)
             out.put(s0 + i, o + 16 * r, _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc[i][r]), m, b));
     }
 }
 
 template <class Out>
-inline void conv1x1(const Conv& c, const Input1* in, const float* bias, const Out& out) {
+inline void conv1x1(const Conv& c, const Input1* in, const float* scale, const float* bias, const Out& out) {
     int o = 0;
     for (; o + 32 <= c.cout; o += 32)
-        for (int s0 = 0; s0 < SQUARES; s0 += 8) conv1x1_tile<8, 2>(c, c.packed.data() + (size_t)o * c.cin, in, s0, o, bias, out);
+        for (int s0 = 0; s0 < SQUARES; s0 += 8) conv1x1_tile<8, 2>(c, c.packed.data() + (size_t)o * c.cin, in, s0, o, scale, bias, out);
     if (o < c.cout)
-        for (int s0 = 0; s0 < SQUARES; s0 += 8) conv1x1_tile<8, 1>(c, c.packed.data() + (size_t)o * c.cin, in, s0, o, bias, out);
+        for (int s0 = 0; s0 < SQUARES; s0 += 8) conv1x1_tile<8, 1>(c, c.packed.data() + (size_t)o * c.cin, in, s0, o, scale, bias, out);
 }
 #elif NET_ISA == 1
 // AVX2: 3x3 convolutions by Winograd's F(2x2, 3x3) in integers (but see AVX-VNNI's below), the 1x1
@@ -667,8 +667,8 @@ NET_INLINE __m256i dot4(__m256i acc, __m256i a, __m256i w) {
 // weights [cout / 16][cin / 4][2][8 outputs][4 inputs]; else in 16 bits (vpmaddwd), [cout / 16][cin
 // / 2][2][8][2].
 template <int S, class Out>
-__attribute__((noinline)) void conv1x1_tile(const Conv& c, const Input1* in, int s0, int o, const float* bias,
-                                            const Out& out) {
+__attribute__((noinline)) void conv1x1_tile(const Conv& c, const Input1* in, int s0, int o, const float* scale,
+                                            const float* bias, const Out& out) {
     const int cin = c.cin;
     __m256i acc[S][2];
     NET_UNROLL for (int i = 0; i < S; i++) acc[i][0] = acc[i][1] = _mm256_setzero_si256();
@@ -698,7 +698,7 @@ __attribute__((noinline)) void conv1x1_tile(const Conv& c, const Input1* in, int
     }
 #endif
     NET_UNROLL for (int r = 0; r < 2; r++) {
-        const __m256 m = _mm256_loadu_ps(c.scale.data() + o + 8 * r), b = _mm256_loadu_ps(bias + o + 8 * r);
+        const __m256 m = _mm256_loadu_ps(scale + o + 8 * r), b = _mm256_loadu_ps(bias + o + 8 * r);
         NET_UNROLL for (int i = 0; i < S; i++)
             out.put(s0 + i, o + 8 * r, _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc[i][r]), m, b));
     }
@@ -713,11 +713,11 @@ constexpr int TILE1 = 6;
 constexpr int TILE1 = 4;
 #endif
 template <class Out>
-inline void conv1x1(const Conv& c, const Input1* in, const float* bias, const Out& out) {
+inline void conv1x1(const Conv& c, const Input1* in, const float* scale, const float* bias, const Out& out) {
     for (int o = 0; o < c.cout; o += 16) {
         int s0 = 0;
-        for (; s0 + TILE1 <= SQUARES; s0 += TILE1) conv1x1_tile<TILE1>(c, in, s0, o, bias, out);
-        if (s0 < SQUARES) conv1x1_tile<SQUARES % TILE1>(c, in, s0, o, bias, out);
+        for (; s0 + TILE1 <= SQUARES; s0 += TILE1) conv1x1_tile<TILE1>(c, in, s0, o, scale, bias, out);
+        if (s0 < SQUARES) conv1x1_tile<SQUARES % TILE1>(c, in, s0, o, scale, bias, out);
     }
 }
 #elif NET_ISA == 3 && defined(__ARM_FEATURE_MATMUL_INT8)
@@ -831,8 +831,8 @@ inline void convolve(const Conv& c, Scratch& s, float* out, int out_stride, bool
 // the offsets; each output vector, acc * scale + `bias`, to `out.put(square, output, v)`. Weights as
 // `pack`'s 1x1, [cout / 8][cin / 8][4][2][8].
 template <class Out>
-__attribute__((noinline)) void conv1x1_tile(const Conv& c, const int8_t* in, int p0, int o, const float* bias,
-                                            const Out& out) {
+__attribute__((noinline)) void conv1x1_tile(const Conv& c, const int8_t* in, int p0, int o, const float* scale,
+                                            const float* bias, const Out& out) {
     const int e = c.cin / 8;
     const int8_t* w = c.packed.data() + (size_t)o * c.cin;
     int32x4_t acc[4][4];
@@ -850,7 +850,7 @@ __attribute__((noinline)) void conv1x1_tile(const Conv& c, const int8_t* in, int
         for (int i = 0; i < 4; i++)
             for (int r = 0; r < 4; r++) acc[i][r] = vmmlaq_s32(acc[i][r], a[i], b[r]);
     }
-    const float32x4_t m0 = vld1q_f32(c.scale.data() + o), m1 = vld1q_f32(c.scale.data() + o + 4);
+    const float32x4_t m0 = vld1q_f32(scale + o), m1 = vld1q_f32(scale + o + 4);
     const float32x4_t b0 = vld1q_f32(bias + o), b1 = vld1q_f32(bias + o + 4);
     for (int i = 0; i < 4; i++)
         for (int sq = 0; sq < 2; sq++) {
@@ -867,9 +867,9 @@ __attribute__((noinline)) void conv1x1_tile(const Conv& c, const int8_t* in, int
 }
 
 template <class Out>
-inline void conv1x1(const Conv& c, const Input1* in, const float* bias, const Out& out) {
+inline void conv1x1(const Conv& c, const Input1* in, const float* scale, const float* bias, const Out& out) {
     for (int o = 0; o < c.cout; o += 8)
-        for (int p0 = 0; p0 < SQUARES / 2; p0 += 4) conv1x1_tile(c, in, p0, o, bias, out);
+        for (int p0 = 0; p0 < SQUARES / 2; p0 += 4) conv1x1_tile(c, in, p0, o, scale, bias, out);
 }
 #else
 // NEON with the dot product: the board's row of 8 squares by 8 outputs, 16 sums, 8 squares' inputs of 16
@@ -929,8 +929,8 @@ inline void convolve(const Conv& c, Scratch& s, float* out, int out_stride, bool
 // from `s0` by 8 outputs from `o`, as the 3x3's tile; each output vector, acc * scale + `bias`, to
 // `out.put(square, output, v)`. Weights as `pack`'s, [cout / 8][cin / 4][8][4]; cin a multiple of 16.
 template <class Out>
-__attribute__((noinline)) void conv1x1_tile(const Conv& c, const int8_t* in, int s0, int o, const float* bias,
-                                            const Out& out) {
+__attribute__((noinline)) void conv1x1_tile(const Conv& c, const int8_t* in, int s0, int o, const float* scale,
+                                            const float* bias, const Out& out) {
     const int cin = c.cin, steps = cin / 4;
     const int8_t* w = c.packed.data() + (size_t)o * cin;
     const int8_t* row = in + (size_t)s0 * cin;
@@ -951,7 +951,7 @@ __attribute__((noinline)) void conv1x1_tile(const Conv& c, const int8_t* in, int
 #undef NET_LANE
     }
     const int32x4_t f0 = vld1q_s32(c.offset.data() + o), f1 = vld1q_s32(c.offset.data() + o + 4);
-    const float32x4_t m0 = vld1q_f32(c.scale.data() + o), m1 = vld1q_f32(c.scale.data() + o + 4);
+    const float32x4_t m0 = vld1q_f32(scale + o), m1 = vld1q_f32(scale + o + 4);
     const float32x4_t b0 = vld1q_f32(bias + o), b1 = vld1q_f32(bias + o + 4);
     for (int i = 0; i < 8; i++)
         out.put8(s0 + i, o, vfmaq_f32(b0, vcvtq_f32_s32(vaddq_s32(acc[i][0], f0)), m0),
@@ -959,9 +959,9 @@ __attribute__((noinline)) void conv1x1_tile(const Conv& c, const int8_t* in, int
 }
 
 template <class Out>
-inline void conv1x1(const Conv& c, const Input1* in, const float* bias, const Out& out) {
+inline void conv1x1(const Conv& c, const Input1* in, const float* scale, const float* bias, const Out& out) {
     for (int o = 0; o < c.cout; o += 8)
-        for (int s0 = 0; s0 < SQUARES; s0 += 8) conv1x1_tile(c, in, s0, o, bias, out);
+        for (int s0 = 0; s0 < SQUARES; s0 += 8) conv1x1_tile(c, in, s0, o, scale, bias, out);
 }
 #endif
 
@@ -1304,9 +1304,10 @@ struct Quantizer {
         int8x8_t b = vqmovn_s16(vcombine_s16(vqmovn_s32(integers(v, ch)), vdup_n_s16(0)));
         vst1_lane_s32((int32_t*)at, vreinterpret_s32_s8(b), 0);
     }
-    // 8 channels from `ch`, `v0` and `v1`, to `at`
-    void put8(float32x4_t v0, float32x4_t v1, int ch, Activation* at) const {
-        vst1_s8(at, vqmovn_s16(vqmovn_high_s32(vqmovn_s32(integers(v0, ch)), integers(v1, ch + 4))));
+    // 8 channels, `v0` and `v1`, already multiplied by their inverses and after a ReLU, to `at`
+    void put8_scaled(float32x4_t v0, float32x4_t v1, Activation* at) const {
+        const int32x4_t i0 = vqaddq_s32(vcvtnq_s32_f32(v0), zero_point), i1 = vqaddq_s32(vcvtnq_s32_f32(v1), zero_point);
+        vst1_s8(at, vqmovn_s16(vqmovn_high_s32(vqmovn_s32(i0), i1)));
     }
     // 16 channels from `ch`, `v[4]`
     void group(const float32x4_t* v, int ch, Activation* q) const {
@@ -1644,16 +1645,17 @@ inline void policy_logits(const Norm& n, const float* h, int stride, int H, cons
 // `cin` channels, `in` (see `input1_at`)
 NET_INLINE void quantize1(const Quantizer& q, F v, int s, int ch, int cin, Input1* in) { q.put(v, ch, in + input1_at(s, ch, cin)); }
 
-// expand's outputs, after a ReLU, quantized for the project into its input, `in`, of `cin` channels
+// expand's outputs, after a ReLU, quantized for the project into its input, `in`, of `cin` channels.
+// NEON's come with the project's inverses folded into expand's scale and bias (`convnext_block`), and
+// 8 outputs from `o` at a time (`put8`): the epilogue only rounds, where it was half of expand's time
 struct ExpandOut {
     Quantizer quantize;
     Input1* in;
     int cin;
     NET_INLINE void put(int s, int o, F v) const { quantize1(quantize, Lanes::relu(v), s, o, cin, in); }
 #if NET_ISA == 3
-    // NEON: 8 outputs from `o`, two vectors, narrowed together
     NET_INLINE void put8(int s, int o, F v0, F v1) const {
-        quantize.put8(Lanes::relu(v0), Lanes::relu(v1), o, in + input1_at(s, o, cin));
+        quantize.put8_scaled(Lanes::relu(v0), Lanes::relu(v1), in + input1_at(s, o, cin));
     }
 #endif
 };
@@ -1695,14 +1697,19 @@ NET_INLINE void ray_row(F* acc, const float* row, int C, const float* w) {
     }
 }
 
-// and from the output's own row: its 15 taps (0, -7) to (0, 7), `w` the first's weights, each
-// output's in order, the input square by square
+// and from the output's own row: its 15 taps (0, -7) to (0, 7), `w` the first's weights. A vector of
+// channels at a time, its row's 8 inputs in registers and each tap's weights loaded once (NEON has no
+// memory operands: a weight a fma made its loads twice its fmas); each output's taps in order.
 template <int CV>
 NET_INLINE void ray_middle(F* acc, const float* row, int C, const float* w) {
-    NET_UNROLL for (int x = 0; x < 8; x++) NET_UNROLL for (int c = 0; c < CV; c++) {
-        const F v = Lanes::load(row + x * C + c * W);
-        NET_UNROLL for (int i = 0; i < 8; i++)
-            acc[8 * c + i] = Lanes::fma(Lanes::load(w + (x - i + 7) * C + c * W), v, acc[8 * c + i]);
+    NET_UNROLL for (int c = 0; c < CV; c++) {
+        F in[8];
+        NET_UNROLL for (int x = 0; x < 8; x++) in[x] = Lanes::load(row + x * C + c * W);
+        NET_UNROLL for (int d = -7; d <= 7; d++) {
+            const F wd = Lanes::load(w + (d + 7) * C + c * W);
+            NET_UNROLL for (int i = 0; i < 8; i++) if (i + d >= 0 && i + d < 8)
+                acc[8 * c + i] = Lanes::fma(wd, in[i + d], acc[8 * c + i]);
+        }
     }
 }
 
@@ -1788,8 +1795,17 @@ constexpr int DEPTHWISE_VECTORS = NET_ISA == 1 ? 1 : 2;
 // squares by `DEPTHWISE_VECTORS` vectors of channels at a time in registers, each tap's weights
 // loaded once for the row; each sum adds its taps in their order, from the bias, those off the
 // board skipped.
+// GCC on ARM schedules instructions before it allocates registers, which spilled the two vectors'
+// sums (Neoverse V2: depthwise 41 -> 34 us of a 7x64 without it; its 1x1s are faster with it). x86
+// GCC doesn't schedule then by default, and clang has no such pass.
+#if defined(__aarch64__) && defined(__GNUC__) && !defined(__clang__)
+#define NET_DEPTHWISE_ATTRIBUTES __attribute__((optimize("no-schedule-insns")))
+#else
+#define NET_DEPTHWISE_ATTRIBUTES
+#endif
+
 template <class Store>
-inline void depthwise(const Depthwise& d, const float* x, int C, int P, float* pooled, Store store) {
+NET_DEPTHWISE_ATTRIBUTES inline void depthwise(const Depthwise& d, const float* x, int C, int P, float* pooled, Store store) {
     constexpr int CV = DEPTHWISE_VECTORS;
     int ch = 0;
     for (; ch + CV * W <= C; ch += CV * W) depthwise_vectors<CV>(d, x, C, P, ch, pooled, store);
@@ -1811,9 +1827,21 @@ inline void convnext_block(const Block& b, Scratch& s, float* x, int C) {
         for (int o = 0; o < H; o++) bias[o] += expand_bias[o];
         expand_bias = bias;
     }
-    conv1x1(b.expand, expand_in, expand_bias, ExpandOut{Quantizer(b.project), project_in, H});
+    const float* expand_scale = b.expand.scale.data();
+#if NET_ISA == 3
+    // the project's inverse (positive: it commutes with the ReLU) folded in, for `ExpandOut::put8`
+    alignas(16) float scaled[1024];
+    const float* inverse = b.project.inverse.data();
+    for (int o = 0; o < H; o++) {
+        scaled[o] = expand_scale[o] * inverse[o];
+        bias[o] = expand_bias[o] * inverse[o];
+    }
+    expand_scale = scaled;
+    expand_bias = bias;
+#endif
+    conv1x1(b.expand, expand_in, expand_scale, expand_bias, ExpandOut{Quantizer(b.project), project_in, H});
     NET_STAGE("expand");
-    conv1x1(b.project, project_in, b.project.bias.data(), ProjectOut{x, C});
+    conv1x1(b.project, project_in, b.project.scale.data(), b.project.bias.data(), ProjectOut{x, C});
     NET_STAGE("project");
 }
 

@@ -468,7 +468,7 @@ static void check_conv1x1() {
                     for (int i = 0; i < cin; i++) acc += value[(size_t)sq * cin + i] * q[(size_t)o * cin + i];
                     want[(size_t)sq * cout + o] = x[(size_t)sq * cout + o] + std::fma((float)acc, c.scale[o], c.bias[o]);
                 }
-            conv1x1(c, in.data(), c.bias.data(), ProjectOut{x.data(), cout});
+            conv1x1(c, in.data(), c.scale.data(), c.bias.data(), ProjectOut{x.data(), cout});
             for (size_t i = 0; i < x.size(); i++) expect(same(x[i], want[i]), "conv1x1", (int)i);
         }
 }
