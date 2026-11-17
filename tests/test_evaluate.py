@@ -197,6 +197,18 @@ def test_a_batched_networks_prior_temperature_makes_it_another_player(tmp_path):
     assert flat.label.endswith(" T1.6") and " T" not in resolve(base, 8).label
 
 
+def test_a_batched_networks_c_init_is_recorded_only_when_set(tmp_path):
+    checkpoint = tmp_path / "1.eqx"
+    checkpoint.write_bytes(b"params")
+    base = f"net:checkpoint={checkpoint},spec=s,device=gpu-batched,visits=100"
+    plain = resolve(base, 8)
+    explore = resolve(f"{base},c_init=1.14", 8)
+    # players from before c_init was an option keep their ids
+    assert "c_init" not in plain.config["search"] and " c" not in plain.label
+    assert explore.config["search"]["c_init"] == 1.14
+    assert explore.id != plain.id and explore.label.endswith(" c1.14")
+
+
 def test_engines_in_batched_matches_default_to_a_thread(engine_dir):
     assert (
         resolve(f"edax:level=8,dir={engine_dir}", 8, batched=True).config["threads"]

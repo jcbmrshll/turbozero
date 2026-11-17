@@ -247,6 +247,10 @@ def resolve_net(
         if value is None and key == "threads":
             value = cores
         search[key] = _typed(key, value, kind)
+    # gpu-batched's exploration constant: recorded only when set, so every player from before it
+    # was an option keeps its id
+    if device == "gpu-batched" and "c_init" in options:
+        search["c_init"] = _typed("c_init", options.pop("c_init"), float)
     if device != "gpu-batched" and "solve" in options:
         search["solve"] = _typed("solve", options.pop("solve"), int)
         for key, (kind, default) in SOLVE.items():
@@ -281,6 +285,8 @@ def resolve_net(
     solve = f" solve{search['solve']}" if "solve" in search else ""
     temperature = search.get("prior_temperature")
     prior = f" T{temperature:g}" if temperature != known["prior_temperature"][1] else ""
+    if device == "gpu-batched" and "c_init" in search:
+        prior += f" c{search['c_init']:g}"
     relative = _relative(checkpoint)
     runtime = {
         "player": "net",

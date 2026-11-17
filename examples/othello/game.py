@@ -327,6 +327,7 @@ def make_test_evaluator(
     noise: bool = True,
     tree_factor: int = 2,
     prior_temperature: float = PLAY_PRIOR_TEMPERATURE,
+    c_init: float = 1.25,
 ) -> MCTS:
     """Evaluator used in test games: temperature 0 to always play the most-visited
     action. Opponents share these settings, so that only the quality of their
@@ -336,7 +337,8 @@ def make_test_evaluator(
     two deterministic players don't replay the same game; turn it off to measure an
     evaluator at full strength when the games get their variety elsewhere (e.g. from
     XOT openings, see `xot.py`). `prior_temperature` flattens (above 1) or sharpens the
-    search's prior (see `MCTS`); play's is flatter than self-play's (`PLAY_PRIOR_TEMPERATURE`)."""
+    search's prior (see `MCTS`); play's is flatter than self-play's (`PLAY_PRIOR_TEMPERATURE`).
+    `c_init` is PUCT's exploration constant (see `PUCTSelector`)."""
     return AlphaZero(MCTS)(
         eval_fn=eval_fn,
         num_iterations=num_iterations,
@@ -344,7 +346,7 @@ def make_test_evaluator(
         # iterations on top (as self-play's, see train.py's --tree-factor)
         max_nodes=tree_factor * num_iterations,
         branching_factor=env.num_actions,
-        action_selector=PUCTSelector(),
+        action_selector=PUCTSelector(c_init=c_init),
         temperature=0.0,
         dirichlet_epsilon=0.25 if noise else 0.0,
         traversal_steps=TRAVERSAL_STEPS,
