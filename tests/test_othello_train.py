@@ -1,5 +1,6 @@
 """train.py's command line, up to the trainer it builds, with a fake trainer."""
 
+import math
 import sys
 
 import jax.numpy as jnp
@@ -574,3 +575,43 @@ def test_a_fixed_network_can_play_and_keep_its_moves(monkeypatch, tmp_path):
         )
     assert built.value.kwargs["train_steps_per_epoch"] == 0
     assert built.value.kwargs["log_moves"] == str(tmp_path / "moves")
+
+
+def fake_solve_fn(solver, threads):
+    return lambda positions: np.zeros((len(positions.current_player), 2), np.float32)
+
+
+@pytest.mark.parametrize("value", ["end", "inf"])
+def test_play_past_end_plays_every_game_to_its_end_with_room_for_its_solves(
+    monkeypatch, value
+):
+    monkeypatch.setattr(train, "make_solve_fn", fake_solve_fn)
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, "--solve-empties", "20", "--solve-play-past", value)
+    solve = built.value.kwargs["endgame_solve"]
+    assert solve.play_past == math.inf
+    with pytest.raises(BuiltTrainer) as mean:
+        run_main(monkeypatch, "--solve-empties", "20", "--solve-play-past", "4")
+    assert solve.slots > mean.value.kwargs["endgame_solve"].slots
+
+
+@pytest.mark.parametrize("value", ["-1", "nan", "forever"])
+def test_bad_play_past_is_refused(monkeypatch, value):
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, "--solve-empties", "20", "--solve-play-past", value)
+
+
+def test_solve_slots_hold_whole_games_and_at_most_a_solve_a_move():
+    # 64 moves an epoch
+    cycles, every = 64 * 129, 129
+    # past a solve point at 20 a game can store more positions than it has moves before it,
+    # so the slots are two epochs' moves
+    assert train.solve_slots(cycles, every, 20, math.inf) == 2 * 64 + 2
+    # at 2, a game stores at most 5 positions past it: 2 games an epoch, each 6 solves
+    assert train.solve_slots(cycles, every, 2, math.inf) == 2 * 2 * 6 + 2
+    for empties in (2, 10, 20):
+        whole = train.solve_slots(cycles, every, empties, math.inf)
+        for mean in (0.0, 1.0, 4.0, 50.0):
+            assert train.solve_slots(cycles, every, empties, mean) <= whole
+    # a mean's room is twice the mean, as before
+    assert train.solve_slots(cycles, every, 20, 4.0) == 2 * 2 * 9 + 2

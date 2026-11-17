@@ -1,8 +1,8 @@
 """Exact endgame labels for Othello self-play (train.py's --solve-empties, see
 core/training/endgame_solve.py): a game's solve point is its first position with `empties` or
 fewer empty squares, and an exact solver's result for it becomes the value target of every
-position before it; with --solve-play-past, the game plays on a few moves, each position stored
-past the solve point getting its own solved result.
+position before it; with --solve-play-past, the game plays on a few moves or to its end, each
+position stored past the solve point getting its own solved result.
 
 Solvers:
 - `native`: endgame.py's C++ solver, a win/draw/loss solve (only the result's sign is needed),
@@ -130,12 +130,18 @@ def solve_slots(
 ) -> int:
     """`EndgameSolve.slots` for self-play of `cycles` search cycles an epoch, playing moves every
     `advance_every` cycles, with solve points at `empties` and `play_past` moves past them on
-    average: two epochs of solves for the most games that can reach their solve points, each at
-    least as long as from an XOT opening (52 empty squares), each with a solve there and room for
-    twice its mean moves past it (each stored and solved, at most)."""
+    average (`math.inf`: to the end): two epochs of solves for the most games that can reach
+    their solve points, each at least as long as from an XOT opening (52 empty squares), each with
+    a solve there and room for twice its mean moves past it (each stored and solved, at most), or
+    for every move a game can play past it; and never more than two epochs' moves, a solve being
+    a move's position at most."""
     moves = -(-cycles // advance_every)
     games = -(-moves // max(52 - empties, 1))
-    return 2 * math.ceil(games * (1 + 2 * play_past)) + 2
+    # past its solve point a game plays at most a move on each empty square, a pass before each,
+    # and the two passes that end a game neither player can move in
+    most_past = 2 * empties + 1
+    per_game = 1 + min(2 * play_past, most_past)
+    return min(2 * math.ceil(games * per_game), 2 * moves) + 2
 
 
 def default_threads() -> int:

@@ -1,9 +1,9 @@
 """Exact endgame labels for self-play (see `Trainer`'s `endgame_solve`): once a game reaches a
 position an exact solver can solve (e.g. Othello's with 20 or fewer empty squares, its solve
 point), every position of the game before it gets the solved result as its value target, instead
-of the result its players went on to get. The game stops there, or plays on a few moves, each
-position stored past the solve point getting its own solved result. Self-play skips the searches
-for the rest of the game, and the labels lose the noise of its endgame mistakes.
+of the result its players went on to get. The game stops there, or plays on a few moves or to its
+end, each position stored past the solve point getting its own solved result. Self-play skips the
+searches for whatever of the game is left, and the labels lose the noise of its endgame mistakes.
 
 The solver runs on the host, a batch at a time, while the device trains and plays: the solves
 waiting at the end of an epoch's self-play are solved through its training and the next epoch's
@@ -12,6 +12,7 @@ buffer, unpopulated so that training doesn't sample them, and the positions to s
 an environment's `PendingSolves`.
 """
 
+import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -123,7 +124,9 @@ class EndgameSolve:
             `solve_missed`, see `Trainer.collection_metrics`)
         share: the fraction of games solved, each drawn as it starts; the others are played to
             the end, as without solving
-        play_past: the mean number of moves a game plays past its solve point (see above)
+        play_past: the mean number of moves a game plays past its solve point (see above);
+            `math.inf` plays every game to its end, each position it stores past its solve
+            point solved
     """
 
     stop_fn: Callable[[Any], jax.Array]
@@ -141,7 +144,11 @@ class EndgameSolve:
             raise ValueError(f"play_past must be at least 0, got {self.play_past}")
 
     def get_config(self) -> dict:
-        return {"slots": self.slots, "share": self.share, "play_past": self.play_past}
+        return {
+            "slots": self.slots,
+            "share": self.share,
+            "play_past": "end" if math.isinf(self.play_past) else self.play_past,
+        }
 
     def init(self, key: jax.Array, env_state: Any, capacity: int) -> PendingSolves:
         """An environment's `PendingSolves`, with nothing waiting.
@@ -194,11 +201,12 @@ class EndgameSolve:
         full = pending.added - pending.labelled >= self.slots
         # a game whose solve point finds no slot plays on unsolved (see `slots`)
         late = wanted & ~first & full
-        ends = (
-            jnp.array(True)
-            if self.play_past == 0
-            else jax.random.uniform(key) < 1 / (1 + self.play_past)
-        )
+        if self.play_past == 0:
+            ends = jnp.array(True)
+        elif math.isinf(self.play_past):
+            ends = jnp.array(False)
+        else:
+            ends = jax.random.uniform(key) < 1 / (1 + self.play_past)
         return Move(
             solve=wanted & ~full,
             whole=first & ~full,

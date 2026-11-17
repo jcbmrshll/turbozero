@@ -46,6 +46,7 @@ a dataset of whole games from; --train-steps 0 plays a fixed network's games wit
 """
 
 import argparse
+import math
 import re
 import tempfile
 import warnings
@@ -176,6 +177,17 @@ def positive_schedule(text: str) -> list[tuple[int, int]]:
     if any(value < 1 for _, value in schedule):
         raise argparse.ArgumentTypeError(f"values must be positive, got {text!r}")
     return schedule
+
+
+def play_past(text: str) -> float:
+    """Parses --solve-play-past: a mean number of moves of at least 0, or "end" (inf)."""
+    try:
+        moves = math.inf if text == "end" else float(text)
+    except ValueError:
+        moves = math.nan
+    if not moves >= 0:
+        raise argparse.ArgumentTypeError(f"a mean of at least 0 or end, got {text!r}")
+    return moves
 
 
 def playout_cap(text: str) -> PlayoutCap:
@@ -470,13 +482,14 @@ def main():
     )
     parser.add_argument(
         "--solve-play-past",
-        type=float,
+        type=play_past,
         default=0.0,
         metavar="MEAN",
         help="with --solve-empties, games play on past N empty squares, ending before each "
-        "further move with probability 1 / (1 + MEAN): MEAN moves on average. Each position "
-        "stored past N is solved and labelled on its own, so the network still trains on "
-        "positions just past N, which searches from above N reach. Default 0: games stop at N",
+        "further move with probability 1 / (1 + MEAN): MEAN moves on average; end (or inf) "
+        "plays every game to its end. Each position stored past N is solved and labelled on "
+        "its own, so the network still trains on positions past N, which searches from above "
+        "N reach. Default 0: games stop at N",
     )
     parser.add_argument(
         "--solver",
@@ -1018,8 +1031,6 @@ def main():
             parser.error("--solve-empties doesn't go with --resign")
     if not 0 <= args.solve_share <= 1:
         parser.error("--solve-share must be between 0 and 1")
-    if args.solve_play_past < 0:
-        parser.error("--solve-play-past must be at least 0")
     if args.dirichlet_alpha <= 0:
         parser.error("--dirichlet-alpha must be positive")
     if not 0 <= args.dirichlet_epsilon <= 1:
