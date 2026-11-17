@@ -145,6 +145,8 @@ def extract(network, state) -> Program:
         stem, stem_norm = conv_norm(network.stem_conv, network.stem_norm)
     blocks = []
     for block in network.blocks:
+        if getattr(block, "group_pool", None) is not None:
+            raise TypeError("line pooling (pool_groups) has no native kernel yet")
         pool = linear(block.pool_linear) if block.pool_linear is not None else None
         if isinstance(block, PreActBlock):
             zeros = np.zeros(block.conv1.out_channels, np.float32)

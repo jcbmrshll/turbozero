@@ -1,6 +1,7 @@
+import functools
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import equinox as eqx
 import jax
@@ -15,6 +16,7 @@ from game import (
     PASS,
     SYMMETRY_TRANSFORM_FNS,
     WEIGHT_DECAY,
+    board_lines,
     env,
     load_checkpoint,
     make_network,
@@ -23,6 +25,7 @@ from game import (
 )
 
 from core.memory.replay_memory import BaseExperience
+from core.networks.azresnet import AZResnet, GroupPool, ResidualBlock
 
 
 def save_checkpoint(path: Path, net: str):
@@ -174,3 +177,86 @@ def test_constant_rate_is_the_cosine_to_itself_and_its_program_ignores_run_lengt
         assert jax.tree.structure(state) == jax.tree.structure(expected_state)
         for a, b in zip(jax.tree.leaves(p), jax.tree.leaves(expected), strict=True):
             np.testing.assert_array_equal(a, b)
+
+
+@functools.cache
+def symmetry_permutations() -> list[np.ndarray]:
+    """Where each of training's symmetries (SYMMETRY_TRANSFORM_FNS) moves each square: a disc on
+    each square in turn, mapped."""
+    squares = np.eye(64, dtype=bool).reshape(64, 8, 8)
+    probes = BaseExperience(
+        reward=jnp.zeros((64, 2)),
+        policy_weights=jnp.zeros((64, 65)),
+        policy_mask=jnp.ones((64, 65), bool),
+        observation_nn=jnp.asarray(np.stack([squares, ~squares], axis=-1)),
+        cur_player_id=jnp.zeros(64, jnp.int32),
+        search_value=jnp.zeros(64),
+    )
+    return [
+        np.asarray(fn(probes).observation_nn[..., 0]).reshape(64, 64).argmax(axis=1)
+        for fn in SYMMETRY_TRANSFORM_FNS
+    ]
+
+
+def test_board_lines_are_the_rows_columns_and_diagonals():
+    straight, diagonal = board_lines()
+    assert len(straight) == 16 and len(diagonal) == 30
+    assert sorted(len(line) for line in straight) == [8] * 16
+    assert sorted(len(line) for line in diagonal) == sorted(
+        [*range(1, 9), *range(1, 8)] * 2
+    )
+    for cls in (straight, diagonal):
+        # every square on exactly two lines of each class: its row and column, its two diagonals
+        counts = np.bincount([sq for line in cls for sq in line], minlength=64)
+        assert (counts == 2).all()
+        # each line a straight run of squares, one step apart
+        for line in cls:
+            rc = np.array([divmod(sq, 8) for sq in line])
+            steps = np.diff(rc, axis=0)
+            assert (steps == steps[:1]).all() and (np.abs(steps) <= 1).all()
+    for line in diagonal:
+        rc = np.array([divmod(sq, 8) for sq in line])
+        assert len(line) == 1 or (np.abs(np.diff(rc, axis=0)) == 1).all()
+
+
+def test_symmetries_map_each_class_of_lines_onto_itself():
+    for to in symmetry_permutations():
+        for cls in board_lines():
+            lines = {frozenset(line) for line in cls}
+            assert {frozenset(to[list(line)].tolist()) for line in cls} == lines
+
+
+def test_line_pooling_commutes_with_the_symmetries():
+    pool = GroupPool(board_lines(), 64, 4, 5, key=jax.random.PRNGKey(0))
+    x = np.random.default_rng(0).normal(size=(4, 64)).astype(np.float32)
+    # the input, then its image under each symmetry
+    perms = symmetry_permutations()
+    inputs = np.stack([x] + [np.empty_like(x) for _ in perms])
+    for moved, to in zip(inputs[1:], perms, strict=True):
+        moved[:, to] = x
+    biases = np.asarray(
+        eqx.filter_jit(jax.vmap(pool))(jnp.asarray(inputs.reshape(-1, 4, 8, 8)))
+    )
+    biases = biases.reshape(len(inputs), 5, 64)
+    for moved_bias, to in zip(biases[1:], perms, strict=True):
+        np.testing.assert_allclose(moved_bias[:, to], biases[0], rtol=1e-5, atol=1e-5)
+
+
+def test_line_pool_spec_adds_line_pooling_beside_global_pooling():
+    base = "resnet:2x8,pool_every=2,heads=pooled,pool_channels=2"
+
+    def group_pools(extra: str) -> list[GroupPool | None]:
+        network = cast(AZResnet, make_network(base + extra)[0])
+        return [cast(ResidualBlock, b).group_pool for b in network.blocks]
+
+    assert group_pools("") == [None, None]
+    assert group_pools(",line_pool=false") == [None, None]
+    first, second = group_pools(",line_pool=true")
+    assert first is None and second is not None and second.groups == board_lines()
+    # in bfloat16 self-play too (the layer computes in float32)
+    obs = env.init(jax.random.PRNGKey(0)).observation
+    net, state = make_network(base + ",line_pool=true", inference_dtype="bfloat16")
+    (policy, value), _ = eqx.filter_jit(eqx.nn.inference_mode(net))(obs, state)
+    assert policy.shape == (65,) and np.isfinite(np.asarray(value, np.float32)).all()
+    with pytest.raises(ValueError, match="line_pool is true or false"):
+        make_network(base + ",line_pool=yes")

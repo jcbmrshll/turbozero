@@ -49,6 +49,7 @@ def test_the_spec_overrides_the_options_it_names():
         ("resnet:10x128,heads=katago", "heads is one of alphazero, pooled"),
         ("transformer:2x8,attention_bias=1", "attention_bias is true or false"),
         ("resnet:10x128,pool_every=x", "invalid literal for int"),
+        ("resnet:10x128,pool_groups=1", "resnet networks have no 'pool_groups'"),
     ],
 )
 def test_specs_that_name_no_network_are_refused(spec, error):

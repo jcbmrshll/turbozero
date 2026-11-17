@@ -11,6 +11,7 @@ from core.networks.azresnet import (
     BottleneckBlock,
     FixedScale,
     GroupNorm,
+    GroupPool,
     ResidualBlock,
     batch_norm,
     conv,
@@ -517,3 +518,113 @@ def test_the_pre_activation_trunk_starts_as_the_stem(name):
         trunk, _ = block(trunk, state, dtype)
 
     np.testing.assert_allclose(trunk, stem, atol=1e-6)
+
+
+# two classes of groups of 6 positions (an input of 2x3): pairs, and the halves
+PAIRS = ((0, 1), (2, 3), (4, 5))
+HALVES = ((0, 1, 2), (3, 4, 5))
+
+
+def test_group_pooling_biases_each_position_by_its_groups_mean_and_max():
+    pool = GroupPool((PAIRS, HALVES), 6, 3, 4, key=jax.random.PRNGKey(0))
+    x = np.random.default_rng(0).normal(size=(3, 2, 3)).astype(np.float32)
+    flat = x.reshape(3, 6)
+    expected = np.zeros((4, 6), np.float32)
+    for linear, groups in zip(pool.linears, (PAIRS, HALVES), strict=True):
+        for group in groups:
+            members = flat[:, list(group)]
+            features = np.concatenate([members.mean(axis=1), members.max(axis=1)])
+            expected[:, list(group)] += (np.asarray(linear.weight) @ features)[:, None]
+    np.testing.assert_allclose(
+        pool(jnp.asarray(x)).reshape(4, 6), expected, rtol=1e-5, atol=1e-6
+    )
+
+
+def test_group_pooling_is_equivariant_under_permutations_that_keep_each_class():
+    pool = GroupPool((PAIRS, HALVES), 6, 3, 4, key=jax.random.PRNGKey(0))
+    x = np.random.default_rng(1).normal(size=(3, 6)).astype(np.float32)
+    # swaps the halves and reverses each pair's order: pairs go to pairs, halves to halves
+    to = np.array([4, 5, 3, 2, 0, 1])
+    moved = np.empty_like(x)
+    moved[:, to] = x
+    bias = np.asarray(pool(jnp.asarray(x.reshape(3, 2, 3)))).reshape(4, 6)
+    moved_bias = np.asarray(pool(jnp.asarray(moved.reshape(3, 2, 3)))).reshape(4, 6)
+    np.testing.assert_allclose(moved_bias[:, to], bias, rtol=1e-5, atol=1e-6)
+
+
+def test_group_pooling_reaches_only_positions_that_share_a_group():
+    pool = GroupPool((PAIRS,), 6, 3, 4, key=jax.random.PRNGKey(0))
+    x = np.random.default_rng(2).normal(size=(3, 6)).astype(np.float32)
+    y = x.copy()
+    y[:, 2] += 1
+    changed = ~np.isclose(
+        np.asarray(pool(jnp.asarray(x.reshape(3, 2, 3)))).reshape(4, 6),
+        np.asarray(pool(jnp.asarray(y.reshape(3, 2, 3)))).reshape(4, 6),
+    ).all(axis=0)
+    assert changed.tolist() == [False, False, True, True, False, False]
+
+
+@pytest.mark.parametrize(
+    "groups",
+    [(), ((),), (((),),), (((0, 6),),), (((-1,),),)],
+)
+def test_group_pooling_refuses_groups_that_are_not_positions(groups):
+    with pytest.raises(ValueError):
+        GroupPool(groups, 6, 3, 4, key=jax.random.PRNGKey(0))
+
+
+@pytest.mark.parametrize("layout", ["post", "pre"])
+@pytest.mark.parametrize("block", ["basic", "bottleneck"])
+def test_pool_groups_add_a_group_pool_beside_each_global_pooling_and_change_nothing_else(
+    layout, block
+):
+    config = AZResnetConfig(
+        policy_head_out_size=7,
+        num_blocks=2,
+        num_channels=8,
+        block=block,
+        pool_every=2,
+        pool_channels=2,
+        heads="pooled",
+        layout=layout,
+        norm="layer" if layout == "pre" else "batch",
+    )
+    shape = (2, 3, 2)
+    plain, _ = eqx.nn.make_with_state(AZResnet)(
+        config, shape, key=jax.random.PRNGKey(0)
+    )
+    grouped_config = AZResnetConfig(
+        **{**config.__dict__, "pool_groups": (PAIRS, HALVES)}
+    )
+    grouped, state = eqx.nn.make_with_state(AZResnet)(
+        grouped_config, shape, key=jax.random.PRNGKey(0)
+    )
+
+    # every other parameter initializes as without groups
+    def basic(net):
+        return [inner for b in net.blocks for inner in getattr(b, "inner", [b])]
+
+    # one basic block in two pools globally, and it alone pools in groups
+    assert [b.group_pool is not None for b in basic(grouped)] == [False, True]
+    without = eqx.tree_at(
+        lambda net: [b.group_pool for b in basic(net)],
+        grouped,
+        replace=[None, None],
+        is_leaf=lambda x: x is None or isinstance(x, GroupPool),
+    )
+    for a, b in zip(
+        jax.tree.leaves(eqx.filter(plain, eqx.is_array)),
+        jax.tree.leaves(eqx.filter(without, eqx.is_array)),
+        strict=True,
+    ):
+        np.testing.assert_array_equal(a, b)
+    # and the network runs, in training and in inference
+    x = jnp.asarray(
+        np.random.default_rng(0).integers(0, 2, size=(4, *shape)), jnp.float32
+    )
+    (policy, value), _ = jax.vmap(
+        grouped, in_axes=(0, None), out_axes=(0, None), axis_name=BATCH_AXIS
+    )(x, state)
+    assert policy.shape == (4, 7) and value.shape == (4, 1)
+    (policy, value), _ = eqx.nn.inference_mode(grouped)(x[0], state)
+    assert policy.shape == (7,) and np.isfinite(np.asarray(value)).all()

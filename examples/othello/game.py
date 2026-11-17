@@ -147,6 +147,49 @@ PLAY_PRIOR_TEMPERATURE = 2.0
 DEFAULT_NET = "resnet:6x128,pool_every=2,heads=pooled"
 
 
+def board_lines(size: int = 8) -> tuple[tuple[tuple[int, ...], ...], ...]:
+    """The board's lines as two classes of groups of squares (row-major indices, as the network's
+    input is laid out): the rows and columns, and the diagonals of both directions, the short corner
+    diagonals included (8 + 8 and 15 + 15 on 8x8). Each of the board's 8 symmetries maps rows and
+    columns onto rows and columns and diagonals onto diagonals, so with one linear map per class
+    (see core.networks.azresnet.GroupPool) line pooling is equivariant under them, as the
+    augmentation in training assumes."""
+    rows = [tuple(r * size + c for c in range(size)) for r in range(size)]
+    cols = [tuple(r * size + c for r in range(size)) for c in range(size)]
+    # r - c constant, then r + c constant
+    diagonals = [
+        tuple(r * size + c for r in range(size) for c in range(size) if r - c == d)
+        for d in range(-(size - 1), size)
+    ]
+    anti = [
+        tuple(r * size + c for r in range(size) for c in range(size) if r + c == d)
+        for d in range(2 * size - 1)
+    ]
+    return (tuple(rows + cols), tuple(diagonals + anti))
+
+
+# spec settings of this example's own, and the network configuration fields each sets: with
+# line_pool=true, every block with global pooling also pools its pooled channels along each of the
+# board's lines (see board_lines), and each square gets a bias from its own four lines
+SPEC_EXTRAS = {"line_pool": lambda on: {"pool_groups": board_lines() if on else ()}}
+
+
+def split_spec(net: str) -> tuple[str, dict]:
+    """A network spec without this example's own settings (see SPEC_EXTRAS), and the configuration
+    fields they set."""
+    head, *settings = net.split(",")
+    kept, fields = [head], {}
+    for setting in settings:
+        name, _, value = setting.partition("=")
+        if name not in SPEC_EXTRAS:
+            kept.append(setting)
+            continue
+        if value not in ("true", "false"):
+            raise ValueError(f"{net}: {name} is true or false, not {value!r}")
+        fields |= SPEC_EXTRAS[name](value == "true")
+    return ",".join(kept), fields
+
+
 def make_network(
     net: str = DEFAULT_NET,
     seed: int = 0,
@@ -158,13 +201,17 @@ def make_network(
     DEFAULT_NET, or "resnet:10x128", the residual network from the AlphaZero paper with
     10 blocks of 128 channels; any equinox module works (see core.networks.utils.apply_nn).
     It's created along with its state (BatchNorm's, if it has any): returns (network,
-    state). It computes in `inference_dtype` when it isn't training, e.g. in self-play,
+    state). Besides the configuration's fields, the spec may set this example's own
+    (see SPEC_EXTRAS), e.g. "resnet:4x64,pool_every=2,heads=pooled,line_pool=true".
+    It computes in `inference_dtype` when it isn't training, e.g. in self-play,
     and in `train_dtype` in training (mixed precision, see AZResnetConfig). With `remat`,
     training computes each block's activations again in the backward pass instead of
     keeping them."""
+    net, extras = split_spec(net)
     config = network_config(
         net,
         env.num_actions,
+        **extras,
         inference_dtype=inference_dtype,
         train_dtype=train_dtype,
         remat=remat,

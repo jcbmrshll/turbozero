@@ -11,6 +11,9 @@ import numpy as np
 
 from core.networks.utils import BATCH_AXIS
 
+# classes of groups of positions, each group a tuple of positions (see `GroupPool`)
+PoolGroups = tuple[tuple[tuple[int, ...], ...], ...]
+
 
 @dataclass
 class AZResnetConfig:
@@ -32,6 +35,12 @@ class AZResnetConfig:
             pooled over the board (mean and max), and a linear map of them biases the others, which
             go on to the second convolution. 0 for none
         pool_channels: channels each global pooling bias pools
+        pool_groups: positions pooled in groups beside the global pooling (see `GroupPool`): classes
+            of groups, each group a tuple of positions (row-major indices of the input's spatial
+            positions). In every block with global pooling, its pooled channels are also pooled
+            over each group (mean and max), a linear map of the class's own maps each group's
+            pooled features to a bias, and every position gets the sum of the biases of the groups
+            it belongs to. Set by the caller, not in a spec string. () for none
         heads: "alphazero", AlphaZero's heads: a 1x1 convolution to 2 channels and a linear map to
             the policy logits; a 1x1 convolution to 1 channel and a hidden layer to the value. Or
             "pooled", KataGo's: a policy logit per square from 1x1 convolutions, biased by features
@@ -90,6 +99,7 @@ class AZResnetConfig:
     bottleneck_inner: int = 1
     pool_every: int = 0
     pool_channels: int = 32
+    pool_groups: PoolGroups = ()
     heads: Literal["alphazero", "pooled"] = "alphazero"
     head_channels: int = 32
     value_hidden_size: int = 256
@@ -363,6 +373,120 @@ def board_pool(x: jax.Array) -> jax.Array:
     return jnp.concatenate([x.mean(axis=(1, 2)), x.max(axis=(1, 2))])
 
 
+@functools.cache
+def group_tables(
+    groups: tuple[tuple[int, ...], ...], positions: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """For a class of `groups` of `positions` positions: each group's members padded to the longest
+    group with `positions` (a column of -inf, see `GroupPool`), (groups, longest); and each group's
+    incidence, 1 at its members, (groups, positions)."""
+    longest = max(len(group) for group in groups)
+    members = np.full((len(groups), longest), positions, np.int32)
+    incidence = np.zeros((len(groups), positions), np.float32)
+    for i, group in enumerate(groups):
+        members[i, : len(group)] = group
+        incidence[i, list(group)] = 1
+    return members, incidence
+
+
+class GroupPool(eqx.Module):
+    """Pooling over groups of positions, each group's pooled features mapped to a bias on its own
+    positions (see `AZResnetConfig.pool_groups`): global pooling's positional relative, where each
+    position learns about the groups it belongs to rather than about all positions.
+
+    Each group's mean (its sum divided by its size, so groups of different sizes give features of the
+    same scale) and maximum of each channel go through its class's linear map; a position's bias is
+    the sum over the groups it belongs to. Groups of one class share one map, so the layer is
+    equivariant under any permutation of the positions that maps each class's groups onto groups of
+    the same class (mean and max don't depend on the order of a group's members). The maps start at
+    the default initialization scaled by 1/sqrt(the mean number of groups a position belongs to): the
+    summed bias has the variance one map's would."""
+
+    linears: list[eqx.nn.Linear]
+    groups: PoolGroups = eqx.field(static=True)
+    positions: int = eqx.field(static=True)
+
+    def __init__(
+        self,
+        groups: PoolGroups,
+        positions: int,
+        in_channels: int,
+        out_channels: int,
+        *,
+        key: jax.Array,
+    ):
+        """
+        Args:
+            groups: classes of groups of positions, each group a tuple of positions in
+                [0, positions), none empty
+            positions: number of positions
+            in_channels: channels pooled
+            out_channels: channels of the bias
+            key: rng used to initialize parameters
+        """
+        if not groups or any(not cls for cls in groups):
+            raise ValueError("pooling groups need at least one class, none empty")
+        for cls in groups:
+            for group in cls:
+                if not group or any(not 0 <= p < positions for p in group):
+                    raise ValueError(
+                        f"a pooling group is a non-empty tuple of positions in [0, {positions}), "
+                        f"not {group}"
+                    )
+        memberships = sum(len(group) for cls in groups for group in cls) / positions
+        scale = 1 / math.sqrt(max(memberships, 1))
+        self.linears = []
+        for k in jax.random.split(key, len(groups)):
+            linear = eqx.nn.Linear(2 * in_channels, out_channels, use_bias=False, key=k)
+            self.linears.append(
+                eqx.tree_at(lambda lin: lin.weight, linear, linear.weight * scale)
+            )
+        self.groups = tuple(
+            tuple(tuple(int(p) for p in g) for g in cls) for cls in groups
+        )
+        self.positions = positions
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        """The bias, (out_channels, height, width), in float32, of features x, (in_channels,
+        height, width)."""
+        channels = x.shape[0]
+        flat = x.astype(jnp.float32).reshape(channels, self.positions)
+        padded = jnp.concatenate(
+            [flat, jnp.full((channels, 1), -jnp.inf, jnp.float32)], axis=1
+        )
+        bias = jnp.zeros((self.linears[0].weight.shape[0], self.positions), jnp.float32)
+        for linear, cls in zip(self.linears, self.groups, strict=True):
+            members, incidence = group_tables(cls, self.positions)
+            incidence = jnp.asarray(incidence)
+            # (channels, groups) each
+            mean = (flat @ incidence.T) / incidence.sum(axis=1)
+            maximum = padded[:, members].max(axis=-1)
+            pooled = jnp.concatenate([mean, maximum])
+            # each group's bias (out, groups), then summed onto its positions
+            bias = bias + (linear.weight @ pooled) @ incidence
+        return bias.reshape(-1, *x.shape[1:])
+
+
+def group_pool(
+    pool_groups: PoolGroups,
+    positions: int,
+    pool_channels: int,
+    out_channels: int,
+    key: jax.Array,
+) -> GroupPool | None:
+    """A block's `GroupPool` beside its global pooling, if it has both: from the global pooling's
+    key folded with 1, so networks without groups initialize as they did before them."""
+    if not pool_groups or not pool_channels:
+        return None
+    return GroupPool(
+        pool_groups,
+        positions,
+        pool_channels,
+        out_channels,
+        key=jax.random.fold_in(key, 1),
+    )
+
+
 class ResidualBlock(eqx.Module):
     """Residual block for AlphaZero ResNet model, optionally with KataGo's global pooling bias (see
     `AZResnetConfig.pool_every`)."""
@@ -370,6 +494,7 @@ class ResidualBlock(eqx.Module):
     conv1: eqx.nn.Conv2d
     norm1: Norm
     pool_linear: eqx.nn.Linear | None
+    group_pool: GroupPool | None
     conv2: eqx.nn.Conv2d
     norm2: Norm
     pool_channels: int = eqx.field(static=True)
@@ -382,6 +507,8 @@ class ResidualBlock(eqx.Module):
         key: jax.Array,
         make_norm: NormMaker,
         stats: Stats,
+        pool_groups: PoolGroups = (),
+        positions: int = 0,
     ):
         """
         Args:
@@ -391,6 +518,9 @@ class ResidualBlock(eqx.Module):
             key: rng used to initialize parameters
             make_norm: makes the normalizations (see `norm_maker`)
             stats: the statistics of the block's input (see `Stats`)
+            pool_groups: groups the pooled channels are also pooled over, with global pooling
+                (see `GroupPool`)
+            positions: the input's spatial positions, with `pool_groups`
         """
         key1, key2, key3 = jax.random.split(key, 3)
         self.conv1 = conv(channels, channels, 3, key1)
@@ -399,6 +529,9 @@ class ResidualBlock(eqx.Module):
             eqx.nn.Linear(2 * pool_channels, channels - pool_channels, key=key3)
             if pool_channels
             else None
+        )
+        self.group_pool = group_pool(
+            pool_groups, positions, pool_channels, channels - pool_channels, key3
         )
         self.conv2 = conv(channels - pool_channels, channels, 3, key2)
         self.norm2 = make_norm(channels, residual_stats(0)[0], 3)
@@ -410,8 +543,11 @@ class ResidualBlock(eqx.Module):
         y, state = conv_norm(self.conv1, self.norm1, x, state, dtype)
         if self.pool_linear is not None:
             y, pooled = y[: -self.pool_channels], y[-self.pool_channels :]
-            bias = self.pool_linear(board_pool(jax.nn.relu(pooled)))
-            y = y + bias.reshape(-1, 1, 1).astype(y.dtype)
+            pooled = jax.nn.relu(pooled)
+            bias = self.pool_linear(board_pool(pooled)).reshape(-1, 1, 1)
+            if self.group_pool is not None:
+                bias = bias + self.group_pool(pooled)
+            y = y + bias.astype(y.dtype)
         y = jax.nn.relu(y)
         y, state = conv_norm(self.conv2, self.norm2, y, state, dtype)
         return jax.nn.relu(x + y), state
@@ -436,6 +572,8 @@ class BottleneckBlock(eqx.Module):
         key: jax.Array,
         make_norm: NormMaker,
         stats: Stats,
+        pool_groups: PoolGroups = (),
+        positions: int = 0,
     ):
         """
         Args:
@@ -446,6 +584,8 @@ class BottleneckBlock(eqx.Module):
             key: rng used to initialize parameters
             make_norm: makes the normalizations (see `norm_maker`)
             stats: the statistics of the block's input (see `Stats`)
+            pool_groups: the inner blocks' pooling groups (see `GroupPool`)
+            positions: the input's spatial positions, with `pool_groups`
         """
         keys = jax.random.split(key, len(inner_pool_channels) + 2)
         self.down_conv = conv(channels, inner_channels, 1, keys[0])
@@ -453,7 +593,13 @@ class BottleneckBlock(eqx.Module):
         inner_stats = residual_stats(len(inner_pool_channels))
         self.inner = [
             ResidualBlock(
-                inner_channels, pool, key=k, make_norm=make_norm, stats=block_stats
+                inner_channels,
+                pool,
+                key=k,
+                make_norm=make_norm,
+                stats=block_stats,
+                pool_groups=pool_groups,
+                positions=positions,
             )
             for pool, k, block_stats in zip(
                 inner_pool_channels, keys[2:], inner_stats[:-1], strict=True
@@ -490,6 +636,7 @@ class PreActBlock(eqx.Module):
     conv1: eqx.nn.Conv2d
     norm2: Norm
     pool_linear: eqx.nn.Linear | None
+    group_pool: GroupPool | None
     conv2: eqx.nn.Conv2d
     pool_channels: int = eqx.field(static=True)
 
@@ -501,6 +648,8 @@ class PreActBlock(eqx.Module):
         key: jax.Array,
         make_norm: NormMaker,
         stats: Stats,
+        pool_groups: PoolGroups = (),
+        positions: int = 0,
     ):
         """
         Args:
@@ -510,6 +659,9 @@ class PreActBlock(eqx.Module):
             key: rng used to initialize parameters
             make_norm: makes the normalizations (see `norm_maker`)
             stats: unused: the normalizations before the convolutions need none
+            pool_groups: groups the pooled channels are also pooled over, with global pooling
+                (see `GroupPool`)
+            positions: the input's spatial positions, with `pool_groups`
         """
         key1, key2, key3 = jax.random.split(key, 3)
         self.norm1 = make_norm(channels, stats, 3)
@@ -519,6 +671,9 @@ class PreActBlock(eqx.Module):
             eqx.nn.Linear(2 * pool_channels, channels - pool_channels, key=key3)
             if pool_channels
             else None
+        )
+        self.group_pool = group_pool(
+            pool_groups, positions, pool_channels, channels - pool_channels, key3
         )
         self.conv2 = zeroed(conv(channels - pool_channels, channels, 3, key2))
         self.pool_channels = pool_channels
@@ -531,8 +686,10 @@ class PreActBlock(eqx.Module):
         y, state = norm_act(self.norm2, y, state, dtype)
         if self.pool_linear is not None:
             y, pooled = y[: -self.pool_channels], y[-self.pool_channels :]
-            bias = self.pool_linear(board_pool(pooled))
-            y = y + bias.reshape(-1, 1, 1).astype(y.dtype)
+            bias = self.pool_linear(board_pool(pooled)).reshape(-1, 1, 1)
+            if self.group_pool is not None:
+                bias = bias + self.group_pool(pooled)
+            y = y + bias.astype(y.dtype)
         y = convolve(self.conv2, y, dtype)
         return x + y.astype(x.dtype), state
 
@@ -557,12 +714,22 @@ class PreActBottleneck(eqx.Module):
         key: jax.Array,
         make_norm: NormMaker,
         stats: Stats,
+        pool_groups: PoolGroups = (),
+        positions: int = 0,
     ):
         keys = jax.random.split(key, len(inner_pool_channels) + 2)
         self.down_norm = make_norm(channels, stats, 1)
         self.down_conv = conv(channels, inner_channels, 1, keys[0])
         self.inner = [
-            PreActBlock(inner_channels, pool, key=k, make_norm=make_norm, stats=stats)
+            PreActBlock(
+                inner_channels,
+                pool,
+                key=k,
+                make_norm=make_norm,
+                stats=stats,
+                pool_groups=pool_groups,
+                positions=positions,
+            )
             for pool, k in zip(inner_pool_channels, keys[2:], strict=True)
         ]
         self.up_norm = make_norm(inner_channels, stats, 1)
@@ -768,7 +935,15 @@ class AZResnet(eqx.Module):
         )
         if config.block == "basic":
             self.blocks = [
-                basic(channels, pool, key=k, make_norm=make_norm, stats=block_stats)
+                basic(
+                    channels,
+                    pool,
+                    key=k,
+                    make_norm=make_norm,
+                    stats=block_stats,
+                    pool_groups=config.pool_groups,
+                    positions=height * width,
+                )
                 for pool, k, block_stats in zip(
                     pool_channels, block_keys, stats[:-1], strict=True
                 )
@@ -782,6 +957,8 @@ class AZResnet(eqx.Module):
                     key=k,
                     make_norm=make_norm,
                     stats=stats[i],
+                    pool_groups=config.pool_groups,
+                    positions=height * width,
                 )
                 for i, k in enumerate(block_keys)
             ]

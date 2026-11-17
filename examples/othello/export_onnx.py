@@ -223,6 +223,8 @@ def to_onnx(network: AZResnet, state: eqx.nn.State) -> onnx.ModelProto:
     else:
         x = graph.relu(graph.conv_norm(network.stem_conv, network.stem_norm, state, x))
     for block in network.blocks:
+        if getattr(block, "group_pool", None) is not None:
+            raise TypeError("line pooling (pool_groups) doesn't export")
         if isinstance(block, ResidualBlock):
             x = graph.block(block, state, x)
         elif isinstance(block, PreActBlock):

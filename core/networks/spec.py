@@ -19,6 +19,9 @@ KINDS: dict[str, tuple[type[Any], type[Any], str, str]] = {
     "transformer": (BoardTransformer, BoardTransformerConfig, "num_layers", "dim"),
 }
 
+# configuration fields a spec can't set: the caller's (see `network_config`'s options)
+NOT_IN_SPECS = ("policy_head_out_size", "pool_groups")
+
 
 def _parse(name: str, annotation: Any, text: str) -> Any:
     """`text` as a value of the configuration field `name`, whose type is `annotation`."""
@@ -70,7 +73,7 @@ def network_config(
     fields = {
         f.name: f
         for f in dataclasses.fields(config_type)
-        if f.name not in ("policy_head_out_size", depth_field, width_field)
+        if f.name not in (*NOT_IN_SPECS, depth_field, width_field)
     }
     hints = typing.get_type_hints(config_type)
     values = dict(options)
