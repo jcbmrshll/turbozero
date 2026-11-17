@@ -641,15 +641,32 @@ class Depthwise(eqx.Module):
         return kernel.at[:, rows, cols].set(self.weight)[:, None]
 
     def __call__(self, x: jax.Array, dtype: jnp.dtype) -> jax.Array:
-        """The filters applied to `x`, computing in `dtype`."""
-        y = jax.lax.conv_general_dilated(
-            x[None].astype(dtype),
-            self.dense().astype(dtype),
-            window_strides=(1, 1),
-            padding="SAME",
-            feature_group_count=x.shape[0],
+        """The filters applied to `x`, computing in `dtype`: each channel's filter as a matrix from
+        the squares to the squares (see `tap_index`), all channels one batched matrix product. A
+        grouped convolution with a kernel as large as the grid ran 8x slower on a GPU."""
+        channels, height, width = x.shape
+        index = tap_index(self.taps, height, width)
+        # one more weight, zero, for the pairs of squares no tap joins
+        weight = jnp.pad(self.weight, ((0, 0), (0, 1)))[:, index]
+        y = jnp.einsum(
+            "cpq,cq->cp",
+            weight.astype(dtype),
+            x.reshape(channels, height * width).astype(dtype),
         )
-        return y[0]
+        return y.reshape(channels, height, width)
+
+
+@functools.cache
+def tap_index(taps: tuple[tuple[int, int], ...], height: int, width: int) -> np.ndarray:
+    """(squares, squares), squares = height * width row by row: which of `taps` joins square p to
+    square q (q = p + its offset), or len(taps) where none does."""
+    index = np.full((height * width, height * width), len(taps))
+    rows, cols = np.divmod(np.arange(height * width), width)
+    for t, (dy, dx) in enumerate(taps):
+        r, c = rows + dy, cols + dx
+        inside = (0 <= r) & (r < height) & (0 <= c) & (c < width)
+        index[np.flatnonzero(inside), (r * width + c)[inside]] = t
+    return index
 
 
 class PreActConvNeXt(eqx.Module):
