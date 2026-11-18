@@ -34,6 +34,17 @@ enum VirtualLoss {
     VL_DRAW = 2,
 };
 
+// what a fixed number of visits does once a move is decided (see `leading_edge`)
+enum Descend {
+    // nothing: PUCT chooses every edge
+    DESCEND_OFF = 0,
+    // at the root: the rest of the search goes on under the move it plays
+    DESCEND_ROOT = 1,
+    // at the root, and then at each of our moves below it, a turn on, whose move the visits left now
+    // and every search up to it can't change
+    DESCEND_RECURSIVE = 2,
+};
+
 constexpr uint64_t NOT_A = 0xfefefefefefefefeULL;  // no square in the first column
 constexpr uint64_t NOT_H = 0x7f7f7f7f7f7f7f7fULL;  // no square in the last column
 
@@ -256,6 +267,16 @@ struct Search {
     bool random_symmetry;
     // whether a leaf may take an evaluation of its position from elsewhere in the tree
     bool reuse;
+    // a `Descend`: whether a fixed number of visits, once its move is decided, goes on under that
+    // move only (see `leading_edge`)
+    int descend;
+    // the root's edge the search's move is decided on, -1 until it is
+    int32_t decided;
+    // the visits of this search, and so of each search to come (0 on a clock)
+    int budget;
+    // positions with so many empties or fewer the player solves rather than searches: their move
+    // isn't the most visited, so `DESCEND_RECURSIVE` never takes it as decided
+    int solved_from;
     uint64_t rng;  // splitmix64's state
     int32_t root;
     int remaining;
@@ -267,8 +288,10 @@ struct Search {
     int visits_total;
     // leaves that took an evaluation from the tree
     long reused_total;
-    // traversals in a row that ended the game, with no leaf between
-    int ended_in_a_row;
+    // visits sent down a decided move's edge rather than chosen by PUCT: at the root, and at one
+    // of our moves below it
+    long descended_total;
+    long descended_deeper_total;
 };
 
 inline float edge_q(const Search& s, const Edge& e) {
@@ -300,6 +323,35 @@ inline int select(const Search& s, const Node& node) {
     }
     return best;
 }
+
+// The edge of `node` the move from it is decided on: its visits more than any other edge's could reach
+// with `extra` more visits and every traversal in flight, so that it stays the most visited
+// (`search_best_action`'s choice) however they go. -1 if none is. Once every traversal through the
+// node takes it, no other edge gains, and the decision holds.
+int leading_edge(const Search& s, const Node& node, long extra) {
+    int top = node.first_edge;
+    for (int i = node.first_edge + 1; i < node.first_edge + node.num_edges; i++) {
+        const Edge& e = s.edges[i];
+        if (e.n > s.edges[top].n || (e.n == s.edges[top].n && e.prior > s.edges[top].prior)) top = i;
+    }
+    long most = s.edges[top].n;
+    for (int i = node.first_edge; i < node.first_edge + node.num_edges; i++) {
+        const Edge& e = s.edges[i];
+        if (i != top && (long)e.n + e.in_flight + extra >= most) return -1;
+    }
+    return top;
+}
+
+// With `descend`, the root's edge once the search's move is decided, against the `left` visits still
+// to come. The search's visits then go on under it, where the tree the next search starts from keeps
+// them, rather than to moves that can't be played. -1 until then, and always without a fixed number
+// of visits (`remaining` then is unbounded).
+int decided_edge(Search& s, const Node& root, int left) {
+    if (s.decided < 0 && s.descend != DESCEND_OFF) s.decided = leading_edge(s, root, left);
+    return s.decided;
+}
+
+inline int empties(const Position& p) { return 64 - __builtin_popcountll(p.me | p.opp); }
 
 int32_t new_node(Search& s, const Position& p) {
     Node node{};
@@ -368,9 +420,8 @@ bool reuse_evaluation(Search& s, int32_t index) {
 }
 
 // `search_collect`'s traversals, their paths kept in `b` until `apply`; each leaf's observation written
-// to `out` as (2, 8, 8) floats, or with `bits`, to it as two words, the discs of the player to move and
-// of the other
-int collect(Search& s, Batch& b, int batch, float* out, uint64_t* bits = nullptr) {
+// to `out` as (2, 8, 8) floats
+int collect(Search& s, Batch& b, int batch, float* out) {
     b.paths.clear();
     b.collisions.clear();
     b.leaf_ends.clear();
@@ -383,6 +434,11 @@ int collect(Search& s, Batch& b, int batch, float* out, uint64_t* bits = nullptr
         int32_t index = s.root;
         b.path.push_back({index, -1});
         enum { LEAF, END, COLLISION } outcome;
+        // whether the path so far took a decided move at each of our turns (see `Descend`); and
+        // whether it did at the root, and below it
+        bool chain = s.descend != DESCEND_OFF;
+        bool descended = false, deeper = false;
+        int depth = 0;
         while (true) {
             Node& node = s.nodes[index];
             if (node.position.terminated) {
@@ -393,7 +449,22 @@ int collect(Search& s, Batch& b, int batch, float* out, uint64_t* bits = nullptr
                 outcome = node.in_flight > 0 ? COLLISION : LEAF;
                 break;
             }
-            int e = select(s, node);
+            int e = -1;
+            if (chain && depth == 0) {
+                e = decided_edge(s, node, s.remaining - visits);
+                descended = e >= 0;
+                chain = descended;
+            } else if (chain && depth % 2 == 0) {
+                // our move `depth / 2` turns on, decided against this search's visits left and the
+                // whole of each search up to it: their root rule keeps it, so visits to its other
+                // moves would be lost by then
+                if (s.descend == DESCEND_RECURSIVE && empties(node.position) > s.solved_from)
+                    e = leading_edge(s, node, (long)(s.remaining - visits) + (long)(depth / 2) * s.budget);
+                deeper = deeper || e >= 0;
+                chain = e >= 0;
+            }
+            depth++;
+            if (e < 0) e = select(s, node);
             int32_t child = s.edges[e].child;
             if (child < 0) {
                 Position next = play(node.position, s.edges[e].action);
@@ -404,15 +475,15 @@ int collect(Search& s, Batch& b, int batch, float* out, uint64_t* bits = nullptr
             index = child;
             b.path.push_back({index, e});
         }
+        if (outcome != COLLISION && descended) s.descended_total++;
+        if (outcome != COLLISION && deeper) s.descended_deeper_total++;
         if (outcome == END) {
             back_up(s, b.path.data(), (int)b.path.size(), s.nodes[index].position.reward, false);
             visits++;
-            s.ended_in_a_row++;
         } else if (outcome == LEAF && s.reuse && reuse_evaluation(s, index)) {
             back_up(s, b.path.data(), (int)b.path.size(), s.nodes[index].value, false);
             visits++;
             s.reused_total++;
-            s.ended_in_a_row = 0;
         } else if (outcome == LEAF) {
             fly(s, b.path, 1);
             b.paths.insert(b.paths.end(), b.path.begin(), b.path.end());
@@ -420,16 +491,10 @@ int collect(Search& s, Batch& b, int batch, float* out, uint64_t* bits = nullptr
             int symmetry = s.random_symmetry ? draw_symmetry(s) : 0;
             b.leaf_symmetries.push_back((uint8_t)symmetry);
             const Position& p = s.nodes[index].position;
-            uint64_t me = symmetric_bits(p.me, symmetry), opp = symmetric_bits(p.opp, symmetry);
-            if (bits) {
-                bits[2 * (size_t)leaves] = me;
-                bits[2 * (size_t)leaves + 1] = opp;
-            } else {
-                write_observation(me, opp, out + (size_t)leaves * 128);
-            }
+            write_observation(symmetric_bits(p.me, symmetry), symmetric_bits(p.opp, symmetry),
+                              out + (size_t)leaves * 128);
             leaves++;
             visits++;
-            s.ended_in_a_row = 0;
         } else {
             fly(s, b.path, 1);
             b.collisions.insert(b.collisions.end(), b.path.begin(), b.path.end());
@@ -491,7 +556,7 @@ void apply(Search& s, Batch& b, const float* logits, const float* values) {
 extern "C" {
 
 Search* search_new(int mode, float weight, float c_init, float prior_temperature, int max_collisions,
-                   int random_symmetry, int reuse, uint64_t seed) {
+                   int random_symmetry, int reuse, int descend, uint64_t seed) {
     Search* s = new Search();
     s->mode = mode;
     s->weight = weight;
@@ -500,12 +565,17 @@ Search* search_new(int mode, float weight, float c_init, float prior_temperature
     s->max_collisions = max_collisions;
     s->random_symmetry = random_symmetry != 0;
     s->reuse = reuse != 0;
+    s->descend = descend;
+    s->decided = -1;
+    s->budget = 0;
+    s->solved_from = 0;
+    s->descended_total = 0;
+    s->descended_deeper_total = 0;
     s->rng = seed;
     s->root = -1;
     s->remaining = 0;
     s->collisions_total = 0;
     s->visits_total = 0;
-    s->ended_in_a_row = 0;
     s->reused_total = 0;
     return s;
 }
@@ -521,7 +591,19 @@ void search_set_position(Search* s, uint64_t me, uint64_t opp) {
     p.me = me;
     p.opp = opp;
     s->root = new_node(*s, p);
+    s->decided = -1;
 }
+
+// A copy of the search, tree and settings, that goes on by itself; with `descend` a `Descend`, that
+// setting changed (-1 keeps it).
+Search* search_clone(const Search* s, int descend) {
+    Search* copy = new Search(*s);
+    if (descend >= 0) copy->descend = descend;
+    return copy;
+}
+
+// Positions with `empties` or fewer the player solves rather than searches (see `Search::solved_from`).
+void search_set_solved_from(Search* s, int empties) { s->solved_from = empties; }
 
 // the game's start: black to move
 void search_reset(Search* s) { search_set_position(s, (1ULL << 28) | (1ULL << 35), (1ULL << 27) | (1ULL << 36)); }
@@ -529,7 +611,8 @@ void search_reset(Search* s) { search_set_position(s, (1ULL << 28) | (1ULL << 35
 // the search for a move: `visits` more of the tree, each a leaf to evaluate or a game's end reached
 void search_begin(Search* s, int visits) {
     s->remaining = visits;
-    s->ended_in_a_row = 0;
+    s->budget = visits;
+    s->decided = -1;
 }
 
 int search_remaining(const Search* s) { return s->remaining; }
@@ -544,30 +627,6 @@ int search_collect(Search* s, int batch, float* out) { return collect(*s, s->bat
 
 // The evaluations of the leaves `search_collect` returned, (leaves, 65) policy logits and (leaves) values.
 void search_apply(Search* s, const float* logits, const float* values) { apply(*s, s->batch, logits, values); }
-
-// Batches of a search's own, beside its `search_collect`'s, for a caller with several in flight at once:
-// each collected into while the others are out for evaluation, its leaves' traversals steered away
-// from theirs by their virtual visits.
-Batch* batch_new() { return new Batch(); }
-
-void batch_free(Batch* b) { delete b; }
-
-// `search_collect` into `b`
-int search_collect_into(Search* s, Batch* b, int batch, float* out) { return collect(*s, *b, batch, out); }
-
-// `search_collect_into`, each leaf's observation written to `out` packed: (batch, 2) words, the discs of
-// the player to move and the other's, bit i the square of row i / 8, column i % 8
-int search_collect_bits(Search* s, Batch* b, int batch, uint64_t* out) {
-    return collect(*s, *b, batch, nullptr, out);
-}
-
-// `search_apply` of what `search_collect_into` put in `b`
-void search_apply_from(Search* s, Batch* b, const float* logits, const float* values) {
-    apply(*s, *b, logits, values);
-}
-
-// traversals in a row, to now, that ended the game with no leaf between
-int search_ended_in_a_row(const Search* s) { return s->ended_in_a_row; }
 
 int search_num_legal(const Search* s) {
     const Position& p = s->nodes[s->root].position;
@@ -615,6 +674,7 @@ float search_root_q(const Search* s) {
 
 // Moves the root down the tree, keeping what it searched under the action.
 void search_play(Search* s, int action) {
+    s->decided = -1;
     Node& root = s->nodes[s->root];
     for (int i = root.first_edge; i < root.first_edge + root.num_edges; i++) {
         if (s->edges[i].action == action && s->edges[i].child >= 0) {
@@ -645,7 +705,25 @@ long search_total_visits(const Search* s) { return s->visits_total; }
 // leaves that took an evaluation from the tree rather than the network
 long search_reused(const Search* s) { return s->reused_total; }
 
+// visits a decided move took at the root (see `decided_edge`), and visits one took below it
+long search_descended(const Search* s) { return s->descended_total; }
+long search_descended_deeper(const Search* s) { return s->descended_deeper_total; }
+
 long search_num_nodes(const Search* s) { return (long)s->nodes.size(); }
+
+// the nodes of the tree under the root, the root's own included: what a search from it starts with
+long search_subtree_nodes(const Search* s) {
+    long count = 0;
+    std::vector<int32_t> stack{s->root};
+    while (!stack.empty()) {
+        const Node& node = s->nodes[stack.back()];
+        stack.pop_back();
+        count++;
+        for (int i = node.first_edge; i < node.first_edge + node.num_edges; i++)
+            if (s->edges[i].child >= 0) stack.push_back(s->edges[i].child);
+    }
+    return count;
+}
 
 void search_legal(const Search* s, int32_t* out) {
     const Position& p = s->nodes[s->root].position;
@@ -745,16 +823,15 @@ Engine* engine_new_net(const net::Net* n, int threads, int batch) {
 void engine_free(Engine* engine) { delete engine; }
 
 // Searches `s`'s tree with all the engine's workers: `visits` visits, or with none, until `seconds`
-// pass, or, either way, until `stop_ended` traversals in a row end the game with no leaf between (the
-// tree has nothing left to evaluate), 0 for never. Batches in flight then are finished. Returns the
-// leaves evaluated.
-long engine_search(Engine* engine, Search* s, int visits, double seconds, int stop_ended) {
+// pass. Batches in flight then are finished. Returns the leaves evaluated.
+long engine_search(Engine* engine, Search* s, int visits, double seconds) {
     using clock = std::chrono::steady_clock;
     auto start = clock::now();
     auto deadline = start + std::chrono::duration_cast<clock::duration>(std::chrono::duration<double>(seconds));
     bool timed = visits <= 0;
     s->remaining = timed ? INT_MAX : visits;
-    s->ended_in_a_row = 0;
+    s->budget = timed ? 0 : visits;
+    s->decided = -1;
     std::mutex lock;
     std::condition_variable applied;
     long generation = 0;
@@ -765,8 +842,7 @@ long engine_search(Engine* engine, Search* s, int visits, double seconds, int st
         double inferring = 0;
         std::unique_lock<std::mutex> held(lock);
         while (true) {
-            if (stop || s->remaining <= 0 || (timed && clock::now() >= deadline) ||
-                (stop_ended > 0 && s->ended_in_a_row >= stop_ended)) {
+            if (stop || s->remaining <= 0 || (timed && clock::now() >= deadline)) {
                 stop = true;
                 applied.notify_all();
                 break;
@@ -856,16 +932,32 @@ int net_set_conv(net::Net* n, const char* where, int block, int cin, int cout, i
                    : name == "head" ? &n->head
                    : name == "conv1" ? &n->blocks.at(block).conv1
                    : name == "conv2" ? &n->blocks.at(block).conv2
+                   : name == "expand" ? &n->blocks.at(block).expand
+                   : name == "project" ? &n->blocks.at(block).project
                                      : nullptr;
     if (!c || cin % 4 || cout % 16 || (k != 1 && k != 3)) return -1;
     c->cin = cin;
     c->cout = cout;
     c->k = k;
-    net::pack(*c, q);
+    if (c == &n->stem) {
+        if (cin != 4 || k != 3) return -1;
+        net::stem_table(*c, q);
+    } else if (name != "expand" && name != "project") {
+        net::pack(*c, q);
+    } else if (k != 1 || cin % 16 || (name == "project" && zero_point != 0)) {
+        // (a project's input is ReLU's, from 0: AVX2's kernels take its zero point as 0)
+        return -1;
+    }
     c->scale.assign(scale, scale + cout);
     c->bias.assign(bias, bias + cout);
     c->inverse.assign(inverse, inverse + cin);
     c->zero_point = zero_point;
+    if (name == "expand" || name == "project") {
+#ifdef NET_SEVEN_BIT
+        net::seven_bit(*c, q);
+#endif
+        net::pack1x1(*c, q, name == "expand");
+    }
     return 0;
 }
 
@@ -904,10 +996,29 @@ int net_set_linear(net::Net* n, const char* where, int block, int in, int out, c
                      : name == "value_out"        ? &n->value_out
                                                   : nullptr;
     if (!l) return -1;
-    l->in = in;
-    l->out = out;
-    l->w.assign(w, w + (size_t)in * out);
-    l->b.assign(b, b + out);
+    net::set_linear(*l, in, out, w, b);
+    return 0;
+}
+
+// Makes block `block` ConvNeXt's (pre layout only), its depthwise filter of `taps` taps, `at`, (taps, 2),
+// each one's (dy, dx) in order of dy then dx, within 7 squares; `w`, (taps, channels), BatchNorm's
+// scale folded in, and `bias`, (channels), its offset. Its 1x1s are its "expand" and "project".
+int net_set_depthwise(net::Net* n, int block, int taps, const int* at, const float* w, const float* bias) {
+    if (!n->pre || taps < 1) return -1;
+    net::Block& b = n->blocks.at(block);
+    b.convnext = true;
+    b.dw.dy.clear();
+    b.dw.dx.clear();
+    for (int t = 0; t < taps; t++) {
+        const int dy = at[2 * t], dx = at[2 * t + 1];
+        if (std::abs(dy) > 7 || std::abs(dx) > 7) return -1;
+        if (t && std::make_pair(dy, dx) <= std::make_pair(b.dw.dy.back(), b.dw.dx.back())) return -1;
+        b.dw.dy.push_back(dy);
+        b.dw.dx.push_back(dx);
+    }
+    b.dw.w.assign(w, w + (size_t)taps * n->channels);
+    b.dw.bias.assign(bias, bias + n->channels);
+    net::prepare(b.dw);
     return 0;
 }
 

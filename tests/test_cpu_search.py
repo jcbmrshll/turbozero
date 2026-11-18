@@ -239,6 +239,141 @@ def test_a_short_batch_still_finishes():
     assert search.collisions() > 0
 
 
+def game_positions(count: int, seed: int) -> list[tuple[int, int]]:
+    """(me, opp) of `count` positions along a random game's opening and middle game."""
+    from cpu_search import Search
+
+    rng = np.random.default_rng(seed)
+    search, positions = Search(), []
+    while len(positions) < count and not search.terminated():
+        me, opp, _, _ = search.position()
+        if search.num_legal() > 1:
+            positions.append((me, opp))
+        search.play(int(rng.choice(np.flatnonzero(search.legal()))))
+    return positions
+
+
+@pytest.mark.parametrize(("batch", "mode"), [(1, "loss"), (8, "loss"), (8, "visit")])
+def test_descend_plays_the_same_move_and_spends_the_rest_under_it(batch, mode):
+    from cpu_search import Search, SearchSettings
+
+    visits, descended = 300, 0
+    for me, opp in game_positions(12, seed=batch):
+        searches = {}
+        for descend in (0, 1):
+            search = Search(
+                SearchSettings(batch=batch, virtual_loss=mode, descend=descend)
+            )
+            search.set_position(me, opp)
+            search.run(visits, fake_eval)
+            searches[descend] = search
+        off, on = searches[0], searches[1]
+        action = off.best_action()
+        assert on.best_action() == action
+        assert on.total_visits() == off.total_visits() == visits
+        # the two searches are the same until the move is decided; then only it gains
+        others = np.arange(65) != action
+        assert np.all(on.visits()[others] <= off.visits()[others])
+        assert on.visits()[action] - off.visits()[action] == (
+            off.visits()[others].sum() - on.visits()[others].sum()
+        )
+        assert off.descended() == 0
+        descended += on.descended()
+        # and the next search starts from more
+        off.play(action)
+        on.play(action)
+        assert on.visits().sum() >= off.visits().sum()
+    assert descended > 0
+
+
+def test_descend_does_nothing_on_a_clock():
+    from cpu_search import Search, SearchSettings
+
+    search = Search(SearchSettings(batch=8, descend=2))
+    batch = np.empty((8, 2, 8, 8), np.float32)
+    search.begin(1 << 30)
+    for _ in range(100):
+        count = search.collect(batch)
+        search.apply(*fake_eval(batch[:count]))
+    assert search.total_visits() > 500
+    assert search.descended() == search.descended_deeper() == 0
+
+
+def test_a_player_parses_descend():
+    from cpu_match import Player
+    from cpu_search import SearchSettings
+
+    assert Player.parse("visits=10,descend=2", "n", "f32").settings.descend == 2
+    assert Player.parse("visits=10", "n", "f32").settings.descend == 0
+    with pytest.raises(ValueError, match="descend"):
+        SearchSettings(descend=3)
+
+
+def sharp_eval(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """`fake_eval` with a sharper prior, as a trained network's: trees deep enough that our
+    moves a turn on get decided."""
+    logits, values = fake_eval(x)
+    return 8 * logits, values
+
+
+def descend_game(descend: int, visits: int, moves: int, solved_from: int = 0):
+    """A game against itself from the start, `visits` a move by `sharp_eval`: each search, and
+    the search before it."""
+    from cpu_search import Search, SearchSettings
+
+    search = Search(SearchSettings(descend=descend))
+    search.set_solved_from(solved_from)
+    for _ in range(moves):
+        if search.terminated():
+            break
+        before = search.clone()
+        search.run(visits, sharp_eval)
+        yield before, search
+        search.play(search.best_action())
+
+
+def test_recursive_descend_decides_the_root_as_root_descend_does():
+    for before, search in descend_game(2, 300, 16):
+        root = before.clone(descend=1)
+        root.run(300, sharp_eval)
+        # the same search until the root is decided; then only what's under its move differs
+        action = root.best_action()
+        assert search.best_action() == action
+        others = np.arange(65) != action
+        assert np.array_equal(search.visits()[others], root.visits()[others])
+
+
+def test_recursive_descend_takes_only_moves_the_searches_to_come_keep():
+    visits, deeper = 200, 0
+    for before, search in descend_game(2, visits, 30):
+        deeper = search.descended_deeper()
+        # a move of ours a turn on that leads by more than a whole search, as one the rule took
+        # must, is the move the next search plays, whatever the opponent's reply
+        action = search.best_action()
+        child = search.clone()
+        child.play(action)
+        if child.terminated():
+            continue
+        for reply in np.flatnonzero(child.legal()):
+            grandchild = child.clone()
+            grandchild.play(int(reply))
+            counts = grandchild.visits()
+            if grandchild.terminated() or counts.sum() == 0:
+                continue
+            top = int(np.argmax(counts))
+            if counts[top] - np.delete(counts, top).max() > visits:
+                grandchild.run(visits, sharp_eval)
+                assert grandchild.best_action() == top
+    assert deeper > 0
+
+
+def test_recursive_descend_leaves_positions_the_player_solves():
+    *_, (_, solving) = descend_game(2, 200, 30, solved_from=60)
+    *_, (_, searching) = descend_game(2, 200, 30)
+    assert solving.descended() > 0 and solving.descended_deeper() == 0
+    assert searching.descended_deeper() > 0
+
+
 def symmetry_tables() -> dict[int, np.ndarray]:
     """For each of the search's symmetries, (65) where each action goes, worked out by hand from
     what it does: 1 swaps rows and columns, 2 reverses the rows, 4 the columns."""
@@ -482,6 +617,9 @@ def test_a_player_parses_random_symmetry():
         "fixed",
         "ws",
         *(f"{norm},layout=pre" for norm in ("batch", "layer", "channel", "rms")),
+        # ConvNeXt blocks: BatchNorm folded into the ray filters, or a normalization after them
+        "batch,layout=pre,block=convnext,dw_taps=rays",
+        "layer,layout=pre,block=convnext,dw_kernel=3,expand=3",
     ],
 )
 def test_export_matches_the_network(norm):
@@ -711,6 +849,26 @@ def test_workers_visit_exactly_and_leave_nothing_in_flight(tiny_model, mode):
     assert stats["calls"] > 0 and stats["leaves"] >= leaves
 
 
+def test_workers_descend_without_changing_the_move(tiny_model):
+    from cpu_search import Engine, Search, SearchSettings
+
+    engine = Engine.openvino(tiny_model, 3, 4)
+    descended = 0
+    for me, opp in game_positions(6, seed=5):
+        search = Search(SearchSettings(batch=4, virtual_loss="visit", descend=2))
+        search.set_position(me, opp)
+        engine.search(search, visits=400)
+        assert search.total_visits() == 400
+        assert search.visits().sum() == 399
+        descended += search.descended()
+        if search.descended():
+            # decided against every visit in flight: what the rest went to is the most visited
+            visits = search.visits()
+            action = search.best_action()
+            assert visits[action] > np.delete(visits, action).max()
+    assert descended > 0
+
+
 def test_a_timed_search_stops_at_its_time(tiny_model):
     import time
 
@@ -724,7 +882,10 @@ def test_a_timed_search_stops_at_its_time(tiny_model):
     assert search.total_visits() > 10
 
 
-def test_a_solved_tree_stops_its_search_early(tiny_model):
+def test_a_timed_search_takes_its_time_with_nothing_left_to_evaluate(tiny_model):
+    import time
+
+    from cpu_match import timed_move
     from cpu_search import Engine, Search, SearchSettings
 
     # a random game to a few empty squares: the whole tree below is soon all games' ends
@@ -736,9 +897,14 @@ def test_a_solved_tree_stops_its_search_early(tiny_model):
             break
         search.play(int(rng.choice(np.flatnonzero(search.legal()))))
     assert not search.terminated()
-    Engine.openvino(tiny_model, 2, 2).search(search, seconds=5.0, stop_ended=64)
-    # far fewer than 5 s of visits
-    assert search.total_visits() < 100_000
+    # a search on a clock spends its time: the next moves search the same tree, which has
+    # nothing to spend it on either
+    start = time.perf_counter()
+    Engine.openvino(tiny_model, 2, 2).search(search, seconds=0.1)
+    assert time.perf_counter() - start >= 0.1
+    start = time.perf_counter()
+    timed_move(search, 0.1, np.empty((2, 2, 8, 8), np.float32), fake_eval)
+    assert time.perf_counter() - start >= 0.1
 
 
 def test_an_engine_player_plays_a_game_through_the_clock_driver(tiny_model):
@@ -807,11 +973,18 @@ NATIVE_SPECS = [
     "resnet:3x64,pool_every=2,heads=pooled,pool_channels=16,norm=channel,layout=pre",
     # pooled channels leaving a number of others that is no multiple of 16
     "resnet:2x48,pool_every=1,heads=pooled,pool_channels=8,head_channels=16,layout=pre",
-    "resnet:2x48,pool_every=2,heads=pooled,pool_channels=24,head_channels=16",
+    # and the post layout's residual normalized
+    "resnet:2x48,pool_every=2,heads=pooled,pool_channels=24,head_channels=16,norm=channel",
+]
+# ConvNeXt blocks: Othello's ray filters, and a square filter at a width off multiples of 32 with
+# pooled channels off multiples of 16
+CONVNEXT_SPECS = [
+    "resnet:3x64,pool_every=2,heads=pooled,pool_channels=16,layout=pre,block=convnext,expand=2,dw_taps=rays",
+    "resnet:2x48,pool_every=1,heads=pooled,pool_channels=8,head_channels=16,layout=pre,block=convnext,expand=3,dw_kernel=5",
 ]
 
 
-@pytest.mark.parametrize("spec", NATIVE_SPECS)
+@pytest.mark.parametrize("spec", NATIVE_SPECS + CONVNEXT_SPECS)
 def test_the_native_networks_layers_compute_the_network(spec):
     import cpu_net
     from cpu_search import ort_eval, ort_session
@@ -828,10 +1001,10 @@ def test_the_native_networks_layers_compute_the_network(spec):
     np.testing.assert_allclose(got_values, values, atol=1e-5)
 
 
-# each convolution kernel: AVX-512 VNNI's, AVX2's Winograd with and without AVX-VNNI, and NEON's with
+# each convolution kernel: AVX-512 VNNI's, AVX-VNNI's, AVX2's Winograd, and NEON's with
 # i8mm and with the dot product alone
 @pytest.mark.parametrize("level", ["v4", "v3-vnni", "v3", "arm-i8mm", "arm-dotprod"])
-@pytest.mark.parametrize("spec", NATIVE_SPECS)
+@pytest.mark.parametrize("spec", NATIVE_SPECS + CONVNEXT_SPECS)
 def test_the_native_network_computes_its_quantized_layers(
     spec, level, tmp_path, monkeypatch
 ):
@@ -857,11 +1030,38 @@ def test_the_native_network_computes_its_quantized_layers(
     assert np.abs(logits - float_logits).mean() < 0.05
 
 
-@pytest.mark.parametrize("spec", NATIVE_SPECS)
+@pytest.mark.parametrize(
+    "level", ["v4", "v3-vnni", "v3", "v3-7bit", "arm-i8mm", "arm-dotprod"]
+)
+def test_the_native_networks_pieces_compute_as_plainer_code_does(level, tmp_path):
+    # its sums of many squares or outputs at once, bit for bit as one at a time, the stem's table as
+    # its convolution, and its 3x3 convolutions as their sums taken directly (`cpu_net_checks.cpp`)
+    import subprocess
+
+    import native_target
+
+    if level not in native_levels():
+        pytest.skip(f"this CPU doesn't run level {level}")
+    here = Path(__file__).parent
+    binary = tmp_path / "checks"
+    subprocess.run(
+        ["g++", "-std=c++17", "-O3", *native_target.LEVELS[level], "-fopenmp-simd"]
+        + [
+            f"-I{here.parent / 'examples' / 'othello'}",
+            str(here / "cpu_net_checks.cpp"),
+        ]
+        + ["-o", str(binary)],
+        check=True,
+    )
+    result = subprocess.run([str(binary)], capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stdout
+
+
+@pytest.mark.parametrize("spec", NATIVE_SPECS + CONVNEXT_SPECS)
 def test_avx_vnni_sums_as_avx2_does(spec, monkeypatch):
     import cpu_net
 
-    # the same integers, multiplied and added in one instruction or two, and the same float code
+    # the same integers, by AVX-VNNI's direct convolutions or AVX2's Winograd, and the same float code
     libs = [library(level, monkeypatch) for level in ("v3-vnni", "v3")]
     program = cpu_net.extract(*random_network(spec))
     x = (np.random.default_rng(0).random((48, 2, 8, 8)) < 0.3).astype(np.float32)
@@ -870,6 +1070,29 @@ def test_avx_vnni_sums_as_avx2_does(spec, monkeypatch):
         cpu_net.NativeNet(program, quantized, lib).forward(x) for lib in libs
     ]
     assert np.array_equal(logits, want_logits) and np.array_equal(values, want_values)
+
+
+@pytest.mark.parametrize("spec", NATIVE_SPECS[1:2] + CONVNEXT_SPECS)
+def test_seven_bit_avx2_changes_only_convnext_blocks(spec, monkeypatch):
+    import cpu_net
+
+    # level v3-7bit: ConvNeXt blocks' 1x1 inputs on half the grid (for vpmaddubsw), close to the
+    # float network still; basic blocks as v3's, bit for bit
+    libs = [library(level, monkeypatch) for level in ("v3-7bit", "v3")]
+    program = cpu_net.extract(*random_network(spec))
+    x = (np.random.default_rng(0).random((48, 2, 8, 8)) < 0.3).astype(np.float32)
+    quantized = cpu_net.quantize(program, x)
+    (logits, values), (want_logits, want_values) = [
+        cpu_net.NativeNet(program, quantized, lib).forward(x) for lib in libs
+    ]
+    if spec in NATIVE_SPECS:
+        assert np.array_equal(logits, want_logits)
+        assert np.array_equal(values, want_values)
+        return
+    float_logits, float_values = cpu_net.float_forward(program, x)
+    eight_bit = np.abs(want_logits - float_logits).mean()
+    assert np.abs(logits - float_logits).mean() < max(3 * eight_bit, 0.02)
+    assert np.abs(values - float_values).mean() < 0.05
 
 
 def test_an_engine_of_the_native_network_searches_as_a_batch_of_one():
@@ -941,3 +1164,18 @@ def test_a_net_player_takes_a_board_and_plays_from_it():
     for move in game.moves:
         board.play(move)
     assert not board.legal()
+
+
+def test_a_clone_searches_on_by_itself_as_the_original_would():
+    from cpu_search import Search
+
+    search = Search()
+    search.run(100, fake_eval)
+    copy, other = search.clone(), search.clone(descend=1)
+    assert other.settings.descend == 1 and search.settings.descend == 0
+    assert copy.subtree_nodes() == search.subtree_nodes() <= search.num_nodes()
+    search.run(200, fake_eval)
+    copy.run(200, fake_eval)
+    assert np.array_equal(copy.visits(), search.visits())
+    other.run(200, fake_eval)
+    assert other.descended() > 0 and search.descended() == 0

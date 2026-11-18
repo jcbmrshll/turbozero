@@ -9,8 +9,10 @@ from core.networks.azresnet import (
     AZResnet,
     AZResnetConfig,
     BottleneckBlock,
+    Depthwise,
     FixedScale,
     GroupNorm,
+    PreActConvNeXt,
     ResidualBlock,
     batch_norm,
     conv,
@@ -18,6 +20,7 @@ from core.networks.azresnet import (
     inference_affine,
     norm_maker,
     residual_stats,
+    square_taps,
 )
 from core.networks.utils import BATCH_AXIS, apply_nn
 
@@ -281,8 +284,24 @@ VARIANTS = {
 }
 
 
+# variants only the pre-activation layout takes
+PRE_VARIANTS = {
+    "convnext": {
+        "num_blocks": 2,
+        "num_channels": 6,
+        "block": "convnext",
+        "expand": 2,
+        "dw_kernel": 3,
+        "pool_every": 2,
+        "pool_channels": 2,
+        "layout": "pre",
+    },
+}
+
+
 def make_variant(name: str, **options):
-    config = AZResnetConfig(policy_head_out_size=10, **{**VARIANTS[name], **options})
+    variant = {**VARIANTS, **PRE_VARIANTS}[name]
+    config = AZResnetConfig(policy_head_out_size=10, **{**variant, **options})
     return eqx.nn.make_with_state(AZResnet)(
         config, INPUT_SHAPE, key=jax.random.PRNGKey(0)
     )
@@ -478,7 +497,7 @@ def test_residual_stats_grow_with_depth():
     assert np.all(np.diff(moments) > 0.5) and np.all(np.diff(variances) > 0.2)
 
 
-@pytest.mark.parametrize("name", VARIANTS)
+@pytest.mark.parametrize("name", [*VARIANTS, *PRE_VARIANTS])
 def test_pre_activation_batch_norm_infers_as_it_trained_on_its_batch(name):
     # BatchNorm before each convolution: after one training step, inference on the same batch
     # gives the outputs training did, as in the post-activation layout
@@ -503,7 +522,7 @@ def test_fixed_scales_refuse_the_pre_activation_layout(norm):
         make_variant("pooled heads", norm=norm, layout="pre")
 
 
-@pytest.mark.parametrize("name", ["global pooling", "bottleneck"])
+@pytest.mark.parametrize("name", ["global pooling", "bottleneck", *PRE_VARIANTS])
 def test_the_pre_activation_trunk_starts_as_the_stem(name):
     # x + branch, each branch's last convolution starting at zero: at initialization the trunk is
     # the stem's output however deep, and the branches add to it once trained
@@ -543,3 +562,73 @@ def test_the_trunk_is_what_the_heads_read(layout, norm):
     assert features.shape == (6, 3, 3)
     np.testing.assert_allclose(head_policy, policy, rtol=1e-6)
     np.testing.assert_allclose(head_value, value, rtol=1e-6)
+
+
+def test_convnext_blocks_refuse_the_post_activation_layout():
+    with pytest.raises(ValueError, match="pre"):
+        make_variant("convnext", layout="post")
+
+
+@pytest.mark.parametrize("norm", ["layer", "channel"])
+def test_convnext_blocks_with_batch_independent_norms_infer_one_input_at_a_time(norm):
+    net, state = make_variant("convnext", norm=norm)
+    rng = np.random.default_rng(0)
+    params, static = eqx.partition(net, eqx.is_inexact_array)
+    params = jax.tree.map(
+        lambda x: x + 0.3 * rng.normal(size=x.shape).astype(x.dtype), params
+    )
+    net = eqx.combine(params, static)
+    x = jnp.asarray(observations(rng, batch_size=4))
+    (policy, value), _ = apply_nn(net, state, x)
+    (one_policy, one_value), _ = apply_nn(eqx.nn.inference_mode(net), state, x[:1])
+    assert policy.shape == (4, 10) and value.shape == (4, 1)
+    np.testing.assert_allclose(one_policy, policy[:1], atol=1e-5)
+    np.testing.assert_allclose(one_value, value[:1], atol=1e-5)
+
+
+def reference_depthwise(weight: np.ndarray, taps, x: np.ndarray) -> np.ndarray:
+    """y[c, i, j] = sum over taps of weight[c, t] * x[c, i + dy, j + dx], zero off the grid."""
+    channels, height, width = x.shape
+    y = np.zeros_like(x)
+    for c in range(channels):
+        for i in range(height):
+            for j in range(width):
+                for t, (dy, dx) in enumerate(taps):
+                    if 0 <= i + dy < height and 0 <= j + dx < width:
+                        y[c, i, j] += weight[c, t] * x[c, i + dy, j + dx]
+    return y
+
+
+@pytest.mark.parametrize(
+    "taps",
+    [square_taps(3), ((0, 0), (0, 2), (-1, 1), (2, -2), (-3, 0))],
+    ids=["3x3", "sparse"],
+)
+def test_depthwise_filters_each_channel_at_its_taps_only(taps):
+    rng = np.random.default_rng(0)
+    dw = Depthwise(3, taps, key=jax.random.PRNGKey(0))
+    weight = rng.normal(size=dw.weight.shape).astype(np.float32)
+    dw = eqx.tree_at(lambda d: d.weight, dw, jnp.asarray(weight))
+    x = rng.normal(size=(3, 5, 6)).astype(np.float32)
+
+    y = dw(jnp.asarray(x), jnp.dtype("float32"))
+
+    np.testing.assert_allclose(y, reference_depthwise(weight, taps, x), atol=1e-5)
+
+
+def test_depthwise_filters_have_a_weight_per_tap_and_the_square_that_holds_them():
+    dw = Depthwise(4, ((0, 0), (0, 3), (-1, -1)), key=jax.random.PRNGKey(0))
+    assert dw.weight.shape == (4, 3) and dw.kernel_size == 7
+    dense = np.asarray(dw.dense())
+    assert dense.shape == (4, 1, 7, 7)
+    assert np.count_nonzero(dense[0, 0]) == 3
+    with pytest.raises(ValueError, match="distinct"):
+        Depthwise(4, ((0, 0), (0, 0)), key=jax.random.PRNGKey(0))
+
+
+def test_convnext_blocks_take_their_taps_from_the_config():
+    taps = ((0, 0), (0, 1), (2, 2))
+    for options, expected in [({"dw_taps": taps}, taps), ({}, square_taps(3))]:
+        net, _ = make_variant("convnext", **options)
+        for block in net.blocks:
+            assert isinstance(block, PreActConvNeXt) and block.dw.taps == expected

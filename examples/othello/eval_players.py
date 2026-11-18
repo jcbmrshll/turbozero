@@ -14,12 +14,15 @@ A network is one of the league store's, by `net`, or any checkpoint, by `checkpo
 
 - `cpu` (the default): `cpu_search.py`'s search, its leaves evaluated by `backend` (bf16, f32, ort,
   native, int8-VARIANT), with `engine=1` by a thread a core (see `clock_match.net_player`)
-- `gpu`: a tree on the host, leaves evaluated on the GPU a batch at a time (`gpu_play.py`)
 - `gpu-batched`: core's MCTS, many games at once on the GPU, as the Elo league plays: fixed
   visits only, against engines at a level or other such networks
 
 On every device `prior_temperature` (default 2, `game.PLAY_PRIOR_TEMPERATURE`) is the softmax
-temperature of the search's prior: above 1 flatter than the network's policy.
+temperature of the search's prior: above 1 flatter than the network's policy. On `cpu` at fixed
+`visits`, a move's visits left once its move is decided go on under that move, for the
+next search to keep, and on down the tree at our later moves (`descend=2`, see
+`cpu_search.SearchSettings`): on by default, `descend=1` at the root only, `descend=0` for the
+players from before it.
 
 Everything that decides how a player plays is in its config, defaults filled in, and its id is the
 config's digest (`core.evals.store.player_id`): a network's checkpoint by its sha256, and a
@@ -50,7 +53,7 @@ from core.evals.store import player_id
 
 LEAGUE_STORE = CACHE_DIR / "league" / "league.db"
 QUANTIZED_DIR = CACHE_DIR / "quantized"
-DEVICES = ("cpu", "gpu", "gpu-batched")
+DEVICES = ("cpu", "gpu-batched")
 
 # a network's options on each device: (type, default); None for a default of the machine's cores.
 # They're all in its config, so a changed default here is a new player, never the same one
@@ -72,16 +75,6 @@ OPTIONS: dict[str, dict[str, tuple[type, Any]]] = {
         "backend": (str, "bf16"),
         "batch": (int, 1),
         **SEARCH,
-        "threads": (int, None),
-    },
-    "gpu": {
-        "batch": (int, 256),
-        "inflight": (int, 2),
-        "max_call": (int, 1024),
-        "calls": (int, 2),
-        "dtype": (str, "bfloat16"),
-        **SEARCH,
-        "ponder": (int, 0),
         "threads": (int, None),
     },
     # a tree of 4 x visits nodes, no root noise, temperature 0 (`elo_league.Othello`), the prior
@@ -256,6 +249,16 @@ def resolve_net(
             search["solve_cost"] = _typed(
                 "solve_cost", options.pop("solve_cost", SOLVE_COST), float
             )
+    if device == "cpu":
+        descend = _typed("descend", options.pop("descend", None), int)
+        if descend not in (None, 0, 1, 2):
+            raise ValueError(f"descend={descend}: 0, 1 or 2")
+        if descend and "visits" not in budget:
+            raise ValueError("descend needs fixed visits: on a clock it does nothing")
+        # 2 at fixed visits unless said, and in the config only when on: the players from before
+        # it, off, keep their ids
+        if "visits" in budget and descend != 0:
+            search["descend"] = 2 if descend is None else descend
     if options:
         raise ValueError(f"unknown options for a {device} network: {sorted(options)}")
     config: dict[str, Any] = {
@@ -279,6 +282,7 @@ def resolve_net(
     )
     where = device + (f"/{search['backend']}" if device == "cpu" else "")
     solve = f" solve{search['solve']}" if "solve" in search else ""
+    solve += {0: "", 1: " descend", 2: " descend-recursive"}[search.get("descend", 0)]
     temperature = search.get("prior_temperature")
     prior = f" T{temperature:g}" if temperature != known["prior_temperature"][1] else ""
     relative = _relative(checkpoint)

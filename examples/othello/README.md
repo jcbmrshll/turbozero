@@ -715,9 +715,8 @@ any checkpoint by `checkpoint=PATH,spec=NET`; or an engine, `edax`, `egaroucid`,
 `neural-reversi`, `ymatioun` or `edax-fm`. Each side has its own budget: a network `visits` a move
 or a `clock`, an engine a `level` or a `clock`, a contest's seconds for the whole game (`10`) or
 GGS's (`01:00//02:00`). A network plays on a `device`: `cpu` (`cpu_search.py`, with `engine`,
-`backend`, `batch` and the rest, see [Playing on CPU](#playing-on-cpu)), `gpu` (a game at a time,
-its leaves batched on the GPU, `gpu_play.py`) or `gpu-batched` (core's MCTS, many games moving in
-step, at fixed visits against engines at a level or other such networks, with a tree of 4 x visits
+`backend`, `batch` and the rest, see [Playing on CPU](#playing-on-cpu)) or `gpu-batched` (core's
+MCTS, many games moving in step, at fixed visits against engines at a level or other such networks, with a tree of 4 x visits
 nodes). On every device `prior_temperature` is the softmax temperature of the search's prior,
 default 2: flatter than the network's policy, which self-play trains at 1.
 Engines get `threads` (all the cores by default, one in batched games) and `args`.
@@ -1066,7 +1065,9 @@ e.g. to play as an AVX2 build would. Every kernel sums exactly the same integers
 
 - AVX2's 3x3 convolutions run Winograd's F(2x2, 3x3) in integers: each 2x2 tile's 4x4 input patch and
   the weights are transformed into values that fit 16 bits, multiplied in pairs summed into 32 bits,
-  and transformed back, in 16 products where the direct convolution takes 36.
+  and transformed back, in 16 products where the direct convolution takes 36. With AVX-VNNI they run
+  directly, as AVX-512's do at half the width: `vpdpbusd` takes 4 byte products a lane, so the direct
+  convolution's 36 products cost 9 instructions where Winograd's 16 cost 8, without the transforms.
 - NEON's multiply signed bytes: the inputs go in less 128, and 128 times each output's weight sum is
   added back. `sdot` takes 4 channels of a square against 4 outputs' weights; i8mm's `smmla` takes 8
   channels of two neighbouring squares against two outputs' weights, twice the products an instruction,
@@ -1110,7 +1111,8 @@ otherwise the same.
 
 The native network's convolutions take each input channel's own scale, folded into the weights
 (SmoothQuant, alpha 0.75), then the tensor's, from the minimum and maximum seen in calibration; their
-float epilogues normalize each square's channels where OpenVINO runs separate ops. Against the float
+normalization of each square's channels runs in the pass that quantizes the next one's input, where
+OpenVINO runs separate ops (`profile_native.cpp` times each stage). Against the float
 network on 2000 search leaves (value's mean error, its 99th percentile, top move):
 
 | Network | Native | OpenVINO int8 |

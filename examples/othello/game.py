@@ -207,6 +207,36 @@ PLAY_PRIOR_TEMPERATURE = 2.0
 # engine-labelled set (see README.md)
 DEFAULT_NET = "resnet:6x128,pool_every=2,heads=pooled"
 
+# Othello's lines: from a square, 7 squares each way along its row, its column and its two
+# diagonals, the lines along which a move flips discs. With them as a depthwise filter's taps, every
+# square sees its whole lines in one layer (57 taps where a 15 x 15 filter has 225). The set is
+# the same under each of the board's 8 symmetries, though each filter's weights aren't tied.
+RAY_TAPS = tuple(
+    (k * dy, k * dx)
+    for dy in (-1, 0, 1)
+    for dx in (-1, 0, 1)
+    for k in range(1 if dy or dx else 0, 8 if dy or dx else 1)
+)
+
+# the depthwise filters' taps a spec names, e.g. "resnet:7x64,block=convnext,dw_taps=rays" (see
+# core.networks.azresnet.AZResnetConfig.dw_taps)
+DW_TAPS = {"rays": RAY_TAPS}
+
+
+def network_options(net: str) -> tuple[str, dict]:
+    """`net` without its setting of taps by name (see DW_TAPS), and that setting as a
+    configuration option."""
+    kept, options = [], {}
+    for setting in net.split(","):
+        name, _, value = setting.partition("=")
+        if name != "dw_taps":
+            kept.append(setting)
+        elif value in DW_TAPS:
+            options["dw_taps"] = DW_TAPS[value]
+        else:
+            raise ValueError(f"dw_taps is one of {', '.join(DW_TAPS)}, not {value!r}")
+    return ",".join(kept), options
+
 
 def make_network(
     net: str = DEFAULT_NET,
@@ -222,10 +252,13 @@ def make_network(
     state). It computes in `inference_dtype` when it isn't training, e.g. in self-play,
     and in `train_dtype` in training (mixed precision, see AZResnetConfig). With `remat`,
     training computes each block's activations again in the backward pass instead of
-    keeping them."""
+    keeping them. Othello's depthwise filter taps are named in the spec as dw_taps=NAME (see
+    DW_TAPS)."""
+    net, options = network_options(net)
     config = network_config(
         net,
         env.num_actions,
+        **options,
         inference_dtype=inference_dtype,
         train_dtype=train_dtype,
         remat=remat,

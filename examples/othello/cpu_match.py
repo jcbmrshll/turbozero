@@ -36,9 +36,6 @@ from native_target import cpus
 from quantize import quantized_path
 from xot import XOT_PATH, load_xot
 
-# traversals in a row that ended the game after which a search on a clock stops
-ENDED_VISITS = 64
-
 
 @dataclass(frozen=True)
 class Player:
@@ -70,6 +67,7 @@ class Player:
             else None,
             random_symmetry=bool(int(fields.pop("random_symmetry", 0))),
             reuse=bool(int(fields.pop("reuse", 1))),
+            descend=int(fields.pop("descend", 0)),
         )
         return cls(net, backend, visits, settings)
 
@@ -123,21 +121,17 @@ def make_engine(name: str, backend: str, cores: int, batch: int) -> Engine:
 def timed_move(
     search: Search, seconds: float, batch: np.ndarray, evaluate: Eval
 ) -> tuple[int, int]:
-    """Searches until `seconds` have passed, finishing the batch in flight. Returns the leaves
-    evaluated and the visits."""
+    """Searches until `seconds` have passed, finishing the batch in flight (all of them, as
+    `Engine.search` does). Returns the leaves evaluated and the visits."""
     start = time.perf_counter()
     before = search.total_visits()
-    leaves = ended = 0
+    leaves = 0
     search.begin(1 << 30)
     while time.perf_counter() - start < seconds:
         count = search.collect(batch)
         logits, values = evaluate(batch[:count])
         search.apply(logits, values)
         leaves += count
-        # a run of traversals that all ended the game: the tree has little left to evaluate
-        ended = ended + len(batch) if count == 0 else 0
-        if ended >= ENDED_VISITS:
-            break
     search.begin(0)
     return leaves, search.total_visits() - before
 
@@ -293,6 +287,8 @@ class NetPlayer:
                 if self.visits
                 else self.solving.depth(seconds_left)
             )
+            # those positions' moves aren't the most visited (`SearchSettings.descend`)
+            self.search.set_solved_from(self.solve_from)
         solve_from = self.solve_from or 0
         action = None
         self.last_value = None
@@ -312,12 +308,7 @@ class NetPlayer:
                 max(seconds_left, 0.0), empties, self.taper, solve_from, reserve
             )
             if isinstance(self.evaluate, Engine):
-                self.evaluate.search(
-                    self.search,
-                    visits=self.visits,
-                    seconds=seconds,
-                    stop_ended=0 if self.visits else ENDED_VISITS,
-                )
+                self.evaluate.search(self.search, visits=self.visits, seconds=seconds)
             elif self.visits:
                 self.search.run(self.visits, self.evaluate)
             else:

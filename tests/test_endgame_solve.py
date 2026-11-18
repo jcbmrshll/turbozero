@@ -4,6 +4,7 @@ collection and labelling.
 Uses `make_fixed_length_env` (see conftest), whose games end after exactly `length` moves, and a
 fake solver: the player to move at the stopped position wins."""
 
+import math
 from dataclasses import replace
 
 import jax
@@ -223,7 +224,7 @@ def test_collection_metrics_count_missed_games(
 
 
 # past the solve point: never ending early, a game plays to its end
-FOREVER = 1e9
+FOREVER = math.inf
 
 
 def test_past_the_solve_point_each_stored_position_is_solved_on_its_own(
@@ -280,7 +281,7 @@ def test_a_solve_past_the_solve_point_finding_no_slot_ends_the_game(
     np.testing.assert_array_equal(sampleable(state), np.arange(STOP + 1))
 
 
-@pytest.mark.parametrize("play_past", [0.0, 3.0])
+@pytest.mark.parametrize("play_past", [0.0, 3.0, FOREVER])
 def test_past_the_solve_point_a_game_ends_before_each_move_at_one_over_one_plus_the_mean(
     fixed_length_env, play_past
 ):
@@ -308,3 +309,8 @@ def test_past_the_solve_point_a_game_ends_before_each_move_at_one_over_one_plus_
 def test_settings_out_of_range_are_rejected(kwargs):
     with pytest.raises(ValueError):
         endgame_solve(**kwargs)
+
+
+def test_a_game_played_to_its_end_says_so_in_the_config():
+    assert endgame_solve(play_past=FOREVER).get_config()["play_past"] == "end"
+    assert endgame_solve(play_past=2.0).get_config()["play_past"] == 2.0
