@@ -166,8 +166,8 @@ class Solving:
 
     On a clock, a game plans its solve as Edax does: from the most empties, up to `empties`,
     whose expected solve takes at most `share` of the game's clock; the moves before it share the
-    clock less that, and the solve may take all but a tenth of what's left before it gives up and
-    the move is searched. A solve that succeeds leaves the game's later moves almost nothing to do.
+    clock less what's kept for it (`kept`), and the solve may take all but a tenth of what's left
+    before it gives up and the move is searched. A solve that succeeds leaves the game's later moves almost nothing to do.
     At fixed visits, positions with `empties` or fewer are solved, taking what they take.
 
     Attributes:
@@ -177,6 +177,9 @@ class Solving:
             then searched as usual, the network's best try against a fallible opponent
         share: of the game's clock, the most a planned solve may be expected to take
         threads: the solver's, by default one
+        reserve, reserve_share: of the clock kept for the solve while the moves before it are
+            searched: its expected cost, or this many seconds, or this share of what's left,
+            whichever is most (`kept`)
         cost_at_24: a solve's expected seconds at 24 empties on 8 threads, twice as long each
             empty more, and shorter in proportion to more threads. By default Edax's exact solver
             on positions of real games on the contest's cores (0.07, 0.19 and 0.80 s at 22, 24
@@ -189,6 +192,16 @@ class Solving:
     share: float = 0.25
     threads: int = 1
     cost_at_24: float = 0.19
+    reserve: float = 4.0
+    reserve_share: float = 0.05
+
+    def kept(self, solve_from: int, seconds_left: float) -> float:
+        """The seconds of `seconds_left` kept for a solve from `solve_from` empties."""
+        return max(
+            self.cost(solve_from),
+            self.reserve,
+            self.reserve_share * max(seconds_left, 0.0),
+        )
 
     def cost(self, empties: int) -> float:
         """A solve's expected seconds at `empties`."""
@@ -275,12 +288,29 @@ class NetPlayer:
         self.solved += 1
         return solved.move
 
-    def move(self, color: str, seconds_left: float) -> int:
-        """Our move, which it also plays. A position with one legal move takes no time."""
+    def move(self, color: str, seconds_left: float, per_move: float = 0.0) -> int:
+        """Our move, which it also plays, on `seconds_left`: what it may plan the rest of the
+        game on. With `per_move` above 0 there's no game clock to plan (`seconds_left` is
+        ignored): the move is searched that long, or solved if a solve is expected to take no
+        longer (and searched if it doesn't finish in that). A position with one legal move takes
+        no time."""
         self.sync(color)
         me, opp, _, _ = self.search.position()
         empties = 64 - (me | opp).bit_count()
-        if self.solving is not None and self.solve_from is None:
+        if per_move > 0:
+            seconds_left = per_move
+        if self.solving is not None and per_move > 0:
+            # no game to plan: the most empties whose solve is expected to fit a move's time
+            fits = [
+                e
+                for e in range(1, self.solving.empties + 1)
+                if self.solving.cost(e) <= per_move
+            ]
+            self.solve_from = (
+                self.solving.empties if self.visits else max(fits, default=0)
+            )
+            self.search.set_solved_from(self.solve_from)
+        elif self.solving is not None and self.solve_from is None:
             # the first move sees the game's whole clock
             self.solve_from = (
                 self.solving.empties
@@ -299,14 +329,17 @@ class NetPlayer:
             action = self.solve(me, opp, seconds_left)
             seconds_left -= time.perf_counter() - start
         if action is None:
-            reserve = (
-                self.solving.cost(solve_from)
-                if self.solving is not None and solve_from
-                else 0.0
-            )
-            seconds = move_budget(
-                max(seconds_left, 0.0), empties, self.taper, solve_from, reserve
-            )
+            if per_move > 0:
+                seconds = max(seconds_left, 0.0)
+            else:
+                reserve = (
+                    self.solving.kept(solve_from, seconds_left)
+                    if self.solving is not None and solve_from
+                    else 0.0
+                )
+                seconds = move_budget(
+                    max(seconds_left, 0.0), empties, self.taper, solve_from, reserve
+                )
             if isinstance(self.evaluate, Engine):
                 self.evaluate.search(self.search, visits=self.visits, seconds=seconds)
             elif self.visits:

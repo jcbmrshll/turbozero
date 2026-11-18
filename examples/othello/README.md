@@ -1142,7 +1142,8 @@ By default it solves for a win, a draw or a loss, about ten times faster than th
 (`solve_exact=1`) and all a result needs: it plays a winning or drawing move, and a lost position is
 searched as usual, the network's best try against a fallible opponent. On a clock the game plans
 its solve as Edax does: from the most empties, up to N, whose expected solve takes at most a quarter
-of the game's clock (`solve_share`), the moves before it sharing the clock less that. The expected
+of the game's clock (`solve_share`), the moves before it sharing the clock less what's kept for
+it: that expected cost, at least 4 s or 5% of what's left (`Solving.kept`). The expected
 cost (`solve_cost`, seconds at 24 empties on 8 threads, doubling each empty more) is by default
 Edax's own exact solver's, 0.19 s, the speed we assume ours will reach; ours took about 2.0 s for a
 win, a draw or a loss there (2026-11-10). A solve may take all but a tenth of what's left, else it
