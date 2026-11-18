@@ -393,6 +393,86 @@ static void check_conv_1x1() {
         }
 }
 
+// a ConvNeXt block's depthwise filter, each sum from its bias through its taps in order, those off
+// the board skipped, and its pooled channels' means and maxima, as one square at a time
+static void check_depthwise() {
+    std::vector<std::pair<int, int>> rays, square;
+    for (int dy = -7; dy <= 7; dy++)
+        for (int dx = -7; dx <= 7; dx++)
+            if (dy == 0 || dx == 0 || dy == dx || dy == -dx) rays.emplace_back(dy, dx);
+    for (int dy = -2; dy <= 2; dy++)
+        for (int dx = -2; dx <= 2; dx++) square.emplace_back(dy, dx);
+    for (const auto& taps : {rays, square})
+        for (int C : {48, 64, 128}) {
+            const int P = C == 48 ? 8 : 16, T = (int)taps.size();
+            Depthwise d;
+            for (const auto& [dy, dx] : taps) {
+                d.dy.push_back(dy);
+                d.dx.push_back(dx);
+            }
+            for (int i = 0; i < T * C; i++) d.w.push_back(any_float());
+            for (int i = 0; i < C; i++) d.bias.push_back(any_float());
+            prepare(d);
+            expect(d.rays == (T == 57), "depthwise rays", T);
+            std::vector<float> x((size_t)SQUARES * C), got((size_t)SQUARES * C), pooled(2 * P);
+            for (auto& v : x) v = any_float();
+            depthwise(d, x.data(), C, P, pooled.data(), [&](int sq, int ch, F v) { Lanes::store(got.data() + (size_t)sq * C + ch, v); });
+            std::vector<float> sum(P, 0.0f), top(P, -INFINITY);
+            for (int sq = 0; sq < SQUARES; sq++)
+                for (int ch = 0; ch < C; ch++) {
+                    float acc = d.bias[ch];
+                    for (int t = 0; t < T; t++) {
+                        const int y = sq / 8 + d.dy[t], xx = sq % 8 + d.dx[t];
+                        if (y >= 0 && y < 8 && xx >= 0 && xx < 8) acc = std::fma(d.w[(size_t)t * C + ch], x[(size_t)(y * 8 + xx) * C + ch], acc);
+                    }
+                    expect(same(got[(size_t)sq * C + ch], acc), "depthwise", sq * C + ch);
+                    if (ch >= C - P) {
+                        sum[ch - (C - P)] += acc;
+                        top[ch - (C - P)] = std::max(top[ch - (C - P)], acc);
+                    }
+                }
+            for (int j = 0; j < P; j++) {
+                expect(same(pooled[j], sum[j] * (1.0f / SQUARES)), "depthwise mean", j);
+                expect(same(pooled[P + j], top[j]), "depthwise max", j);
+            }
+        }
+}
+
+// a ConvNeXt block's 1x1 convolutions: integer sums, then acc * scale + bias added to the trunk
+static void check_conv1x1() {
+    for (int cin : {48, 64, 128})
+        for (int cout : {48, 64, 144}) {
+            Conv c;
+            c.cin = cin;
+            c.cout = cout;
+            c.k = 1;
+            std::vector<int8_t> q((size_t)cout * cin);
+            for (auto& v : q) v = (int8_t)((int)(rng() % 255) - 127);
+            pack1x1(c, q.data());
+            for (int o = 0; o < cout; o++) {
+                c.scale.push_back(any_float());
+                c.bias.push_back(any_float());
+            }
+            std::vector<Input1, Aligned<Input1>> in((size_t)SQUARES * cin);
+            std::vector<int> value((size_t)SQUARES * cin);
+            for (int sq = 0; sq < SQUARES; sq++)
+                for (int i = 0; i < cin; i++) {
+                    value[(size_t)sq * cin + i] = (int)(rng() % (INPUT1_TOP + 1));
+                    in[input1_at(sq, i, cin)] = (Input1)(value[(size_t)sq * cin + i] - ACTIVATION_SHIFT);
+                }
+            std::vector<float> x((size_t)SQUARES * cout), want(x.size());
+            for (auto& v : x) v = any_float();
+            for (int sq = 0; sq < SQUARES; sq++)
+                for (int o = 0; o < cout; o++) {
+                    int32_t acc = 0;
+                    for (int i = 0; i < cin; i++) acc += value[(size_t)sq * cin + i] * q[(size_t)o * cin + i];
+                    want[(size_t)sq * cout + o] = x[(size_t)sq * cout + o] + std::fma((float)acc, c.scale[o], c.bias[o]);
+                }
+            conv1x1(c, in.data(), c.scale.data(), c.bias.data(), ProjectOut{x.data(), cout});
+            for (size_t i = 0; i < x.size(); i++) expect(same(x[i], want[i]), "conv1x1", (int)i);
+        }
+}
+
 int main() {
     check_reduce();
     check_norm_stats();
@@ -404,6 +484,8 @@ int main() {
     check_transpose();
     check_linear();
     check_policy_logits();
+    check_depthwise();
+    check_conv1x1();
     std::printf("%d failures\n", failures);
     return failures ? 1 : 0;
 }

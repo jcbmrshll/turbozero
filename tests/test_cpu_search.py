@@ -617,6 +617,9 @@ def test_a_player_parses_random_symmetry():
         "fixed",
         "ws",
         *(f"{norm},layout=pre" for norm in ("batch", "layer", "channel", "rms")),
+        # ConvNeXt blocks: BatchNorm folded into the ray filters, or a normalization after them
+        "batch,layout=pre,block=convnext,dw_taps=rays",
+        "layer,layout=pre,block=convnext,dw_kernel=3,expand=3",
     ],
 )
 def test_export_matches_the_network(norm):
@@ -973,9 +976,15 @@ NATIVE_SPECS = [
     # and the post layout's residual normalized
     "resnet:2x48,pool_every=2,heads=pooled,pool_channels=24,head_channels=16,norm=channel",
 ]
+# ConvNeXt blocks: Othello's ray filters, and a square filter at a width off multiples of 32 with
+# pooled channels off multiples of 16
+CONVNEXT_SPECS = [
+    "resnet:3x64,pool_every=2,heads=pooled,pool_channels=16,layout=pre,block=convnext,expand=2,dw_taps=rays",
+    "resnet:2x48,pool_every=1,heads=pooled,pool_channels=8,head_channels=16,layout=pre,block=convnext,expand=3,dw_kernel=5",
+]
 
 
-@pytest.mark.parametrize("spec", NATIVE_SPECS)
+@pytest.mark.parametrize("spec", NATIVE_SPECS + CONVNEXT_SPECS)
 def test_the_native_networks_layers_compute_the_network(spec):
     import cpu_net
     from cpu_search import ort_eval, ort_session
@@ -995,7 +1004,7 @@ def test_the_native_networks_layers_compute_the_network(spec):
 # each convolution kernel: AVX-512 VNNI's, AVX-VNNI's, AVX2's Winograd, and NEON's with
 # i8mm and with the dot product alone
 @pytest.mark.parametrize("level", ["v4", "v3-vnni", "v3", "arm-i8mm", "arm-dotprod"])
-@pytest.mark.parametrize("spec", NATIVE_SPECS)
+@pytest.mark.parametrize("spec", NATIVE_SPECS + CONVNEXT_SPECS)
 def test_the_native_network_computes_its_quantized_layers(
     spec, level, tmp_path, monkeypatch
 ):
@@ -1021,7 +1030,9 @@ def test_the_native_network_computes_its_quantized_layers(
     assert np.abs(logits - float_logits).mean() < 0.05
 
 
-@pytest.mark.parametrize("level", ["v4", "v3-vnni", "v3", "arm-i8mm", "arm-dotprod"])
+@pytest.mark.parametrize(
+    "level", ["v4", "v3-vnni", "v3", "v3-7bit", "arm-i8mm", "arm-dotprod"]
+)
 def test_the_native_networks_pieces_compute_as_plainer_code_does(level, tmp_path):
     # its sums of many squares or outputs at once, bit for bit as one at a time, the stem's table as
     # its convolution, and its 3x3 convolutions as their sums taken directly (`cpu_net_checks.cpp`)
@@ -1046,7 +1057,7 @@ def test_the_native_networks_pieces_compute_as_plainer_code_does(level, tmp_path
     assert result.returncode == 0, result.stdout
 
 
-@pytest.mark.parametrize("spec", NATIVE_SPECS)
+@pytest.mark.parametrize("spec", NATIVE_SPECS + CONVNEXT_SPECS)
 def test_avx_vnni_sums_as_avx2_does(spec, monkeypatch):
     import cpu_net
 
@@ -1059,6 +1070,29 @@ def test_avx_vnni_sums_as_avx2_does(spec, monkeypatch):
         cpu_net.NativeNet(program, quantized, lib).forward(x) for lib in libs
     ]
     assert np.array_equal(logits, want_logits) and np.array_equal(values, want_values)
+
+
+@pytest.mark.parametrize("spec", NATIVE_SPECS[1:2] + CONVNEXT_SPECS)
+def test_seven_bit_avx2_changes_only_convnext_blocks(spec, monkeypatch):
+    import cpu_net
+
+    # level v3-7bit: ConvNeXt blocks' 1x1 inputs on half the grid (for vpmaddubsw), close to the
+    # float network still; basic blocks as v3's, bit for bit
+    libs = [library(level, monkeypatch) for level in ("v3-7bit", "v3")]
+    program = cpu_net.extract(*random_network(spec))
+    x = (np.random.default_rng(0).random((48, 2, 8, 8)) < 0.3).astype(np.float32)
+    quantized = cpu_net.quantize(program, x)
+    (logits, values), (want_logits, want_values) = [
+        cpu_net.NativeNet(program, quantized, lib).forward(x) for lib in libs
+    ]
+    if spec in NATIVE_SPECS:
+        assert np.array_equal(logits, want_logits)
+        assert np.array_equal(values, want_values)
+        return
+    float_logits, float_values = cpu_net.float_forward(program, x)
+    eight_bit = np.abs(want_logits - float_logits).mean()
+    assert np.abs(logits - float_logits).mean() < max(3 * eight_bit, 0.02)
+    assert np.abs(values - float_values).mean() < 0.05
 
 
 def test_an_engine_of_the_native_network_searches_as_a_batch_of_one():
