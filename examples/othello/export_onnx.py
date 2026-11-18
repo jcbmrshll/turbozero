@@ -225,7 +225,14 @@ class Graph:
                 self.slice_channels(y, channels - block.pool_channels, channels)
             )
             h = self.add(h, self.board_bias(self.linear(block.pool_linear, pooled)))
-        return self.add(x, self.conv(block.project, self.relu(h)))
+        h = (
+            self.norm_relu(block.expand_norm, state, h)
+            if block.expand_norm
+            else self.relu(h)
+        )
+        if block.project_norm is None:
+            return self.add(x, self.conv(block.project, h))
+        return self.add(x, self.conv_norm(block.project, block.project_norm, state, h))
 
     def heads(self, heads: PooledHeads, state: eqx.nn.State, x: str) -> tuple[str, str]:
         policy = self.conv_norm(heads.policy_conv, heads.policy_norm, state, x)
@@ -257,7 +264,9 @@ def to_onnx(network: AZResnet, state: eqx.nn.State) -> onnx.ModelProto:
     if network.stem_norm is None:
         x = graph.conv(network.stem_conv, x)
     else:
-        x = graph.relu(graph.conv_norm(network.stem_conv, network.stem_norm, state, x))
+        x = graph.conv_norm(network.stem_conv, network.stem_norm, state, x)
+        # the pre-activation trunk starts from the normalized stem as it is
+        x = x if network.final_norm is not None else graph.relu(x)
     for block in network.blocks:
         if isinstance(block, ResidualBlock):
             x = graph.block(block, state, x)
