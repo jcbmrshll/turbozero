@@ -296,6 +296,20 @@ PRE_VARIANTS = {
         "pool_channels": 2,
         "layout": "pre",
     },
+    # and with a normalization after each convolution: the stem, expand and project
+    "normalized convnext": {
+        "num_blocks": 2,
+        "num_channels": 6,
+        "block": "convnext",
+        "expand": 2,
+        "dw_kernel": 3,
+        "pool_every": 2,
+        "pool_channels": 2,
+        "layout": "pre",
+        "stem_norm": True,
+        "expand_norm": True,
+        "project_norm": True,
+    },
 }
 
 
@@ -531,6 +545,8 @@ def test_the_pre_activation_trunk_starts_as_the_stem(name):
     dtype = jnp.dtype("float32")
 
     stem = net.stem_conv(x.astype(dtype))
+    if net.stem_norm is not None:
+        stem, _ = conv_norm(net.stem_conv, net.stem_norm, x, state, dtype)
     trunk = stem
     for block in net.blocks:
         trunk, _ = block(trunk, state, dtype)
@@ -606,3 +622,78 @@ def test_convnext_blocks_take_their_taps_from_the_config():
         net, _ = make_variant("convnext", **options)
         for block in net.blocks:
             assert isinstance(block, PreActConvNeXt) and block.dw.taps == expected
+
+
+def test_normalizations_are_options_of_the_layouts_and_blocks_that_have_them():
+    with pytest.raises(ValueError, match="stem_norm"):
+        make_variant("global pooling", stem_norm=True)
+    with pytest.raises(ValueError, match="convnext"):
+        make_variant("global pooling", layout="pre", expand_norm=True)
+    with pytest.raises(ValueError, match="convnext"):
+        make_variant("global pooling", layout="pre", project_norm=True)
+
+
+def test_a_normalized_projects_scale_starts_at_zero_and_its_weights_do_not():
+    # a zeroed convolution under a normalization would output 0 and never learn
+    net, _ = make_variant("normalized convnext")
+    for block in net.blocks:
+        assert isinstance(block, PreActConvNeXt) and block.project_norm is not None
+        assert np.all(np.asarray(block.project_norm.weight) == 0)
+        assert np.abs(np.asarray(block.project.weight)).min() > 0
+
+
+@pytest.mark.parametrize(
+    "name, invariant", [("convnext", False), ("normalized convnext", True)]
+)
+def test_a_normalized_convnext_trunk_ignores_the_scale_of_its_convolutions(
+    name, invariant
+):
+    # in training mode, with each convolution followed by a BatchNorm, scaling any of them (and the
+    # pooling bias with expand, which share a normalization) changes nothing: weight decay
+    # shrinking them can't change the function. Without, scaling the stem or a block's MLP does
+    net, state = make_variant(name)
+    rng = np.random.default_rng(0)
+    params, static = eqx.partition(net, eqx.is_inexact_array)
+    # every weight nonzero, the scales of the branches' outputs included
+    params = jax.tree.map(
+        lambda x: x + 0.3 * rng.normal(size=x.shape).astype(x.dtype), params
+    )
+    net = eqx.combine(params, static)
+    x = jnp.asarray(observations(rng, batch_size=8))
+
+    def scaled_block(block, f):
+        block = eqx.tree_at(
+            lambda b: (b.dw.weight, b.expand.weight, b.project.weight),
+            block,
+            (block.dw.weight * f, block.expand.weight * f, block.project.weight * f),
+        )
+        if block.pool_linear is None:
+            return block
+        pool = block.pool_linear
+        return eqx.tree_at(
+            lambda b: b.pool_linear,
+            block,
+            eqx.tree_at(
+                lambda p: (p.weight, p.bias), pool, (pool.weight * f, pool.bias * f)
+            ),
+        )
+
+    def scaled(net, factor):
+        return eqx.tree_at(
+            lambda n: (n.stem_conv.weight, n.blocks),
+            net,
+            (
+                net.stem_conv.weight * factor,
+                [scaled_block(b, factor ** (i + 2)) for i, b in enumerate(net.blocks)],
+            ),
+        )
+
+    (policy, value), _ = apply_nn(net, state, x)
+    (scaled_policy, scaled_value), _ = apply_nn(scaled(net, 0.7), state, x)
+
+    # up to BatchNorm's epsilon, against changes of about 0.1 or more
+    change = max(
+        float(jnp.abs(scaled_policy - policy).max()),
+        float(jnp.abs(scaled_value - value).max()),
+    )
+    assert change < 1e-3 if invariant else change > 1e-2, change
