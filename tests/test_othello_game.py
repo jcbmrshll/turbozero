@@ -24,7 +24,7 @@ from game import (
 )
 
 from core.memory.replay_memory import BaseExperience
-from core.networks.azresnet import AZResnet, Depthwise, PreActConvNeXt
+from core.networks.azresnet import AZResnet, Depthwise, PreActConvNeXt, SpatialMix
 
 
 def save_checkpoint(path: Path, net: str):
@@ -200,7 +200,8 @@ def test_a_spec_names_the_ray_taps():
     network, state = make_network(RAY_NET)
     assert isinstance(network, AZResnet)
     for block in network.blocks:
-        assert isinstance(block, PreActConvNeXt) and block.dw.taps == RAY_TAPS
+        assert isinstance(block, PreActConvNeXt) and isinstance(block.dw, Depthwise)
+        assert block.dw.taps == RAY_TAPS
     obs = jnp.zeros((3, 8, 8, 2), bool)
     (policy, value), _ = jax.vmap(lambda o: network(o, state), axis_name="batch")(obs)
     assert policy.shape == (3, 65) and value.shape == (3, 1)
@@ -256,5 +257,53 @@ def test_a_symmetry_of_a_ray_filter_is_a_ray_filter(quarter_turns, transpose):
     np.testing.assert_allclose(
         moved(jnp.asarray(image(x).copy()), f32),
         image(np.asarray(dw(jnp.asarray(x), f32))),
+        atol=1e-5,
+    )
+
+
+MIXING_NET = RAY_NET.replace("dw_taps=rays", "mix_groups=2")
+
+
+def test_a_learned_mixing_holds_a_ray_filter_exactly():
+    # with a group a channel, the mixing's matrices are the ray filters' own
+    network, state = make_network(MIXING_NET.replace("mix_groups=2", "mix_groups=8"))
+    assert isinstance(network, AZResnet)
+    block = network.blocks[0]
+    assert isinstance(block, PreActConvNeXt) and isinstance(block.dw, SpatialMix)
+    dw = ray_filter(channels=8, seed=2)
+    mix = eqx.tree_at(lambda m: m.weight, block.dw, dw.matrices(8, 8))
+    x = jnp.asarray(np.random.default_rng(0).normal(size=(8, 8, 8)), jnp.float32)
+    f32 = jnp.dtype("float32")
+    np.testing.assert_allclose(mix(x, f32), dw(x, f32), atol=1e-5)
+    assert mix.weight.shape == (8, 64, 64)
+    obs = jnp.zeros((3, 8, 8, 2), bool)
+    (policy, value), _ = jax.vmap(lambda o: network(o, state), axis_name="batch")(obs)
+    assert policy.shape == (3, 65) and value.shape == (3, 1)
+
+
+@pytest.mark.parametrize("transpose", [False, True])
+@pytest.mark.parametrize("quarter_turns", range(4))
+def test_a_symmetry_of_a_learned_mixing_is_a_learned_mixing(quarter_turns, transpose):
+    # as for ray filters: a mixing of a board's image is the image of the mixing whose matrices are
+    # moved by the symmetry on both sides. Training's augmentation stays in the family, though a
+    # learned mixing isn't tied across symmetric squares
+    def image(a):
+        a = np.swapaxes(a, -2, -1) if transpose else a
+        return np.rot90(a, quarter_turns, axes=(-2, -1))
+
+    # the square that ends up at each square
+    order = image(np.arange(64).reshape(8, 8)).reshape(64)
+    network, _ = make_network(MIXING_NET)
+    assert isinstance(network, AZResnet) and isinstance(
+        network.blocks[0], PreActConvNeXt
+    )
+    mix = network.blocks[0].dw
+    moved = eqx.tree_at(lambda m: m.weight, mix, mix.weight[:, order][:, :, order])
+    x = np.random.default_rng(quarter_turns).normal(size=(8, 8, 8)).astype(np.float32)
+    f32 = jnp.dtype("float32")
+
+    np.testing.assert_allclose(
+        moved(jnp.asarray(image(x).copy()), f32),
+        image(np.asarray(mix(jnp.asarray(x), f32))),
         atol=1e-5,
     )

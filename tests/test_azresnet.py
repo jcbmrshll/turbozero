@@ -14,6 +14,7 @@ from core.networks.azresnet import (
     GroupNorm,
     PreActConvNeXt,
     ResidualBlock,
+    SpatialMix,
     batch_norm,
     conv,
     conv_norm,
@@ -292,6 +293,16 @@ PRE_VARIANTS = {
         "block": "convnext",
         "expand": 2,
         "dw_kernel": 3,
+        "pool_every": 2,
+        "pool_channels": 2,
+        "layout": "pre",
+    },
+    "convnext mixing": {
+        "num_blocks": 2,
+        "num_channels": 6,
+        "block": "convnext",
+        "expand": 2,
+        "mix_groups": 3,
         "pool_every": 2,
         "pool_channels": 2,
         "layout": "pre",
@@ -605,4 +616,73 @@ def test_convnext_blocks_take_their_taps_from_the_config():
     for options, expected in [({"dw_taps": taps}, taps), ({}, square_taps(3))]:
         net, _ = make_variant("convnext", **options)
         for block in net.blocks:
-            assert isinstance(block, PreActConvNeXt) and block.dw.taps == expected
+            assert isinstance(block, PreActConvNeXt) and isinstance(block.dw, Depthwise)
+            assert block.dw.taps == expected
+
+
+def with_weight(module, weight):
+    return eqx.tree_at(lambda m: m.weight, module, jnp.asarray(weight, jnp.float32))
+
+
+def test_spatial_mixing_shares_a_matrix_of_every_square_to_every_square_by_group():
+    mix = SpatialMix(6, 3, 4, 5, key=jax.random.PRNGKey(0))
+    assert mix.weight.shape == (3, 20, 20) and mix.groups == 3
+    rng = np.random.default_rng(0)
+    weight = rng.normal(size=mix.weight.shape)
+    x = rng.normal(size=(6, 4, 5)).astype(np.float32)
+
+    y = with_weight(mix, weight)(jnp.asarray(x), jnp.dtype("float32"))
+
+    assert y.shape == (6, 4, 5)
+    # channels 2g and 2g + 1 through group g's matrix
+    expected = np.stack([weight[c // 2] @ x[c].reshape(20) for c in range(6)])
+    np.testing.assert_allclose(y, expected.reshape(6, 4, 5), atol=1e-4)
+    np.testing.assert_allclose(with_weight(mix, weight).matrices(6)[3], weight[1])
+    with pytest.raises(ValueError, match="groups"):
+        SpatialMix(6, 4, 4, 5, key=jax.random.PRNGKey(0))
+
+
+@pytest.mark.parametrize("groups", [1, 2, 4])
+def test_spatial_mixing_is_a_depthwise_filter_its_groups_share(groups):
+    # any filter of any taps, as a mixing whose matrices are its filters' (see Depthwise.matrices):
+    # exactly, where each group's channels share their filter's weights
+    taps = ((0, 0), (0, 2), (-1, 1), (2, -2), (-3, 0))
+    rng = np.random.default_rng(groups)
+    weight = np.repeat(rng.normal(size=(groups, len(taps))), 4 // groups, axis=0)
+    dw = with_weight(Depthwise(4, taps, key=jax.random.PRNGKey(0)), weight)
+    mix = SpatialMix(4, groups, 5, 6, key=jax.random.PRNGKey(0))
+    mix = with_weight(mix, dw.matrices(5, 6)[:: 4 // groups])
+    x = rng.normal(size=(4, 5, 6)).astype(np.float32)
+    f32 = jnp.dtype("float32")
+
+    y = mix(jnp.asarray(x), f32)
+    np.testing.assert_allclose(y, dw(jnp.asarray(x), f32), atol=1e-5)
+    np.testing.assert_allclose(y, reference_depthwise(weight, taps, x), atol=1e-5)
+
+
+def test_a_permutation_of_the_squares_maps_a_mixing_to_a_mixing():
+    # a mixing of permuted inputs is the permutation of another mixing's outputs, its matrices
+    # those permuted on both sides: its family is closed under any rearrangement of the squares,
+    # though a mixing itself isn't unchanged by one
+    rng = np.random.default_rng(0)
+    mix = SpatialMix(4, 2, 3, 4, key=jax.random.PRNGKey(0))
+    order = rng.permutation(12)
+    moved = with_weight(mix, np.asarray(mix.weight)[:, order][:, :, order])
+    x = rng.normal(size=(4, 12)).astype(np.float32)
+    f32 = jnp.dtype("float32")
+
+    y = mix(jnp.asarray(x).reshape(4, 3, 4), f32).reshape(4, 12)
+    y_moved = moved(jnp.asarray(x[:, order]).reshape(4, 3, 4), f32).reshape(4, 12)
+
+    np.testing.assert_allclose(y_moved, np.asarray(y)[:, order], atol=1e-5)
+
+
+def test_mixing_blocks_take_their_groups_from_the_config():
+    net, _ = make_variant("convnext mixing")
+    for block in net.blocks:
+        assert isinstance(block, PreActConvNeXt) and isinstance(block.dw, SpatialMix)
+        assert block.dw.weight.shape == (3, 9, 9)
+    with pytest.raises(ValueError, match="dw_taps"):
+        make_variant("convnext mixing", dw_taps=((0, 0),))
+    with pytest.raises(ValueError, match="convnext"):
+        make_variant("bottleneck", mix_groups=2)

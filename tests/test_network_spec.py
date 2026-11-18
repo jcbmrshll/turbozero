@@ -107,6 +107,11 @@ def test_a_spec_names_the_pre_activation_layout():
     assert jax.tree.leaves(state) == []
 
 
+def test_a_spec_names_the_mixing_groups():
+    config = network_config("resnet:2x8,block=convnext,layout=pre,mix_groups=4", 65)
+    assert isinstance(config, AZResnetConfig) and config.mix_groups == 4
+
+
 def test_fields_without_a_text_form_cannot_be_set_in_a_spec():
     with pytest.raises(ValueError, match="dw_taps"):
         network_config("resnet:2x8,block=convnext,layout=pre,dw_taps=1", 65)

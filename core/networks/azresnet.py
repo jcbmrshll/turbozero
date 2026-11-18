@@ -37,6 +37,9 @@ class AZResnetConfig:
         dw_taps: the depthwise filters' taps instead, as (row, column) offsets from the square
             filtered (see `Depthwise`): a sparse filter of long reach, e.g. along chosen lines.
             Not settable in a spec: an application names its own sets and passes them in
+        mix_groups: the ConvNeXt blocks' step between squares a learned mixing instead of a
+            depthwise filter (see `SpatialMix`): a matrix from every square to every square,
+            shared by each of `mix_groups` groups of channels. 0 for the depthwise filter
         pool_every: every `pool_every`-th basic block (counting those inside bottleneck blocks) has
             KataGo's global pooling bias: `pool_channels` of its first convolution's channels are
             pooled over the board (mean and max), and a linear map of them biases the others, which
@@ -101,6 +104,7 @@ class AZResnetConfig:
     expand: int = 4
     dw_kernel: int = 7
     dw_taps: tuple[tuple[int, int], ...] | None = None
+    mix_groups: int = 0
     pool_every: int = 0
     pool_channels: int = 32
     heads: Literal["alphazero", "pooled"] = "alphazero"
@@ -640,18 +644,76 @@ class Depthwise(eqx.Module):
         kernel = jnp.zeros((self.weight.shape[0], k, k), self.weight.dtype)
         return kernel.at[:, rows, cols].set(self.weight)[:, None]
 
-    def __call__(self, x: jax.Array, dtype: jnp.dtype) -> jax.Array:
-        """The filters applied to `x`, computing in `dtype`: each channel's filter as a matrix from
-        the squares to the squares (see `tap_index`), all channels one batched matrix product. A
-        grouped convolution with a kernel as large as the grid ran 8x slower on a GPU."""
-        channels, height, width = x.shape
+    def matrices(self, height: int, width: int) -> jax.Array:
+        """Each channel's filter on a grid of `height` x `width` squares as a matrix from the squares
+        to the squares, (channels, squares, squares), squares row by row: y[c] = matrices[c] @ x[c]
+        (see `tap_index`)."""
         index = tap_index(self.taps, height, width)
         # one more weight, zero, for the pairs of squares no tap joins
-        weight = jnp.pad(self.weight, ((0, 0), (0, 1)))[:, index]
+        return jnp.pad(self.weight, ((0, 0), (0, 1)))[:, index]
+
+    def __call__(self, x: jax.Array, dtype: jnp.dtype) -> jax.Array:
+        """The filters applied to `x`, computing in `dtype`: each channel's filter as a matrix (see
+        `matrices`), all channels one batched matrix product. A grouped convolution with a kernel
+        as large as the grid ran 8x slower on a GPU."""
+        channels, height, width = x.shape
         y = jnp.einsum(
             "cpq,cq->cp",
-            weight.astype(dtype),
+            self.matrices(height, width).astype(dtype),
             x.reshape(channels, height * width).astype(dtype),
+        )
+        return y.reshape(channels, height, width)
+
+
+class SpatialMix(eqx.Module):
+    """A learned linear map from every square of (channels, height, width) inputs to every square,
+    each channel on its own, one matrix shared by each group of channels (MLP-Mixer's token mixing,
+    without its hidden layer): y[c, p] = sum over squares q of weight[g, p, q] * x[c, q], for
+    channel c of group g, groups of consecutive channels, squares row by row. No bias.
+
+    It generalizes `Depthwise`: with a group a channel, it is any depthwise filter, of any taps,
+    and more, a different filter at each square. Where groups hold several channels, they share
+    their filter, which keeps the weights small: groups * squares^2 of them, whatever the channels.
+    Its cost, squares^2 multiply-adds a channel, doesn't depend on the groups."""
+
+    weight: jax.Array
+    grid: tuple[int, int] = eqx.field(static=True)
+
+    def __init__(
+        self, channels: int, groups: int, height: int, width: int, *, key: jax.Array
+    ):
+        if groups < 1 or channels % groups:
+            raise ValueError(f"{channels} channels don't split into {groups} groups")
+        self.grid = (height, width)
+        squares = height * width
+        # as `Depthwise` and equinox's convolutions: uniform in +-1/sqrt(fan in), every square
+        bound = 1 / math.sqrt(squares)
+        self.weight = jax.random.uniform(
+            key, (groups, squares, squares), minval=-bound, maxval=bound
+        )
+
+    @property
+    def groups(self) -> int:
+        return self.weight.shape[0]
+
+    @property
+    def kernel_size(self) -> int:
+        """The side of the smallest square filter, centred, that reaches every square from every
+        other."""
+        return 2 * max(self.grid) - 1
+
+    def matrices(self, channels: int) -> jax.Array:
+        """Each of `channels` channels' matrix, (channels, squares, squares), as `Depthwise`'s."""
+        return jnp.repeat(self.weight, channels // self.groups, axis=0)
+
+    def __call__(self, x: jax.Array, dtype: jnp.dtype) -> jax.Array:
+        """The mixing of `x`, computing in `dtype`: one batched matrix product, a group's channels
+        its matrix's columns."""
+        channels, height, width = x.shape
+        y = jnp.einsum(
+            "gpq,gcq->gcp",
+            self.weight.astype(dtype),
+            x.reshape(self.groups, -1, height * width).astype(dtype),
         )
         return y.reshape(channels, height, width)
 
@@ -671,12 +733,13 @@ def tap_index(taps: tuple[tuple[int, int], ...], height: int, width: int) -> np.
 
 class PreActConvNeXt(eqx.Module):
     """ConvNeXt's block: x + project(relu(expand(norm(depthwise(x))))), a depthwise filter of the
-    trunk itself (see `Depthwise`), one normalization, then a per-square MLP of 1x1 convolutions
+    trunk itself (see `Depthwise`), or a learned mixing of its squares (see `SpatialMix`), one
+    normalization, then a per-square MLP of 1x1 convolutions
     through `hidden` channels. With global pooling, the last `pool_channels` of the normalized
     features, pooled over the board, bias the hidden channels. project starts at zero (see
     `zeroed`)."""
 
-    dw: Depthwise
+    dw: Depthwise | SpatialMix
     norm: Norm
     expand: eqx.nn.Conv2d
     pool_linear: eqx.nn.Linear | None
@@ -689,6 +752,7 @@ class PreActConvNeXt(eqx.Module):
         hidden: int,
         taps: tuple[tuple[int, int], ...],
         pool_channels: int = 0,
+        mix: tuple[int, int, int] | None = None,
         *,
         key: jax.Array,
         make_norm: NormMaker,
@@ -701,12 +765,18 @@ class PreActConvNeXt(eqx.Module):
             taps: the depthwise filters' offsets (see `Depthwise`)
             pool_channels: normalized channels pooled over the board to bias the hidden ones, 0
                 for no global pooling bias
+            mix: (groups, height, width): a learned mixing of the squares of a grid of `height` x
+                `width` (see `SpatialMix`) instead of the depthwise filters; `taps` unused
             key: rng used to initialize parameters
             make_norm: makes the normalization (see `norm_maker`)
             stats: unused: the normalization needs none
         """
         keys = jax.random.split(key, 4)
-        self.dw = Depthwise(channels, taps, key=keys[0])
+        self.dw = (
+            SpatialMix(channels, *mix, key=keys[0])
+            if mix
+            else Depthwise(channels, taps, key=keys[0])
+        )
         self.norm = make_norm(channels, stats, self.dw.kernel_size)
         self.expand = conv(channels, hidden, 1, keys[1])
         self.pool_linear = (
@@ -921,13 +991,19 @@ class AZResnet(eqx.Module):
         if config.block == "convnext":
             if not pre:
                 raise ValueError('block="convnext" needs layout="pre"')
+            if config.mix_groups and config.dw_taps:
+                raise ValueError(
+                    "mix_groups replaces the depthwise filters: no dw_taps"
+                )
             taps = config.dw_taps or square_taps(config.dw_kernel)
+            mix = (config.mix_groups, height, width) if config.mix_groups else None
             self.blocks = [
                 PreActConvNeXt(
                     channels,
                     config.expand * channels,
                     taps,
                     pool,
+                    mix,
                     key=k,
                     make_norm=make_norm,
                     stats=block_stats,
@@ -936,6 +1012,10 @@ class AZResnet(eqx.Module):
                     pool_channels, block_keys, stats[:-1], strict=True
                 )
             ]
+        elif config.mix_groups:
+            raise ValueError(
+                'mix_groups is the step between squares of block="convnext"'
+            )
         elif config.block == "basic":
             self.blocks = [
                 basic(channels, pool, key=k, make_norm=make_norm, stats=block_stats)

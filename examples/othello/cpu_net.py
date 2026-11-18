@@ -114,6 +114,7 @@ def extract(network, state) -> Program:
     import equinox as eqx
 
     from core.networks.azresnet import (
+        Depthwise,
         FixedScale,
         GroupNorm,
         PooledHeads,
@@ -156,6 +157,8 @@ def extract(network, state) -> Program:
     def convnext(block, pool: Linear | None) -> ConvNeXtBlock:
         if not isinstance(block.norm, eqx.nn.BatchNorm):
             raise unsupported(block.norm)
+        if not isinstance(block.dw, Depthwise):
+            raise TypeError(f"no native {type(block.dw).__name__}")
         scale, offset = inference_affine(block.norm, state)
         order = sorted(range(len(block.dw.taps)), key=lambda t: block.dw.taps[t])
         zeros = lambda c: np.zeros(c.out_channels, np.float32)
