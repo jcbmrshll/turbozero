@@ -998,8 +998,8 @@ class AZResnet(eqx.Module):
     def trunk(
         self, x: jax.Array, state: eqx.nn.State
     ) -> tuple[jax.Array, eqx.nn.State]:
-        """The trunk's output, the features the heads read: (channels, *board), e.g. to compare
-        positions as the network sees them.
+        """The trunk's output, the features the heads read: (channels, height, width), e.g. to
+        compare inputs as the network sees them.
 
         Args:
             x: one input, channels last
