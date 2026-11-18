@@ -15,7 +15,7 @@ import json
 from pathlib import Path
 
 from engine_set import DEFAULT_PATH, EngineSet
-from game import DEFAULT_NET, load_checkpoint
+from game import DEFAULT_NET, PLAY_PRIOR_TEMPERATURE, load_checkpoint
 
 from core.testing.scored_positions import METRICS, ScoredPositionsTester
 
@@ -55,7 +55,9 @@ def main():
         network, params = load_checkpoint(path, args.net, args.dtype)
         if tester is None:
             tester = ScoredPositionsTester(
-                engine_set.scored_positions(args.by_source), network
+                engine_set.scored_positions(args.by_source),
+                network,
+                prior_temperature=PLAY_PRIOR_TEMPERATURE,
             )
         metrics = {k: float(v) for k, v in tester.evaluate(params).items()}
         print(
