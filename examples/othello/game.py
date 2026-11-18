@@ -84,6 +84,67 @@ def episode_metrics(rewards):
     return {"draw": (rewards == 0).all()}
 
 
+# bitboard masks of every square but those of the a and h files (bit i is square i, a1 = 0)
+_NOT_A = np.uint64(0xFEFEFEFEFEFEFEFE)
+_NOT_H = np.uint64(0x7F7F7F7F7F7F7F7F)
+# the 8 directions as (shift, mask of where a step may land): left shifts go up the board
+_DIRECTIONS = [
+    (1, _NOT_A),
+    (-1, _NOT_H),
+    (8, None),
+    (-8, None),
+    (9, _NOT_A),
+    (7, _NOT_H),
+    (-7, _NOT_A),
+    (-9, _NOT_H),
+]
+
+
+def legal_moves(me: np.ndarray, opp: np.ndarray) -> np.ndarray:
+    """The player to move's legal squares, as bitboards, from its discs' and the opponent's."""
+    empty = ~(me | opp)
+    moves = np.zeros_like(me)
+
+    def step(bits: np.ndarray, shift: int, mask: np.uint64 | None) -> np.ndarray:
+        moved = bits << np.uint64(shift) if shift > 0 else bits >> np.uint64(-shift)
+        return moved if mask is None else moved & mask
+
+    for shift, mask in _DIRECTIONS:
+        line = step(me, shift, mask) & opp
+        for _ in range(5):
+            line |= step(line, shift, mask) & opp
+        moves |= step(line, shift, mask) & empty
+    return moves
+
+
+def position_states(observations: np.ndarray):
+    """Environment states of positions given as the network's input, (n, 8, 8, 2) bool (the
+    player to move's discs, then the opponent's), e.g. an engine-labelled set's, to search from.
+    The move history isn't known: the step count is the discs played (60 - empties), passes
+    aside, and the last move isn't a pass."""
+    observations = np.asarray(observations, dtype=bool)
+    n = len(observations)
+    bits = np.uint64(1) << np.arange(64, dtype=np.uint64)
+    flat = observations.reshape(n, 64, 2)
+    me = (flat[..., 0] * bits).sum(-1, dtype=np.uint64)
+    opp = (flat[..., 1] * bits).sum(-1, dtype=np.uint64)
+    legal = (legal_moves(me, opp)[:, None] & bits) != 0
+    legal = np.concatenate([legal, ~legal.any(1, keepdims=True)], axis=1)
+    states = jax.vmap(env.init)(jax.random.split(jax.random.PRNGKey(0), n))
+    board = flat[..., 0].astype(np.int32) - flat[..., 1].astype(np.int32)
+    return states.replace(  # type: ignore[attr-defined]
+        current_player=jnp.zeros(n, jnp.int32),
+        observation=jnp.asarray(observations),
+        legal_action_mask=jnp.asarray(legal),
+        _step_count=jnp.asarray(flat.any(-1).sum(-1) - 4, dtype=jnp.int32),
+        _x=states._x._replace(  # type: ignore[attr-defined]
+            turn=jnp.zeros(n, jnp.int32),
+            board=jnp.asarray(board),
+            passed=jnp.zeros(n, bool),
+        ),
+    )
+
+
 def make_symmetry_transform_fn(quarter_turns: int, transpose: bool):
     """A DataTransformFn that maps a training sample through one of the board's symmetries
     (an optional transpose, then `quarter_turns` quarter turns). Othello's rules don't

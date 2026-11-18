@@ -538,6 +538,32 @@ def test_the_pre_activation_trunk_starts_as_the_stem(name):
     np.testing.assert_allclose(trunk, stem, atol=1e-6)
 
 
+@pytest.mark.parametrize("layout, norm", [("post", "batch"), ("pre", "channel")])
+def test_the_trunk_is_what_the_heads_read(layout, norm):
+    config = AZResnetConfig(
+        policy_head_out_size=5,
+        num_blocks=2,
+        num_channels=6,
+        pool_every=2,
+        pool_channels=2,
+        layout=layout,
+        norm=norm,
+    )
+    net, state = eqx.nn.make_with_state(AZResnet)(
+        config, INPUT_SHAPE, key=jax.random.PRNGKey(0)
+    )
+    net = eqx.nn.inference_mode(net)
+    x = jnp.asarray(np.random.default_rng(0).normal(size=INPUT_SHAPE), jnp.float32)
+
+    features, _ = net.trunk(x, state)
+    (policy, value), _ = net(x, state)
+    (head_policy, head_value), _ = net.heads(features, state, jnp.dtype("float32"))
+
+    assert features.shape == (6, 3, 3)
+    np.testing.assert_allclose(head_policy, policy, rtol=1e-6)
+    np.testing.assert_allclose(head_value, value, rtol=1e-6)
+
+
 def test_convnext_blocks_refuse_the_post_activation_layout():
     with pytest.raises(ValueError, match="pre"):
         make_variant("convnext", layout="post")
