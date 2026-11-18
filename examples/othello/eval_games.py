@@ -443,7 +443,8 @@ def play_batched(
                 net=network["net"],
                 settings={
                     key: p.config["search"][key]
-                    for key in ("tree_factor", "prior_temperature")
+                    for key in ("tree_factor", "prior_temperature", "c_init")
+                    if key in p.config["search"]
                 },
             )
         return Player(
