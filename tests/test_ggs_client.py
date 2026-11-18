@@ -566,8 +566,10 @@ class FakeNetPlayer:
             self.board.black_to_move = not self.board.black_to_move
         self.board.play(move)
 
-    def move(self, color: str, seconds_left: float) -> int:
-        self.calls.append(("move", color, round(seconds_left, 6), self.evaluate))
+    def move(self, color: str, seconds_left: float, per_move: float = 0.0) -> int:
+        self.calls.append(
+            ("move", color, round(seconds_left, 6), self.evaluate, per_move, self.taper)
+        )
         if color != self.board.color:
             self.board.black_to_move = not self.board.black_to_move
         move = self.board.legal()[0]
@@ -576,7 +578,7 @@ class FakeNetPlayer:
         return move
 
 
-def fake_bridge(cores=4):
+def fake_bridge(cores=4, **kwargs):
     players: list[FakeNetPlayer] = []
     engines: list[int] = []
 
@@ -590,7 +592,7 @@ def fake_bridge(cores=4):
 
     from ggs_player import PlayerBridge
 
-    return PlayerBridge(new_player, make_engine, cores), players, engines
+    return PlayerBridge(new_player, make_engine, cores, **kwargs), players, engines
 
 
 def view_after(moves, start=None, game_id=".1.0", seconds=60.0, **kwargs):
@@ -653,35 +655,44 @@ def test_bridge_passes_without_searching():
 
 
 def test_bridge_time_and_cores():
-    bridge, players, engines = fake_bridge(cores=8)
+    bridge, players, engines = fake_bridge(cores=8, taper=30)
     view = view_after([], seconds=60.0)
     bridge.decide(view, 3)
-    assert players[0].calls[-1][2] == pytest.approx(bridge.time.seconds_left(view))
-    assert players[0].calls[-1][3] == "engine1x3" and engines == [3]
+    _, _, seconds, engine, per_move, taper = players[0].calls[-1]
+    assert seconds == pytest.approx(bridge.time.seconds_left(view))
+    assert per_move == 0 and taper == 30
+    assert engine == "engine1x3" and engines == [3]
     bridge.decide(
         view_after([], game_id=".2.0", seconds=0.0, extension=100.0, extended=True), 16
     )
-    seconds = players[-1].calls[-1][2]
-    # move_budget's share of that over the moves left is a tenth of the extension, less reserve
-    assert seconds == pytest.approx((100 - 1.5) * 0.1 * 61 / 2 / 0.95)
+    # on the extension, no clock to plan: a tenth of it a move, less the reserve
+    _, _, seconds, _, per_move, _ = players[-1].calls[-1]
+    assert seconds == 0 and per_move == pytest.approx((100 - 1.5) * 0.1)
     assert engines == [3, 8]
 
 
 def test_clock_planned_to_the_solve():
-    """With the endgame solved from 20 empties, the clock goes to our moves before it."""
-    from cpu_match import move_budget
+    """With the endgame solved from 20 empties, the player is told the usable clock as it is,
+    untapered: what's kept for the solve is its own to keep, once."""
+    from cpu_match import Solving, move_budget
 
-    policy = TimePolicy()
-    board = Board()
-    view = GameView(".1", (0, 0, "b"), (), board.discs[0], board.discs[1], "b", 60.0)
+    bridge, players, _ = fake_bridge(taper=30, solve_from=20)
+    policy = bridge.time
+    view = view_after([], seconds=60.0)
     assert view.empties == 60
+    bridge.decide(view, 4)
+    _, _, told, _, per_move, taper = players[0].calls[-1]
     usable = policy.seconds_left(view)
-    per_move = move_budget(policy.planned_left(view, 20), view.empties)
-    # 20 of our moves to reach 20 empties, the solve's reserve kept
-    assert per_move == pytest.approx(0.95 * (usable - policy.solve_reserve) / 20)
-    # unsolved, or within the solve: the whole game's plan
-    assert policy.planned_left(view, 0) == usable
-    late = GameView(".1", (0, 0, "b"), (), (1 << 45) - 1, 0, "b", 10.0)
-    assert late.empties == 19 and policy.planned_left(late, 20) == policy.seconds_left(
-        late
-    )
+    assert told == pytest.approx(usable) and per_move == 0 and taper == 0
+    # what NetPlayer then searches: 20 of our moves to reach 20 empties, the solve's reserve
+    # kept, about 2.5 s a move from 60 s
+    solving = Solving(empties=20, exact=True, threads=4)
+    budget = move_budget(usable, 60, 0, 20, solving.kept(20, usable))
+    assert budget == pytest.approx(0.95 * (usable - solving.reserve) / 20)
+    # near the solve, a move never plans on more than the clock (twice-kept, this was 64 s of 10)
+    late = GameView(".1", (0, 0, "b"), (), (1 << 42) - 1, 0, "b", 12.0)
+    assert late.empties == 22
+    usable = policy.seconds_left(late)
+    budget = move_budget(usable, 22, 0, 20, solving.kept(20, usable))
+    assert budget < usable
+    assert budget == pytest.approx(0.95 * (usable - solving.reserve))
