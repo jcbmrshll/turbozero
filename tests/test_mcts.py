@@ -322,7 +322,7 @@ def test_the_prior_is_the_policys_softmax_at_its_temperature_at_every_node(
 
 
 def test_the_prior_temperature_is_positive():
-    with pytest.raises(ValueError, match="prior_temperature"):
+    with pytest.raises(AssertionError):
         make_mcts(prior_temperature=0.0)
 
 

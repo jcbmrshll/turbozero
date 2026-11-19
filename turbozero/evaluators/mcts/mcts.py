@@ -95,17 +95,14 @@ class MCTS(Evaluator):
                 traversal steps until the deepest in the batch is done: more
                 steps a check wait less and compute more, and which is fastest
                 depends on the trees' depth
-            prior_temperature: (optional) the softmax temperature of the prior, at every node: the
-                network's policy logits are divided by it before the softmax (default: 1.0, the
-                policy itself). Above 1 flattens the prior, so the search tries more of the moves
-                the network rates low (Leela Chess Zero's policy softmax temperature). The root's
-                noise is mixed into the flattened prior
+            prior_temperature: every node's prior is the softmax of
+                `leaf_eval_fn`'s policy logits divided by this (Leela Chess
+                Zero's policy softmax temperature). Above 1 flattens the prior,
+                so the search tries more of the actions the network rates low;
+                the root's noise is mixed into the flattened prior
         """
-        if prior_temperature <= 0:
-            raise ValueError(
-                f"prior_temperature must be positive, got {prior_temperature}"
-            )
         assert traversal_steps >= 1
+        assert prior_temperature > 0
         assert 0 <= min_iterations <= num_iterations
         assert 0 < full_probability <= 1
         assert full_probability == 1 or 0 < fast_iterations < num_iterations
@@ -351,9 +348,9 @@ class MCTS(Evaluator):
     ) -> MCTSTree:
         """Writes the evaluation of the root into the tree.
 
-        The root gets the softmax of `policy_logits` over the legal actions,
-        with the search's Dirichlet noise mixed in, as its prior, and
-        `root_embedding` as its state. A new root also gets `value` and one visit; a root kept from the
+        The root gets the `prior` of `policy_logits`, with the search's
+        Dirichlet noise mixed in, as its prior, and `root_embedding` as its
+        state. A new root also gets `value` and one visit; a root kept from the
         previous move keeps its visits and value. Does nothing if `write` is
         False (see `Tree.set_root`).
         """
@@ -385,25 +382,13 @@ class MCTS(Evaluator):
         return tree.set_root(node, write=write)
 
     def prior(self, policy_logits: jax.Array, action_mask: jax.Array) -> jax.Array:
-        """A node's prior over its legal actions: the softmax of the network's policy logits
-        at `prior_temperature`, 0 for illegal actions.
-
-        Args:
-            policy_logits: the network's policy logits
-            action_mask: the legal actions
-
-        Returns:
-            jax.Array: the prior
+        """Computes a node's prior: the softmax of `policy_logits` divided by
+        `prior_temperature`, over the legal actions (0 for the others).
         """
-        # divided before masking, so the masked logits stay finite: dividing the lowest float by a
-        # temperature below 1 would overflow it
-        return jax.nn.softmax(
-            jnp.where(
-                action_mask,
-                policy_logits / self.prior_temperature,
-                jnp.finfo(policy_logits).min,
-            )
-        )
+        # divided before masking: the lowest float divided by a temperature
+        # below 1 would overflow
+        logits = policy_logits / self.prior_temperature
+        return jax.nn.softmax(jnp.where(action_mask, logits, jnp.finfo(logits).min))
 
     def find_leaf(
         self, key: jax.Array, tree: MCTSTree, env_step_fn: EnvStepFn
@@ -459,8 +444,7 @@ class MCTS(Evaluator):
         """Adds `leaf` (from `find_leaf`) to the tree and backs its value up
         to the root.
 
-        The new node's prior is the softmax of `policy_logits` over its legal
-        actions, and its value is `value`, or the reward if the leaf is
+        The new node's prior is the `prior` of `policy_logits`, and its value is `value`, or the reward if the leaf is
         terminal. A terminal node already in the tree is visited again instead.
         In a full tree the new node replaces an evicted leaf; if there's none to
         evict, nothing changes. Then every node from the parent up to the root
