@@ -1,4 +1,4 @@
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import Any
 
@@ -6,22 +6,42 @@ import jax
 import jax.numpy as jnp
 from jax.typing import ArrayLike
 
-from turbozero.evaluators.evaluator import Evaluator
+from turbozero.evaluators.evaluator import EvalOutput, Evaluator
 from turbozero.evaluators.mcts.action_selection import MCTSActionSelector
-from turbozero.evaluators.mcts.policy_targets import PolicyTarget, VisitCounts
-from turbozero.evaluators.mcts.state import (
-    Leaf,
-    MCTSNode,
-    MCTSOutput,
-    MCTSTree,
-    SearchRecord,
-    TraversalState,
-    backprop_stats,
-    init_mcts_tree,
-    search_record,
-    with_backprop_stats,
-)
-from turbozero.types import EnvStepFn, EvalFn, StepMetadata
+from turbozero.evaluators.mcts.state import MCTSNode, MCTSTree, init_mcts_tree
+from turbozero.types import EnvStepFn, LeafEvalFn, StepMetadata
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class TraversalState:
+    """State used during traversal step of MCTS.
+
+    Attributes:
+        parent: parent node index
+        action: action taken from parent
+    """
+
+    parent: ArrayLike
+    action: jax.Array
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class Leaf:
+    """Where an iteration's traversal ended, and the state there it evaluates.
+
+    Attributes:
+        parent: index of the node the leaf is under
+        action: action from the parent to the leaf
+        embedding: the leaf's environment state
+        metadata: its metadata
+    """
+
+    parent: ArrayLike
+    action: jax.Array
+    embedding: Any
+    metadata: StepMetadata
 
 
 class MCTS(Evaluator):
@@ -34,7 +54,7 @@ class MCTS(Evaluator):
 
     def __init__(
         self,
-        eval_fn: EvalFn,
+        leaf_eval_fn: LeafEvalFn,
         action_selector: MCTSActionSelector,
         branching_factor: int,
         max_nodes: int,
@@ -42,12 +62,11 @@ class MCTS(Evaluator):
         discount: float = -1.0,
         temperature: float = 1.0,
         persist_tree: bool = True,
-        policy_target: PolicyTarget | None = None,
     ):
         """Initializes an MCTS evaluator.
 
         Args:
-            eval_fn: leaf node evaluation function (env_state -> (policy_logits, value))
+            leaf_eval_fn: leaf node evaluation function (env_state -> (policy_logits, value))
             action_selector: action selection function (eval_state -> action)
             branching_factor: max number of actions (== children per node)
             max_nodes: allocated size of MCTS tree. A search that needs a new node when the tree is
@@ -62,23 +81,20 @@ class MCTS(Evaluator):
             temperature: temperature for root action selection (default: 1.0); at 0, the most visited
                 action, ties broken at random
             persist_tree: whether to persist search tree state between calls to `evaluate` (default: True)
-            policy_target: (optional) what the policy trains towards, from the root of a finished
-                search (default: `VisitCounts`, its visit distribution)
         """
         super().__init__(discount=discount)
-        self.eval_fn = eval_fn
+        self.leaf_eval_fn = leaf_eval_fn
         self.num_iterations = num_iterations
         self.branching_factor = branching_factor
         self.max_nodes = max_nodes
         self.action_selector = action_selector
         self.temperature = temperature
         self.persist_tree = persist_tree
-        self.policy_target = policy_target or VisitCounts()
 
     def get_config(self) -> dict:
         """Returns a config object for checkpoints."""
         return {
-            "eval_fn": self.eval_fn.__name__,
+            "leaf_eval_fn": self.leaf_eval_fn.__name__,
             "num_iterations": self.num_iterations,
             "branching_factor": self.branching_factor,
             "max_nodes": self.max_nodes,
@@ -86,19 +102,17 @@ class MCTS(Evaluator):
             "discount": self.discount,
             "temperature": self.temperature,
             "persist_tree": self.persist_tree,
-            "policy_target_config": self.policy_target.get_config(),
         }
 
     def evaluate(
-        self,  # pylint: disable=arguments-differ
+        self,
         key: jax.Array,
         eval_state: MCTSTree,
         env_state: Any,
         root_metadata: StepMetadata,
         params: Any,
         env_step_fn: EnvStepFn,
-        **kwargs,
-    ) -> MCTSOutput:
+    ) -> EvalOutput:
         """Performs `self.num_iterations` MCTS iterations on an `MCTSTree`.
 
         Samples an action to take from the root node after search is completed.
@@ -112,7 +126,7 @@ class MCTS(Evaluator):
             env_step_fn: env step fn: (env_state, action) -> (new_env_state, metadata)
 
         Returns:
-            MCTSOutput: contains new tree state, selected action, root value, and policy weights
+            EvalOutput: contains new tree state, selected action, and policy weights
         """
         eval_state = self.start_search(key, eval_state)
         # store current state metadata in the root node
@@ -131,7 +145,7 @@ class MCTS(Evaluator):
         # sample action based on root visit counts
         # (also get normalized policy weights for training purposes)
         action, policy_weights = self.sample_root_action(sample_key, eval_state)
-        return MCTSOutput(
+        return EvalOutput(
             eval_state=eval_state, action=action, policy_weights=policy_weights
         )
 
@@ -206,7 +220,7 @@ class MCTS(Evaluator):
         # Both are computed, as under vmap a lax.cond would, but they write only what they change,
         # where a cond would select between two whole trees
         leaf = self.find_leaf(traverse_key, state, env_step_fn)
-        policy_logits, value = self.eval_fn(
+        policy_logits, value = self.leaf_eval_fn(
             jax.tree.map(
                 lambda r, l: jnp.where(at_root, r, l), env_state, leaf.embedding
             ),
@@ -238,17 +252,17 @@ class MCTS(Evaluator):
         root_metadata: StepMetadata,
         params: Any,
         env_step_fn: EnvStepFn,
-    ) -> MCTSOutput:
+    ) -> EvalOutput:
         """Samples the action to take from the root, as `evaluate` does after its iterations.
 
         Args: see `Evaluator.search_output`.
 
         Returns:
-            MCTSOutput: as `evaluate`'s
+            EvalOutput: as `evaluate`'s
         """
         _, _, sample_key = jax.random.split(key, 3)
         action, policy_weights = self.sample_root_action(sample_key, state)
-        return MCTSOutput(
+        return EvalOutput(
             eval_state=state, action=action, policy_weights=policy_weights
         )
 
@@ -263,10 +277,6 @@ class MCTS(Evaluator):
         """
         return state.data_at(state.ROOT_INDEX).q
 
-    def search_record(self, state: MCTSTree) -> SearchRecord:
-        """The record of what the search in `state` explored, see `SearchRecord`."""
-        return search_record(state)
-
     def update_root(
         self,
         key: jax.Array,
@@ -274,8 +284,7 @@ class MCTS(Evaluator):
         root_embedding: Any,
         params: Any,
         root_metadata: StepMetadata,
-        **kwargs,
-    ) -> MCTSTree:  # pylint: disable=unused-argument
+    ) -> MCTSTree:
         """Populates the root node of an MCTSTree.
 
         Args:
@@ -289,7 +298,7 @@ class MCTS(Evaluator):
             MCTSTree: updated MCTSTree
         """
         eval_key, _ = jax.random.split(key)
-        policy_logits, value = self.eval_fn(root_embedding, params, eval_key)
+        policy_logits, value = self.leaf_eval_fn(root_embedding, params, eval_key)
         return self.expand_root(
             key, tree, root_embedding, root_metadata, policy_logits, value
         )
@@ -320,17 +329,8 @@ class MCTS(Evaluator):
         """
         policy = self.prior(policy_logits, root_metadata.action_mask)
         prior = self.root_prior(tree.root_noise, policy, root_metadata.action_mask)
-        policy_logits = jnp.where(
-            root_metadata.action_mask, policy_logits, jnp.finfo(policy_logits).min
-        )
         root_node = self.update_root_node(
             tree.data_at(tree.ROOT_INDEX), prior, value, root_embedding
-        )
-        # the network's evaluation, before the prior's noise and the search's averaging
-        tree = replace(
-            tree,
-            root_logits=jnp.where(write, policy_logits, tree.root_logits),
-            root_value=jnp.where(write, value, tree.root_value),
         )
         return tree.set_root(root_node, write=write)
 
@@ -391,7 +391,7 @@ class MCTS(Evaluator):
         """
         traverse_key, eval_key, key = jax.random.split(key, 3)
         leaf = self.find_leaf(traverse_key, tree, env_step_fn)
-        policy_logits, value = self.eval_fn(leaf.embedding, params, eval_key)
+        policy_logits, value = self.leaf_eval_fn(leaf.embedding, params, eval_key)
         return self.expand(key, tree, leaf, policy_logits, value, write=write)
 
     def find_leaf(self, key: jax.Array, tree: MCTSTree, env_step_fn: EnvStepFn) -> Leaf:
@@ -581,14 +581,18 @@ class MCTS(Evaluator):
             values = value * jnp.cumprod(jnp.full(path.shape, self.discount))
         # entries past the root point out of bounds, so their writes are dropped
         index = jnp.where(path == tree.NULL_INDEX, tree.capacity, path)
-        stats = backprop_stats(tree)
+        # only the statistics: the policies and embeddings (a whole environment state per node)
+        # are most of the tree, and backpropagation doesn't change them
+        stats = replace(tree.data, p=None, embedding=None)
         nodes = jax.tree.map(lambda x: x[index], stats)
         # increment visit counts and update value estimates
         visited = self.visit_node(nodes, values)
         stats = jax.tree.map(
             lambda x, y: x.at[index].set(y, mode="drop"), stats, visited
         )
-        return with_backprop_stats(tree, stats)
+        return replace(
+            tree, data=replace(stats, p=tree.data.p, embedding=tree.data.embedding)
+        )
 
     def sample_root_action(
         self, key: jax.Array, tree: MCTSTree
@@ -600,10 +604,14 @@ class MCTS(Evaluator):
             tree: MCTSTree to evaluate
 
         Returns:
-            Tuple[jax.Array, jax.Array]: sampled action, the policy target (see `policy_target`)
+            Tuple[jax.Array, jax.Array]: sampled action, the root's visit distribution (uniform
+                if its children have no visits)
         """
-        target = self.policy_target(tree, self.discount)
-        policy_weights = VisitCounts()(tree, self.discount)
+        n = tree.get_child_data("n", tree.ROOT_INDEX)
+        total = n.sum(axis=-1)
+        policy_weights = jnp.where(
+            total > 0, n / jnp.maximum(total, 1), 1 / n.shape[-1]
+        )
 
         # zero temperature == argmax
         if self.temperature == 0:
@@ -612,7 +620,7 @@ class MCTS(Evaluator):
             action = jnp.argmax(
                 jnp.where(policy_weights == policy_weights.max(), noise, -1.0)
             )
-            return action, target
+            return action, policy_weights
 
         # apply temperature
         policy_weights_t = policy_weights ** (1 / self.temperature)
@@ -620,7 +628,7 @@ class MCTS(Evaluator):
         policy_weights_t /= policy_weights_t.sum()
         # sample action
         action = jax.random.choice(key, policy_weights_t.shape[-1], p=policy_weights_t)
-        return action, target
+        return action, policy_weights
 
     @staticmethod
     def visit_node(
@@ -760,7 +768,7 @@ class MCTS(Evaluator):
             action, reset=jnp.logical_or(reset, not self.persist_tree), active=active
         )
 
-    def init(self, template_embedding: Any, *args, **kwargs) -> MCTSTree:  # pylint: disable=arguments-differ
+    def init(self, template_embedding: Any) -> MCTSTree:
         """Initializes the internal state of the MCTS evaluator.
 
         Args:

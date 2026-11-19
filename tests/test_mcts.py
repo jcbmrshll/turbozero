@@ -11,19 +11,23 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from turbozero.evaluators.alphazero import AlphaZero
 from turbozero.evaluators.mcts.action_selection import MCTSActionSelector, PUCTSelector
 from turbozero.evaluators.mcts.mcts import MCTS
-from turbozero.evaluators.mcts.policy_targets import CompletedQ
-from turbozero.evaluators.mcts.weighted_mcts import WeightedMCTS, WeightedMCTSNode
-
-AZ_MCTS = AlphaZero(MCTS)
-AZ_WEIGHTED = AlphaZero(WeightedMCTS)
-
-# the two ways of backing values up
-BACKUPS = [pytest.param(MCTS, id="MCTS"), pytest.param(WeightedMCTS, id="WeightedMCTS")]
 
 NULL = -1
+
+
+class NoisyMCTS(MCTS):
+    """MCTS whose root prior mixes in uniform noise over the legal actions, a
+    stand-in for AlphaZero's Dirichlet noise: a search with a root noise draw and
+    mix to compile and check."""
+
+    def root_noise(self, key, shape):
+        return jax.random.uniform(key, shape)
+
+    def root_prior(self, noise, policy, action_mask):
+        noise = jnp.where(action_mask, noise, 0.0)
+        return 0.75 * policy + 0.25 * noise / noise.sum()
 
 
 @pytest.fixture(scope="module")
@@ -65,7 +69,7 @@ def make_mcts(
     cls=MCTS,
     num_actions=3,
     max_nodes=8,
-    eval_fn=None,
+    leaf_eval_fn=None,
     logits=None,
     value=0.0,
     selector=None,
@@ -73,13 +77,13 @@ def make_mcts(
     **kwargs,
 ):
     """An MCTS evaluator (of class `cls`) whose evaluation function gives every state `logits`
-    (uniform by default) and `value`, unless it's `eval_fn`."""
-    if eval_fn is None:
-        eval_fn = fixed_eval_fn(
+    (uniform by default) and `value`, unless it's `leaf_eval_fn`."""
+    if leaf_eval_fn is None:
+        leaf_eval_fn = fixed_eval_fn(
             logits if logits is not None else jnp.zeros(num_actions), value
         )
     return cls(
-        eval_fn=eval_fn,
+        leaf_eval_fn=leaf_eval_fn,
         action_selector=selector if selector is not None else PUCTSelector(),
         branching_factor=num_actions,
         max_nodes=max_nodes,
@@ -113,7 +117,7 @@ def build_tree(search, env, nodes):
         tree = (
             tree.set_root(node)
             if parent is None
-            else tree.add_node(parent, action, node)
+            else tree.set_child(parent, action, node)
         )
     return tree
 
@@ -164,10 +168,9 @@ def assert_trees_equal(a, b):
 # the root
 
 
-@pytest.mark.parametrize("cls", BACKUPS)
-def test_update_root_evaluates_an_empty_root_with_a_masked_prior(fixed_length_env, cls):
+def test_update_root_evaluates_an_empty_root_with_a_masked_prior(fixed_length_env):
     env = fixed_length_env(length=10, num_actions=3, action_mask=(True, False, True))
-    search = make_mcts(cls, logits=[1.0, 5.0, 0.0], value=0.3)
+    search = make_mcts(logits=[1.0, 5.0, 0.0], value=0.3)
     state, meta = env.init_fn(jax.random.PRNGKey(0))
     tree = search.init(template_embedding=state)
 
@@ -179,16 +182,10 @@ def test_update_root_evaluates_an_empty_root_with_a_masked_prior(fixed_length_en
     )
     assert int(node.n) == 1 and float(node.q) == pytest.approx(0.3)
     assert int(tree.next_free_idx) == 1
-    # the network's evaluation is kept for the policy target
-    np.testing.assert_allclose(
-        jax.nn.softmax(tree.root_logits), node.p, rtol=1e-6, atol=1e-30
-    )
-    assert float(tree.root_value) == pytest.approx(0.3)
 
 
-@pytest.mark.parametrize("cls", BACKUPS)
-def test_update_root_keeps_a_reused_roots_visits_and_value(env, cls):
-    search = make_mcts(cls, logits=[0.0, 1.0, 2.0], value=0.9)
+def test_update_root_keeps_a_reused_roots_visits_and_value(env):
+    search = make_mcts(logits=[0.0, 1.0, 2.0], value=0.9)
     tree = build_tree(search, env, [(None, None, 5, -0.2), (0, 1, 4, 0.1)])
     state, meta = env.init_fn(jax.random.PRNGKey(0))
 
@@ -196,102 +193,32 @@ def test_update_root_keeps_a_reused_roots_visits_and_value(env, cls):
 
     node = root(tree)
     assert int(node.n) == 5 and float(node.q) == pytest.approx(-0.2)
-    # while the network's value kept for the policy target is the new evaluation's
-    assert float(tree.root_value) == pytest.approx(0.9)
-    if isinstance(node, WeightedMCTSNode):
-        # the network's value too
-        assert float(node.r) == pytest.approx(-0.2)
     # the prior is the new evaluation's
     np.testing.assert_allclose(node.p, jax.nn.softmax(jnp.array([0.0, 1.0, 2.0])))
 
 
-@pytest.mark.parametrize(
-    # a small alpha's Gamma draws underflow to 0 outside log space
-    "alpha",
-    [0.03, 0.3, 2.0],
-)
-def test_dirichlet_noise_is_mixed_into_the_root_prior_over_legal_moves_only(
-    fixed_length_env, alpha
-):
-    mask = np.array([True, True, False, True, False, True])
-    env = fixed_length_env(length=10, num_actions=6, action_mask=mask)
-    logits = jnp.array([2.0, -1.0, 0.5, 0.0, 3.0, -2.0])
-    epsilon = 0.25
-    search = make_mcts(
-        AZ_MCTS,
-        num_actions=6,
-        logits=logits,
-        dirichlet_alpha=alpha,
-        dirichlet_epsilon=epsilon,
-    )
-    state, meta = env.init_fn(jax.random.PRNGKey(0))
-    tree = search.init(template_embedding=state)
-    keys = jax.random.split(jax.random.PRNGKey(0), 1024)
-
-    priors = jax.jit(
-        jax.vmap(
-            lambda key: (
-                root(
-                    search.update_root(
-                        key, search.start_search(key, tree), state, None, meta
-                    )
-                ).p
-            )
-        )
-    )(keys)
-
-    np.testing.assert_allclose(priors.sum(axis=-1), 1.0, rtol=1e-5)
-    np.testing.assert_array_equal(priors[:, ~mask], 0.0)
-    # the noise differs from key to key
-    assert not np.allclose(priors[0], priors[1])
-    # what's left after taking out the network's share is the noise: a distribution
-    # over the legal moves, carrying exactly `epsilon` of the root prior
-    noise = (priors - (1 - epsilon) * masked_softmax(logits, mask)) / epsilon
-    assert (noise > -1e-5).all()
-    np.testing.assert_allclose(noise.sum(axis=-1), 1.0, rtol=1e-5)
-    np.testing.assert_allclose(noise[:, ~mask], 0.0, atol=1e-6)
-    # a symmetric Dirichlet: each legal move gets an equal share on average, spread as
-    # Dirichlet(alpha)'s, (1/k)(1 - 1/k) / (k alpha + 1) over k legal moves
-    k = mask.sum()
-    np.testing.assert_allclose(noise[:, mask].mean(axis=0), 1 / k, atol=0.06)
-    np.testing.assert_allclose(
-        noise[:, mask].var(), (1 / k) * (1 - 1 / k) / (k * alpha + 1), rtol=0.15
-    )
-
-
-def test_drawing_the_root_noise_has_no_open_loops():
-    # on GPU, each trip of a loop whose trip count XLA doesn't know waits on the host: self-play
-    # starts searches (and draws their noise) for every environment at every check
-    search = make_mcts(AZ_MCTS, num_actions=6, logits=jnp.zeros(6))
-    keys = jax.random.split(jax.random.PRNGKey(0), 5)
-
-    hlo = (
-        jax.jit(jax.vmap(lambda key: search.root_noise(key, (6,))))
-        .lower(keys)
-        .compile()
-        .as_text()
-    )
-
-    assert hlo is not None
-    # (the random bits' hash rounds may stay a loop, of a known trip count)
-    loops = [line for line in hlo.splitlines() if " while(" in line]
-    assert all("known_trip_count" in line for line in loops)
-
-
-def test_the_root_keeps_the_networks_policy_without_the_noise(fixed_length_env):
+def test_the_roots_prior_takes_the_noise_its_search_drew(fixed_length_env):
     mask = np.array([True, False, True, True])
     env = fixed_length_env(length=10, num_actions=4, action_mask=mask)
     logits = jnp.array([2.0, 1.0, 0.5, -1.0])
-    search = make_mcts(AZ_MCTS, num_actions=4, logits=logits, dirichlet_epsilon=0.5)
+    search = make_mcts(NoisyMCTS, num_actions=4, logits=logits)
     state, meta = env.init_fn(jax.random.PRNGKey(0))
+    tree = search.init(template_embedding=state)
 
-    key = jax.random.PRNGKey(0)
-    tree = search.start_search(key, search.init(template_embedding=state))
-    tree = search.update_root(key, tree, state, None, meta)
+    started = search.start_search(jax.random.PRNGKey(1), tree)
+    kept = search.start_search(jax.random.PRNGKey(2), started, active=False)
+    other = search.start_search(jax.random.PRNGKey(2), tree)
+    updated = search.update_root(jax.random.PRNGKey(0), kept, state, None, meta)
 
-    assert not np.allclose(root(tree).p, masked_softmax(logits, mask))
+    # a search that doesn't start keeps its noise, and another key draws another
+    np.testing.assert_array_equal(kept.root_noise, started.root_noise)
+    assert not np.allclose(other.root_noise, started.root_noise)
     np.testing.assert_allclose(
-        jax.nn.softmax(tree.root_logits), masked_softmax(logits, mask), rtol=1e-6
+        root(updated).p,
+        search.root_prior(
+            started.root_noise, masked_softmax(logits, mask), meta.action_mask
+        ),
+        rtol=1e-6,
     )
 
 
@@ -344,21 +271,6 @@ def test_moves_are_sampled_by_their_visits_to_the_power_of_one_over_the_temperat
     )
     # the policy target is the visits, without the temperature
     np.testing.assert_allclose(weights[0], np.array([3, 0, 5, 5]) / 13, rtol=1e-6)
-
-
-def test_the_move_is_chosen_by_visits_whatever_the_policy_target(fixed_length_env):
-    env = fixed_length_env(length=10, num_actions=3)
-    search = make_mcts(temperature=0.0, policy_target=CompletedQ())
-    # action 0 is the most visited, but action 1 is worth more to the root's player
-    tree = build_tree(
-        search, env, [(None, None, 9, 0.0), (0, 0, 5, 0.5), (0, 1, 3, -0.5)]
-    )
-
-    action, weights = search.sample_root_action(jax.random.PRNGKey(0), tree)
-
-    assert int(action) == 0
-    np.testing.assert_allclose(weights, CompletedQ()(tree, search.discount))
-    assert weights[1] > weights[0]
 
 
 def test_a_root_without_visited_children_has_a_uniform_policy(fixed_length_env):
@@ -551,7 +463,7 @@ class KeyRecordingMCTS(MCTS):
     def record(self, name, key):
         jax.debug.callback(lambda k: self.recorded.append((name, np.asarray(k))), key)
 
-    def update_root(self, key, tree, root_embedding, params, root_metadata, **kwargs):
+    def update_root(self, key, tree, root_embedding, params, root_metadata):
         self.record("update_root", key)
         return tree
 
@@ -566,7 +478,7 @@ class KeyRecordingMCTS(MCTS):
 
 def test_evaluate_gives_every_consumer_an_independent_key(env):
     search = KeyRecordingMCTS(
-        eval_fn=fixed_eval_fn(jnp.zeros(3)),
+        leaf_eval_fn=fixed_eval_fn(jnp.zeros(3)),
         action_selector=PUCTSelector(),
         branching_factor=3,
         max_nodes=8,
@@ -595,28 +507,6 @@ def test_evaluate_gives_every_consumer_an_independent_key(env):
             for c in np.asarray(jax.random.split(k, n))
         }
         assert not children & set(keys)
-
-
-def test_search_record_matches_the_tree(env):
-    # room for nodes the search didn't use
-    search = make_mcts(max_nodes=8)
-    tree = build_tree(search, env, FULL)
-
-    record = jax.device_get(search.search_record(tree))
-
-    tree = jax.device_get(tree)
-    k = int(record.num_nodes)
-    assert k == len(FULL)
-    assert (record.parents[0], record.actions[0]) == (NULL, NULL)
-    for i, (parent, action, _, _) in enumerate(FULL[1:], start=1):
-        # each node hangs off its parent by its action, with its parent's prior for it
-        assert (record.parents[i], record.actions[i]) == (parent, action)
-        assert record.prior[i] == tree.data.p[parent, action]
-    np.testing.assert_array_equal(record.n[:k], tree.data.n[:k])
-    np.testing.assert_array_equal(record.q[:k], tree.data.q[:k])
-    np.testing.assert_array_equal(record.policy, tree.data.p[tree.ROOT_INDEX])
-    # unused nodes have no parent or action
-    assert (record.parents[k:] == NULL).all() and (record.actions[k:] == NULL).all()
 
 
 # iterations must be exact: the same whether trees are batched, and whatever their capacity
@@ -648,11 +538,10 @@ def iterations(search, env, num):
     return run
 
 
-@pytest.mark.parametrize("cls", BACKUPS)
-def test_batched_iterations_match_iterating_each_tree_alone(env, cls):
+def test_batched_iterations_match_iterating_each_tree_alone(env):
     # under vmap, WeightedMCTS's backpropagation loops until the longest path in the batch is done,
     # and the trees on shorter paths must come out exactly as if iterated alone
-    search = make_mcts(cls, max_nodes=16, eval_fn=varying_eval_fn)
+    search = make_mcts(max_nodes=16, leaf_eval_fn=varying_eval_fn)
     trees = [build_tree(search, env, nodes) for nodes in SHAPES]
     keys = jax.random.split(jax.random.PRNGKey(0), len(trees))
     run = iterations(search, env, 4)
@@ -668,12 +557,11 @@ def test_batched_iterations_match_iterating_each_tree_alone(env, cls):
         )
 
 
-@pytest.mark.parametrize("cls", BACKUPS)
-def test_iterations_do_not_depend_on_the_trees_capacity(env, cls):
+def test_iterations_do_not_depend_on_the_trees_capacity(env):
     # with room to spare, a larger tree changes nothing: arrays of the tree's capacity (e.g. the path
     # to the root) mustn't change the results, e.g. by XLA fusing the arithmetic differently
     small, large = (
-        make_mcts(cls, max_nodes=m, eval_fn=varying_eval_fn) for m in (24, 40)
+        make_mcts(max_nodes=m, leaf_eval_fn=varying_eval_fn) for m in (24, 40)
     )
 
     def search_step_search(search):
@@ -721,40 +609,13 @@ def search_cycles(search, env, cycles):
     return run
 
 
-def search_until_done(search, env):
-    """The search for a move with key `key` of the position in the tree's root: `start_search`,
-    then its cycles until it's done."""
-    root_state, root_meta = env.init_fn(jax.random.PRNGKey(0))
-
-    def run(key, tree):
-        def cycle(carry):
-            tree, c = carry
-            tree = search.search_cycle(
-                key, tree, c, root_state, root_meta, None, env.step_fn
-            )
-            return tree, c + 1
-
-        return jax.lax.while_loop(
-            lambda carry: ~search.search_done(*carry),
-            cycle,
-            (search.start_search(key, tree), jnp.array(0, dtype=jnp.int32)),
-        )[0]
-
-    return run
-
-
-@pytest.mark.parametrize(
-    "cls",
-    [
-        pytest.param(AZ_MCTS, id="AlphaZero(MCTS)"),
-        pytest.param(AZ_WEIGHTED, id="AlphaZero(WeightedMCTS)"),
-    ],
-)
 @pytest.mark.parametrize("reused", [False, True], ids=["empty", "reused"])
-def test_a_search_a_cycle_at_a_time_is_evaluate(env, cls, reused):
+def test_a_search_a_cycle_at_a_time_is_evaluate(env, reused):
     # with the root's evaluation first, the same keys, and a tree too small for every iteration
     key = jax.random.PRNGKey(3)
-    search = make_mcts(cls, max_nodes=8, eval_fn=state_eval_fn, num_iterations=6)
+    search = make_mcts(
+        NoisyMCTS, max_nodes=8, leaf_eval_fn=state_eval_fn, num_iterations=6
+    )
     root_state, root_meta = env.init_fn(jax.random.PRNGKey(0))
     tree = (
         build_tree(search, env, SHAPES[2])
@@ -765,7 +626,8 @@ def test_a_search_a_cycle_at_a_time_is_evaluate(env, cls, reused):
 
     @jax.jit
     def by_cycles(key, tree):
-        tree = search_until_done(search, env)(key, tree)
+        cycles = jnp.arange(search.search_cycles())
+        tree = search_cycles(search, env, cycles)(key, tree)
         return search.search_output(key, tree, root_state, root_meta, None, env.step_fn)
 
     expected = jax.jit(search.evaluate, static_argnames="env_step_fn")(
@@ -775,20 +637,10 @@ def test_a_search_a_cycle_at_a_time_is_evaluate(env, cls, reused):
     assert_trees_equal(by_cycles(key, tree), expected)
 
 
-def test_a_search_is_done_after_the_roots_evaluation_and_its_iterations(env):
-    search = make_mcts(num_iterations=3)
-    tree = build_tree(search, env, SHAPES[2])
-
-    done = [bool(search.search_done(tree, jnp.array(c))) for c in range(6)]
-
-    assert done == [False, False, False, False, True, True]
-
-
-@pytest.mark.parametrize("cls", BACKUPS)
-def test_a_search_past_its_iterations_goes_on_iterating(env, cls):
+def test_a_search_past_its_iterations_goes_on_iterating(env):
     # as self-play's does, until its move is played: each cycle past the 4th iteration visits
     # the tree once more
-    search = make_mcts(cls, max_nodes=12, eval_fn=state_eval_fn, num_iterations=4)
+    search = make_mcts(max_nodes=12, leaf_eval_fn=state_eval_fn, num_iterations=4)
     root_state, _ = env.init_fn(jax.random.PRNGKey(0))
     tree = search.init(template_embedding=root_state)
     run = jax.jit(
@@ -804,11 +656,10 @@ def test_a_search_past_its_iterations_goes_on_iterating(env, cls):
     assert_consistent(on)
 
 
-@pytest.mark.parametrize("cls", BACKUPS)
-def test_batched_cycles_match_each_trees_cycle_alone(env, cls):
+def test_batched_cycles_match_each_trees_cycle_alone(env):
     # under vmap the root's evaluation and the iteration are both computed, and each tree must
     # take only its own; past its iterations, a search goes on
-    search = make_mcts(cls, max_nodes=8, eval_fn=state_eval_fn, num_iterations=4)
+    search = make_mcts(max_nodes=8, leaf_eval_fn=state_eval_fn, num_iterations=4)
     trees = [build_tree(search, env, nodes) for nodes in SHAPES]
     cycles = jnp.array([0, 1, 6])
     keys = jax.random.split(jax.random.PRNGKey(0), len(trees))
@@ -865,21 +716,14 @@ def open_loops_in_loop(hlo: str) -> int:
     )
 
 
-@pytest.mark.parametrize(
-    "cls",
-    [
-        pytest.param(AZ_MCTS, id="AlphaZero(MCTS)"),
-        pytest.param(AZ_WEIGHTED, id="AlphaZero(WeightedMCTS)"),
-    ],
-)
-def test_search_cycles_write_the_trees_in_place(env, cls):
+def test_search_cycles_write_the_trees_in_place(env):
     # a copy of an array of the trees' nodes in a cycle makes each cycle's cost grow with the
     # trees' capacity: e.g. where the root's update reads what the iteration writes (or the other
-    # way round) and XLA doesn't order the reads first, it copies the arrays to read from.
-    # (WeightedMCTS's backpropagation is a loop within the cycle's, which under vmap selects its
-    # statistics every step, see `backprop_stats`)
+    # way round) and XLA doesn't order the reads first, it copies the arrays to read from
     batch, capacity = 5, 24
-    search = make_mcts(cls, max_nodes=capacity, eval_fn=state_eval_fn, num_iterations=6)
+    search = make_mcts(
+        NoisyMCTS, max_nodes=capacity, leaf_eval_fn=state_eval_fn, num_iterations=6
+    )
     trees = jax.vmap(lambda _: search.init(template_embedding=env.init_fn(None)[0]))(
         jnp.arange(batch)
     )
@@ -892,17 +736,11 @@ def test_search_cycles_write_the_trees_in_place(env, cls):
     assert copies_in_loop(hlo, f"{batch},{capacity}") == []
 
 
-@pytest.mark.parametrize(
-    "cls, loops",
-    [
-        pytest.param(AZ_MCTS, 1, id="AlphaZero(MCTS)"),
-        # and its backpropagation
-        pytest.param(AZ_WEIGHTED, 2, id="AlphaZero(WeightedMCTS)"),
-    ],
-)
-def test_a_search_cycle_loops_only_to_traverse(env, cls, loops):
+def test_a_search_cycle_loops_only_to_traverse(env):
     # the root's noise is drawn once, before the cycles
-    search = make_mcts(cls, max_nodes=24, eval_fn=state_eval_fn, num_iterations=6)
+    search = make_mcts(
+        NoisyMCTS, max_nodes=24, leaf_eval_fn=state_eval_fn, num_iterations=6
+    )
     trees = jax.vmap(lambda _: search.init(template_embedding=env.init_fn(None)[0]))(
         jnp.arange(5)
     )
@@ -912,7 +750,7 @@ def test_a_search_cycle_loops_only_to_traverse(env, cls, loops):
     hlo = jax.jit(run).lower(keys, trees).compile().as_text()
 
     assert hlo is not None
-    assert open_loops_in_loop(hlo) == loops
+    assert open_loops_in_loop(hlo) == 1
 
 
 # whole searches, on tic-tac-toe
@@ -924,23 +762,14 @@ BLOCK_MOVES, BLOCKING_ACTION = [0, 4, 8, 2], 6
 # a few moves in, so some actions are illegal
 MIDGAME_MOVES = [4, 0, 8, 2]
 
-# one instance, so that its searches share a compiled function
-COMPLETED_Q = CompletedQ()
 
-SEARCHES = [
-    pytest.param(AZ_MCTS, id="AlphaZero(MCTS)"),
-    pytest.param(AZ_WEIGHTED, id="AlphaZero(WeightedMCTS)"),
-]
-
-
-def run_search(search, key, moves, ttt, key_init=None):
-    state, meta = ttt.play(moves, key_init)
+def run_search(search, key, moves, ttt, first_player=0):
+    state, meta = ttt.play(moves, first_player)
     return search.evaluate(key, search.init(), state, meta), meta
 
 
-@pytest.mark.parametrize("cls", SEARCHES)
-def test_a_search_and_the_next_one_from_its_subtree(make_search, ttt, cls):
-    search = make_search(cls)
+def test_a_search_and_the_next_one_from_its_subtree(make_search, ttt):
+    search = make_search()
     k = search.evaluator.num_iterations
     state, meta = ttt.play(MIDGAME_MOVES)
 
@@ -954,9 +783,8 @@ def test_a_search_and_the_next_one_from_its_subtree(make_search, ttt, cls):
     np.testing.assert_allclose(out.policy_weights.sum(), 1.0, rtol=1e-6)
     np.testing.assert_array_equal(out.policy_weights[~meta.action_mask], 0.0)
     assert meta.action_mask[out.action]
-    # no node has a child along an illegal move (pgx marks every action legal in terminal states,
-    # and terminal nodes are never expanded)
-    legal = np.asarray(tree.data.embedding.legal_action_mask)
+    # no node has a child along an illegal move
+    legal = np.asarray(tree.data.embedding.board == 0)
     has_child = np.asarray(tree.edge_map != tree.NULL_INDEX)
     assert not (has_child & ~legal).any()
 
@@ -972,14 +800,9 @@ def test_a_search_and_the_next_one_from_its_subtree(make_search, ttt, cls):
 
 
 @pytest.mark.parametrize("first_player", [0, 1])
-@pytest.mark.parametrize("cls", SEARCHES)
-def test_finds_forced_win(make_search, ttt, cls, first_player):
+def test_finds_forced_win(make_search, ttt, first_player):
     out, _ = run_search(
-        make_search(cls),
-        jax.random.PRNGKey(0),
-        WIN_MOVES,
-        ttt,
-        key_init=ttt.first_player_keys[first_player],
+        make_search(), jax.random.PRNGKey(0), WIN_MOVES, ttt, first_player
     )
 
     assert out.action == WINNING_ACTION
@@ -988,38 +811,17 @@ def test_finds_forced_win(make_search, ttt, cls, first_player):
 
 
 @pytest.mark.parametrize("first_player", [0, 1])
-def test_the_completed_q_target_finds_forced_win(make_search, ttt, first_player):
-    out, meta = run_search(
-        make_search(AZ_MCTS, policy_target=COMPLETED_Q),
-        jax.random.PRNGKey(0),
-        WIN_MOVES,
-        ttt,
-        key_init=ttt.first_player_keys[first_player],
-    )
-
-    np.testing.assert_allclose(out.policy_weights.sum(), 1.0, rtol=1e-6)
-    np.testing.assert_array_equal(out.policy_weights[~meta.action_mask], 0.0)
-    assert int(out.policy_weights.argmax()) == WINNING_ACTION
-
-
-@pytest.mark.parametrize("first_player", [0, 1])
-@pytest.mark.parametrize("cls", SEARCHES)
-def test_blocks_forced_loss(make_search, ttt, cls, first_player):
+def test_blocks_forced_loss(make_search, ttt, first_player):
     out, _ = run_search(
-        make_search(cls),
-        jax.random.PRNGKey(0),
-        BLOCK_MOVES,
-        ttt,
-        key_init=ttt.first_player_keys[first_player],
+        make_search(), jax.random.PRNGKey(0), BLOCK_MOVES, ttt, first_player
     )
 
     assert out.action == BLOCKING_ACTION
 
 
-@pytest.mark.parametrize("cls", SEARCHES)
-def test_searches_in_a_tree_too_small_for_them(make_search, ttt, cls):
+def test_searches_in_a_tree_too_small_for_them(make_search, ttt):
     # 10 nodes for 32 iterations: room for the root's 5 children and deeper leaves to evict
-    search = make_search(cls, max_nodes=10)
+    search = make_search(max_nodes=10)
     k = search.evaluator.num_iterations
     state, meta = ttt.play(MIDGAME_MOVES)
 
