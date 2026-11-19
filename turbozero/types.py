@@ -36,7 +36,7 @@ class TrainState:
 EnvStepFn = Callable[[Any, jax.Array], tuple[Any, StepMetadata]]
 # key -> (initial env_state, its metadata)
 EnvInitFn = Callable[[jax.Array], tuple[Any, StepMetadata]]
-# (env_state, params, key) -> (policy logits, value), for one state
-EvalFn = Callable[[Any, Any, jax.Array], tuple[jax.Array, jax.Array]]
+# MCTS's leaf evaluation: (env_state, params, key) -> (policy logits, value)
+LeafEvalFn = Callable[[Any, Any, jax.Array], tuple[jax.Array, jax.Array]]
 # env_state -> the network's input
 StateToNNInputFn = Callable[[Any], jax.Array]

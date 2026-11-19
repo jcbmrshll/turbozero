@@ -5,19 +5,19 @@ import equinox as eqx
 import jax
 
 from turbozero.networks.utils import apply_nn
-from turbozero.types import EvalFn
+from turbozero.types import LeafEvalFn
 
 
-def make_nn_eval_fn(
+def make_nn_leaf_eval_fn(
     nn: eqx.Module, state_to_nn_input_fn: Callable[[Any], jax.Array]
-) -> EvalFn:
+) -> LeafEvalFn:
     """MCTS's leaf evaluation with network `nn` (see `apply_nn`): (state, params,
     key) -> (policy_logits, value), where `params` is (nn_params, nn_state), the
     trained arrays to combine with `nn`'s structure.
     """
     static = eqx.filter(nn, eqx.is_inexact_array, inverse=True)
 
-    def eval_fn(state, params, key):
+    def leaf_eval_fn(state, params, key):
         nn_params, nn_state = params
         nn = eqx.nn.inference_mode(eqx.combine(nn_params, static))
         (policy_logits, value), _ = apply_nn(
@@ -26,4 +26,4 @@ def make_nn_eval_fn(
         # the raw logits: MCTS applies the (masked) softmax
         return policy_logits.squeeze(0), value.squeeze()
 
-    return eval_fn
+    return leaf_eval_fn

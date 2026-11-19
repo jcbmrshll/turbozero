@@ -5,7 +5,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from turbozero.evaluators.evaluation_fns import make_nn_eval_fn
+from turbozero.evaluators.leaf_eval import make_nn_leaf_eval_fn
 
 
 class OffsetNet(eqx.Module):
@@ -22,15 +22,15 @@ class OffsetNet(eqx.Module):
         return (self.linear(x), state.get(self.offset)[None]), state
 
 
-def test_nn_eval_fn_applies_the_params_and_state_it_is_given():
+def test_nn_leaf_eval_fn_applies_the_params_and_state_it_is_given():
     net, _ = eqx.nn.make_with_state(OffsetNet)(jax.random.PRNGKey(0))
     other, state = eqx.nn.make_with_state(OffsetNet)(jax.random.PRNGKey(1))
     state = state.set(other.offset, jnp.array(3.0))
-    eval_fn = make_nn_eval_fn(net, lambda s: s["obs"])
+    leaf_eval_fn = make_nn_leaf_eval_fn(net, lambda s: s["obs"])
     x = jnp.array([1.0, -2.0])
 
     # the params and state of the trained network, not those it was made with
-    logits, value = eval_fn(
+    logits, value = leaf_eval_fn(
         {"obs": x},
         (eqx.filter(other, eqx.is_inexact_array), state),
         jax.random.PRNGKey(0),
