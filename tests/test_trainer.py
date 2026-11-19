@@ -3534,6 +3534,9 @@ def test_an_average_follows_the_weights_direction_at_their_norm():
     # a share of 1 is exactly the weights
     exact = _move_average(average, params, jnp.float32(1.0))
     assert all(np.array_equal(exact[k], params[k]) for k in params)
+    # without rescaling, the plain moving average
+    plain_moved = _move_average(average, params, jnp.float32(0.5), rescale=False)
+    np.testing.assert_allclose(plain_moved["w"], plain, rtol=1e-6)
 
 
 def test_a_warmup_of_one_makes_an_average_the_mean_until_its_horizon():

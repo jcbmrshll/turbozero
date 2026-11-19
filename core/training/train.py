@@ -258,12 +258,14 @@ def average_share(averaged: int, horizon: float, warmup: float) -> float:
     return 1.0 / min(horizon, 1.0 + averaged / warmup)
 
 
-@jax.jit
-def _move_average(average: Any, params: Any, share: jax.Array) -> Any:
+@partial(jax.jit, static_argnames=("rescale",))
+def _move_average(
+    average: Any, params: Any, share: jax.Array, rescale: bool = True
+) -> Any:
     """`average` moved toward `params` by `share` (with a share of 1, exactly the params), then
-    each weight tensor weight decay shrinks (2 or more dimensions, see `weight_decay_mask`)
-    rescaled to the norm of the same tensor in `params`: the average follows the weights'
-    direction, not their scale.
+    (with `rescale`) each weight tensor weight decay shrinks (2 or more dimensions, see
+    `weight_decay_mask`) rescaled to the norm of the same tensor in `params`: the average
+    follows the weights' direction, not their scale.
 
     While weight decay shrinks the weights, as it does for tens of epochs after a learning rate
     drop, an average lags them in scale too, yet plays with the current network's BatchNorm
@@ -274,7 +276,7 @@ def _move_average(average: Any, params: Any, share: jax.Array) -> Any:
 
     def move(a: jax.Array, p: jax.Array) -> jax.Array:
         moved = (1 - share) * a + share * p
-        if moved.ndim < 2:
+        if not rescale or moved.ndim < 2:
             return moved
         norm = jnp.linalg.norm(moved)
         return jnp.where(norm > 0, moved * (jnp.linalg.norm(p) / norm), moved)
@@ -716,6 +718,7 @@ class Trainer:
         selfplay_average: float | None = None,
         average_warmup: float = 10.0,
         average_norm_batches: int = 0,
+        average_rescale: bool = True,
         log_moves: str | None = None,
         extra_config: dict | None = None,
     ):
@@ -889,6 +892,8 @@ class Trainer:
                 average's; with a normalization after every convolution of an Othello ConvNeXt
                 net, its 4-epoch average lost 0.3-0.5 engine regret against its weights on them.
                 Not part of a saved state: a resumed run estimates them from the replay buffer
+            average_rescale: each average's weight tensors take the network's norms every
+                epoch (see `_move_average`); without it, an average is the plain moving average
             log_moves: (optional) a directory to keep every move self-play plays in, whether
                 its search trains or not, an epoch's moves to a file (see
                 `core.memory.move_log`). It doesn't change training. A new directory, or one
@@ -1088,6 +1093,7 @@ class Trainer:
                 f"average_norm_batches can't be negative, got {average_norm_batches}"
             )
         self.average_norm_batches = average_norm_batches
+        self.average_rescale = average_rescale
         # checkpoints
         self.ckpt_dir = ckpt_dir
         self.max_checkpoints = max_checkpoints
@@ -1324,6 +1330,8 @@ class Trainer:
                     "averages": list(self.averages),
                     "selfplay_average": self.selfplay_average,
                     "average_warmup": self.average_warmup,
+                    "average_norm_batches": self.average_norm_batches,
+                    "average_rescale": self.average_rescale,
                 }
                 if self.averages
                 else {}
@@ -4373,6 +4381,7 @@ class Trainer:
                         jnp.float32(
                             average_share(averaged[i], horizon, self.average_warmup)
                         ),
+                        rescale=self.average_rescale,
                     )
                     for average, horizon in zip(averages[i], self.averages, strict=True)
                 )
