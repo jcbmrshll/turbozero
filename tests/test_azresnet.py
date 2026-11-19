@@ -311,20 +311,6 @@ PRE_VARIANTS = {
         "pool_channels": 2,
         "layout": "pre",
     },
-    # and with a normalization after each convolution: the stem, expand and project
-    "normalized convnext": {
-        "num_blocks": 2,
-        "num_channels": 6,
-        "block": "convnext",
-        "expand": 2,
-        "dw_kernel": 3,
-        "pool_every": 2,
-        "pool_channels": 2,
-        "layout": "pre",
-        "stem_norm": True,
-        "expand_norm": True,
-        "project_norm": True,
-    },
 }
 
 
