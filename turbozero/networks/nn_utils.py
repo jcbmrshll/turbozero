@@ -11,7 +11,8 @@ BATCH_AXIS = "batch"
 def apply_nn(
     nn: Callable, nn_state: eqx.nn.State | None, x: jax.Array
 ) -> tuple[tuple[jax.Array, jax.Array], eqx.nn.State | None]:
-    """((policy_logits, value), nn_state) of `nn` for a batch of inputs `x`.
+    """Applies `nn` to a batch of inputs `x`, returning ((policy_logits,
+    value), nn_state).
 
     As equinox networks do, `nn` acts on one input: `nn(x) -> (policy_logits,
     value)` for a stateless network (`nn_state` None), and `nn(x, nn_state) ->
