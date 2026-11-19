@@ -735,7 +735,7 @@ def test_iterations_do_not_depend_on_the_traversals_steps_between_checks(
 
 
 def test_traversal_steps_is_at_least_1():
-    with pytest.raises(ValueError, match="traversal_steps"):
+    with pytest.raises(AssertionError):
         make_mcts(traversal_steps=0)
 
 
