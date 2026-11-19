@@ -13,7 +13,7 @@ import pytest
 from conftest import copies_in_loop, open_loops_in_loop
 
 from turbozero.evaluators.mcts.action_selection import MCTSActionSelector, PUCTSelector
-from turbozero.evaluators.mcts.mcts import MCTS, PlayoutCap
+from turbozero.evaluators.mcts.mcts import MCTS
 from turbozero.evaluators.mcts.state import MCTSNode
 
 NULL = -1
@@ -739,8 +739,8 @@ def search_until_done(search, env):
     [
         {},
         # key 3 draws a full search, key 10 a fast one
-        {"playout_cap": PlayoutCap(0.5, 2)},
-        {"playout_cap": PlayoutCap(0.5, 2), "key": 10},
+        {"full_probability": 0.5, "fast_iterations": 2},
+        {"full_probability": 0.5, "fast_iterations": 2, "key": 10},
     ],
     ids=["iterations", "playout-cap-full", "playout-cap-fast"],
 )
@@ -759,7 +759,7 @@ def test_a_search_a_cycle_at_a_time_is_evaluate(env, reused, budget):
         else search.init(template_embedding=root_state)
     )
     assert search.search_cycles() == 7
-    if "playout_cap" in budget:
+    if "full_probability" in budget:
         # the key draws the kind of search the test is named for
         fast = bool(search.start_search(key, tree).fast)
         assert fast == (key[-1] == 10)
@@ -954,7 +954,8 @@ def test_searches_in_a_tree_too_small_for_them(make_search, ttt):
 def capped(full_probability=0.25, fast_iterations=2, **kwargs):
     return make_mcts(
         num_iterations=kwargs.pop("num_iterations", 5),
-        playout_cap=PlayoutCap(full_probability, fast_iterations),
+        full_probability=full_probability,
+        fast_iterations=fast_iterations,
         **kwargs,
     )
 
@@ -1037,10 +1038,7 @@ def test_only_full_searches_make_training_positions(env):
     assert bool(plain.trains_on(plain.init(template_embedding=root_state)))
 
 
-@pytest.mark.parametrize(
-    "cap",
-    [PlayoutCap(0.0, 2), PlayoutCap(1.5, 2), PlayoutCap(0.5, 0), PlayoutCap(0.5, 5)],
-)
-def test_a_playout_cap_must_be_a_probability_and_fewer_iterations(cap):
-    with pytest.raises(ValueError, match="playout cap"):
-        make_mcts(num_iterations=5, playout_cap=cap)
+@pytest.mark.parametrize("probability, fast", [(0.0, 2), (1.5, 2), (0.5, 0), (0.5, 5)])
+def test_a_playout_cap_must_be_a_probability_and_fewer_iterations(probability, fast):
+    with pytest.raises(AssertionError):
+        capped(num_iterations=5, full_probability=probability, fast_iterations=fast)
