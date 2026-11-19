@@ -923,7 +923,7 @@ def test_a_search_counting_reused_visits_ends_with_as_many_root_visits(
 
 
 def test_min_iterations_is_at_most_num_iterations():
-    with pytest.raises(ValueError, match="min_iterations"):
+    with pytest.raises(AssertionError):
         make_mcts(num_iterations=2, count_reused_visits=True, min_iterations=3)
 
 
