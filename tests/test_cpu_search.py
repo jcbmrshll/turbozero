@@ -910,6 +910,33 @@ def test_a_timed_search_takes_its_time_with_nothing_left_to_evaluate(tiny_model)
     assert time.perf_counter() - start >= 0.1
 
 
+def test_a_halted_search_stops_at_once_and_until_let_go(tiny_model):
+    """`halt` from another thread ends a search under way (a ponder, when the opponent moves),
+    and any started while it's set."""
+    import threading
+    import time
+
+    from cpu_search import Engine, Search, SearchSettings
+
+    engine = Engine.openvino(tiny_model, 2, 2)
+    search = Search(SearchSettings(batch=2, virtual_loss="visit"))
+    thread = threading.Thread(
+        target=engine.search, args=(search,), kwargs={"seconds": 30.0}
+    )
+    thread.start()
+    time.sleep(0.1)
+    start = time.perf_counter()
+    search.halt()
+    thread.join(5.0)
+    assert not thread.is_alive() and time.perf_counter() - start < 0.5
+    visits = search.total_visits()
+    assert visits > 10
+    assert engine.search(search, seconds=5.0) == 0 and search.total_visits() == visits
+    search.halt(False)
+    engine.search(search, visits=50)
+    assert search.total_visits() == visits + 50
+
+
 def test_an_engine_player_plays_a_game_through_the_clock_driver(tiny_model):
     from clock_match import play_game
     from cpu_match import NetPlayer

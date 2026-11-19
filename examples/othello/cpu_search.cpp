@@ -3,6 +3,7 @@
 // and pgx's Othello have them, with virtual loss steering a batch's traversals apart. A search can show
 // the network each leaf in a random one of the board's 8 symmetries.
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <climits>
 #include <cmath>
@@ -257,6 +258,14 @@ struct Batch {
     std::vector<uint8_t> leaf_symmetries;  // the symmetry each leaf was shown in
 };
 
+// A flag set from another thread; a copy of it (`search_clone`) starts unset.
+struct Halt {
+    std::atomic<bool> on{false};
+    Halt() = default;
+    Halt(const Halt&) {}
+    Halt& operator=(const Halt&) { return *this; }
+};
+
 struct Search {
     int mode;
     float weight;
@@ -292,6 +301,9 @@ struct Search {
     // of our moves below it
     long descended_total;
     long descended_deeper_total;
+    // set from another thread (`search_halt`) to end an engine's search under way, or the next one,
+    // at once: a ponder stopped when the opponent's move comes
+    Halt halted;
 };
 
 inline float edge_q(const Search& s, const Edge& e) {
@@ -686,6 +698,10 @@ void search_play(Search* s, int action) {
     s->root = new_node(*s, next);
 }
 
+// Ends an engine's search of `s` under way, and any started while it's set, at once (the batches in
+// flight finished); safe from any thread. 0 lets searches run again.
+void search_halt(Search* s, int halted) { s->halted.on.store(halted != 0); }
+
 // (me, opp, passed, terminated) of the root
 void search_position(const Search* s, uint64_t* me, uint64_t* opp, int* passed, int* terminated) {
     const Position& p = s->nodes[s->root].position;
@@ -823,7 +839,8 @@ Engine* engine_new_net(const net::Net* n, int threads, int batch) {
 void engine_free(Engine* engine) { delete engine; }
 
 // Searches `s`'s tree with all the engine's workers: `visits` visits, or with none, until `seconds`
-// pass. Batches in flight then are finished. Returns the leaves evaluated.
+// pass, or either way until halted (`search_halt`). Batches in flight then are finished. Returns the
+// leaves evaluated.
 long engine_search(Engine* engine, Search* s, int visits, double seconds) {
     using clock = std::chrono::steady_clock;
     auto start = clock::now();
@@ -842,7 +859,8 @@ long engine_search(Engine* engine, Search* s, int visits, double seconds) {
         double inferring = 0;
         std::unique_lock<std::mutex> held(lock);
         while (true) {
-            if (stop || s->remaining <= 0 || (timed && clock::now() >= deadline)) {
+            if (stop || s->remaining <= 0 || s->halted.on.load(std::memory_order_relaxed) ||
+                (timed && clock::now() >= deadline)) {
                 stop = true;
                 applied.notify_all();
                 break;
