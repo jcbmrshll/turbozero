@@ -1,7 +1,8 @@
-"""MCTS: each step of a search (root update, traversal, expansion, backpropagation, eviction,
-action choice, tree reuse) called on small hand-built trees of a fixed-length environment, and a
-few whole searches on tic-tac-toe for what only a search shows: tactics, and its bookkeeping over
-many iterations, in a tree with room to spare and in one too small for it."""
+"""MCTS: each step of a search (root update, traversal, expansion,
+backpropagation, eviction, action choice, tree reuse) run on small hand-built
+trees of a fixed-length environment, and a few whole searches on tic-tac-toe for
+what only a search shows: tactics, and its bookkeeping over many iterations, in
+a tree with room to spare and in one too small for it."""
 
 import jax
 import jax.numpy as jnp
@@ -92,9 +93,10 @@ def make_mcts(
 
 
 def build_tree(search, env, nodes):
-    """A tree of `search` holding `env`'s positions: `nodes` are (parent, action, n, q) for each node
-    in the order they're added, the root's (None, None, n, q). Each node holds the position its moves
-    lead to, and a uniform policy over its legal moves."""
+    """Builds a tree of `search` holding `env`'s positions: `nodes` are (parent,
+    action, n, q) for each node in the order they're added, the root's (None, None,
+    n, q). Each node holds the position its moves lead to, and a uniform policy over
+    its legal moves."""
     root_state, root_meta = env.init_fn(jax.random.PRNGKey(0))
     tree = search.init(template_embedding=root_state)
     states = []
@@ -165,10 +167,11 @@ def assert_trees_equal(a, b):
 # the root
 
 
-def evaluate_root(search, tree, state, meta):
-    """The root's update `evaluate` makes: `leaf_eval_fn`'s evaluation of `state`, at the root."""
-    policy_logits, value = search.leaf_eval_fn(state, None, jax.random.PRNGKey(0))
-    return search.expand_root(tree, state, meta, policy_logits, value)
+def evaluate_root(search, env, tree, state, meta):
+    """Runs the search's root cycle (cycle 0) on `tree`, for `state`."""
+    return search.search_cycle(
+        jax.random.PRNGKey(0), tree, jnp.array(0), state, meta, None, env.step_fn
+    )
 
 
 def test_the_root_update_evaluates_an_empty_root_with_a_masked_prior(fixed_length_env):
@@ -177,7 +180,7 @@ def test_the_root_update_evaluates_an_empty_root_with_a_masked_prior(fixed_lengt
     state, meta = env.init_fn(jax.random.PRNGKey(0))
     tree = search.init(template_embedding=state)
 
-    tree = evaluate_root(search, tree, state, meta)
+    tree = evaluate_root(search, env, tree, state, meta)
 
     node = root(tree)
     np.testing.assert_allclose(
@@ -192,7 +195,7 @@ def test_the_root_update_keeps_a_reused_roots_visits_and_value(env):
     tree = build_tree(search, env, [(None, None, 5, -0.2), (0, 1, 4, 0.1)])
     state, meta = env.init_fn(jax.random.PRNGKey(0))
 
-    tree = evaluate_root(search, tree, state, meta)
+    tree = evaluate_root(search, env, tree, state, meta)
 
     node = root(tree)
     assert int(node.n) == 5 and float(node.q) == pytest.approx(-0.2)
@@ -211,7 +214,7 @@ def test_the_roots_prior_takes_the_noise_its_search_drew(fixed_length_env):
     started = search.start_search(jax.random.PRNGKey(1), tree)
     kept = search.start_search(jax.random.PRNGKey(2), started, active=False)
     other = search.start_search(jax.random.PRNGKey(2), tree)
-    updated = evaluate_root(search, kept, state, meta)
+    updated = evaluate_root(search, env, kept, state, meta)
 
     # a search that doesn't start keeps its noise, and another key draws another
     np.testing.assert_array_equal(kept.root_noise, started.root_noise)
@@ -274,7 +277,7 @@ def test_moves_are_sampled_by_their_visits_to_the_power_of_one_over_the_temperat
     np.testing.assert_allclose(
         frequencies, np.array(expected) / sum(expected), atol=0.03
     )
-    # the policy target is the visits, without the temperature
+    # the policy weights are the visits, without the temperature
     np.testing.assert_allclose(weights[0], np.array([3, 0, 5, 5]) / 13, rtol=1e-6)
 
 
@@ -323,21 +326,14 @@ def test_traversal_stops_at_a_terminal_child(fixed_length_env):
     assert [int(parent), int(action)] == [1, 0]
 
 
-def iteration(search, env):
-    """An iteration of `search` on `env`'s trees, as `evaluate` makes it, with no params."""
-
-    def run(key, tree):
-        traverse_key, eval_key, key = jax.random.split(key, 3)
-        leaf = search.find_leaf(traverse_key, tree, env.step_fn)
-        policy_logits, value = search.leaf_eval_fn(leaf[2], None, eval_key)
-        return search.expand(tree, leaf, policy_logits, value)
-
-    return run
-
-
 def iterate(search, env):
-    """`iteration`, compiled."""
-    return jax.jit(iteration(search, env))
+    """Runs one iteration of `search` (its cycle 1) on a tree of `env`, compiled."""
+    root_state, root_meta = env.init_fn(jax.random.PRNGKey(0))
+    return jax.jit(
+        lambda key, tree: search.search_cycle(
+            key, tree, jnp.array(1), root_state, root_meta, None, env.step_fn
+        )
+    )
 
 
 def test_an_iteration_expands_a_leaf_and_backs_its_value_up(fixed_length_env):
@@ -360,6 +356,20 @@ def test_an_iteration_expands_a_leaf_and_backs_its_value_up(fixed_length_env):
     assert float(root(tree).q) == pytest.approx((0.5 - 0.3) / 2)
 
 
+def test_an_iteration_values_a_new_terminal_leaf_by_its_outcome(fixed_length_env):
+    # the root's child along action 0 ends the game, won by player 0: it's worth -1
+    # to player 1, who would be to move there, whatever the evaluation says
+    env = fixed_length_env(length=1, num_actions=3)
+    search = make_mcts(value=0.3, selector=FirstAction())
+    tree = build_tree(search, env, [(None, None, 1, 0.0)])
+
+    tree = iterate(search, env)(jax.random.PRNGKey(0), tree)
+
+    assert bool(tree.data_at(1).terminated)
+    assert int(tree.data_at(1).n) == 1 and float(tree.data_at(1).q) == pytest.approx(-1)
+    assert float(root(tree).q) == pytest.approx(0.5)
+
+
 def test_an_iteration_revisits_a_terminal_child_with_its_outcome(fixed_length_env):
     # the root's child along action 0 ends the game, won by player 0: it's worth -1 to player 1,
     # who would be to move there
@@ -379,8 +389,9 @@ def test_an_iteration_in_a_full_tree_takes_an_evicted_leafs_place(env):
     search = make_mcts(max_nodes=6, selector=FirstAction())
     tree = build_tree(search, env, FULL)
 
-    # it reaches leaf 3 (along action 0 from the root, then from 1), and expands it in place of
-    # leaf 5 (see test_a_new_leaf_in_a_full_tree_evicts)
+    # it reaches leaf 3 (along action 0 from the root, then from 1) and expands it
+    # in place of leaf 5: the least visited leaf below the root's children, other
+    # than 3 itself, the node the new leaf goes under
     tree = iterate(search, env)(jax.random.PRNGKey(0), tree)
 
     assert int(tree.edge_map[3, 0]) == 5 and int(tree.parents[5]) == 3
@@ -404,8 +415,6 @@ def test_an_iteration_in_a_full_tree_with_nothing_to_evict_changes_nothing(env):
         # the least-visited leaf below the root's children: of 3 and 5, the one whose parent has
         # fewer visits
         (FULL, 3, 1, 2, 3),
-        # never the node the new leaf goes under
-        (FULL, 3, 3, 0, 5),
         # a child of the root only when every leaf is one: the least visited
         (
             [(None, None, 7, 0.0), (0, 0, 3, 0.0), (0, 1, 1, 0.0), (0, 2, 2, 0.0)],
@@ -437,7 +446,9 @@ def test_a_new_leaf_in_a_full_tree_evicts(
         # the value each node gets, from node 2 up to the root
         # two players: the sign flips at each level up
         (-1.0, [-0.8, 0.8, -0.8]),
-        # one player: discounted once more at each level up
+        # one player: the same value at every level
+        (1.0, [0.8, 0.8, 0.8]),
+        # one player, discounted: once more at each level up
         (0.5, [0.4, 0.2, 0.1]),
     ],
 )
@@ -452,9 +463,8 @@ def test_backpropagation_visits_every_node_up_to_the_root(env, discount, values)
     # the value 0.8 of a new leaf under node 2
     backed_up = search.expand(tree, leaf, jnp.zeros(3), 0.8)
 
-    assert int(backed_up.data.n[3]) == 1 and float(
-        backed_up.data.q[3]
-    ) == pytest.approx(0.8)
+    new = backed_up.data_at(3)
+    assert int(new.n) == 1 and float(new.q) == pytest.approx(0.8)
     np.testing.assert_array_equal(backed_up.data.n[:3], [4, 3, 2])
     old_q, old_n = np.array([0.3, 0.2, 0.1]), np.array([3, 2, 1])
     np.testing.assert_allclose(
@@ -563,8 +573,6 @@ def test_evaluate_gives_every_consumer_an_independent_key(env):
         assert not children & set(keys)
 
 
-# iterations must be exact: the same whether trees are batched, and whatever their capacity
-
 # trees of different depths
 SHAPES = [
     [(None, None, 1, 0.0)],
@@ -579,46 +587,35 @@ SHAPES = [
 ]
 
 
-def iterations(search, env, num):
-    """`num` iterations of `search`, one after another."""
+def search_cycles(search, env, cycles):
+    """Runs `start_search` and then `search`'s cycles `cycles` on a tree of
+    `env`, with key `key`, in a scan (unrolled, XLA could compile each cycle
+    differently and round differently)."""
+    root_state, root_meta = env.init_fn(jax.random.PRNGKey(0))
 
     def run(key, tree):
-        run = iteration(search, env)
-        return jax.lax.scan(
-            lambda t, k: (run(k, t), None), tree, jax.random.split(key, num)
-        )[0]
+        def cycle(tree, c):
+            tree = search.search_cycle(
+                key, tree, c, root_state, root_meta, None, env.step_fn
+            )
+            return tree, None
+
+        tree = search.start_search(key, tree)
+        return jax.lax.scan(cycle, tree, jnp.asarray(cycles, dtype=jnp.int32))[0]
 
     return run
 
 
-def test_batched_iterations_match_iterating_each_tree_alone(env):
-    # under vmap, traversals loop until the deepest in the batch is done, and the trees with
-    # shallower ones must come out exactly as if iterated alone
-    search = make_mcts(max_nodes=16, leaf_eval_fn=varying_eval_fn)
-    trees = [build_tree(search, env, nodes) for nodes in SHAPES]
-    keys = jax.random.split(jax.random.PRNGKey(0), len(trees))
-    run = iterations(search, env, 4)
-
-    batched = jax.jit(jax.vmap(run))(
-        keys, jax.tree.map(lambda *x: jnp.stack(x), *trees)
-    )
-
-    alone = jax.jit(run)
-    for i, tree in enumerate(trees):
-        assert_trees_equal(
-            jax.tree.map(lambda x, i=i: x[i], batched), alone(keys[i], tree)
-        )
-
-
 def test_iterations_do_not_depend_on_the_trees_capacity(env):
-    # with room to spare, a larger tree changes nothing: arrays of the tree's capacity (e.g. the path
-    # to the root) mustn't change the results, e.g. by XLA fusing the arithmetic differently
+    # with room to spare, a larger tree changes nothing: arrays of the tree's
+    # capacity (e.g. the path to the root) mustn't change the results, e.g. by XLA
+    # fusing the arithmetic differently
     small, large = (
         make_mcts(max_nodes=m, leaf_eval_fn=varying_eval_fn) for m in (24, 40)
     )
 
     def search_step_search(search):
-        run = iterations(search, env, 6)
+        run = search_cycles(search, env, jnp.arange(1, 7))
 
         @jax.jit
         def go(key, tree):
@@ -641,25 +638,6 @@ def test_iterations_do_not_depend_on_the_trees_capacity(env):
 
 
 # a search a cycle at a time, as self-play runs it
-
-
-def search_cycles(search, env, cycles):
-    """`search`'s cycles `cycles`, one after another, of the search for a move with key `key` of
-    the position in the tree's root, after its `start_search`. In a loop: unrolled, XLA could compile each cycle for its
-    number, and round differently."""
-    root_state, root_meta = env.init_fn(jax.random.PRNGKey(0))
-
-    def run(key, tree):
-        def cycle(tree, c):
-            tree = search.search_cycle(
-                key, tree, c, root_state, root_meta, None, env.step_fn
-            )
-            return tree, None
-
-        tree = search.start_search(key, tree)
-        return jax.lax.scan(cycle, tree, jnp.asarray(cycles, dtype=jnp.int32))[0]
-
-    return run
 
 
 @pytest.mark.parametrize("reused", [False, True], ids=["empty", "reused"])
@@ -710,11 +688,13 @@ def test_a_search_past_its_iterations_goes_on_iterating(env):
 
 
 def test_batched_cycles_match_each_trees_cycle_alone(env):
-    # under vmap the root's evaluation and the iteration are both computed, and each tree must
-    # take only its own; past its iterations, a search goes on
+    # under vmap the root's evaluation and the iteration are both computed, and each
+    # tree must take only its own; traversals loop until the deepest in the batch is
+    # done, and the shallower ones must come out as if alone; past its iterations, a
+    # search goes on
     search = make_mcts(max_nodes=8, leaf_eval_fn=state_eval_fn, num_iterations=4)
-    trees = [build_tree(search, env, nodes) for nodes in SHAPES]
-    cycles = jnp.array([0, 1, 6])
+    trees = [build_tree(search, env, nodes) for nodes in [*SHAPES, SHAPES[0]]]
+    cycles = jnp.array([0, 1, 6, 2])
     keys = jax.random.split(jax.random.PRNGKey(0), len(trees))
     root_state, root_meta = env.init_fn(jax.random.PRNGKey(0))
 
@@ -735,10 +715,13 @@ def test_batched_cycles_match_each_trees_cycle_alone(env):
         )
 
 
-def test_search_cycles_write_the_trees_in_place(env):
-    # a copy of an array of the trees' nodes in a cycle makes each cycle's cost grow with the
-    # trees' capacity: e.g. where the root's update reads what the iteration writes (or the other
-    # way round) and XLA doesn't order the reads first, it copies the arrays to read from
+def test_search_cycles_write_trees_in_place_and_loop_only_to_traverse(env):
+    # a copy of an array of the trees' nodes in a cycle makes each cycle's cost grow
+    # with the trees' capacity: e.g. where the root's update reads what the iteration
+    # writes (or the other way round) and XLA doesn't order the reads first, it
+    # copies the arrays to read from. And on GPU each trip of a loop whose trip count
+    # XLA doesn't know waits on the host: the traversal's is the only one (the root's
+    # noise is drawn once, before the cycles)
     batch, capacity = 5, 24
     search = make_mcts(
         NoisyMCTS, max_nodes=capacity, leaf_eval_fn=state_eval_fn, num_iterations=6
@@ -753,22 +736,6 @@ def test_search_cycles_write_the_trees_in_place(env):
 
     assert hlo is not None
     assert copies_in_loop(hlo, f"{batch},{capacity}") == []
-
-
-def test_a_search_cycle_loops_only_to_traverse(env):
-    # the root's noise is drawn once, before the cycles
-    search = make_mcts(
-        NoisyMCTS, max_nodes=24, leaf_eval_fn=state_eval_fn, num_iterations=6
-    )
-    trees = jax.vmap(lambda _: search.init(template_embedding=env.init_fn(None)[0]))(
-        jnp.arange(5)
-    )
-    run = jax.vmap(search_cycles(search, env, jnp.arange(search.search_cycles())))
-    keys = jax.random.split(jax.random.PRNGKey(0), 5)
-
-    hlo = jax.jit(run).lower(keys, trees).compile().as_text()
-
-    assert hlo is not None
     assert open_loops_in_loop(hlo) == 1
 
 
@@ -798,7 +765,7 @@ def test_a_search_and_the_next_one_from_its_subtree(make_search, ttt):
     # every iteration is counted at the root, and in its children
     assert root(tree).n == 1 + k == 1 + root_child_visits(tree).sum()
     assert_consistent(tree)
-    # the policy target is over the legal moves, and so is the move played
+    # the policy weights are over the legal moves, and so is the move played
     np.testing.assert_allclose(out.policy_weights.sum(), 1.0, rtol=1e-6)
     np.testing.assert_array_equal(out.policy_weights[~meta.action_mask], 0.0)
     assert meta.action_mask[out.action]
@@ -848,7 +815,7 @@ def test_searches_in_a_tree_too_small_for_them(make_search, ttt):
 
     tree = out.eval_state
     assert tree.next_free_idx == tree.capacity
-    # every iteration lands on a node, and is counted in the policy target
+    # every iteration lands on a node, and is counted in the policy weights
     assert root(tree).n == 1 + k
     assert root_child_visits(tree).sum() == k
     assert jnp.isfinite(tree.data.q).all()
