@@ -3,7 +3,6 @@ action choice, tree reuse) called on small hand-built trees of a fixed-length en
 few whole searches on tic-tac-toe for what only a search shows: tactics, and its bookkeeping over
 many iterations, in a tree with room to spare and in one too small for it."""
 
-from dataclasses import replace
 
 import jax
 import jax.numpy as jnp
@@ -13,6 +12,7 @@ from conftest import copies_in_loop, open_loops_in_loop
 
 from turbozero.evaluators.mcts.action_selection import MCTSActionSelector, PUCTSelector
 from turbozero.evaluators.mcts.mcts import MCTS
+from turbozero.evaluators.mcts.state import MCTSNode
 
 NULL = -1
 
@@ -105,14 +105,12 @@ def build_tree(search, env, nodes):
         else:
             state, meta = env.step_fn(states[parent], action)
         states.append(state)
-        node = replace(
-            search.new_node(
-                policy=meta.action_mask / meta.action_mask.sum(),
-                value=q,
-                embedding=state,
-                terminated=meta.terminated,
-            ),
+        node = MCTSNode(
             n=jnp.array(n, dtype=jnp.int32),
+            p=meta.action_mask / meta.action_mask.sum(),
+            q=jnp.array(q, dtype=jnp.float32),
+            terminated=meta.terminated,
+            embedding=state,
         )
         tree = (
             tree.set_root(node)
@@ -171,9 +169,7 @@ def assert_trees_equal(a, b):
 def update_root(search, tree, state, meta):
     """The root's update `evaluate` makes: the network's evaluation of `state`, at the root."""
     policy_logits, value = search.leaf_eval_fn(state, None, jax.random.PRNGKey(0))
-    return search.expand_root(
-        jax.random.PRNGKey(0), tree, state, meta, policy_logits, value
-    )
+    return search.expand_root(tree, state, meta, policy_logits, value)
 
 
 def test_the_root_update_evaluates_an_empty_root_with_a_masked_prior(fixed_length_env):
@@ -233,6 +229,12 @@ def test_the_roots_prior_takes_the_noise_its_search_drew(fixed_length_env):
 # choosing the move to play
 
 
+def sample(search, key, tree):
+    """The move `search` plays from `tree`'s root with key `key`, and its policy weights."""
+    out = search.search_output(key, tree, None, None, None, None)
+    return out.action, out.policy_weights
+
+
 def root_with_child_visits(search, env, visits):
     """A tree whose root has a child along action i visited `visits[i]` times (none for 0)."""
     return build_tree(
@@ -249,9 +251,7 @@ def test_temperature_zero_plays_a_most_visited_move(fixed_length_env):
     tree = root_with_child_visits(search, env, [3, 0, 5, 5])
     keys = jax.random.split(jax.random.PRNGKey(0), 64)
 
-    actions, weights = jax.vmap(search.sample_root_action, in_axes=(0, None))(
-        keys, tree
-    )
+    actions, weights = jax.vmap(lambda k: sample(search, k, tree))(keys)
 
     # ties are broken at random
     assert set(np.asarray(actions).tolist()) == {2, 3}
@@ -269,9 +269,7 @@ def test_moves_are_sampled_by_their_visits_to_the_power_of_one_over_the_temperat
     tree = root_with_child_visits(search, env, [3, 0, 5, 5])
     keys = jax.random.split(jax.random.PRNGKey(0), 4000)
 
-    actions, weights = jax.jit(jax.vmap(search.sample_root_action, in_axes=(0, None)))(
-        keys, tree
-    )
+    actions, weights = jax.jit(jax.vmap(lambda k: sample(search, k, tree)))(keys)
 
     frequencies = np.bincount(np.asarray(actions), minlength=4) / len(keys)
     np.testing.assert_allclose(
@@ -286,7 +284,7 @@ def test_a_root_without_visited_children_has_a_uniform_policy(fixed_length_env):
     search = make_mcts(num_actions=4)
     tree = root_with_child_visits(search, env, [0, 0, 0, 0])
 
-    _, weights = search.sample_root_action(jax.random.PRNGKey(0), tree)
+    _, weights = sample(search, jax.random.PRNGKey(0), tree)
 
     np.testing.assert_allclose(weights, 0.25)
 
@@ -333,7 +331,7 @@ def iteration(search, env):
         traverse_key, eval_key, key = jax.random.split(key, 3)
         leaf = search.find_leaf(traverse_key, tree, env.step_fn)
         policy_logits, value = search.leaf_eval_fn(leaf[2], None, eval_key)
-        return search.expand(key, tree, leaf, policy_logits, value)
+        return search.expand(tree, leaf, policy_logits, value)
 
     return run
 
@@ -427,9 +425,7 @@ def test_a_new_leaf_in_a_full_tree_evicts(
     tree = build_tree(search, env, nodes)
     leaf = (parent, action, *env.step_fn(tree.data_at(parent).embedding, action))
 
-    expanded = search.expand(
-        jax.random.PRNGKey(0), tree, leaf, jnp.zeros(num_actions), 0.0
-    )
+    expanded = search.expand(tree, leaf, jnp.zeros(num_actions), 0.0)
 
     assert int(expanded.edge_map[parent, action]) == evicted
     assert int(expanded.parents[evicted]) == parent
@@ -455,7 +451,7 @@ def test_backpropagation_visits_every_node_up_to_the_root(env, discount, values)
     leaf = (2, 0, *env.step_fn(tree.data_at(2).embedding, 0))
 
     # the value 0.8 of a new leaf under node 2
-    backed_up = search.expand(jax.random.PRNGKey(0), tree, leaf, jnp.zeros(3), 0.8)
+    backed_up = search.expand(tree, leaf, jnp.zeros(3), 0.8)
 
     assert int(backed_up.data.n[3]) == 1 and float(
         backed_up.data.q[3]
@@ -498,8 +494,7 @@ class RecordingSelector(PUCTSelector):
 
 
 class KeyRecordingMCTS(MCTS):
-    """MCTS whose network evaluations, selections and action sampling record the key each one
-    receives."""
+    """MCTS whose network evaluations and selections record the key each one receives."""
 
     def __init__(self, **kwargs):
         def leaf_eval_fn(state, params, key):
@@ -516,10 +511,6 @@ class KeyRecordingMCTS(MCTS):
     def record(self, name, key):
         jax.debug.callback(lambda k: self.recorded.append((name, np.asarray(k))), key)
 
-    def sample_root_action(self, key, tree):
-        self.record("sample_root_action", key)
-        return super().sample_root_action(key, tree)
-
 
 def test_evaluate_gives_every_consumer_an_independent_key(env):
     search = KeyRecordingMCTS(branching_factor=3, max_nodes=8, num_iterations=4)
@@ -532,15 +523,16 @@ def test_evaluate_gives_every_consumer_an_independent_key(env):
 
     names = [name for name, _ in search.recorded]
     assert names.count("leaf_eval_fn") == 1 + search.num_iterations
-    assert names.count("sample_root_action") == 1
     # a selection at the root and one more for each level down
     assert names.count("select") >= search.num_iterations
-    keys = [tuple(k.tolist()) for _, k in search.recorded]
+    # and the move is sampled with the third key of the move's
+    recorded = [*search.recorded, ("sample", jax.random.split(key, 3)[2])]
+    keys = [tuple(np.asarray(k).tolist()) for _, k in recorded]
     assert tuple(np.asarray(key).tolist()) not in keys
     assert len(set(keys)) == len(keys)
     # no consumer's key is a split of another consumer's key
     # (the search used to split the action-sampling key into the iteration keys)
-    for _, k in search.recorded:
+    for _, k in recorded:
         children = {
             tuple(c.tolist())
             for n in range(2, search.num_iterations + 1)
