@@ -75,28 +75,17 @@ class Evaluator:
         """
         return 1
 
-    def search_done(self, state: Any, cycles: jax.Array) -> jax.Array:  # pylint: disable=unused-argument
-        """Whether the search in `state`, which has run `cycles` cycles, is done.
-
-        Args:
-            state: The internal state of the Evaluator.
-            cycles: the cycles the search has run so far
-
-        Returns:
-            jax.Array: whether to stop searching and play a move
+    def search_done(self, state: Any, cycles: jax.Array) -> jax.Array:
+        """Returns whether the search in `state` is done after `cycles` cycles,
+        so self-play can play its move: after `search_cycles()`, unless the
+        evaluator's searches vary in length.
         """
-        return jnp.array(True)
+        return cycles >= self.search_cycles()
 
-    def trains_on(self, state: Any) -> jax.Array:  # pylint: disable=unused-argument
-        """Whether the search in `state` makes a training position (self-play stores its
-        position in the replay buffer): always, unless an evaluator says otherwise (e.g. MCTS's
-        fast searches, see `PlayoutCap`).
-
-        Args:
-            state: The internal state of the Evaluator, during or after a search.
-
-        Returns:
-            jax.Array: whether to store the position searched
+    def trains_on(self, state: Any) -> jax.Array:
+        """Returns whether self-play trains on the position searched in `state`
+        (stores it in the replay buffer): always, unless the evaluator says
+        otherwise (e.g. MCTS's fast searches).
         """
         return jnp.array(True)
 
