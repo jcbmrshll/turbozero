@@ -1,9 +1,11 @@
 """Modal jobs, with a directory as the bucket and a stand-in for train.py that writes what it
 writes (checkpoints, states, a real seaglass run), so a job's whole trip runs in seconds."""
 
+import dataclasses
 import json
 import socket
 import textwrap
+import threading
 from pathlib import Path
 
 import pytest
@@ -449,6 +451,44 @@ def test_a_bucket_outage_doesnt_stop_training(scene):
     assert runner.run() == "done"
     assert Flaky.failures == 0
     assert modal_store.get_json(scene.store, modal_spec.job_key("o", "manifest.json"))
+
+
+def test_a_heartbeat_in_flight_at_the_end_doesnt_undo_the_final_status(scene):
+    """A slow bucket holds the mirror thread's heartbeat until the job's final status is written
+    (or a quarter second): written after it, its "running" would be the job's last word."""
+    scene.job(step("t", "--epochs 2"), name="h")
+
+    class Slow(modal_store.DirStore):
+        # held while a heartbeat of the mirror thread's is written
+        writing = threading.Lock()
+        in_flight = threading.Event()
+        final = threading.Event()
+
+        def put_bytes(self, key, data):
+            if not key.endswith("status.json"):
+                return super().put_bytes(key, data)
+            if threading.current_thread() is not threading.main_thread():
+                with Slow.writing:
+                    Slow.in_flight.set()
+                    Slow.final.wait(0.25)
+                    super().put_bytes(key, data)
+                    Slow.in_flight.clear()
+            elif json.loads(data)["state"] == "running":
+                super().put_bytes(key, data)
+            else:
+                Slow.in_flight.wait(0.25)
+                super().put_bytes(key, data)
+                Slow.final.set()
+
+    # ticking often enough that one is under way however soon the step ends
+    place = dataclasses.replace(scene.place(), mirror_seconds=0.01)
+    runner = modal_run.Runner(Slow(scene.store.root), "h", place, dict)
+    assert runner.run() == "done"
+    with Slow.writing:  # what was still being written has landed
+        status = modal_store.get_json(
+            scene.store, modal_spec.job_key("h", "status.json")
+        )
+    assert status["state"] == "done"
 
 
 # --- sync

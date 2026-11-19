@@ -356,10 +356,21 @@ def fake_eval(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 @pytest.mark.parametrize("exact", [True, False])
-def test_a_net_player_plays_its_endgame_solved(exact):
+def test_a_net_player_plays_its_endgame_solved(exact, monkeypatch):
     from clock_match import play_game
     from cpu_match import NetPlayer, Solving
     from cpu_search import SearchSettings
+
+    # a fake clock on which each batch evaluated takes a millisecond: the same game on any
+    # machine (only the solve runs on real time). On the wall clock a loaded machine searched
+    # less, played other moves and could reach the endgame lost, where a solve for a win, a draw
+    # or a loss finds the loss and the move is searched: nothing solved
+    now = [0.0]
+    monkeypatch.setattr(time, "perf_counter", lambda: now[0])
+
+    def evaluate(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        now[0] += 1e-3
+        return fake_eval(x)
 
     n = 14
     opening = load_xot(XOT_PATH)[3]
@@ -368,7 +379,7 @@ def test_a_net_player_plays_its_endgame_solved(exact):
     # short would leave the solve too little time to finish
     black = NetPlayer(
         SearchSettings(batch=2),
-        fake_eval,
+        evaluate,
         # and keeping no more than a tenth of a second for it: the default 4 s would swallow
         # the 1 s clock
         solving=Solving(
@@ -379,7 +390,7 @@ def test_a_net_player_plays_its_endgame_solved(exact):
             reserve=0.1,
         ),
     )
-    white = NetPlayer(SearchSettings(batch=2), fake_eval, seed=1)
+    white = NetPlayer(SearchSettings(batch=2), evaluate, seed=1)
     game = play_game(black, white, opening, 1.0)
     assert game.flagged is None
     assert black.solved > 0 and black.gave_up == 0
