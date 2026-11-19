@@ -1,4 +1,4 @@
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 import jax
@@ -9,6 +9,31 @@ from turbozero.evaluators.evaluator import EvalOutput, Evaluator
 from turbozero.evaluators.mcts.action_selection import MCTSActionSelector
 from turbozero.evaluators.mcts.state import MCTSNode, MCTSTree, init_mcts_tree
 from turbozero.types import EnvStepFn, LeafEvalFn, StepMetadata
+
+
+@dataclass(frozen=True)
+class PlayoutCap:
+    """Playout cap randomization (KataGo, https://arxiv.org/abs/1902.10565, section 3.1): each
+    move's search is a full one, with probability `full_probability`, or else a fast one of
+    `fast_iterations` iterations. Only full searches make training positions (see
+    `MCTS.trains_on`); fast ones play their move without the root's noise (e.g.
+    AlphaZero's Dirichlet noise), for strength. More moves for the same compute means more games,
+    each with one outcome for the value to learn from, while the policy learns from full searches
+    only.
+
+    Attributes:
+        full_probability: the share of moves searched in full, `num_iterations` iterations
+        fast_iterations: the iterations of a fast search
+    """
+
+    full_probability: float
+    fast_iterations: int
+
+    def get_config(self) -> dict:
+        return {
+            "full_probability": self.full_probability,
+            "fast_iterations": self.fast_iterations,
+        }
 
 
 class MCTS(Evaluator):
@@ -39,6 +64,7 @@ class MCTS(Evaluator):
         persist_tree: bool = True,
         dirichlet_alpha: float = 0.3,
         dirichlet_epsilon: float = 0.0,
+        playout_cap: PlayoutCap | None = None,
     ):
         """
         Args:
@@ -61,8 +87,19 @@ class MCTS(Evaluator):
                 in Go)
             dirichlet_epsilon: the share of the root's prior that is the noise,
                 0 for none (AlphaZero: 0.25)
+            playout_cap: (optional) search each move in full (`num_iterations` iterations) only
+                some of the time, and otherwise with fewer, see `PlayoutCap`
         """
+        if playout_cap is not None and not (
+            0 < playout_cap.full_probability <= 1
+            and 0 < playout_cap.fast_iterations < num_iterations
+        ):
+            raise ValueError(
+                "a playout cap's full_probability must be in (0, 1] and its fast_iterations "
+                f"between 1 and num_iterations ({num_iterations}) - 1, got {playout_cap}"
+            )
         super().__init__(discount=discount)
+        self.playout_cap = playout_cap
         self.leaf_eval_fn = leaf_eval_fn
         self.num_iterations = num_iterations
         self.branching_factor = branching_factor
@@ -85,6 +122,9 @@ class MCTS(Evaluator):
             "persist_tree": self.persist_tree,
             "dirichlet_alpha": self.dirichlet_alpha,
             "dirichlet_epsilon": self.dirichlet_epsilon,
+            "playout_cap": self.playout_cap.get_config()
+            if self.playout_cap is not None
+            else None,
         }
 
     def evaluate(
@@ -110,14 +150,23 @@ class MCTS(Evaluator):
         policy_logits, value = self.leaf_eval_fn(env_state, params, eval_key)
         tree = self.expand_root(tree, env_state, root_metadata, policy_logits, value)
 
-        def iterate(tree: MCTSTree, key: jax.Array) -> tuple[MCTSTree, None]:
+        def iterate(tree: MCTSTree, key: jax.Array, write=True) -> MCTSTree:
             traverse_key, eval_key, _ = jax.random.split(key, 3)
             leaf = self.find_leaf(traverse_key, tree, env_step_fn)
             policy_logits, value = self.leaf_eval_fn(leaf[2], params, eval_key)
-            return self.expand(tree, leaf, policy_logits, value), None
+            return self.expand(tree, leaf, policy_logits, value, write=write)
+
+        def iteration(
+            state: MCTSTree, i_key: tuple[jax.Array, jax.Array]
+        ) -> tuple[MCTSTree, None]:
+            i, k = i_key
+            if self.playout_cap is None:
+                return iterate(state, k), None
+            # after the root's evaluation and `i` iterations, as `search_cycle` counts them
+            return iterate(state, k, write=~self.search_done(state, i + 1)), None
 
         keys = jax.random.split(iterate_key, self.num_iterations)
-        tree, _ = jax.lax.scan(iterate, tree, keys)
+        tree, _ = jax.lax.scan(iteration, tree, (jnp.arange(self.num_iterations), keys))
         return self.search_output(
             key, tree, env_state, root_metadata, params, env_step_fn
         )
@@ -127,6 +176,25 @@ class MCTS(Evaluator):
         per iteration.
         """
         return self.num_iterations + 1
+
+    def iterations(self, state: MCTSTree) -> jax.Array:
+        """The iterations of the search in `state`: `num_iterations`, or a fast search's (see
+        `PlayoutCap`)."""
+        if self.playout_cap is None:
+            return jnp.array(self.num_iterations)
+        return jnp.where(
+            state.fast, self.playout_cap.fast_iterations, self.num_iterations
+        )
+
+    def search_done(self, state: MCTSTree, cycles: jax.Array) -> jax.Array:
+        """Done after the root's evaluation and its `iterations`."""
+        iterations = self.iterations(state)
+        return cycles >= iterations + 1
+
+    def trains_on(self, state: MCTSTree) -> jax.Array:
+        """Whether the search in `state` makes a training position: unless it's a fast one
+        (see `PlayoutCap`)."""
+        return ~state.fast
 
     def start_search(
         self, key: jax.Array, state: MCTSTree, active: ArrayLike = True
@@ -140,7 +208,9 @@ class MCTS(Evaluator):
         under vmap every cycle computes the root's update, so the draw would be
         repeated every cycle. Trees where `active` is False are left unchanged.
         """
-        root_key, _, _ = jax.random.split(key, 3)
+        # the 4th key of the split: the first 3 are those `evaluate` splits off (the split's i-th
+        # key doesn't depend on how many it makes)
+        root_key, _, _, cap_key = jax.random.split(key, 4)
         _, noise_key = jax.random.split(root_key)
         shape = state.root_noise.shape
         noise = jnp.zeros(shape, dtype=jnp.float32)
@@ -153,7 +223,11 @@ class MCTS(Evaluator):
             noise = jax.random.loggamma(
                 noise_key, self.dirichlet_alpha, shape, method="approximate"
             )
-        return replace(state, root_noise=jnp.where(active, noise, state.root_noise))
+        state = replace(state, root_noise=jnp.where(active, noise, state.root_noise))
+        if self.playout_cap is None:
+            return state
+        fast = ~jax.random.bernoulli(cap_key, self.playout_cap.full_probability)
+        return replace(state, fast=jnp.where(active, fast, state.fast))
 
     def search_cycle(
         self,
@@ -264,7 +338,8 @@ class MCTS(Evaluator):
         """
         mask = root_metadata.action_mask
         lowest = jnp.finfo(policy_logits).min
-        prior = jax.nn.softmax(jnp.where(mask, policy_logits, lowest))
+        policy = jax.nn.softmax(jnp.where(mask, policy_logits, lowest))
+        prior = policy
         if self.dirichlet_epsilon:
             # the softmax of log-Gamma(alpha) draws is a Dirichlet(alpha) sample,
             # here over the legal actions only, as in AlphaZero. Both are
@@ -272,6 +347,11 @@ class MCTS(Evaluator):
             noise = jax.nn.softmax(jnp.where(mask, tree.root_noise, lowest))
             epsilon = self.dirichlet_epsilon
             prior = (1 - epsilon) * prior + epsilon * noise
+        if self.playout_cap is not None:
+            # only the full searches' roots take the noise. The barrier keeps XLA from fusing the
+            # noise's mix into the select, which it does differently in `evaluate` and in a search
+            # a cycle at a time, rounding the prior differently
+            prior = jnp.where(tree.fast, policy, jax.lax.optimization_barrier(prior))
         node = tree.data_at(tree.ROOT_INDEX)
         visited = node.n > 0
         node = replace(

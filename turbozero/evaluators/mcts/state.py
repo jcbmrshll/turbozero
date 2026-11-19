@@ -24,9 +24,14 @@ class MCTSNode:
 class MCTSTree(Tree[MCTSNode]):
     """A search tree, with the noise its root's prior takes (e.g. AlphaZero's
     Dirichlet noise), drawn once when the search starts.
+
+    Attributes:
+        fast: () with a `PlayoutCap`, whether the search is a fast one, drawn when it starts (see
+            `MCTS.start_search`); False without
     """
 
     root_noise: jax.Array  # (F,)
+    fast: jax.Array
 
 
 def init_mcts_tree(
@@ -36,4 +41,5 @@ def init_mcts_tree(
     return MCTSTree(
         **vars(init_tree(max_nodes, branching_factor, template_data)),
         root_noise=jnp.zeros((branching_factor,), dtype=jnp.float32),
+        fast=jnp.array(False),
     )

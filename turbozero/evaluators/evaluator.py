@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 from jax.typing import ArrayLike
 
 from turbozero.pytree_utils import where_tree
@@ -73,6 +74,31 @@ class Evaluator:
         this many.
         """
         return 1
+
+    def search_done(self, state: Any, cycles: jax.Array) -> jax.Array:  # pylint: disable=unused-argument
+        """Whether the search in `state`, which has run `cycles` cycles, is done.
+
+        Args:
+            state: The internal state of the Evaluator.
+            cycles: the cycles the search has run so far
+
+        Returns:
+            jax.Array: whether to stop searching and play a move
+        """
+        return jnp.array(True)
+
+    def trains_on(self, state: Any) -> jax.Array:  # pylint: disable=unused-argument
+        """Whether the search in `state` makes a training position (self-play stores its
+        position in the replay buffer): always, unless an evaluator says otherwise (e.g. MCTS's
+        fast searches, see `PlayoutCap`).
+
+        Args:
+            state: The internal state of the Evaluator, during or after a search.
+
+        Returns:
+            jax.Array: whether to store the position searched
+        """
+        return jnp.array(True)
 
     def start_search(self, key: jax.Array, state: Any, active: ArrayLike = True) -> Any:
         """Does the work a search needs only once, before its cycles (e.g.
