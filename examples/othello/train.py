@@ -11,8 +11,9 @@ openings (see xot.py), which keeps them varied.
     uv run examples/othello/train.py --sims-schedule 0:32,50:64,150:128
 
 Every epoch it scores the network on the engine-labelled set, if there is one (see
-engine_set.py and --engine-set), logged as `engine_*`: `engine_exp_regret`, the discs its
-policy gives up against Edax's best move, is the one to watch. Games measure strength:
+engine_set.py and --engine-set), logged as `engine_*`. `engine_result_change`, how likely the
+prior play's search starts from is to pick a move that worsens the result Edax predicts, is the
+one to watch: it ranks a run's checkpoints by strength. Games measure strength:
 `evaluate.py` plays checkpoints against engines and each other, and the Elo league rates them.
 
 With --monitor the run logs to slick's seaglass server ($SEAGLASS_URL, set in a slick task;
@@ -58,6 +59,7 @@ from engine_set import EngineSet
 from exact_labels import SOLVERS, default_threads, make_solve_fn, solve_slots, stops_at
 from game import (
     DEFAULT_NET,
+    PLAY_PRIOR_TEMPERATURE,
     SGD_WEIGHT_DECAY,
     SYMMETRY_TRANSFORM_FNS,
     TRAVERSAL_STEPS,
@@ -1157,6 +1159,7 @@ def main():
                         "path": str(args.engine_set or DEFAULT_ENGINE_SET),
                         **engine_set.describe(),
                     },
+                    prior_temperature=PLAY_PRIOR_TEMPERATURE,
                 )
             )
         return testers
