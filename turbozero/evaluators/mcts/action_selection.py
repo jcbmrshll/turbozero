@@ -6,8 +6,8 @@ from turbozero.evaluators.mcts.state import MCTSTree
 
 
 def random_argmax(key: jax.Array, scores: jax.Array) -> jax.Array:
-    """Index of the highest score over the last axis, exact ties broken at
-    random rather than to the lowest index.
+    """Returns the index of the highest score over the last axis, breaking
+    exact ties at random rather than to the lowest index.
     """
     noise = jax.random.uniform(key, scores.shape)
     return jnp.where(scores == scores.max(axis=-1, keepdims=True), noise, -1.0).argmax(
@@ -21,7 +21,10 @@ class MCTSActionSelector:
     def __call__(
         self, key: jax.Array, tree: MCTSTree, index: ArrayLike, discount: float
     ) -> jax.Array:
-        """The action from node `index`, ties broken with `key`."""
+        """Chooses the action to traverse from node `index`, breaking ties with
+        `key`. `discount` turns the children's values, each for the player to
+        move at that child, into values for the player to move at `index`.
+        """
         raise NotImplementedError()
 
     def get_config(self) -> dict:
