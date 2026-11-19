@@ -12,7 +12,9 @@ openings (see xot.py), which keeps them varied.
 
 Every epoch it scores the network on the engine-labelled set, if there is one (see
 engine_set.py and --engine-set), logged as `engine_*`: `engine_exp_regret`, the discs its
-policy gives up against Edax's best move, is the one to watch. Games measure strength:
+policy gives up against Edax's best move, is the one to watch. `filtered_engine_*` are the same
+over only the positions the network decides, from the XOT opening to the exact solver's 20 empty
+squares. Games measure strength:
 `evaluate.py` plays checkpoints against engines and each other, and the Elo league rates them.
 
 With --monitor the run logs to slick's seaglass server ($SEAGLASS_URL, set in a slick task;
@@ -1145,21 +1147,24 @@ def main():
     )
 
     def make_testers(network) -> list[BaseTester]:
-        """A network's testers: the engine-labelled set."""
-        testers: list[BaseTester] = []
-        if engine_set is not None:
-            testers.append(
-                ScoredPositionsTester(
-                    engine_set.scored_positions(),
-                    network,
-                    epochs_per_test=args.engine_eval_every,
-                    config={
-                        "path": str(args.engine_set or DEFAULT_ENGINE_SET),
-                        **engine_set.describe(),
-                    },
-                )
+        """A network's testers: the engine-labelled set, all of its positions as engine_*, and
+        those between the opening and the solver as filtered_engine_*."""
+        if engine_set is None:
+            return []
+        config = {
+            "path": str(args.engine_set or DEFAULT_ENGINE_SET),
+            **engine_set.describe(),
+        }
+        return [
+            ScoredPositionsTester(
+                engine_set.scored_positions(filtered=filtered),
+                network,
+                epochs_per_test=args.engine_eval_every,
+                name=name,
+                config=config,
             )
-        return testers
+            for name, filtered in (("engine", False), ("filtered_engine", True))
+        ]
 
     network, network_state = make_net(args.net)
     evaluator = make_selfplay(network)

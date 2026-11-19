@@ -895,6 +895,11 @@ game phase (`opening`, 40-51 empty squares; `midgame`, 25-39; `endgame`, 1-24):
   draw)
 - `engine_value_sign`: how often its value calls the winner Edax does
 
+It logs the same metrics as `filtered_engine_*` over only the positions the network decides:
+from the XOT opening's to the exact solver's, which plays and labels positions with 20 empty
+squares or fewer. They leave out positions whose moves the solver makes in play, and are
+reported for all of them and in halves (`opening`, 36-51 empty squares; `midgame`, 21-35).
+
 Scoring takes a forward pass over the positions, about 20 ms for 5000 on the GPU.
 `--engine-set PATH` scores on another set, and `--engine-eval-every N` sets the cadence (0
 for never). Without a set at the default path, `~/.cache/turbozero/othello/engine-sets/edax-l24.npz`,

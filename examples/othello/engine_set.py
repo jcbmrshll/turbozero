@@ -1,7 +1,9 @@
 """Othello positions with every legal move scored by Edax: a fixed set to measure networks
 against a far stronger player (see `label_positions.py` to build one, `score_engine_set.py` to
 score checkpoints on one, and train.py's --engine-set, which scores the network on one as it
-trains, with `core.testing.scored_positions.ScoredPositionsTester`).
+trains, with `core.testing.scored_positions.ScoredPositionsTester`). Networks are measured on
+every position, by game phase (`PHASES`), and on the positions they decide, between the XOT
+opening and the exact solver, logged as filtered_* (`FILTERED_PHASES`).
 
 A set is an .npz of numpy arrays:
 - obs: (N, 16) uint8, each position's (8, 8, 2) observation (as the network takes it: the
@@ -37,8 +39,12 @@ ILLEGAL = -999
 # positions with this many empty squares or more are XOT openings' (8 moves from the standard
 # start), which every game shares
 OPENING_EMPTIES = 52
-# the game phases metrics are reported for, by empty squares
+# the game phases metrics are reported for, by empty squares, over every position
 PHASES = {"opening": (40, 51), "midgame": (25, 39), "endgame": (1, 24)}
+# the phases the filtered metrics are reported for: the positions the network decides, from the
+# XOT opening's to the exact solver's (which plays and labels positions with 20 empty squares or
+# fewer), in halves; the filtered metrics are over these positions only
+FILTERED_PHASES = {"opening": (36, 51), "midgame": (21, 35)}
 
 
 @dataclass(frozen=True)
@@ -150,26 +156,38 @@ class EngineSet:
                 level=int(f["level"]),
             )
 
-    def groups(self, by_source: bool = False) -> dict[str, np.ndarray]:
-        """The subsets metrics are reported for: each game phase, and with `by_source` each
-        source too (where positions came from matters for checking a set, not for reading a
-        network's metrics)."""
+    def groups(
+        self, by_source: bool = False, phases: dict[str, tuple[int, int]] = PHASES
+    ) -> dict[str, np.ndarray]:
+        """The subsets metrics are reported for: each game phase of `phases`, and with
+        `by_source` each source too (where positions came from matters for checking a set, not
+        for reading a network's metrics)."""
         groups = (
             {name: self.source == i for i, name in enumerate(self.source_names)}
             if by_source
             else {}
         )
-        for name, (lo, hi) in PHASES.items():
+        for name, (lo, hi) in phases.items():
             groups[name] = (self.empties >= lo) & (self.empties <= hi)
         return groups
 
-    def scored_positions(self, by_source: bool = False) -> ScoredPositions:
-        """The positions and scores to measure networks on, with the groups of `groups`."""
+    def scored_positions(
+        self, by_source: bool = False, filtered: bool = False
+    ) -> ScoredPositions:
+        """The positions and scores to measure networks on, with the groups of `groups`: every
+        position, by `PHASES`; with `filtered`, only those of a phase of `FILTERED_PHASES`."""
+        phases = FILTERED_PHASES if filtered else PHASES
+        groups = self.groups(by_source, phases)
+        keep = (
+            np.any([groups[name] for name in phases], axis=0)
+            if filtered
+            else np.ones(len(self), bool)
+        )
         return ScoredPositions(
-            observations=self.obs,
-            legal=self.legal,
-            scores=self.scores.astype(np.float32),
-            groups=self.groups(by_source),
+            observations=self.obs[keep],
+            legal=self.legal[keep],
+            scores=self.scores[keep].astype(np.float32),
+            groups={name: group[keep] for name, group in groups.items()},
         )
 
     def describe(self) -> dict:

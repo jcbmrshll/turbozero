@@ -225,9 +225,15 @@ def test_grow_builds_a_network_to_grow_into_with_its_own_search_and_tests(
     assert grown.nn is not built.value.kwargs["nn"]
     assert grown.schedule.at(0).num_iterations == 16
     assert grown.evaluator_test is not built.value.kwargs["evaluator_test"]
-    # each network has its own engine-set tester, of its own network
-    (own,), (theirs,) = built.value.kwargs["testers"], grown.testers
-    assert own is not theirs and theirs.name == own.name == "engine"
+    # each network has its own engine-set testers, of its own network: the positions it
+    # every position, and the positions it decides
+    own, theirs = built.value.kwargs["testers"], grown.testers
+    assert (
+        [t.name for t in own]
+        == [t.name for t in theirs]
+        == ["engine", "filtered_engine"]
+    )
+    assert all(a is not b for a, b in zip(own, theirs, strict=True))
 
 
 def test_grow_lr_scales_the_grown_networks_rate(monkeypatch):

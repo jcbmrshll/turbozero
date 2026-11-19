@@ -153,6 +153,7 @@ def test_runs_headline_their_losses_and_test_outcomes(key, headline):
         ("engine_value_mse", "lower"),
         ("random_loss_rate", "lower"),
         ("engine_top1_opening", "higher"),
+        ("filtered_engine_regret_midgame", "lower"),
         ("engine_value_sign", "higher"),
         ("random_avg_outcome", "higher"),
         ("edax_level4_sims1000_win", "higher"),
