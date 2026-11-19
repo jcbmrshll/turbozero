@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 from conftest import copies_in_loop, open_loops_in_loop
 
+from turbozero.evaluators.alphazero import AlphaZero
 from turbozero.evaluators.mcts.action_selection import MCTSActionSelector, PUCTSelector
 from turbozero.evaluators.mcts.mcts import MCTS
 from turbozero.evaluators.mcts.state import MCTSNode
@@ -226,6 +227,86 @@ def test_the_roots_prior_takes_the_noise_its_search_drew(fixed_length_env):
         ),
         rtol=1e-6,
     )
+
+
+@pytest.mark.parametrize(
+    # a small alpha's Gamma draws underflow to 0 outside log space
+    "alpha",
+    [0.03, 0.3, 2.0],
+)
+def test_dirichlet_noise_is_mixed_into_the_root_prior_over_legal_moves_only(
+    fixed_length_env, alpha
+):
+    mask = np.array([True, True, False, True, False, True])
+    env = fixed_length_env(length=10, num_actions=6, action_mask=mask)
+    logits = jnp.array([2.0, -1.0, 0.5, 0.0, 3.0, -2.0])
+    epsilon = 0.25
+    search = make_mcts(
+        AlphaZero,
+        num_actions=6,
+        logits=logits,
+        dirichlet_alpha=alpha,
+        dirichlet_epsilon=epsilon,
+    )
+    state, meta = env.init_fn(jax.random.PRNGKey(0))
+    tree = search.init(template_embedding=state)
+    keys = jax.random.split(jax.random.PRNGKey(0), 1024)
+
+    priors = jax.jit(
+        jax.vmap(
+            lambda key: (
+                root(
+                    search.search_cycle(
+                        key,
+                        search.start_search(key, tree),
+                        jnp.array(0),
+                        state,
+                        meta,
+                        None,
+                        env.step_fn,
+                    )
+                ).p
+            )
+        )
+    )(keys)
+
+    np.testing.assert_allclose(priors.sum(axis=-1), 1.0, rtol=1e-5)
+    np.testing.assert_array_equal(priors[:, ~mask], 0.0)
+    # the noise differs from key to key
+    assert not np.allclose(priors[0], priors[1])
+    # what's left after taking out the network's share is the noise: a distribution
+    # over the legal moves, carrying exactly `epsilon` of the root prior
+    noise = (priors - (1 - epsilon) * masked_softmax(logits, mask)) / epsilon
+    assert (noise > -1e-5).all()
+    np.testing.assert_allclose(noise.sum(axis=-1), 1.0, rtol=1e-5)
+    np.testing.assert_allclose(noise[:, ~mask], 0.0, atol=1e-6)
+    # a symmetric Dirichlet: each legal move gets an equal share on average, spread as
+    # Dirichlet(alpha)'s, (1/k)(1 - 1/k) / (k alpha + 1) over k legal moves
+    k = mask.sum()
+    np.testing.assert_allclose(noise[:, mask].mean(axis=0), 1 / k, atol=0.06)
+    np.testing.assert_allclose(
+        noise[:, mask].var(), (1 / k) * (1 - 1 / k) / (k * alpha + 1), rtol=0.15
+    )
+
+
+def test_drawing_the_root_noise_has_no_open_loops(env):
+    # on GPU, each trip of a loop whose trip count XLA doesn't know waits on the host: self-play
+    # starts searches (and draws their noise) for every environment at every check
+    search = make_mcts(AlphaZero)
+    tree = search.init(template_embedding=env.init_fn(None)[0])
+    keys = jax.random.split(jax.random.PRNGKey(0), 5)
+
+    hlo = (
+        jax.jit(jax.vmap(lambda key: search.start_search(key, tree)))
+        .lower(keys)
+        .compile()
+        .as_text()
+    )
+
+    assert hlo is not None
+    # (the random bits' hash rounds may stay a loop, of a known trip count)
+    loops = [line for line in hlo.splitlines() if " while(" in line]
+    assert all("known_trip_count" in line for line in loops)
 
 
 # choosing the move to play
