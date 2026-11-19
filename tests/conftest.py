@@ -8,7 +8,7 @@ import re
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cache
 from types import SimpleNamespace
 from typing import Any
@@ -17,6 +17,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
+from turbozero.evaluators.evaluator import EvalOutput, Evaluator
 from turbozero.evaluators.mcts.action_selection import PUCTSelector
 from turbozero.evaluators.mcts.mcts import MCTS
 from turbozero.types import StepMetadata
@@ -252,4 +253,64 @@ def open_loops_in_loop(hlo: str) -> int:
         for body in outer_loop_bodies(hlo)
         for line in body.splitlines()
         if " while(" in line
+    )
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class ScriptedState:
+    """State of `ScriptedEvaluator`: the moves it has made, the times it has been
+    stepped and the action it was last stepped with (-1 for none), and the times
+    it has been reset."""
+
+    moves: jax.Array
+    steps: jax.Array
+    last_step: jax.Array
+    resets: jax.Array
+
+
+class ScriptedEvaluator(Evaluator):
+    """Plays the first legal action in `order` (by default, the lowest legal
+    action), without a search. Its state records how it's used (see
+    `ScriptedState`)."""
+
+    def __init__(self, order=None, discount=-1.0):
+        super().__init__(discount)
+        self.order = order
+
+    def init(self, template_embedding):
+        zero = jnp.array(0, dtype=jnp.int32)
+        return ScriptedState(moves=zero, steps=zero, last_step=zero - 1, resets=zero)
+
+    def reset(self, state):
+        return replace(self.init(None), resets=state.resets + 1)
+
+    def step(self, state, action):
+        return replace(state, steps=state.steps + 1, last_step=action.astype(jnp.int32))
+
+    def evaluate(self, key, eval_state, env_state, root_metadata, params, env_step_fn):
+        mask = root_metadata.action_mask
+        if self.order is None:
+            action = jnp.argmax(mask)
+        else:
+            order = jnp.array(self.order)
+            action = order[jnp.argmax(mask[order])]
+        return EvalOutput(
+            eval_state=replace(eval_state, moves=eval_state.moves + 1),
+            action=action,
+            policy_weights=jax.nn.one_hot(action, mask.shape[-1]),
+        )
+
+    def get_value(self, state):
+        return jnp.array(0.0)
+
+
+@pytest.fixture(scope="session")
+def scripted():
+    """Scripted evaluators (see `ScriptedEvaluator`): `first_legal`, and
+    `beats_first_legal`, which wins tic-tac-toe against it whoever moves first
+    (with the centre, then corners 2 and 6)."""
+    return SimpleNamespace(
+        first_legal=ScriptedEvaluator(),
+        beats_first_legal=ScriptedEvaluator(order=(4, 2, 6, 0, 8, 1, 3, 5, 7)),
     )
