@@ -1,13 +1,16 @@
 """Two-player games between evaluators."""
 
+from dataclasses import replace
 from functools import partial
 from types import SimpleNamespace
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
+from conftest import ScriptedEvaluator
 
-from turbozero.common import two_player_game
+from turbozero.games import two_player_game
 
 
 def play_games(env, evaluator_1, evaluator_2, max_steps, p1_first, num_games=16):
@@ -80,13 +83,45 @@ def test_two_player_game_finishing_on_exactly_max_steps_is_scored(
     np.testing.assert_array_equal(outcomes, np.tile(env.rewards, (len(outcomes), 1)))
 
 
-def test_two_player_game_hitting_the_step_limit_is_completed_as_a_draw(
+def test_two_player_game_hitting_the_step_limit_is_scored_with_its_last_rewards(
     fixed_length_env, scripted
 ):
-    env = fixed_length_env(length=5)
+    base = fixed_length_env(length=10)
+
+    def step_fn(state, action):
+        # every step pays (step, -step)
+        state, meta = base.step_fn(state, action)
+        rewards = jnp.stack([meta.step, -meta.step]).astype(jnp.float32)
+        return state, replace(meta, rewards=rewards)
+
+    env = SimpleNamespace(step_fn=step_fn, init_fn=base.init_fn)
 
     outcomes = play_games(
         env, scripted.first_legal, scripted.first_legal, 4, p1_first=True
     )
 
-    np.testing.assert_array_equal(outcomes, np.zeros_like(outcomes))
+    np.testing.assert_array_equal(outcomes, np.tile([4.0, -4.0], (len(outcomes), 1)))
+
+
+class Follower(ScriptedEvaluator):
+    """Plays the square after the last move it was stepped with (0 at first)."""
+
+    def evaluate(self, key, eval_state, env_state, root_metadata, params, env_step_fn):
+        output = super().evaluate(
+            key, eval_state, env_state, root_metadata, params, env_step_fn
+        )
+        return replace(output, action=eval_state.last_step + 1)
+
+
+@pytest.mark.parametrize("p1_first", [True, False])
+def test_both_evaluators_follow_every_move(ttt, scripted, p1_first):
+    # with first_legal, a follower that sees every move plays 0, 1, 2, ... in
+    # turn with it, so the first to move takes 2, 4 and 6 on its fourth move
+    env = SimpleNamespace(step_fn=ttt.step_fn, init_fn=lambda key: ttt.init_fn(0))
+
+    outcomes = play_games(
+        env, Follower(), scripted.first_legal, max_steps=9, p1_first=p1_first
+    )
+
+    expected = [1.0, -1.0] if p1_first else [-1.0, 1.0]
+    np.testing.assert_array_equal(outcomes, np.tile(expected, (len(outcomes), 1)))
