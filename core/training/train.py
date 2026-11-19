@@ -698,7 +698,7 @@ class Trainer:
         averages: Sequence[float] = (),
         selfplay_average: float | None = None,
         average_warmup: float = 10.0,
-        average_norm_batches: int = 0,
+        average_norm_batches: int = 32,
         log_moves: str | None = None,
         extra_config: dict | None = None,
     ):
@@ -875,7 +875,9 @@ class Trainer:
                 transformed as training's are, through the average's weights (see
                 `average_norm_states`). The network's statistics fit its own weights, not its
                 average's; with a normalization after every convolution of an Othello ConvNeXt
-                net, its 4-epoch average lost 0.3-0.5 engine regret against its weights on them.
+                net, its 4-epoch average lost 0.3-0.5 engine regret against its weights on them,
+                and with its own its engine value error varied about 8x less from epoch to epoch.
+                0 for none
                 Not part of a saved state: a resumed run estimates them from the replay buffer
             log_moves: (optional) a directory to keep every move self-play plays in, whether
                 its search trains or not, an epoch's moves to a file (see

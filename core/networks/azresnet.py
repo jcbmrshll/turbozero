@@ -33,7 +33,8 @@ class AZResnetConfig:
         bottleneck_inner: basic blocks inside each bottleneck block
         expand: the ConvNeXt blocks' hidden width, in multiples of `num_channels`
         expand_norm: the ConvNeXt blocks also normalize their hidden channels, after the expand
-            convolution, before the global pooling bias and the ReLU. With BatchNorm it folds into
+            convolution, before the global pooling bias and the ReLU. By default (None), ConvNeXt
+            blocks do. With BatchNorm it folds into
             the expand convolution in inference. The pooling bias comes after it: under the norm,
             whatever part of the bias hardly varies from input to input cost nothing in training,
             and grew to 2-6 standard deviations of the hidden channels in the ray net, which any
@@ -44,7 +45,8 @@ class AZResnetConfig:
             in inference. With `stem_norm` and `expand_norm` as well, every convolution of a
             BatchNorm ConvNeXt trunk is followed by a normalization, and the function the trunk
             computes no longer depends on the scale of any convolution's weights, which weight
-            decay shrinks (the pooling biases' linear maps still do)
+            decay shrinks (the pooling biases' linear maps still do). By default (None), ConvNeXt
+            blocks do
         dw_kernel: the ConvNeXt blocks' depthwise filters' size: every square within
             `dw_kernel // 2` rows and columns (odd)
         dw_taps: the depthwise filters' taps instead, as (row, column) offsets from the square
@@ -95,7 +97,8 @@ class AZResnetConfig:
             Not with "fixed" or "ws", which scale the convolution they follow. BatchNorm in "pre"
             doesn't fold into a convolution in inference
         stem_norm: in the "pre" layout, normalize the stem convolution's output too (no ReLU: the
-            trunk starts from it). The "post" layout always does, with a ReLU
+            trunk starts from it). The "post" layout always does, with a ReLU. By default (None),
+            a trunk of ConvNeXt blocks does, and one of other blocks doesn't
         norm_groups: "group"'s groups of channels: of a layer of C channels, gcd(norm_groups, C)
         bn_momentum: how slowly BatchNorm's running averages of the batch statistics, which inference
             uses, follow them: at about 1 / (1 - momentum) training steps. A long window lags the
@@ -114,8 +117,8 @@ class AZResnetConfig:
     bottleneck_channels: int | None = None
     bottleneck_inner: int = 1
     expand: int = 4
-    expand_norm: bool = False
-    project_norm: bool = False
+    expand_norm: bool | None = None
+    project_norm: bool | None = None
     dw_kernel: int = 7
     dw_taps: tuple[tuple[int, int], ...] | None = None
     pool_every: int = 0
@@ -127,7 +130,7 @@ class AZResnetConfig:
     train_dtype: str = "float32"
     norm: Literal["batch", "layer", "group", "rms", "channel", "fixed", "ws"] = "batch"
     layout: Literal["post", "pre"] = "post"
-    stem_norm: bool = False
+    stem_norm: bool | None = None
     norm_groups: int = 8
     bn_momentum: float = 0.9
     remat: bool = False
@@ -949,17 +952,22 @@ class AZResnet(eqx.Module):
                 f'norm={config.norm} scales the convolution it follows: not with layout="pre"'
             )
         # initial conv layer: in the pre-activation layout, the trunk starts from it unnormalized
+        # by default, a ConvNeXt trunk is normalized after every convolution
+        convnext = config.block == "convnext"
+        stem_norm = convnext if config.stem_norm is None else config.stem_norm
+        expand_norm = convnext if config.expand_norm is None else config.expand_norm
+        project_norm = convnext if config.project_norm is None else config.project_norm
         if config.stem_norm and not pre:
             raise ValueError(
                 'stem_norm is the "pre" layout\'s option: "post" always has it'
             )
-        if (config.expand_norm or config.project_norm) and config.block != "convnext":
+        if (expand_norm or project_norm) and not convnext:
             raise ValueError(
                 'expand_norm and project_norm are block="convnext"\'s options'
             )
         self.stem_conv = conv(in_channels, channels, 3, stem_key)
         self.stem_norm = (
-            make_norm(channels, INPUT_STATS, 3) if config.stem_norm or not pre else None
+            make_norm(channels, INPUT_STATS, 3) if stem_norm or not pre else None
         )
 
         # residual blocks: the global pooling channels of each basic block, counting those inside
@@ -988,8 +996,8 @@ class AZResnet(eqx.Module):
                     key=k,
                     make_norm=make_norm,
                     stats=block_stats,
-                    expand_norm=config.expand_norm,
-                    project_norm=config.project_norm,
+                    expand_norm=expand_norm,
+                    project_norm=project_norm,
                 )
                 for pool, k, block_stats in zip(
                     pool_channels, block_keys, stats[:-1], strict=True

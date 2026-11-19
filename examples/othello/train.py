@@ -900,11 +900,11 @@ def main():
     parser.add_argument(
         "--average-norm-batches",
         type=int,
-        default=0,
+        default=32,
         metavar="N",
         help="each weight average gets BatchNorm statistics of its own after every epoch, from N "
         "training batches of the replay buffer through its weights, for self-play, tests and its "
-        "checkpoints (0: averages play with the network's statistics, which fit its own weights)",
+        "checkpoints (0: averages play with the network's statistics, which fit only its own weights)",
     )
     parser.add_argument(
         "--save-state-at",

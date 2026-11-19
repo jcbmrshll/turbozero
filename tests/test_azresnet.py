@@ -286,6 +286,7 @@ VARIANTS = {
 
 # variants only the pre-activation layout takes
 PRE_VARIANTS = {
+    # without a normalization after the stem, expand and project
     "convnext": {
         "num_blocks": 2,
         "num_channels": 6,
@@ -295,8 +296,11 @@ PRE_VARIANTS = {
         "pool_every": 2,
         "pool_channels": 2,
         "layout": "pre",
+        "stem_norm": False,
+        "expand_norm": False,
+        "project_norm": False,
     },
-    # and with a normalization after each convolution: the stem, expand and project
+    # with one after each convolution, a ConvNeXt trunk's default
     "normalized convnext": {
         "num_blocks": 2,
         "num_channels": 6,
@@ -306,9 +310,6 @@ PRE_VARIANTS = {
         "pool_every": 2,
         "pool_channels": 2,
         "layout": "pre",
-        "stem_norm": True,
-        "expand_norm": True,
-        "project_norm": True,
     },
 }
 
@@ -715,3 +716,14 @@ def test_a_normalized_convnext_blocks_pooling_bias_comes_after_its_norm():
 
     assert float(jnp.abs(shifted_value - value).max()) > 1e-3
     assert float(jnp.abs(shifted_policy - policy).max()) > 1e-3
+
+
+def test_a_convnext_trunk_is_normalized_after_every_convolution_by_default():
+    net, _ = make_variant("normalized convnext")
+    assert net.stem_norm is not None
+    for block in net.blocks:
+        assert isinstance(block, PreActConvNeXt)
+        assert block.expand_norm is not None and block.project_norm is not None
+    # other pre-activation trunks start from the stem as it is
+    plain, _ = make_variant("global pooling", layout="pre")
+    assert plain.stem_norm is None

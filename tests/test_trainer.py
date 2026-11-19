@@ -3676,7 +3676,7 @@ def test_an_averages_own_statistics_follow_its_weights(env, tmp_path):
 def test_without_an_average_norm_option_or_a_buffer_averages_use_the_networks_state(
     env, tmp_path
 ):
-    trainer = norm_trainer(env, tmp_path, averages=(2,))
+    trainer = norm_trainer(env, tmp_path, averages=(2,), average_norm_batches=0)
     ts = trainer.init_train_state()
     empty = trainer.memory_buffer.init(
         trainer.batch_size, trainer.make_template_experience()
