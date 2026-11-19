@@ -37,11 +37,11 @@ class MCTS(Evaluator):
         """
         Args:
             branching_factor: the number of actions
-            max_nodes: the tree's size. A search needing a new node in a full
-                tree evicts a leaf, so it runs all its iterations whatever the
-                size, but forgets part of the tree; with `persist_tree` the
-                reused subtree can fill most of it, so allow `num_iterations`
-                on top of what a search typically keeps
+            max_nodes: the tree's size, by convention 4 * `num_iterations`. A
+                search needing a new node in a full tree evicts a leaf, so it
+                runs all its iterations whatever the size, but forgets part of
+                the tree, and with `persist_tree` the reused subtree takes room
+                too: at 2 * `num_iterations`, evictions cost strength
             num_iterations: iterations per search, after the root's evaluation
             discount: see `Evaluator`
             temperature: each move is played with probability proportional to
