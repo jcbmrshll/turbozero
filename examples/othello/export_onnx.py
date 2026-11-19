@@ -219,17 +219,16 @@ class Graph:
                     f"no normalization after a depthwise filter: {block.norm!r}"
                 )
             y = self.group_norm(block.norm, y)
-        h = self.conv(block.expand, y)
+        if block.expand_norm is None:
+            h = self.conv(block.expand, y)
+        else:
+            h = self.conv_norm(block.expand, block.expand_norm, state, y)
         if block.pool_linear is not None:
             pooled = self.board_pool(
                 self.slice_channels(y, channels - block.pool_channels, channels)
             )
             h = self.add(h, self.board_bias(self.linear(block.pool_linear, pooled)))
-        h = (
-            self.norm_relu(block.expand_norm, state, h)
-            if block.expand_norm
-            else self.relu(h)
-        )
+        h = self.relu(h)
         if block.project_norm is None:
             return self.add(x, self.conv(block.project, h))
         return self.add(x, self.conv_norm(block.project, block.project_norm, state, h))

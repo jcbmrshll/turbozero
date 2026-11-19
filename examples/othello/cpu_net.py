@@ -66,8 +66,7 @@ class ConvNeXtBlock:
     """ConvNeXt's block (see `core.networks.azresnet.PreActConvNeXt`): x + project(relu(expand(y) +
     pool)), y = dw(x) + dw_bias, a depthwise filter of the trunk with its BatchNorm folded in;
     `pool` biases the hidden channels from the last `pool_channels` of y. BatchNorms after expand
-    (and the pooling bias) and after project fold into them, and into `pool`. The depthwise filter
-    stays in float."""
+    and project fold into them. The depthwise filter stays in float."""
 
     taps: np.ndarray  # (taps, 2): each tap's (dy, dx), in order of dy, then dx
     dw: np.ndarray  # (channels, taps)
@@ -168,17 +167,11 @@ def extract(network, state) -> Program:
             raise unsupported(block.norm)
         scale, offset = inference_affine(block.norm, state)
         order = sorted(range(len(block.dw.taps)), key=lambda t: block.dw.taps[t])
-        # the hidden channels' normalization, after the expand and the pooling bias: both scaled
-        expand = folded(block.expand, block.expand_norm)
-        if pool is not None and block.expand_norm is not None:
-            # it folded, so it's BatchNorm (fixed scales aren't in the pre layout)
-            hidden = f32(inference_affine(block.expand_norm, state)[0])
-            pool = Linear(pool.w * hidden[:, None], pool.b * hidden)
         return ConvNeXtBlock(
             taps=np.array([block.dw.taps[t] for t in order], np.int32).reshape(-1, 2),
             dw=f32(block.dw.weight)[:, order] * f32(scale)[:, None],
             dw_bias=f32(offset),
-            expand=expand,
+            expand=folded(block.expand, block.expand_norm),
             project=folded(block.project, block.project_norm),
             pool_channels=block.pool_channels,
             pool=pool,

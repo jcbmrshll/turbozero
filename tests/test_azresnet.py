@@ -648,9 +648,9 @@ def test_a_normalized_projects_scale_starts_at_zero_and_its_weights_do_not():
 def test_a_normalized_convnext_trunk_ignores_the_scale_of_its_convolutions(
     name, invariant
 ):
-    # in training mode, with each convolution followed by a BatchNorm, scaling any of them (and the
-    # pooling bias with expand, which share a normalization) changes nothing: weight decay
-    # shrinking them can't change the function. Without, scaling the stem or a block's MLP does
+    # in training mode, with each convolution followed by a BatchNorm, scaling any of them changes
+    # nothing: weight decay shrinking them can't change the function. Without, scaling the stem or
+    # a block's MLP does
     net, state = make_variant(name)
     rng = np.random.default_rng(0)
     params, static = eqx.partition(net, eqx.is_inexact_array)
@@ -662,20 +662,10 @@ def test_a_normalized_convnext_trunk_ignores_the_scale_of_its_convolutions(
     x = jnp.asarray(observations(rng, batch_size=8))
 
     def scaled_block(block, f):
-        block = eqx.tree_at(
+        return eqx.tree_at(
             lambda b: (b.dw.weight, b.expand.weight, b.project.weight),
             block,
             (block.dw.weight * f, block.expand.weight * f, block.project.weight * f),
-        )
-        if block.pool_linear is None:
-            return block
-        pool = block.pool_linear
-        return eqx.tree_at(
-            lambda b: b.pool_linear,
-            block,
-            eqx.tree_at(
-                lambda p: (p.weight, p.bias), pool, (pool.weight * f, pool.bias * f)
-            ),
         )
 
     def scaled(net, factor):
@@ -697,3 +687,31 @@ def test_a_normalized_convnext_trunk_ignores_the_scale_of_its_convolutions(
         float(jnp.abs(scaled_value - value).max()),
     )
     assert change < 1e-3 if invariant else change > 1e-2, change
+
+
+def test_a_normalized_convnext_blocks_pooling_bias_comes_after_its_norm():
+    # in training mode, a shift of the pooling bias the same for every input changes the outputs:
+    # the norm doesn't take it out, so training sees all of the bias, and an average of the
+    # weights moves only what training saw
+    net, state = make_variant("normalized convnext")
+    rng = np.random.default_rng(0)
+    params, static = eqx.partition(net, eqx.is_inexact_array)
+    params = jax.tree.map(
+        lambda x: x + 0.3 * rng.normal(size=x.shape).astype(x.dtype), params
+    )
+    net = eqx.combine(params, static)
+    x = jnp.asarray(observations(rng, batch_size=8))
+    pooled = [i for i, b in enumerate(net.blocks) if b.pool_linear is not None]
+    assert pooled
+    i = pooled[0]
+    shifted = eqx.tree_at(
+        lambda n: n.blocks[i].pool_linear.bias,
+        net,
+        net.blocks[i].pool_linear.bias + 1.0,
+    )
+
+    (policy, value), _ = apply_nn(net, state, x)
+    (shifted_policy, shifted_value), _ = apply_nn(shifted, state, x)
+
+    assert float(jnp.abs(shifted_value - value).max()) > 1e-3
+    assert float(jnp.abs(shifted_policy - policy).max()) > 1e-3
