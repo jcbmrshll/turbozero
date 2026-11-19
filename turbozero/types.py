@@ -10,7 +10,7 @@ import optax
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class StepMetadata:
-    """What an environment reports with each state it steps to."""
+    """What an environment reports after each step."""
 
     rewards: jax.Array  # (players,) this step's reward for each player
     action_mask: jax.Array  # (actions,) the legal actions
