@@ -217,8 +217,6 @@ class TwoPlayerGameState:
         env_state_metadata: Metadata associated with the environment state.
         p1_eval_state: The internal state of the first evaluator.
         p2_eval_state: The internal state of the second evaluator.
-        p1_value_estimate: The current state value estimate of the first evaluator.
-        p2_value_estimate: The current state value estimate of the second evaluator.
         outcomes: The outcomes of the game (final rewards) for each player.
         completed: Whether the game is completed.
     """
@@ -228,30 +226,8 @@ class TwoPlayerGameState:
     env_state_metadata: StepMetadata
     p1_eval_state: Any
     p2_eval_state: Any
-    p1_value_estimate: jax.Array
-    p2_value_estimate: jax.Array
     outcomes: jax.Array
     completed: jax.Array
-
-
-@jax.tree_util.register_dataclass
-@dataclass(frozen=True)
-class GameFrame:
-    """Stores information necessary for rendering the environment state in a two-player game.
-
-    Attributes:
-        env_state: The environment state.
-        p1_value_estimate: The current state value estimate of the first evaluator.
-        p2_value_estimate: The current state value estimate of the second evaluator.
-        completed: Whether the game is completed.
-        outcomes: The outcomes of the game (final rewards) for each player.
-    """
-
-    env_state: Any
-    p1_value_estimate: jax.Array
-    p2_value_estimate: jax.Array
-    completed: jax.Array
-    outcomes: jax.Array
 
 
 def _select(pred: jax.Array, on_true: Any, on_false: Any) -> Any:
@@ -314,29 +290,13 @@ def two_player_game_step(
     )
 
     active_eval_state = output.eval_state
-    active_value_estimate = active_evaluator.get_value(active_eval_state)
-    active_value_estimate = jax.lax.cond(
-        terminated | truncated,
-        lambda a: a,
-        lambda a: active_evaluator.discount * a,
-        active_value_estimate,
-    )
     # update the other evaluator
     other_eval_state = other_evaluator.step(other_eval_state, output.action)
-    other_value_estimate = other_evaluator.get_value(other_eval_state)
     # update the game state
     if use_p1:
         p1_eval_state, p2_eval_state = active_eval_state, other_eval_state
-        p1_value_estimate, p2_value_estimate = (
-            active_value_estimate,
-            other_value_estimate,
-        )
     else:
         p1_eval_state, p2_eval_state = other_eval_state, active_eval_state
-        p1_value_estimate, p2_value_estimate = (
-            other_value_estimate,
-            active_value_estimate,
-        )
     return replace(
         state,
         key=key,
@@ -344,8 +304,6 @@ def two_player_game_step(
         env_state_metadata=env_state_metadata,
         p1_eval_state=p1_eval_state,
         p2_eval_state=p2_eval_state,
-        p1_value_estimate=p1_value_estimate,
-        p2_value_estimate=p2_value_estimate,
         outcomes=jnp.where(
             ((terminated | truncated) & ~state.completed)[..., None],
             rewards,
@@ -365,7 +323,7 @@ def two_player_game(
     env_init_fn: EnvInitFn,
     max_steps: int,
     p1_first: bool | None = None,
-) -> tuple[jax.Array, GameFrame, jax.Array]:
+) -> jax.Array:
     """Play a two player game between two evaluators.
 
     Args:
@@ -385,11 +343,7 @@ def two_player_game(
               to run only the active evaluator at each step.
 
     Returns:
-        Tuple[jax.Array, GameFrame, jax.Array]:
-            - `outcomes`: The outcomes of the game (final rewards) for each player.
-            - `frames`: Frames collected from the game (used for rendering), `max_steps + 1` of them:
-              the initial state, then the state after each step.
-            - `p_ids`: The player ids of the two evaluators. [evaluator_1_id, evaluator_2_id]
+        jax.Array: The outcomes of the game (final rewards) of the first and second evaluator.
     """
     # init rng
     env_key, turn_key, key = jax.random.split(key, 3)
@@ -427,24 +381,14 @@ def two_player_game(
         env_state_metadata=metadata,
         p1_eval_state=p1_eval_state,
         p2_eval_state=p2_eval_state,
-        p1_value_estimate=jnp.array(0.0, dtype=jnp.float32),
-        p2_value_estimate=jnp.array(0.0, dtype=jnp.float32),
         outcomes=jnp.zeros((2,), dtype=jnp.float32),
         completed=jnp.zeros((), dtype=jnp.bool_),
-    )
-    # make initial render frame
-    initial_game_frame = GameFrame(
-        env_state=state.env_state,
-        p1_value_estimate=state.p1_value_estimate,
-        p2_value_estimate=state.p2_value_estimate,
-        completed=state.completed,
-        outcomes=state.outcomes,
     )
 
     # takes a turn for the active player
     def take_turn(
         state: TwoPlayerGameState, step_num: jax.Array
-    ) -> tuple[TwoPlayerGameState, GameFrame]:
+    ) -> tuple[TwoPlayerGameState, None]:
         # players alternate turns, starting with the first player
         use_p1 = (step_num % 2 == 0) == p1_moves_first
         # Branches whose predicate can differ across a vmapped batch of games are written as selects
@@ -458,28 +402,8 @@ def two_player_game(
             new_state = _select(use_p1, step_p1(state), step_p2(state))
         # a completed game keeps its final state
         state = _select(state.completed, state, new_state)
-        # collect render frame
-        frame = GameFrame(
-            env_state=state.env_state,
-            p1_value_estimate=state.p1_value_estimate,
-            p2_value_estimate=state.p2_value_estimate,
-            completed=state.completed,
-            outcomes=state.outcomes,
-        )
-        # return game state and render frame
-        return state, frame
+        return state, None
 
     # play the game
-    state, frames = jax.lax.scan(take_turn, state, xs=jnp.arange(max_steps))
-    # append initial state to front of frames
-    frames = jax.tree.map(
-        lambda i, x: jnp.concatenate([jnp.expand_dims(i, 0), x]),
-        initial_game_frame,
-        frames,
-    )
-    # return outcome, frames, player ids
-    return (
-        jnp.array([state.outcomes[p1_id], state.outcomes[p2_id]]),
-        frames,
-        jnp.array([p1_id, p2_id]),
-    )
+    state, _ = jax.lax.scan(take_turn, state, xs=jnp.arange(max_steps))
+    return jnp.array([state.outcomes[p1_id], state.outcomes[p2_id]])
