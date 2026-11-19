@@ -1,209 +1,12 @@
-from collections.abc import Callable
 from dataclasses import dataclass, replace
 from functools import partial
 from typing import Any
 
 import jax
 import jax.numpy as jnp
-from jax.typing import ArrayLike
 
-from turbozero.evaluators.evaluator import EvalOutput, Evaluator
+from turbozero.evaluators.evaluator import Evaluator
 from turbozero.types import EnvInitFn, EnvStepFn, StepMetadata
-
-# (key, evaluator output, metadata of the state being evaluated) -> action to play
-ChooseActionFn = Callable[[jax.Array, EvalOutput, StepMetadata], jax.Array]
-
-
-def step_env_and_evaluator(
-    key: jax.Array,
-    env_state: Any,
-    env_state_metadata: StepMetadata,
-    eval_state: Any,
-    params: Any,
-    evaluator: Evaluator,
-    env_step_fn: EnvStepFn,
-    env_init_fn: EnvInitFn,
-    max_steps: int,
-    reset: bool = True,
-    choose_action: ChooseActionFn | None = None,
-) -> tuple[EvalOutput, Any, StepMetadata, jax.Array, jax.Array, jax.Array]:
-    """Steps the environment and evaluator.
-
-    - Evaluates the environment state with the Evaluator and selects an action.
-    - Optionally replaces the selected action with one chosen by `choose_action`.
-    - Performs a step in the environment with the selected action.
-    - Updates the internal state of the Evaluator.
-    - Optionally resets the environment and evaluator state if the episode is terminated or truncated.
-
-    Args:
-        key: rng
-        env_state: The environment state to evaluate.
-        env_state_metadata: Metadata associated with the environment state.
-        eval_state: The internal state of the Evaluator.
-        params: nn parameters used by the Evaluator.
-        evaluator: The Evaluator.
-        env_step_fn: The environment step function.
-        env_init_fn: The environment initialization function.
-        max_steps: The maximum number of environment steps per episode. An episode that has taken
-            `max_steps` steps without terminating is truncated, so no episode runs longer than `max_steps` steps.
-        reset: Whether to reset the environment and evaluator state if the episode is terminated or truncated.
-        choose_action: (optional) chooses the action to play from the evaluator's output instead,
-            e.g. `core.training.exploration.Exploration.choose_action`. The environment and
-            evaluator step with the action it returns; the policy weights are left as they are.
-
-    Returns:
-        Tuple[EvalOutput, Any, StepMetadata, jax.Array, jax.Array, jax.Array]:
-            - `output`: The output of the evaluation, with the action that was played.
-            - `env_state`: The updated environment state.
-            - `env_state_metadata`: Metadata associated with the updated environment state.
-            - `terminated`: Whether the episode is terminated.
-            - `truncated`: Whether the episode reached `max_steps` steps without terminating.
-              Never true together with `terminated`: an episode that terminates on its last allowed step is terminated.
-            - `rewards`: Rewards emitted by the environment.
-    """
-    return search_and_step(
-        key,
-        env_state,
-        env_state_metadata,
-        eval_state,
-        params,
-        evaluator,
-        env_step_fn,
-        env_init_fn,
-        max_steps,
-        reset,
-        choose_action,
-    )[:6]
-
-
-def search_and_step(
-    key: jax.Array,
-    env_state: Any,
-    env_state_metadata: StepMetadata,
-    eval_state: Any,
-    params: Any,
-    evaluator: Evaluator,
-    env_step_fn: EnvStepFn,
-    env_init_fn: EnvInitFn,
-    max_steps: int,
-    reset: bool = True,
-    choose_action: ChooseActionFn | None = None,
-) -> tuple[EvalOutput, Any, StepMetadata, jax.Array, jax.Array, jax.Array, Any]:
-    """`step_env_and_evaluator`, also returning the evaluator's state as the evaluation left it, before
-    the evaluator stepped: e.g. the whole search tree, and its root value (`Evaluator.get_value`).
-
-    Args: see `step_env_and_evaluator`.
-
-    Returns:
-        Tuple[EvalOutput, Any, StepMetadata, jax.Array, jax.Array, jax.Array, Any]:
-            what `step_env_and_evaluator` returns, then the evaluator's state after the evaluation
-    """
-    key, evaluate_key = jax.random.split(key)
-    # evaluate the environment state
-    output = evaluator.evaluate(
-        key=evaluate_key,
-        eval_state=eval_state,
-        env_state=env_state,
-        root_metadata=env_state_metadata,
-        params=params,
-        env_step_fn=env_step_fn,
-    )
-    return step_with_output(
-        key,
-        output,
-        env_state,
-        env_state_metadata,
-        evaluator,
-        env_step_fn,
-        env_init_fn,
-        max_steps,
-        reset,
-        choose_action,
-    )
-
-
-def step_with_output(
-    key: jax.Array,
-    output: EvalOutput,
-    env_state: Any,
-    env_state_metadata: StepMetadata,
-    evaluator: Evaluator,
-    env_step_fn: EnvStepFn,
-    env_init_fn: EnvInitFn,
-    max_steps: int,
-    reset: bool = True,
-    choose_action: ChooseActionFn | None = None,
-    active: ArrayLike = True,
-    end: ArrayLike = False,
-    step_evaluator: bool = True,
-) -> tuple[EvalOutput, Any, StepMetadata, jax.Array, jax.Array, jax.Array, Any]:
-    """`search_and_step` after its evaluation: steps the environment and evaluator with the
-    evaluator's `output` for `env_state`.
-
-    Args:
-        key: rng, `search_and_step`'s after it splits off the evaluation's
-        output: the evaluator's output
-        active: (optional) if not, the evaluator's state stays as `output` left it (see
-            `Evaluator.next_state`); the environment's is stepped all the same, for the caller
-            to keep or not
-        end: (optional) ends the episode before its move, e.g. on a resignation: the
-            environment and evaluator are reset (with `reset`) as if it had terminated, and
-            `terminated` and `truncated` are False. The caller scores it.
-        step_evaluator: (optional) if not, the evaluator's state stays as `output` left it, for
-            the caller to move on (with `Evaluator.next_state`)
-        others: see `step_env_and_evaluator`.
-
-    Returns:
-        Tuple[EvalOutput, Any, StepMetadata, jax.Array, jax.Array, jax.Array, Any]: see
-            `search_and_step`
-    """
-    if choose_action is not None:
-        choose_key, key = jax.random.split(key)
-        output = replace(
-            output, action=choose_action(choose_key, output, env_state_metadata)
-        )
-    # take the selected action
-    env_state, env_state_metadata = env_step_fn(env_state, output.action)
-    # check for termination and truncation
-    end = jnp.asarray(end, dtype=jnp.bool_)
-    terminated = env_state_metadata.terminated & ~end
-    # `step` counts the steps taken so far, so this is the episode's `max_steps`-th step
-    truncated = ~terminated & ~end & (env_state_metadata.step >= max_steps)
-    ended = terminated | truncated | end
-    # reset the environment and evaluator state if the episode ended
-    # else, update the evaluator state
-    rewards = env_state_metadata.rewards
-    if not step_evaluator:
-        eval_state = output.eval_state
-    elif reset:
-        eval_state = evaluator.next_state(
-            output.eval_state, output.action, ended, active=active
-        )
-    else:
-        eval_state = evaluator.next_state(
-            output.eval_state,
-            output.action,
-            False,
-            active=active & ~ended,
-        )
-    # reset the environment if the episode ended
-    env_state, env_state_metadata = jax.lax.cond(
-        ended,
-        lambda _: env_init_fn(key) if reset else (env_state, env_state_metadata),
-        lambda _: (env_state, env_state_metadata),
-        None,
-    )
-    searched_eval_state = output.eval_state
-    output = replace(output, eval_state=eval_state)
-    return (
-        output,
-        env_state,
-        env_state_metadata,
-        terminated,
-        truncated,
-        rewards,
-        searched_eval_state,
-    )
 
 
 @jax.tree_util.register_dataclass
@@ -255,7 +58,7 @@ def two_player_game_step(
         env_step_fn: The environment step function.
         env_init_fn: The environment initialization function.
         use_p1: Whether to use the first evaluator.
-        max_steps: The maximum number of steps per episode (see `step_env_and_evaluator`).
+        max_steps: The maximum number of steps per episode (see `two_player_game`).
 
     Returns:
         TwoPlayerGameState: The updated game state.
@@ -272,24 +75,22 @@ def two_player_game_step(
         active_eval_state = state.p2_eval_state
         other_eval_state = state.p1_eval_state
 
-    # step
     step_key, key = jax.random.split(state.key)
-    output, env_state, env_state_metadata, terminated, truncated, rewards, _ = (
-        search_and_step(
-            key=step_key,
-            env_state=state.env_state,
-            env_state_metadata=state.env_state_metadata,
-            eval_state=active_eval_state,
-            params=params,
-            evaluator=active_evaluator,
-            env_step_fn=env_step_fn,
-            env_init_fn=env_init_fn,
-            max_steps=max_steps,
-            reset=False,
-        )
+    _, evaluate_key = jax.random.split(step_key)
+    output = active_evaluator.evaluate(
+        evaluate_key,
+        active_eval_state,
+        state.env_state,
+        state.env_state_metadata,
+        params,
+        env_step_fn,
     )
-
-    active_eval_state = output.eval_state
+    env_state, env_state_metadata = env_step_fn(state.env_state, output.action)
+    # `step` counts the steps taken so far: a game still going after its
+    # `max_steps`-th step is truncated
+    ended = env_state_metadata.terminated | (env_state_metadata.step >= max_steps)
+    # the evaluator follows the move played, e.g. to its search tree's subtree
+    active_eval_state = active_evaluator.step(output.eval_state, output.action)
     # update the other evaluator
     other_eval_state = other_evaluator.step(other_eval_state, output.action)
     # update the game state
@@ -305,11 +106,11 @@ def two_player_game_step(
         p1_eval_state=p1_eval_state,
         p2_eval_state=p2_eval_state,
         outcomes=jnp.where(
-            ((terminated | truncated) & ~state.completed)[..., None],
-            rewards,
+            (ended & ~state.completed)[..., None],
+            env_state_metadata.rewards,
             state.outcomes,
         ),
-        completed=state.completed | terminated | truncated,
+        completed=state.completed | ended,
     )
 
 
