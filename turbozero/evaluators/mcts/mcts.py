@@ -44,8 +44,9 @@ class MCTS(Evaluator):
                 on top of what a search typically keeps
             num_iterations: iterations per search, after the root's evaluation
             discount: see `Evaluator`
-            temperature: the move is sampled by root visits to the power of
-                1 / temperature; at 0, the most visited, ties broken at random
+            temperature: each move is played with probability proportional to
+                its root visits to the power of 1 / temperature; at 0, the most
+                visited move is played, ties broken at random
             persist_tree: whether the next move's search starts from the
                 subtree of the move played, rather than an empty tree
         """
