@@ -2872,7 +2872,8 @@ def test_games_waiting_for_solves_are_solved_during_self_play_and_labelled_after
     env, tmp_path, fake_loop, monkeypatch
 ):
     monitor = FakeMonitor()
-    trainer = solving_trainer(env, tmp_path, monitor=monitor)
+    # a batch of the 2 positions each self-play leaves to train on
+    trainer = solving_trainer(env, tmp_path, monitor=monitor, train_batch_size=2)
     calls = fake_loop(trainer)
     fake_collect = trainer.collect_steps
     solved = []
@@ -2923,7 +2924,9 @@ def test_with_nothing_to_train_on_the_games_just_stopped_are_solved_at_once(
     env, tmp_path, fake_loop, monkeypatch
 ):
     monitor = FakeMonitor()
-    trainer = solving_trainer(env, tmp_path, monitor=monitor, warmup_steps=0)
+    trainer = solving_trainer(
+        env, tmp_path, monitor=monitor, warmup_steps=0, train_batch_size=2
+    )
     fake_loop(trainer)
     fake_collect = trainer.collect_steps
     solved = []
@@ -2963,6 +2966,55 @@ def test_with_nothing_to_train_on_the_games_just_stopped_are_solved_at_once(
     assert logged(monitor, "solve_games") == {0: 2.0, 1: 0.0}
     # both of epoch 0's solves, 0.5 s each by the fake
     assert logged(monitor, "solve_seconds")[0] == 1.0
+
+
+def test_with_less_than_a_batch_to_train_on_the_games_just_stopped_are_solved_at_once(
+    env, tmp_path, fake_loop, monkeypatch
+):
+    # a few games that finished before stopping (fewer positions than a training batch) don't
+    # make the first epoch train before its stopped games are solved
+    trainer = solving_trainer(env, tmp_path, warmup_steps=0, train_batch_size=8)
+    fake_loop(trainer)
+    fake_collect = trainer.collect_steps
+    solved = []
+
+    def collect_steps(key, state, params, num_steps, *, evaluator=None):
+        # a call with steps stops a game; the first also finishes one position to train on
+        state = fake_collect(key, state, params, num_steps, evaluator=evaluator)
+        if num_steps == 0:
+            return state
+        buffer_state = state.buffer_state
+        if not np.asarray(buffer_state.populated).any():
+            buffer_state = written(buffer_state, 1)
+        return replace(
+            state,
+            pending=replace(state.pending, added=state.pending.added + 1),
+            buffer_state=buffer_state,
+        )
+
+    def solve_waiting(pending):
+        solved.append(np.array(pending.added))
+        counts = np.asarray(pending.added - pending.labelled)
+        games = np.zeros((counts.sum(), 2), np.float32)
+        whole = np.ones(len(games), bool)
+        return Solved(np.zeros((2, 2, 2), np.float32), counts, games, whole, 0.5)
+
+    def label_solved(state, results, counts):
+        # the games labelled are trained on: enough for a batch
+        return replace(
+            state,
+            pending=replace(state.pending, labelled=state.pending.labelled + counts),
+            buffer_state=written(state.buffer_state, 4),
+        )
+
+    monkeypatch.setattr(trainer, "collect_steps", collect_steps)
+    monkeypatch.setattr(trainer, "solve_waiting", solve_waiting)
+    monkeypatch.setattr(trainer, "label_solved", label_solved)
+
+    trainer.train_loop(seed=0, num_epochs=2)
+
+    # epoch 0 waits for the games it stopped, as with nothing at all to train on
+    np.testing.assert_array_equal(solved, [[0, 0], [1, 1], [1, 1], [2, 2]])
 
 
 def test_a_saved_state_keeps_its_games_waiting_for_solves(env, tmp_path):
