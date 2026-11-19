@@ -742,6 +742,7 @@ def search_until_done(search, env):
         {"full_probability": 0.5, "fast_iterations": 2},
         {"full_probability": 0.5, "fast_iterations": 2, "key": 10},
         {"count_reused_visits": True},
+        {"count_reused_visits": True, "min_iterations": 2},
         {
             "full_probability": 0.5,
             "fast_iterations": 2,
@@ -754,6 +755,7 @@ def search_until_done(search, env):
         "playout-cap-full",
         "playout-cap-fast",
         "visits",
+        "visits-min-2",
         "playout-cap-fast-visits",
     ],
 )
@@ -870,18 +872,22 @@ def test_a_search_is_done_after_the_roots_evaluation_and_its_iterations(env):
 
 
 @pytest.mark.parametrize(
-    "nodes, done_from",
+    "nodes, min_iterations, done_from",
     [
         # the root has 1 visit: done after its evaluation and 4 iterations, as without
-        (SHAPES[0], 5),
+        (SHAPES[0], 0, 5),
         # 6 visits: done once evaluated
-        (SHAPES[2], 1),
+        (SHAPES[2], 0, 1),
+        # but for 2 iterations more
+        (SHAPES[2], 2, 3),
     ],
 )
 def test_a_search_counting_reused_visits_is_done_with_the_roots_visits(
-    env, nodes, done_from
+    env, nodes, min_iterations, done_from
 ):
-    search = make_mcts(num_iterations=4, count_reused_visits=True)
+    search = make_mcts(
+        num_iterations=4, count_reused_visits=True, min_iterations=min_iterations
+    )
     tree = build_tree(search, env, nodes)
 
     done = [bool(search.search_done(tree, jnp.array(c))) for c in range(7)]
@@ -889,14 +895,21 @@ def test_a_search_counting_reused_visits_is_done_with_the_roots_visits(
     assert done == [c >= done_from for c in range(7)]
 
 
-@pytest.mark.parametrize("nodes", [SHAPES[0], SHAPES[2]])
-def test_a_search_counting_reused_visits_ends_with_as_many_root_visits(env, nodes):
-    # 8 iterations of a search from scratch: 9 visits, from the root's 1 or the reused 6
+@pytest.mark.parametrize(
+    "nodes, min_iterations, visits",
+    [(SHAPES[0], 0, 9), (SHAPES[2], 0, 9), (SHAPES[2], 2, 9), (SHAPES[2], 5, 11)],
+)
+def test_a_search_counting_reused_visits_ends_with_as_many_root_visits(
+    env, nodes, min_iterations, visits
+):
+    # 8 iterations of a search from scratch: 9 visits, from the root's 1 or the reused 6; with
+    # 5 iterations at least, 11
     search = make_mcts(
         max_nodes=16,
         leaf_eval_fn=state_eval_fn,
         num_iterations=8,
         count_reused_visits=True,
+        min_iterations=min_iterations,
     )
     tree = build_tree(search, env, nodes)
     state, meta = env.init_fn(jax.random.PRNGKey(0))
@@ -905,8 +918,13 @@ def test_a_search_counting_reused_visits_ends_with_as_many_root_visits(env, node
         jax.random.PRNGKey(0), tree, state, meta, None, env_step_fn=env.step_fn
     ).eval_state
 
-    assert int(root(searched).n) == 9
+    assert int(root(searched).n) == visits
     assert_consistent(searched)
+
+
+def test_min_iterations_is_at_most_num_iterations():
+    with pytest.raises(ValueError, match="min_iterations"):
+        make_mcts(num_iterations=2, count_reused_visits=True, min_iterations=3)
 
 
 # whole searches, on tic-tac-toe
