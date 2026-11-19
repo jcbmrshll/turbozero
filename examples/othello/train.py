@@ -133,13 +133,13 @@ def lr_drops(text: str) -> list[tuple[float, float]]:
 
 
 def warm_start_spec(text: str) -> tuple[str, str]:
-    """Parses --warm-start: SIZE=PATH."""
-    size, sep, path = text.partition("=")
-    if not (size and sep and path):
+    """Parses --warm-start: NAME=PATH."""
+    name, sep, path = text.partition("=")
+    if not (name and sep and path):
         raise argparse.ArgumentTypeError(
-            f"{text!r} isn't SIZE=PATH, e.g. 4x64=run/state-100.npz"
+            f"{text!r} isn't NAME=PATH, e.g. 4x64=run/state-100.npz"
         )
-    return size, path
+    return name, path
 
 
 def lr_drop_spec(text: str) -> LRDrop:
@@ -248,10 +248,35 @@ def load_engine_set(
 
 
 def net_name(spec: str) -> str:
-    """A network's short name, for --grow's metrics and checkpoint directories: its size, e.g.
-    4x64 for resnet:4x64,pool_every=2."""
+    """A network's short name, for --grow's metrics and checkpoint directories: the name a
+    NAME=SPEC gives it (see `named_spec`), or its size, e.g. 4x64 for resnet:4x64,pool_every=2."""
+    name, spec = named_spec(spec)
+    if name is not None:
+        return name
     found = re.search(r"\d+x\d+", spec)
     return found.group(0) if found else spec.split(",")[0].replace(":", "-")
+
+
+def named_spec(text: str) -> tuple[str | None, str]:
+    """A --net or --grow network: NAME=KIND:..., e.g. r7e3=resnet:7x64,expand=3, as its name
+    and spec, or an unnamed spec (KIND:...) as None and the spec."""
+    found = re.fullmatch(r"([A-Za-z0-9_.+-]+)=([a-z]+:.*)", text)
+    if found is None:
+        return None, text
+    return found.group(1), found.group(2)
+
+
+def per_network(text: str) -> tuple[str, float]:
+    """Parses --lr-of and --weight-decay-of: NAME=VALUE."""
+    name, sep, value = text.partition("=")
+    try:
+        if not (name and sep):
+            raise ValueError
+        return name, float(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} isn't NAME=VALUE, e.g. r7e3=5e-5"
+        ) from e
 
 
 def main():
@@ -261,10 +286,11 @@ def main():
     parser.add_argument(
         "--net",
         default=DEFAULT_NET,
-        help="the network: KIND:DEPTHxWIDTH[,FIELD=VALUE...], e.g. resnet:10x128 for "
+        help="the network: [NAME=]KIND:DEPTHxWIDTH[,FIELD=VALUE...], e.g. resnet:10x128 for "
         "AlphaZero's ResNet with 10 blocks of 128 channels, resnet:10x128,pool_every=3,"
         "heads=pooled with KataGo's global pooling, or transformer:8x256 (see "
-        "core.networks.spec.network_config)",
+        "core.networks.spec.network_config). With --grow, NAME (default its size) names it "
+        "in metrics, checkpoint directories and the --grow options that take a network",
     )
     parser.add_argument(
         "--grow",
@@ -274,8 +300,8 @@ def main():
         help="a bigger network to grow into (repeat for several, smallest first), as --net: "
         "--net plays self-play first, and each takes over in turn, training alongside the one "
         "playing until it does, on the same replay buffer (see core/training/growth.py). Each "
-        "network's checkpoints go to --ckpt-dir/<its size>, and its metrics are logged as "
-        "<its size>/<metric>",
+        "network's checkpoints go to --ckpt-dir/<its name>, and its metrics are logged as "
+        "<its name>/<metric>: NAME=SPEC names it, by default its size (e.g. 4x64)",
     )
     parser.add_argument(
         "--grow-metric",
@@ -301,6 +327,14 @@ def main():
         help="with --grow, the networks that played before the one playing keep training on "
         "its games, --train-steps each an epoch (for the record: not compute-optimal); a "
         "resumed or branched run can turn it on or off",
+    )
+    parser.add_argument(
+        "--grow-train-waiting",
+        action="store_true",
+        help="with --grow, every network after the one playing trains on its games, --train-steps "
+        "each an epoch, not only the next: a battery of students beside --net as a fixed teacher "
+        "(--grow-frozen, forked with --init-from), see student_rack.py. A resumed or branched "
+        "run can turn it on or off, and a branch can drop students and add new ones",
     )
     parser.add_argument(
         "--grow-frozen",
@@ -354,6 +388,25 @@ def main():
         metavar="LR",
         help="the --grow networks' learning rate, where --lr is the first network's (their "
         "schedules are --lr's, scaled by --grow-lr / --lr); default --lr",
+    )
+    parser.add_argument(
+        "--lr-of",
+        type=per_network,
+        action="append",
+        default=[],
+        metavar="NAME=LR",
+        help="with --grow, one --grow network's own learning rate, in place of --grow-lr "
+        "(its schedule is --lr's, scaled). Repeatable",
+    )
+    parser.add_argument(
+        "--weight-decay-of",
+        type=per_network,
+        action="append",
+        default=[],
+        metavar="NAME=WD",
+        help="with --grow, one --grow network's own --weight-decay (scaled by its learning rate "
+        "as --weight-decay is by --lr's, so drop it with the rate to hold its weight norm). "
+        "Repeatable",
     )
     parser.add_argument(
         "--grow-manual",
@@ -884,10 +937,10 @@ def main():
     parser.add_argument(
         "--fork-into",
         default=None,
-        metavar="SIZE",
-        help="with --init-from: the saved run's network to fork, by size (e.g. 8x128), from a "
-        "--grow run's state too. With --grow, it forks into this "
-        "run's network of that size, which plays from the start; the ones before it are retired "
+        metavar="NAME",
+        help="with --init-from: the saved run's network to fork, by name (its size, e.g. 8x128, "
+        "unless NAME=SPEC named it), from a --grow run's state too. With --grow, it forks into "
+        "this run's network of that name, which plays from the start; the ones before it are retired "
         "(training beside it with --grow-train-retired), the next waits, and the rest start from "
         "scratch. Without --grow, it is this run's --net, trained alone",
     )
@@ -896,10 +949,10 @@ def main():
         type=warm_start_spec,
         action="append",
         default=[],
-        metavar="SIZE=PATH",
-        help="with --grow, in a new run: this run's network of that size (e.g. 4x64) starts from "
+        metavar="NAME=PATH",
+        help="with --grow, in a new run: this run's network of that name (e.g. 4x64) starts from "
         "a saved state's (state-<EPOCH>.npz, or a --ckpt-dir to take the newest from; a --grow "
-        "run's network of that size, or a run's one network) instead of from scratch, with its "
+        "run's network of that name, or a run's one network) instead of from scratch, with its "
         "optimizer state (the learning rate decaying anew) and weight averages, "
         "e.g. a student beside a teacher forked with --init-from and --fork-into. Repeatable; "
         "not the network --init-from forks into",
@@ -978,6 +1031,26 @@ def main():
         parser.error("--grow-train-retired is for a run with --grow")
     if args.grow_frozen and not args.grow:
         parser.error("--grow-frozen is for a run with --grow")
+    if args.grow_train_waiting and not args.grow:
+        parser.error("--grow-train-waiting is for a run with --grow")
+    grown_names = [net_name(spec) for spec in args.grow]
+    for option, given in (
+        ("--lr-of", args.lr_of),
+        ("--weight-decay-of", args.weight_decay_of),
+    ):
+        names = [name for name, _ in given]
+        unknown = sorted(set(names) - set(grown_names))
+        if unknown:
+            parser.error(
+                f"{option}: no --grow network {', '.join(unknown)} (they are "
+                f"{', '.join(grown_names) or 'none'})"
+            )
+        if len(set(names)) != len(names):
+            parser.error(f"{option} names a network more than once")
+    if any(value <= 0 for _, value in args.lr_of):
+        parser.error("--lr-of takes positive learning rates")
+    if any(value < 0 for _, value in args.weight_decay_of):
+        parser.error("--weight-decay-of takes weight decays of at least 0")
     if args.grow_lr is not None and (not args.grow or args.grow_lr <= 0):
         parser.error("--grow-lr is a positive learning rate, with --grow")
     if any(h < 1 for h in args.average_epochs) or len(set(args.average_epochs)) != len(
@@ -1100,9 +1173,10 @@ def main():
     test_init_fn = make_xot_init_fn(load_xot(), standard_start_fraction=0)
 
     def make_net(spec: str):
-        """A network (see game.py), with its state (BatchNorm's, if it has any)."""
+        """A network (see game.py), with its state (BatchNorm's, if it has any), from its
+        [NAME=]SPEC."""
         return make_network(
-            spec,
+            named_spec(spec)[1],
             seed=args.seed,
             inference_dtype=args.inference_dtype,
             train_dtype=args.train_dtype,
@@ -1190,11 +1264,14 @@ def main():
     growth = None
     if args.grow:
         learners = []
+        lr_of, weight_decay_of = dict(args.lr_of), dict(args.weight_decay_of)
         for spec in args.grow:
             grown, grown_state = make_net(spec)
+            name = net_name(spec)
+            lr = lr_of.get(name, args.lr if args.grow_lr is None else args.grow_lr)
             learners.append(
                 Learner(
-                    name=net_name(spec),
+                    name=name,
                     nn=grown,
                     nn_state=grown_state,
                     evaluator=make_selfplay(grown),
@@ -1202,7 +1279,10 @@ def main():
                         make_nn_eval_fn(grown, state_to_nn_input)
                     ),
                     testers=make_testers(grown),
-                    lr_scale=1.0 if args.grow_lr is None else args.grow_lr / args.lr,
+                    lr_scale=lr / args.lr,
+                    hyperparams={"weight_decay": weight_decay_of[name]}
+                    if name in weight_decay_of
+                    else {},
                 )
             )
         try:
@@ -1273,6 +1353,7 @@ def main():
         growth=growth,
         waiting_train_steps=args.grow_train_steps,
         train_retired=args.grow_train_retired,
+        train_waiting=args.grow_train_waiting,
         train_playing=not args.grow_frozen,
         averages=args.average_epochs,
         selfplay_average=args.selfplay_average,

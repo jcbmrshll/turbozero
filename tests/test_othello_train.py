@@ -576,6 +576,81 @@ def test_a_frozen_teacher_reaches_the_trainer(monkeypatch):
     assert built.value.kwargs["train_retired"] is True
 
 
+def test_a_rack_of_named_students_with_their_own_rates(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(
+            monkeypatch,
+            "--net",
+            "teacher=resnet:1x4",
+            "--grow",
+            "wide=resnet:1x8",
+            "--grow",
+            "deep=resnet:2x4",
+            "--grow",
+            "resnet:1x16",
+            "--grow-switch-at",
+            "80,90,100",
+            "--grow-frozen",
+            "--grow-train-waiting",
+            "--lr",
+            "1e-4",
+            "--lr-of",
+            "deep=5e-5",
+            "--weight-decay-of",
+            "deep=0.05",
+        )
+    kwargs = built.value.kwargs
+    growth = kwargs["growth"]
+    assert growth.names == ("teacher", "wide", "deep", "1x16")
+    wide, deep, plain = growth.learners
+    assert (wide.lr_scale, wide.hyperparams) == (1.0, {})
+    assert deep.lr_scale == pytest.approx(0.5)
+    assert deep.hyperparams == {"weight_decay": 0.05}
+    assert plain.lr_scale == 1.0
+    # the specs, not their names, make the networks
+    assert deep.nn is not wide.nn
+    assert (kwargs["train_waiting"], kwargs["train_playing"]) == (True, False)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ("--grow-train-waiting",),
+        ("--grow", "a=resnet:2x8", "--grow-switch-at", "80", "--lr-of", "b=1e-4"),
+        ("--grow", "a=resnet:2x8", "--grow-switch-at", "80", "--lr-of", "a=0"),
+        ("--grow", "a=resnet:2x8", "--grow-switch-at", "80", "--lr-of", "a"),
+        (
+            "--grow",
+            "a=resnet:2x8",
+            "--grow-switch-at",
+            "80",
+            "--weight-decay-of",
+            "a=-1",
+        ),
+        (
+            "--grow",
+            "a=resnet:2x8",
+            "--grow-switch-at",
+            "80",
+            "--lr-of",
+            "a=1e-4",
+            "--lr-of",
+            "a=2e-4",
+        ),
+    ],
+)
+def test_bad_rack_options_are_refused(monkeypatch, options):
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, *options)
+
+
+def test_named_specs():
+    assert train.named_spec("r7=resnet:7x64,expand=2") == ("r7", "resnet:7x64,expand=2")
+    assert train.named_spec("resnet:7x64,expand=2") == (None, "resnet:7x64,expand=2")
+    assert train.net_name("r7=resnet:7x64") == "r7"
+    assert train.net_name("resnet:7x64,expand=2") == "7x64"
+
+
 def test_a_frozen_teacher_needs_grow(monkeypatch):
     with pytest.raises(SystemExit):
         run_main(monkeypatch, "--grow-frozen")
