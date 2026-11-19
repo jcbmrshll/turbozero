@@ -409,12 +409,12 @@ plays. `--grow-train-retired` keeps the networks that played before training on 
 rather than `--train-steps`, e.g. what its own play would afford for the same compute. With
 `--grow-manual`, nothing takes over by itself: the run logs `growth_caught_up` (1 once
 the rule would switch), saved states record it too, and the next network takes over in a branch
-of the run, with `--branch-from` and `--take-over` (see the run controller below). A branch can
-also grow past the networks the run started with: `--grow` networks after the saved state's
-last start from scratch, as one that hasn't joined a run yet does, so a run whose last network
-plays can go on into a bigger one.
+of the run, with `--branch-from` and `--take-over` (see the run controller below). A branch
+matches its networks to the saved state's by name: one the state hasn't starts from scratch, as
+one that hasn't joined a run yet does (so a run whose last network plays can go on into a bigger
+one), and one the branch leaves out is dropped, unless it plays (see the rack of students below).
 
-Each network's checkpoints go to `--ckpt-dir/<its size>`, e.g. `runs/grow/2x32` and `runs/grow/4x64`.
+Each network's checkpoints go to `--ckpt-dir/<its name>` (its size unless `NAME=SPEC` names it), e.g. `runs/grow/2x32` and `runs/grow/4x64`.
 Saved states hold every network, in `--ckpt-dir`. Each network's metrics are logged as
 `<its size>/<metric>`, and the playing network's also without the prefix. The run logs which
 network played (`growth_playing`), the next's mean metric minus the playing one's (`growth_gap`),
@@ -432,6 +432,50 @@ uv run examples/othello/train.py --net resnet:2x32,pool_every=2,heads=pooled,poo
     --grow resnet:4x64,pool_every=2,heads=pooled,pool_channels=16 --engine-eval-every 1 \
     --lr-plateau --lr-plateau-stop --epochs 600 --ckpt-dir runs/grow
 ```
+
+### A rack of students
+
+To compare candidate architectures quickly, train them side by side as students of a fixed
+teacher, on its self-play games. `--grow-frozen --grow-train-waiting` does that within one run:
+`--net` (the teacher, forked from a saved state with `--init-from`) plays and never trains, and
+every `--grow` network trains on its games each epoch, `--train-steps` steps each. `NAME=SPEC`
+names a network (`--grow r7=resnet:7x64,...`), so students of one size can sit side by side, and
+`--lr-of NAME=LR` and `--weight-decay-of NAME=WD` give one its own rate and decay. A branch
+(`--branch-from`) matches networks to the saved state's by name: it may drop students (all but
+the teacher) and add new ones, which start from scratch, while every student it keeps goes on
+exactly where it was: weights, optimizer state, step count and weight averages.
+
+`student_rack.py` runs such a rack in short segments, each ending in a saved state. Its
+roster, `rack.toml` in the rack's directory, lists the teacher, the students, their learning
+rates, and the train.py options of every segment. `run` reads it before each segment, so
+changes take effect at the next boundary: a student left out is dropped, a new one joins,
+and `stop = true` ends the run. `init` writes a roster for the ray 9x64 (run 860) as the
+teacher, with the self-play recipe it trained with, and two control students, a ray 7x64 and a
+ray 9x64.
+
+The rack is for quick iterations on architectures, not for training final networks: candidates
+are ranked on cheap metrics, and the promising ones then train in self-play from scratch and
+are evaluated in games. `status` prints each student's metrics on the engine set (its weight
+average's value error and regret, and its training loss), over its last epochs or at equal
+training (`--age N`: each student's own epochs up to N, for students that joined at different
+times). `checkpoints` lists each student's newest weight-average checkpoint and spec, for
+evaluating one further. `graduate` forks a student into a run of its own self-play from the
+newest state, with its weights, optimizer, averages and the teacher's replay buffer, which its
+games then replace.
+
+```
+uv run examples/othello/student_rack.py init runs/rack      # the 9x64 ray teacher's recipe
+$EDITOR runs/rack/rack.toml                                 # add [[students]]
+uv run examples/othello/student_rack.py run runs/rack
+uv run examples/othello/student_rack.py status runs/rack --age 40
+uv run examples/othello/student_rack.py checkpoints runs/rack
+uv run examples/othello/student_rack.py graduate runs/rack r7 --epochs 200 --ckpt-dir runs/r7
+```
+
+The rack's directory holds the roster, `ledger.json` (the segments, who trained in each, and
+when each student joined and left), `ckpt/` (each network's checkpoints in `ckpt/<name>/`, and
+the newest `keep_states` saved states) and `logs/`. A name is never reused, so each student's
+checkpoints and metrics stay its own.
 
 ### Weight averages
 
