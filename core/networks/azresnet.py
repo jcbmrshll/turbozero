@@ -33,14 +33,18 @@ class AZResnetConfig:
         bottleneck_inner: basic blocks inside each bottleneck block
         expand: the ConvNeXt blocks' hidden width, in multiples of `num_channels`
         expand_norm: the ConvNeXt blocks also normalize their hidden channels, after the expand
-            convolution and the global pooling bias, before the ReLU. With BatchNorm it folds into
-            the expand convolution and the pooling bias's linear map in inference
+            convolution, before the global pooling bias and the ReLU. With BatchNorm it folds into
+            the expand convolution in inference. The pooling bias comes after it: under the norm,
+            whatever part of the bias hardly varies from input to input cost nothing in training,
+            and grew to 2-6 standard deviations of the hidden channels in the ray net, which any
+            change of its weights (e.g. their average) then moved by many
         project_norm: the ConvNeXt blocks also normalize their output, after the project
             convolution, its learned scale starting at zero (Goyal et al.'s zero gamma) in place
             of a zeroed project convolution. With BatchNorm it folds into the project convolution
             in inference. With `stem_norm` and `expand_norm` as well, every convolution of a
             BatchNorm ConvNeXt trunk is followed by a normalization, and the function the trunk
-            computes no longer depends on the scale of any weight that weight decay shrinks
+            computes no longer depends on the scale of any convolution's weights, which weight
+            decay shrinks (the pooling biases' linear maps still do)
         dw_kernel: the ConvNeXt blocks' depthwise filters' size: every square within
             `dw_kernel // 2` rows and columns (odd)
         dw_taps: the depthwise filters' taps instead, as (row, column) offsets from the square
@@ -697,9 +701,9 @@ class PreActConvNeXt(eqx.Module):
     trunk itself (see `Depthwise`), one normalization, then a per-square MLP of 1x1 convolutions
     through `hidden` channels. With global pooling, the last `pool_channels` of the normalized
     features, pooled over the board, bias the hidden channels. project starts at zero (see
-    `zeroed`). Optionally normalized after expand (with the pooling bias added) and after project
-    too, `expand_norm` and `project_norm`: x + project_norm(project(relu(expand_norm(expand(y) +
-    pool bias)))), project_norm's scale then starting at zero instead (see `zero_scale`)."""
+    `zeroed`). Optionally normalized after expand and after project too, `expand_norm` and
+    `project_norm`: x + project_norm(project(relu(expand_norm(expand(y)) + pool bias))),
+    project_norm's scale then starting at zero instead (see `zero_scale`)."""
 
     dw: Depthwise
     norm: Norm
@@ -758,14 +762,14 @@ class PreActConvNeXt(eqx.Module):
     ) -> tuple[jax.Array, eqx.nn.State]:
         y = self.dw(x, dtype)
         y, state = norm_act(self.norm, y, state, dtype, relu=False)
-        h = convolve(self.expand, y, dtype)
+        if self.expand_norm is None:
+            h = convolve(self.expand, y, dtype)
+        else:
+            h, state = conv_norm(self.expand, self.expand_norm, y, state, dtype)
         if self.pool_linear is not None:
             bias = self.pool_linear(board_pool(y[-self.pool_channels :]))
             h = h + bias.reshape(-1, 1, 1).astype(h.dtype)
-        if self.expand_norm is None:
-            h = jax.nn.relu(h)
-        else:
-            h, state = norm_act(self.expand_norm, h, state, dtype)
+        h = jax.nn.relu(h)
         if self.project_norm is None:
             y = convolve(self.project, h, dtype)
         else:
