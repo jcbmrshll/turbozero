@@ -12,9 +12,10 @@ from turbozero.types import EnvStepFn, LeafEvalFn, StepMetadata
 
 
 class MCTS(Evaluator):
-    """Monte Carlo tree search, with a network's policy and value at each leaf
-    instead of rollouts, as in AlphaZero. Its state is an `MCTSTree`; every
-    method is a pure function of it, so searches jit and vmap.
+    """Monte Carlo tree search that evaluates its leaves with `leaf_eval_fn`,
+    a policy and a value (e.g. a network's, as in AlphaZero), rather than with
+    rollouts. Its state is an `MCTSTree`; every method is a pure function of
+    it, so searches jit and vmap.
 
     Each iteration traverses the tree with `action_selector` to a leaf, steps
     the environment to it, evaluates it with `leaf_eval_fn` and backs its value
@@ -126,8 +127,8 @@ class MCTS(Evaluator):
     def root_prior(
         self, noise: jax.Array, policy: jax.Array, action_mask: jax.Array
     ) -> jax.Array:
-        """The root's prior, from the search's `noise` and the network's policy
-        (0 for illegal actions): the policy itself.
+        """The root's prior, from the search's `noise` and the leaf evaluation's
+        policy (0 for illegal actions): the policy itself.
         """
         return policy
 
@@ -142,8 +143,8 @@ class MCTS(Evaluator):
         env_step_fn: EnvStepFn,
     ) -> MCTSTree:
         """The root's evaluation (cycle 0) or an iteration, as `evaluate` makes
-        them, with the same keys. Either way one network evaluation, so a batch
-        of searches at different cycles evaluates the network once. Past
+        them, with the same keys. Either way one call of `leaf_eval_fn`, so a
+        batch of searches at different cycles makes one batched call. Past
         `num_iterations`, more iterations, each with a key of its own.
         """
         root_key, iterate_key, _ = jax.random.split(key, 3)
@@ -160,10 +161,10 @@ class MCTS(Evaluator):
         traverse_key, leaf_eval_key, _ = jax.random.split(iteration_key, 3)
         root_eval_key, _ = jax.random.split(root_key)
         at_root = cycle == 0
-        # the network evaluates the root or the leaf, then the tree takes one of
-        # the two updates. Both are computed, as under vmap a lax.cond would, but
-        # each writes only what it changes, where a cond would select between
-        # two whole trees
+        # `leaf_eval_fn` evaluates the root or the leaf, then the tree takes one
+        # of the two updates. Both are computed, as under vmap a lax.cond would,
+        # but each writes only what it changes, where a cond would select
+        # between two whole trees
         leaf = self.find_leaf(traverse_key, state, env_step_fn)
         policy_logits, value = self.leaf_eval_fn(
             jax.tree.map(lambda r, l: jnp.where(at_root, r, l), env_state, leaf[2]),
@@ -220,7 +221,7 @@ class MCTS(Evaluator):
         value: ArrayLike,
         write: ArrayLike = True,
     ) -> MCTSTree:
-        """The tree with the network's evaluation of the root: its prior (see
+        """The tree with `leaf_eval_fn`'s evaluation of the root: its prior (see
         `root_prior`), and its value and one visit unless a reused root has
         them already. Unchanged unless `write` (see `Tree.set_root`).
         """

@@ -166,7 +166,7 @@ def assert_trees_equal(a, b):
 
 
 def evaluate_root(search, tree, state, meta):
-    """The root's update `evaluate` makes: the network's evaluation of `state`, at the root."""
+    """The root's update `evaluate` makes: `leaf_eval_fn`'s evaluation of `state`, at the root."""
     policy_logits, value = search.leaf_eval_fn(state, None, jax.random.PRNGKey(0))
     return search.expand_root(tree, state, meta, policy_logits, value)
 
@@ -369,7 +369,7 @@ def test_an_iteration_revisits_a_terminal_child_with_its_outcome(fixed_length_en
 
     tree = iterate(search, env)(jax.random.PRNGKey(0), tree)
 
-    # no new node: the child is visited again, with the outcome rather than the network's value
+    # no new node: the child is visited again, with the outcome rather than the evaluated value
     assert int(tree.next_free_idx) == 2
     assert int(tree.data_at(1).n) == 2 and float(tree.data_at(1).q) == pytest.approx(-1)
     assert int(root(tree).n) == 3 and float(root(tree).q) == pytest.approx(1)
@@ -516,7 +516,7 @@ class RecordingSelector(PUCTSelector):
 
 
 class KeyRecordingMCTS(MCTS):
-    """MCTS whose network evaluations and selections record the key each one receives."""
+    """MCTS whose leaf evaluations and selections record the key each one receives."""
 
     def __init__(self, **kwargs):
         def leaf_eval_fn(state, params, key):
