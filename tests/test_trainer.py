@@ -916,38 +916,42 @@ def test_fork_starts_from_the_saved_network_optimizer_and_buffers(env, tmp_path)
     assert leaves_equal(adam, saved_adam) and int(adam.count) == 2
     assert int(saved_schedule.count) == 2 and int(schedule.count) == 0
     assert int(train_state.step) == 0
-    # the replay buffer as saved, without the entries of the games that were in progress
-    buffer, saved_buffer = (
-        collection_state.buffer_state,
-        saved.collection_state.buffer_state,
-    )
-    assert not saved_buffer.has_reward.all()
-    assert leaves_equal(buffer.buffer, saved_buffer.buffer)
-    np.testing.assert_array_equal(
-        buffer.populated, saved_buffer.populated & saved_buffer.has_reward
-    )
-    np.testing.assert_array_equal(buffer.next_idx, saved_buffer.episode_start_idx)
-    assert np.asarray(buffer.has_reward).all()
-    # the tree positions as saved, and the move counts their ages are measured by
+    # the collection state as saved: its replay buffer with the game in progress, the tree
+    # positions, the move counts their ages are measured by, and the games and their search
+    # states, so self-play goes on as the saved run's would
+    assert not saved.collection_state.buffer_state.has_reward.all()
     assert leaves_equal(
-        collection_state.tree_buffer_state, saved.collection_state.tree_buffer_state
+        replace(collection_state, episode_metrics={}),
+        replace(saved.collection_state, episode_metrics={}),
     )
-    for name in ("tree_written_at", "moves"):
-        np.testing.assert_array_equal(
-            getattr(collection_state, name), getattr(saved.collection_state, name)
-        )
-    # new games, and search trees for the fork's evaluator
-    env_state, metadata, eval_state = fork.init_games(
-        key, fork.batch_size, fork.collection_schedule.at(0)
+
+
+def test_fork_keeps_the_games_waiting_for_solves(env, tmp_path):
+    # a fork labels the saved run's finished games waiting for their solves, as the saved run
+    # would have, rather than leaving their places in the buffer empty
+    trunk = solving_trainer(env, tmp_path / "trunk")
+    state = trunk.init_collection_state(jax.random.PRNGKey(0), trunk.batch_size)
+    assert state.pending is not None
+    pending = replace(
+        state.pending,
+        added=jnp.array([2, 1], dtype=jnp.int32),
+        entry_solve=state.pending.entry_solve.at[:, :3].set(0),
     )
-    assert leaves_equal(
-        (
-            collection_state.env_state,
-            collection_state.metadata,
-            collection_state.eval_state,
-        ),
-        (env_state, metadata, eval_state),
+    output = TrainLoopOutput(
+        collection_state=replace(state, pending=pending),
+        train_states=(trained_state(trunk),),
+        test_states=([],),
+        cur_epoch=2,
+        key=jax.random.PRNGKey(5),
     )
+    saved = snapshot(pending)
+    path = trunk.save_state(output)
+
+    forked, _ = solving_trainer(env, tmp_path / "fork").fork_state(
+        path, jax.random.PRNGKey(0)
+    )
+
+    assert leaves_equal(forked.pending, saved)
 
 
 @pytest.mark.parametrize("capacity", [4, 16])
@@ -964,13 +968,9 @@ def test_fork_resizes_the_replay_buffers(env, tmp_path, capacity):
 
     saved = saved.collection_state
     pairs = [
-        # without the games in progress
+        # with the games in progress
         (
-            by_age(
-                replace(
-                    saved.buffer_state, next_idx=saved.buffer_state.episode_start_idx
-                )
-            ),
+            by_age(saved.buffer_state),
             by_age(loaded.buffer_state),
             min(8, capacity),
         ),
@@ -1046,11 +1046,10 @@ def test_a_fork_records_its_parent(env, tmp_path, fake_loop):
         "parent": None,
     }
     assert monitor.started[0]["parent"] == parent
-    # it trains on the saved replay buffer, without the games that were in progress
-    saved_buffer = saved.collection_state.buffer_state
+    # it trains on the saved replay buffer, with the games that were in progress
     np.testing.assert_array_equal(
         of_kind(calls, "train")[0].state.buffer_state.populated,
-        saved_buffer.populated & saved_buffer.has_reward,
+        saved.collection_state.buffer_state.populated,
     )
     # its own saved states record it, for forks of the fork
     meta = read_state_meta(state_path(fork.ckpt_dir, 1))
