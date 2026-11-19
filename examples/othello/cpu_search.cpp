@@ -942,19 +942,22 @@ int net_set_conv(net::Net* n, const char* where, int block, int cin, int cout, i
     if (c == &n->stem) {
         if (cin != 4 || k != 3) return -1;
         net::stem_table(*c, q);
-    } else if (name == "expand" || name == "project") {
-        if (k != 1 || cin % 16) return -1;
-        net::pack1x1(*c, q);
-    } else {
+    } else if (name != "expand" && name != "project") {
         net::pack(*c, q);
+    } else if (k != 1 || cin % 16 || (name == "project" && zero_point != 0)) {
+        // (a project's input is ReLU's, from 0: AVX2's kernels take its zero point as 0)
+        return -1;
     }
     c->scale.assign(scale, scale + cout);
     c->bias.assign(bias, bias + cout);
     c->inverse.assign(inverse, inverse + cin);
     c->zero_point = zero_point;
+    if (name == "expand" || name == "project") {
 #ifdef NET_SEVEN_BIT
-    if (name == "expand" || name == "project") net::seven_bit(*c, q);
+        net::seven_bit(*c, q);
 #endif
+        net::pack1x1(*c, q, name == "expand");
+    }
     return 0;
 }
 

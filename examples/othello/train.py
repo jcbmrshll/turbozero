@@ -11,8 +11,11 @@ openings (see xot.py), which keeps them varied.
     uv run examples/othello/train.py --sims-schedule 0:32,50:64,150:128
 
 Every epoch it scores the network on the engine-labelled set, if there is one (see
-engine_set.py and --engine-set), logged as `engine_*`: `engine_exp_regret`, the discs its
-policy gives up against Edax's best move, is the one to watch. Games measure strength:
+engine_set.py and --engine-set), logged as `engine_*`. `engine_result_change`, how likely the
+prior play's search starts from is to pick a move that worsens the result Edax predicts, is the
+one to watch: it ranks a run's checkpoints by strength. `filtered_engine_*` are the same over
+only the positions the network decides, from the XOT opening to the exact solver's 20 empty
+squares. Games measure strength:
 `evaluate.py` plays checkpoints against engines and each other, and the Elo league rates them.
 
 With --monitor the run logs to slick's seaglass server ($SEAGLASS_URL, set in a slick task;
@@ -58,6 +61,7 @@ from engine_set import EngineSet
 from exact_labels import SOLVERS, default_threads, make_solve_fn, solve_slots, stops_at
 from game import (
     DEFAULT_NET,
+    PLAY_PRIOR_TEMPERATURE,
     SGD_WEIGHT_DECAY,
     SYMMETRY_TRANSFORM_FNS,
     TRAVERSAL_STEPS,
@@ -129,13 +133,13 @@ def lr_drops(text: str) -> list[tuple[float, float]]:
 
 
 def warm_start_spec(text: str) -> tuple[str, str]:
-    """Parses --warm-start: SIZE=PATH."""
-    size, sep, path = text.partition("=")
-    if not (size and sep and path):
+    """Parses --warm-start: NAME=PATH."""
+    name, sep, path = text.partition("=")
+    if not (name and sep and path):
         raise argparse.ArgumentTypeError(
-            f"{text!r} isn't SIZE=PATH, e.g. 4x64=run/state-100.npz"
+            f"{text!r} isn't NAME=PATH, e.g. 4x64=run/state-100.npz"
         )
-    return size, path
+    return name, path
 
 
 def lr_drop_spec(text: str) -> LRDrop:
@@ -177,6 +181,21 @@ def positive_schedule(text: str) -> list[tuple[int, int]]:
     if any(value < 1 for _, value in schedule):
         raise argparse.ArgumentTypeError(f"values must be positive, got {text!r}")
     return schedule
+
+
+def solve_empties(text: str) -> int | None:
+    """Parses --solve-empties: empty squares in [0, 60), or "off" (None)."""
+    if text == "off":
+        return None
+    try:
+        empties = int(text)
+    except ValueError:
+        empties = -1
+    if not 0 <= empties < 60:
+        raise argparse.ArgumentTypeError(
+            f"empty squares in [0, 60) or off, got {text!r}"
+        )
+    return empties
 
 
 def play_past(text: str) -> float:
@@ -229,10 +248,35 @@ def load_engine_set(
 
 
 def net_name(spec: str) -> str:
-    """A network's short name, for --grow's metrics and checkpoint directories: its size, e.g.
-    4x64 for resnet:4x64,pool_every=2."""
+    """A network's short name, for --grow's metrics and checkpoint directories: the name a
+    NAME=SPEC gives it (see `named_spec`), or its size, e.g. 4x64 for resnet:4x64,pool_every=2."""
+    name, spec = named_spec(spec)
+    if name is not None:
+        return name
     found = re.search(r"\d+x\d+", spec)
     return found.group(0) if found else spec.split(",")[0].replace(":", "-")
+
+
+def named_spec(text: str) -> tuple[str | None, str]:
+    """A --net or --grow network: NAME=KIND:..., e.g. r7e3=resnet:7x64,expand=3, as its name
+    and spec, or an unnamed spec (KIND:...) as None and the spec."""
+    found = re.fullmatch(r"([A-Za-z0-9_.+-]+)=([a-z]+:.*)", text)
+    if found is None:
+        return None, text
+    return found.group(1), found.group(2)
+
+
+def per_network(text: str) -> tuple[str, float]:
+    """Parses --lr-of and --weight-decay-of: NAME=VALUE."""
+    name, sep, value = text.partition("=")
+    try:
+        if not (name and sep):
+            raise ValueError
+        return name, float(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} isn't NAME=VALUE, e.g. r7e3=5e-5"
+        ) from e
 
 
 def main():
@@ -242,10 +286,11 @@ def main():
     parser.add_argument(
         "--net",
         default=DEFAULT_NET,
-        help="the network: KIND:DEPTHxWIDTH[,FIELD=VALUE...], e.g. resnet:10x128 for "
+        help="the network: [NAME=]KIND:DEPTHxWIDTH[,FIELD=VALUE...], e.g. resnet:10x128 for "
         "AlphaZero's ResNet with 10 blocks of 128 channels, resnet:10x128,pool_every=3,"
         "heads=pooled with KataGo's global pooling, or transformer:8x256 (see "
-        "core.networks.spec.network_config)",
+        "core.networks.spec.network_config). With --grow, NAME (default its size) names it "
+        "in metrics, checkpoint directories and the --grow options that take a network",
     )
     parser.add_argument(
         "--grow",
@@ -255,8 +300,8 @@ def main():
         help="a bigger network to grow into (repeat for several, smallest first), as --net: "
         "--net plays self-play first, and each takes over in turn, training alongside the one "
         "playing until it does, on the same replay buffer (see core/training/growth.py). Each "
-        "network's checkpoints go to --ckpt-dir/<its size>, and its metrics are logged as "
-        "<its size>/<metric>",
+        "network's checkpoints go to --ckpt-dir/<its name>, and its metrics are logged as "
+        "<its name>/<metric>: NAME=SPEC names it, by default its size (e.g. 4x64)",
     )
     parser.add_argument(
         "--grow-metric",
@@ -282,6 +327,14 @@ def main():
         help="with --grow, the networks that played before the one playing keep training on "
         "its games, --train-steps each an epoch (for the record: not compute-optimal); a "
         "resumed or branched run can turn it on or off",
+    )
+    parser.add_argument(
+        "--grow-train-waiting",
+        action="store_true",
+        help="with --grow, every network after the one playing trains on its games, --train-steps "
+        "each an epoch, not only the next: a battery of students beside --net as a fixed teacher "
+        "(--grow-frozen, forked with --init-from), see student_rack.py. A resumed or branched "
+        "run can turn it on or off, and a branch can drop students and add new ones",
     )
     parser.add_argument(
         "--grow-frozen",
@@ -335,6 +388,25 @@ def main():
         metavar="LR",
         help="the --grow networks' learning rate, where --lr is the first network's (their "
         "schedules are --lr's, scaled by --grow-lr / --lr); default --lr",
+    )
+    parser.add_argument(
+        "--lr-of",
+        type=per_network,
+        action="append",
+        default=[],
+        metavar="NAME=LR",
+        help="with --grow, one --grow network's own learning rate, in place of --grow-lr "
+        "(its schedule is --lr's, scaled). Repeatable",
+    )
+    parser.add_argument(
+        "--weight-decay-of",
+        type=per_network,
+        action="append",
+        default=[],
+        metavar="NAME=WD",
+        help="with --grow, one --grow network's own --weight-decay (scaled by its learning rate "
+        "as --weight-decay is by --lr's, so drop it with the rate to hold its weight norm). "
+        "Repeatable",
     )
     parser.add_argument(
         "--grow-manual",
@@ -454,7 +526,7 @@ def main():
         "-THRESHOLD: 0.95 (an expected score of 2.5%%) if no threshold is given, 0.9 for "
         "5%%. Saves the searches of decided endgames for more games at "
         "the same compute: on 4x64 at 0.9, 1.26x the games per epoch, +7 ± 17 Elo. "
-        "Default: games are played to the end",
+        "Needs --solve-empties off. Default: no resigning",
     )
     parser.add_argument(
         "--resign-calibration",
@@ -465,31 +537,33 @@ def main():
     )
     parser.add_argument(
         "--solve-empties",
-        type=int,
-        default=None,
+        type=solve_empties,
+        default=20,
         metavar="N",
-        help="exact endgame labels: self-play's games stop at N or fewer empty squares, and "
-        "an exact solver's result for that position is every position's value target (see "
-        "exact_labels.py). A game stopped in an epoch is solved during the next epoch's "
-        "self-play and trained on from then. Default: games are played to the end",
+        help="exact endgame labels: once a self-play game reaches N or fewer empty squares, "
+        "an exact solver's result for that position is every earlier position's value "
+        "target, and with the default --solve-play-past end each stored position from there "
+        "on gets its own exact result (see exact_labels.py). A game cut in an epoch is "
+        "solved during the next epoch's self-play and trained on from then. Default 20; off "
+        "plays games to the end and labels them with the played result",
     )
     parser.add_argument(
         "--solve-share",
         type=float,
         default=1.0,
-        help="with --solve-empties, the fraction of games that stop; the others are played "
-        "to the end, so that training still sees positions past N",
+        help="with --solve-empties, the fraction of games labelled exactly; the others are "
+        "played to the end and labelled with their played result",
     )
     parser.add_argument(
         "--solve-play-past",
         type=play_past,
-        default=0.0,
+        default=math.inf,
         metavar="MEAN",
         help="with --solve-empties, games play on past N empty squares, ending before each "
         "further move with probability 1 / (1 + MEAN): MEAN moves on average; end (or inf) "
         "plays every game to its end. Each position stored past N is solved and labelled on "
         "its own, so the network still trains on positions past N, which searches from above "
-        "N reach. Default 0: games stop at N",
+        "N reach. 0 stops games at N. Default end",
     )
     parser.add_argument(
         "--solver",
@@ -832,11 +906,11 @@ def main():
     parser.add_argument(
         "--average-norm-batches",
         type=int,
-        default=0,
+        default=32,
         metavar="N",
         help="each weight average gets BatchNorm statistics of its own after every epoch, from N "
         "training batches of the replay buffer through its weights, for self-play, tests and its "
-        "checkpoints (0: averages play with the network's statistics, which fit its own weights)",
+        "checkpoints (0: averages play with the network's statistics, which fit only its own weights)",
     )
     parser.add_argument(
         "--save-state-at",
@@ -878,10 +952,10 @@ def main():
     parser.add_argument(
         "--fork-into",
         default=None,
-        metavar="SIZE",
-        help="with --init-from: the saved run's network to fork, by size (e.g. 8x128), from a "
-        "--grow run's state too. With --grow, it forks into this "
-        "run's network of that size, which plays from the start; the ones before it are retired "
+        metavar="NAME",
+        help="with --init-from: the saved run's network to fork, by name (its size, e.g. 8x128, "
+        "unless NAME=SPEC named it), from a --grow run's state too. With --grow, it forks into "
+        "this run's network of that name, which plays from the start; the ones before it are retired "
         "(training beside it with --grow-train-retired), the next waits, and the rest start from "
         "scratch. Without --grow, it is this run's --net, trained alone",
     )
@@ -890,10 +964,10 @@ def main():
         type=warm_start_spec,
         action="append",
         default=[],
-        metavar="SIZE=PATH",
-        help="with --grow, in a new run: this run's network of that size (e.g. 4x64) starts from "
+        metavar="NAME=PATH",
+        help="with --grow, in a new run: this run's network of that name (e.g. 4x64) starts from "
         "a saved state's (state-<EPOCH>.npz, or a --ckpt-dir to take the newest from; a --grow "
-        "run's network of that size, or a run's one network) instead of from scratch, with its "
+        "run's network of that name, or a run's one network) instead of from scratch, with its "
         "optimizer state (the learning rate decaying anew) and weight averages, "
         "e.g. a student beside a teacher forked with --init-from and --fork-into. Repeatable; "
         "not the network --init-from forks into",
@@ -972,6 +1046,26 @@ def main():
         parser.error("--grow-train-retired is for a run with --grow")
     if args.grow_frozen and not args.grow:
         parser.error("--grow-frozen is for a run with --grow")
+    if args.grow_train_waiting and not args.grow:
+        parser.error("--grow-train-waiting is for a run with --grow")
+    grown_names = [net_name(spec) for spec in args.grow]
+    for option, given in (
+        ("--lr-of", args.lr_of),
+        ("--weight-decay-of", args.weight_decay_of),
+    ):
+        names = [name for name, _ in given]
+        unknown = sorted(set(names) - set(grown_names))
+        if unknown:
+            parser.error(
+                f"{option}: no --grow network {', '.join(unknown)} (they are "
+                f"{', '.join(grown_names) or 'none'})"
+            )
+        if len(set(names)) != len(names):
+            parser.error(f"{option} names a network more than once")
+    if any(value <= 0 for _, value in args.lr_of):
+        parser.error("--lr-of takes positive learning rates")
+    if any(value < 0 for _, value in args.weight_decay_of):
+        parser.error("--weight-decay-of takes weight decays of at least 0")
     if args.grow_lr is not None and (not args.grow or args.grow_lr <= 0):
         parser.error("--grow-lr is a positive learning rate, with --grow")
     if any(h < 1 for h in args.average_epochs) or len(set(args.average_epochs)) != len(
@@ -1039,11 +1133,8 @@ def main():
         parser.error("--resign must be in (0, 1]")
     if not 0 <= args.resign_calibration <= 1:
         parser.error("--resign-calibration must be between 0 and 1")
-    if args.solve_empties is not None:
-        if not 0 <= args.solve_empties < 60:
-            parser.error("--solve-empties must be in [0, 60)")
-        if args.resign is not None:
-            parser.error("--solve-empties doesn't go with --resign")
+    if args.solve_empties is not None and args.resign is not None:
+        parser.error("--resign needs --solve-empties off")
     if not 0 <= args.solve_share <= 1:
         parser.error("--solve-share must be between 0 and 1")
     if args.dirichlet_alpha <= 0:
@@ -1097,9 +1188,10 @@ def main():
     test_init_fn = make_xot_init_fn(load_xot(), standard_start_fraction=0)
 
     def make_net(spec: str):
-        """A network (see game.py), with its state (BatchNorm's, if it has any)."""
+        """A network (see game.py), with its state (BatchNorm's, if it has any), from its
+        [NAME=]SPEC."""
         return make_network(
-            spec,
+            named_spec(spec)[1],
             seed=args.seed,
             inference_dtype=args.inference_dtype,
             train_dtype=args.train_dtype,
@@ -1160,21 +1252,25 @@ def main():
     )
 
     def make_testers(network) -> list[BaseTester]:
-        """A network's testers: the engine-labelled set."""
-        testers: list[BaseTester] = []
-        if engine_set is not None:
-            testers.append(
-                ScoredPositionsTester(
-                    engine_set.scored_positions(),
-                    network,
-                    epochs_per_test=args.engine_eval_every,
-                    config={
-                        "path": str(args.engine_set or DEFAULT_ENGINE_SET),
-                        **engine_set.describe(),
-                    },
-                )
+        """A network's testers: the engine-labelled set, all of its positions as engine_*, and
+        those between the opening and the solver as filtered_engine_*."""
+        if engine_set is None:
+            return []
+        config = {
+            "path": str(args.engine_set or DEFAULT_ENGINE_SET),
+            **engine_set.describe(),
+        }
+        return [
+            ScoredPositionsTester(
+                engine_set.scored_positions(filtered=filtered),
+                network,
+                epochs_per_test=args.engine_eval_every,
+                name=name,
+                config=config,
+                prior_temperature=PLAY_PRIOR_TEMPERATURE,
             )
-        return testers
+            for name, filtered in (("engine", False), ("filtered_engine", True))
+        ]
 
     network, network_state = make_net(args.net)
     evaluator = make_selfplay(network)
@@ -1183,11 +1279,14 @@ def main():
     growth = None
     if args.grow:
         learners = []
+        lr_of, weight_decay_of = dict(args.lr_of), dict(args.weight_decay_of)
         for spec in args.grow:
             grown, grown_state = make_net(spec)
+            name = net_name(spec)
+            lr = lr_of.get(name, args.lr if args.grow_lr is None else args.grow_lr)
             learners.append(
                 Learner(
-                    name=net_name(spec),
+                    name=name,
                     nn=grown,
                     nn_state=grown_state,
                     evaluator=make_selfplay(grown),
@@ -1195,7 +1294,10 @@ def main():
                         make_nn_eval_fn(grown, state_to_nn_input)
                     ),
                     testers=make_testers(grown),
-                    lr_scale=1.0 if args.grow_lr is None else args.grow_lr / args.lr,
+                    lr_scale=lr / args.lr,
+                    hyperparams={"weight_decay": weight_decay_of[name]}
+                    if name in weight_decay_of
+                    else {},
                 )
             )
         try:
@@ -1266,6 +1368,7 @@ def main():
         growth=growth,
         waiting_train_steps=args.grow_train_steps,
         train_retired=args.grow_train_retired,
+        train_waiting=args.grow_train_waiting,
         train_playing=not args.grow_frozen,
         averages=args.average_epochs,
         selfplay_average=args.selfplay_average,

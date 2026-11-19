@@ -50,6 +50,7 @@ from core.evaluators.evaluation_fns import make_nn_eval_fn
 from core.league.cli import main
 from core.league.game import ExternalPlayer, LeagueGame
 from core.league.store import (
+    DEFAULT_C_INIT,
     DEFAULT_PRIOR_TEMPERATURE,
     DEFAULT_TREE_FACTOR,
     EngineSearch,
@@ -172,6 +173,7 @@ class Othello(LeagueGame):
         sims: int,
         tree_factor: int = DEFAULT_TREE_FACTOR,
         prior_temperature: float = DEFAULT_PRIOR_TEMPERATURE,
+        c_init: float = DEFAULT_C_INIT,
     ):
         return make_test_evaluator(
             make_nn_eval_fn(network, state_to_nn_input),
@@ -179,6 +181,7 @@ class Othello(LeagueGame):
             noise=False,
             tree_factor=tree_factor,
             prior_temperature=prior_temperature,
+            c_init=c_init,
         )
 
     def num_openings(self) -> int:

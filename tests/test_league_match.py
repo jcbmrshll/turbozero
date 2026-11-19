@@ -70,13 +70,15 @@ class TicTacToe(LeagueGame):
         logits = jax.random.normal(jax.random.PRNGKey(seed), (9,))
         return None, {"logits": logits, "value": jnp.array(0.0)}
 
-    def make_evaluator(self, network, sims, tree_factor=2, prior_temperature=1.0):
+    def make_evaluator(
+        self, network, sims, tree_factor=2, prior_temperature=1.0, c_init=1.25
+    ):
         return AlphaZero(MCTS)(
             eval_fn=eval_fn,
             num_iterations=sims,
             max_nodes=tree_factor * sims,
             branching_factor=9,
-            action_selector=PUCTSelector(),
+            action_selector=PUCTSelector(c_init=c_init),
             temperature=0.0,
             dirichlet_epsilon=0.0,
             prior_temperature=prior_temperature,
@@ -462,6 +464,16 @@ def test_a_prior_temperature_is_a_program_of_its_own(game, tmp_path):
     # the settings a batch records: a player at another temperature isn't the same player
     assert programs.settings(plain, 2)["prior_temperature"] == 1.0
     assert programs.settings(flat, 2)["prior_temperature"] == 1.6
+
+
+def test_a_c_init_is_a_program_of_its_own(game, tmp_path):
+    path = tmp_path / "1.ckpt"
+    path.write_text("1")
+    plain = Player(id=1, name="n@8", network="n", net="tiny", sims=8, path=str(path))
+    explore = replace(plain, id=2, name="n@8-c2", settings={"c_init": 2.0})
+    programs = Programs(game, "float32")
+    assert programs.settings(plain, 2)["action_selection_config"]["c_init"] == 1.25
+    assert programs.settings(explore, 2)["action_selection_config"]["c_init"] == 2.0
 
 
 def test_a_tiny_league_plays_and_rates(game, tmp_path):

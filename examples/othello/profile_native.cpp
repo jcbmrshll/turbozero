@@ -121,13 +121,13 @@ Block make_ray_block(int channels, bool pooled, int pool_channels) {
         c.k = 1;
         std::vector<int8_t> q((size_t)cout * cin);
         for (auto& v : q) v = (int8_t)std::uniform_int_distribution<int>(-127, 127)(rng);
-        pack1x1(c, q.data());
         for (int o = 0; o < cout; o++) {
             c.scale.push_back(1.0f / (40.0f * cin));
             c.bias.push_back(0.1f * normal());
         }
         for (int i = 0; i < cin; i++) c.inverse.push_back(40.0f);
         c.zero_point = zero_point;
+        pack1x1(c, q.data(), cin < cout);
         return c;
     };
     b.expand = conv1x1(channels, 2 * channels, 128);

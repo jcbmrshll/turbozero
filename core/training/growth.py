@@ -1,7 +1,7 @@
 """Growing the network as training goes: a run that starts with a small network and hands
 self-play over to bigger ones in turn (see `Growth`), as KataGo and Leela Zero grew theirs."""
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 
 import equinox as eqx
@@ -29,6 +29,10 @@ class Learner:
         lr_scale: (optional) its learning rate as a multiple of the optimizer's: its updates are
             scaled by this (on top of `lr_drop`'s), so that networks of one run can train at
             different rates, e.g. 5 for 5e-5 beside 1e-5
+        hyperparams: (optional) its own values of the optimizer's unscheduled hyperparameters,
+            e.g. {"weight_decay": 0.05}, in place of the `Trainer`'s (see
+            `Trainer.with_fixed_hyperparams`). With `lr_scale`, a decoupled weight decay's step
+            scales with its learning rate, as the decay of a run at that rate would
     """
 
     name: str
@@ -38,6 +42,7 @@ class Learner:
     testers: Sequence[BaseTester] = ()
     nn_state: eqx.nn.State | None = None
     lr_scale: float = 1.0
+    hyperparams: Mapping[str, float] = field(default_factory=dict)
 
     @property
     def schedule(self) -> EvaluatorSchedule:
@@ -310,6 +315,16 @@ class Growth:
                     "evaluator": learner.schedule.get_config(),
                     "evaluator_test": learner.evaluator_test.get_config(),
                     "testers": [tester.get_config() for tester in learner.testers],
+                    **(
+                        {"lr_scale": learner.lr_scale}
+                        if learner.lr_scale != 1.0
+                        else {}
+                    ),
+                    **(
+                        {"hyperparams": dict(learner.hyperparams)}
+                        if learner.hyperparams
+                        else {}
+                    ),
                 }
                 for learner in self.learners
             ],

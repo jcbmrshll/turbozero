@@ -115,6 +115,7 @@ class Programs:
             player.sims,
             player.tree_factor,
             player.prior_temperature,
+            player.c_init,
             games,
         )
         found = self.programs.get(key)
@@ -122,7 +123,11 @@ class Programs:
             assert player.sims is not None
             network, _ = self.network(player)
             found = self._compile(
-                network, player.sims, player.tree_factor, player.prior_temperature
+                network,
+                player.sims,
+                player.tree_factor,
+                player.prior_temperature,
+                player.c_init,
             )
             self.programs[key] = found
             self.compiled = True
@@ -132,10 +137,17 @@ class Programs:
         return found
 
     def _compile(
-        self, network: Any, sims: int, tree_factor: int, prior_temperature: float
+        self,
+        network: Any,
+        sims: int,
+        tree_factor: int,
+        prior_temperature: float,
+        c_init: float,
     ) -> Program:
         game = self.game
-        evaluator = game.make_evaluator(network, sims, tree_factor, prior_temperature)
+        evaluator = game.make_evaluator(
+            network, sims, tree_factor, prior_temperature, c_init
+        )
         return Program(
             init=jax.jit(
                 jax.vmap(lambda state: evaluator.init(template_embedding=state))

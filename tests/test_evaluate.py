@@ -219,6 +219,18 @@ def test_a_batched_networks_prior_temperature_makes_it_another_player(tmp_path):
     assert flat.label.endswith(" T1.6") and " T" not in resolve(base, 8).label
 
 
+def test_a_batched_networks_c_init_is_recorded_only_when_set(tmp_path):
+    checkpoint = tmp_path / "1.eqx"
+    checkpoint.write_bytes(b"params")
+    base = f"net:checkpoint={checkpoint},spec=s,device=gpu-batched,visits=100"
+    plain = resolve(base, 8)
+    explore = resolve(f"{base},c_init=1.14", 8)
+    # players from before c_init was an option keep their ids
+    assert "c_init" not in plain.config["search"] and " c" not in plain.label
+    assert explore.config["search"]["c_init"] == 1.14
+    assert explore.id != plain.id and explore.label.endswith(" c1.14")
+
+
 def test_engines_in_batched_matches_default_to_a_thread(engine_dir):
     assert (
         resolve(f"edax:level=8,dir={engine_dir}", 8, batched=True).config["threads"]
@@ -281,6 +293,18 @@ def test_a_network_runs_where_its_runtime_says(monkeypatch, tmp_path):
 
 
 # --- matches ---------------------------------------------------------------------------------
+
+
+def test_a_cloud_host_gets_the_solver_only_for_games_stopped_at_a_depth():
+    a = PlayerSpec({"kind": "engine"}, {}, "a", ("engines/a/bin",))
+    b = PlayerSpec({"kind": "engine"}, {}, "b", ("engines/b/bin",))
+    assert evaluate.job_files(MatchSpec(a, b, openings=1)) == [
+        "engines/a/bin",
+        "engines/b/bin",
+    ]
+    files = evaluate.job_files(MatchSpec(a, b, openings=1, solve_at=28))
+    assert set(files) == {"engines/a/bin", "engines/b/bin", *evaluate.referee_files()}
+    assert all(f.endswith("target/release/cli") for f in evaluate.referee_files())
 
 
 def test_a_matchs_id_is_its_setup_and_where_its_played():

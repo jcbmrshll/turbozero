@@ -70,6 +70,7 @@ if __name__ == "__main__" and not wants_gpu(sys.argv[1:]):
 
 import numpy as np
 from clock_match import Game, elo, pair_summary
+from engines import RUNTIME, NeuralReversi, default_dir
 from eval_games import MatchSpec, numbers_of, play
 from eval_players import CACHE_DIR, parse, resolve
 
@@ -309,9 +310,19 @@ def play_here_in_jobs(
             raise SystemExit(f"jobs {failed} failed")
 
 
+def referee_files() -> list[str]:
+    """Neural Reversi's runtime files under `CACHE_DIR`: what scores a match's stopped games."""
+    root = default_dir(NeuralReversi.name).resolve().relative_to(CACHE_DIR.resolve())
+    return [f"{root}/{part}" for part in RUNTIME[NeuralReversi.name]]
+
+
 def job_files(spec: MatchSpec) -> list[str]:
-    """What a cloud host needs of `CACHE_DIR` for the match's players."""
-    files = sorted({f for p in (spec.a, spec.b) for f in p.files})
+    """What a cloud host needs of `CACHE_DIR` for the match's players, and for a match whose
+    games stop at a depth, of the solver that scores them (`clock_match.endgame_solve`)."""
+    files = sorted(
+        {f for p in (spec.a, spec.b) for f in p.files}
+        | (set(referee_files()) if spec.solve_at is not None else set())
+    )
     outside = [f for f in files if f.startswith("/")]
     if outside:
         raise SystemExit(

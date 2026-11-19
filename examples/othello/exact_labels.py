@@ -1,8 +1,8 @@
-"""Exact endgame labels for Othello self-play (train.py's --solve-empties, see
-core/training/endgame_solve.py): a game's solve point is its first position with `empties` or
-fewer empty squares, and an exact solver's result for it becomes the value target of every
-position before it; with --solve-play-past, the game plays on a few moves or to its end, each
-position stored past the solve point getting its own solved result.
+"""Exact endgame labels for Othello self-play (train.py's --solve-empties, on at 20 by default;
+see core/training/endgame_solve.py): a game's solve point is its first position with `empties`
+or fewer empty squares, and an exact solver's result for it becomes the value target of every
+position before it; with --solve-play-past (by default `end`), the game plays on a few moves or
+to its end, each position stored past the solve point getting its own solved result.
 
 Solvers:
 - `native`: endgame.py's C++ solver, a win/draw/loss solve (only the result's sign is needed),
