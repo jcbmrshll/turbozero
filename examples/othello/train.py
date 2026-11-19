@@ -898,6 +898,12 @@ def main():
         "long average lags it (1: the plain mean of the epochs so far until the horizon)",
     )
     parser.add_argument(
+        "--no-average-rescale",
+        action="store_true",
+        help="weight averages are plain moving averages of the weights, not rescaled to the "
+        "network's norms every epoch",
+    )
+    parser.add_argument(
         "--average-norm-batches",
         type=int,
         default=32,
@@ -1368,6 +1374,7 @@ def main():
         selfplay_average=args.selfplay_average,
         average_warmup=args.average_warmup,
         average_norm_batches=args.average_norm_batches,
+        average_rescale=not args.no_average_rescale,
         evaluator=evaluator,
         # stores `capacity` positions for each of the `batch_size` environments
         memory_buffer=EpisodeReplayBuffer(capacity=args.buffer),
