@@ -212,6 +212,18 @@ class TrainLoopOutput:
         return self.train_states[self.playing]
 
 
+def with_average(
+    train_state: TrainState,
+    average: Any,
+    average_states: Sequence[Any] | None,
+    n: int,
+) -> TrainState:
+    """`train_state` with the weights of an average, the `n`th, and its own network state if
+    `average_states` has one (see `Trainer.average_norm_states`), else the network's."""
+    nn_state = train_state.nn_state if average_states is None else average_states[n]
+    return replace(train_state, params=average, nn_state=nn_state)
+
+
 def extract_params(state: TrainState) -> Any:
     """Extracts model parameters from TrainState.
 
@@ -321,6 +333,10 @@ def read_state_meta(path: str) -> dict:
 
 # saved states' format, recorded in their metadata
 STATE_FORMAT = 2
+
+# folded into the run's key for the averages' own network states (see
+# `Trainer.average_norm_states`), so that the run's rng is the same with them as without
+AVERAGE_NORM_SALT = 0x61766E73
 
 
 def _describe(tree: Any) -> list[tuple[str, tuple[int, ...], str]]:
@@ -682,6 +698,7 @@ class Trainer:
         averages: Sequence[float] = (),
         selfplay_average: float | None = None,
         average_warmup: float = 10.0,
+        average_norm_batches: int = 0,
         log_moves: str | None = None,
         extra_config: dict | None = None,
     ):
@@ -844,12 +861,22 @@ class Trainer:
                 (e.g. a `ScoredPositionsTester`) also run on it, logging `avg<horizon>/<metric>`.
                 A saved state keeps them (see `save_state`); a state saved without them, or with
                 other horizons, starts them at its weights. BatchNorm statistics aren't
-                averaged: an average plays with the network's current ones.
+                averaged: an average plays with the network's current ones, unless
+                `average_norm_batches` gives it its own.
             selfplay_average: (optional) self-play plays with this average (one of
                 `averages`) of the network playing, rather than its current weights
             average_warmup: the epochs an average takes in for each epoch its horizon grows
                 by, from 1 to its own (see `average_share`); 1 makes it the plain mean of the
                 epochs so far until its horizon
+            average_norm_batches: (optional) with `averages` and a network with state (e.g.
+                BatchNorm's statistics), each average gets statistics of its own after each
+                epoch, rather than playing with the network's: from the network's initial
+                state, those of this many training batches of the replay buffer, sampled and
+                transformed as training's are, through the average's weights (see
+                `average_norm_states`). The network's statistics fit its own weights, not its
+                average's; with a normalization after every convolution of an Othello ConvNeXt
+                net, its 4-epoch average lost 0.3-0.5 engine regret against its weights on them.
+                Not part of a saved state: a resumed run estimates them from the replay buffer
             log_moves: (optional) a directory to keep every move self-play plays in, whether
                 its search trains or not, an epoch's moves to a file (see
                 `core.memory.move_log`). It doesn't change training. A new directory, or one
@@ -1053,6 +1080,11 @@ class Trainer:
         if average_warmup <= 0:
             raise ValueError(f"average_warmup must be positive, got {average_warmup}")
         self.average_warmup = float(average_warmup)
+        if average_norm_batches < 0:
+            raise ValueError(
+                f"average_norm_batches can't be negative, got {average_norm_batches}"
+            )
+        self.average_norm_batches = average_norm_batches
         # checkpoints
         self.ckpt_dir = ckpt_dir
         self.max_checkpoints = max_checkpoints
@@ -1138,13 +1170,77 @@ class Trainer:
         """A network's weight averages before any epoch is in them: copies of its weights."""
         return tuple(jax.tree.map(jnp.copy, train_state.params) for _ in self.averages)
 
-    def selfplay_params(self, train_state: TrainState, averages: Sequence[Any]) -> Any:
+    def selfplay_params(
+        self,
+        train_state: TrainState,
+        averages: Sequence[Any],
+        average_states: Sequence[Any] | None = None,
+    ) -> Any:
         """The model parameters self-play plays with: the network's, or with `selfplay_average`,
-        that average's."""
+        that average's (with its own state, if `average_states` has it, see
+        `average_norm_states`)."""
         if self.selfplay_average is None:
             return self.extract_model_params_fn(train_state)
-        average = averages[self.averages.index(self.selfplay_average)]
-        return self.extract_model_params_fn(replace(train_state, params=average))
+        n = self.averages.index(self.selfplay_average)
+        return self.extract_model_params_fn(
+            with_average(train_state, averages[n], average_states, n)
+        )
+
+    def average_norm_states(
+        self,
+        key: jax.Array,
+        buffer_state: ReplayBufferState,
+        averages: Sequence[Any],
+        train_state: TrainState,
+        learner: int = 0,
+    ) -> tuple[Any, ...] | None:
+        """Each of `averages`' own network state (e.g. BatchNorm's statistics), with
+        `average_norm_batches`: from the network's initial state, updated in training mode on
+        that many batches of the replay buffer through the average's weights. None without
+        it, a network without state, or nothing in the buffer yet: the averages play with the
+        network's state."""
+        if not self.average_norm_batches or train_state.nn_state is None:
+            return None
+        mask = self.memory_buffer.sample_mask(buffer_state)
+        if not bool(mask.any()):
+            return None
+        keys = jax.random.split(key, len(averages))
+        return tuple(
+            self._norm_state(k, buffer_state, mask, average, learner=learner)
+            for k, average in zip(keys, averages, strict=True)
+        )
+
+    @partial(jax.jit, static_argnums=(0,), static_argnames=("learner",))
+    def _norm_state(
+        self,
+        key: jax.Array,
+        buffer_state: ReplayBufferState,
+        mask: jax.Array,
+        params: Any,
+        learner: int = 0,
+    ) -> Any:
+        """The network state training mode leaves after `average_norm_batches` batches of the
+        replay buffer through `params`, from the network's initial state."""
+        net = self.learners[learner]
+        nn = eqx.combine(params, eqx.filter(net.nn, eqx.is_inexact_array, inverse=True))
+
+        def one(state: Any, k: jax.Array) -> tuple[Any, None]:
+            sample_key, transform_key = jax.random.split(k)
+            indices = jnp.unravel_index(
+                self.memory_buffer.sample_indices(
+                    sample_key, mask, self.train_batch_size
+                ),
+                mask.shape,
+            )
+            batch = jax.tree.map(lambda x: x[indices], buffer_state.buffer)
+            batch = transform_randomly(transform_key, batch, self.transform_fns)
+            _, (_, state) = self.loss_fn(nn, state, batch)
+            return state, None
+
+        state, _ = jax.lax.scan(
+            one, net.nn_state, jax.random.split(key, self.average_norm_batches)
+        )
+        return state
 
     def get_config(self):
         """Returns a dictionary of the configuration of the trainer. Used for logging to the monitor.
@@ -4154,8 +4250,25 @@ class Trainer:
         )
         if self.lr_plateau is not None and lr_progress[playing_now()] is None:
             lr_progress[playing_now()] = LRPlateauProgress()
+        # each network's averages' own network states (see `average_norm_states`), from the
+        # replay buffer if it holds anything: a resumed run's, not saved with its state. Their
+        # keys are folded from the run's, so its rng is the same with them as without
+        average_states: list[tuple[Any, ...] | None] = [
+            self.average_norm_states(
+                jax.random.fold_in(key, AVERAGE_NORM_SALT + i),
+                collection_state.buffer_state,
+                averages[i],
+                ts,
+                learner=i,
+            )
+            if self.averages and averaged[i]
+            else None
+            for i, ts in enumerate(train_states)
+        ]
         params = self.selfplay_params(
-            train_states[playing_now()], averages[playing_now()]
+            train_states[playing_now()],
+            averages[playing_now()],
+            average_states[playing_now()],
         )
         # exact endgame labels' solver, on a thread of its own
         solver = ThreadPoolExecutor(1) if self.endgame_solve is not None else None
@@ -4185,7 +4298,9 @@ class Trainer:
             evaluator, collection_state = self.follow_schedule(
                 cur_epoch, evaluator, collection_state, playing
             )
-            params = self.selfplay_params(train_states[playing], averages[playing])
+            params = self.selfplay_params(
+                train_states[playing], averages[playing], average_states[playing]
+            )
             collect_key, key = jax.random.split(key)
             collect_keys = jax.random.split(collect_key, self.batch_size)
             # only the counts outlive the state donated to self-play: keeping the whole state
@@ -4323,6 +4438,14 @@ class Trainer:
                     for average, horizon in zip(averages[i], self.averages, strict=True)
                 )
                 averaged[i] += 1
+                if self.averages:
+                    average_states[i] = self.average_norm_states(
+                        jax.random.fold_in(key, AVERAGE_NORM_SALT + i),
+                        collection_state.buffer_state,
+                        averages[i],
+                        train_states[i],
+                        learner=i,
+                    )
                 if self.noise_measure and self.averages:
                     horizon = self.selfplay_average or self.averages[0]
                     measure_key, key = jax.random.split(key)
@@ -4424,7 +4547,12 @@ class Trainer:
                                     evaluator=learner.evaluator_test,
                                     state=test_state,
                                     params=self.extract_model_params_fn(
-                                        replace(train_states[i], params=average)
+                                        with_average(
+                                            train_states[i],
+                                            average,
+                                            average_states[i],
+                                            n,
+                                        )
                                     ),
                                 )
                                 if average_metrics:
@@ -4517,9 +4645,11 @@ class Trainer:
             self.set_activity(f"epoch {cur_epoch}: saving checkpoint")
             for i in training:
                 self.save_checkpoint(train_states[i], cur_epoch, i)
-                for average, horizon in zip(averages[i], self.averages, strict=True):
+                for n, (average, horizon) in enumerate(
+                    zip(averages[i], self.averages, strict=True)
+                ):
                     self.save_checkpoint(
-                        replace(train_states[i], params=average),
+                        with_average(train_states[i], average, average_states[i], n),
                         cur_epoch,
                         i,
                         average=horizon,

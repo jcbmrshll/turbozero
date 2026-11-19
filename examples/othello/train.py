@@ -898,6 +898,15 @@ def main():
         "long average lags it (1: the plain mean of the epochs so far until the horizon)",
     )
     parser.add_argument(
+        "--average-norm-batches",
+        type=int,
+        default=0,
+        metavar="N",
+        help="each weight average gets BatchNorm statistics of its own after every epoch, from N "
+        "training batches of the replay buffer through its weights, for self-play, tests and its "
+        "checkpoints (0: averages play with the network's statistics, which fit its own weights)",
+    )
+    parser.add_argument(
         "--save-state-at",
         type=epoch_list,
         default=[],
@@ -1358,6 +1367,7 @@ def main():
         averages=args.average_epochs,
         selfplay_average=args.selfplay_average,
         average_warmup=args.average_warmup,
+        average_norm_batches=args.average_norm_batches,
         evaluator=evaluator,
         # stores `capacity` positions for each of the `batch_size` environments
         memory_buffer=EpisodeReplayBuffer(capacity=args.buffer),

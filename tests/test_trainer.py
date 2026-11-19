@@ -3623,6 +3623,143 @@ def test_self_play_can_play_an_average(env, tmp_path, fake_loop):
     ] == pytest.approx([0, 0, 1, 1.5, 2.25])
 
 
+def norm_trainer(env, tmp_path, **kwargs):
+    """A trainer of `NormMLP`, a network with BatchNorm statistics."""
+    return make_trainer(
+        env,
+        tmp_path,
+        network=eqx.nn.make_with_state(NormMLP)(
+            2, env.num_actions, key=jax.random.PRNGKey(0)
+        ),
+        **kwargs,
+    )
+
+
+def test_an_averages_own_statistics_follow_its_weights(env, tmp_path):
+    # through the average's weights: scaling its hidden layer scales the statistics BatchNorm
+    # keeps of it, and the average plays the same; with the network's statistics it doesn't
+    trainer = norm_trainer(env, tmp_path, averages=(2,), average_norm_batches=3)
+    output = trainer.train_loop(seed=0, num_epochs=1)
+    ts, buffer_state = output.train_state, output.collection_state.buffer_state
+    average = output.averages[0][0]
+    scaled = eqx.tree_at(
+        lambda p: (p.hidden.weight, p.hidden.bias),
+        average,
+        (average.hidden.weight * 3, average.hidden.bias * 3),
+    )
+    key = jax.random.PRNGKey(1)
+
+    states = []
+    for a in (average, scaled):
+        own_states = trainer.average_norm_states(key, buffer_state, (a,), ts)
+        assert own_states is not None
+        states.append(own_states[0])
+    own, own_scaled = states
+    counter, (mean, var) = jax.tree.leaves(own)[:1], jax.tree.leaves(own)[1:]
+    _, (mean3, var3) = jax.tree.leaves(own_scaled)[:1], jax.tree.leaves(own_scaled)[1:]
+    # from the network's initial state, one update a batch
+    assert int(counter[0]) == 3
+    np.testing.assert_allclose(mean3, 3 * mean, rtol=1e-4, atol=1e-6)
+    np.testing.assert_allclose(var3, 9 * var, rtol=1e-4, atol=1e-6)
+    x = random_batch(env, jax.random.PRNGKey(2)).observation_nn
+
+    def play(params, state):
+        nn = eqx.nn.inference_mode(eqx.combine(params, trainer.nn_static))
+        return apply_nn(nn, state, x)[0]
+
+    assert_trees_close(
+        play(scaled, own_scaled), play(average, own), rtol=1e-3, atol=1e-4
+    )
+    assert not np.allclose(play(scaled, ts.nn_state)[1], play(average, ts.nn_state)[1])
+
+
+def test_without_an_average_norm_option_or_a_buffer_averages_use_the_networks_state(
+    env, tmp_path
+):
+    trainer = norm_trainer(env, tmp_path, averages=(2,))
+    ts = trainer.init_train_state()
+    empty = trainer.memory_buffer.init(
+        trainer.batch_size, trainer.make_template_experience()
+    )
+    assert (
+        trainer.average_norm_states(jax.random.PRNGKey(0), empty, (ts.params,), ts)
+        is None
+    )
+    trainer.average_norm_batches = 2
+    assert (
+        trainer.average_norm_states(jax.random.PRNGKey(0), empty, (ts.params,), ts)
+        is None
+    )
+    with pytest.raises(ValueError, match="average_norm_batches"):
+        norm_trainer(env, tmp_path, averages=(2,), average_norm_batches=-1)
+
+
+def test_an_average_plays_tests_and_is_saved_with_its_own_statistics(
+    env, tmp_path, fake_loop, monkeypatch
+):
+    # its own state (here a marked one) wherever the average stands in for the network, and the
+    # run's keys as they were without
+    runs = []
+    for batches in (0, 2):
+        tester = StatelessTester(name="positions")
+        trainer = norm_trainer(
+            env,
+            tmp_path / str(batches),
+            averages=(2,),
+            selfplay_average=2,
+            average_norm_batches=batches,
+            testers=[tester],
+            max_checkpoints=10,
+        )
+        calls = fake_loop(trainer)
+
+        def marked(
+            key, buffer_state, averages, train_state, learner=0, trainer=trainer
+        ):
+            if not trainer.average_norm_batches:
+                return None
+            return tuple(
+                jax.tree.map(
+                    lambda x: x + 7 if jnp.issubdtype(x.dtype, jnp.inexact) else x,
+                    train_state.nn_state,
+                )
+                for _ in averages
+            )
+
+        monkeypatch.setattr(trainer, "average_norm_states", marked)
+        trainer.train_loop(seed=0, num_epochs=3)
+        runs.append((trainer, calls, tester))
+
+    (plain, plain_calls, _), (own, own_calls, own_tester) = runs
+    assert [c.key.tolist() for c in plain_calls] == [c.key.tolist() for c in own_calls]
+
+    def offset(state, network_state):
+        return {
+            float(jnp.max(a - b))
+            for a, b in zip(jax.tree.leaves(state), jax.tree.leaves(network_state))
+            if jnp.issubdtype(a.dtype, jnp.inexact)
+        }
+
+    collects = of_kind(own_calls, "collect")
+    trains = of_kind(own_calls, "train")
+    # warmup and epoch 0 play the network (its average holds no epoch yet), then the average
+    assert offset(collects[2].params[1], trains[0].result.nn_state) == {7.0}
+    assert offset(collects[1].params[1], trains[0].result.nn_state) == {0.0}
+    for epoch in range(3):
+        saved = own.load_train_state_from_checkpoint(
+            str(tmp_path / "2" / "avg2"), epoch
+        )
+        raw = own.load_train_state_from_checkpoint(str(tmp_path / "2"), epoch)
+        assert offset(saved.nn_state, raw.nn_state) == {7.0}
+        plain_saved = plain.load_train_state_from_checkpoint(
+            str(tmp_path / "0" / "avg2"), epoch
+        )
+        assert offset(plain_saved.nn_state, raw.nn_state) == {0.0}
+    # the tester scores the network, then the average with its own state
+    assert offset(own_tester.calls[-1].params[1], trains[-1].result.nn_state) == {7.0}
+    assert offset(own_tester.calls[-2].params[1], trains[-1].result.nn_state) == {0.0}
+
+
 def test_a_branch_of_a_state_without_averages_starts_them_at_its_weights(
     env, tmp_path, fake_loop, capsys
 ):
