@@ -295,6 +295,18 @@ def test_a_network_runs_where_its_runtime_says(monkeypatch, tmp_path):
 # --- matches ---------------------------------------------------------------------------------
 
 
+def test_a_cloud_host_gets_the_solver_only_for_games_stopped_at_a_depth():
+    a = PlayerSpec({"kind": "engine"}, {}, "a", ("engines/a/bin",))
+    b = PlayerSpec({"kind": "engine"}, {}, "b", ("engines/b/bin",))
+    assert evaluate.job_files(MatchSpec(a, b, openings=1)) == [
+        "engines/a/bin",
+        "engines/b/bin",
+    ]
+    files = evaluate.job_files(MatchSpec(a, b, openings=1, solve_at=28))
+    assert set(files) == {"engines/a/bin", "engines/b/bin", *evaluate.referee_files()}
+    assert all(f.endswith("target/release/cli") for f in evaluate.referee_files())
+
+
 def test_a_matchs_id_is_its_setup_and_where_its_played():
     a, b = fake("a", {"level": 1}, threads=1), fake("b", {"level": 2}, threads=1)
     spec = MatchSpec(a, b, openings=4)

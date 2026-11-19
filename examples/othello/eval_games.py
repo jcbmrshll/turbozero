@@ -235,7 +235,7 @@ def play_sequential(
     openings = spec.choose_openings()
     host = hardware.describe()
     if spec.solve_at is not None and solve is None:
-        solve = endgame_solve(spec.solve_exact)
+        solve = endgame_solve()
     build = make or (lambda p, clock: maker(p.runtime, clock))
     clocks = {p.id: p.clock or UNTIMED for p in (spec.a, spec.b)}
     a, b = (build(p, clocks[p.id]) for p in (spec.a, spec.b))
@@ -312,7 +312,7 @@ def play_parallel(
     build = make or (lambda p, clock: maker(p.runtime, clock))
     clocks = {p.id: p.clock or UNTIMED for p in (spec.a, spec.b)}
     a, b = (build(p, clocks[p.id]) for p in (spec.a, spec.b))
-    new_solver = solver or (lambda: endgame_solve(spec.solve_exact))
+    new_solver = solver or endgame_solve
 
     queue = list(reversed(numbers))
     lock = threading.Lock()
@@ -417,7 +417,7 @@ def play_batched(
     openings = spec.choose_openings()
     host = hardware.describe(with_gpu=True)
     if spec.solve_at is not None and solve is None:
-        solve = endgame_solve(spec.solve_exact)
+        solve = endgame_solve()
     game = Othello()
     dtype = next(
         (
