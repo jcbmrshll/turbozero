@@ -5,6 +5,7 @@ what only a search shows: tactics, and its bookkeeping over many iterations, in
 a tree with room to spare and in one too small for it."""
 
 from dataclasses import replace
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -20,7 +21,7 @@ NULL = -1
 
 
 # AlphaZero's root noise
-NOISE = {"dirichlet_alpha": 0.3, "dirichlet_epsilon": 0.25}
+NOISE: dict[str, Any] = {"dirichlet_alpha": 0.3, "dirichlet_epsilon": 0.25}
 
 
 @pytest.fixture(scope="module")
@@ -906,7 +907,7 @@ def test_batched_cycles_match_each_trees_cycle_alone(env):
 
 
 # every option on
-ALL_OPTIONS = {
+ALL_OPTIONS: dict[str, Any] = {
     **NOISE,
     "full_probability": 0.5,
     "fast_iterations": 2,
