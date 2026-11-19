@@ -319,13 +319,11 @@ class EndgameSolve:
         """
         nth = (jnp.arange(self.slots) - pending.labelled) % self.slots
         labelled_slots = nth < count
-        solve = pending.labelled + nth
-        # (slots, capacity): the entries of each solve labelled
-        match = labelled_slots[:, None] & (
-            pending.entry_solve[None, :] == solve[:, None]
-        )
-        hit = match.any(0)
-        result = jnp.einsum("sc,sp->cp", match.astype(results.dtype), results)
+        # solve n waits in slot n % slots: each entry's result is a gather, not a (slots, capacity)
+        # match, which takes gigabytes at PCR's slot counts
+        solve = pending.entry_solve
+        hit = (solve >= pending.labelled) & (solve < pending.labelled + count)
+        result = results[jnp.where(hit, solve, 0) % self.slots]
         return (
             replace(
                 pending,

@@ -202,7 +202,28 @@ def test_playout_cap_and_selfplay_cycles_reach_self_play(monkeypatch):
     assert built.value.kwargs["extra_config"]["args"]["playout_cap"] == {
         "full_probability": 0.25,
         "fast_iterations": 21,
+        "noisy": "full",
     }
+
+
+def test_playout_cap_noise_picks_the_noisy_searches(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(
+            monkeypatch,
+            "--sims",
+            "63",
+            "--playout-cap",
+            "0.25:21",
+            "--playout-cap-noise",
+            "fast",
+        )
+    evaluator = built.value.kwargs["evaluator"].at(0)
+    assert evaluator.playout_cap == train.PlayoutCap(0.25, 21, "fast")
+
+
+def test_playout_cap_noise_goes_with_a_playout_cap(monkeypatch):
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, "--sims", "63", "--playout-cap-noise", "fast")
 
 
 def test_without_playout_cap_every_search_is_full(monkeypatch):
