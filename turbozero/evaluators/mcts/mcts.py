@@ -41,7 +41,8 @@ class MCTS(Evaluator):
                 search needing a new node in a full tree evicts a leaf, so it
                 runs all its iterations whatever the size, but forgets part of
                 the tree, and with `persist_tree` the reused subtree takes room
-                too: at 2 * `num_iterations`, evictions cost strength
+                too. Smaller trees (e.g. 2 * `num_iterations`) have been
+                observed to cost strength in some settings
             num_iterations: iterations per search, after the root's evaluation
             discount: see `Evaluator`
             temperature: each move is played with probability proportional to
