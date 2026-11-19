@@ -3,7 +3,6 @@ action choice, tree reuse) called on small hand-built trees of a fixed-length en
 few whole searches on tic-tac-toe for what only a search shows: tactics, and its bookkeeping over
 many iterations, in a tree with room to spare and in one too small for it."""
 
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -40,18 +39,18 @@ def fixed_eval_fn(logits, value=0.0):
     """An evaluation function giving every state `logits` and `value`."""
     logits = jnp.asarray(logits, dtype=jnp.float32)
 
-    def eval_fn(state, params, key):  # pylint: disable=unused-argument
+    def eval_fn(state, params, key):
         return logits, jnp.array(value, dtype=jnp.float32)
 
     return eval_fn
 
 
-def varying_eval_fn(state, params, key):  # pylint: disable=unused-argument
+def varying_eval_fn(state, params, key):
     """An evaluation function whose value differs from one move to the next."""
     return jnp.array([0.5, 0.0, -0.5]), jnp.sin(state.step.astype(jnp.float32))
 
 
-def state_eval_fn(state, params, key):  # pylint: disable=unused-argument
+def state_eval_fn(state, params, key):
     """An evaluation function whose policy and value both differ from one move to the next (none
     of its arithmetic is constant, for XLA to fold where it would compute it at runtime)."""
     step = state.step.astype(jnp.float32)
@@ -166,7 +165,7 @@ def assert_trees_equal(a, b):
 # the root
 
 
-def update_root(search, tree, state, meta):
+def evaluate_root(search, tree, state, meta):
     """The root's update `evaluate` makes: the network's evaluation of `state`, at the root."""
     policy_logits, value = search.leaf_eval_fn(state, None, jax.random.PRNGKey(0))
     return search.expand_root(tree, state, meta, policy_logits, value)
@@ -178,7 +177,7 @@ def test_the_root_update_evaluates_an_empty_root_with_a_masked_prior(fixed_lengt
     state, meta = env.init_fn(jax.random.PRNGKey(0))
     tree = search.init(template_embedding=state)
 
-    tree = update_root(search, tree, state, meta)
+    tree = evaluate_root(search, tree, state, meta)
 
     node = root(tree)
     np.testing.assert_allclose(
@@ -193,7 +192,7 @@ def test_the_root_update_keeps_a_reused_roots_visits_and_value(env):
     tree = build_tree(search, env, [(None, None, 5, -0.2), (0, 1, 4, 0.1)])
     state, meta = env.init_fn(jax.random.PRNGKey(0))
 
-    tree = update_root(search, tree, state, meta)
+    tree = evaluate_root(search, tree, state, meta)
 
     node = root(tree)
     assert int(node.n) == 5 and float(node.q) == pytest.approx(-0.2)
@@ -212,7 +211,7 @@ def test_the_roots_prior_takes_the_noise_its_search_drew(fixed_length_env):
     started = search.start_search(jax.random.PRNGKey(1), tree)
     kept = search.start_search(jax.random.PRNGKey(2), started, active=False)
     other = search.start_search(jax.random.PRNGKey(2), tree)
-    updated = update_root(search, kept, state, meta)
+    updated = evaluate_root(search, kept, state, meta)
 
     # a search that doesn't start keeps its noise, and another key draws another
     np.testing.assert_array_equal(kept.root_noise, started.root_noise)
@@ -479,6 +478,29 @@ def test_step_keeps_the_played_moves_subtree_or_starts_over(env, persist_tree):
         assert_trees_equal(stepped.data_at(stepped.edge_map[0, 0]), tree.data_at(5))
     else:
         assert int(stepped.next_free_idx) == 0
+
+
+@pytest.mark.parametrize("persist_tree", [True, False])
+def test_next_state_steps_resets_or_keeps_each_tree(env, persist_tree):
+    # as self-play moves a batch of trees on: one played a move, one ended its game,
+    # and one didn't play
+    search = make_mcts(persist_tree=persist_tree)
+    tree = build_tree(search, env, FULL)
+    trees = jax.tree.map(lambda x: jnp.stack([x] * 3), tree)
+
+    moved = jax.vmap(search.next_state)(
+        trees,
+        jnp.array([1, 1, 1]),
+        jnp.array([False, True, False]),
+        jnp.array([True, True, False]),
+    )
+
+    def at(i):
+        return jax.tree.map(lambda x: x[i], moved)
+
+    assert_trees_equal(at(0), search.step(tree, jnp.array(1)))
+    assert_trees_equal(at(1), search.reset(tree))
+    assert_trees_equal(at(2), tree)
 
 
 class RecordingSelector(PUCTSelector):
