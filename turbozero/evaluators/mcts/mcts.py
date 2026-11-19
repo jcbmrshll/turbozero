@@ -80,17 +80,14 @@ class MCTS(Evaluator):
                 than after `num_iterations` iterations. Searches from
                 well-explored subtrees then take fewer iterations, and every
                 root ends with the visits of a search from scratch. The tree
-                never holds more than `num_iterations` + 1 nodes, plus one per
-                cycle self-play runs past `search_done`
-            min_iterations: (optional) with `count_reused_visits`, the fewest iterations a search
-                takes, however many visits it reused: the root's noise (e.g. AlphaZero's) only steers
-                the visits of its own search (default: 0). At most `num_iterations`
+                never holds more than `num_iterations` + 1 + `min_iterations`
+                nodes, plus one per cycle self-play runs past `search_done`
+            min_iterations: with `count_reused_visits`, the fewest iterations a
+                search runs however many visits it reused, at most
+                `num_iterations`: the root's noise only steers the visits of the
+                search that drew it
         """
-        if min_iterations < 0 or min_iterations > num_iterations:
-            raise ValueError(
-                f"min_iterations must be 0 to num_iterations ({num_iterations}), "
-                f"got {min_iterations}"
-            )
+        assert 0 <= min_iterations <= num_iterations
         assert 0 < full_probability <= 1
         assert full_probability == 1 or 0 < fast_iterations < num_iterations
         super().__init__(discount=discount)
@@ -179,8 +176,9 @@ class MCTS(Evaluator):
         """Returns whether the search in `state` is done after `cycles` cycles:
         once it has evaluated the root and run `num_iterations` iterations, or
         `fast_iterations` if it's a fast one (see `full_probability`). With
-        `count_reused_visits`, also once the root, evaluated, has one visit
-        more than that.
+        `count_reused_visits`, also once the root has one visit more than that
+        and the search has evaluated the root and run `min_iterations`
+        iterations.
         """
         iterations = jnp.where(state.fast, self.fast_iterations, self.num_iterations)
         done = cycles >= iterations + 1
