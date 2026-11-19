@@ -12,7 +12,7 @@ KEY = jax.random.PRNGKey(0)
 
 
 def new_node(policy, value, embedding, terminated):
-    """An evaluated node, visited once (dev's `MCTS.new_node`)."""
+    """An evaluated node, visited once."""
     return MCTSNode(
         n=jnp.array(1, dtype=jnp.int32),
         p=policy,
