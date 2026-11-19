@@ -73,13 +73,14 @@ class MCTS(Evaluator):
                 the value to learn from, while the policy learns only from full
                 searches
             fast_iterations: the iterations of a fast search
-            count_reused_visits: (optional) with `persist_tree`, stop a search once its root has
-                `num_iterations + 1` visits, those of the subtree it reused from the last search
-                counted, rather than after `num_iterations` iterations (default: False). A search from
-                a well-explored subtree then takes fewer iterations, and every root ends with the visits
-                of a search from scratch. The tree then never holds more than
-                `num_iterations + 1` nodes, so `max_nodes` needs no more. With a playout cap, a
-                fast search stops at `fast_iterations + 1` root visits
+            count_reused_visits: with `persist_tree`, a search is done once its
+                root has `num_iterations` + 1 visits (`fast_iterations` + 1 for
+                a fast search), counting those of the subtree it reused, rather
+                than after `num_iterations` iterations. Searches from
+                well-explored subtrees then take fewer iterations, and every
+                root ends with the visits of a search from scratch. The tree
+                never holds more than `num_iterations` + 1 nodes, plus one per
+                cycle self-play runs past `search_done`
         """
         assert 0 < full_probability <= 1
         assert full_probability == 1 or 0 < fast_iterations < num_iterations
@@ -144,11 +145,11 @@ class MCTS(Evaluator):
             traverse_key, eval_key, _ = jax.random.split(key, 3)
             leaf = self.find_leaf(traverse_key, tree, env_step_fn)
             policy_logits, value = self.leaf_eval_fn(leaf[2], params, eval_key)
-            # iterations past a fast search's change nothing (after the root's
-            # evaluation and `i` iterations, as `search_done` counts cycles)
-            write = (
-                self.full_probability == 1 and not self.count_reused_visits
-            ) or ~self.search_done(tree, i + 1)
+            # iterations after the search is done change nothing (it has run
+            # the root's evaluation and `i` iterations, `i` + 1 cycles)
+            write = True
+            if self.full_probability < 1 or self.count_reused_visits:
+                write = ~self.search_done(tree, i + 1)
             return self.expand(tree, leaf, policy_logits, value, write=write), None
 
         keys = jax.random.split(iterate_key, self.num_iterations)
@@ -166,15 +167,15 @@ class MCTS(Evaluator):
     def search_done(self, state: MCTSTree, cycles: jax.Array) -> jax.Array:
         """Returns whether the search in `state` is done after `cycles` cycles:
         once it has evaluated the root and run `num_iterations` iterations, or
-        `fast_iterations` if it's a fast one (see `full_probability`).
+        `fast_iterations` if it's a fast one (see `full_probability`). With
+        `count_reused_visits`, also once the root, evaluated, has one visit
+        more than that.
         """
         iterations = jnp.where(state.fast, self.fast_iterations, self.num_iterations)
         done = cycles >= iterations + 1
-        if not self.count_reused_visits:
-            return done
-        # also once the root has `iterations + 1` visits, after its evaluation
-        visited = state.data.n[state.ROOT_INDEX] > iterations
-        return done | (visited & (cycles >= 1))
+        if self.count_reused_visits:
+            done |= (cycles >= 1) & (state.data.n[state.ROOT_INDEX] > iterations)
+        return done
 
     def trains_on(self, state: MCTSTree) -> jax.Array:
         """Returns whether self-play trains on the position searched in `state`:
