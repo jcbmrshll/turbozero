@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from turbozero.evaluators.mcts.action_selection import PUCTSelector, bounded_q_values
+from turbozero.evaluators.mcts.action_selection import PUCTSelector
 from turbozero.evaluators.mcts.state import MCTSNode, init_mcts_tree
 
 KEY = jax.random.PRNGKey(0)
@@ -19,14 +19,6 @@ def new_node(policy, value, embedding, terminated):
         q=jnp.array(value, dtype=jnp.float32),
         terminated=jnp.array(terminated, dtype=jnp.bool_),
         embedding=embedding,
-    )
-
-
-def test_bounded_q_values_maps_fixed_range_and_unvisited_to_zero():
-    q = jnp.array([-1.0, 0.0, 1.0, 0.5, 0.0])
-    n = jnp.array([1, 2, 3, 4, 0])
-    np.testing.assert_allclose(
-        bounded_q_values(q, n), [0.0, 0.5, 1.0, 0.75, 0.0], atol=1e-6
     )
 
 
@@ -47,7 +39,8 @@ def test_puct_with_no_visits_picks_highest_prior():
 
 
 def visited_tree(prior, root_q, child_n, child_q):
-    """Root with every child visited: `child_q` is from each child's perspective, the root's `n` is 1 + the children's."""
+    """A root whose children have `child_n` visits (unvisited ones aren't in the tree) and values
+    `child_q`, from each child's perspective; the root's `n` is 1 + the children's."""
     prior, child_n, child_q = (np.asarray(x) for x in (prior, child_n, child_q))
     root = replace(
         new_node(
@@ -61,6 +54,8 @@ def visited_tree(prior, root_q, child_n, child_q):
     )
     tree = init_mcts_tree(8, len(prior), root).set_root(root)
     for action, (n, q) in enumerate(zip(child_n, child_q)):
+        if n == 0:
+            continue
         child = replace(
             new_node(
                 policy=jnp.zeros(len(prior)),
@@ -112,20 +107,38 @@ def test_tie_breaking_never_overturns_a_strict_preference():
     assert {int(select(jax.random.PRNGKey(seed))) for seed in range(32)} == {2}
 
 
+ALL_VISITED = [4, 10, 1, 3]
+ONE_UNVISITED = [4, 10, 0, 3]
+
+
 @pytest.mark.parametrize(
-    "c1, c2, expected", [(1.25, 19652, 3), (1.25, 1.0, 2), (0.1, 19652, 0)]
+    "child_n, discount, c1, c2, expected",
+    [
+        (ALL_VISITED, -1.0, 1.25, 19652, 3),
+        (ALL_VISITED, -1.0, 1.25, 1.0, 2),
+        (ALL_VISITED, -1.0, 0.1, 19652, 0),
+        # a positive discount (single-player): the children's values are the root's
+        (ALL_VISITED, 1.0, 1.25, 19652, 2),
+        # an unvisited child scores 0 for its value, a loss; at 0.5 it would win
+        # each of these
+        (ONE_UNVISITED, -1.0, 1.25, 19652, 3),
+        (ONE_UNVISITED, -1.0, 0.5, 19652, 0),
+        (ONE_UNVISITED, 1.0, 1.25, 19652, 1),
+    ],
 )
-def test_puct_matches_alphazero_and_muzero_ucb_score(c1, c2, expected):
+def test_puct_matches_alphazero_and_muzero_ucb_score(
+    child_n, discount, c1, c2, expected
+):
     """MuZero pseudocode `ucb_score` for board games, whose values are normalized by
-    `KnownBounds(-1, 1)`."""
+    `KnownBounds(-1, 1)`; an unvisited child's value score is 0."""
     prior = np.array([0.1, 0.5, 0.15, 0.25])
-    child_n = np.array([4, 10, 1, 3])
+    child_n = np.array(child_n)
     child_q = np.array([-0.5, 0.2, 0.3, -0.1])
-    root_q, discount = 0.1, -1.0
+    root_q = 0.1
     tree = visited_tree(prior, root_q, child_n, child_q)
 
     parent_n = 1 + child_n.sum()
-    value_score = (discount * child_q + 1) / 2
+    value_score = np.where(child_n > 0, (discount * child_q + 1) / 2, 0.0)
     pb_c = (np.log((parent_n + c2 + 1) / c2) + c1) * np.sqrt(parent_n) / (child_n + 1)
     ucb = value_score + pb_c * prior
     assert np.argmax(ucb) == expected
