@@ -43,6 +43,7 @@ class MCTS(Evaluator):
         fast_iterations: int = 0,
         count_reused_visits: bool = False,
         min_iterations: int = 0,
+        traversal_steps: int = 1,
     ):
         """
         Args:
@@ -86,7 +87,16 @@ class MCTS(Evaluator):
                 search runs however many visits it reused, at most
                 `num_iterations`: the root's noise only steers the visits of the
                 search that drew it
+            traversal_steps: (optional) steps down the tree a traversal takes between checks for
+                having reached its leaf (default: 1). Steps past it change nothing, so the search is
+                the same whatever the number; but on GPU each check waits on the host, and under
+                vmap a traversal goes on until the deepest in the batch is done: more steps a check
+                wait less and compute more, and which is fastest depends on the trees' depth
         """
+        if traversal_steps < 1:
+            raise ValueError(
+                f"traversal_steps must be at least 1, got {traversal_steps}"
+            )
         assert 0 <= min_iterations <= num_iterations
         assert 0 < full_probability <= 1
         assert full_probability == 1 or 0 < fast_iterations < num_iterations
@@ -104,6 +114,7 @@ class MCTS(Evaluator):
         self.fast_iterations = fast_iterations
         self.count_reused_visits = count_reused_visits
         self.min_iterations = min_iterations
+        self.traversal_steps = traversal_steps
 
     def get_config(self) -> dict:
         return {
@@ -121,6 +132,7 @@ class MCTS(Evaluator):
             "fast_iterations": self.fast_iterations,
             "count_reused_visits": self.count_reused_visits,
             "min_iterations": self.min_iterations,
+            "traversal_steps": self.traversal_steps,
         }
 
     def evaluate(
@@ -386,12 +398,27 @@ class MCTS(Evaluator):
             node_key = jax.random.fold_in(key, index)
             return self.action_selector(node_key, tree, index, self.discount)
 
+        # each step, unless the traversal is already at its leaf:
+        # - get the index of the child node connected to the chosen action
+        # - choose the action to take from the child node
         def step(state: tuple[jax.Array, jax.Array]) -> tuple[jax.Array, jax.Array]:
+            down = descend(state)
             child = tree.edge_map[state[0], state[1]]
-            return child, select(child)
+            action = select(child)
+            return (
+                jnp.where(down, child, state[0]),
+                jnp.where(down, action, state[1]),
+            )
+
+        # `traversal_steps` steps between checks of the loop's condition: on GPU each check waits
+        # on the host, and under vmap the loop runs until the deepest traversal in the batch is done
+        def body_fn(state: tuple[jax.Array, jax.Array]) -> tuple[jax.Array, jax.Array]:
+            for _ in range(self.traversal_steps):
+                state = step(state)
+            return state
 
         root = jnp.asarray(tree.ROOT_INDEX)
-        parent, action = jax.lax.while_loop(descend, step, (root, select(root)))
+        parent, action = jax.lax.while_loop(descend, body_fn, (root, select(root)))
         embedding, metadata = env_step_fn(tree.data_at(parent).embedding, action)
         return parent, action, embedding, metadata
 
