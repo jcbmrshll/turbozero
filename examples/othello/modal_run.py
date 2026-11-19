@@ -483,7 +483,10 @@ class Runner:
             self.status["state"] = "interrupted"
             raise
         finally:
+            # the final status is the last word: a heartbeat still on its way, of a status from
+            # before the job ended, would otherwise land after it
             self.stop_thread.set()
+            thread.join()
             self._flush()
             server.terminate()
         print(f"modal-jobs: {self.name}: {outcome}", flush=True)
