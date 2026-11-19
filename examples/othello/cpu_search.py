@@ -154,6 +154,11 @@ def load_library() -> ctypes.CDLL:
             + [floats, floats],
         ),
         "net_set_heads": (None, [ctypes.c_void_p, floats]),
+        "net_set_depthwise": (
+            ctypes.c_int,
+            [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+            + [floats, floats],
+        ),
         "net_forward": (
             None,
             [ctypes.c_void_p, ctypes.c_int, floats, floats, floats, ctypes.c_int],

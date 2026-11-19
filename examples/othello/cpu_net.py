@@ -4,6 +4,10 @@ training on calibration positions (`quantize`), and saved, so that play needs ne
 OpenVINO.
 
     uv run examples/othello/cpu_net.py --net 8x128-128s-8p-w1125-274m --positions LEAVES.npy
+    uv run examples/othello/cpu_net.py --checkpoint RUN/avg4/210.eqx --spec SPEC --positions LEAVES.npy
+
+A checkpoint outside the league is saved under the name evaluate.py's checkpoint= player looks for
+(its directory and file names, avg4-210), or --name, as its net= gives it.
 
 Each convolution of the trunk takes 8-bit inputs, scaled for the whole tensor by the minimum and
 maximum seen in calibration (with a zero point when the minimum is below 0), and 8-bit weights
@@ -58,6 +62,22 @@ class Block:
 
 
 @dataclass
+class ConvNeXtBlock:
+    """ConvNeXt's block (see `core.networks.azresnet.PreActConvNeXt`): x + project(relu(expand(y) +
+    pool)), y = dw(x) + dw_bias, a depthwise filter of the trunk with its BatchNorm folded in;
+    `pool` biases the hidden channels from the last `pool_channels` of y. BatchNorms after expand
+    and project fold into them. The depthwise filter stays in float."""
+
+    taps: np.ndarray  # (taps, 2): each tap's (dy, dx), in order of dy, then dx
+    dw: np.ndarray  # (channels, taps)
+    dw_bias: np.ndarray  # (channels)
+    expand: Conv
+    project: Conv
+    pool_channels: int = 0
+    pool: Linear | None = None
+
+
+@dataclass
 class Program:
     """A network's layers as arrays, its normalizations folded into its convolutions where they
     can be. In the post-activation layout (`pre` False) a block's norms follow its convolutions; in
@@ -68,7 +88,7 @@ class Program:
     head_channels: int
     stem: Conv
     stem_norm: Norm
-    blocks: list[Block]
+    blocks: list[Block | ConvNeXtBlock]
     final_norm: Norm
     # the heads: (channels, 3 * head_channels) of policy, its pooled part, and value
     head: Conv
@@ -98,6 +118,7 @@ def extract(network, state) -> Program:
         GroupNorm,
         PooledHeads,
         PreActBlock,
+        PreActConvNeXt,
         ResidualBlock,
         inference_affine,
     )
@@ -132,21 +153,42 @@ def extract(network, state) -> Program:
     def linear(layer) -> Linear:
         return Linear(f32(layer.weight), f32(layer.bias))
 
-    pre = network.stem_norm is None
-    if pre:
-        stem, stem_norm = (
-            Conv(
-                f32(network.stem_conv.weight),
-                np.zeros(network.stem_conv.out_channels, np.float32),
-            ),
-            Norm(),
+    def folded(conv, norm) -> Conv:
+        """A convolution with the normalization after it, if any, folded in: one that must fold."""
+        if norm is None:
+            return Conv(f32(conv.weight), np.zeros(conv.out_channels, np.float32))
+        c, rest = conv_norm(conv, norm)
+        if rest.type != NORM_NONE:
+            raise unsupported(norm)
+        return c
+
+    def convnext(block, pool: Linear | None) -> ConvNeXtBlock:
+        if not isinstance(block.norm, eqx.nn.BatchNorm):
+            raise unsupported(block.norm)
+        scale, offset = inference_affine(block.norm, state)
+        order = sorted(range(len(block.dw.taps)), key=lambda t: block.dw.taps[t])
+        return ConvNeXtBlock(
+            taps=np.array([block.dw.taps[t] for t in order], np.int32).reshape(-1, 2),
+            dw=f32(block.dw.weight)[:, order] * f32(scale)[:, None],
+            dw_bias=f32(offset),
+            expand=folded(block.expand, block.expand_norm),
+            project=folded(block.project, block.project_norm),
+            pool_channels=block.pool_channels,
+            pool=pool,
         )
+
+    pre = network.final_norm is not None
+    if pre:
+        # the pre-activation trunk starts from the stem as it is, or normalized (folded in)
+        stem, stem_norm = folded(network.stem_conv, network.stem_norm), Norm()
     else:
         stem, stem_norm = conv_norm(network.stem_conv, network.stem_norm)
-    blocks = []
+    blocks: list[Block | ConvNeXtBlock] = []
     for block in network.blocks:
         pool = linear(block.pool_linear) if block.pool_linear is not None else None
-        if isinstance(block, PreActBlock):
+        if isinstance(block, PreActConvNeXt):
+            blocks.append(convnext(block, pool))
+        elif isinstance(block, PreActBlock):
             zeros = np.zeros(block.conv1.out_channels, np.float32)
             blocks.append(
                 Block(
@@ -220,6 +262,16 @@ def conv2d(x: np.ndarray, w: np.ndarray) -> np.ndarray:
     return out
 
 
+def depthwise(b: ConvNeXtBlock, x: np.ndarray) -> np.ndarray:
+    """`b`'s depthwise filter of (n, 8, 8, channels) features, its bias added first, then each tap's
+    product in order, taps off the board adding nothing."""
+    out = np.broadcast_to(b.dw_bias, x.shape).astype(np.float32)
+    padded = np.pad(x, ((0, 0), (7, 7), (7, 7), (0, 0)))
+    for t, (dy, dx) in enumerate(b.taps):
+        out = out + padded[:, 7 + dy : 15 + dy, 7 + dx : 15 + dx] * b.dw[:, t]
+    return out
+
+
 def normalize(norm: Norm, x: np.ndarray, relu: bool = False) -> np.ndarray:
     if norm.type == NORM_AFFINE:
         x = x * norm.a + norm.c
@@ -255,6 +307,15 @@ def forward(
     if not p.pre:
         x = normalize(p.stem_norm, x, relu=True)
     for i, b in enumerate(p.blocks):
+        if isinstance(b, ConvNeXtBlock):
+            y = depthwise(b, x)
+            h = apply(f"{i}.expand", b.expand, y)
+            if b.pool_channels:
+                assert b.pool is not None
+                pooled = board_pool(y[..., -b.pool_channels :])
+                h = h + dense(b.pool, pooled)[:, None, None, :]
+            x = x + apply(f"{i}.project", b.project, np.maximum(h, 0))
+            continue
         kept = p.channels - b.pool_channels
         if p.pre:
             y = apply(f"{i}.conv1", b.conv1, normalize(b.norm1, x, relu=True))
@@ -337,15 +398,20 @@ ALPHA = 0.75
 
 
 def quantize_conv(
-    c: Conv, low: np.ndarray, high: np.ndarray, smooth: bool = True
+    c: Conv,
+    low: np.ndarray,
+    high: np.ndarray,
+    smooth: bool = True,
+    alpha: float = ALPHA,
 ) -> QuantizedConv:
     """`c`, its input's channels ranging from `low` to `high`: each channel divided by a scale of
-    its own, folded into the weights, and then the whole input by one scale and zero point."""
+    its own (SmoothQuant's, `alpha`), folded into the weights, and then the whole input by one scale
+    and zero point."""
     w = c.w
     if smooth:
         reach = np.maximum(np.maximum(-low, high), 1e-3)
         weights = np.maximum(np.abs(w).max((0, 2, 3)), 1e-6)
-        channel = reach**ALPHA / weights ** (1 - ALPHA)
+        channel = reach**alpha / weights ** (1 - alpha)
         channel = f32(channel / channel.max())
     else:
         channel = np.ones(w.shape[1], np.float32)
@@ -367,16 +433,78 @@ def quantize_conv(
     return QuantizedConv(q, scale, bias, inverse, zero_point)
 
 
+def pointwise(qc: QuantizedConv, x: np.ndarray) -> np.ndarray:
+    """A quantized 1x1 convolution of (n, cin) inputs, as the C++ computes it."""
+    if x.shape[-1] % 4:
+        x = np.pad(x, ((0, 0), (0, -x.shape[-1] % 4)))
+    u = np.clip(np.rint(x * qc.inverse) + qc.zero_point, 0, 255)
+    return f32(u @ qc.q[:, :, 0, 0].T.astype(np.float32)) * qc.scale + qc.bias
+
+
+# what `searched_conv` tries: SmoothQuant's alpha, and the share of each channel's calibration range
+# that the quantization covers (beyond it, values saturate)
+ALPHAS = (0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.0)
+CLIPS = (1.0, 0.9, 0.8, 0.7, 0.6, 0.5)
+
+
+def searched_conv(
+    c: Conv, low: np.ndarray, high: np.ndarray, x: np.ndarray
+) -> QuantizedConv:
+    """`c`, a 1x1 convolution, quantized with the alpha and clip (`ALPHAS`, `CLIPS`) whose outputs on
+    `x`, (n, cin) samples of its input, are nearest the float convolution's (least squared error).
+    A ConvNeXt block's expand takes the depthwise filter's output, signed, with channels' ranges
+    many times apart and set by rare outliers, which no one setting suited: the value's error on
+    two ray-filter nets was least at alpha 1.0 for one and 0.9 for the other."""
+    want = x @ c.w[:, :, 0, 0].T + c.b
+    best, best_error = None, np.inf
+    for alpha in ALPHAS:
+        for clip in CLIPS:
+            qc = quantize_conv(c, low * clip, high * clip, alpha=alpha)
+            error = float(np.square(pointwise(qc, x) - want).mean())
+            if error < best_error:
+                best, best_error = qc, error
+    assert best is not None
+    return best
+
+
+def layer_inputs(
+    p: Program, positions: np.ndarray, names: set[str], rows: int = 16384, seed: int = 0
+) -> dict[str, np.ndarray]:
+    """Up to `rows` squares' inputs, (rows, cin), to each convolution of `names`, from `positions`."""
+    rng = np.random.default_rng(seed)
+    pick = np.sort(rng.permutation(len(positions) * 64)[:rows])
+    seen: dict[str, np.ndarray] = {}
+
+    def record(name, x):
+        if name in names:
+            seen[name] = x.reshape(-1, x.shape[-1])[pick]
+
+    float_forward(p, positions, record)
+    return seen
+
+
 def quantize(p: Program, positions: np.ndarray) -> dict[str, QuantizedConv]:
     """The convolutions quantized, by name, their inputs' ranges from `positions`, (n, 2, 8,
-    8) observations (best the leaves of the network's own searches)."""
+    8) observations (best the leaves of the network's own searches). A ConvNeXt block's 1x1s
+    search their quantization's settings on those inputs (`searched_conv`)."""
     ranges = input_ranges(p, positions)
     convs = {"stem": p.stem, "head": p.head}
     for i, b in enumerate(p.blocks):
-        convs[f"{i}.conv1"] = b.conv1
-        convs[f"{i}.conv2"] = b.conv2
+        if isinstance(b, ConvNeXtBlock):
+            convs[f"{i}.expand"], convs[f"{i}.project"] = b.expand, b.project
+        else:
+            convs[f"{i}.conv1"], convs[f"{i}.conv2"] = b.conv1, b.conv2
+    searched = {
+        f"{i}.{part}"
+        for i, b in enumerate(p.blocks)
+        if isinstance(b, ConvNeXtBlock)
+        for part in ("expand", "project")
+    }
+    samples = layer_inputs(p, positions[:256], searched) if searched else {}
     quantized = {
-        name: quantize_conv(c, *ranges[name])
+        name: searched_conv(c, *ranges[name], samples[name])
+        if name in searched
+        else quantize_conv(c, *ranges[name])
         for name, c in convs.items()
         if name != "stem"
     }
@@ -447,6 +575,13 @@ def save(path: Path, p: Program, q: dict[str, QuantizedConv]) -> None:
         put(name, getattr(p, name))
     for i, b in enumerate(p.blocks):
         arrays[f"b{i}.pool_channels"] = np.array(b.pool_channels)
+        if isinstance(b, ConvNeXtBlock):
+            arrays[f"b{i}.taps"], arrays[f"b{i}.dw"] = b.taps, b.dw
+            arrays[f"b{i}.dw_bias"] = b.dw_bias
+            for part in ("expand", "project", "pool"):
+                if getattr(b, part) is not None:
+                    put(f"b{i}.{part}", getattr(b, part))
+            continue
         for part in ("conv1", "norm1", "conv2", "norm2", "pool"):
             if getattr(b, part) is not None:
                 put(f"b{i}.{part}", getattr(b, part))
@@ -478,23 +613,35 @@ def load(path: Path) -> tuple[Program, dict[str, QuantizedConv]]:
     def linear(name):
         return Linear(a[f"{name}.w"], a[f"{name}.b"])
 
+    def block(i) -> Block | ConvNeXtBlock:
+        pool = linear(f"b{i}.pool") if f"b{i}.pool.w" in a else None
+        pool_channels = int(a[f"b{i}.pool_channels"])
+        if f"b{i}.taps" in a:
+            return ConvNeXtBlock(
+                a[f"b{i}.taps"],
+                a[f"b{i}.dw"],
+                a[f"b{i}.dw_bias"],
+                conv(f"b{i}.expand"),
+                conv(f"b{i}.project"),
+                pool_channels,
+                pool,
+            )
+        return Block(
+            conv(f"b{i}.conv1"),
+            norm(f"b{i}.norm1"),
+            conv(f"b{i}.conv2"),
+            norm(f"b{i}.norm2"),
+            pool_channels,
+            pool,
+        )
+
     program = Program(
         channels=channels,
         pre=bool(pre),
         head_channels=head_channels,
         stem=conv("stem"),
         stem_norm=norm("stem_norm"),
-        blocks=[
-            Block(
-                conv(f"b{i}.conv1"),
-                norm(f"b{i}.norm1"),
-                conv(f"b{i}.conv2"),
-                norm(f"b{i}.norm2"),
-                int(a[f"b{i}.pool_channels"]),
-                linear(f"b{i}.pool") if f"b{i}.pool.w" in a else None,
-            )
-            for i in range(blocks)
-        ],
+        blocks=[block(i) for i in range(blocks)],
         final_norm=norm("final_norm"),
         head=conv("head"),
         policy_norm=norm("policy_norm"),
@@ -591,6 +738,22 @@ class NativeNet:
         conv("stem", 0, q["stem"])
         norm("stem", 0, p.stem_norm, p.channels)
         for i, b in enumerate(p.blocks):
+            if isinstance(b, ConvNeXtBlock):
+                taps = np.ascontiguousarray(b.taps, np.int32)
+                if lib.net_set_depthwise(
+                    self.handle,
+                    i,
+                    len(taps),
+                    taps.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+                    ptr(b.dw.T),
+                    ptr(b.dw_bias),
+                ):
+                    raise ValueError(f"the C++ can't take block {i}'s taps")
+                conv("expand", i, q[f"{i}.expand"])
+                conv("project", i, q[f"{i}.project"])
+                if b.pool is not None:
+                    linear("pool", i, b.pool)
+                continue
             conv("conv1", i, q[f"{i}.conv1"])
             conv("conv2", i, q[f"{i}.conv2"])
             norm("norm1", i, b.norm1, p.channels)
@@ -645,7 +808,10 @@ def load_native(name: str) -> NativeNet:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
-    parser.add_argument("--net", nargs="+", required=True)
+    parser.add_argument("--net", nargs="+", default=[], help="the league's networks")
+    parser.add_argument("--checkpoint", type=Path, help="or a checkpoint, of --spec")
+    parser.add_argument("--spec")
+    parser.add_argument("--name", help="the checkpoint's name (see above)")
     parser.add_argument(
         "--positions", type=Path, required=True, help="calibration .npy"
     )
@@ -653,9 +819,17 @@ def main() -> None:
     args = parser.parse_args()
     from bench_cpu_backends import network_path
 
+    nets = [(name, *network_path(name)) for name in args.net]
+    if args.checkpoint is not None:
+        if args.spec is None:
+            parser.error("--checkpoint needs its network's --spec")
+        checkpoint = args.checkpoint.expanduser()
+        name = args.name or f"{checkpoint.parent.name}-{checkpoint.stem}"
+        nets.append((name, str(checkpoint), args.spec))
+    if not nets:
+        parser.error("--net or --checkpoint")
     positions = np.load(args.positions)[: args.calibration]
-    for name in args.net:
-        path, net = network_path(name)
+    for name, path, net in nets:
         program = extract_checkpoint(path, net)
         save(native_path(name), program, quantize(program, positions))
         print(native_path(name), flush=True)

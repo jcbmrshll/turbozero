@@ -932,6 +932,8 @@ int net_set_conv(net::Net* n, const char* where, int block, int cin, int cout, i
                    : name == "head" ? &n->head
                    : name == "conv1" ? &n->blocks.at(block).conv1
                    : name == "conv2" ? &n->blocks.at(block).conv2
+                   : name == "expand" ? &n->blocks.at(block).expand
+                   : name == "project" ? &n->blocks.at(block).project
                                      : nullptr;
     if (!c || cin % 4 || cout % 16 || (k != 1 && k != 3)) return -1;
     c->cin = cin;
@@ -940,13 +942,22 @@ int net_set_conv(net::Net* n, const char* where, int block, int cin, int cout, i
     if (c == &n->stem) {
         if (cin != 4 || k != 3) return -1;
         net::stem_table(*c, q);
-    } else {
+    } else if (name != "expand" && name != "project") {
         net::pack(*c, q);
+    } else if (k != 1 || cin % 16 || (name == "project" && zero_point != 0)) {
+        // (a project's input is ReLU's, from 0: AVX2's kernels take its zero point as 0)
+        return -1;
     }
     c->scale.assign(scale, scale + cout);
     c->bias.assign(bias, bias + cout);
     c->inverse.assign(inverse, inverse + cin);
     c->zero_point = zero_point;
+    if (name == "expand" || name == "project") {
+#ifdef NET_SEVEN_BIT
+        net::seven_bit(*c, q);
+#endif
+        net::pack1x1(*c, q, name == "expand");
+    }
     return 0;
 }
 
@@ -986,6 +997,28 @@ int net_set_linear(net::Net* n, const char* where, int block, int in, int out, c
                                                   : nullptr;
     if (!l) return -1;
     net::set_linear(*l, in, out, w, b);
+    return 0;
+}
+
+// Makes block `block` ConvNeXt's (pre layout only), its depthwise filter of `taps` taps, `at`, (taps, 2),
+// each one's (dy, dx) in order of dy then dx, within 7 squares; `w`, (taps, channels), BatchNorm's
+// scale folded in, and `bias`, (channels), its offset. Its 1x1s are its "expand" and "project".
+int net_set_depthwise(net::Net* n, int block, int taps, const int* at, const float* w, const float* bias) {
+    if (!n->pre || taps < 1) return -1;
+    net::Block& b = n->blocks.at(block);
+    b.convnext = true;
+    b.dw.dy.clear();
+    b.dw.dx.clear();
+    for (int t = 0; t < taps; t++) {
+        const int dy = at[2 * t], dx = at[2 * t + 1];
+        if (std::abs(dy) > 7 || std::abs(dx) > 7) return -1;
+        if (t && std::make_pair(dy, dx) <= std::make_pair(b.dw.dy.back(), b.dw.dx.back())) return -1;
+        b.dw.dy.push_back(dy);
+        b.dw.dx.push_back(dx);
+    }
+    b.dw.w.assign(w, w + (size_t)taps * n->channels);
+    b.dw.bias.assign(bias, bias + n->channels);
+    net::prepare(b.dw);
     return 0;
 }
 

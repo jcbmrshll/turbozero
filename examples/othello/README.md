@@ -257,33 +257,32 @@ made up (`tree_batch_fraction`).
 
 ### Exact endgame labels
 
-`--solve-empties N` stops each self-play game once its position has N or fewer empty
-squares. That position is searched and stored like any other, and an exact solver's result
-for it (win, draw or loss for the player to move) becomes every position's value target,
-instead of the result the game would have had if played out. Self-play skips the searches
-for the last N moves and plays more games in the same compute. The labels lose the noise of
-endgame mistakes: in F2 e440's self-play (the 8x128 at 511/127 sims), the played result
-differs from the exact one at 16-20 empties in 17% of games, mostly a win or loss played
-as a draw or the reverse.
+By default every self-play position with 20 or fewer empty squares gets an exact value
+target: an exact solver's result for it (win, draw or loss for the player to move), instead of
+the result the game had when played out. Each position before a game's first one at 20 or fewer
+takes that position's result. The labels lose the noise of endgame mistakes: in F2 e440's
+self-play (the 8x128 at 511/127 sims), the played result differs from the exact one at 16-20
+empties in 17% of games, mostly a win or loss played as a draw or the reverse.
+`--solve-empties N` moves the cut to N empty squares; `--solve-empties off` plays games out and
+labels them with their played results (and is what `--resign` needs).
 
 The solver (`--solver native`, endgame.py, a win/draw/loss solve; `edax` for comparison)
-runs on the CPU while the GPU trains and plays. Games stopped in an epoch's self-play are solved
-through its training and the next epoch's self-play, and trained on from then. A new run's first epoch solves them at once,
-since it has nothing else to train on. At N = 20, a solve averages about 80 ms a core on
-F2's positions, and an epoch at F2's settings should stop about 4,600 games (152,000 moves at
-about 33 a game from an XOT opening), so the solver needs
-3-4 cores to keep up with a 5080 (`--solve-threads`, default every core the process may
-use; on Modal, `--cpu 8`). `solve_wait_seconds` shows how long self-play waited for it,
-and `solve_games`, `solve_draw` and `solve_missed` count the games.
+runs on the CPU while the GPU trains and plays. Positions stored in an epoch's self-play are solved
+through its training and the next epoch's self-play, and trained on from then. A new run's first
+epoch solves them at once, since it has nothing else to train on. On the 4x64 at 128 sims, an
+epoch stores 43,000-60,000 positions at 20 or fewer empties, solved in 13-19 s on 14 cores, and
+self-play waited under 0.25 s an epoch for them (`--solve-threads`, default every core the process
+may use; on Modal, `--cpu 16`). `solve_wait_seconds` shows how long self-play waited for the
+solver, `solve_positions` counts every solve, and `solve_games`, `solve_draw` and `solve_missed`
+count the games.
 
-Stopped games never produce positions with fewer than N empty squares, though searches from
-just above N still reach them, and their leaves there are valued by the network.
-`--solve-play-past MEAN` plays each game on past N, ending before each further move with
-probability 1 / (1 + MEAN): MEAN moves on average, a geometric number. Positions up to N keep the
-solved result at N; each position stored past N is solved on its own and gets its own exact
-result. Solves below N are cheap (24 ms at 18 empties, a few below that), so at MEAN 3.5 the
-solver's time goes up about 15% a game. `solve_positions` counts every solve. `--solve-share P`
-stops only a fraction P of games and plays the rest to the end, unsolved.
+`--solve-play-past MEAN` ends games early instead: each game stops past N before each further
+move with probability 1 / (1 + MEAN), MEAN moves on average, a geometric number, and skips those
+moves' searches to play more games in the same compute. Positions up to N keep the solved result
+at N; each position stored past N is solved on its own. With 0, games stop at N and never produce
+positions below it, though searches from just above N still reach them and the network values
+their leaves there. The default, `end`, plays every game to its end. `--solve-share P` labels
+only a fraction P of games exactly and plays the rest out, with their played results.
 
 ### Policy target from the search
 
@@ -410,12 +409,12 @@ plays. `--grow-train-retired` keeps the networks that played before training on 
 rather than `--train-steps`, e.g. what its own play would afford for the same compute. With
 `--grow-manual`, nothing takes over by itself: the run logs `growth_caught_up` (1 once
 the rule would switch), saved states record it too, and the next network takes over in a branch
-of the run, with `--branch-from` and `--take-over` (see the run controller below). A branch can
-also grow past the networks the run started with: `--grow` networks after the saved state's
-last start from scratch, as one that hasn't joined a run yet does, so a run whose last network
-plays can go on into a bigger one.
+of the run, with `--branch-from` and `--take-over` (see the run controller below). A branch
+matches its networks to the saved state's by name: one the state hasn't starts from scratch, as
+one that hasn't joined a run yet does (so a run whose last network plays can go on into a bigger
+one), and one the branch leaves out is dropped, unless it plays (see the rack of students below).
 
-Each network's checkpoints go to `--ckpt-dir/<its size>`, e.g. `runs/grow/2x32` and `runs/grow/4x64`.
+Each network's checkpoints go to `--ckpt-dir/<its name>` (its size unless `NAME=SPEC` names it), e.g. `runs/grow/2x32` and `runs/grow/4x64`.
 Saved states hold every network, in `--ckpt-dir`. Each network's metrics are logged as
 `<its size>/<metric>`, and the playing network's also without the prefix. The run logs which
 network played (`growth_playing`), the next's mean metric minus the playing one's (`growth_gap`),
@@ -433,6 +432,50 @@ uv run examples/othello/train.py --net resnet:2x32,pool_every=2,heads=pooled,poo
     --grow resnet:4x64,pool_every=2,heads=pooled,pool_channels=16 --engine-eval-every 1 \
     --lr-plateau --lr-plateau-stop --epochs 600 --ckpt-dir runs/grow
 ```
+
+### A rack of students
+
+To compare candidate architectures quickly, train them side by side as students of a fixed
+teacher, on its self-play games. `--grow-frozen --grow-train-waiting` does that within one run:
+`--net` (the teacher, forked from a saved state with `--init-from`) plays and never trains, and
+every `--grow` network trains on its games each epoch, `--train-steps` steps each. `NAME=SPEC`
+names a network (`--grow r7=resnet:7x64,...`), so students of one size can sit side by side, and
+`--lr-of NAME=LR` and `--weight-decay-of NAME=WD` give one its own rate and decay. A branch
+(`--branch-from`) matches networks to the saved state's by name: it may drop students (all but
+the teacher) and add new ones, which start from scratch, while every student it keeps goes on
+exactly where it was: weights, optimizer state, step count and weight averages.
+
+`student_rack.py` runs such a rack in short segments, each ending in a saved state. Its
+roster, `rack.toml` in the rack's directory, lists the teacher, the students, their learning
+rates, and the train.py options of every segment. `run` reads it before each segment, so
+changes take effect at the next boundary: a student left out is dropped, a new one joins,
+and `stop = true` ends the run. `init` writes a roster for the ray 9x64 (run 860) as the
+teacher, with the self-play recipe it trained with, and two control students, a ray 7x64 and a
+ray 9x64.
+
+The rack is for quick iterations on architectures, not for training final networks: candidates
+are ranked on cheap metrics, and the promising ones then train in self-play from scratch and
+are evaluated in games. `status` prints each student's metrics on the engine set (its weight
+average's value error and regret, and its training loss), over its last epochs or at equal
+training (`--age N`: each student's own epochs up to N, for students that joined at different
+times). `checkpoints` lists each student's newest weight-average checkpoint and spec, for
+evaluating one further. `graduate` forks a student into a run of its own self-play from the
+newest state, with its weights, optimizer, averages and the teacher's replay buffer, which its
+games then replace.
+
+```
+uv run examples/othello/student_rack.py init runs/rack      # the 9x64 ray teacher's recipe
+$EDITOR runs/rack/rack.toml                                 # add [[students]]
+uv run examples/othello/student_rack.py run runs/rack
+uv run examples/othello/student_rack.py status runs/rack --age 40
+uv run examples/othello/student_rack.py checkpoints runs/rack
+uv run examples/othello/student_rack.py graduate runs/rack r7 --epochs 200 --ckpt-dir runs/r7
+```
+
+The rack's directory holds the roster, `ledger.json` (the segments, who trained in each, and
+when each student joined and left), `ckpt/` (each network's checkpoints in `ckpt/<name>/`, and
+the newest `keep_states` saved states) and `logs/`. A name is never reused, so each student's
+checkpoints and metrics stay its own.
 
 ### Weight averages
 
@@ -895,6 +938,11 @@ game phase (`opening`, 40-51 empty squares; `midgame`, 25-39; `endgame`, 1-24):
   draw)
 - `engine_value_sign`: how often its value calls the winner Edax does
 
+It logs the same metrics as `filtered_engine_*` over only the positions the network decides:
+from the XOT opening's to the exact solver's, which plays and labels positions with 20 empty
+squares or fewer. They leave out positions whose moves the solver makes in play, and are
+reported for all of them and in halves (`opening`, 36-51 empty squares; `midgame`, 21-35).
+
 Scoring takes a forward pass over the positions, about 20 ms for 5000 on the GPU.
 `--engine-set PATH` scores on another set, and `--engine-eval-every N` sets the cadence (0
 for never). Without a set at the default path, `~/.cache/turbozero/othello/engine-sets/edax-l24.npz`,
@@ -1142,7 +1190,8 @@ By default it solves for a win, a draw or a loss, about ten times faster than th
 (`solve_exact=1`) and all a result needs: it plays a winning or drawing move, and a lost position is
 searched as usual, the network's best try against a fallible opponent. On a clock the game plans
 its solve as Edax does: from the most empties, up to N, whose expected solve takes at most a quarter
-of the game's clock (`solve_share`), the moves before it sharing the clock less that. The expected
+of the game's clock (`solve_share`), the moves before it sharing the clock less what's kept for
+it: that expected cost, at least 4 s or 5% of what's left (`Solving.kept`). The expected
 cost (`solve_cost`, seconds at 24 empties on 8 threads, doubling each empty more) is by default
 Edax's own exact solver's, 0.19 s, the speed we assume ours will reach; ours took about 2.0 s for a
 win, a draw or a loss there (2026-11-10). A solve may take all but a tenth of what's left, else it

@@ -4,6 +4,7 @@
 //     g++ -std=c++17 -O3 -march=x86-64-v4 -mavx512vnni -mtune=generic -fopenmp-simd profile_native.cpp
 //         -o /tmp/profile_native  (or another level's flags, `native_target.LEVELS`)
 //     taskset -c 9 /tmp/profile_native 4 64 pre channel
+//     taskset -c 9 /tmp/profile_native 7 64 ray batch     (ConvNeXt blocks of Othello's ray filters)
 //
 // prints one JSON line: the shape, ns a forward pass without the marks (the median of rounds), and ns
 // a pass in each stage with them (each mark costs a few ns of its own).
@@ -99,8 +100,49 @@ Linear make_linear(int in, int out) {
     return l;
 }
 
-// as `core.networks.azresnet` builds a ResNet of pooled heads, pool_every=2
-Net make_net(int blocks, int channels, bool pre, int norm, int pool_channels, int head_channels, int hidden) {
+// a ConvNeXt block of Othello's ray filters (57 taps: the row, the column and both diagonals, 7
+// squares each way), expand 2; with a pooling bias from `pool_channels` if `pooled`
+Block make_ray_block(int channels, bool pooled, int pool_channels) {
+    Block b;
+    b.convnext = true;
+    for (int dy = -7; dy <= 7; dy++)
+        for (int dx = -7; dx <= 7; dx++)
+            if (dy == 0 || dx == 0 || dy == dx || dy == -dx) {
+                b.dw.dy.push_back(dy);
+                b.dw.dx.push_back(dx);
+            }
+    for (size_t i = 0; i < b.dw.dy.size() * channels; i++) b.dw.w.push_back(0.1f * normal());
+    for (int i = 0; i < channels; i++) b.dw.bias.push_back(0.1f * normal());
+    prepare(b.dw);
+    auto conv1x1 = [&](int cin, int cout, int zero_point) {
+        Conv c;
+        c.cin = cin;
+        c.cout = cout;
+        c.k = 1;
+        std::vector<int8_t> q((size_t)cout * cin);
+        for (auto& v : q) v = (int8_t)std::uniform_int_distribution<int>(-127, 127)(rng);
+        for (int o = 0; o < cout; o++) {
+            c.scale.push_back(1.0f / (40.0f * cin));
+            c.bias.push_back(0.1f * normal());
+        }
+        for (int i = 0; i < cin; i++) c.inverse.push_back(40.0f);
+        c.zero_point = zero_point;
+        pack1x1(c, q.data(), cin < cout);
+        return c;
+    };
+    b.expand = conv1x1(channels, 2 * channels, 128);
+    b.project = conv1x1(2 * channels, channels, 0);
+    if (pooled) {
+        b.pool_channels = pool_channels;
+        b.pool = make_linear(2 * pool_channels, 2 * channels);
+    }
+    return b;
+}
+
+// as `core.networks.azresnet` builds a ResNet of pooled heads, pool_every=2; with `ray`, of
+// ConvNeXt blocks (`make_ray_block`), pre layout
+Net make_net(int blocks, int channels, bool pre, int norm, int pool_channels, int head_channels, int hidden,
+             bool ray = false) {
     Net n;
     n.channels = channels;
     n.pre = pre;
@@ -114,6 +156,10 @@ Net make_net(int blocks, int channels, bool pre, int norm, int pool_channels, in
         Block b;
         // a pooling bias's block: its second convolution takes the channels not pooled
         const bool pooled = (i + 1) % 2 == 0;
+        if (ray) {
+            n.blocks.push_back(make_ray_block(channels, pooled, pool_channels));
+            continue;
+        }
         b.conv1 = make_conv(channels, channels, 3, pre ? 0 : 0);
         b.conv2 = make_conv(pooled ? channels - pool_channels : channels, channels, 3, pre ? 40 : 0);
         b.norm1 = make_norm(pre ? before : after, channels);
@@ -143,11 +189,12 @@ int main(int argc, char** argv) {
         return 2;
     }
     int blocks = std::atoi(argv[1]), channels = std::atoi(argv[2]);
-    bool pre = std::string(argv[3]) == "pre";
+    const bool ray = std::string(argv[3]) == "ray";
+    bool pre = ray || std::string(argv[3]) == "pre";
     int norm = std::string(argv[4]) == "channel" ? NORM_CHANNEL : NORM_AFFINE;
     int rounds = argc > 5 ? std::atoi(argv[5]) : 15;
     int hidden = argc > 6 ? std::atoi(argv[6]) : 256;
-    Net n = make_net(blocks, channels, pre, norm, channels >= 96 ? 32 : 16, 32, hidden);
+    Net n = make_net(blocks, channels, pre, norm, channels >= 96 ? 32 : 16, 32, hidden, ray);
     Scratch s(n);
     // positions of random discs, the same every run
     const int P = 1024;
@@ -183,8 +230,8 @@ int main(int argc, char** argv) {
     }
     double ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count();
     double per_ns = (profile::now() - c0) / ns;
-    std::printf("{\"shape\": \"%dx%d\", \"pre\": %d, \"norm\": \"%s\", \"ns\": %.1f, \"min_ns\": %.1f, \"marked_ns\": %.1f, \"stages\": {",
-                blocks, channels, (int)pre, argv[4], times[times.size() / 2], times[0], ns / marked);
+    std::printf("{\"shape\": \"%dx%d%s\", \"pre\": %d, \"norm\": \"%s\", \"ns\": %.1f, \"min_ns\": %.1f, \"marked_ns\": %.1f, \"stages\": {",
+                blocks, channels, ray ? " ray" : "", (int)pre, argv[4], times[times.size() / 2], times[0], ns / marked);
     for (size_t i = 0; i < profile::names.size(); i++)
         std::printf("%s\"%s\": %.1f", i ? ", " : "", profile::names[i].c_str(), profile::ticks[i] / per_ns / marked);
     std::printf("}, \"check\": %g}\n", (double)check);

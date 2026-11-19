@@ -31,6 +31,7 @@ from core.networks.azresnet import (
     Norm,
     PooledHeads,
     PreActBlock,
+    PreActConvNeXt,
     ResidualBlock,
     inference_affine,
 )
@@ -191,6 +192,47 @@ class Graph:
             y = self.add(y, self.board_bias(self.linear(block.pool_linear, pooled)))
         return self.add(x, self.conv(block.conv2, y))
 
+    def convnext_block(self, block: PreActConvNeXt, state: eqx.nn.State, x: str) -> str:
+        """ConvNeXt's block: its depthwise filter a grouped convolution, its kernel the smallest
+        square holding its taps, zero off them, with BatchNorm folded in (or another normalization
+        after it)."""
+        kernel = np.asarray(block.dw.dense(), np.float32)
+        channels, size = kernel.shape[0], kernel.shape[-1]
+        bias = None
+        if isinstance(block.norm, eqx.nn.BatchNorm):
+            scale, offset = inference_affine(block.norm, state)
+            kernel = kernel * np.asarray(scale, np.float32).reshape(-1, 1, 1, 1)
+            bias = np.asarray(offset, np.float32)
+        inputs = [x, self.weight(kernel)]
+        if bias is not None:
+            inputs.append(self.weight(bias))
+        y = self.node(
+            "Conv",
+            *inputs,
+            kernel_shape=[size, size],
+            pads=[size // 2] * 4,
+            group=channels,
+        )
+        if bias is None:
+            if not isinstance(block.norm, GroupNorm):
+                raise TypeError(
+                    f"no normalization after a depthwise filter: {block.norm!r}"
+                )
+            y = self.group_norm(block.norm, y)
+        if block.expand_norm is None:
+            h = self.conv(block.expand, y)
+        else:
+            h = self.conv_norm(block.expand, block.expand_norm, state, y)
+        if block.pool_linear is not None:
+            pooled = self.board_pool(
+                self.slice_channels(y, channels - block.pool_channels, channels)
+            )
+            h = self.add(h, self.board_bias(self.linear(block.pool_linear, pooled)))
+        h = self.relu(h)
+        if block.project_norm is None:
+            return self.add(x, self.conv(block.project, h))
+        return self.add(x, self.conv_norm(block.project, block.project_norm, state, h))
+
     def heads(self, heads: PooledHeads, state: eqx.nn.State, x: str) -> tuple[str, str]:
         policy = self.conv_norm(heads.policy_conv, heads.policy_norm, state, x)
         pooled = self.conv_norm(
@@ -212,7 +254,7 @@ class Graph:
 
 
 def to_onnx(network: AZResnet, state: eqx.nn.State) -> onnx.ModelProto:
-    """The ONNX graph of `network`, of basic blocks and pooled heads, with its `state` (BatchNorm's,
+    """The ONNX graph of `network`, of basic or ConvNeXt blocks and pooled heads, with its `state` (BatchNorm's,
     if it has any)."""
     if not isinstance(network.heads, PooledHeads):
         raise TypeError("only pooled heads export")
@@ -221,14 +263,18 @@ def to_onnx(network: AZResnet, state: eqx.nn.State) -> onnx.ModelProto:
     if network.stem_norm is None:
         x = graph.conv(network.stem_conv, x)
     else:
-        x = graph.relu(graph.conv_norm(network.stem_conv, network.stem_norm, state, x))
+        x = graph.conv_norm(network.stem_conv, network.stem_norm, state, x)
+        # the pre-activation trunk starts from the normalized stem as it is
+        x = x if network.final_norm is not None else graph.relu(x)
     for block in network.blocks:
         if isinstance(block, ResidualBlock):
             x = graph.block(block, state, x)
         elif isinstance(block, PreActBlock):
             x = graph.pre_block(block, state, x)
+        elif isinstance(block, PreActConvNeXt):
+            x = graph.convnext_block(block, state, x)
         else:
-            raise TypeError("only basic blocks export")
+            raise TypeError(f"no export of {type(block).__name__}")
     if network.final_norm is not None:
         x = graph.norm_relu(network.final_norm, state, x)
     policy, value = graph.heads(network.heads, state, x)

@@ -138,11 +138,13 @@ search's root value, a solve's margin when solved.
 - **Tree reuse.** A player per game, started from the game's start (`set_position`), is told
   every move, so the tree carries over between our moves; if what it was told disagrees with
   the server it starts again from the server's board.
-- **Time.** A move's search time is the usable clock over our moves left until the solve
-  (`TimePolicy.planned_left`, through `cpu_match.move_budget`); positions with `solve` or fewer
-  empties are solved exactly (`solve_share` of the clock). Planning to the end of the game
-  instead left 26 of 60 s unused at `01:00//02:00` (from 20 empties a solve takes about a
-  second); planned to the solve, about 6.
+- **Time.** A move's search time is the usable clock (`TimePolicy.seconds_left`), less what
+  the player keeps for its solve (`cpu_match.Solving.kept`: at least 4 s or 5% of it), over our
+  moves left until the solve (`cpu_match.move_budget`); positions with `solve` or fewer empties
+  are solved exactly (`solve_share` of the clock). At `01:00//02:00` with `solve=20`, that's
+  about 3.3 s a move from a 14-disc start. Planning to the end of the game instead left 26 of
+  60 s unused (from 20 empties a solve takes about a second). On the extension a move gets a
+  tenth of it, solved only if the solve is expected to fit that.
 - **Komi games** (`K`): before colours are set, both players send a first move with the result
   they expect for the player to move; ours is the search's eval, in discs.
 - **Offers.** Undo, abort and score offers are left unanswered, which declines them.
