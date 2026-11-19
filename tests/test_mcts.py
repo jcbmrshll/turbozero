@@ -741,8 +741,21 @@ def search_until_done(search, env):
         # key 3 draws a full search, key 10 a fast one
         {"full_probability": 0.5, "fast_iterations": 2},
         {"full_probability": 0.5, "fast_iterations": 2, "key": 10},
+        {"count_reused_visits": True},
+        {
+            "full_probability": 0.5,
+            "fast_iterations": 2,
+            "count_reused_visits": True,
+            "key": 10,
+        },
     ],
-    ids=["iterations", "playout-cap-full", "playout-cap-fast"],
+    ids=[
+        "iterations",
+        "playout-cap-full",
+        "playout-cap-fast",
+        "visits",
+        "playout-cap-fast-visits",
+    ],
 )
 def test_a_search_a_cycle_at_a_time_is_evaluate(env, reused, budget):
     # with the root's evaluation first, the same keys, a tree too small for every iteration, and
@@ -854,6 +867,46 @@ def test_a_search_is_done_after_the_roots_evaluation_and_its_iterations(env):
     done = [bool(search.search_done(tree, jnp.array(c))) for c in range(6)]
 
     assert done == [False, False, False, False, True, True]
+
+
+@pytest.mark.parametrize(
+    "nodes, done_from",
+    [
+        # the root has 1 visit: done after its evaluation and 4 iterations, as without
+        (SHAPES[0], 5),
+        # 6 visits: done once evaluated
+        (SHAPES[2], 1),
+    ],
+)
+def test_a_search_counting_reused_visits_is_done_with_the_roots_visits(
+    env, nodes, done_from
+):
+    search = make_mcts(num_iterations=4, count_reused_visits=True)
+    tree = build_tree(search, env, nodes)
+
+    done = [bool(search.search_done(tree, jnp.array(c))) for c in range(7)]
+
+    assert done == [c >= done_from for c in range(7)]
+
+
+@pytest.mark.parametrize("nodes", [SHAPES[0], SHAPES[2]])
+def test_a_search_counting_reused_visits_ends_with_as_many_root_visits(env, nodes):
+    # 8 iterations of a search from scratch: 9 visits, from the root's 1 or the reused 6
+    search = make_mcts(
+        max_nodes=16,
+        leaf_eval_fn=state_eval_fn,
+        num_iterations=8,
+        count_reused_visits=True,
+    )
+    tree = build_tree(search, env, nodes)
+    state, meta = env.init_fn(jax.random.PRNGKey(0))
+
+    searched = search.evaluate(
+        jax.random.PRNGKey(0), tree, state, meta, None, env_step_fn=env.step_fn
+    ).eval_state
+
+    assert int(root(searched).n) == 9
+    assert_consistent(searched)
 
 
 # whole searches, on tic-tac-toe
@@ -1001,6 +1054,18 @@ def test_a_fast_search_is_done_after_its_own_iterations(env, fast, done_from):
 
     assert done == [c >= done_from for c in range(8)]
     assert search.search_cycles() == 6
+
+
+def test_a_fast_search_counting_reused_visits_stops_at_its_own_visits(env):
+    # 6 reused visits: past a fast search's 2 + 1, done once the root is evaluated
+    search = capped(num_iterations=8, fast_iterations=2, count_reused_visits=True)
+    tree = build_tree(search, env, SHAPES[2])
+
+    fast = replace(tree, fast=jnp.array(True))
+    full = replace(tree, fast=jnp.array(False))
+
+    assert bool(search.search_done(fast, jnp.array(1)))
+    assert not bool(search.search_done(full, jnp.array(1)))
 
 
 def test_only_full_searches_roots_take_noise(fixed_length_env):
