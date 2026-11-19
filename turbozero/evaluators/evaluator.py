@@ -27,9 +27,9 @@ class Evaluator:
 
     `evaluate` does a move's work in one call. Self-play instead runs a search
     a cycle at a time, so that environments at different points of their
-    searches evaluate the network together: `start_search`, then
-    `search_cycles()` calls of `search_cycle` (or more, while self-play waits to
-    play its moves), then `search_output`, all with the move's key. An evaluator
+    searches evaluate the network together: `start_search`, then calls of
+    `search_cycle` until `search_done` (or more, while self-play waits to play
+    its moves), then `search_output`, all with the move's key. An evaluator
     that doesn't search does all of it in `search_output`.
     """
 
