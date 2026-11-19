@@ -1,5 +1,4 @@
-from dataclasses import dataclass, replace
-from functools import partial
+from dataclasses import replace
 from typing import Any
 
 import jax
@@ -10,38 +9,6 @@ from turbozero.evaluators.evaluator import EvalOutput, Evaluator
 from turbozero.evaluators.mcts.action_selection import MCTSActionSelector
 from turbozero.evaluators.mcts.state import MCTSNode, MCTSTree, init_mcts_tree
 from turbozero.types import EnvStepFn, LeafEvalFn, StepMetadata
-
-
-@jax.tree_util.register_dataclass
-@dataclass(frozen=True)
-class TraversalState:
-    """State used during traversal step of MCTS.
-
-    Attributes:
-        parent: parent node index
-        action: action taken from parent
-    """
-
-    parent: ArrayLike
-    action: jax.Array
-
-
-@jax.tree_util.register_dataclass
-@dataclass(frozen=True)
-class Leaf:
-    """Where an iteration's traversal ended, and the state there it evaluates.
-
-    Attributes:
-        parent: index of the node the leaf is under
-        action: action from the parent to the leaf
-        embedding: the leaf's environment state
-        metadata: its metadata
-    """
-
-    parent: ArrayLike
-    action: jax.Array
-    embedding: Any
-    metadata: StepMetadata
 
 
 class MCTS(Evaluator):
@@ -128,26 +95,24 @@ class MCTS(Evaluator):
         Returns:
             EvalOutput: contains new tree state, selected action, and policy weights
         """
-        eval_state = self.start_search(key, eval_state)
-        # store current state metadata in the root node
+        tree = self.start_search(key, eval_state)
         root_key, iterate_key, sample_key = jax.random.split(key, 3)
-        eval_state = self.update_root(
-            root_key, eval_state, env_state, params, root_metadata=root_metadata
+        eval_key, _ = jax.random.split(root_key)
+        policy_logits, value = self.leaf_eval_fn(env_state, params, eval_key)
+        tree = self.expand_root(
+            root_key, tree, env_state, root_metadata, policy_logits, value
         )
-        # perform 'num_iterations' iterations of MCTS
-        iterate = partial(self.iterate, params=params, env_step_fn=env_step_fn)
 
-        iterate_keys = jax.random.split(iterate_key, self.num_iterations)
+        def iterate(tree: MCTSTree, key: jax.Array) -> tuple[MCTSTree, None]:
+            traverse_key, eval_key, key = jax.random.split(key, 3)
+            leaf = self.find_leaf(traverse_key, tree, env_step_fn)
+            policy_logits, value = self.leaf_eval_fn(leaf[2], params, eval_key)
+            return self.expand(key, tree, leaf, policy_logits, value), None
 
-        eval_state, _ = jax.lax.scan(
-            lambda state, k: (iterate(k, state), None), eval_state, iterate_keys
-        )
-        # sample action based on root visit counts
-        # (also get normalized policy weights for training purposes)
-        action, policy_weights = self.sample_root_action(sample_key, eval_state)
-        return EvalOutput(
-            eval_state=eval_state, action=action, policy_weights=policy_weights
-        )
+        keys = jax.random.split(iterate_key, self.num_iterations)
+        tree, _ = jax.lax.scan(iterate, tree, keys)
+        action, policy_weights = self.sample_root_action(sample_key, tree)
+        return EvalOutput(eval_state=tree, action=action, policy_weights=policy_weights)
 
     def search_cycles(self) -> int:
         """The root's evaluation, then `num_iterations` iterations."""
@@ -221,9 +186,7 @@ class MCTS(Evaluator):
         # where a cond would select between two whole trees
         leaf = self.find_leaf(traverse_key, state, env_step_fn)
         policy_logits, value = self.leaf_eval_fn(
-            jax.tree.map(
-                lambda r, l: jnp.where(at_root, r, l), env_state, leaf.embedding
-            ),
+            jax.tree.map(lambda r, l: jnp.where(at_root, r, l), env_state, leaf[2]),
             params,
             jnp.where(at_root, root_eval_key, leaf_eval_key),
         )
@@ -277,32 +240,6 @@ class MCTS(Evaluator):
         """
         return state.data_at(state.ROOT_INDEX).q
 
-    def update_root(
-        self,
-        key: jax.Array,
-        tree: MCTSTree,
-        root_embedding: Any,
-        params: Any,
-        root_metadata: StepMetadata,
-    ) -> MCTSTree:
-        """Populates the root node of an MCTSTree.
-
-        Args:
-            key: rng
-            tree: MCTSTree to update
-            root_embedding: root environment state
-            params: nn parameters
-            root_metadata: metadata of the root environment state
-
-        Returns:
-            MCTSTree: updated MCTSTree
-        """
-        eval_key, _ = jax.random.split(key)
-        policy_logits, value = self.leaf_eval_fn(root_embedding, params, eval_key)
-        return self.expand_root(
-            key, tree, root_embedding, root_metadata, policy_logits, value
-        )
-
     def expand_root(
         self,
         key: jax.Array,
@@ -329,8 +266,16 @@ class MCTS(Evaluator):
         """
         policy = self.prior(policy_logits, root_metadata.action_mask)
         prior = self.root_prior(tree.root_noise, policy, root_metadata.action_mask)
-        root_node = self.update_root_node(
-            tree.data_at(tree.ROOT_INDEX), prior, value, root_embedding
+        root_node = tree.data_at(tree.ROOT_INDEX)
+        visited = root_node.n > 0
+        root_node = replace(
+            root_node,
+            p=prior,
+            # keep old value estimate if the node has already been visited
+            q=jnp.where(visited, root_node.q, value),
+            # keep old visit count if the node has already been visited
+            n=jnp.where(visited, root_node.n, 1),
+            embedding=root_embedding,
         )
         return tree.set_root(root_node, write=write)
 
@@ -364,37 +309,9 @@ class MCTS(Evaluator):
         """
         return policy
 
-    def iterate(
-        self,
-        key: jax.Array,
-        tree: MCTSTree,
-        params: Any,
-        env_step_fn: EnvStepFn,
-        write: ArrayLike = True,
-    ) -> MCTSTree:
-        """Performs one iteration of MCTS.
-
-        1. Traverse to leaf node.
-        2. Evaluate Leaf Node
-        3. Expand Leaf Node (add to tree)
-        4. Backpropagate
-
-        Args:
-            key: rng
-            tree: MCTSTree to evaluate
-            params: parameters to pass to the the leaf evaluation function
-            env_step_fn: env step fn: (env_state, action) -> (new_env_state, metadata)
-            write: (optional) whether to; if not, the tree is left as it is (see `expand`)
-
-        Returns:
-            MCTSTree: updated MCTSTree
-        """
-        traverse_key, eval_key, key = jax.random.split(key, 3)
-        leaf = self.find_leaf(traverse_key, tree, env_step_fn)
-        policy_logits, value = self.leaf_eval_fn(leaf.embedding, params, eval_key)
-        return self.expand(key, tree, leaf, policy_logits, value, write=write)
-
-    def find_leaf(self, key: jax.Array, tree: MCTSTree, env_step_fn: EnvStepFn) -> Leaf:
+    def find_leaf(
+        self, key: jax.Array, tree: MCTSTree, env_step_fn: EnvStepFn
+    ) -> tuple[jax.Array, jax.Array, Any, StepMetadata]:
         """Traverses from the root to the leaf an iteration evaluates, and steps to its state.
 
         Args:
@@ -403,20 +320,48 @@ class MCTS(Evaluator):
             env_step_fn: env step fn: (env_state, action) -> (new_env_state, metadata)
 
         Returns:
-            Leaf: the leaf
+            the leaf: the index of the node it's under, the action from there to it, its
+            environment state and its metadata
         """
-        traversal_state = self.traverse(key, tree)
-        parent, action = traversal_state.parent, traversal_state.action
+
+        # continue while:
+        # - there is an existing edge corresponding to the chosen action
+        # - AND the child node connected to that edge is not terminal
+        def cond_fn(state: tuple[jax.Array, jax.Array]) -> jax.Array:
+            parent, action = state
+            return jnp.logical_and(
+                tree.is_edge(parent, action),
+                ~(tree.data_at(tree.edge_map[parent, action]).terminated),
+            )
+
+        # a traversal visits each node at most once, so each selection gets its own key
+        def select(node_idx: ArrayLike) -> jax.Array:
+            node_key = jax.random.fold_in(key, node_idx)
+            return self.action_selector(node_key, tree, node_idx, self.discount)
+
+        # each step, unless the traversal is already at its leaf:
+        # - get the index of the child node connected to the chosen action
+        # - choose the action to take from the child node
+        def step(state: tuple[jax.Array, jax.Array]) -> tuple[jax.Array, jax.Array]:
+            parent, action = state
+            descend = cond_fn(state)
+            node_idx = tree.edge_map[parent, action]
+            return (
+                jnp.where(descend, node_idx, parent),
+                jnp.where(descend, select(node_idx), action),
+            )
+
+        # traverse from root to leaf, from the action to take from the root
+        root = jnp.asarray(tree.ROOT_INDEX)
+        parent, action = jax.lax.while_loop(cond_fn, step, (root, select(root)))
         embedding, metadata = env_step_fn(tree.data_at(parent).embedding, action)
-        return Leaf(
-            parent=parent, action=action, embedding=embedding, metadata=metadata
-        )
+        return parent, action, embedding, metadata
 
     def expand(
         self,
         key: jax.Array,
         tree: MCTSTree,
-        leaf: Leaf,
+        leaf: tuple[ArrayLike, ArrayLike, Any, StepMetadata],
         policy_logits: jax.Array,
         value: ArrayLike,
         write: ArrayLike = True,
@@ -434,8 +379,7 @@ class MCTS(Evaluator):
         Returns:
             MCTSTree: updated MCTSTree
         """
-        parent, action = leaf.parent, leaf.action
-        new_embedding, metadata = leaf.embedding, leaf.metadata
+        parent, action, new_embedding, metadata = leaf
         player_reward = metadata.rewards[metadata.cur_player_id]
         policy = self.prior(policy_logits, metadata.action_mask)
         value = jnp.where(metadata.terminated, player_reward, value)
@@ -460,37 +404,11 @@ class MCTS(Evaluator):
         node_data = jax.tree.map(
             lambda v, n: jnp.where(node_exists, v, n), visited, new
         )
-        # when the tree is full, a new leaf takes the slot of the least-visited leaf
-        tree = tree.set_child(
-            parent,
-            action,
-            node_data,
-            evict=self.eviction_candidate(tree, parent),
-            write=write,
-        )
-        # backpropagate, only if the leaf is in the tree: otherwise (a full tree with nothing to
-        # evict) its value would reach the root but no child of it, and PUCT would choose the same
-        # leaf again and again. Every later iteration then does nothing, and the search ends early
-        landed = write & tree.is_edge(parent, action)
-        return self.backpropagate(
-            key, tree, jnp.where(landed, parent, tree.NULL_INDEX), value
-        )
-
-    def eviction_candidate(self, tree: MCTSTree, parent: ArrayLike) -> jax.Array:
-        """The leaf to evict if the tree is full and an iteration needs a new node under `parent`:
-        the least-visited leaf, other than the root and `parent`, and not a child of the root unless
-        every leaf is (the root's children hold the policy target); of those, the one whose parent
-        has the fewest visits, which the search is least likely to come back to. The evicted leaf's
-        visits stay counted in its ancestors, as if it had never been expanded; PUCT can expand it
-        again.
-
-        Args:
-            tree: MCTSTree, full
-            parent: index of the node the new leaf goes under
-
-        Returns:
-            jax.Array: the leaf's index, or NULL_INDEX if there is none
-        """
+        # when the tree is full, a new leaf takes the slot of the least-visited leaf, other than
+        # the root and `parent`, and not a child of the root unless every leaf is (the root's
+        # children hold the policy target); of those, the one whose parent has the fewest visits,
+        # which the search is least likely to come back to. The evicted leaf's visits stay
+        # counted in its ancestors, as if it had never been expanded; PUCT can expand it again
         index = jnp.arange(tree.capacity)
         leaves = tree.leaves() & (index != tree.ROOT_INDEX) & (index != parent)
         deep = leaves & (tree.parents != tree.ROOT_INDEX)
@@ -500,75 +418,21 @@ class MCTS(Evaluator):
         # (only the root's parent is NULL_INDEX, and the root isn't a candidate)
         parent_n = tree.data.n[jnp.maximum(tree.parents, 0)]
         # of the least visited, the first with the least visited parent
-        leaf = jnp.argmin(jnp.where(n == n.min(), parent_n, most))
-        return jnp.where(candidates.any(), leaf, tree.NULL_INDEX)
-
-    def traverse(self, key: jax.Array, tree: MCTSTree) -> TraversalState:
-        """Traverse from the root node until an unvisited leaf node is reached.
-
-        Args:
-            key: rng, for the action selector
-            tree: MCTSTree to evaluate
-
-        Returns:
-            TraversalState: state of the traversal
-                - parent: index of the parent node
-                - action: action to take from the parent node
-        """
-
-        # continue while:
-        # - there is an existing edge corresponding to the chosen action
-        # - AND the child node connected to that edge is not terminal
-        def cond_fn(state: TraversalState) -> jax.Array:
-            return jnp.logical_and(
-                tree.is_edge(state.parent, state.action),
-                ~(tree.data_at(tree.edge_map[state.parent, state.action]).terminated),
-                # TODO: maximum depth
-            )
-
-        # a traversal visits each node at most once, so each selection gets its own key
-        def select(node_idx: ArrayLike) -> jax.Array:
-            node_key = jax.random.fold_in(key, node_idx)
-            return self.action_selector(node_key, tree, node_idx, self.discount)
-
-        # each step, unless the traversal is already at its leaf:
-        # - get the index of the child node connected to the chosen action
-        # - choose the action to take from the child node
-        def step(state: TraversalState) -> TraversalState:
-            descend = cond_fn(state)
-            node_idx = tree.edge_map[state.parent, state.action]
-            action = select(node_idx)
-            return TraversalState(
-                parent=jnp.where(descend, node_idx, state.parent),
-                action=jnp.where(descend, action, state.action),
-            )
-
-        # choose the action to take from the root
-        root_action = select(tree.ROOT_INDEX)
-        # traverse from root to leaf
-        return jax.lax.while_loop(
-            cond_fn, step, TraversalState(parent=tree.ROOT_INDEX, action=root_action)
+        evict = jnp.argmin(jnp.where(n == n.min(), parent_n, most))
+        tree = tree.set_child(
+            parent,
+            action,
+            node_data,
+            evict=jnp.where(candidates.any(), evict, tree.NULL_INDEX),
+            write=write,
         )
-
-    def backpropagate(
-        self, key: jax.Array, tree: MCTSTree, parent: ArrayLike, value: ArrayLike
-    ) -> MCTSTree:  # pylint: disable=unused-argument
-        """Backpropagate the value estimate from the leaf node to the root node and update visit counts.
-
-        Args:
-            key: rng
-            tree: MCTSTree to evaluate
-            parent: index of the parent node (in most cases, this is the new node added to the tree this iteration),
-                or NULL_INDEX to back up nothing
-            value: value estimate of the leaf node
-
-        Returns:
-            MCTSTree: updated search tree
-        """
-
+        # backpropagate, only if the leaf is in the tree: otherwise (a full tree with nothing to
+        # evict) its value would reach the root but no child of it, and PUCT would choose the same
+        # leaf again and again. Every later iteration then does nothing, and the search ends early
+        landed = write & tree.is_edge(parent, action)
         # every node from `parent` up to the root is visited once, all at the same time (rather than
         # in a loop up the path, see `Tree.path_to_root`)
-        path = tree.path_to_root(parent)
+        path = tree.path_to_root(jnp.where(landed, parent, tree.NULL_INDEX))
         # the value is discounted once more at each level up
         if abs(self.discount) == 1:
             # flip signs rather than multiply: exactly the values a loop up the path computes, and
@@ -691,35 +555,6 @@ class MCTS(Evaluator):
             q=jnp.array(value, dtype=jnp.float32),
             terminated=jnp.array(terminated, dtype=jnp.bool_),
             embedding=embedding,
-        )
-
-    @staticmethod
-    def update_root_node(
-        root_node: MCTSNode,
-        root_policy: jax.Array,
-        root_value: ArrayLike,
-        root_embedding: Any,
-    ) -> MCTSNode:
-        """Update the root node of the search tree.
-
-        Args:
-            root_node: node to update
-            root_policy: policy weights
-            root_value: value estimate
-            root_embedding: environment state embedding
-
-        Returns:
-            MCTSNode: updated root node
-        """
-        visited = root_node.n > 0
-        return replace(
-            root_node,
-            p=root_policy,
-            # keep old value estimate if the node has already been visited
-            q=jnp.where(visited, root_node.q, root_value),
-            # keep old visit count if the node has already been visited
-            n=jnp.where(visited, root_node.n, 1),
-            embedding=root_embedding,
         )
 
     def reset(self, state: MCTSTree) -> MCTSTree:

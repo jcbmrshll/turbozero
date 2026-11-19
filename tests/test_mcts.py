@@ -168,13 +168,21 @@ def assert_trees_equal(a, b):
 # the root
 
 
-def test_update_root_evaluates_an_empty_root_with_a_masked_prior(fixed_length_env):
+def update_root(search, tree, state, meta):
+    """The root's update `evaluate` makes: the network's evaluation of `state`, at the root."""
+    policy_logits, value = search.leaf_eval_fn(state, None, jax.random.PRNGKey(0))
+    return search.expand_root(
+        jax.random.PRNGKey(0), tree, state, meta, policy_logits, value
+    )
+
+
+def test_the_root_update_evaluates_an_empty_root_with_a_masked_prior(fixed_length_env):
     env = fixed_length_env(length=10, num_actions=3, action_mask=(True, False, True))
     search = make_mcts(logits=[1.0, 5.0, 0.0], value=0.3)
     state, meta = env.init_fn(jax.random.PRNGKey(0))
     tree = search.init(template_embedding=state)
 
-    tree = search.update_root(jax.random.PRNGKey(0), tree, state, None, meta)
+    tree = update_root(search, tree, state, meta)
 
     node = root(tree)
     np.testing.assert_allclose(
@@ -184,12 +192,12 @@ def test_update_root_evaluates_an_empty_root_with_a_masked_prior(fixed_length_en
     assert int(tree.next_free_idx) == 1
 
 
-def test_update_root_keeps_a_reused_roots_visits_and_value(env):
+def test_the_root_update_keeps_a_reused_roots_visits_and_value(env):
     search = make_mcts(logits=[0.0, 1.0, 2.0], value=0.9)
     tree = build_tree(search, env, [(None, None, 5, -0.2), (0, 1, 4, 0.1)])
     state, meta = env.init_fn(jax.random.PRNGKey(0))
 
-    tree = search.update_root(jax.random.PRNGKey(0), tree, state, None, meta)
+    tree = update_root(search, tree, state, meta)
 
     node = root(tree)
     assert int(node.n) == 5 and float(node.q) == pytest.approx(-0.2)
@@ -208,7 +216,7 @@ def test_the_roots_prior_takes_the_noise_its_search_drew(fixed_length_env):
     started = search.start_search(jax.random.PRNGKey(1), tree)
     kept = search.start_search(jax.random.PRNGKey(2), started, active=False)
     other = search.start_search(jax.random.PRNGKey(2), tree)
-    updated = search.update_root(jax.random.PRNGKey(0), kept, state, None, meta)
+    updated = update_root(search, kept, state, meta)
 
     # a search that doesn't start keeps its noise, and another key draws another
     np.testing.assert_array_equal(kept.root_noise, started.root_noise)
@@ -290,20 +298,18 @@ def test_traversal_follows_the_selector_to_an_unexpanded_edge(env):
     search = make_mcts(selector=FirstAction())
     tree = build_tree(search, env, CHAIN[:3])
 
-    traversal = search.traverse(jax.random.PRNGKey(0), tree)
+    parent, action, _, _ = search.find_leaf(jax.random.PRNGKey(0), tree, env.step_fn)
 
-    assert np.asarray([traversal.parent, traversal.action]).tolist() == [2, 0]
+    assert [int(parent), int(action)] == [2, 0]
 
 
 def test_traversal_breaks_ties_with_its_key(env):
     # a root with no visited children and a uniform prior: every action scores the same
     search = make_mcts()
     tree = build_tree(search, env, CHAIN[:1])
-    traverse = jax.jit(search.traverse)
+    find_leaf = jax.jit(lambda key: search.find_leaf(key, tree, env.step_fn))
 
-    actions = {
-        int(traverse(jax.random.PRNGKey(seed), tree).action) for seed in range(16)
-    }
+    actions = {int(find_leaf(jax.random.PRNGKey(seed))[1]) for seed in range(16)}
 
     assert actions == {0, 1, 2}
 
@@ -315,14 +321,26 @@ def test_traversal_stops_at_a_terminal_child(fixed_length_env):
     tree = build_tree(search, env, CHAIN[:3])
     assert bool(tree.data_at(2).terminated)
 
-    traversal = search.traverse(jax.random.PRNGKey(0), tree)
+    parent, action, _, _ = search.find_leaf(jax.random.PRNGKey(0), tree, env.step_fn)
 
-    assert np.asarray([traversal.parent, traversal.action]).tolist() == [1, 0]
+    assert [int(parent), int(action)] == [1, 0]
+
+
+def iteration(search, env):
+    """An iteration of `search` on `env`'s trees, as `evaluate` makes it, with no params."""
+
+    def run(key, tree):
+        traverse_key, eval_key, key = jax.random.split(key, 3)
+        leaf = search.find_leaf(traverse_key, tree, env.step_fn)
+        policy_logits, value = search.leaf_eval_fn(leaf[2], None, eval_key)
+        return search.expand(key, tree, leaf, policy_logits, value)
+
+    return run
 
 
 def iterate(search, env):
-    """`search`'s compiled iteration on `env`'s trees, with no params."""
-    return jax.jit(lambda key, tree: search.iterate(key, tree, None, env.step_fn))
+    """`iteration`, compiled."""
+    return jax.jit(iteration(search, env))
 
 
 def test_an_iteration_expands_a_leaf_and_backs_its_value_up(fixed_length_env):
@@ -365,7 +383,7 @@ def test_an_iteration_in_a_full_tree_takes_an_evicted_leafs_place(env):
     tree = build_tree(search, env, FULL)
 
     # it reaches leaf 3 (along action 0 from the root, then from 1), and expands it in place of
-    # leaf 5 (see test_eviction_candidate)
+    # leaf 5 (see test_a_new_leaf_in_a_full_tree_evicts)
     tree = iterate(search, env)(jax.random.PRNGKey(0), tree)
 
     assert int(tree.edge_map[3, 0]) == 5 and int(tree.parents[5]) == 3
@@ -384,24 +402,38 @@ def test_an_iteration_in_a_full_tree_with_nothing_to_evict_changes_nothing(env):
 
 
 @pytest.mark.parametrize(
-    "nodes, parent, evicted",
+    "nodes, num_actions, parent, action, evicted",
     [
         # the least-visited leaf below the root's children: of 3 and 5, the one whose parent has
         # fewer visits
-        (FULL, 1, 3),
+        (FULL, 3, 1, 2, 3),
         # never the node the new leaf goes under
-        (FULL, 3, 5),
+        (FULL, 3, 3, 0, 5),
         # a child of the root only when every leaf is one: the least visited
-        ([(None, None, 7, 0.0), (0, 0, 3, 0.0), (0, 1, 1, 0.0), (0, 2, 2, 0.0)], 0, 2),
-        # none, when the only leaf is the node the new leaf goes under
-        (CHAIN, 3, NULL),
+        (
+            [(None, None, 7, 0.0), (0, 0, 3, 0.0), (0, 1, 1, 0.0), (0, 2, 2, 0.0)],
+            4,
+            0,
+            3,
+            2,
+        ),
     ],
 )
-def test_eviction_candidate(env, nodes, parent, evicted):
-    search = make_mcts(max_nodes=len(nodes))
+def test_a_new_leaf_in_a_full_tree_evicts(
+    fixed_length_env, nodes, num_actions, parent, action, evicted
+):
+    env = fixed_length_env(length=10, num_actions=num_actions)
+    search = make_mcts(num_actions=num_actions, max_nodes=len(nodes))
     tree = build_tree(search, env, nodes)
+    leaf = (parent, action, *env.step_fn(tree.data_at(parent).embedding, action))
 
-    assert int(search.eviction_candidate(tree, parent)) == evicted
+    expanded = search.expand(
+        jax.random.PRNGKey(0), tree, leaf, jnp.zeros(num_actions), 0.0
+    )
+
+    assert int(expanded.edge_map[parent, action]) == evicted
+    assert int(expanded.parents[evicted]) == parent
+    assert_consistent(expanded)
 
 
 @pytest.mark.parametrize(
@@ -420,20 +452,20 @@ def test_backpropagation_visits_every_node_up_to_the_root(env, discount, values)
     tree = build_tree(
         search, env, [(None, None, 3, 0.3), (0, 0, 2, 0.2), (1, 0, 1, 0.1)]
     )
+    leaf = (2, 0, *env.step_fn(tree.data_at(2).embedding, 0))
 
     # the value 0.8 of a new leaf under node 2
-    backed_up = search.backpropagate(jax.random.PRNGKey(0), tree, 2, 0.8)
+    backed_up = search.expand(jax.random.PRNGKey(0), tree, leaf, jnp.zeros(3), 0.8)
 
+    assert int(backed_up.data.n[3]) == 1 and float(
+        backed_up.data.q[3]
+    ) == pytest.approx(0.8)
     np.testing.assert_array_equal(backed_up.data.n[:3], [4, 3, 2])
     old_q, old_n = np.array([0.3, 0.2, 0.1]), np.array([3, 2, 1])
     np.testing.assert_allclose(
         backed_up.data.q[:3],
         (old_q * old_n + np.array(values[::-1])) / (old_n + 1),
         rtol=1e-6,
-    )
-    # nothing, from NULL_INDEX
-    assert_trees_equal(
-        search.backpropagate(jax.random.PRNGKey(0), tree, NULL, 0.8), tree
     )
 
 
@@ -453,48 +485,56 @@ def test_step_keeps_the_played_moves_subtree_or_starts_over(env, persist_tree):
         assert int(stepped.next_free_idx) == 0
 
 
-class KeyRecordingMCTS(MCTS):
-    """MCTS whose root update, iterations and action sampling only record the key each one receives."""
+class RecordingSelector(PUCTSelector):
+    """PUCT, recording each key it receives with `record`."""
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, record):
+        super().__init__()
+        self.record = record
+
+    def __call__(self, key, tree, index, discount):
+        self.record("select", key)
+        return super().__call__(key, tree, index, discount)
+
+
+class KeyRecordingMCTS(MCTS):
+    """MCTS whose network evaluations, selections and action sampling record the key each one
+    receives."""
+
+    def __init__(self, **kwargs):
+        def leaf_eval_fn(state, params, key):
+            self.record("leaf_eval_fn", key)
+            return jnp.zeros(self.branching_factor), jnp.array(0.0)
+
+        super().__init__(
+            leaf_eval_fn=leaf_eval_fn,
+            action_selector=RecordingSelector(self.record),
+            **kwargs,
+        )
         self.recorded = []
 
     def record(self, name, key):
         jax.debug.callback(lambda k: self.recorded.append((name, np.asarray(k))), key)
 
-    def update_root(self, key, tree, root_embedding, params, root_metadata):
-        self.record("update_root", key)
-        return tree
-
-    def iterate(self, key, tree, params, env_step_fn, write=True):
-        self.record("iterate", key)
-        return tree
-
     def sample_root_action(self, key, tree):
         self.record("sample_root_action", key)
-        return jnp.array(0), jnp.zeros((self.branching_factor,))
+        return super().sample_root_action(key, tree)
 
 
 def test_evaluate_gives_every_consumer_an_independent_key(env):
-    search = KeyRecordingMCTS(
-        leaf_eval_fn=fixed_eval_fn(jnp.zeros(3)),
-        action_selector=PUCTSelector(),
-        branching_factor=3,
-        max_nodes=8,
-        num_iterations=4,
-    )
+    search = KeyRecordingMCTS(branching_factor=3, max_nodes=8, num_iterations=4)
     state, meta = env.init_fn(jax.random.PRNGKey(0))
     tree = search.init(template_embedding=state)
     key = jax.random.PRNGKey(0)
 
-    search.evaluate(key, tree, state, meta, params=None, env_step_fn=env.step_fn)
+    search.evaluate(key, tree, state, meta, None, env.step_fn)
     jax.effects_barrier()
 
     names = [name for name, _ in search.recorded]
-    assert sorted(names) == sorted(
-        ["update_root", "sample_root_action"] + ["iterate"] * search.num_iterations
-    )
+    assert names.count("leaf_eval_fn") == 1 + search.num_iterations
+    assert names.count("sample_root_action") == 1
+    # a selection at the root and one more for each level down
+    assert names.count("select") >= search.num_iterations
     keys = [tuple(k.tolist()) for _, k in search.recorded]
     assert tuple(np.asarray(key).tolist()) not in keys
     assert len(set(keys)) == len(keys)
@@ -529,18 +569,17 @@ def iterations(search, env, num):
     """`num` iterations of `search`, one after another."""
 
     def run(key, tree):
+        run = iteration(search, env)
         return jax.lax.scan(
-            lambda t, k: (search.iterate(k, t, None, env.step_fn), None),
-            tree,
-            jax.random.split(key, num),
+            lambda t, k: (run(k, t), None), tree, jax.random.split(key, num)
         )[0]
 
     return run
 
 
 def test_batched_iterations_match_iterating_each_tree_alone(env):
-    # under vmap, WeightedMCTS's backpropagation loops until the longest path in the batch is done,
-    # and the trees on shorter paths must come out exactly as if iterated alone
+    # under vmap, traversals loop until the deepest in the batch is done, and the trees with
+    # shallower ones must come out exactly as if iterated alone
     search = make_mcts(max_nodes=16, leaf_eval_fn=varying_eval_fn)
     trees = [build_tree(search, env, nodes) for nodes in SHAPES]
     keys = jax.random.split(jax.random.PRNGKey(0), len(trees))
