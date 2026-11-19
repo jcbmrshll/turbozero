@@ -13,7 +13,7 @@ import pytest
 
 from turbozero.evaluators.alphazero import AlphaZero
 from turbozero.evaluators.mcts.action_selection import MCTSActionSelector, PUCTSelector
-from turbozero.evaluators.mcts.mcts import MCTS, PlayoutCap
+from turbozero.evaluators.mcts.mcts import MCTS
 from turbozero.evaluators.mcts.policy_targets import CompletedQ
 from turbozero.evaluators.mcts.weighted_mcts import WeightedMCTS, WeightedMCTSNode
 
@@ -293,38 +293,6 @@ def test_the_root_keeps_the_networks_policy_without_the_noise(fixed_length_env):
     np.testing.assert_allclose(
         jax.nn.softmax(tree.root_logits), masked_softmax(logits, mask), rtol=1e-6
     )
-
-
-@pytest.mark.parametrize("cls", BACKUPS)
-@pytest.mark.parametrize("temperature", [0.5, 2.0])
-def test_the_prior_is_the_policys_softmax_at_its_temperature_at_every_node(
-    fixed_length_env, cls, temperature
-):
-    mask = (True, False, True)
-    env = fixed_length_env(length=10, num_actions=3, action_mask=mask)
-    logits = jnp.array([1.0, 5.0, 0.0])
-    search = make_mcts(
-        cls, logits=logits, selector=FirstAction(), prior_temperature=temperature
-    )
-    state, meta = env.init_fn(jax.random.PRNGKey(0))
-    tree = search.update_root(
-        jax.random.PRNGKey(0), search.init(template_embedding=state), state, None, meta
-    )
-
-    tree = iterate(search, env)(jax.random.PRNGKey(0), tree)
-
-    flattened = masked_softmax(logits / temperature, mask)
-    np.testing.assert_allclose(root(tree).p, flattened, rtol=1e-6)
-    np.testing.assert_allclose(tree.data_at(1).p, flattened, rtol=1e-6)
-    # the policy target's logits are still the network's own
-    np.testing.assert_allclose(
-        jax.nn.softmax(tree.root_logits), masked_softmax(logits, mask), rtol=1e-6
-    )
-
-
-def test_the_prior_temperature_is_positive():
-    with pytest.raises(ValueError, match="prior_temperature"):
-        make_mcts(prior_temperature=0.0)
 
 
 # choosing the move to play
@@ -700,34 +668,6 @@ def test_batched_iterations_match_iterating_each_tree_alone(env, cls):
         )
 
 
-@pytest.mark.parametrize("traversal_steps", [2, 3])
-def test_iterations_do_not_depend_on_the_traversals_steps_between_checks(
-    env, traversal_steps
-):
-    # batched, the trees' traversals end at different depths, and steps past a traversal's leaf
-    # (to the next check, or until the deepest in the batch is done) must change nothing
-    trees = [build_tree(make_mcts(max_nodes=16), env, nodes) for nodes in SHAPES]
-    trees = jax.tree.map(lambda *x: jnp.stack(x), *trees)
-    keys = jax.random.split(jax.random.PRNGKey(0), len(SHAPES))
-
-    def run(search):
-        return jax.jit(jax.vmap(iterations(search, env, 6)))(keys, trees)
-
-    assert_trees_equal(
-        run(
-            make_mcts(
-                max_nodes=16, eval_fn=varying_eval_fn, traversal_steps=traversal_steps
-            )
-        ),
-        run(make_mcts(max_nodes=16, eval_fn=varying_eval_fn)),
-    )
-
-
-def test_traversal_steps_is_at_least_1():
-    with pytest.raises(ValueError, match="traversal_steps"):
-        make_mcts(traversal_steps=0)
-
-
 @pytest.mark.parametrize("cls", BACKUPS)
 def test_iterations_do_not_depend_on_the_trees_capacity(env, cls):
     # with room to spare, a larger tree changes nothing: arrays of the tree's capacity (e.g. the path
@@ -811,34 +751,10 @@ def search_until_done(search, env):
     ],
 )
 @pytest.mark.parametrize("reused", [False, True], ids=["empty", "reused"])
-@pytest.mark.parametrize(
-    "budget",
-    [
-        {},
-        {"count_reused_visits": True},
-        {"count_reused_visits": True, "min_iterations": 2},
-        # key 3 draws a full search, key 10 a fast one
-        {"playout_cap": PlayoutCap(0.5, 2)},
-        {"playout_cap": PlayoutCap(0.5, 2), "key": 10},
-        {"playout_cap": PlayoutCap(0.5, 2), "count_reused_visits": True, "key": 10},
-    ],
-    ids=[
-        "iterations",
-        "visits",
-        "visits-min-2",
-        "playout-cap-full",
-        "playout-cap-fast",
-        "playout-cap-fast-visits",
-    ],
-)
-def test_a_search_a_cycle_at_a_time_is_evaluate(env, cls, reused, budget):
-    # with the root's evaluation first, the same keys, a tree too small for every iteration, and
-    # searches that stop early
-    budget = dict(budget)
-    key = jax.random.PRNGKey(budget.pop("key", 3))
-    search = make_mcts(
-        cls, max_nodes=8, eval_fn=state_eval_fn, num_iterations=6, **budget
-    )
+def test_a_search_a_cycle_at_a_time_is_evaluate(env, cls, reused):
+    # with the root's evaluation first, the same keys, and a tree too small for every iteration
+    key = jax.random.PRNGKey(3)
+    search = make_mcts(cls, max_nodes=8, eval_fn=state_eval_fn, num_iterations=6)
     root_state, root_meta = env.init_fn(jax.random.PRNGKey(0))
     tree = (
         build_tree(search, env, SHAPES[2])
@@ -846,10 +762,6 @@ def test_a_search_a_cycle_at_a_time_is_evaluate(env, cls, reused, budget):
         else search.init(template_embedding=root_state)
     )
     assert search.search_cycles() == 7
-    if "playout_cap" in budget:
-        # the key draws the kind of search the test is named for
-        fast = bool(search.start_search(key, tree).fast)
-        assert fast == (key[-1] == 10)
 
     @jax.jit
     def by_cycles(key, tree):
@@ -870,62 +782,6 @@ def test_a_search_is_done_after_the_roots_evaluation_and_its_iterations(env):
     done = [bool(search.search_done(tree, jnp.array(c))) for c in range(6)]
 
     assert done == [False, False, False, False, True, True]
-
-
-@pytest.mark.parametrize(
-    "nodes, min_iterations, done_from",
-    [
-        # the root has 1 visit: done after its evaluation and 4 iterations, as without
-        (SHAPES[0], 0, 5),
-        # 6 visits: done once evaluated
-        (SHAPES[2], 0, 1),
-        # but for 2 iterations more
-        (SHAPES[2], 2, 3),
-    ],
-)
-def test_a_search_counting_reused_visits_is_done_with_the_roots_visits(
-    env, nodes, min_iterations, done_from
-):
-    search = make_mcts(
-        num_iterations=4, count_reused_visits=True, min_iterations=min_iterations
-    )
-    tree = build_tree(search, env, nodes)
-
-    done = [bool(search.search_done(tree, jnp.array(c))) for c in range(7)]
-
-    assert done == [c >= done_from for c in range(7)]
-
-
-@pytest.mark.parametrize(
-    "nodes, min_iterations, visits",
-    [(SHAPES[0], 0, 9), (SHAPES[2], 0, 9), (SHAPES[2], 2, 9), (SHAPES[2], 5, 11)],
-)
-def test_a_search_counting_reused_visits_ends_with_as_many_root_visits(
-    env, nodes, min_iterations, visits
-):
-    # 8 iterations of a search from scratch: 9 visits, from the root's 1 or the reused 6; with
-    # 5 iterations at least, 11
-    search = make_mcts(
-        max_nodes=16,
-        eval_fn=state_eval_fn,
-        num_iterations=8,
-        count_reused_visits=True,
-        min_iterations=min_iterations,
-    )
-    tree = build_tree(search, env, nodes)
-    state, meta = env.init_fn(jax.random.PRNGKey(0))
-
-    searched = search.evaluate(
-        jax.random.PRNGKey(0), tree, state, meta, None, env_step_fn=env.step_fn
-    ).eval_state
-
-    assert int(root(searched).n) == visits
-    assert_consistent(searched)
-
-
-def test_min_iterations_is_at_most_num_iterations():
-    with pytest.raises(ValueError, match="min_iterations"):
-        make_mcts(num_iterations=2, count_reused_visits=True, min_iterations=3)
 
 
 @pytest.mark.parametrize("cls", BACKUPS)
@@ -1185,119 +1041,3 @@ def test_searches_in_a_tree_too_small_for_them(make_search, ttt, cls):
     # and values still reach the root
     out, _ = run_search(search, jax.random.PRNGKey(0), WIN_MOVES, ttt)
     assert out.action == WINNING_ACTION and root(out.eval_state).q > 0
-
-
-# playout cap randomization
-
-
-def capped(cls=AZ_MCTS, full_probability=0.25, fast_iterations=2, **kwargs):
-    return make_mcts(
-        cls,
-        num_iterations=kwargs.pop("num_iterations", 5),
-        playout_cap=PlayoutCap(full_probability, fast_iterations),
-        **kwargs,
-    )
-
-
-def test_a_playout_cap_draws_a_full_search_with_its_probability(env):
-    search = capped(full_probability=0.25)
-    root_state, _ = env.init_fn(jax.random.PRNGKey(0))
-    tree = search.init(template_embedding=root_state)
-    keys = jax.random.split(jax.random.PRNGKey(0), 4000)
-
-    fast = jax.vmap(lambda k: search.start_search(k, tree).fast)(keys)
-    kept = jax.vmap(lambda k: search.start_search(k, tree, active=False).fast)(keys)
-
-    assert np.mean(fast) == pytest.approx(0.75, abs=0.03)
-    # a search that doesn't start keeps its draw
-    assert not np.asarray(kept).any()
-
-
-def test_without_a_playout_cap_starting_a_search_draws_the_same_noise(env):
-    # the cap's draw takes a key of its own: searches without one are as before it
-    search = make_mcts(AZ_MCTS, dirichlet_alpha=0.3)
-    root_state, _ = env.init_fn(jax.random.PRNGKey(0))
-    tree = search.init(template_embedding=root_state)
-    key = jax.random.PRNGKey(7)
-
-    started = search.start_search(key, tree)
-
-    root_key, _, _ = jax.random.split(key, 3)
-    _, noise_key = jax.random.split(root_key)
-    np.testing.assert_array_equal(
-        started.root_noise, search.root_noise(noise_key, tree.root_noise.shape)
-    )
-    assert not bool(started.fast)
-
-
-@pytest.mark.parametrize("fast, done_from", [(False, 6), (True, 3)])
-def test_a_fast_search_is_done_after_its_own_iterations(env, fast, done_from):
-    search = capped(num_iterations=5, fast_iterations=2)
-    tree = replace(build_tree(search, env, SHAPES[0]), fast=jnp.array(fast))
-
-    done = [bool(search.search_done(tree, jnp.array(c))) for c in range(8)]
-
-    assert done == [c >= done_from for c in range(8)]
-    assert search.search_cycles() == 6
-
-
-def test_a_fast_search_counting_reused_visits_stops_at_its_own_visits(env):
-    # 6 reused visits: past a fast search's 2 + 1, done once the root is evaluated
-    search = capped(num_iterations=8, fast_iterations=2, count_reused_visits=True)
-    tree = build_tree(search, env, SHAPES[2])
-
-    fast = replace(tree, fast=jnp.array(True))
-    full = replace(tree, fast=jnp.array(False))
-
-    assert bool(search.search_done(fast, jnp.array(1)))
-    assert not bool(search.search_done(full, jnp.array(1)))
-
-
-def test_a_fast_searchs_root_takes_no_noise(fixed_length_env):
-    mask = np.array([True, False, True, True])
-    env = fixed_length_env(length=10, num_actions=4, action_mask=mask)
-    logits = jnp.array([2.0, 1.0, 0.5, -1.0])
-    search = capped(
-        num_actions=4, logits=logits, dirichlet_epsilon=0.5, full_probability=0.5
-    )
-    state, meta = env.init_fn(jax.random.PRNGKey(0))
-    tree = search.start_search(
-        jax.random.PRNGKey(0), search.init(template_embedding=state)
-    )
-
-    def prior(fast):
-        searched = replace(tree, fast=jnp.array(fast))
-        return root(
-            search.update_root(jax.random.PRNGKey(0), searched, state, None, meta)
-        ).p
-
-    np.testing.assert_allclose(prior(True), masked_softmax(logits, mask), rtol=1e-6)
-    assert not np.allclose(prior(False), masked_softmax(logits, mask))
-
-
-def test_only_full_searches_make_training_positions(env):
-    root_state, _ = env.init_fn(jax.random.PRNGKey(0))
-    search = capped()
-    tree = search.init(template_embedding=root_state)
-
-    assert bool(search.trains_on(tree))
-    assert not bool(search.trains_on(replace(tree, fast=jnp.array(True))))
-    # without a cap, every search
-    plain = make_mcts()
-    assert bool(plain.trains_on(plain.init(template_embedding=root_state)))
-
-
-def test_mean_iterations_mixes_full_and_fast_searches():
-    assert capped(
-        num_iterations=127, full_probability=0.25, fast_iterations=43
-    ).mean_iterations() == pytest.approx(64.0)
-    assert make_mcts(num_iterations=64).mean_iterations() == 64.0
-
-
-@pytest.mark.parametrize(
-    "cap",
-    [PlayoutCap(0.0, 2), PlayoutCap(1.5, 2), PlayoutCap(0.5, 0), PlayoutCap(0.5, 5)],
-)
-def test_a_playout_cap_must_be_a_probability_and_fewer_iterations(cap):
-    with pytest.raises(ValueError, match="playout cap"):
-        make_mcts(num_iterations=5, playout_cap=cap)

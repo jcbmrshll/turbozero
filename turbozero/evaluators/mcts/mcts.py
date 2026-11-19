@@ -1,4 +1,4 @@
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from functools import partial
 from typing import Any
 
@@ -24,30 +24,6 @@ from turbozero.evaluators.mcts.state import (
 from turbozero.types import EnvStepFn, EvalFn, StepMetadata
 
 
-@dataclass(frozen=True)
-class PlayoutCap:
-    """Playout cap randomization (KataGo, https://arxiv.org/abs/1902.10565, section 3.1): each
-    move's search is a full one, with probability `full_probability`, or else a fast one of
-    `fast_iterations` iterations. Only full searches make training positions (see
-    `MCTS.trains_on`); fast ones play their move without the root's noise (e.g. AlphaZero's
-    Dirichlet noise), for strength. More moves for the same compute means more games, each with
-    one outcome for the value to learn from, while the policy learns from full searches only.
-
-    Attributes:
-        full_probability: the share of moves searched in full, `num_iterations` iterations
-        fast_iterations: the iterations of a fast search
-    """
-
-    full_probability: float
-    fast_iterations: int
-
-    def get_config(self) -> dict:
-        return {
-            "full_probability": self.full_probability,
-            "fast_iterations": self.fast_iterations,
-        }
-
-
 class MCTS(Evaluator):
     """Batched implementation of Monte Carlo Tree Search (MCTS).
 
@@ -66,12 +42,7 @@ class MCTS(Evaluator):
         discount: float = -1.0,
         temperature: float = 1.0,
         persist_tree: bool = True,
-        count_reused_visits: bool = False,
-        min_iterations: int = 0,
         policy_target: PolicyTarget | None = None,
-        traversal_steps: int = 1,
-        playout_cap: PlayoutCap | None = None,
-        prior_temperature: float = 1.0,
     ):
         """Initializes an MCTS evaluator.
 
@@ -91,56 +62,10 @@ class MCTS(Evaluator):
             temperature: temperature for root action selection (default: 1.0); at 0, the most visited
                 action, ties broken at random
             persist_tree: whether to persist search tree state between calls to `evaluate` (default: True)
-            count_reused_visits: (optional) with `persist_tree`, stop a search once its root has
-                `num_iterations + 1` visits, those of the subtree it reused from the last search
-                counted, rather than after `num_iterations` iterations (default: False). A search from
-                a well-explored subtree then takes fewer iterations, and every root ends with the visits
-                of a search from scratch. The tree then never holds more than
-                `num_iterations + 1 + min_iterations` nodes, so `max_nodes` needs no more
-            min_iterations: (optional) with `count_reused_visits`, the fewest iterations a search
-                takes, however many visits it reused: the root's noise (e.g. AlphaZero's) only steers
-                the visits of its own search (default: 0). At most `num_iterations`
             policy_target: (optional) what the policy trains towards, from the root of a finished
                 search (default: `VisitCounts`, its visit distribution)
-            traversal_steps: (optional) steps down the tree a traversal takes between checks for
-                having reached its leaf (default: 1). Steps past it change nothing, so the search is
-                the same whatever the number; but on GPU each check waits on the host, and under
-                vmap a traversal goes on until the deepest in the batch is done: more steps a check
-                wait less and compute more, and which is fastest depends on the trees' depth
-            playout_cap: (optional) search each move in full (`num_iterations` iterations) only
-                some of the time, and otherwise with fewer, see `PlayoutCap`. With
-                `count_reused_visits`, a fast search stops at `fast_iterations + 1` root visits
-            prior_temperature: (optional) the softmax temperature of the prior, at every node: the
-                network's policy logits are divided by it before the softmax (default: 1.0, the
-                policy itself). Above 1 flattens the prior, so the search tries more of the moves
-                the network rates low (Leela Chess Zero's policy softmax temperature). The root's
-                noise is mixed into the flattened prior; `root_logits` stay the network's
         """
-        if prior_temperature <= 0:
-            raise ValueError(
-                f"prior_temperature must be positive, got {prior_temperature}"
-            )
-        if traversal_steps < 1:
-            raise ValueError(
-                f"traversal_steps must be at least 1, got {traversal_steps}"
-            )
-        if min_iterations < 0 or min_iterations > num_iterations:
-            raise ValueError(
-                f"min_iterations must be 0 to num_iterations ({num_iterations}), "
-                f"got {min_iterations}"
-            )
-        if playout_cap is not None and not (
-            0 < playout_cap.full_probability <= 1
-            and 0 < playout_cap.fast_iterations < num_iterations
-        ):
-            raise ValueError(
-                "a playout cap's full_probability must be in (0, 1] and its fast_iterations "
-                f"between 1 and num_iterations ({num_iterations}) - 1, got {playout_cap}"
-            )
         super().__init__(discount=discount)
-        self.playout_cap = playout_cap
-        self.count_reused_visits = count_reused_visits
-        self.min_iterations = min_iterations
         self.eval_fn = eval_fn
         self.num_iterations = num_iterations
         self.branching_factor = branching_factor
@@ -149,8 +74,6 @@ class MCTS(Evaluator):
         self.temperature = temperature
         self.persist_tree = persist_tree
         self.policy_target = policy_target or VisitCounts()
-        self.traversal_steps = traversal_steps
-        self.prior_temperature = prior_temperature
 
     def get_config(self) -> dict:
         """Returns a config object for checkpoints."""
@@ -163,14 +86,7 @@ class MCTS(Evaluator):
             "discount": self.discount,
             "temperature": self.temperature,
             "persist_tree": self.persist_tree,
-            "count_reused_visits": self.count_reused_visits,
-            "min_iterations": self.min_iterations,
             "policy_target_config": self.policy_target.get_config(),
-            "traversal_steps": self.traversal_steps,
-            "playout_cap": self.playout_cap.get_config()
-            if self.playout_cap is not None
-            else None,
-            "prior_temperature": self.prior_temperature,
         }
 
     def evaluate(
@@ -183,8 +99,7 @@ class MCTS(Evaluator):
         env_step_fn: EnvStepFn,
         **kwargs,
     ) -> MCTSOutput:
-        """Performs `self.num_iterations` MCTS iterations on an `MCTSTree` (fewer with
-        `count_reused_visits`, see `search_done`).
+        """Performs `self.num_iterations` MCTS iterations on an `MCTSTree`.
 
         Samples an action to take from the root node after search is completed.
 
@@ -210,17 +125,8 @@ class MCTS(Evaluator):
 
         iterate_keys = jax.random.split(iterate_key, self.num_iterations)
 
-        def iteration(
-            state: MCTSTree, i_key: tuple[jax.Array, jax.Array]
-        ) -> tuple[MCTSTree, None]:
-            i, k = i_key
-            if not self.count_reused_visits and self.playout_cap is None:
-                return iterate(k, state), None
-            # after the root's evaluation and `i` iterations, as `search_cycle` counts them
-            return iterate(k, state, write=~self.search_done(state, i + 1)), None
-
         eval_state, _ = jax.lax.scan(
-            iteration, eval_state, (jnp.arange(self.num_iterations), iterate_keys)
+            lambda state, k: (iterate(k, state), None), eval_state, iterate_keys
         )
         # sample action based on root visit counts
         # (also get normalized policy weights for training purposes)
@@ -233,65 +139,22 @@ class MCTS(Evaluator):
         """The root's evaluation, then `num_iterations` iterations."""
         return self.num_iterations + 1
 
-    def mean_iterations(self) -> float:
-        """The iterations a search runs on average: `num_iterations`, or with a `playout_cap`,
-        its mix of full and fast searches' (counting reused visits, at most these)."""
-        cap = self.playout_cap
-        if cap is None:
-            return float(self.num_iterations)
-        return (
-            cap.full_probability * self.num_iterations
-            + (1 - cap.full_probability) * cap.fast_iterations
-        )
-
-    def iterations(self, state: MCTSTree) -> jax.Array:
-        """The iterations of the search in `state`: `num_iterations`, or a fast search's (see
-        `PlayoutCap`)."""
-        if self.playout_cap is None:
-            return jnp.array(self.num_iterations)
-        return jnp.where(
-            state.fast, self.playout_cap.fast_iterations, self.num_iterations
-        )
-
-    def search_done(self, state: MCTSTree, cycles: jax.Array) -> jax.Array:
-        """Done after the root's evaluation and its `iterations`; with `count_reused_visits`,
-        also once the root has `iterations + 1` visits, after its evaluation and
-        `min_iterations` iterations."""
-        iterations = self.iterations(state)
-        done = cycles >= iterations + 1
-        if not self.count_reused_visits:
-            return done
-        visited = state.data.n[state.ROOT_INDEX] > iterations
-        return done | (visited & (cycles >= 1 + self.min_iterations))
-
-    def trains_on(self, state: MCTSTree) -> jax.Array:
-        """Whether the search in `state` makes a training position: unless it's a fast one
-        (see `PlayoutCap`)."""
-        return ~state.fast
-
     def start_search(
         self, key: jax.Array, state: MCTSTree, active: ArrayLike = True
     ) -> MCTSTree:
         """Draws the root's noise (see `root_noise`) for the search for a move with key `key`, as
         `evaluate` does first: a search a cycle at a time draws it once, rather than in every
         cycle (under vmap, the root's update is computed in every cycle, see `search_cycle`).
-        With a `playout_cap`, also draws whether the search is a fast one.
 
         Args: see `Evaluator.start_search`.
 
         Returns:
-            MCTSTree: the tree, with its `root_noise` (and `fast`)
+            MCTSTree: the tree, with its `root_noise`
         """
-        # the 4th key of the split: the first 3 are those `evaluate` splits off (the split's i-th
-        # key doesn't depend on how many it makes)
-        root_key, _, _, cap_key = jax.random.split(key, 4)
+        root_key, _, _ = jax.random.split(key, 3)
         _, noise_key = jax.random.split(root_key)
         noise = self.root_noise(noise_key, state.root_noise.shape)
-        state = replace(state, root_noise=jnp.where(active, noise, state.root_noise))
-        if self.playout_cap is None:
-            return state
-        fast = ~jax.random.bernoulli(cap_key, self.playout_cap.full_probability)
-        return replace(state, fast=jnp.where(active, fast, state.fast))
+        return replace(state, root_noise=jnp.where(active, noise, state.root_noise))
 
     def root_noise(self, key: jax.Array, shape: tuple[int, ...]) -> jax.Array:  # pylint: disable=unused-argument
         """The noise the root's prior takes (see `root_prior`): none.
@@ -317,7 +180,7 @@ class MCTS(Evaluator):
     ) -> MCTSTree:
         """The root's evaluation (cycle 0), or an iteration: what `evaluate` does after
         `start_search`, a step at a time, with the same keys. Either way, one network evaluation, so that a batch of searches
-        at different points evaluates the network once a cycle. Past `search_done`, more
+        at different points evaluates the network once a cycle. Past `num_iterations`, more
         iterations, each with a key of its own.
 
         Args: see `Evaluator.search_cycle`.
@@ -457,11 +320,6 @@ class MCTS(Evaluator):
         """
         policy = self.prior(policy_logits, root_metadata.action_mask)
         prior = self.root_prior(tree.root_noise, policy, root_metadata.action_mask)
-        if self.playout_cap is not None:
-            # a fast search's root takes no noise. The barrier keeps XLA from fusing the noise's
-            # mix into the select, which it does differently in `evaluate` and in a search a cycle
-            # at a time, rounding the prior differently
-            prior = jnp.where(tree.fast, policy, jax.lax.optimization_barrier(prior))
         policy_logits = jnp.where(
             root_metadata.action_mask, policy_logits, jnp.finfo(policy_logits).min
         )
@@ -477,8 +335,8 @@ class MCTS(Evaluator):
         return tree.set_root(root_node, write=write)
 
     def prior(self, policy_logits: jax.Array, action_mask: jax.Array) -> jax.Array:
-        """A node's prior over its legal actions: the softmax of the network's policy logits
-        at `prior_temperature`, 0 for illegal actions.
+        """A node's prior over its legal actions: the softmax of the network's policy logits,
+        0 for illegal actions.
 
         Args:
             policy_logits: the network's policy logits
@@ -487,14 +345,8 @@ class MCTS(Evaluator):
         Returns:
             jax.Array: the prior
         """
-        # divided before masking, so the masked logits stay finite: dividing the lowest float by a
-        # temperature below 1 would overflow it
         return jax.nn.softmax(
-            jnp.where(
-                action_mask,
-                policy_logits / self.prior_temperature,
-                jnp.finfo(policy_logits).min,
-            )
+            jnp.where(action_mask, policy_logits, jnp.finfo(policy_logits).min)
         )
 
     def root_prior(
@@ -691,18 +543,11 @@ class MCTS(Evaluator):
                 action=jnp.where(descend, action, state.action),
             )
 
-        # `traversal_steps` steps between checks of the loop's condition: on GPU each check waits
-        # on the host, and under vmap the loop runs until the deepest traversal in the batch is done
-        def body_fn(state: TraversalState) -> TraversalState:
-            for _ in range(self.traversal_steps):
-                state = step(state)
-            return state
-
         # choose the action to take from the root
         root_action = select(tree.ROOT_INDEX)
         # traverse from root to leaf
         return jax.lax.while_loop(
-            cond_fn, body_fn, TraversalState(parent=tree.ROOT_INDEX, action=root_action)
+            cond_fn, step, TraversalState(parent=tree.ROOT_INDEX, action=root_action)
         )
 
     def backpropagate(
