@@ -3,13 +3,13 @@ action choice, tree reuse) called on small hand-built trees of a fixed-length en
 few whole searches on tic-tac-toe for what only a search shows: tactics, and its bookkeeping over
 many iterations, in a tree with room to spare and in one too small for it."""
 
-import re
 from dataclasses import replace
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from conftest import copies_in_loop, open_loops_in_loop
 
 from turbozero.evaluators.mcts.action_selection import MCTSActionSelector, PUCTSelector
 from turbozero.evaluators.mcts.mcts import MCTS
@@ -680,40 +680,6 @@ def test_batched_cycles_match_each_trees_cycle_alone(env):
             jax.tree.map(lambda x, i=i: x[i], batched),
             alone(keys[i], tree, cycles[i]),
         )
-
-
-def outer_loop_bodies(hlo: str) -> list[str]:
-    """The bodies of the outermost while loops of compiled `hlo` with a known trip count (e.g. a
-    scan; not the loops within them)."""
-    computations = re.split(r"\n(?=\S)", hlo)
-    (entry,) = [c for c in computations if c.startswith("ENTRY")]
-    bodies = {
-        body
-        for line in entry.splitlines()
-        if " while(" in line and "known_trip_count" in line
-        for body in re.findall(r"body=%?([\w.-]+)", line)
-    }
-    return [c for c in computations if c.split(" ", 1)[0].lstrip("%") in bodies]
-
-
-def copies_in_loop(hlo: str, shape: str) -> list[str]:
-    """The copies of arrays whose shape starts with `shape` (e.g. "5,24") in `outer_loop_bodies`."""
-    return [
-        copy
-        for body in outer_loop_bodies(hlo)
-        for copy in re.findall(rf"= \w+\[{shape}[,\]]\S* copy\(.*", body)
-    ]
-
-
-def open_loops_in_loop(hlo: str) -> int:
-    """The while loops in `outer_loop_bodies` whose trip count XLA doesn't know: on GPU, each of
-    their trips waits on the host for their condition."""
-    return sum(
-        "known_trip_count" not in line
-        for body in outer_loop_bodies(hlo)
-        for line in body.splitlines()
-        if " while(" in line
-    )
 
 
 def test_search_cycles_write_the_trees_in_place(env):

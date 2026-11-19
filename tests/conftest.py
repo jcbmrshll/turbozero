@@ -1,6 +1,7 @@
 """Shared setup for the turbozero test suite."""
 
 import os
+import re
 
 # tests run on the CPU unless JAX_PLATFORMS asks for another platform, e.g.
 # JAX_PLATFORMS=cuda; without preallocation the pytest-xdist workers share a GPU
@@ -217,3 +218,38 @@ def make_search():
         )
 
     return make
+
+
+def outer_loop_bodies(hlo: str) -> list[str]:
+    """The bodies of the outermost while loops of compiled `hlo` with a known trip
+    count (e.g. a scan; not the loops within them)."""
+    computations = re.split(r"\n(?=\S)", hlo)
+    (entry,) = [c for c in computations if c.startswith("ENTRY")]
+    bodies = {
+        body
+        for line in entry.splitlines()
+        if " while(" in line and "known_trip_count" in line
+        for body in re.findall(r"body=%?([\w.-]+)", line)
+    }
+    return [c for c in computations if c.split(" ", 1)[0].lstrip("%") in bodies]
+
+
+def copies_in_loop(hlo: str, shape: str) -> list[str]:
+    """The copies of arrays whose shape starts with `shape` (e.g. "5,24") in
+    `outer_loop_bodies`: each makes the loop's every trip cost the whole array."""
+    return [
+        copy
+        for body in outer_loop_bodies(hlo)
+        for copy in re.findall(rf"= \w+\[{shape}[,\]]\S* copy\(.*", body)
+    ]
+
+
+def open_loops_in_loop(hlo: str) -> int:
+    """The while loops in `outer_loop_bodies` whose trip count XLA doesn't know: on
+    GPU, each of their trips waits on the host for their condition."""
+    return sum(
+        "known_trip_count" not in line
+        for body in outer_loop_bodies(hlo)
+        for line in body.splitlines()
+        if " while(" in line
+    )

@@ -1,11 +1,11 @@
 import random
-import re
 from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from conftest import copies_in_loop
 
 from turbozero.trees.tree import Tree, init_tree
 
@@ -493,25 +493,6 @@ def test_init_tree_takes_python_scalar_template_leaves():
 
 
 # writing in place in a loop
-
-
-def copies_in_loop(hlo: str, shape: str) -> list[str]:
-    """Copies of arrays whose shape starts with `shape` (e.g. "5,24") in the bodies
-    of the outermost while loops of compiled `hlo` with a known trip count."""
-    computations = re.split(r"\n(?=\S)", hlo)
-    (entry,) = [c for c in computations if c.startswith("ENTRY")]
-    bodies = {
-        body
-        for line in entry.splitlines()
-        if " while(" in line and "known_trip_count" in line
-        for body in re.findall(r"body=%?([\w.-]+)", line)
-    }
-    return [
-        copy
-        for c in computations
-        if c.split(" ", 1)[0].lstrip("%") in bodies
-        for copy in re.findall(rf"= \w+\[{shape}[,\]]\S* copy\(.*", c)
-    ]
 
 
 def test_set_child_in_a_loop_writes_the_trees_in_place():
