@@ -42,6 +42,7 @@ class MCTS(Evaluator):
         full_probability: float = 1.0,
         fast_iterations: int = 0,
         count_reused_visits: bool = False,
+        min_iterations: int = 0,
     ):
         """
         Args:
@@ -81,7 +82,15 @@ class MCTS(Evaluator):
                 root ends with the visits of a search from scratch. The tree
                 never holds more than `num_iterations` + 1 nodes, plus one per
                 cycle self-play runs past `search_done`
+            min_iterations: (optional) with `count_reused_visits`, the fewest iterations a search
+                takes, however many visits it reused: the root's noise (e.g. AlphaZero's) only steers
+                the visits of its own search (default: 0). At most `num_iterations`
         """
+        if min_iterations < 0 or min_iterations > num_iterations:
+            raise ValueError(
+                f"min_iterations must be 0 to num_iterations ({num_iterations}), "
+                f"got {min_iterations}"
+            )
         assert 0 < full_probability <= 1
         assert full_probability == 1 or 0 < fast_iterations < num_iterations
         super().__init__(discount=discount)
@@ -97,6 +106,7 @@ class MCTS(Evaluator):
         self.full_probability = full_probability
         self.fast_iterations = fast_iterations
         self.count_reused_visits = count_reused_visits
+        self.min_iterations = min_iterations
 
     def get_config(self) -> dict:
         return {
@@ -113,6 +123,7 @@ class MCTS(Evaluator):
             "full_probability": self.full_probability,
             "fast_iterations": self.fast_iterations,
             "count_reused_visits": self.count_reused_visits,
+            "min_iterations": self.min_iterations,
         }
 
     def evaluate(
@@ -174,7 +185,8 @@ class MCTS(Evaluator):
         iterations = jnp.where(state.fast, self.fast_iterations, self.num_iterations)
         done = cycles >= iterations + 1
         if self.count_reused_visits:
-            done |= (cycles >= 1) & (state.data.n[state.ROOT_INDEX] > iterations)
+            visited = state.data.n[state.ROOT_INDEX] > iterations
+            done |= visited & (cycles >= 1 + self.min_iterations)
         return done
 
     def trains_on(self, state: MCTSTree) -> jax.Array:
