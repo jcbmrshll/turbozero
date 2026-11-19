@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 from jax.typing import ArrayLike
 
 from turbozero.pytree_utils import where_tree
@@ -26,9 +27,9 @@ class Evaluator:
 
     `evaluate` does a move's work in one call. Self-play instead runs a search
     a cycle at a time, so that environments at different points of their
-    searches evaluate the network together: `start_search`, then
-    `search_cycles()` calls of `search_cycle` (or more, while self-play waits to
-    play its moves), then `search_output`, all with the move's key. An evaluator
+    searches evaluate the network together: `start_search`, then calls of
+    `search_cycle` until `search_done` (or more, while self-play waits to play
+    its moves), then `search_output`, all with the move's key. An evaluator
     that doesn't search does all of it in `search_output`.
     """
 
@@ -66,6 +67,20 @@ class Evaluator:
     def search_cycles(self) -> int:
         """The cycles a move's search takes: self-play's unit of compute."""
         return 1
+
+    def search_done(self, state: Any, cycles: jax.Array) -> jax.Array:
+        """Returns whether the search in `state` is done after `cycles` cycles,
+        so self-play can play its move: after `search_cycles()`, unless the
+        evaluator's searches vary in length.
+        """
+        return cycles >= self.search_cycles()
+
+    def trains_on(self, state: Any) -> jax.Array:
+        """Returns whether self-play trains on the position searched in `state`
+        (stores it in the replay buffer): always, unless the evaluator says
+        otherwise (e.g. MCTS's fast searches).
+        """
+        return jnp.array(True)
 
     def start_search(self, key: jax.Array, state: Any, active: ArrayLike = True) -> Any:
         """What a search does once before its cycles rather than in each (under

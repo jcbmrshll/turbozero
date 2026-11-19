@@ -1,4 +1,5 @@
 from dataclasses import replace
+from functools import partial
 from typing import Any
 
 import jax
@@ -20,11 +21,12 @@ class MCTS(Evaluator):
     new state with `leaf_eval_fn` (policy logits and a value, e.g. from a
     network as in AlphaZero, instead of rollouts), adds it to the tree and backs
     the value up to the root. After `num_iterations` iterations, the move is
-    sampled from the root's visit counts.
+    sampled from the root's visit counts. As in AlphaZero, the root's prior can
+    take Dirichlet noise, so that self-play tries moves the network rates low.
+    Options can make some searches shorter (see `search_done`).
 
     The search's state is an `MCTSTree`, which methods take and return rather
-    than store, so searches can be jitted and vmapped. Subclasses can add noise
-    to the root's prior by overriding `root_noise` and `root_prior`.
+    than store, so searches can be jitted and vmapped.
     """
 
     def __init__(
@@ -37,6 +39,14 @@ class MCTS(Evaluator):
         discount: float = -1.0,
         temperature: float = 1.0,
         persist_tree: bool = True,
+        dirichlet_alpha: float = 0.3,
+        dirichlet_epsilon: float = 0.0,
+        full_probability: float = 1.0,
+        fast_iterations: int = 0,
+        count_reused_visits: bool = False,
+        min_iterations: int = 0,
+        traversal_steps: int = 1,
+        prior_temperature: float = 1.0,
     ):
         """
         Args:
@@ -54,7 +64,49 @@ class MCTS(Evaluator):
                 visited move is played, ties broken at random
             persist_tree: whether the next move's search starts from the
                 subtree of the move played, rather than an empty tree
+            dirichlet_alpha: the concentration of the root's Dirichlet noise:
+                lower puts it on fewer actions (AlphaZero: 0.3 in chess, 0.03
+                in Go)
+            dirichlet_epsilon: the share of the root's prior that is the noise,
+                0 for none (AlphaZero: 0.25)
+            full_probability: KataGo's playout cap randomization
+                (https://arxiv.org/abs/1902.10565, section 3.1): the share of
+                searches that are full ones, of `num_iterations` iterations. The
+                others are fast ones, of `fast_iterations`, whose roots take no
+                noise and whose positions don't train (see `trains_on`). For the
+                same compute self-play then plays more moves, so more games for
+                the value to learn from, while the policy learns only from full
+                searches
+            fast_iterations: the iterations of a fast search
+            count_reused_visits: with `persist_tree`, a search is done once its
+                root has `num_iterations` + 1 visits (`fast_iterations` + 1 for
+                a fast search), counting those of the subtree it reused, rather
+                than after `num_iterations` iterations. Searches from
+                well-explored subtrees then take fewer iterations, and every
+                root ends with the visits of a search from scratch. The tree
+                never holds more than `num_iterations` + 1 + `min_iterations`
+                nodes, plus one per cycle self-play runs past `search_done`
+            min_iterations: with `count_reused_visits`, the fewest iterations a
+                search runs however many visits it reused, at most
+                `num_iterations`: the root's noise only steers the visits of the
+                search that drew it
+            traversal_steps: the steps down the tree a traversal takes between
+                checks for its leaf. The search is the same whatever the number,
+                but on GPU each check waits on the host, and under vmap every
+                traversal steps until the deepest in the batch is done: more
+                steps a check wait less and compute more, and which is fastest
+                depends on the trees' depth
+            prior_temperature: every node's prior is the softmax of
+                `leaf_eval_fn`'s policy logits divided by this (Leela Chess
+                Zero's policy softmax temperature). Above 1 flattens the prior,
+                so the search tries more of the actions the network rates low;
+                the root's noise is mixed into the flattened prior
         """
+        assert 0 < full_probability <= 1
+        assert full_probability == 1 or 0 < fast_iterations < num_iterations
+        assert 0 <= min_iterations <= num_iterations
+        assert traversal_steps >= 1
+        assert prior_temperature > 0
         super().__init__(discount=discount)
         self.leaf_eval_fn = leaf_eval_fn
         self.num_iterations = num_iterations
@@ -63,6 +115,14 @@ class MCTS(Evaluator):
         self.action_selector = action_selector
         self.temperature = temperature
         self.persist_tree = persist_tree
+        self.dirichlet_alpha = dirichlet_alpha
+        self.dirichlet_epsilon = dirichlet_epsilon
+        self.full_probability = full_probability
+        self.fast_iterations = fast_iterations
+        self.count_reused_visits = count_reused_visits
+        self.min_iterations = min_iterations
+        self.traversal_steps = traversal_steps
+        self.prior_temperature = prior_temperature
 
     def get_config(self) -> dict:
         return {
@@ -74,6 +134,14 @@ class MCTS(Evaluator):
             "discount": self.discount,
             "temperature": self.temperature,
             "persist_tree": self.persist_tree,
+            "dirichlet_alpha": self.dirichlet_alpha,
+            "dirichlet_epsilon": self.dirichlet_epsilon,
+            "full_probability": self.full_probability,
+            "fast_iterations": self.fast_iterations,
+            "count_reused_visits": self.count_reused_visits,
+            "min_iterations": self.min_iterations,
+            "traversal_steps": self.traversal_steps,
+            "prior_temperature": self.prior_temperature,
         }
 
     def evaluate(
@@ -87,11 +155,12 @@ class MCTS(Evaluator):
     ) -> EvalOutput:
         """Runs a whole search for one move and picks the move.
 
-        Evaluates the root, runs `num_iterations` iterations, then samples the
-        move from the root's visit counts (see `search_output`). `eval_state` is
-        an empty tree or the subtree kept from the previous move. Uses the same
-        keys as running the search a cycle at a time (`start_search`,
-        `search_cycle`, `search_output`), so both give the same result.
+        Evaluates the root, runs `num_iterations` iterations (or fewer, see
+        `search_done`), then samples the move from the root's visit counts (see
+        `search_output`). `eval_state` is an empty tree or the subtree kept from
+        the previous move. Uses the same keys as running the search a cycle at a
+        time (`start_search`, `search_cycle` until `search_done`,
+        `search_output`), so both give the same result.
         """
         tree = self.start_search(key, eval_state)
         root_key, iterate_key, _ = jax.random.split(key, 3)
@@ -99,52 +168,86 @@ class MCTS(Evaluator):
         policy_logits, value = self.leaf_eval_fn(env_state, params, eval_key)
         tree = self.expand_root(tree, env_state, root_metadata, policy_logits, value)
 
-        def iterate(tree: MCTSTree, key: jax.Array) -> tuple[MCTSTree, None]:
+        def iterate(
+            tree: MCTSTree, i_key: tuple[jax.Array, jax.Array]
+        ) -> tuple[MCTSTree, None]:
+            i, key = i_key
             traverse_key, eval_key, _ = jax.random.split(key, 3)
             leaf = self.find_leaf(traverse_key, tree, env_step_fn)
             policy_logits, value = self.leaf_eval_fn(leaf[2], params, eval_key)
-            return self.expand(tree, leaf, policy_logits, value), None
+            # iterations after the search is done change nothing (it has run
+            # the root's evaluation and `i` iterations, `i` + 1 cycles)
+            write = True
+            if self.full_probability < 1 or self.count_reused_visits:
+                write = ~self.search_done(tree, i + 1)
+            return self.expand(tree, leaf, policy_logits, value, write=write), None
 
         keys = jax.random.split(iterate_key, self.num_iterations)
-        tree, _ = jax.lax.scan(iterate, tree, keys)
+        tree, _ = jax.lax.scan(iterate, tree, (jnp.arange(self.num_iterations), keys))
         return self.search_output(
             key, tree, env_state, root_metadata, params, env_step_fn
         )
 
     def search_cycles(self) -> int:
-        """The number of cycles in a search: one to evaluate the root, then one
-        per iteration.
+        """The number of cycles in a full search: one to evaluate the root,
+        then one per iteration.
         """
         return self.num_iterations + 1
+
+    def search_done(self, state: MCTSTree, cycles: jax.Array) -> jax.Array:
+        """Returns whether the search in `state` is done after `cycles` cycles:
+        once it has evaluated the root and run `num_iterations` iterations, or
+        `fast_iterations` if it's a fast one (see `full_probability`). With
+        `count_reused_visits`, also once the root has one visit more than that
+        and the search has evaluated the root and run `min_iterations`
+        iterations.
+        """
+        iterations = jnp.where(state.fast, self.fast_iterations, self.num_iterations)
+        done = cycles >= iterations + 1
+        if self.count_reused_visits:
+            visited = state.data.n[state.ROOT_INDEX] > iterations
+            done |= visited & (cycles >= 1 + self.min_iterations)
+        return done
+
+    def trains_on(self, state: MCTSTree) -> jax.Array:
+        """Returns whether self-play trains on the position searched in `state`:
+        unless the search is a fast one (see `full_probability`).
+        """
+        return ~state.fast
 
     def start_search(
         self, key: jax.Array, state: MCTSTree, active: ArrayLike = True
     ) -> MCTSTree:
-        """Draws the root noise for a new search and stores it in the tree.
+        """Draws the root's noise for a new search and stores it in the tree:
+        log-Gamma(`dirichlet_alpha`) draws, one per action, which `expand_root`
+        turns into a Dirichlet sample over the legal actions (zeros without
+        noise). With `full_probability` below 1, also draws whether the search
+        is a fast one.
 
         Done once per search, before its cycles, rather than in `search_cycle`:
         under vmap every cycle computes the root's update, so the draw would be
         repeated every cycle. Trees where `active` is False are left unchanged.
         """
-        root_key, _, _ = jax.random.split(key, 3)
+        # the first 3 keys are those `evaluate` splits off: the i-th key of a
+        # split doesn't depend on how many it makes
+        root_key, _, _, fast_key = jax.random.split(key, 4)
         _, noise_key = jax.random.split(root_key)
-        noise = self.root_noise(noise_key, state.root_noise.shape)
-        return replace(state, root_noise=jnp.where(active, noise, state.root_noise))
-
-    def root_noise(self, key: jax.Array, shape: tuple[int, ...]) -> jax.Array:
-        """Draws the noise `root_prior` mixes into the root's prior, float32 of
-        shape `shape`. MCTS adds no noise, so this returns zeros.
-        """
-        return jnp.zeros(shape, dtype=jnp.float32)
-
-    def root_prior(
-        self, noise: jax.Array, policy: jax.Array, action_mask: jax.Array
-    ) -> jax.Array:
-        """Computes the root's prior from the search's root noise and the policy
-        from `leaf_eval_fn` (0 for illegal actions). MCTS uses the policy as it
-        is.
-        """
-        return policy
+        shape = state.root_noise.shape
+        noise = jnp.zeros(shape, dtype=jnp.float32)
+        if self.dirichlet_epsilon:
+            # JAX's exact sampler loops until every draw in the batch is
+            # accepted, and on GPU each trip waits on the host. The approximate
+            # one is a fixed computation, and its draws have been observed to be
+            # as close to the exact sampler's as two sets of exact draws (KS
+            # distance at alpha 0.03-2)
+            noise = jax.random.loggamma(
+                noise_key, self.dirichlet_alpha, shape, method="approximate"
+            )
+        state = replace(state, root_noise=jnp.where(active, noise, state.root_noise))
+        if self.full_probability == 1:
+            return state
+        fast = ~jax.random.bernoulli(fast_key, self.full_probability)
+        return replace(state, fast=jnp.where(active, fast, state.fast))
 
     def search_cycle(
         self,
@@ -161,7 +264,8 @@ class MCTS(Evaluator):
 
         Every cycle calls `leaf_eval_fn` exactly once, so a batch of searches at
         different cycles shares one batched evaluation. Cycles past
-        `num_iterations` keep iterating, each with a key of its own.
+        `search_done` keep iterating (self-play runs them while it waits to
+        play its moves), each with a key of its own.
         """
         root_key, iterate_key, _ = jax.random.split(key, 3)
         # the same key `evaluate` gives this iteration: the i-th key of a split
@@ -247,17 +351,28 @@ class MCTS(Evaluator):
     ) -> MCTSTree:
         """Writes the evaluation of the root into the tree.
 
-        The root gets the softmax of `policy_logits` over the legal actions,
-        passed through `root_prior`, as its prior, and `root_embedding` as its
+        The root gets the `prior` of `policy_logits`, with the search's
+        Dirichlet noise mixed in, as its prior, and `root_embedding` as its
         state. A new root also gets `value` and one visit; a root kept from the
         previous move keeps its visits and value. Does nothing if `write` is
         False (see `Tree.set_root`).
         """
         mask = root_metadata.action_mask
-        policy = jax.nn.softmax(
-            jnp.where(mask, policy_logits, jnp.finfo(policy_logits).min)
-        )
-        prior = self.root_prior(tree.root_noise, policy, mask)
+        prior = self.prior(policy_logits, mask)
+        if self.dirichlet_epsilon:
+            # the softmax of log-Gamma(alpha) draws is a Dirichlet(alpha) sample,
+            # here over the legal actions only, as in AlphaZero. Both are
+            # distributions over the legal actions, so their mix is too
+            lowest = jnp.finfo(policy_logits).min
+            noise = jax.nn.softmax(jnp.where(mask, tree.root_noise, lowest))
+            epsilon = self.dirichlet_epsilon
+            mixed = (1 - epsilon) * prior + epsilon * noise
+            # fast searches' roots take no noise. The barrier keeps XLA from
+            # fusing the mix into the select, which it does differently in
+            # `evaluate` and in a search a cycle at a time, rounding differently
+            if self.full_probability < 1:
+                mixed = jnp.where(tree.fast, prior, jax.lax.optimization_barrier(mixed))
+            prior = mixed
         node = tree.data_at(tree.ROOT_INDEX)
         visited = node.n > 0
         node = replace(
@@ -268,6 +383,15 @@ class MCTS(Evaluator):
             embedding=root_embedding,
         )
         return tree.set_root(node, write=write)
+
+    def prior(self, policy_logits: jax.Array, action_mask: jax.Array) -> jax.Array:
+        """Computes a node's prior: the softmax of `policy_logits` divided by
+        `prior_temperature`, over the legal actions (0 for the others).
+        """
+        # divided before masking: the lowest float divided by a temperature
+        # below 1 would overflow
+        logits = policy_logits / self.prior_temperature
+        return jax.nn.softmax(jnp.where(action_mask, logits, jnp.finfo(logits).min))
 
     def find_leaf(
         self, key: jax.Array, tree: MCTSTree, env_step_fn: EnvStepFn
@@ -298,8 +422,17 @@ class MCTS(Evaluator):
             child = tree.edge_map[state[0], state[1]]
             return child, select(child)
 
+        # `traversal_steps` steps a check (see `__init__`): the check holds for
+        # the first, and the others stay put once the traversal is at its leaf
+        def steps(state: tuple[jax.Array, jax.Array]) -> tuple[jax.Array, jax.Array]:
+            state = step(state)
+            for _ in range(self.traversal_steps - 1):
+                down = descend(state)
+                state = jax.tree.map(partial(jnp.where, down), step(state), state)
+            return state
+
         root = jnp.asarray(tree.ROOT_INDEX)
-        parent, action = jax.lax.while_loop(descend, step, (root, select(root)))
+        parent, action = jax.lax.while_loop(descend, steps, (root, select(root)))
         embedding, metadata = env_step_fn(tree.data_at(parent).embedding, action)
         return parent, action, embedding, metadata
 
@@ -314,8 +447,7 @@ class MCTS(Evaluator):
         """Adds `leaf` (from `find_leaf`) to the tree and backs its value up
         to the root.
 
-        The new node's prior is the softmax of `policy_logits` over its legal
-        actions, and its value is `value`, or the reward if the leaf is
+        The new node's prior is the `prior` of `policy_logits`, and its value is `value`, or the reward if the leaf is
         terminal. A terminal node already in the tree is visited again instead.
         In a full tree the new node replaces an evicted leaf; if there's none to
         evict, nothing changes. Then every node from the parent up to the root
@@ -333,11 +465,7 @@ class MCTS(Evaluator):
         node = MCTSNode(
             n=jnp.where(exists, node.n + 1, 1),
             q=jnp.where(exists, (node.q * node.n + value) / (node.n + 1), value),
-            p=jax.nn.softmax(
-                jnp.where(
-                    metadata.action_mask, policy_logits, jnp.finfo(policy_logits).min
-                )
-            ),
+            p=self.prior(policy_logits, metadata.action_mask),
             terminated=metadata.terminated,
             embedding=embedding,
         )
