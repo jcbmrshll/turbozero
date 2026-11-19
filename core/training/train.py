@@ -3242,20 +3242,37 @@ class Trainer:
         )
 
     def _branch_collection_state(
-        self, saved: Any, meta: dict, evaluator: Evaluator, keep_search: bool = True
+        self,
+        saved: Any,
+        meta: dict,
+        evaluator: Evaluator,
+        keep_search: bool = True,
+        fork_key: jax.Array | None = None,
     ) -> tuple[CollectionState, bool]:
         """A saved collection state, for `evaluator`, at its saved capacities: with
         `keep_search`, the saved search states if they have its states' shapes, else new ones,
         with the moves in progress searched again (see `branch`). Returns it, and whether the
         saved search states were kept. With `endgame_solve`, the saved pending solves if they
-        have this run's shapes, else none waiting (any the saved state had are dropped)."""
+        have this run's shapes, else none waiting (any the saved state had are dropped).
+
+        With `fork_key` (see `fork_state`), the parts a fork's settings may change start anew
+        (from it) when they don't fit, rather than raising: the resignation states, the episode
+        metrics' sums, and the tree position buffer (empty, at this trainer's capacity, if the
+        saved state has none; left out if this trainer has none)."""
+        tree_capacity = meta["tree_buffer_capacity"]
+        if (
+            fork_key is not None
+            and tree_capacity is None
+            and self.tree_buffer is not None
+        ):
+            tree_capacity = self.tree_buffer.capacity
         template = jax.eval_shape(
             lambda: self.init_collection_state(
                 jax.random.PRNGKey(0),
                 self.batch_size,
                 evaluator,
                 meta["buffer_capacity"],
-                meta["tree_buffer_capacity"],
+                tree_capacity,
             )
         )
         expected = _describe(template)
@@ -3264,19 +3281,30 @@ class Trainer:
             for leaf_path, shape, dtype in meta["leaves"]["collection_state"]
         ]
         index = {leaf_path: i for i, (leaf_path, _, _) in enumerate(described)}
+        # the parts that start anew when the saved ones don't fit; the rest must
+        groups = [".eval_state", ".pending"]
+        if fork_key is not None:
+            groups += [
+                ".resign_state",
+                ".episode_metrics",
+                ".tree_buffer_state",
+                ".tree_written_at",
+            ]
 
-        def searching(leaf_path: str) -> bool:
-            return leaf_path.startswith(".eval_state")
+        def group(leaf_path: str) -> str | None:
+            return next((g for g in groups if leaf_path.startswith(g)), None)
 
-        def solving(leaf_path: str) -> bool:
-            return leaf_path.startswith(".pending")
+        def fits(name: str) -> bool:
+            return [d for d in described if group(d[0]) == name] == [
+                e for e in expected if group(e[0]) == name
+            ]
 
-        keep = keep_search and [d for d in described if searching(d[0])] == [
-            e for e in expected if searching(e[0])
-        ]
-        keep_pending = [d for d in described if solving(d[0])] == [
-            e for e in expected if solving(e[0])
-        ]
+        kept = {name: fits(name) for name in groups}
+        kept[".eval_state"] = keep_search and kept[".eval_state"]
+        if fork_key is not None:
+            # the tree positions' ages are measured in moves: they go together
+            trees = kept[".tree_buffer_state"] and kept[".tree_written_at"]
+            kept[".tree_buffer_state"] = kept[".tree_written_at"] = trees
         mismatched = [
             f"  {leaf_path}: saved "
             + (
@@ -3286,8 +3314,7 @@ class Trainer:
             )
             + f", this run's {shape} {dtype}"
             for leaf_path, shape, dtype in expected
-            if not searching(leaf_path)
-            and not solving(leaf_path)
+            if group(leaf_path) is None
             and (
                 leaf_path not in index
                 or described[index[leaf_path]] != (leaf_path, shape, dtype)
@@ -3298,40 +3325,62 @@ class Trainer:
                 "the saved collection state doesn't match this run's:\n"
                 + "\n".join(mismatched[:8])
             )
-        fresh = (
-            None
-            if keep
-            else iter(jax.tree.leaves(self.init_eval_state(evaluator, self.batch_size)))
-        )
         leaves = [
-            jnp.zeros(shape, dtype)  # replaced below
-            if solving(leaf_path) and not keep_pending
-            else _to_device(saved[f"collection_state.{index[leaf_path]}"])
-            if keep or not searching(leaf_path)
-            else next(fresh)  # pyright: ignore[reportArgumentType]
+            _to_device(saved[f"collection_state.{index[leaf_path]}"])
+            if kept.get(group(leaf_path) or "", True)
+            else jnp.zeros(shape, dtype)  # replaced below
             for leaf_path, shape, dtype in expected
         ]
         state = jax.tree.unflatten(jax.tree.structure(template), leaves)
-        if not keep_pending:
-            if any(solving(d[0]) for d in described):
+        key = fork_key if fork_key is not None else jax.random.PRNGKey(meta["epoch"])
+        if not kept[".pending"]:
+            if any(group(d[0]) == ".pending" for d in described):
                 print(
-                    "branch: the saved games waiting for solves don't fit this run's, so "
-                    "they're dropped",
+                    f"{'fork' if fork_key is not None else 'branch'}: the saved games waiting "
+                    "for solves don't fit this run's, so they're dropped",
                     flush=True,
                 )
             state = replace(
                 state,
                 pending=self.init_pending(
-                    jax.random.PRNGKey(meta["epoch"]),
-                    self.batch_size,
-                    state.env_state,
-                    meta["buffer_capacity"],
+                    key, self.batch_size, state.env_state, meta["buffer_capacity"]
                 ),
             )
-        if not keep:
+        if not kept[".eval_state"]:
             # the moves in progress start their searches again
-            state = replace(state, search_cycles=jnp.zeros_like(state.search_cycles))
-        return state, keep
+            state = replace(
+                state,
+                eval_state=self.init_eval_state(evaluator, self.batch_size),
+                search_cycles=jnp.zeros_like(state.search_cycles),
+            )
+        if fork_key is not None:
+            if not kept[".resign_state"]:
+                state = replace(
+                    state, resign_state=self.init_resign_state(key, self.batch_size)
+                )
+            if not kept[".episode_metrics"]:
+                state = replace(
+                    state,
+                    episode_metrics=self.init_episode_metrics(
+                        self.batch_size, state.metadata.rewards[0]
+                    ),
+                )
+            if self.tree_buffer is not None and not kept[".tree_buffer_state"]:
+                print(
+                    "fork: the saved state has no tree positions, the tree position buffer "
+                    "starts empty",
+                    flush=True,
+                )
+                state = replace(
+                    state,
+                    tree_buffer_state=self.tree_buffer.init(
+                        self.batch_size, self.make_template_experience()
+                    ),
+                    tree_written_at=jnp.zeros(
+                        (self.batch_size, self.tree_buffer.capacity), dtype=jnp.int32
+                    ),
+                )
+        return state, kept[".eval_state"]
 
     def fork_state(
         self,
@@ -3345,11 +3394,19 @@ class Trainer:
 
         - the train state: the saved network and optimizer state, with the step count and the
           learning rate schedules' (see `restart_schedules`) back at 0
-        - with `replay_buffers`, the collection state: the saved replay buffers (and tree
-          positions', if both runs have them), with self-play's games and the evaluator's states
-          (e.g. search trees) initialized anew, for the evaluator scheduled for epoch 0. The
-          entries of the games in progress are discarded. A buffer of a different capacity
-          keeps each environment's newest entries (see `EpisodeReplayBuffer.resized`).
+        - with `replay_buffers`, the collection state as saved, so the fork's self-play goes
+          on as the saved run's would: the replay buffers (and tree positions', if both runs
+          have them, else an empty buffer or none), the games in progress, those waiting for
+          exact solves (see `endgame_solve`), labelled in the fork's first epoch, and the
+          search states, if they fit the evaluator scheduled for epoch 0 and the network forked
+          is the one that played them (else the moves in progress are searched again, as in
+          `branch`). Starting new games instead would leave the fork's first epoch nothing
+          fresh to train on and, with exact solves, drop the saved run's last epoch of finished
+          games, whose places stay empty until the buffer wraps around: for that long the
+          fork trains on a smaller, staler buffer, and its training losses read low. A buffer
+          of a different capacity keeps each environment's newest entries (see
+          `resize_replay_buffer`). Resignation states and episode metrics start anew if the
+          fork's don't fit the saved ones.
         - without, a new collection state, as a run from scratch starts with
 
         The number of environments, network and optimizer must match the saved run's. A run
@@ -3406,69 +3463,52 @@ class Trainer:
                     train_state,
                 )
             self._check_sizes(path, meta)
-            index = {
-                leaf_path: i
-                for i, (leaf_path, _, _) in enumerate(
-                    meta["leaves"]["collection_state"]
-                )
-            }
-
-            def get(leaf_path: str) -> np.ndarray:
-                if leaf_path not in index:
-                    raise ValueError(f"{path} has no collection state{leaf_path}")
-                return saved[f"collection_state.{index[leaf_path]}"]
-
-            stats: dict[str, Any] = {
-                name: _to_device(get(f".{name}"))
-                for name in (
-                    "episodes",
-                    "tree_positions",
-                    "tree_visits",
-                    "moves",
-                )
-            }
-            buffer_state, _ = self._load_buffer(
-                get, ".buffer_state", self.memory_buffer
+            # the saved trees fit only the network that played them
+            saved_playing = (
+                saved_network_names(meta)[saved_growth(meta["growth"]).playing]
+                if meta["growth"] is not None
+                else None
             )
-            tree_buffer_state, tree_written_at = None, None
-            if self.tree_buffer is not None:
-                if meta["tree_buffer_capacity"] is not None:
-                    tree_buffer_state, (tree_written_at,) = self._load_buffer(
-                        get, ".tree_buffer_state", self.tree_buffer, ".tree_written_at"
-                    )
-                else:
-                    print(
-                        f"fork: {path} has no tree positions, the tree position buffer "
-                        "starts empty",
-                        flush=True,
-                    )
-                    tree_buffer_state = self.tree_buffer.init(
-                        self.batch_size, self.make_template_experience()
-                    )
-                    tree_written_at = jnp.zeros(
-                        (self.batch_size, self.tree_buffer.capacity), dtype=jnp.int32
-                    )
-        env_state, metadata, eval_state = self.init_games(
-            key, self.batch_size, evaluator
+            collection_state, kept_search = self._branch_collection_state(
+                saved,
+                meta,
+                evaluator,
+                keep_search=saved_playing is None
+                or saved_playing == (name or self.learners[into].name),
+                fork_key=key,
+            )
+        tree_capacity = (
+            buffer_capacity(collection_state.tree_buffer_state)
+            if collection_state.tree_buffer_state is not None
+            else None
         )
-        collection_state = CollectionState(
-            eval_state=eval_state,
-            env_state=env_state,
-            buffer_state=buffer_state,
-            metadata=metadata,
-            tree_buffer_state=tree_buffer_state,
-            tree_written_at=tree_written_at,
-            # metrics are compared within an epoch, so their sums can start again
-            episode_metrics=self.init_episode_metrics(
-                self.batch_size, metadata.rewards[0]
-            ),
-            **self.init_moves(key, self.batch_size),
-            **stats,
-            resign_state=self.init_resign_state(key, self.batch_size),
-            pending=self.init_pending(
-                key, self.batch_size, env_state, buffer_capacity(buffer_state)
-            ),
+        wanted_tree = (
+            self.tree_buffer.capacity if self.tree_buffer is not None else None
         )
+        if (
+            buffer_capacity(collection_state.buffer_state)
+            != self.memory_buffer.capacity
+            or tree_capacity != wanted_tree
+        ):
+            print(
+                f"fork: resizing the saved replay buffer from {meta['buffer_capacity']} to "
+                f"{self.memory_buffer.capacity} entries per environment"
+                + (
+                    f", tree positions' from {tree_capacity} to {wanted_tree}"
+                    if tree_capacity != wanted_tree
+                    else ""
+                ),
+                flush=True,
+            )
+            collection_state = self.resize_replay_buffer(
+                collection_state, self.memory_buffer.capacity, wanted_tree
+            )
+        if not kept_search:
+            print(
+                "fork: the saved search states don't fit, the moves in progress are searched "
+                "again",
+                flush=True,
+            )
         return collection_state, train_state
 
     def warm_state(
@@ -3599,46 +3639,6 @@ class Trainer:
             jax.tree.structure(template),
             [_to_device(saved[f"{part}.{i}"]) for i in range(len(expected))],
         )
-
-    def _load_buffer(
-        self,
-        get: Callable[[str], np.ndarray],
-        prefix: str,
-        buffer: EpisodeReplayBuffer,
-        *entry_paths: str,
-    ) -> tuple[ReplayBufferState, list[jax.Array]]:
-        """Loads a saved collection state's replay buffer (at `prefix`) into `buffer`'s capacity,
-        without the entries of games in progress, with arrays at `entry_paths` that have an
-        entry per place in it (see `EpisodeReplayBuffer.resized`)."""
-        template = jax.eval_shape(
-            lambda: buffer.init(self.batch_size, self.make_template_experience())
-        )
-        arrays = []
-        for leaf_path, shape, dtype in _describe(template):
-            x = get(prefix + leaf_path)
-            # all but the capacity dimension must match
-            if str(x.dtype) != dtype or (x.shape[:1] + x.shape[2:]) != (
-                shape[:1] + shape[2:]
-            ):
-                raise ValueError(
-                    f"the saved collection state{prefix}{leaf_path} is {x.shape} {x.dtype}, "
-                    f"this run's {shape} {dtype}, which only differ in the buffer's capacity"
-                )
-            arrays.append(x)
-        state = jax.tree.unflatten(jax.tree.structure(template), arrays)
-        entry_data = [get(p) for p in entry_paths]
-        # the games in progress don't carry on: their entries would never get rewards
-        state = jax.tree.map(np.asarray, buffer.truncate(state))
-        capacity = state.populated.shape[1]
-        if capacity != buffer.capacity:
-            name = "tree position" if buffer is self.tree_buffer else "replay"
-            print(
-                f"fork: resizing the saved {name} buffer from {capacity} to "
-                f"{buffer.capacity} entries per environment",
-                flush=True,
-            )
-            state, entry_data = buffer.resized(state, *entry_data)
-        return jax.tree.map(_to_device, state), [_to_device(x) for x in entry_data]
 
     def make_template_env_state(self) -> Any:
         """Create a template environment state used for initializing data structures that hold environment states to the correct shape.
