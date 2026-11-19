@@ -95,6 +95,29 @@ def test_a_set_reports_its_phases_and_on_request_its_sources():
     ]
 
 
+def test_filtered_positions_are_those_the_network_decides_in_halves():
+    s = tiny_set(np.random.default_rng(0))
+    # positions with 20 empty squares or fewer are the solver's
+    s = EngineSet(**{**s.__dict__, "empties": np.array([45, 30, 20, 21], np.int8)})
+
+    filtered = s.scored_positions(filtered=True)
+
+    assert filtered.scores.dtype == np.float32
+    np.testing.assert_array_equal(filtered.observations, s.obs[[0, 1, 3]])
+    np.testing.assert_array_equal(filtered.scores, s.scores[[0, 1, 3]])
+    np.testing.assert_array_equal(filtered.legal, s.legal[[0, 1, 3]])
+    assert {k: v.tolist() for k, v in filtered.groups.items()} == {
+        "opening": [True, False, False],
+        "midgame": [False, True, True],
+    }
+    assert list(s.scored_positions(by_source=True, filtered=True).groups) == [
+        "held-out",
+        "self_play",
+        "opening",
+        "midgame",
+    ]
+
+
 @pytest.mark.parametrize(
     "change, error",
     [
