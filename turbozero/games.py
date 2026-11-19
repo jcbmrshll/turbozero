@@ -19,9 +19,8 @@ def two_player_game(
     max_steps: int,
     p1_first: bool | None = None,
 ) -> jax.Array:
-    """Plays a game between two evaluators, with networks `params_1` and
-    `params_2`, and returns the outcomes (final rewards) of `evaluator_1` and
-    `evaluator_2`.
+    """Plays a game between two evaluators and returns the outcomes (final
+    rewards) of `evaluator_1` and `evaluator_2`, whichever seat each played.
 
     A game still going after `max_steps` steps is truncated: it's scored with
     the rewards of its last step (0 in games that only reward their end).
@@ -43,7 +42,8 @@ def two_player_game(
     )
 
     def move(state: tuple, p: int) -> tuple:
-        """`state` after evaluator `p`'s (0 or 1) move."""
+        """Has evaluator `p` (0 or 1) choose and play a move; both evaluators
+        then step with it, e.g. to reuse their search trees."""
         key, env_state, metadata, eval_states, outcomes, _ = state
         step_key, key = jax.random.split(key)
         _, evaluate_key = jax.random.split(step_key)
@@ -51,7 +51,6 @@ def two_player_game(
             evaluate_key, eval_states[p], env_state, metadata, params[p], env_step_fn
         )
         env_state, metadata = env_step_fn(env_state, output.action)
-        # both evaluators follow the move, e.g. to their search trees' subtrees
         eval_states = list(eval_states)
         eval_states[p] = output.eval_state
         eval_states = tuple(
@@ -69,8 +68,8 @@ def two_player_game(
         # are written as selects rather than lax.cond. vmap turns such a cond
         # into a select anyway, running both branches, but it does so by
         # batching every operand of the branches, the evaluators' parameters
-        # included: their convolutions then run per game, an order of
-        # magnitude slower.
+        # included: their convolutions then run per game, which has been seen
+        # to run about an order of magnitude slower.
         if isinstance(p1_moves_first, bool):
             moved = jax.lax.cond(
                 p1_moves, lambda s: move(s, 0), lambda s: move(s, 1), state

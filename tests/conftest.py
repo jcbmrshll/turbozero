@@ -307,7 +307,7 @@ class ScriptedEvaluator(Evaluator):
 
 @pytest.fixture(scope="session")
 def scripted():
-    """Scripted evaluators (see `ScriptedEvaluator`): `first_legal`, and
+    """Provides scripted evaluators (see `ScriptedEvaluator`): `first_legal`, and
     `beats_first_legal`, which wins tic-tac-toe against it whoever moves first
     (with the centre, then corners 2 and 6)."""
     return SimpleNamespace(
