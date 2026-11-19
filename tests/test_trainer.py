@@ -3921,6 +3921,23 @@ def rack_trainer(env, ckpt_dir, grown=(1, 2), **kwargs):
     return trainer
 
 
+def test_every_training_network_gets_its_averages_statistics_and_a_frozen_teacher_doesnt(
+    env, tmp_path, fake_loop, monkeypatch
+):
+    trainer = rack_trainer(env, tmp_path, grown=(1, 2, 3))
+    fake_loop(trainer)
+    estimated = []
+
+    def record(key, buffer_state, averages, train_state, learner=0):
+        estimated.append(learner)
+
+    monkeypatch.setattr(trainer, "average_norm_states", record)
+    trainer.train_loop(seed=0, num_epochs=2)
+
+    # after each epoch, each student whose averages moved; the teacher's never move
+    assert estimated == [1, 2, 3, 1, 2, 3]
+
+
 def test_every_waiting_network_trains_beside_a_frozen_teacher(env, tmp_path, fake_loop):
     trainer = rack_trainer(env, tmp_path, grown=(1, 2, 3))
     calls = fake_loop(trainer)
