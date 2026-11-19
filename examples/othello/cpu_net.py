@@ -65,8 +65,8 @@ class Block:
 class ConvNeXtBlock:
     """ConvNeXt's block (see `core.networks.azresnet.PreActConvNeXt`): x + project(relu(expand(y) +
     pool)), y = dw(x) + dw_bias, a depthwise filter of the trunk with its BatchNorm folded in;
-    `pool` biases the hidden channels from the last `pool_channels` of y. The depthwise filter
-    stays in float."""
+    `pool` biases the hidden channels from the last `pool_channels` of y. BatchNorms after expand
+    and project fold into them. The depthwise filter stays in float."""
 
     taps: np.ndarray  # (taps, 2): each tap's (dy, dx), in order of dy, then dx
     dw: np.ndarray  # (channels, taps)
@@ -153,31 +153,34 @@ def extract(network, state) -> Program:
     def linear(layer) -> Linear:
         return Linear(f32(layer.weight), f32(layer.bias))
 
+    def folded(conv, norm) -> Conv:
+        """A convolution with the normalization after it, if any, folded in: one that must fold."""
+        if norm is None:
+            return Conv(f32(conv.weight), np.zeros(conv.out_channels, np.float32))
+        c, rest = conv_norm(conv, norm)
+        if rest.type != NORM_NONE:
+            raise unsupported(norm)
+        return c
+
     def convnext(block, pool: Linear | None) -> ConvNeXtBlock:
         if not isinstance(block.norm, eqx.nn.BatchNorm):
             raise unsupported(block.norm)
         scale, offset = inference_affine(block.norm, state)
         order = sorted(range(len(block.dw.taps)), key=lambda t: block.dw.taps[t])
-        zeros = lambda c: np.zeros(c.out_channels, np.float32)
         return ConvNeXtBlock(
             taps=np.array([block.dw.taps[t] for t in order], np.int32).reshape(-1, 2),
             dw=f32(block.dw.weight)[:, order] * f32(scale)[:, None],
             dw_bias=f32(offset),
-            expand=Conv(f32(block.expand.weight), zeros(block.expand)),
-            project=Conv(f32(block.project.weight), zeros(block.project)),
+            expand=folded(block.expand, block.expand_norm),
+            project=folded(block.project, block.project_norm),
             pool_channels=block.pool_channels,
             pool=pool,
         )
 
-    pre = network.stem_norm is None
+    pre = network.final_norm is not None
     if pre:
-        stem, stem_norm = (
-            Conv(
-                f32(network.stem_conv.weight),
-                np.zeros(network.stem_conv.out_channels, np.float32),
-            ),
-            Norm(),
-        )
+        # the pre-activation trunk starts from the stem as it is, or normalized (folded in)
+        stem, stem_norm = folded(network.stem_conv, network.stem_norm), Norm()
     else:
         stem, stem_norm = conv_norm(network.stem_conv, network.stem_norm)
     blocks: list[Block | ConvNeXtBlock] = []

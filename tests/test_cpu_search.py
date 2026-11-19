@@ -617,9 +617,12 @@ def test_a_player_parses_random_symmetry():
         "fixed",
         "ws",
         *(f"{norm},layout=pre" for norm in ("batch", "layer", "channel", "rms")),
-        # ConvNeXt blocks: BatchNorm folded into the ray filters, or a normalization after them
+        # ConvNeXt blocks: BatchNorm folded into the ray filters and after the stem, expand and
+        # project (the default), or other normalizations after them
         "batch,layout=pre,block=convnext,dw_taps=rays",
         "layer,layout=pre,block=convnext,dw_kernel=3,expand=3",
+        # and without normalizations after the stem, expand and project
+        "batch,layout=pre,block=convnext,dw_kernel=3,stem_norm=false,expand_norm=false,project_norm=false",
     ],
 )
 def test_export_matches_the_network(norm):
@@ -976,10 +979,14 @@ NATIVE_SPECS = [
     # and the post layout's residual normalized
     "resnet:2x48,pool_every=2,heads=pooled,pool_channels=24,head_channels=16,norm=channel",
 ]
-# ConvNeXt blocks: Othello's ray filters, and a square filter at a width off multiples of 32 with
-# pooled channels off multiples of 16
+# ConvNeXt blocks: Othello's ray filters without normalizations after the stem, expands and
+# projects, and a square filter at a width off multiples of 32 with pooled channels off multiples
+# of 16, normalized after them (the default, folded in)
 CONVNEXT_SPECS = [
-    "resnet:3x64,pool_every=2,heads=pooled,pool_channels=16,layout=pre,block=convnext,expand=2,dw_taps=rays",
+    (
+        "resnet:3x64,pool_every=2,heads=pooled,pool_channels=16,layout=pre,block=convnext,expand=2,"
+        "dw_taps=rays,stem_norm=false,expand_norm=false,project_norm=false"
+    ),
     "resnet:2x48,pool_every=1,heads=pooled,pool_channels=8,head_channels=16,layout=pre,block=convnext,expand=3,dw_kernel=5",
 ]
 

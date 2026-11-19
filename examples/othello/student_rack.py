@@ -50,7 +50,7 @@ TEACHER_STATE = (
 )
 TEACHER_NET = (
     "resnet:9x64,pool_every=2,heads=pooled,pool_channels=16,layout=pre,block=convnext,"
-    "expand=2,dw_taps=rays"
+    "expand=2,dw_taps=rays,stem_norm=false,expand_norm=false,project_norm=false"
 )
 TRAIN_ARGS = [
     "--train-batch",
