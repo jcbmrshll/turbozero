@@ -103,10 +103,6 @@ class MatchSpec:
         return any(p.device == "gpu-batched" for p in (self.a, self.b))
 
     @property
-    def uses_gpu(self) -> bool:
-        return any(p.device in ("gpu", "gpu-batched") for p in (self.a, self.b))
-
-    @property
     def games(self) -> int:
         return 2 * self.openings
 
@@ -237,9 +233,9 @@ def play_sequential(
     by fresh players from `make` (`eval_players.maker` of their runtime), emitting each as it
     ends."""
     openings = spec.choose_openings()
-    host = hardware.describe(with_gpu=spec.uses_gpu)
+    host = hardware.describe()
     if spec.solve_at is not None and solve is None:
-        solve = endgame_solve(spec.solve_exact)
+        solve = endgame_solve()
     build = make or (lambda p, clock: maker(p.runtime, clock))
     clocks = {p.id: p.clock or UNTIMED for p in (spec.a, spec.b)}
     a, b = (build(p, clocks[p.id]) for p in (spec.a, spec.b))
@@ -303,9 +299,8 @@ def play_parallel(
     solver: Callable[[], Callable[[int, int], int]] | None = None,
 ) -> None:
     """Plays the games `numbers` `parallel` at a time, each in a thread by fresh players, on
-    the same cores: for players a game's thread can have to itself, engines (a process a game)
-    and networks on the GPU (whose games share one stream, its calls the bigger for it). At fixed
-    budgets the moves are the same as one at a time; on a clock, games slow each other."""
+    the same cores: for players a game's thread can have to itself, engines (a process a game).
+    At fixed budgets the moves are the same as one at a time; on a clock, games slow each other."""
     if any(p.device == "cpu" for p in (spec.a, spec.b)):
         raise ValueError(
             "networks on the CPU play one game at a time (--jobs: processes)"
@@ -313,11 +308,11 @@ def play_parallel(
     if spec.synchro:
         raise ValueError("synchro pairs are already two games at once")
     openings = spec.choose_openings()
-    host = hardware.describe(with_gpu=spec.uses_gpu)
+    host = hardware.describe()
     build = make or (lambda p, clock: maker(p.runtime, clock))
     clocks = {p.id: p.clock or UNTIMED for p in (spec.a, spec.b)}
     a, b = (build(p, clocks[p.id]) for p in (spec.a, spec.b))
-    new_solver = solver or (lambda: endgame_solve(spec.solve_exact))
+    new_solver = solver or endgame_solve
 
     queue = list(reversed(numbers))
     lock = threading.Lock()
@@ -422,7 +417,7 @@ def play_batched(
     openings = spec.choose_openings()
     host = hardware.describe(with_gpu=True)
     if spec.solve_at is not None and solve is None:
-        solve = endgame_solve(spec.solve_exact)
+        solve = endgame_solve()
     game = Othello()
     dtype = next(
         (
@@ -448,7 +443,8 @@ def play_batched(
                 net=network["net"],
                 settings={
                     key: p.config["search"][key]
-                    for key in ("tree_factor", "prior_temperature")
+                    for key in ("tree_factor", "prior_temperature", "c_init")
+                    if key in p.config["search"]
                 },
             )
         return Player(

@@ -1,6 +1,8 @@
 """train.py's command line, up to the trainer it builds, with a fake trainer."""
 
+import math
 import sys
+from types import SimpleNamespace
 
 import jax.numpy as jnp
 import numpy as np
@@ -22,8 +24,13 @@ def fake_trainer(**kwargs):
     raise BuiltTrainer(**kwargs)
 
 
+def fake_solve_fn(solver, threads):
+    return lambda positions: np.zeros((len(positions.current_player), 2), np.float32)
+
+
 def run_main(monkeypatch, *args):
     monkeypatch.setattr(train, "Trainer", fake_trainer)
+    monkeypatch.setattr(train, "make_solve_fn", fake_solve_fn)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -53,8 +60,18 @@ def test_root_noise_options_out_of_range_are_refused(monkeypatch, option):
     "options, resignation",
     [
         ((), None),
-        (("--resign",), (0.95, 0.1)),
-        (("--resign", "0.9", "--resign-calibration", "0.2"), (0.9, 0.2)),
+        (("--solve-empties", "off", "--resign"), (0.95, 0.1)),
+        (
+            (
+                "--solve-empties",
+                "off",
+                "--resign",
+                "0.9",
+                "--resign-calibration",
+                "0.2",
+            ),
+            (0.9, 0.2),
+        ),
     ],
 )
 def test_resignation_is_off_unless_asked_for(monkeypatch, options, resignation):
@@ -68,7 +85,13 @@ def test_resignation_is_off_unless_asked_for(monkeypatch, options, resignation):
 
 
 @pytest.mark.parametrize(
-    "option", [("--resign", "0"), ("--resign", "1.5"), ("--resign-calibration", "2")]
+    "option",
+    [
+        ("--solve-empties", "off", "--resign", "0"),
+        ("--solve-empties", "off", "--resign", "1.5"),
+        ("--resign-calibration", "2"),
+        ("--resign",),
+    ],
 )
 def test_resignation_options_out_of_range_are_refused(monkeypatch, option):
     with pytest.raises(SystemExit):
@@ -224,9 +247,15 @@ def test_grow_builds_a_network_to_grow_into_with_its_own_search_and_tests(
     assert grown.nn is not built.value.kwargs["nn"]
     assert grown.schedule.at(0).num_iterations == 16
     assert grown.evaluator_test is not built.value.kwargs["evaluator_test"]
-    # each network has its own engine-set tester, of its own network
-    (own,), (theirs,) = built.value.kwargs["testers"], grown.testers
-    assert own is not theirs and theirs.name == own.name == "engine"
+    # each network has its own engine-set testers, of its own network: the positions it
+    # every position, and the positions it decides
+    own, theirs = built.value.kwargs["testers"], grown.testers
+    assert (
+        [t.name for t in own]
+        == [t.name for t in theirs]
+        == ["engine", "filtered_engine"]
+    )
+    assert all(a is not b for a, b in zip(own, theirs, strict=True))
 
 
 def test_grow_lr_scales_the_grown_networks_rate(monkeypatch):
@@ -339,6 +368,7 @@ def test_warm_starts_reach_the_training_loop(monkeypatch):
             loops.append(kwargs)
 
     monkeypatch.setattr(train, "Trainer", Trainer)
+    monkeypatch.setattr(train, "make_solve_fn", fake_solve_fn)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -546,6 +576,81 @@ def test_a_frozen_teacher_reaches_the_trainer(monkeypatch):
     assert built.value.kwargs["train_retired"] is True
 
 
+def test_a_rack_of_named_students_with_their_own_rates(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(
+            monkeypatch,
+            "--net",
+            "teacher=resnet:1x4",
+            "--grow",
+            "wide=resnet:1x8",
+            "--grow",
+            "deep=resnet:2x4",
+            "--grow",
+            "resnet:1x16",
+            "--grow-switch-at",
+            "80,90,100",
+            "--grow-frozen",
+            "--grow-train-waiting",
+            "--lr",
+            "1e-4",
+            "--lr-of",
+            "deep=5e-5",
+            "--weight-decay-of",
+            "deep=0.05",
+        )
+    kwargs = built.value.kwargs
+    growth = kwargs["growth"]
+    assert growth.names == ("teacher", "wide", "deep", "1x16")
+    wide, deep, plain = growth.learners
+    assert (wide.lr_scale, wide.hyperparams) == (1.0, {})
+    assert deep.lr_scale == pytest.approx(0.5)
+    assert deep.hyperparams == {"weight_decay": 0.05}
+    assert plain.lr_scale == 1.0
+    # the specs, not their names, make the networks
+    assert deep.nn is not wide.nn
+    assert (kwargs["train_waiting"], kwargs["train_playing"]) == (True, False)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ("--grow-train-waiting",),
+        ("--grow", "a=resnet:2x8", "--grow-switch-at", "80", "--lr-of", "b=1e-4"),
+        ("--grow", "a=resnet:2x8", "--grow-switch-at", "80", "--lr-of", "a=0"),
+        ("--grow", "a=resnet:2x8", "--grow-switch-at", "80", "--lr-of", "a"),
+        (
+            "--grow",
+            "a=resnet:2x8",
+            "--grow-switch-at",
+            "80",
+            "--weight-decay-of",
+            "a=-1",
+        ),
+        (
+            "--grow",
+            "a=resnet:2x8",
+            "--grow-switch-at",
+            "80",
+            "--lr-of",
+            "a=1e-4",
+            "--lr-of",
+            "a=2e-4",
+        ),
+    ],
+)
+def test_bad_rack_options_are_refused(monkeypatch, options):
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, *options)
+
+
+def test_named_specs():
+    assert train.named_spec("r7=resnet:7x64,expand=2") == ("r7", "resnet:7x64,expand=2")
+    assert train.named_spec("resnet:7x64,expand=2") == (None, "resnet:7x64,expand=2")
+    assert train.net_name("r7=resnet:7x64") == "r7"
+    assert train.net_name("resnet:7x64,expand=2") == "7x64"
+
+
 def test_a_frozen_teacher_needs_grow(monkeypatch):
     with pytest.raises(SystemExit):
         run_main(monkeypatch, "--grow-frozen")
@@ -574,3 +679,63 @@ def test_a_fixed_network_can_play_and_keep_its_moves(monkeypatch, tmp_path):
         )
     assert built.value.kwargs["train_steps_per_epoch"] == 0
     assert built.value.kwargs["log_moves"] == str(tmp_path / "moves")
+
+
+def test_every_position_at_20_empties_or_fewer_is_solved_by_default(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch)
+    solve = built.value.kwargs["endgame_solve"]
+    assert solve.play_past == math.inf
+    assert solve.share == 1.0
+    assert solve.get_config()["play_past"] == "end"
+    # the cut is at 20 empty squares: 44 discs on the board
+    for discs, stops in ((43, False), (44, True)):
+        observation = jnp.zeros(128).at[:discs].set(1).reshape(8, 8, 2)
+        assert bool(solve.stop_fn(SimpleNamespace(observation=observation))) is stops
+
+
+def test_solve_empties_off_plays_games_out(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, "--solve-empties", "off")
+    assert built.value.kwargs["endgame_solve"] is None
+
+
+@pytest.mark.parametrize("value", ["-1", "60", "none", "2.5"])
+def test_bad_solve_empties_is_refused(monkeypatch, value):
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, "--solve-empties", value)
+
+
+@pytest.mark.parametrize("value", ["end", "inf"])
+def test_play_past_end_plays_every_game_to_its_end_with_room_for_its_solves(
+    monkeypatch, value
+):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, "--solve-empties", "20", "--solve-play-past", value)
+    solve = built.value.kwargs["endgame_solve"]
+    assert solve.play_past == math.inf
+    with pytest.raises(BuiltTrainer) as mean:
+        run_main(monkeypatch, "--solve-empties", "20", "--solve-play-past", "4")
+    assert solve.slots > mean.value.kwargs["endgame_solve"].slots
+
+
+@pytest.mark.parametrize("value", ["-1", "nan", "forever"])
+def test_bad_play_past_is_refused(monkeypatch, value):
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, "--solve-empties", "20", "--solve-play-past", value)
+
+
+def test_solve_slots_hold_whole_games_and_at_most_a_solve_a_move():
+    # 64 moves an epoch
+    cycles, every = 64 * 129, 129
+    # past a solve point at 20 a game can store more positions than it has moves before it,
+    # so the slots are two epochs' moves
+    assert train.solve_slots(cycles, every, 20, math.inf) == 2 * 64 + 2
+    # at 2, a game stores at most 5 positions past it: 2 games an epoch, each 6 solves
+    assert train.solve_slots(cycles, every, 2, math.inf) == 2 * 2 * 6 + 2
+    for empties in (2, 10, 20):
+        whole = train.solve_slots(cycles, every, empties, math.inf)
+        for mean in (0.0, 1.0, 4.0, 50.0):
+            assert train.solve_slots(cycles, every, empties, mean) <= whole
+    # a mean's room is twice the mean, as before
+    assert train.solve_slots(cycles, every, 20, 4.0) == 2 * 2 * 9 + 2

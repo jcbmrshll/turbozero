@@ -36,9 +36,6 @@ from native_target import cpus
 from quantize import quantized_path
 from xot import XOT_PATH, load_xot
 
-# traversals in a row that ended the game after which a search on a clock stops
-ENDED_VISITS = 64
-
 
 @dataclass(frozen=True)
 class Player:
@@ -70,6 +67,7 @@ class Player:
             else None,
             random_symmetry=bool(int(fields.pop("random_symmetry", 0))),
             reuse=bool(int(fields.pop("reuse", 1))),
+            descend=int(fields.pop("descend", 0)),
         )
         return cls(net, backend, visits, settings)
 
@@ -123,21 +121,17 @@ def make_engine(name: str, backend: str, cores: int, batch: int) -> Engine:
 def timed_move(
     search: Search, seconds: float, batch: np.ndarray, evaluate: Eval
 ) -> tuple[int, int]:
-    """Searches until `seconds` have passed, finishing the batch in flight. Returns the leaves
-    evaluated and the visits."""
+    """Searches until `seconds` have passed, finishing the batch in flight (all of them, as
+    `Engine.search` does). Returns the leaves evaluated and the visits."""
     start = time.perf_counter()
     before = search.total_visits()
-    leaves = ended = 0
+    leaves = 0
     search.begin(1 << 30)
     while time.perf_counter() - start < seconds:
         count = search.collect(batch)
         logits, values = evaluate(batch[:count])
         search.apply(logits, values)
         leaves += count
-        # a run of traversals that all ended the game: the tree has little left to evaluate
-        ended = ended + len(batch) if count == 0 else 0
-        if ended >= ENDED_VISITS:
-            break
     search.begin(0)
     return leaves, search.total_visits() - before
 
@@ -172,8 +166,8 @@ class Solving:
 
     On a clock, a game plans its solve as Edax does: from the most empties, up to `empties`,
     whose expected solve takes at most `share` of the game's clock; the moves before it share the
-    clock less that, and the solve may take all but a tenth of what's left before it gives up and
-    the move is searched. A solve that succeeds leaves the game's later moves almost nothing to do.
+    clock less what's kept for it (`kept`), and the solve may take all but a tenth of what's left
+    before it gives up and the move is searched. A solve that succeeds leaves the game's later moves almost nothing to do.
     At fixed visits, positions with `empties` or fewer are solved, taking what they take.
 
     Attributes:
@@ -183,6 +177,9 @@ class Solving:
             then searched as usual, the network's best try against a fallible opponent
         share: of the game's clock, the most a planned solve may be expected to take
         threads: the solver's, by default one
+        reserve, reserve_share: of the clock kept for the solve while the moves before it are
+            searched: its expected cost, or this many seconds, or this share of what's left,
+            whichever is most (`kept`)
         cost_at_24: a solve's expected seconds at 24 empties on 8 threads, twice as long each
             empty more, and shorter in proportion to more threads. By default Edax's exact solver
             on positions of real games on the contest's cores (0.07, 0.19 and 0.80 s at 22, 24
@@ -195,6 +192,16 @@ class Solving:
     share: float = 0.25
     threads: int = 1
     cost_at_24: float = 0.19
+    reserve: float = 4.0
+    reserve_share: float = 0.05
+
+    def kept(self, solve_from: int, seconds_left: float) -> float:
+        """The seconds of `seconds_left` kept for a solve from `solve_from` empties."""
+        return max(
+            self.cost(solve_from),
+            self.reserve,
+            self.reserve_share * max(seconds_left, 0.0),
+        )
 
     def cost(self, empties: int) -> float:
         """A solve's expected seconds at `empties`."""
@@ -281,20 +288,37 @@ class NetPlayer:
         self.solved += 1
         return solved.move
 
-    def move(self, color: str, seconds_left: float, budget: float | None = None) -> int:
-        """Our move, which it also plays. A position with one legal move takes no time.
-        `budget`, if given, is the search's seconds, the caller's plan; else `move_budget`'s
-        share of `seconds_left`, which plans the solve and bounds it either way."""
+    def move(self, color: str, seconds_left: float, per_move: float = 0.0) -> int:
+        """Our move, which it also plays, on `seconds_left`: what it may plan the rest of the
+        game on. With `per_move` above 0 there's no game clock to plan (`seconds_left` is
+        ignored): the move is searched that long, or solved if a solve is expected to take no
+        longer (and searched if it doesn't finish in that). A position with one legal move takes
+        no time."""
         self.sync(color)
         me, opp, _, _ = self.search.position()
         empties = 64 - (me | opp).bit_count()
-        if self.solving is not None and self.solve_from is None:
+        if per_move > 0:
+            seconds_left = per_move
+        if self.solving is not None and per_move > 0:
+            # no game to plan: the most empties whose solve is expected to fit a move's time
+            fits = [
+                e
+                for e in range(1, self.solving.empties + 1)
+                if self.solving.cost(e) <= per_move
+            ]
+            self.solve_from = (
+                self.solving.empties if self.visits else max(fits, default=0)
+            )
+            self.search.set_solved_from(self.solve_from)
+        elif self.solving is not None and self.solve_from is None:
             # the first move sees the game's whole clock
             self.solve_from = (
                 self.solving.empties
                 if self.visits
                 else self.solving.depth(seconds_left)
             )
+            # those positions' moves aren't the most visited (`SearchSettings.descend`)
+            self.search.set_solved_from(self.solve_from)
         solve_from = self.solve_from or 0
         action = None
         self.last_value = None
@@ -305,25 +329,19 @@ class NetPlayer:
             action = self.solve(me, opp, seconds_left)
             seconds_left -= time.perf_counter() - start
         if action is None:
-            reserve = (
-                self.solving.cost(solve_from)
-                if self.solving is not None and solve_from
-                else 0.0
-            )
-            seconds = (
-                budget
-                if budget is not None
-                else move_budget(
+            if per_move > 0:
+                seconds = max(seconds_left, 0.0)
+            else:
+                reserve = (
+                    self.solving.kept(solve_from, seconds_left)
+                    if self.solving is not None and solve_from
+                    else 0.0
+                )
+                seconds = move_budget(
                     max(seconds_left, 0.0), empties, self.taper, solve_from, reserve
                 )
-            )
             if isinstance(self.evaluate, Engine):
-                self.evaluate.search(
-                    self.search,
-                    visits=self.visits,
-                    seconds=seconds,
-                    stop_ended=0 if self.visits else ENDED_VISITS,
-                )
+                self.evaluate.search(self.search, visits=self.visits, seconds=seconds)
             elif self.visits:
                 self.search.run(self.visits, self.evaluate)
             else:

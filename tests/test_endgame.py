@@ -178,15 +178,31 @@ def test_solves_match_plain_minimax():
             assert np.sign(after[sign_move]) == np.sign(expected)
 
 
-def test_a_match_solves_with_the_solver():
+def test_neural_reversis_solve_table_is_read_in_order():
+    from engines import solve_scores
+
+    text = """
+|   #   | Depth  | Score |    Time     |        Nodes        |
+| ----: | :----: | :---: | ----------: | ------------------: |
+|     2 |   15   |  +00  |    0:00.002 |             441,796 |
+|     1 |   6    |  -06  |    0:00.000 |                  46 |
+| Total |        |       |    0:00.004 |             984,148 |
+"""
+    assert solve_scores(text, 2) == [-6, 0]
+    with pytest.raises(RuntimeError):
+        solve_scores(text, 3)
+
+
+def test_a_match_solves_exactly_with_neural_reversi():
     from clock_match import endgame_solve
     from endgame import LIB
+    from engines import NeuralReversi
 
-    exact, wld = endgame_solve(exact=True), endgame_solve(exact=False)
+    if not NeuralReversi.installed(NeuralReversi.default_dir()):
+        pytest.skip("Neural Reversi isn't built here (setup_neural_reversi.sh)")
+    solve = endgame_solve()
     for me, opp in random_positions([8, 10], 10, seed=2):
-        expected = LIB.endgame_minimax(me, opp)
-        assert exact(me, opp) == expected
-        assert np.sign(wld(me, opp)) == np.sign(expected)
+        assert solve(me, opp) == LIB.endgame_minimax(me, opp)
 
 
 def test_a_net_player_on_a_clock_plans_its_solve_by_its_cost():
@@ -368,8 +384,14 @@ def test_a_net_player_plays_its_endgame_solved(exact):
     black = NetPlayer(
         SearchSettings(batch=2),
         fake_eval,
+        # and keeping no more than a tenth of a second for it: the default 4 s would swallow
+        # the 1 s clock
         solving=Solving(
-            empties=n, exact=exact, threads=2, cost_at_24=7.0 if exact else 2.0
+            empties=n,
+            exact=exact,
+            threads=2,
+            cost_at_24=7.0 if exact else 2.0,
+            reserve=0.1,
         ),
     )
     white = NetPlayer(SearchSettings(batch=2), fake_eval, seed=1)
@@ -406,3 +428,37 @@ def test_a_net_player_searches_when_a_solve_gives_up():
     move = player.move("b", 0.2)
     assert player.gave_up == 1 and player.solved == 0
     assert move in Board().legal()
+
+
+def test_a_net_player_on_a_fixed_time_solves_only_what_fits():
+    """With `per_move`, no game clock: solved if the solve is expected to fit the move's time,
+    else searched that long."""
+    from cpu_match import NetPlayer, Solving
+    from cpu_search import SearchSettings
+
+    b = Board()
+    while 64 - (b.discs[0] | b.discs[1]).bit_count() > 14:
+        b.play(b.legal()[0])
+    position = (b.discs[0], b.discs[1], b.color)
+    solving = Solving(empties=20, exact=True, threads=2, cost_at_24=7.0)
+    assert solving.cost(14) < 0.1 < solving.cost(18)
+
+    def player():
+        p = NetPlayer(SearchSettings(), fake_eval, solving=solving)
+        p.set_position(*position)
+        return p
+
+    fits = player()
+    move = fits.move(b.color, 0.0, per_move=0.1)
+    # planned from the most empties that fit, no more than asked for
+    assert fits.solve_from == 15 and fits.solved == 1
+    assert fits.last_value is not None and fits.last_value[0] == "margin"
+    assert move in b.legal()
+    short = player()
+    start = time.perf_counter()
+    move = short.move(b.color, 100.0, per_move=0.01)
+    # nothing fits 0.01 s from 14 empties: searched that long, the clock ignored
+    assert short.solve_from == 12 and short.solved == 0 and short.gave_up == 0
+    assert short.last_value is not None and short.last_value[0] == "q"
+    assert time.perf_counter() - start < 1.0
+    assert move in b.legal()

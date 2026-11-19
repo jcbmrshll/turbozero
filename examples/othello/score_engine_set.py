@@ -4,8 +4,9 @@ search, against Edax's scores of every legal move.
     uv run examples/othello/score_engine_set.py runs/othello/49.eqx runs/othello/99.eqx \\
         --net resnet:10x128,pool_every=3,heads=pooled
 
-Prints each checkpoint's metrics, for all positions and by game phase (and with --by-source,
-by where the positions came from; see
+Prints each checkpoint's metrics as training logs them: engine_*, over all the positions, and
+filtered_engine_*, over those between the XOT opening and the exact solver; each overall and by game
+phase (and with --by-source, by where the positions came from; see
 `core.testing.scored_positions.scored_position_metrics`); with --out, also appends them to a
 .jsonl file.
 """
@@ -15,7 +16,7 @@ import json
 from pathlib import Path
 
 from engine_set import DEFAULT_PATH, EngineSet
-from game import DEFAULT_NET, load_checkpoint
+from game import DEFAULT_NET, PLAY_PRIOR_TEMPERATURE, load_checkpoint
 
 from core.testing.scored_positions import METRICS, ScoredPositionsTester
 
@@ -50,23 +51,33 @@ def main():
             f"no engine-labelled set at {args.set}: build one with label_positions.py"
         )
     engine_set = EngineSet.load(args.set)
-    tester = None
+    testers = None
     for path in args.checkpoints:
         network, params = load_checkpoint(path, args.net, args.dtype)
-        if tester is None:
-            tester = ScoredPositionsTester(
-                engine_set.scored_positions(args.by_source), network
-            )
-        metrics = {k: float(v) for k, v in tester.evaluate(params).items()}
+        if testers is None:
+            testers = [
+                ScoredPositionsTester(
+                    engine_set.scored_positions(args.by_source, filtered),
+                    network,
+                    name=name,
+                    prior_temperature=PLAY_PRIOR_TEMPERATURE,
+                )
+                for name, filtered in (("engine", False), ("filtered_engine", True))
+            ]
         print(
             f"{path} ({len(engine_set)} positions, {engine_set.engine} level {engine_set.level})"
         )
-        for group in tester.group_names:
-            suffix = "" if group == "all" else f"_{group}"
-            values = "  ".join(
-                f"{m} {metrics[f'{tester.name}_{m}{suffix}']:.4f}" for m in METRICS
-            )
-            print(f"  {group:>24}: {values}")
+        metrics = {}
+        for tester in testers:
+            scored = {k: float(v) for k, v in tester.evaluate(params).items()}
+            metrics.update(scored)
+            print(f"  {tester.name} ({tester.num_positions} positions)")
+            for group in tester.group_names:
+                suffix = "" if group == "all" else f"_{group}"
+                values = "  ".join(
+                    f"{m} {scored[f'{tester.name}_{m}{suffix}']:.4f}" for m in METRICS
+                )
+                print(f"  {group:>24}: {values}")
         if args.out:
             with open(args.out, "a") as f:
                 f.write(

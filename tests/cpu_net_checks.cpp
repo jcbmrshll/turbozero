@@ -290,6 +290,48 @@ static void check_quantize() {
     }
 }
 
+#if NET_ISA == 1
+// AVX2's project inputs (`ExpandOut::put16`): relu(x) * inverse rounded, ties to even, within 0 to
+// 255 (a NaN and floats out of the int32 range to 0), then without AVX-VNNI at most 127 with the
+// rest beside it (`Residuals`), and for v3-7bit at most 127
+static void check_project_input() {
+    const int cin = 64;
+    std::vector<float> x, inverse;
+    for (float v : {0.0f, -0.0f, 0.5f, 1.5f, 2.5f, -0.5f, -1.5f, 126.5f, 127.5f, 128.5f, 254.5f, 255.5f, 1e10f, -1e10f,
+                    INFINITY, -INFINITY, NAN, -NAN, 2147483520.0f, 2147483648.0f, -2147483648.0f, 3e9f, 0x1p-130f})
+        x.push_back(v);
+    inverse.assign(x.size(), 1.0f);
+    while (x.size() % cin) {
+        x.push_back(any_float() * 300);
+        inverse.push_back(std::ldexp(1.0f + (rng() % 1000) / 1000.0f, (int)(rng() % 8)));
+    }
+    for (size_t first = 0; first < x.size(); first += cin) {
+        Conv project;
+        project.cin = cin;
+        project.top = INPUT1_TOP;
+        project.inverse.assign(inverse.begin() + first, inverse.begin() + first + cin);
+        std::vector<Input1, Aligned<Input1>> in(cin);
+        Residuals rest;
+        rest.reserve(cin, 16);
+        ExpandOut sink{Quantizer(project), in.data(), cin};
+#if NET_SPLIT1
+        sink.rest = &rest;
+#endif
+        for (int o = 0; o < cin; o += 16)
+            sink.put16(0, o, Lanes::load(x.data() + first + o), Lanes::load(x.data() + first + o + 8));
+        for (int i = 0; i < cin; i++) {
+            volatile float t = x[first + i] * inverse[first + i];
+            const float v = t;
+            const bool out = std::isnan(v) || v >= 2147483648.0f || v < -2147483648.0f;
+            const int want = out ? 0 : std::clamp((int)std::nearbyint(v), 0, 255);
+            const int top = NET_SPLIT1 || INPUT1_TOP == 127 ? 127 : 255;
+            expect(in[i] == std::min(want, top), "project input", (int)first + i);
+            if (NET_SPLIT1) expect(rest.dense[i] == want - std::min(want, 127), "project residual", (int)first + i);
+        }
+    }
+}
+#endif
+
 static void check_transpose() {
     alignas(64) float x[W][W], got[W];
     F r[W];
@@ -393,6 +435,97 @@ static void check_conv_1x1() {
         }
 }
 
+// a ConvNeXt block's depthwise filter, each sum from its bias through its taps in order, those off
+// the board skipped, and its pooled channels' means and maxima, as one square at a time
+static void check_depthwise() {
+    std::vector<std::pair<int, int>> rays, square;
+    for (int dy = -7; dy <= 7; dy++)
+        for (int dx = -7; dx <= 7; dx++)
+            if (dy == 0 || dx == 0 || dy == dx || dy == -dx) rays.emplace_back(dy, dx);
+    for (int dy = -2; dy <= 2; dy++)
+        for (int dx = -2; dx <= 2; dx++) square.emplace_back(dy, dx);
+    for (const auto& taps : {rays, square})
+        for (int C : {48, 64, 128}) {
+            const int P = C == 48 ? 8 : 16, T = (int)taps.size();
+            Depthwise d;
+            for (const auto& [dy, dx] : taps) {
+                d.dy.push_back(dy);
+                d.dx.push_back(dx);
+            }
+            for (int i = 0; i < T * C; i++) d.w.push_back(any_float());
+            for (int i = 0; i < C; i++) d.bias.push_back(any_float());
+            prepare(d);
+            expect(d.rays == (T == 57), "depthwise rays", T);
+            std::vector<float> x((size_t)SQUARES * C), got((size_t)SQUARES * C), pooled(2 * P);
+            for (auto& v : x) v = any_float();
+            depthwise(d, x.data(), C, P, pooled.data(), [&](int sq, int ch, F v) { Lanes::store(got.data() + (size_t)sq * C + ch, v); });
+            std::vector<float> sum(P, 0.0f), top(P, -INFINITY);
+            for (int sq = 0; sq < SQUARES; sq++)
+                for (int ch = 0; ch < C; ch++) {
+                    float acc = d.bias[ch];
+                    for (int t = 0; t < T; t++) {
+                        const int y = sq / 8 + d.dy[t], xx = sq % 8 + d.dx[t];
+                        if (y >= 0 && y < 8 && xx >= 0 && xx < 8) acc = std::fma(d.w[(size_t)t * C + ch], x[(size_t)(y * 8 + xx) * C + ch], acc);
+                    }
+                    expect(same(got[(size_t)sq * C + ch], acc), "depthwise", sq * C + ch);
+                    if (ch >= C - P) {
+                        sum[ch - (C - P)] += acc;
+                        top[ch - (C - P)] = std::max(top[ch - (C - P)], acc);
+                    }
+                }
+            for (int j = 0; j < P; j++) {
+                expect(same(pooled[j], sum[j] * (1.0f / SQUARES)), "depthwise mean", j);
+                expect(same(pooled[P + j], top[j]), "depthwise max", j);
+            }
+        }
+}
+
+// a ConvNeXt block's 1x1 convolutions, the project's and the expand's (their inputs may differ:
+// `ExpandInput`): integer sums, then acc * scale + bias added to the trunk
+static void check_conv1x1() {
+    for (bool expand : {false, true})
+        for (int cin : {48, 64, 128})
+            for (int cout : {48, 64, 144}) {
+                Conv c;
+                c.cin = cin;
+                c.cout = cout;
+                c.k = 1;
+                std::vector<int8_t> q((size_t)cout * cin);
+                for (auto& v : q) v = (int8_t)((int)(rng() % 255) - 127);
+                for (int o = 0; o < cout; o++) {
+                    c.scale.push_back(any_float());
+                    c.bias.push_back(any_float());
+                }
+                // inputs over the whole range (half of them above AVX2's bytes' 127)
+                pack1x1(c, q.data(), expand);
+                std::vector<Input1, Aligned<Input1>> in((size_t)SQUARES * cin);
+                std::vector<ExpandInput, Aligned<ExpandInput>> wide((size_t)SQUARES * cin);
+                Residuals rest;
+                rest.reserve(cin, cout);
+                std::vector<int> value((size_t)SQUARES * cin);
+                for (int sq = 0; sq < SQUARES; sq++) {
+                    for (int i = 0; i < cin; i++) {
+                        value[(size_t)sq * cin + i] = (int)(rng() % (INPUT1_TOP + 1));
+                        wide[input1_at(sq, i, cin)] = (ExpandInput)(value[(size_t)sq * cin + i] - ACTIVATION_SHIFT);
+                    }
+                    put_square1(c, sq, value.data() + (size_t)sq * cin, in.data(), rest);
+                }
+                std::vector<float> x((size_t)SQUARES * cout), want(x.size());
+                for (auto& v : x) v = any_float();
+                for (int sq = 0; sq < SQUARES; sq++)
+                    for (int o = 0; o < cout; o++) {
+                        int32_t acc = 0;
+                        for (int i = 0; i < cin; i++) acc += value[(size_t)sq * cin + i] * q[(size_t)o * cin + i];
+                        want[(size_t)sq * cout + o] = x[(size_t)sq * cout + o] + std::fma((float)acc, c.scale[o], c.bias[o]);
+                    }
+                if (expand && sizeof(ExpandInput) != sizeof(Input1))
+                    conv1x1(c, wide.data(), &rest, c.scale.data(), c.bias.data(), ProjectOut{x.data(), cout});
+                else
+                    conv1x1(c, in.data(), &rest, c.scale.data(), c.bias.data(), ProjectOut{x.data(), cout});
+                for (size_t i = 0; i < x.size(); i++) expect(same(x[i], want[i]), expand ? "conv1x1 expand" : "conv1x1", (int)i);
+            }
+}
+
 int main() {
     check_reduce();
     check_norm_stats();
@@ -400,10 +533,15 @@ int main() {
     check_convolve();
     check_conv_1x1();
     check_quantize();
+#if NET_ISA == 1
+    check_project_input();
+#endif
     check_pool_bias_quantize();
     check_transpose();
     check_linear();
     check_policy_logits();
+    check_depthwise();
+    check_conv1x1();
     std::printf("%d failures\n", failures);
     return failures ? 1 : 0;
 }

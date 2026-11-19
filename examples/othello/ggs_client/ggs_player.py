@@ -88,7 +88,8 @@ class Bridge(Protocol):
     `decide` is our move, called on a thread of its own for each game (two can overlap, with
     two matches); `cores` is the CPU share the client gives the search. `observe` is told every
     board of our games as the server shows it, whoever's to move, on the client's thread: it
-    must return at once (a player that ponders queues it). `forget` is a game's end.
+    must return at once (a player that ponders hands it to a thread of its own). `forget` is a
+    game's end.
     """
 
     def decide(self, view: GameView, cores: int) -> Decision: ...
@@ -134,7 +135,9 @@ def colored_moves(
 
 @dataclass(frozen=True)
 class TimePolicy:
-    """How much of the clock a move may plan on.
+    """How much of the clock a move may plan on. What's kept for the endgame's solve is the
+    player's to keep (`cpu_match.Solving.kept`): a clock already planned to the solve, told to
+    it, would keep it twice.
 
     Attributes:
         reserve: seconds of the clock never planned on, for the network and the server's whole
@@ -142,16 +145,11 @@ class TimePolicy:
         reserve_share: and this share of what's left
         extension_share: on the extension (a soft timeout: the game is lost by at least the
             least margin already), this share of it a move, so as never to run out of it too
-        solve_reserve, solve_share: with the endgame solved from N empties, the seconds (or
-            this share of the clock, whichever is more) kept for it; the rest is planned over
-            our moves before it
     """
 
     reserve: float = 1.5
     reserve_share: float = 0.03
     extension_share: float = 0.1
-    solve_reserve: float = 4.0
-    solve_share: float = 0.05
 
     def seconds_left(self, view: GameView) -> float:
         """What the player may plan the rest of the game on."""
@@ -162,21 +160,6 @@ class TimePolicy:
         # an increment comes after each move, the game's half of the empties ours
         usable += view.increment * max(view.empties // 2 - 1, 0)
         return max(usable, 0.0)
-
-    def planned_left(self, view: GameView, solve_from: int = 0) -> float:
-        """What to tell `cpu_match.move_budget` is left (untapered), for its share of it a move
-        to spread the clock over our moves until the endgame's solved from `solve_from` empties,
-        rather than to the end: solved, those moves take little (about a second, from 20
-        empties, against tens of seconds planned)."""
-        usable = self.seconds_left(view)
-        empties = view.empties
-        if not solve_from or empties <= solve_from:
-            return usable
-        kept = max(self.solve_reserve, self.solve_share * usable)
-        ours_to_solve = max((empties - solve_from + 1) // 2, 1)
-        ours_to_end = max((empties + 1) // 2, 1)
-        # move_budget gives 0.95 * left / ours_to_end a move, untapered
-        return max(usable - kept, 0.0) / ours_to_solve * ours_to_end
 
     def extension_move(self, view: GameView) -> float:
         """A move's seconds on the extension."""
@@ -257,9 +240,6 @@ class EnginePool:
 
 # a ponder searches in slices of this many seconds, checking its tree's size between them
 PONDER_SLICE = 0.5
-# traversals in a row that end the game after which a ponder stops: its tree has nothing left
-# to evaluate (`cpu_match.ENDED_VISITS`)
-PONDER_STOP_ENDED = 64
 
 
 class _Ponder:
@@ -281,9 +261,7 @@ class _Ponder:
         while not self.stopping:
             if self.max_nodes and search.num_nodes() >= self.max_nodes:
                 break
-            leaves = self.engine.search(
-                search, seconds=PONDER_SLICE, stop_ended=PONDER_STOP_ENDED
-            )
+            leaves = self.engine.search(search, seconds=PONDER_SLICE)
             self.leaves += leaves
             if leaves == 0:
                 # halted, or the tree's all games' ends
@@ -318,8 +296,9 @@ class PlayerBridge:
         ponder: bool = False,
         ponder_nodes: int = 0,
     ):
-        """`solve_from`: the empties from which the player solves the endgame (its `solve`),
-        which the clock is planned to reach; no ponder then, the next move of ours solved.
+        """`solve_from`: the empties from which the player solves the endgame (its `solve`); the
+        moves before it share the clock evenly (no `taper`), the player keeping the solve's
+        reserve (`cpu_match.Solving.kept`); no ponder when our next move is solved.
         `ponder_nodes`: a ponder stops once its game's tree has this many nodes (0: never)."""
         self.new_player = new_player
         self.solve_from = solve_from
@@ -432,8 +411,6 @@ class PlayerBridge:
         return game
 
     def decide(self, view: GameView, cores: int) -> Decision:
-        from cpu_match import move_budget
-
         start = time.perf_counter()
         board = Board.at(view.black, view.white, view.color)
         legal = board.legal()
@@ -453,18 +430,15 @@ class PlayerBridge:
         try:
             game.player.evaluate = engine
             if view.extended:
-                # on the extension: a fixed share of it a move; a solve may take the rest
-                budget = self.time.extension_move(view)
-                left = max(view.extension - self.time.reserve, 0.0)
-            else:
-                # the clock planned to the solve, evenly (see `TimePolicy.planned_left`), or
-                # with none, tapered to the end; the player's own plan only bounds its solve
-                left = self.time.seconds_left(view)
-                taper = 0 if self.solve_from else self.taper
-                budget = move_budget(
-                    self.time.planned_left(view, self.solve_from), view.empties, taper
+                # on the extension: a fixed share of it a move
+                move = game.player.move(
+                    view.color, 0.0, per_move=self.time.extension_move(view)
                 )
-            move = game.player.move(view.color, left, budget)
+            else:
+                # solving, the moves before the solve share the clock evenly: solved, those
+                # after it take little (about a second, from 20 empties)
+                game.player.taper = 0 if self.solve_from else self.taper
+                move = game.player.move(view.color, self.time.seconds_left(view))
         finally:
             self.pool.release(cores, engine)
             with self.lock:
@@ -590,20 +564,9 @@ class _Game:
 
 
 def make_bridge(options: dict[str, str], cores: int) -> Bridge:
-    """The player `--player` names: `net=NAME,...` on the CPU's native engine (`NetBridge`), or
-    with `device=gpu`, the GPU player's bridge (see the README)."""
+    """The player `--player` names: `net=NAME,...` on the CPU's native engine (`NetBridge`)."""
     options = dict(options)
     device = options.pop("device", "cpu")
     if device == "cpu":
         return NetBridge(options, cores)
-    if device == "gpu":
-        # the GPU player (examples/othello/gpu_play.py), its trees' leaves batched on one
-        # stream, pondering the game the opponent's moving in; it takes our types so as not to
-        # import this module
-        import importlib
-
-        gpu_play = importlib.import_module("gpu_play")
-        return gpu_play.make_ggs_bridge(
-            options, cores, decision=Decision, time_policy=TimePolicy()
-        )
     raise ValueError(f"no GGS player for device={device}")

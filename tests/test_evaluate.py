@@ -167,6 +167,28 @@ def test_a_network_is_its_checkpoint_by_content_and_its_search(tmp_path):
     assert resolve(f"net:checkpoint={two},{spec}", cores=8).id != a.id
 
 
+def test_descend_is_on_at_fixed_visits_and_off_is_the_player_from_before(tmp_path):
+    checkpoint = tmp_path / "1.eqx"
+    checkpoint.write_bytes(b"params")
+    base = f"net:checkpoint={checkpoint},spec=s"
+    on = resolve(f"{base},visits=100", 8)
+    assert on.config["search"]["descend"] == 2
+    assert on.label.endswith(" descend-recursive")
+    assert resolve(f"{base},visits=100,descend=2", 8).id == on.id
+    root = resolve(f"{base},visits=100,descend=1", 8)
+    assert root.config["search"]["descend"] == 1 and root.label.endswith(" descend")
+    assert root.id != on.id
+    # off is the player from before the option: not in its config
+    off = resolve(f"{base},visits=100,descend=0", 8)
+    assert "descend" not in off.config["search"] and off.id not in (on.id, root.id)
+    # on a clock it does nothing, so it's no part of the player
+    assert "descend" not in resolve(f"{base},clock=10", 8).config["search"]
+    with pytest.raises(ValueError, match="fixed visits"):
+        resolve(f"{base},clock=10,descend=1", 8)
+    with pytest.raises(ValueError, match="descend=3"):
+        resolve(f"{base},visits=100,descend=3", 8)
+
+
 def test_a_clock_is_a_contests_or_ggss(tmp_path):
     checkpoint = tmp_path / "1.eqx"
     checkpoint.write_bytes(b"params")
@@ -195,6 +217,18 @@ def test_a_batched_networks_prior_temperature_makes_it_another_player(tmp_path):
     assert flat.config["search"]["prior_temperature"] == 1.6
     assert flat.id != resolve(base, 8).id
     assert flat.label.endswith(" T1.6") and " T" not in resolve(base, 8).label
+
+
+def test_a_batched_networks_c_init_is_recorded_only_when_set(tmp_path):
+    checkpoint = tmp_path / "1.eqx"
+    checkpoint.write_bytes(b"params")
+    base = f"net:checkpoint={checkpoint},spec=s,device=gpu-batched,visits=100"
+    plain = resolve(base, 8)
+    explore = resolve(f"{base},c_init=1.14", 8)
+    # players from before c_init was an option keep their ids
+    assert "c_init" not in plain.config["search"] and " c" not in plain.label
+    assert explore.config["search"]["c_init"] == 1.14
+    assert explore.id != plain.id and explore.label.endswith(" c1.14")
 
 
 def test_engines_in_batched_matches_default_to_a_thread(engine_dir):
@@ -259,6 +293,18 @@ def test_a_network_runs_where_its_runtime_says(monkeypatch, tmp_path):
 
 
 # --- matches ---------------------------------------------------------------------------------
+
+
+def test_a_cloud_host_gets_the_solver_only_for_games_stopped_at_a_depth():
+    a = PlayerSpec({"kind": "engine"}, {}, "a", ("engines/a/bin",))
+    b = PlayerSpec({"kind": "engine"}, {}, "b", ("engines/b/bin",))
+    assert evaluate.job_files(MatchSpec(a, b, openings=1)) == [
+        "engines/a/bin",
+        "engines/b/bin",
+    ]
+    files = evaluate.job_files(MatchSpec(a, b, openings=1, solve_at=28))
+    assert set(files) == {"engines/a/bin", "engines/b/bin", *evaluate.referee_files()}
+    assert all(f.endswith("target/release/cli") for f in evaluate.referee_files())
 
 
 def test_a_matchs_id_is_its_setup_and_where_its_played():
@@ -550,10 +596,10 @@ def test_jax_stays_off_the_gpu_unless_a_player_is_on_it(tmp_path):
     assert not evaluate.wants_gpu(["run", "--config", str(config)])
     assert not evaluate.wants_gpu(["run", "--a", "net:net=x,device=cpu,visits=1"])
     assert evaluate.wants_gpu(["run", "--a", "net:net=x,device=gpu-batched,visits=1"])
-    config.write_text('[a]\nkind = "net"\ndevice = "gpu"\n')
+    config.write_text('[a]\nkind = "net"\ndevice = "gpu-batched"\n')
     assert evaluate.wants_gpu(["run", "--config", str(config)])
     match = tmp_path / "match.json"
-    match.write_text(json.dumps({"spec": {"a": {"config": {"device": "gpu"}}}}))
+    match.write_text(json.dumps({"spec": {"a": {"config": {"device": "gpu-batched"}}}}))
     assert evaluate.wants_gpu(["play", "--match", f"@{match}"])
     assert evaluate.wants_gpu(["play", "--match", match.read_text()])
 

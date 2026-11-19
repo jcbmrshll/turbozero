@@ -9,8 +9,10 @@ from core.networks.azresnet import (
     AZResnet,
     AZResnetConfig,
     BottleneckBlock,
+    Depthwise,
     FixedScale,
     GroupNorm,
+    PreActConvNeXt,
     ResidualBlock,
     batch_norm,
     conv,
@@ -18,6 +20,7 @@ from core.networks.azresnet import (
     inference_affine,
     norm_maker,
     residual_stats,
+    square_taps,
 )
 from core.networks.utils import BATCH_AXIS, apply_nn
 
@@ -281,8 +284,39 @@ VARIANTS = {
 }
 
 
+# variants only the pre-activation layout takes
+PRE_VARIANTS = {
+    # without a normalization after the stem, expand and project
+    "convnext": {
+        "num_blocks": 2,
+        "num_channels": 6,
+        "block": "convnext",
+        "expand": 2,
+        "dw_kernel": 3,
+        "pool_every": 2,
+        "pool_channels": 2,
+        "layout": "pre",
+        "stem_norm": False,
+        "expand_norm": False,
+        "project_norm": False,
+    },
+    # with one after each convolution, a ConvNeXt trunk's default
+    "normalized convnext": {
+        "num_blocks": 2,
+        "num_channels": 6,
+        "block": "convnext",
+        "expand": 2,
+        "dw_kernel": 3,
+        "pool_every": 2,
+        "pool_channels": 2,
+        "layout": "pre",
+    },
+}
+
+
 def make_variant(name: str, **options):
-    config = AZResnetConfig(policy_head_out_size=10, **{**VARIANTS[name], **options})
+    variant = {**VARIANTS, **PRE_VARIANTS}[name]
+    config = AZResnetConfig(policy_head_out_size=10, **{**variant, **options})
     return eqx.nn.make_with_state(AZResnet)(
         config, INPUT_SHAPE, key=jax.random.PRNGKey(0)
     )
@@ -478,7 +512,7 @@ def test_residual_stats_grow_with_depth():
     assert np.all(np.diff(moments) > 0.5) and np.all(np.diff(variances) > 0.2)
 
 
-@pytest.mark.parametrize("name", VARIANTS)
+@pytest.mark.parametrize("name", [*VARIANTS, *PRE_VARIANTS])
 def test_pre_activation_batch_norm_infers_as_it_trained_on_its_batch(name):
     # BatchNorm before each convolution: after one training step, inference on the same batch
     # gives the outputs training did, as in the post-activation layout
@@ -503,7 +537,7 @@ def test_fixed_scales_refuse_the_pre_activation_layout(norm):
         make_variant("pooled heads", norm=norm, layout="pre")
 
 
-@pytest.mark.parametrize("name", ["global pooling", "bottleneck"])
+@pytest.mark.parametrize("name", ["global pooling", "bottleneck", *PRE_VARIANTS])
 def test_the_pre_activation_trunk_starts_as_the_stem(name):
     # x + branch, each branch's last convolution starting at zero: at initialization the trunk is
     # the stem's output however deep, and the branches add to it once trained
@@ -512,8 +546,184 @@ def test_the_pre_activation_trunk_starts_as_the_stem(name):
     dtype = jnp.dtype("float32")
 
     stem = net.stem_conv(x.astype(dtype))
+    if net.stem_norm is not None:
+        stem, _ = conv_norm(net.stem_conv, net.stem_norm, x, state, dtype)
     trunk = stem
     for block in net.blocks:
         trunk, _ = block(trunk, state, dtype)
 
     np.testing.assert_allclose(trunk, stem, atol=1e-6)
+
+
+def test_convnext_blocks_refuse_the_post_activation_layout():
+    with pytest.raises(ValueError, match="pre"):
+        make_variant("convnext", layout="post")
+
+
+@pytest.mark.parametrize("norm", ["layer", "channel"])
+def test_convnext_blocks_with_batch_independent_norms_infer_one_input_at_a_time(norm):
+    net, state = make_variant("convnext", norm=norm)
+    rng = np.random.default_rng(0)
+    params, static = eqx.partition(net, eqx.is_inexact_array)
+    params = jax.tree.map(
+        lambda x: x + 0.3 * rng.normal(size=x.shape).astype(x.dtype), params
+    )
+    net = eqx.combine(params, static)
+    x = jnp.asarray(observations(rng, batch_size=4))
+    (policy, value), _ = apply_nn(net, state, x)
+    (one_policy, one_value), _ = apply_nn(eqx.nn.inference_mode(net), state, x[:1])
+    assert policy.shape == (4, 10) and value.shape == (4, 1)
+    np.testing.assert_allclose(one_policy, policy[:1], atol=1e-5)
+    np.testing.assert_allclose(one_value, value[:1], atol=1e-5)
+
+
+def reference_depthwise(weight: np.ndarray, taps, x: np.ndarray) -> np.ndarray:
+    """y[c, i, j] = sum over taps of weight[c, t] * x[c, i + dy, j + dx], zero off the grid."""
+    channels, height, width = x.shape
+    y = np.zeros_like(x)
+    for c in range(channels):
+        for i in range(height):
+            for j in range(width):
+                for t, (dy, dx) in enumerate(taps):
+                    if 0 <= i + dy < height and 0 <= j + dx < width:
+                        y[c, i, j] += weight[c, t] * x[c, i + dy, j + dx]
+    return y
+
+
+@pytest.mark.parametrize(
+    "taps",
+    [square_taps(3), ((0, 0), (0, 2), (-1, 1), (2, -2), (-3, 0))],
+    ids=["3x3", "sparse"],
+)
+def test_depthwise_filters_each_channel_at_its_taps_only(taps):
+    rng = np.random.default_rng(0)
+    dw = Depthwise(3, taps, key=jax.random.PRNGKey(0))
+    weight = rng.normal(size=dw.weight.shape).astype(np.float32)
+    dw = eqx.tree_at(lambda d: d.weight, dw, jnp.asarray(weight))
+    x = rng.normal(size=(3, 5, 6)).astype(np.float32)
+
+    y = dw(jnp.asarray(x), jnp.dtype("float32"))
+
+    np.testing.assert_allclose(y, reference_depthwise(weight, taps, x), atol=1e-5)
+
+
+def test_depthwise_filters_have_a_weight_per_tap_and_the_square_that_holds_them():
+    dw = Depthwise(4, ((0, 0), (0, 3), (-1, -1)), key=jax.random.PRNGKey(0))
+    assert dw.weight.shape == (4, 3) and dw.kernel_size == 7
+    dense = np.asarray(dw.dense())
+    assert dense.shape == (4, 1, 7, 7)
+    assert np.count_nonzero(dense[0, 0]) == 3
+    with pytest.raises(ValueError, match="distinct"):
+        Depthwise(4, ((0, 0), (0, 0)), key=jax.random.PRNGKey(0))
+
+
+def test_convnext_blocks_take_their_taps_from_the_config():
+    taps = ((0, 0), (0, 1), (2, 2))
+    for options, expected in [({"dw_taps": taps}, taps), ({}, square_taps(3))]:
+        net, _ = make_variant("convnext", **options)
+        for block in net.blocks:
+            assert isinstance(block, PreActConvNeXt) and block.dw.taps == expected
+
+
+def test_normalizations_are_options_of_the_layouts_and_blocks_that_have_them():
+    with pytest.raises(ValueError, match="stem_norm"):
+        make_variant("global pooling", stem_norm=True)
+    with pytest.raises(ValueError, match="convnext"):
+        make_variant("global pooling", layout="pre", expand_norm=True)
+    with pytest.raises(ValueError, match="convnext"):
+        make_variant("global pooling", layout="pre", project_norm=True)
+
+
+def test_a_normalized_projects_scale_starts_at_zero_and_its_weights_do_not():
+    # a zeroed convolution under a normalization would output 0 and never learn
+    net, _ = make_variant("normalized convnext")
+    for block in net.blocks:
+        assert isinstance(block, PreActConvNeXt) and block.project_norm is not None
+        assert np.all(np.asarray(block.project_norm.weight) == 0)
+        assert np.abs(np.asarray(block.project.weight)).min() > 0
+
+
+@pytest.mark.parametrize(
+    "name, invariant", [("convnext", False), ("normalized convnext", True)]
+)
+def test_a_normalized_convnext_trunk_ignores_the_scale_of_its_convolutions(
+    name, invariant
+):
+    # in training mode, with each convolution followed by a BatchNorm, scaling any of them changes
+    # nothing: weight decay shrinking them can't change the function. Without, scaling the stem or
+    # a block's MLP does
+    net, state = make_variant(name)
+    rng = np.random.default_rng(0)
+    params, static = eqx.partition(net, eqx.is_inexact_array)
+    # every weight nonzero, the scales of the branches' outputs included
+    params = jax.tree.map(
+        lambda x: x + 0.3 * rng.normal(size=x.shape).astype(x.dtype), params
+    )
+    net = eqx.combine(params, static)
+    x = jnp.asarray(observations(rng, batch_size=8))
+
+    def scaled_block(block, f):
+        return eqx.tree_at(
+            lambda b: (b.dw.weight, b.expand.weight, b.project.weight),
+            block,
+            (block.dw.weight * f, block.expand.weight * f, block.project.weight * f),
+        )
+
+    def scaled(net, factor):
+        return eqx.tree_at(
+            lambda n: (n.stem_conv.weight, n.blocks),
+            net,
+            (
+                net.stem_conv.weight * factor,
+                [scaled_block(b, factor ** (i + 2)) for i, b in enumerate(net.blocks)],
+            ),
+        )
+
+    (policy, value), _ = apply_nn(net, state, x)
+    (scaled_policy, scaled_value), _ = apply_nn(scaled(net, 0.7), state, x)
+
+    # up to BatchNorm's epsilon, against changes of about 0.1 or more
+    change = max(
+        float(jnp.abs(scaled_policy - policy).max()),
+        float(jnp.abs(scaled_value - value).max()),
+    )
+    assert change < 1e-3 if invariant else change > 1e-2, change
+
+
+def test_a_normalized_convnext_blocks_pooling_bias_comes_after_its_norm():
+    # in training mode, a shift of the pooling bias the same for every input changes the outputs:
+    # the norm doesn't take it out, so training sees all of the bias, and an average of the
+    # weights moves only what training saw
+    net, state = make_variant("normalized convnext")
+    rng = np.random.default_rng(0)
+    params, static = eqx.partition(net, eqx.is_inexact_array)
+    params = jax.tree.map(
+        lambda x: x + 0.3 * rng.normal(size=x.shape).astype(x.dtype), params
+    )
+    net = eqx.combine(params, static)
+    x = jnp.asarray(observations(rng, batch_size=8))
+    pooled = [i for i, b in enumerate(net.blocks) if b.pool_linear is not None]
+    assert pooled
+    i = pooled[0]
+    shifted = eqx.tree_at(
+        lambda n: n.blocks[i].pool_linear.bias,
+        net,
+        net.blocks[i].pool_linear.bias + 1.0,
+    )
+
+    (policy, value), _ = apply_nn(net, state, x)
+    (shifted_policy, shifted_value), _ = apply_nn(shifted, state, x)
+
+    assert float(jnp.abs(shifted_value - value).max()) > 1e-3
+    assert float(jnp.abs(shifted_policy - policy).max()) > 1e-3
+
+
+def test_a_convnext_trunk_is_normalized_after_every_convolution_by_default():
+    net, _ = make_variant("normalized convnext")
+    assert net.stem_norm is not None
+    for block in net.blocks:
+        assert isinstance(block, PreActConvNeXt)
+        assert block.expand_norm is not None and block.project_norm is not None
+    # other pre-activation trunks start from the stem as it is
+    plain, _ = make_variant("global pooling", layout="pre")
+    assert plain.stem_norm is None

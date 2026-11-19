@@ -34,6 +34,8 @@ def _parse(name: str, annotation: Any, text: str) -> Any:
         if text not in ("true", "false"):
             raise ValueError(f"{name} is true or false, not {text!r}")
         return text == "true"
+    if annotation not in (int, float, str):
+        raise ValueError(f"{name} can't be set in a spec")
     return annotation(text)
 
 

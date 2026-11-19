@@ -41,6 +41,9 @@ def test_metrics_measure_the_policy_and_value_against_the_engine():
             softmax([2, 0]) @ [0, 3],
         ]
     )
+    # 0's second move gives up 4 but still wins, and every move of 1 loses as the best does:
+    # only 2's second move (a draw to a loss) worsens the outcome
+    result_change = np.array([0.0, 0.0, softmax([2, 0])[1]])
     # the engine's predicted outcomes: win, loss, draw
     value_se = np.array([(0.5 - 1) ** 2, (0.2 + 1) ** 2, (-0.4 - 0) ** 2])
     expected_all = [
@@ -50,11 +53,31 @@ def test_metrics_measure_the_policy_and_value_against_the_engine():
         value_se.mean(),
         # the draw doesn't count: 1 of the 2 decided positions has the right sign
         0.5,
+        result_change.mean(),
     ]
     np.testing.assert_allclose(table[0], expected_all, rtol=1e-5)
     np.testing.assert_allclose(
-        table[1], [0, 4, exp_regret[0], value_se[0], 1], rtol=1e-5
+        table[1], [0, 4, exp_regret[0], value_se[0], 1, 0], rtol=1e-5
     )
+
+
+def test_result_change_is_measured_under_the_flattened_prior():
+    # a win: the second move draws and the third loses, both worsen the outcome
+    legal = np.array([[True, True, True]])
+    scores = np.array([[3, 0, -1]], dtype=np.float32)
+    logits = jnp.asarray([[2.0, 0.0, 0.0]])
+    groups = np.array([[True]])
+    result_change = METRICS.index("result_change")
+
+    for temperature in (1.0, 2.0):
+        table = scored_position_metrics(
+            logits, jnp.zeros(1), legal, scores, groups, temperature
+        )
+        np.testing.assert_allclose(
+            table[0, result_change],
+            softmax([2 / temperature, 0, 0])[1:].sum(),
+            rtol=1e-5,
+        )
 
 
 class Echo(eqx.Module):
@@ -83,7 +106,9 @@ def make_positions(rng, n):
 def test_the_tester_batches_and_pads_without_changing_the_metrics(batch_size):
     positions = make_positions(np.random.default_rng(0), 7)
     net, state = eqx.nn.make_with_state(Echo)()
-    tester = ScoredPositionsTester(positions, net, batch_size=batch_size, name="edax")
+    tester = ScoredPositionsTester(
+        positions, net, batch_size=batch_size, name="edax", prior_temperature=2.0
+    )
     params = (eqx.filter(net, eqx.is_inexact_array), state)
 
     metrics = tester.evaluate(params)
@@ -97,6 +122,7 @@ def test_the_tester_batches_and_pads_without_changing_the_metrics(batch_size):
             positions.legal,
             positions.scores,
             groups,
+            2.0,
         )
     )
     assert set(metrics) == {f"edax_{m}" for m in METRICS} | {

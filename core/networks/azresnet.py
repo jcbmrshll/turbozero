@@ -24,9 +24,34 @@ class AZResnetConfig:
             KataGo's nested bottleneck block: a 1x1 convolution down to `bottleneck_channels`,
             `bottleneck_inner` basic blocks at that width, and a 1x1 convolution back up. At half
             the width with one inner block it takes about 5.5 d^2 multiply-adds per square, against
-            the basic block's 18 d^2 (d channels)
+            the basic block's 18 d^2 (d channels). Or "convnext", ConvNeXt's block (see
+            `PreActConvNeXt`), in the "pre" layout only: a depthwise filter of each channel on its
+            own, the block's only step between squares, a normalization, then a per-square MLP of
+            1x1 convolutions through `expand` times the width: 2 * expand * d^2 + taps * d
+            multiply-adds per square
         bottleneck_channels: the bottleneck blocks' inner width, by default half of `num_channels`
         bottleneck_inner: basic blocks inside each bottleneck block
+        expand: the ConvNeXt blocks' hidden width, in multiples of `num_channels`
+        expand_norm: the ConvNeXt blocks also normalize their hidden channels, after the expand
+            convolution, before the global pooling bias and the ReLU. By default (None), ConvNeXt
+            blocks do. With BatchNorm it folds into
+            the expand convolution in inference. The pooling bias comes after it: under the norm,
+            whatever part of the bias hardly varies from input to input cost nothing in training,
+            and grew to 2-6 standard deviations of the hidden channels in the ray net, which any
+            change of its weights (e.g. their average) then moved by many
+        project_norm: the ConvNeXt blocks also normalize their output, after the project
+            convolution, its learned scale starting at zero (Goyal et al.'s zero gamma) in place
+            of a zeroed project convolution. With BatchNorm it folds into the project convolution
+            in inference. With `stem_norm` and `expand_norm` as well, every convolution of a
+            BatchNorm ConvNeXt trunk is followed by a normalization, and the function the trunk
+            computes no longer depends on the scale of any convolution's weights, which weight
+            decay shrinks (the pooling biases' linear maps still do). By default (None), ConvNeXt
+            blocks do
+        dw_kernel: the ConvNeXt blocks' depthwise filters' size: every square within
+            `dw_kernel // 2` rows and columns (odd)
+        dw_taps: the depthwise filters' taps instead, as (row, column) offsets from the square
+            filtered (see `Depthwise`): a sparse filter of long reach, e.g. along chosen lines.
+            Not settable in a spec: an application names its own sets and passes them in
         pool_every: every `pool_every`-th basic block (counting those inside bottleneck blocks) has
             KataGo's global pooling bias: `pool_channels` of its first convolution's channels are
             pooled over the board (mean and max), and a linear map of them biases the others, which
@@ -71,6 +96,9 @@ class AZResnetConfig:
             heads. Every branch then sees normalized input, however the trunk grows with depth.
             Not with "fixed" or "ws", which scale the convolution they follow. BatchNorm in "pre"
             doesn't fold into a convolution in inference
+        stem_norm: in the "pre" layout, normalize the stem convolution's output too (no ReLU: the
+            trunk starts from it). The "post" layout always does, with a ReLU. By default (None),
+            a trunk of ConvNeXt blocks does, and one of other blocks doesn't
         norm_groups: "group"'s groups of channels: of a layer of C channels, gcd(norm_groups, C)
         bn_momentum: how slowly BatchNorm's running averages of the batch statistics, which inference
             uses, follow them: at about 1 / (1 - momentum) training steps. A long window lags the
@@ -85,9 +113,14 @@ class AZResnetConfig:
     policy_head_out_size: int
     num_blocks: int
     num_channels: int
-    block: Literal["basic", "bottleneck"] = "basic"
+    block: Literal["basic", "bottleneck", "convnext"] = "basic"
     bottleneck_channels: int | None = None
     bottleneck_inner: int = 1
+    expand: int = 4
+    expand_norm: bool | None = None
+    project_norm: bool | None = None
+    dw_kernel: int = 7
+    dw_taps: tuple[tuple[int, int], ...] | None = None
     pool_every: int = 0
     pool_channels: int = 32
     heads: Literal["alphazero", "pooled"] = "alphazero"
@@ -97,6 +130,7 @@ class AZResnetConfig:
     train_dtype: str = "float32"
     norm: Literal["batch", "layer", "group", "rms", "channel", "fixed", "ws"] = "batch"
     layout: Literal["post", "pre"] = "post"
+    stem_norm: bool | None = None
     norm_groups: int = 8
     bn_momentum: float = 0.9
     remat: bool = False
@@ -338,11 +372,15 @@ def conv_norm(
 
 
 def norm_act(
-    norm: Norm, x: jax.Array, state: eqx.nn.State, dtype: jnp.dtype
+    norm: Norm,
+    x: jax.Array,
+    state: eqx.nn.State,
+    dtype: jnp.dtype,
+    relu: bool = True,
 ) -> tuple[jax.Array, eqx.nn.State]:
-    """A normalization of `x`, (channels, height, width), then a ReLU, as the "pre" layout puts
-    before each convolution (see `AZResnetConfig.layout`): in float32 in training, `dtype` in
-    inference mode."""
+    """A normalization of `x`, (channels, height, width), then a ReLU (unless not `relu`), as the
+    "pre" layout puts before each convolution (see `AZResnetConfig.layout`): in float32 in
+    training, `dtype` in inference mode."""
     if isinstance(norm, FixedScale):
         raise TypeError("fixed scales go after a convolution, not before")
     if isinstance(norm, eqx.nn.BatchNorm) and norm.inference:
@@ -352,7 +390,8 @@ def norm_act(
         y, state = norm(x.astype(jnp.float32), state)
     else:
         y = norm(x)
-    y = jax.nn.relu(y)
+    if relu:
+        y = jax.nn.relu(y)
     return (y.astype(dtype) if norm.inference else y), state
 
 
@@ -481,6 +520,15 @@ def zeroed(conv: eqx.nn.Conv2d) -> eqx.nn.Conv2d:
     return eqx.tree_at(lambda c: c.weight, conv, jnp.zeros_like(conv.weight))
 
 
+def zero_scale(norm: Norm) -> Norm:
+    """`norm` with its learned scale at zero: a residual branch ending in it starts adding nothing,
+    as one ending in a `zeroed` convolution does, but the convolution before it starts random (a
+    zeroed one under a normalization would never move: its output, and so its gradient, is 0)."""
+    if not isinstance(norm, eqx.nn.BatchNorm | GroupNorm) or norm.weight is None:
+        raise TypeError(f"no learned scale to zero in {norm!r}")
+    return eqx.tree_at(lambda n: n.weight, norm, jnp.zeros_like(norm.weight))
+
+
 class PreActBlock(eqx.Module):
     """A pre-activation residual block (see `AZResnetConfig.layout`): x + conv2(relu(norm2(conv1(
     relu(norm1(x)))))), optionally with KataGo's global pooling bias, from the last
@@ -580,7 +628,161 @@ class PreActBottleneck(eqx.Module):
         return x + y.astype(x.dtype), state
 
 
-Block = ResidualBlock | BottleneckBlock | PreActBlock | PreActBottleneck
+def square_taps(kernel: int) -> tuple[tuple[int, int], ...]:
+    """Every (row, column) offset of a `kernel` x `kernel` filter (odd) from its centre."""
+    if kernel % 2 == 0:
+        raise ValueError(f"depthwise filters have an odd size, not {kernel}")
+    r = range(-(kernel // 2), kernel // 2 + 1)
+    return tuple((dy, dx) for dy in r for dx in r)
+
+
+class Depthwise(eqx.Module):
+    """A depthwise convolution of (channels, height, width) inputs: each channel filtered on its
+    own, y[c, i, j] = sum over taps t of weight[c, t] * x[c, i + dy_t, j + dx_t], zero outside,
+    by a filter with weights only at its `taps`' (dy, dx) offsets. Every offset of a k x k square
+    makes the usual depthwise convolution; a sparse set reaches far for few weights. No bias."""
+
+    weight: jax.Array
+    taps: tuple[tuple[int, int], ...] = eqx.field(static=True)
+
+    def __init__(
+        self, channels: int, taps: tuple[tuple[int, int], ...], *, key: jax.Array
+    ):
+        self.taps = tuple((int(dy), int(dx)) for dy, dx in taps)
+        if len(set(self.taps)) != len(self.taps) or not self.taps:
+            raise ValueError(f"taps are distinct offsets, at least one: {taps}")
+        # as equinox initializes a convolution: uniform in +-1/sqrt(fan in), the fan in the taps
+        bound = 1 / math.sqrt(len(self.taps))
+        self.weight = jax.random.uniform(
+            key, (channels, len(self.taps)), minval=-bound, maxval=bound
+        )
+
+    @property
+    def kernel_size(self) -> int:
+        """The side of the smallest square filter, centred, that holds every tap."""
+        return 2 * max(max(abs(dy), abs(dx)) for dy, dx in self.taps) + 1
+
+    def dense(self) -> jax.Array:
+        """The filters as a grouped convolution's (channels, 1, k, k) kernel, zero off the taps."""
+        r = self.kernel_size // 2
+        rows, cols = (np.array(a) + r for a in zip(*self.taps, strict=True))
+        k = self.kernel_size
+        kernel = jnp.zeros((self.weight.shape[0], k, k), self.weight.dtype)
+        return kernel.at[:, rows, cols].set(self.weight)[:, None]
+
+    def __call__(self, x: jax.Array, dtype: jnp.dtype) -> jax.Array:
+        """The filters applied to `x`, computing in `dtype`: each channel's filter as a matrix from
+        the squares to the squares (see `tap_index`), all channels one batched matrix product. A
+        grouped convolution with a kernel as large as the grid ran 8x slower on a GPU."""
+        channels, height, width = x.shape
+        index = tap_index(self.taps, height, width)
+        # one more weight, zero, for the pairs of squares no tap joins
+        weight = jnp.pad(self.weight, ((0, 0), (0, 1)))[:, index]
+        y = jnp.einsum(
+            "cpq,cq->cp",
+            weight.astype(dtype),
+            x.reshape(channels, height * width).astype(dtype),
+        )
+        return y.reshape(channels, height, width)
+
+
+@functools.cache
+def tap_index(taps: tuple[tuple[int, int], ...], height: int, width: int) -> np.ndarray:
+    """(squares, squares), squares = height * width row by row: which of `taps` joins square p to
+    square q (q = p + its offset), or len(taps) where none does."""
+    index = np.full((height * width, height * width), len(taps))
+    rows, cols = np.divmod(np.arange(height * width), width)
+    for t, (dy, dx) in enumerate(taps):
+        r, c = rows + dy, cols + dx
+        inside = (0 <= r) & (r < height) & (0 <= c) & (c < width)
+        index[np.flatnonzero(inside), (r * width + c)[inside]] = t
+    return index
+
+
+class PreActConvNeXt(eqx.Module):
+    """ConvNeXt's block: x + project(relu(expand(norm(depthwise(x))))), a depthwise filter of the
+    trunk itself (see `Depthwise`), one normalization, then a per-square MLP of 1x1 convolutions
+    through `hidden` channels. With global pooling, the last `pool_channels` of the normalized
+    features, pooled over the board, bias the hidden channels. project starts at zero (see
+    `zeroed`). Optionally normalized after expand and after project too, `expand_norm` and
+    `project_norm`: x + project_norm(project(relu(expand_norm(expand(y)) + pool bias))),
+    project_norm's scale then starting at zero instead (see `zero_scale`)."""
+
+    dw: Depthwise
+    norm: Norm
+    expand: eqx.nn.Conv2d
+    expand_norm: Norm | None
+    pool_linear: eqx.nn.Linear | None
+    project: eqx.nn.Conv2d
+    project_norm: Norm | None
+    pool_channels: int = eqx.field(static=True)
+
+    def __init__(
+        self,
+        channels: int,
+        hidden: int,
+        taps: tuple[tuple[int, int], ...],
+        pool_channels: int = 0,
+        *,
+        key: jax.Array,
+        make_norm: NormMaker,
+        stats: Stats,
+        expand_norm: bool = False,
+        project_norm: bool = False,
+    ):
+        """
+        Args:
+            channels: number of channels
+            hidden: the MLP's hidden channels
+            taps: the depthwise filters' offsets (see `Depthwise`)
+            pool_channels: normalized channels pooled over the board to bias the hidden ones, 0
+                for no global pooling bias
+            key: rng used to initialize parameters
+            make_norm: makes the normalizations (see `norm_maker`)
+            stats: unused: the normalizations need none
+            expand_norm: normalize the hidden channels before their ReLU
+            project_norm: normalize the output, its scale starting at zero
+        """
+        keys = jax.random.split(key, 4)
+        self.dw = Depthwise(channels, taps, key=keys[0])
+        self.norm = make_norm(channels, stats, self.dw.kernel_size)
+        self.expand = conv(channels, hidden, 1, keys[1])
+        self.expand_norm = make_norm(hidden, stats, 1) if expand_norm else None
+        self.pool_linear = (
+            eqx.nn.Linear(2 * pool_channels, hidden, key=keys[2])
+            if pool_channels
+            else None
+        )
+        self.project = conv(hidden, channels, 1, keys[3])
+        if project_norm:
+            self.project_norm = zero_scale(make_norm(channels, stats, 1))
+        else:
+            self.project, self.project_norm = zeroed(self.project), None
+        self.pool_channels = pool_channels
+
+    def __call__(
+        self, x: jax.Array, state: eqx.nn.State, dtype: jnp.dtype
+    ) -> tuple[jax.Array, eqx.nn.State]:
+        y = self.dw(x, dtype)
+        y, state = norm_act(self.norm, y, state, dtype, relu=False)
+        if self.expand_norm is None:
+            h = convolve(self.expand, y, dtype)
+        else:
+            h, state = conv_norm(self.expand, self.expand_norm, y, state, dtype)
+        if self.pool_linear is not None:
+            bias = self.pool_linear(board_pool(y[-self.pool_channels :]))
+            h = h + bias.reshape(-1, 1, 1).astype(h.dtype)
+        h = jax.nn.relu(h)
+        if self.project_norm is None:
+            y = convolve(self.project, h, dtype)
+        else:
+            y, state = conv_norm(self.project, self.project_norm, h, state, dtype)
+        return x + y.astype(x.dtype), state
+
+
+Block = (
+    ResidualBlock | BottleneckBlock | PreActBlock | PreActBottleneck | PreActConvNeXt
+)
 
 
 def checkpointed(
@@ -750,12 +952,27 @@ class AZResnet(eqx.Module):
                 f'norm={config.norm} scales the convolution it follows: not with layout="pre"'
             )
         # initial conv layer: in the pre-activation layout, the trunk starts from it unnormalized
+        # by default, a ConvNeXt trunk is normalized after every convolution
+        convnext = config.block == "convnext"
+        stem_norm = convnext if config.stem_norm is None else config.stem_norm
+        expand_norm = convnext if config.expand_norm is None else config.expand_norm
+        project_norm = convnext if config.project_norm is None else config.project_norm
+        if config.stem_norm and not pre:
+            raise ValueError(
+                'stem_norm is the "pre" layout\'s option: "post" always has it'
+            )
+        if (expand_norm or project_norm) and not convnext:
+            raise ValueError(
+                'expand_norm and project_norm are block="convnext"\'s options'
+            )
         self.stem_conv = conv(in_channels, channels, 3, stem_key)
-        self.stem_norm = None if pre else make_norm(channels, INPUT_STATS, 3)
+        self.stem_norm = (
+            make_norm(channels, INPUT_STATS, 3) if stem_norm or not pre else None
+        )
 
         # residual blocks: the global pooling channels of each basic block, counting those inside
         # bottleneck blocks
-        inner = 1 if config.block == "basic" else config.bottleneck_inner
+        inner = config.bottleneck_inner if config.block == "bottleneck" else 1
         pool_channels = [
             config.pool_channels
             if config.pool_every and (i + 1) % config.pool_every == 0
@@ -766,7 +983,27 @@ class AZResnet(eqx.Module):
         basic, bottleneck = (
             (PreActBlock, PreActBottleneck) if pre else (ResidualBlock, BottleneckBlock)
         )
-        if config.block == "basic":
+        if config.block == "convnext":
+            if not pre:
+                raise ValueError('block="convnext" needs layout="pre"')
+            taps = config.dw_taps or square_taps(config.dw_kernel)
+            self.blocks = [
+                PreActConvNeXt(
+                    channels,
+                    config.expand * channels,
+                    taps,
+                    pool,
+                    key=k,
+                    make_norm=make_norm,
+                    stats=block_stats,
+                    expand_norm=expand_norm,
+                    project_norm=project_norm,
+                )
+                for pool, k, block_stats in zip(
+                    pool_channels, block_keys, stats[:-1], strict=True
+                )
+            ]
+        elif config.block == "basic":
             self.blocks = [
                 basic(channels, pool, key=k, make_norm=make_norm, stats=block_stats)
                 for pool, k, block_stats in zip(
@@ -833,7 +1070,8 @@ class AZResnet(eqx.Module):
             x = x if self.inference else x.astype(jnp.float32)
         else:
             x, state = conv_norm(self.stem_conv, self.stem_norm, x, state, dtype)
-            x = jax.nn.relu(x)
+            # the pre-activation trunk starts from the normalized stem as it is
+            x = x if self.final_norm is not None else jax.nn.relu(x)
 
         # residual blocks
         for block in self.blocks:

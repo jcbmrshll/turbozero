@@ -212,6 +212,18 @@ class TrainLoopOutput:
         return self.train_states[self.playing]
 
 
+def with_average(
+    train_state: TrainState,
+    average: Any,
+    average_states: Sequence[Any] | None,
+    n: int,
+) -> TrainState:
+    """`train_state` with the weights of an average, the `n`th, and its own network state if
+    `average_states` has one (see `Trainer.average_norm_states`), else the network's."""
+    nn_state = train_state.nn_state if average_states is None else average_states[n]
+    return replace(train_state, params=average, nn_state=nn_state)
+
+
 def extract_params(state: TrainState) -> Any:
     """Extracts model parameters from TrainState.
 
@@ -246,10 +258,30 @@ def average_share(averaged: int, horizon: float, warmup: float) -> float:
     return 1.0 / min(horizon, 1.0 + averaged / warmup)
 
 
-@jax.jit
-def _move_average(average: Any, params: Any, share: jax.Array) -> Any:
-    # with a share of 1, exactly the params
-    return jax.tree.map(lambda a, p: (1 - share) * a + share * p, average, params)
+@partial(jax.jit, static_argnames=("rescale",))
+def _move_average(
+    average: Any, params: Any, share: jax.Array, rescale: bool = True
+) -> Any:
+    """`average` moved toward `params` by `share` (with a share of 1, exactly the params), then
+    (with `rescale`) each weight tensor weight decay shrinks (2 or more dimensions, see
+    `weight_decay_mask`) rescaled to the norm of the same tensor in `params`: the average
+    follows the weights' direction, not their scale.
+
+    While weight decay shrinks the weights, as it does for tens of epochs after a learning rate
+    drop, an average lags them in scale too, yet plays with the current network's BatchNorm
+    statistics. In a pre-activation trunk, whose stem and residual branches nothing normalizes,
+    that scale error reaches the outputs: an Othello ConvNeXt net's 4-epoch average, 2-4% larger
+    than its weights after a drop to 1e-4, rose to 0.40 engine value MSE against its weights'
+    0.34; rescaled to their norms it scored 0.342."""
+
+    def move(a: jax.Array, p: jax.Array) -> jax.Array:
+        moved = (1 - share) * a + share * p
+        if not rescale or moved.ndim < 2:
+            return moved
+        norm = jnp.linalg.norm(moved)
+        return jnp.where(norm > 0, moved * (jnp.linalg.norm(p) / norm), moved)
+
+    return jax.tree.map(move, average, params)
 
 
 def checkpoint_path(ckpt_dir: str, epoch: int) -> str:
@@ -321,6 +353,10 @@ def read_state_meta(path: str) -> dict:
 
 # saved states' format, recorded in their metadata
 STATE_FORMAT = 2
+
+# folded into the run's key for the averages' own network states (see
+# `Trainer.average_norm_states`), so that the run's rng is the same with them as without
+AVERAGE_NORM_SALT = 0x61766E73
 
 
 def _describe(tree: Any) -> list[tuple[str, tuple[int, ...], str]]:
@@ -677,10 +713,13 @@ class Trainer:
         growth: Growth | None = None,
         waiting_train_steps: int | None = None,
         train_retired: bool = False,
+        train_waiting: bool = False,
         train_playing: bool = True,
         averages: Sequence[float] = (),
         selfplay_average: float | None = None,
         average_warmup: float = 10.0,
+        average_norm_batches: int = 32,
+        average_rescale: bool = True,
         log_moves: str | None = None,
         extra_config: dict | None = None,
     ):
@@ -824,6 +863,11 @@ class Trainer:
                 games (not compute-optimal). Not part of a saved state: a run or branch turns
                 it on or off from any state, and a retired network takes up its training where
                 it left it
+            train_waiting: (optional) with `growth`, every network after the one playing
+                trains, `train_steps_per_epoch` steps an epoch each (the next one
+                `waiting_train_steps`), not only the next: a battery of students learning side
+                by side from one network's games (with `train_playing` False, a fixed teacher's).
+                Not part of a saved state, as `train_retired`
             train_playing: (optional) with `growth`, whether the network playing self-play
                 trains (default) or stays as it is, weights and weight averages: a fixed teacher
                 whose games the networks before it learn from with `train_retired`. Not part of
@@ -838,12 +882,26 @@ class Trainer:
                 (e.g. a `ScoredPositionsTester`) also run on it, logging `avg<horizon>/<metric>`.
                 A saved state keeps them (see `save_state`); a state saved without them, or with
                 other horizons, starts them at its weights. BatchNorm statistics aren't
-                averaged: an average plays with the network's current ones.
+                averaged: an average plays with the network's current ones, unless
+                `average_norm_batches` gives it its own.
             selfplay_average: (optional) self-play plays with this average (one of
                 `averages`) of the network playing, rather than its current weights
             average_warmup: the epochs an average takes in for each epoch its horizon grows
                 by, from 1 to its own (see `average_share`); 1 makes it the plain mean of the
                 epochs so far until its horizon
+            average_norm_batches: (optional) with `averages` and a network with state (e.g.
+                BatchNorm's statistics), each average gets statistics of its own after each
+                epoch, rather than playing with the network's: from the network's initial
+                state, those of this many training batches of the replay buffer, sampled and
+                transformed as training's are, through the average's weights (see
+                `average_norm_states`). The network's statistics fit its own weights, not its
+                average's; with a normalization after every convolution of an Othello ConvNeXt
+                net, its 4-epoch average lost 0.3-0.5 engine regret against its weights on them,
+                and with its own its engine value error varied about 8x less from epoch to epoch.
+                0 for none
+                Not part of a saved state: a resumed run estimates them from the replay buffer
+            average_rescale: each average's weight tensors take the network's norms every
+                epoch (see `_move_average`); without it, an average is the plain moving average
             log_moves: (optional) a directory to keep every move self-play plays in, whether
                 its search trains or not, an epoch's moves to a file (see
                 `core.memory.move_log`). It doesn't change training. A new directory, or one
@@ -970,6 +1028,9 @@ class Trainer:
         if train_retired and growth is None:
             raise ValueError("train_retired is for a run with growth")
         self.train_retired = train_retired
+        if train_waiting and growth is None:
+            raise ValueError("train_waiting is for a run with growth")
+        self.train_waiting = train_waiting
         if not train_playing and growth is None:
             raise ValueError(
                 "a network that plays without training is for a run with growth"
@@ -1009,6 +1070,12 @@ class Trainer:
             (own, *growth.learners) if growth is not None else (own,)
         )
         for learner in self.learners[1:]:
+            unknown = set(learner.hyperparams) - set(self.fixed_hyperparams)
+            if unknown:
+                raise ValueError(
+                    f"{learner.name}: {sorted(unknown)} aren't the optimizer's unscheduled "
+                    f"hyperparameters ({sorted(self.fixed_hyperparams)})"
+                )
             if tree_positions is not None and not all(
                 isinstance(e, MCTS) for _, e in learner.schedule.stages
             ):
@@ -1038,6 +1105,12 @@ class Trainer:
         if average_warmup <= 0:
             raise ValueError(f"average_warmup must be positive, got {average_warmup}")
         self.average_warmup = float(average_warmup)
+        if average_norm_batches < 0:
+            raise ValueError(
+                f"average_norm_batches can't be negative, got {average_norm_batches}"
+            )
+        self.average_norm_batches = average_norm_batches
+        self.average_rescale = average_rescale
         # checkpoints
         self.ckpt_dir = ckpt_dir
         self.max_checkpoints = max_checkpoints
@@ -1079,19 +1152,26 @@ class Trainer:
             step=jnp.array(0, dtype=jnp.int32),
         )
 
-    def with_fixed_hyperparams(self, train_state: TrainState, name: str) -> TrainState:
+    def with_fixed_hyperparams(
+        self, train_state: TrainState, learner: int = 0
+    ) -> TrainState:
         """`train_state` with its optimizer state's unscheduled hyperparameters (e.g. weight
-        decay, momentum) this trainer's own (see `with_hyperparams`), saying which of them
-        change, e.g. from a saved state's. `name` names the network in that message."""
+        decay, momentum) this trainer's own, or network `learner`'s where it has its own (see
+        `Learner.hyperparams`, `with_hyperparams`), saying which of them change, e.g. from a
+        saved state's."""
+        hyperparams = {**self.fixed_hyperparams, **self.learners[learner].hyperparams}
         before = injected_hyperparams(train_state.opt_state)
-        opt_state = with_hyperparams(train_state.opt_state, self.fixed_hyperparams)
+        opt_state = with_hyperparams(train_state.opt_state, hyperparams)
         changed = [
             f"{k} {_to_config(before[k])} -> {_to_config(v)}"
             for k, v in injected_hyperparams(opt_state).items()
-            if k in self.fixed_hyperparams and _to_config(before[k]) != _to_config(v)
+            if k in hyperparams and _to_config(before[k]) != _to_config(v)
         ]
         if changed:
-            print(f"{name}: the optimizer's {', '.join(changed)}", flush=True)
+            print(
+                f"{self.learners[learner].name}: the optimizer's {', '.join(changed)}",
+                flush=True,
+            )
         return replace(train_state, opt_state=opt_state)
 
     def steps_of(self, learner: int, playing: int) -> int:
@@ -1116,13 +1196,77 @@ class Trainer:
         """A network's weight averages before any epoch is in them: copies of its weights."""
         return tuple(jax.tree.map(jnp.copy, train_state.params) for _ in self.averages)
 
-    def selfplay_params(self, train_state: TrainState, averages: Sequence[Any]) -> Any:
+    def selfplay_params(
+        self,
+        train_state: TrainState,
+        averages: Sequence[Any],
+        average_states: Sequence[Any] | None = None,
+    ) -> Any:
         """The model parameters self-play plays with: the network's, or with `selfplay_average`,
-        that average's."""
+        that average's (with its own state, if `average_states` has it, see
+        `average_norm_states`)."""
         if self.selfplay_average is None:
             return self.extract_model_params_fn(train_state)
-        average = averages[self.averages.index(self.selfplay_average)]
-        return self.extract_model_params_fn(replace(train_state, params=average))
+        n = self.averages.index(self.selfplay_average)
+        return self.extract_model_params_fn(
+            with_average(train_state, averages[n], average_states, n)
+        )
+
+    def average_norm_states(
+        self,
+        key: jax.Array,
+        buffer_state: ReplayBufferState,
+        averages: Sequence[Any],
+        train_state: TrainState,
+        learner: int = 0,
+    ) -> tuple[Any, ...] | None:
+        """Each of `averages`' own network state (e.g. BatchNorm's statistics), with
+        `average_norm_batches`: from the network's initial state, updated in training mode on
+        that many batches of the replay buffer through the average's weights. None without
+        it, a network without state, or nothing in the buffer yet: the averages play with the
+        network's state."""
+        if not self.average_norm_batches or train_state.nn_state is None:
+            return None
+        mask = self.memory_buffer.sample_mask(buffer_state)
+        if not bool(mask.any()):
+            return None
+        keys = jax.random.split(key, len(averages))
+        return tuple(
+            self._norm_state(k, buffer_state, mask, average, learner=learner)
+            for k, average in zip(keys, averages, strict=True)
+        )
+
+    @partial(jax.jit, static_argnums=(0,), static_argnames=("learner",))
+    def _norm_state(
+        self,
+        key: jax.Array,
+        buffer_state: ReplayBufferState,
+        mask: jax.Array,
+        params: Any,
+        learner: int = 0,
+    ) -> Any:
+        """The network state training mode leaves after `average_norm_batches` batches of the
+        replay buffer through `params`, from the network's initial state."""
+        net = self.learners[learner]
+        nn = eqx.combine(params, eqx.filter(net.nn, eqx.is_inexact_array, inverse=True))
+
+        def one(state: Any, k: jax.Array) -> tuple[Any, None]:
+            sample_key, transform_key = jax.random.split(k)
+            indices = jnp.unravel_index(
+                self.memory_buffer.sample_indices(
+                    sample_key, mask, self.train_batch_size
+                ),
+                mask.shape,
+            )
+            batch = jax.tree.map(lambda x: x[indices], buffer_state.buffer)
+            batch = transform_randomly(transform_key, batch, self.transform_fns)
+            _, (_, state) = self.loss_fn(nn, state, batch)
+            return state, None
+
+        state, _ = jax.lax.scan(
+            one, net.nn_state, jax.random.split(key, self.average_norm_batches)
+        )
+        return state
 
     def get_config(self):
         """Returns a dictionary of the configuration of the trainer. Used for logging to the monitor.
@@ -1145,6 +1289,7 @@ class Trainer:
                 else {}
             ),
             **({"train_retired": True} if self.train_retired else {}),
+            **({"train_waiting": True} if self.train_waiting else {}),
             **({"train_playing": False} if not self.train_playing else {}),
             "max_episode_steps": self.max_episode_steps,
             "nn": self.nn.__class__.__name__,
@@ -1210,6 +1355,8 @@ class Trainer:
                     "averages": list(self.averages),
                     "selfplay_average": self.selfplay_average,
                     "average_warmup": self.average_warmup,
+                    "average_norm_batches": self.average_norm_batches,
+                    "average_rescale": self.average_rescale,
                 }
                 if self.averages
                 else {}
@@ -2813,15 +2960,16 @@ class Trainer:
         """The shapes of the networks' testers' states, from their train states (or their
         shapes): the first networks', as many as `train_states` has."""
         return tuple(
-            jax.eval_shape(
-                lambda params, testers=learner.testers: [
-                    t.init(params=params) for t in testers
-                ],
-                self.extract_model_params_fn(ts),
-            )
-            for learner, ts in zip(
-                self.learners[: len(train_states)], train_states, strict=True
-            )
+            self.test_state_template(i, ts) for i, ts in enumerate(train_states)
+        )
+
+    def test_state_template(self, learner: int, train_state: Any) -> list:
+        """The shapes of network `learner`'s testers' states, from its train state (or its
+        shape)."""
+        testers = self.learners[learner].testers
+        return jax.eval_shape(
+            lambda params: [t.init(params=params) for t in testers],
+            self.extract_model_params_fn(train_state),
         )
 
     def resume(self, path: str | None = None) -> TrainLoopOutput:
@@ -2890,9 +3038,15 @@ class Trainer:
         `resize_replay_buffer`). A branch logs to a monitor run of its own, whose config records
         the state as its parent, and leaves the saved run's directory as it is.
 
-        With `growth`, the trainer's networks may go on past the saved run's (the run grows into
-        a bigger one than it was set up with): those start from scratch, at their own weights,
-        as a network that hasn't joined a run yet is. One can't take over in the branch.
+        With `growth`, the trainer's networks are the saved run's by name, in the trainer's
+        order, which sets their roles (playing, retired, next, waiting; see `Growth`). The branch
+        may add networks (the run grows into more than it was set up with): those start from
+        scratch, at their own weights, as a network that hasn't joined a run yet is, and can't
+        take over in the branch. It may drop networks, all but the one playing: theirs are left
+        out of its states, and every network it keeps goes on as it was (its step count,
+        learning rate schedule, weight averages and testers' states), e.g. a battery of
+        students beside a fixed teacher (`train_waiting`, `train_playing`) whose weakest are
+        replaced by new ones.
 
         Args:
             path: the saved state (see `save_state`), or a directory to take the newest from
@@ -2920,22 +3074,45 @@ class Trainer:
                     f"{path} was saved {'without' if self.tree_buffer else 'with'} tree "
                     "positions: a branch of it needs the same"
                 )
+            names = [learner.name for learner in self.learners]
+            saved_names = (
+                saved_network_names(meta) if meta["growth"] is not None else names[:1]
+            )
+            # each of the trainer's networks' index in the saved run, by name; None for one
+            # the branch adds
+            source: list[int | None] = [
+                saved_names.index(name) if name in saved_names else None
+                for name in names
+            ]
+            dropped = [name for name in saved_names if name not in names]
             growth = None
-            # the networks the saved run has: the trainer's first ones (see the docstring)
-            saved_networks = 1
-            if self.growth is not None:
-                growth = saved_growth(meta["growth"])
-                saved_networks = len(growth.trained)
-                if saved_networks > len(self.learners):
+            # (the saved run and this one both have growth, or neither, checked above)
+            if self.growth is not None and meta["growth"] is not None:
+                saved_progress = saved_growth(meta["growth"])
+                playing_name = saved_names[saved_progress.playing]
+                if playing_name not in names:
                     raise ValueError(
-                        f"{path} was saved with {saved_networks} networks, this run has "
-                        f"{len(self.learners)}: a branch can add networks, not drop them"
+                        f"{playing_name} plays self-play in {path}: a branch can't drop it"
                     )
+
+                def pick(values: Sequence[Any], empty: Any) -> tuple:
+                    return tuple(empty if j is None else values[j] for j in source)
+
+                growth = GrowthProgress(
+                    playing=names.index(playing_name),
+                    trained=pick(saved_progress.trained, 0),
+                    values=pick(saved_progress.values, ()),
+                    guard_values=pick(saved_progress.guard_values, ())
+                    if saved_progress.guard_values
+                    else (),
+                    played=pick(saved_progress.played, 0),
+                )
                 if take_over:
-                    if growth.playing + 1 == saved_networks < len(self.learners):
+                    following = growth.playing + 1
+                    if following < len(names) and source[following] is None:
                         raise ValueError(
-                            f"{self.learners[growth.playing].name} is the saved run's last "
-                            "network: a network the branch adds can't take over from it"
+                            f"{names[following]} is new in the branch: a network the branch "
+                            "adds can't take over"
                         )
                     growth = self.growth.take_over(growth)
             elif take_over:
@@ -2943,49 +3120,67 @@ class Trainer:
             playing = growth.playing if growth is not None else 0
             # the search whose states the branch starts with (see `train_loop`'s initial_state)
             evaluator = self.learners[playing].schedule.at(max(epoch - 1, 0))
-            train_templates = tuple(
+            train_templates = [
                 jax.eval_shape(partial(self.init_train_state, i))
-                for i in range(saved_networks)
+                for i in range(len(names))
+            ]
+            # the networks the saved run has, by name, with their own weights, optimizer
+            # state, testers' states and averages; those it hasn't, from scratch
+            train_states = tuple(
+                self.init_train_state(i)
+                if j is None
+                else self._load_network(saved, meta, "train_states", j, template)
+                for i, (j, template) in enumerate(
+                    zip(source, train_templates, strict=True)
+                )
             )
-            train_states = self._load_part(saved, meta, "train_states", train_templates)
+            test_states = tuple(
+                [
+                    tester.init(params=self.extract_model_params_fn(ts))
+                    for tester in self.learners[i].testers
+                ]
+                if j is None
+                else self._load_network(
+                    saved, meta, "test_states", j, self.test_state_template(i, template)
+                )
+                for i, (j, ts, template) in enumerate(
+                    zip(source, train_states, train_templates, strict=True)
+                )
+            )
             collection_state, kept_search = self._branch_collection_state(
                 saved, meta, evaluator, keep_search=not take_over
             )
-            test_states = self._load_part(
-                saved,
-                meta,
-                "test_states",
-                self.test_state_templates(train_templates),
-            )
-            averages, averaged = self._load_averages(saved, meta, train_templates)
+            averages: tuple[tuple[Any, ...], ...] = ()
+            averaged: tuple[int, ...] = ()
+            info = meta.get("averages")
+            if (
+                self.averages
+                and info is not None
+                and info["horizons"] == list(self.averages)
+            ):
+                averages = tuple(
+                    self.fresh_averages(ts)
+                    if j is None
+                    else self._load_network(
+                        saved,
+                        meta,
+                        "averages",
+                        j,
+                        tuple(ts.params for _ in self.averages),
+                    )
+                    for j, ts in zip(source, train_states, strict=True)
+                )
+                averaged = tuple(
+                    0 if j is None else int(info["averaged"][j]) for j in source
+                )
+            elif self.averages:
+                print(
+                    f"the saved state has no averages over {list(self.averages)} epochs: they "
+                    "start at its networks' weights",
+                    flush=True,
+                )
             key = _to_device(saved["key"])
-        added = range(saved_networks, len(self.learners))
-        if added:
-            assert growth is not None
-            fresh = tuple(self.init_train_state(i) for i in added)
-            train_states = (*train_states, *fresh)
-            test_states = (
-                *test_states,
-                *(
-                    [
-                        tester.init(params=self.extract_model_params_fn(ts))
-                        for tester in self.learners[i].testers
-                    ]
-                    for i, ts in zip(added, fresh, strict=True)
-                ),
-            )
-            if averages:
-                averages = (*averages, *(self.fresh_averages(ts) for ts in fresh))
-                averaged = (*averaged, *(0 for _ in added))
-            growth = replace(
-                growth,
-                trained=(*growth.trained, *(0 for _ in added)),
-                values=(*growth.values, *(() for _ in added)),
-                guard_values=(*growth.guard_values, *(() for _ in added))
-                if growth.guard_values
-                else (),
-                played=(*growth.played, *(0 for _ in added)),
-            )
+        added = [i for i, j in enumerate(source) if j is None]
         resized = ""
         if self.memory_buffer.capacity != meta["buffer_capacity"]:
             collection_state = self.resize_replay_buffer(
@@ -3003,27 +3198,32 @@ class Trainer:
                 raise ValueError(
                     f"{path} was saved by a run without lr_plateau: fork a run from it instead"
                 )
-            progress = [
+            saved_plateau = [
                 LRPlateauProgress(p["epochs"], tuple(p["losses"]))
                 if p is not None
                 else None
                 for p in meta["lr_plateau"]
             ]
+            progress = [None if j is None else saved_plateau[j] for j in source]
             if take_over:
                 # its own rule starts, at the rate it has trained at (as when the rule switches)
                 progress[playing] = LRPlateauProgress()
-            lr_plateau = (*progress, *(None for _ in added))
+            lr_plateau = tuple(progress)
         self.parent = {
             "path": os.path.abspath(path),
             "epoch": epoch,
             "branch": True,
             "take_over": take_over,
+            **({"added": [names[i] for i in added]} if added else {}),
+            **({"dropped": dropped} if dropped else {}),
             "monitor_run": meta["monitor_run"],
             "parent": meta["parent"],
         }
         whose = f", {self.learners[playing].name} playing" if take_over else ""
         search = "its search's states kept" if kept_search else "new search states"
-        new = "".join(f", {self.learners[i].name} added" for i in added)
+        new = "".join(f", {names[i]} added" for i in added) + "".join(
+            f", {name} dropped" for name in dropped
+        )
         print(
             f"branching from {path}: {epoch} epochs done{whose}, {search}{resized}{new}",
             flush=True,
@@ -4013,7 +4213,7 @@ class Trainer:
         # a saved optimizer state (resumed, branched, forked or warm started) takes this
         # trainer's fixed hyperparameters, e.g. a new weight decay or momentum
         for i, ts in enumerate(train_states):
-            train_states[i] = self.with_fixed_hyperparams(ts, self.learners[i].name)
+            train_states[i] = self.with_fixed_hyperparams(ts, i)
 
         # weight averages: the saved state's, or started at the networks' weights (a fork's
         # network goes on with its saved ones, if any)
@@ -4040,12 +4240,15 @@ class Trainer:
                 return ()
             if growth is None or self.growth is None:
                 return (0,)
-            # the growth rule's (the one playing, and the next), and those retired before it;
-            # the one playing only if it trains
+            # the growth rule's (the one playing, and the next), those retired before it, and
+            # those waiting after the next; the one playing only if it trains
             retired = range(growth.playing) if self.train_retired else ()
+            waiting = (
+                range(growth.playing + 2, num_learners) if self.train_waiting else ()
+            )
             return tuple(
                 i
-                for i in (*retired, *self.growth.training(growth))
+                for i in (*retired, *self.growth.training(growth), *waiting)
                 if self.train_playing or i != growth.playing
             )
 
@@ -4075,8 +4278,25 @@ class Trainer:
         )
         if self.lr_plateau is not None and lr_progress[playing_now()] is None:
             lr_progress[playing_now()] = LRPlateauProgress()
+        # each network's averages' own network states (see `average_norm_states`), from the
+        # replay buffer if it holds anything: a resumed run's, not saved with its state. Their
+        # keys are folded from the run's, so its rng is the same with them as without
+        average_states: list[tuple[Any, ...] | None] = [
+            self.average_norm_states(
+                jax.random.fold_in(key, AVERAGE_NORM_SALT + i),
+                collection_state.buffer_state,
+                averages[i],
+                ts,
+                learner=i,
+            )
+            if self.averages and averaged[i]
+            else None
+            for i, ts in enumerate(train_states)
+        ]
         params = self.selfplay_params(
-            train_states[playing_now()], averages[playing_now()]
+            train_states[playing_now()],
+            averages[playing_now()],
+            average_states[playing_now()],
         )
         # exact endgame labels' solver, on a thread of its own
         solver = ThreadPoolExecutor(1) if self.endgame_solve is not None else None
@@ -4106,7 +4326,9 @@ class Trainer:
             evaluator, collection_state = self.follow_schedule(
                 cur_epoch, evaluator, collection_state, playing
             )
-            params = self.selfplay_params(train_states[playing], averages[playing])
+            params = self.selfplay_params(
+                train_states[playing], averages[playing], average_states[playing]
+            )
             collect_key, key = jax.random.split(key)
             collect_keys = jax.random.split(collect_key, self.batch_size)
             # only the counts outlive the state donated to self-play: keeping the whole state
@@ -4148,11 +4370,12 @@ class Trainer:
                     self.solve_waiting,
                     jax.tree.map(np.asarray, collection_state.pending),
                 )
-                if not self.memory_buffer.sample_mask(
-                    collection_state.buffer_state
-                ).any():
-                    # nothing to train on yet (e.g. a new run's first epoch, whose games all
-                    # stopped): they're labelled once solved
+                if (
+                    self.memory_buffer.sample_mask(collection_state.buffer_state).sum()
+                    < self.train_batch_size
+                ):
+                    # not a training batch to train on yet (e.g. a new run's first epoch, whose
+                    # games nearly all stopped): they're labelled once solved
                     self.set_activity(f"epoch {cur_epoch}: solving")
                     started_waiting = time.perf_counter()
                     solved.append(solving.result())
@@ -4240,10 +4463,19 @@ class Trainer:
                         jnp.float32(
                             average_share(averaged[i], horizon, self.average_warmup)
                         ),
+                        rescale=self.average_rescale,
                     )
                     for average, horizon in zip(averages[i], self.averages, strict=True)
                 )
                 averaged[i] += 1
+                if self.averages:
+                    average_states[i] = self.average_norm_states(
+                        jax.random.fold_in(key, AVERAGE_NORM_SALT + i),
+                        collection_state.buffer_state,
+                        averages[i],
+                        train_states[i],
+                        learner=i,
+                    )
                 if self.noise_measure and self.averages:
                     horizon = self.selfplay_average or self.averages[0]
                     measure_key, key = jax.random.split(key)
@@ -4345,7 +4577,12 @@ class Trainer:
                                     evaluator=learner.evaluator_test,
                                     state=test_state,
                                     params=self.extract_model_params_fn(
-                                        replace(train_states[i], params=average)
+                                        with_average(
+                                            train_states[i],
+                                            average,
+                                            average_states[i],
+                                            n,
+                                        )
                                     ),
                                 )
                                 if average_metrics:
@@ -4438,9 +4675,11 @@ class Trainer:
             self.set_activity(f"epoch {cur_epoch}: saving checkpoint")
             for i in training:
                 self.save_checkpoint(train_states[i], cur_epoch, i)
-                for average, horizon in zip(averages[i], self.averages, strict=True):
+                for n, (average, horizon) in enumerate(
+                    zip(averages[i], self.averages, strict=True)
+                ):
                     self.save_checkpoint(
-                        replace(train_states[i], params=average),
+                        with_average(train_states[i], average, average_states[i], n),
                         cur_epoch,
                         i,
                         average=horizon,
