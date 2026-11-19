@@ -10,6 +10,8 @@ on:
 jobs:
   pytest:
     runs-on: ubuntu-latest
+    # a cold run takes a few minutes; anything near this is a hang
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v7
@@ -17,14 +19,23 @@ jobs:
           enable-cache: true
       # CPU build of jax: no --extra cuda, the runners have no GPU (tests/conftest.py also forces CPU)
       - run: uv sync --locked
+      # JAX's cache keys include the host CPU, so programs compiled on another runner model never
+      # hit: each model gets its own cache. Nothing evicts entries, so the cache starts over weekly.
+      - id: cache-id
+        run: |
+          cpu=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs)
+          echo "runner CPU: $cpu ($(nproc) vCPUs)"
+          echo "cpu=$(echo "$cpu" | sha256sum | cut -c1-8)" >> "$GITHUB_OUTPUT"
+          echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
       # the programs the tests compiled last time (see tests/conftest.py): a run reuses those its
       # changes didn't touch
       - uses: actions/cache@v4
         with:
           path: ~/.cache/turbozero/jax-tests
-          key: jax-tests-${{ hashFiles('uv.lock') }}-${{ github.sha }}
-          restore-keys: jax-tests-${{ hashFiles('uv.lock') }}-
-      - run: uv run pytest
+          key: jax-tests-${{ steps.cache-id.outputs.cpu }}-${{ steps.cache-id.outputs.week }}-${{ hashFiles('uv.lock') }}-${{ github.sha }}
+          restore-keys: jax-tests-${{ steps.cache-id.outputs.cpu }}-${{ steps.cache-id.outputs.week }}-${{ hashFiles('uv.lock') }}-
+      # -n logical: a worker per vCPU (the default, -n auto, counts physical cores: 2 of the 4)
+      - run: uv run pytest -n logical --durations=15
 
   lint:
     runs-on: ubuntu-latest
