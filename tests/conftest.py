@@ -43,7 +43,8 @@ if jax.config.jax_compilation_cache_dir is None:
         os.path.expanduser("~/.cache/turbozero/jax-tests"),
     )
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
-jax.config.update("jax_compilation_cache_max_size", 2**30)
+# no jax_compilation_cache_max_size: its LRU rescans the whole cache on every write, which made a
+# cold run twice as slow and a CI run with a large restored cache take an hour
 
 env = pgx.make("tic_tac_toe")
 
