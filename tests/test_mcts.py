@@ -299,6 +299,33 @@ def test_drawing_the_root_noise_has_no_open_loops(env):
     assert all("known_trip_count" in line for line in loops)
 
 
+@pytest.mark.parametrize("temperature", [0.5, 2.0])
+def test_the_prior_is_the_policys_softmax_at_its_temperature_at_every_node(
+    fixed_length_env, temperature
+):
+    mask = (True, False, True)
+    env = fixed_length_env(length=10, num_actions=3, action_mask=mask)
+    logits = jnp.array([1.0, 5.0, 0.0])
+    search = make_mcts(
+        logits=logits, selector=FirstAction(), prior_temperature=temperature
+    )
+    state, meta = env.init_fn(jax.random.PRNGKey(0))
+    tree = evaluate_root(
+        search, env, search.init(template_embedding=state), state, meta
+    )
+
+    tree = iterate(search, env)(jax.random.PRNGKey(0), tree)
+
+    flattened = masked_softmax(logits / temperature, mask)
+    np.testing.assert_allclose(root(tree).p, flattened, rtol=1e-6)
+    np.testing.assert_allclose(tree.data_at(1).p, flattened, rtol=1e-6)
+
+
+def test_the_prior_temperature_is_positive():
+    with pytest.raises(ValueError, match="prior_temperature"):
+        make_mcts(prior_temperature=0.0)
+
+
 # choosing the move to play
 
 
