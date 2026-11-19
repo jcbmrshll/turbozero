@@ -10,7 +10,6 @@ import numpy as np
 import pytest
 from conftest import copies_in_loop, open_loops_in_loop
 
-from turbozero.evaluators.alphazero import AlphaZero
 from turbozero.evaluators.mcts.action_selection import MCTSActionSelector, PUCTSelector
 from turbozero.evaluators.mcts.mcts import MCTS
 from turbozero.evaluators.mcts.state import MCTSNode
@@ -18,17 +17,8 @@ from turbozero.evaluators.mcts.state import MCTSNode
 NULL = -1
 
 
-class NoisyMCTS(MCTS):
-    """MCTS whose root prior mixes in uniform noise over the legal actions, a
-    stand-in for AlphaZero's Dirichlet noise: a search with a root noise draw and
-    mix to compile and check."""
-
-    def root_noise(self, key, shape):
-        return jax.random.uniform(key, shape)
-
-    def root_prior(self, noise, policy, action_mask):
-        noise = jnp.where(action_mask, noise, 0.0)
-        return 0.75 * policy + 0.25 * noise / noise.sum()
+# AlphaZero's root noise
+NOISE = {"dirichlet_alpha": 0.3, "dirichlet_epsilon": 0.25}
 
 
 @pytest.fixture(scope="module")
@@ -208,7 +198,7 @@ def test_the_roots_prior_takes_the_noise_its_search_drew(fixed_length_env):
     mask = np.array([True, False, True, True])
     env = fixed_length_env(length=10, num_actions=4, action_mask=mask)
     logits = jnp.array([2.0, 1.0, 0.5, -1.0])
-    search = make_mcts(NoisyMCTS, num_actions=4, logits=logits)
+    search = make_mcts(num_actions=4, logits=logits, **NOISE)
     state, meta = env.init_fn(jax.random.PRNGKey(0))
     tree = search.init(template_embedding=state)
 
@@ -222,9 +212,8 @@ def test_the_roots_prior_takes_the_noise_its_search_drew(fixed_length_env):
     assert not np.allclose(other.root_noise, started.root_noise)
     np.testing.assert_allclose(
         root(updated).p,
-        search.root_prior(
-            started.root_noise, masked_softmax(logits, mask), meta.action_mask
-        ),
+        0.75 * masked_softmax(logits, mask)
+        + 0.25 * masked_softmax(started.root_noise, mask),
         rtol=1e-6,
     )
 
@@ -242,7 +231,6 @@ def test_dirichlet_noise_is_mixed_into_the_root_prior_over_legal_moves_only(
     logits = jnp.array([2.0, -1.0, 0.5, 0.0, 3.0, -2.0])
     epsilon = 0.25
     search = make_mcts(
-        AlphaZero,
         num_actions=6,
         logits=logits,
         dirichlet_alpha=alpha,
@@ -292,7 +280,7 @@ def test_dirichlet_noise_is_mixed_into_the_root_prior_over_legal_moves_only(
 def test_drawing_the_root_noise_has_no_open_loops(env):
     # on GPU, each trip of a loop whose trip count XLA doesn't know waits on the host: self-play
     # starts searches (and draws their noise) for every environment at every check
-    search = make_mcts(AlphaZero)
+    search = make_mcts(**NOISE)
     tree = search.init(template_embedding=env.init_fn(None)[0])
     keys = jax.random.split(jax.random.PRNGKey(0), 5)
 
@@ -726,7 +714,7 @@ def test_a_search_a_cycle_at_a_time_is_evaluate(env, reused):
     # with the root's evaluation first, the same keys, and a tree too small for every iteration
     key = jax.random.PRNGKey(3)
     search = make_mcts(
-        NoisyMCTS, max_nodes=8, leaf_eval_fn=state_eval_fn, num_iterations=6
+        max_nodes=8, leaf_eval_fn=state_eval_fn, num_iterations=6, **NOISE
     )
     root_state, root_meta = env.init_fn(jax.random.PRNGKey(0))
     tree = (
@@ -805,7 +793,7 @@ def test_search_cycles_write_trees_in_place_and_loop_only_to_traverse(env):
     # noise is drawn once, before the cycles)
     batch, capacity = 5, 24
     search = make_mcts(
-        NoisyMCTS, max_nodes=capacity, leaf_eval_fn=state_eval_fn, num_iterations=6
+        max_nodes=capacity, leaf_eval_fn=state_eval_fn, num_iterations=6, **NOISE
     )
     trees = jax.vmap(lambda _: search.init(template_embedding=env.init_fn(None)[0]))(
         jnp.arange(batch)

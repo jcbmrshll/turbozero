@@ -20,11 +20,11 @@ class MCTS(Evaluator):
     new state with `leaf_eval_fn` (policy logits and a value, e.g. from a
     network as in AlphaZero, instead of rollouts), adds it to the tree and backs
     the value up to the root. After `num_iterations` iterations, the move is
-    sampled from the root's visit counts.
+    sampled from the root's visit counts. As in AlphaZero, the root's prior can
+    take Dirichlet noise, so that self-play tries moves the network rates low.
 
     The search's state is an `MCTSTree`, which methods take and return rather
-    than store, so searches can be jitted and vmapped. Subclasses can add noise
-    to the root's prior by overriding `root_noise` and `root_prior`.
+    than store, so searches can be jitted and vmapped.
     """
 
     def __init__(
@@ -37,6 +37,8 @@ class MCTS(Evaluator):
         discount: float = -1.0,
         temperature: float = 1.0,
         persist_tree: bool = True,
+        dirichlet_alpha: float = 0.3,
+        dirichlet_epsilon: float = 0.0,
     ):
         """
         Args:
@@ -54,6 +56,11 @@ class MCTS(Evaluator):
                 visited move is played, ties broken at random
             persist_tree: whether the next move's search starts from the
                 subtree of the move played, rather than an empty tree
+            dirichlet_alpha: the concentration of the root's Dirichlet noise:
+                lower puts it on fewer actions (AlphaZero: 0.3 in chess, 0.03
+                in Go)
+            dirichlet_epsilon: the share of the root's prior that is the noise,
+                0 for none (AlphaZero: 0.25)
         """
         super().__init__(discount=discount)
         self.leaf_eval_fn = leaf_eval_fn
@@ -63,6 +70,8 @@ class MCTS(Evaluator):
         self.action_selector = action_selector
         self.temperature = temperature
         self.persist_tree = persist_tree
+        self.dirichlet_alpha = dirichlet_alpha
+        self.dirichlet_epsilon = dirichlet_epsilon
 
     def get_config(self) -> dict:
         return {
@@ -74,6 +83,8 @@ class MCTS(Evaluator):
             "discount": self.discount,
             "temperature": self.temperature,
             "persist_tree": self.persist_tree,
+            "dirichlet_alpha": self.dirichlet_alpha,
+            "dirichlet_epsilon": self.dirichlet_epsilon,
         }
 
     def evaluate(
@@ -120,7 +131,10 @@ class MCTS(Evaluator):
     def start_search(
         self, key: jax.Array, state: MCTSTree, active: ArrayLike = True
     ) -> MCTSTree:
-        """Draws the root noise for a new search and stores it in the tree.
+        """Draws the root's noise for a new search and stores it in the tree:
+        log-Gamma(`dirichlet_alpha`) draws, one per action, which `expand_root`
+        turns into a Dirichlet sample over the legal actions (zeros without
+        noise).
 
         Done once per search, before its cycles, rather than in `search_cycle`:
         under vmap every cycle computes the root's update, so the draw would be
@@ -128,23 +142,18 @@ class MCTS(Evaluator):
         """
         root_key, _, _ = jax.random.split(key, 3)
         _, noise_key = jax.random.split(root_key)
-        noise = self.root_noise(noise_key, state.root_noise.shape)
+        shape = state.root_noise.shape
+        noise = jnp.zeros(shape, dtype=jnp.float32)
+        if self.dirichlet_epsilon:
+            # JAX's exact sampler loops until every draw in the batch is
+            # accepted, and on GPU each trip waits on the host. The approximate
+            # one is a fixed computation, and its draws have been observed to be
+            # as close to the exact sampler's as two sets of exact draws (KS
+            # distance at alpha 0.03-2)
+            noise = jax.random.loggamma(
+                noise_key, self.dirichlet_alpha, shape, method="approximate"
+            )
         return replace(state, root_noise=jnp.where(active, noise, state.root_noise))
-
-    def root_noise(self, key: jax.Array, shape: tuple[int, ...]) -> jax.Array:
-        """Draws the noise `root_prior` mixes into the root's prior, float32 of
-        shape `shape`. MCTS adds no noise, so this returns zeros.
-        """
-        return jnp.zeros(shape, dtype=jnp.float32)
-
-    def root_prior(
-        self, noise: jax.Array, policy: jax.Array, action_mask: jax.Array
-    ) -> jax.Array:
-        """Computes the root's prior from the search's root noise and the policy
-        from `leaf_eval_fn` (0 for illegal actions). MCTS uses the policy as it
-        is.
-        """
-        return policy
 
     def search_cycle(
         self,
@@ -248,16 +257,21 @@ class MCTS(Evaluator):
         """Writes the evaluation of the root into the tree.
 
         The root gets the softmax of `policy_logits` over the legal actions,
-        passed through `root_prior`, as its prior, and `root_embedding` as its
-        state. A new root also gets `value` and one visit; a root kept from the
+        with the search's Dirichlet noise mixed in, as its prior, and
+        `root_embedding` as its state. A new root also gets `value` and one visit; a root kept from the
         previous move keeps its visits and value. Does nothing if `write` is
         False (see `Tree.set_root`).
         """
         mask = root_metadata.action_mask
-        policy = jax.nn.softmax(
-            jnp.where(mask, policy_logits, jnp.finfo(policy_logits).min)
-        )
-        prior = self.root_prior(tree.root_noise, policy, mask)
+        lowest = jnp.finfo(policy_logits).min
+        prior = jax.nn.softmax(jnp.where(mask, policy_logits, lowest))
+        if self.dirichlet_epsilon:
+            # the softmax of log-Gamma(alpha) draws is a Dirichlet(alpha) sample,
+            # here over the legal actions only, as in AlphaZero. Both are
+            # distributions over the legal actions, so their mix is too
+            noise = jax.nn.softmax(jnp.where(mask, tree.root_noise, lowest))
+            epsilon = self.dirichlet_epsilon
+            prior = (1 - epsilon) * prior + epsilon * noise
         node = tree.data_at(tree.ROOT_INDEX)
         visited = node.n > 0
         node = replace(
