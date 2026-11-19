@@ -221,8 +221,6 @@ class TwoPlayerGameState:
         p2_value_estimate: The current state value estimate of the second evaluator.
         outcomes: The outcomes of the game (final rewards) for each player.
         completed: Whether the game is completed.
-        p1_search: What the first evaluator made of the last position played from, see `GameFrame`.
-        p2_search: The same for the second evaluator.
     """
 
     key: jax.Array
@@ -234,8 +232,6 @@ class TwoPlayerGameState:
     p2_value_estimate: jax.Array
     outcomes: jax.Array
     completed: jax.Array
-    p1_search: Any = None
-    p2_search: Any = None
 
 
 @jax.tree_util.register_dataclass
@@ -249,10 +245,6 @@ class GameFrame:
         p2_value_estimate: The current state value estimate of the second evaluator.
         completed: Whether the game is completed.
         outcomes: The outcomes of the game (final rewards) for each player.
-        p1_search: What the first evaluator made of the position the last move was played from
-            (`Evaluator.search_record`), None unless the game records searches: its search, if it
-            played the move, else the tree it had for the position from its own previous search.
-        p2_search: The same for the second evaluator.
     """
 
     env_state: Any
@@ -260,8 +252,6 @@ class GameFrame:
     p2_value_estimate: jax.Array
     completed: jax.Array
     outcomes: jax.Array
-    p1_search: Any = None
-    p2_search: Any = None
 
 
 def _select(pred: jax.Array, on_true: Any, on_false: Any) -> Any:
@@ -278,7 +268,6 @@ def two_player_game_step(
     env_init_fn: EnvInitFn,
     use_p1: bool,
     max_steps: int,
-    record_search: bool = False,
 ) -> TwoPlayerGameState:
     """Make a single step in a two player game.
 
@@ -291,8 +280,6 @@ def two_player_game_step(
         env_init_fn: The environment initialization function.
         use_p1: Whether to use the first evaluator.
         max_steps: The maximum number of steps per episode (see `step_env_and_evaluator`).
-        record_search: Whether to keep a record of what the active evaluator's search explored
-            (`Evaluator.search_record`).
 
     Returns:
         TwoPlayerGameState: The updated game state.
@@ -311,7 +298,7 @@ def two_player_game_step(
 
     # step
     step_key, key = jax.random.split(state.key)
-    output, env_state, env_state_metadata, terminated, truncated, rewards, searched = (
+    output, env_state, env_state_metadata, terminated, truncated, rewards, _ = (
         search_and_step(
             key=step_key,
             env_state=state.env_state,
@@ -337,17 +324,6 @@ def two_player_game_step(
     # update the other evaluator
     other_eval_state = other_evaluator.step(other_eval_state, output.action)
     other_value_estimate = other_evaluator.get_value(other_eval_state)
-    # what each player made of the position: the active one's search, and what the other had
-    # explored of it before (searching its own last move, if it keeps its tree)
-    p1_search, p2_search = state.p1_search, state.p2_search
-    if record_search:
-        active_search = active_evaluator.search_record(searched)
-        other_search = other_evaluator.search_record(
-            state.p2_eval_state if use_p1 else state.p1_eval_state
-        )
-        p1_search, p2_search = (
-            (active_search, other_search) if use_p1 else (other_search, active_search)
-        )
     # update the game state
     if use_p1:
         p1_eval_state, p2_eval_state = active_eval_state, other_eval_state
@@ -370,8 +346,6 @@ def two_player_game_step(
         p2_eval_state=p2_eval_state,
         p1_value_estimate=p1_value_estimate,
         p2_value_estimate=p2_value_estimate,
-        p1_search=p1_search,
-        p2_search=p2_search,
         outcomes=jnp.where(
             ((terminated | truncated) & ~state.completed)[..., None],
             rewards,
@@ -391,7 +365,6 @@ def two_player_game(
     env_init_fn: EnvInitFn,
     max_steps: int,
     p1_first: bool | None = None,
-    record_search: bool = False,
 ) -> tuple[jax.Array, GameFrame, jax.Array]:
     """Play a two player game between two evaluators.
 
@@ -410,9 +383,6 @@ def two_player_game(
             - Under `vmap`, a random first player makes whose turn it is differ across games, so every step runs
               both evaluators and keeps one move from each game. Pass it as a fixed value for a batch of games
               to run only the active evaluator at each step.
-        record_search: Whether the frames record what each move's search explored (`GameFrame.p1_search`,
-            `p2_search`), for the monitor to show. Each frame then holds a record of a whole search
-            tree from each player, so leave it off unless something reads them.
 
     Returns:
         Tuple[jax.Array, GameFrame, jax.Array]:
@@ -428,9 +398,6 @@ def two_player_game(
     # init evaluator states
     p1_eval_state = evaluator_1.init(template_embedding=env_state)
     p2_eval_state = evaluator_2.init(template_embedding=env_state)
-    # a record of a search has the same shape before the first search as after it
-    p1_search = evaluator_1.search_record(p1_eval_state) if record_search else None
-    p2_search = evaluator_2.search_record(p2_eval_state) if record_search else None
     # compile step functions
     game_step = partial(
         two_player_game_step,
@@ -439,7 +406,6 @@ def two_player_game(
         env_step_fn=env_step_fn,
         env_init_fn=env_init_fn,
         max_steps=max_steps,
-        record_search=record_search,
     )
     step_p1 = partial(game_step, params=params_1, use_p1=True)
     step_p2 = partial(game_step, params=params_2, use_p1=False)
@@ -465,8 +431,6 @@ def two_player_game(
         p2_value_estimate=jnp.array(0.0, dtype=jnp.float32),
         outcomes=jnp.zeros((2,), dtype=jnp.float32),
         completed=jnp.zeros((), dtype=jnp.bool_),
-        p1_search=p1_search,
-        p2_search=p2_search,
     )
     # make initial render frame
     initial_game_frame = GameFrame(
@@ -475,8 +439,6 @@ def two_player_game(
         p2_value_estimate=state.p2_value_estimate,
         completed=state.completed,
         outcomes=state.outcomes,
-        p1_search=state.p1_search,
-        p2_search=state.p2_search,
     )
 
     # takes a turn for the active player
@@ -503,8 +465,6 @@ def two_player_game(
             p2_value_estimate=state.p2_value_estimate,
             completed=state.completed,
             outcomes=state.outcomes,
-            p1_search=state.p1_search,
-            p2_search=state.p2_search,
         )
         # return game state and render frame
         return state, frame
