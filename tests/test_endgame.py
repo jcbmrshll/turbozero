@@ -178,21 +178,6 @@ def test_solves_match_plain_minimax():
             assert np.sign(after[sign_move]) == np.sign(expected)
 
 
-def test_neural_reversis_solve_table_is_read_in_order():
-    from engines import solve_scores
-
-    text = """
-|   #   | Depth  | Score |    Time     |        Nodes        |
-| ----: | :----: | :---: | ----------: | ------------------: |
-|     2 |   15   |  +00  |    0:00.002 |             441,796 |
-|     1 |   6    |  -06  |    0:00.000 |                  46 |
-| Total |        |       |    0:00.004 |             984,148 |
-"""
-    assert solve_scores(text, 2) == [-6, 0]
-    with pytest.raises(RuntimeError):
-        solve_scores(text, 3)
-
-
 def test_a_match_solves_exactly_with_neural_reversi():
     from clock_match import endgame_solve
     from endgame import LIB
@@ -200,9 +185,9 @@ def test_a_match_solves_exactly_with_neural_reversi():
 
     if not NeuralReversi.installed(NeuralReversi.default_dir()):
         pytest.skip("Neural Reversi isn't built here (setup_neural_reversi.sh)")
-    solve = endgame_solve()
-    for me, opp in random_positions([8, 10], 10, seed=2):
-        assert solve(me, opp) == LIB.endgame_minimax(me, opp)
+    with endgame_solve(10) as solve:
+        for me, opp in random_positions([8, 10], 10, seed=2):
+            assert solve(me, opp) == LIB.endgame_minimax(me, opp)
 
 
 def test_a_net_player_on_a_clock_plans_its_solve_by_its_cost():

@@ -2,6 +2,7 @@
 with the real engines where they're installed."""
 
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,7 @@ from engines import (
     ClockedNeuralReversi,
     ClockedYmatioun,
     EdaxFM,
+    ExactSolver,
     Melody,
     NeuralReversi,
     default_dir,
@@ -222,3 +224,63 @@ def test_the_real_edax_fm_takes_a_board():
         assert engine.genmove(board.color) in board.legal()
     finally:
         engine.close()
+
+
+# stands in for Neural Reversi's `cli solve FILE`: notes its arguments, then reads FILE a
+# position at a time and answers each with a row of its table, the score the mover's discs less
+# the opponent's; a position with none of the mover's discs ends it, as a crash would
+FAKE_SOLVE = """#!{python}
+import sys
+from pathlib import Path
+
+Path(sys.argv[0]).with_name("calls").open("a").write(" ".join(sys.argv[1:]) + "\\n")
+print("Neural Reversi (fake)", flush=True)
+print("|   #   | Depth  | Score |    Time     |", flush=True)
+with open(sys.argv[2]) as positions:
+    for n, line in enumerate(positions, 1):
+        board = line.split()[0]
+        if "X" not in board:
+            print("no discs", file=sys.stderr)
+            sys.exit(1)
+        print(f"|  {{n:4d}} |   20   |  {{board.count('X') - board.count('O'):+03d}}  |    0:00.001 |", flush=True)
+"""
+
+
+@pytest.fixture
+def fake_solver_dir(tmp_path):
+    cli = tmp_path / "target" / "release" / "cli"
+    cli.parent.mkdir(parents=True)
+    cli.write_text(FAKE_SOLVE.format(python=sys.executable))
+    cli.chmod(0o755)
+    return tmp_path
+
+
+def test_one_solver_process_answers_every_solve(fake_solver_dir):
+    with ExactSolver(3, fake_solver_dir) as solve:
+        assert solve(0b111, 1 << 63) == 2
+        assert solve(0b1, 0b1111 << 60) == -3
+        assert solve(0b1, 0) == 1
+    calls = (fake_solver_dir / "target" / "release" / "calls").read_text().splitlines()
+    assert calls == ["solve /dev/stdin --exact --threads 3 --hash-size 1024"]
+
+
+def test_solves_from_many_threads_each_get_their_own_answer(fake_solver_dir):
+    got: dict[int, int] = {}
+    with ExactSolver(1, fake_solver_dir) as solve:
+
+        def solving(k: int) -> None:
+            got[k] = solve((1 << (k + 1)) - 1, 1 << 63)
+
+        threads = [threading.Thread(target=solving, args=(k,)) for k in range(20)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    assert got == {k: k for k in range(20)}
+
+
+def test_a_solver_that_dies_is_raised_with_what_it_said(fake_solver_dir):
+    with ExactSolver(1, fake_solver_dir) as solve:
+        assert solve(0b11, 0) == 2
+        with pytest.raises(RuntimeError, match="position 2.*no discs"):
+            solve(0, 0b11)
