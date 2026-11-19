@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from turbozero.pytree import map_where
+from turbozero.pytree_utils import map_where
 
 
 def step(tree: dict, by: jax.Array) -> dict:

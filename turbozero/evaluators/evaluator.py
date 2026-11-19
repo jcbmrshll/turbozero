@@ -4,7 +4,7 @@ from typing import Any
 import jax
 from jax.typing import ArrayLike
 
-from turbozero.pytree import where_tree
+from turbozero.pytree_utils import where_tree
 from turbozero.types import EnvStepFn, StepMetadata
 
 
