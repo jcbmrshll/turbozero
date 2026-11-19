@@ -4,7 +4,7 @@ from typing import Any
 import equinox as eqx
 import jax
 
-from turbozero.networks.utils import apply_nn
+from turbozero.networks.nn_utils import apply_nn
 from turbozero.types import LeafEvalFn
 
 
