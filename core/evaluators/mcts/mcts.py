@@ -1,6 +1,6 @@
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import Any
+from typing import Any, Literal
 
 import jax
 import jax.numpy as jnp
@@ -29,22 +29,31 @@ class PlayoutCap:
     """Playout cap randomization (KataGo, https://arxiv.org/abs/1902.10565, section 3.1): each
     move's search is a full one, with probability `full_probability`, or else a fast one of
     `fast_iterations` iterations. Only full searches make training positions (see
-    `MCTS.trains_on`); fast ones play their move without the root's noise (e.g. AlphaZero's
-    Dirichlet noise), for strength. More moves for the same compute means more games, each with
-    one outcome for the value to learn from, while the policy learns from full searches only.
+    `MCTS.trains_on`); by default fast ones play their move without the root's noise (e.g.
+    AlphaZero's Dirichlet noise), for strength. More moves for the same compute means more games,
+    each with one outcome for the value to learn from, while the policy learns from full searches
+    only.
 
     Attributes:
         full_probability: the share of moves searched in full, `num_iterations` iterations
         fast_iterations: the iterations of a fast search
+        noisy: which searches' roots take the noise: "full" (KataGo's), or "fast", so that the
+            fast searches explore and the full ones, which train, search the network's own prior
     """
 
     full_probability: float
     fast_iterations: int
+    noisy: Literal["full", "fast"] = "full"
+
+    def __post_init__(self):
+        if self.noisy not in ("full", "fast"):
+            raise ValueError(f'noisy must be "full" or "fast", got {self.noisy!r}')
 
     def get_config(self) -> dict:
         return {
             "full_probability": self.full_probability,
             "fast_iterations": self.fast_iterations,
+            "noisy": self.noisy,
         }
 
 
@@ -458,10 +467,11 @@ class MCTS(Evaluator):
         policy = self.prior(policy_logits, root_metadata.action_mask)
         prior = self.root_prior(tree.root_noise, policy, root_metadata.action_mask)
         if self.playout_cap is not None:
-            # a fast search's root takes no noise. The barrier keeps XLA from fusing the noise's
-            # mix into the select, which it does differently in `evaluate` and in a search a cycle
-            # at a time, rounding the prior differently
-            prior = jnp.where(tree.fast, policy, jax.lax.optimization_barrier(prior))
+            # only the `noisy` searches' roots take the noise. The barrier keeps XLA from fusing the
+            # noise's mix into the select, which it does differently in `evaluate` and in a search
+            # a cycle at a time, rounding the prior differently
+            noiseless = tree.fast if self.playout_cap.noisy == "full" else ~tree.fast
+            prior = jnp.where(noiseless, policy, jax.lax.optimization_barrier(prior))
         policy_logits = jnp.where(
             root_metadata.action_mask, policy_logits, jnp.finfo(policy_logits).min
         )

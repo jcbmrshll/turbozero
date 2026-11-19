@@ -5,6 +5,7 @@ many iterations, in a tree with room to spare and in one too small for it."""
 
 import re
 from dataclasses import replace
+from typing import Literal
 
 import jax
 import jax.numpy as jnp
@@ -1190,11 +1191,17 @@ def test_searches_in_a_tree_too_small_for_them(make_search, ttt, cls):
 # playout cap randomization
 
 
-def capped(cls=AZ_MCTS, full_probability=0.25, fast_iterations=2, **kwargs):
+def capped(
+    cls=AZ_MCTS,
+    full_probability=0.25,
+    fast_iterations=2,
+    noisy: Literal["full", "fast"] = "full",
+    **kwargs,
+):
     return make_mcts(
         cls,
         num_iterations=kwargs.pop("num_iterations", 5),
-        playout_cap=PlayoutCap(full_probability, fast_iterations),
+        playout_cap=PlayoutCap(full_probability, fast_iterations, noisy),
         **kwargs,
     )
 
@@ -1253,12 +1260,19 @@ def test_a_fast_search_counting_reused_visits_stops_at_its_own_visits(env):
     assert not bool(search.search_done(full, jnp.array(1)))
 
 
-def test_a_fast_searchs_root_takes_no_noise(fixed_length_env):
+@pytest.mark.parametrize("noisy", ["full", "fast"])
+def test_only_the_noisy_searches_roots_take_noise(
+    fixed_length_env, noisy: Literal["full", "fast"]
+):
     mask = np.array([True, False, True, True])
     env = fixed_length_env(length=10, num_actions=4, action_mask=mask)
     logits = jnp.array([2.0, 1.0, 0.5, -1.0])
     search = capped(
-        num_actions=4, logits=logits, dirichlet_epsilon=0.5, full_probability=0.5
+        num_actions=4,
+        logits=logits,
+        dirichlet_epsilon=0.5,
+        full_probability=0.5,
+        noisy=noisy,
     )
     state, meta = env.init_fn(jax.random.PRNGKey(0))
     tree = search.start_search(
@@ -1271,8 +1285,14 @@ def test_a_fast_searchs_root_takes_no_noise(fixed_length_env):
             search.update_root(jax.random.PRNGKey(0), searched, state, None, meta)
         ).p
 
-    np.testing.assert_allclose(prior(True), masked_softmax(logits, mask), rtol=1e-6)
-    assert not np.allclose(prior(False), masked_softmax(logits, mask))
+    quiet, loud = (True, False) if noisy == "full" else (False, True)
+    np.testing.assert_allclose(prior(quiet), masked_softmax(logits, mask), rtol=1e-6)
+    assert not np.allclose(prior(loud), masked_softmax(logits, mask))
+
+
+def test_a_playout_caps_noisy_searches_are_full_or_fast():
+    with pytest.raises(ValueError, match="noisy"):
+        PlayoutCap(0.5, 2, "both")  # type: ignore[arg-type]
 
 
 def test_only_full_searches_make_training_positions(env):

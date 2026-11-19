@@ -49,6 +49,7 @@ a dataset of whole games from; --train-steps 0 plays a fixed network's games wit
 """
 
 import argparse
+import dataclasses
 import math
 import re
 import tempfile
@@ -481,6 +482,14 @@ def main():
         "iterations with probability P, and otherwise with FAST, without the root's noise; "
         "only the --sims searches' positions are stored for training, e.g. 0.25:43. Size "
         "--buffer by the share stored, and see --selfplay-cycles and --advance-every",
+    )
+    parser.add_argument(
+        "--playout-cap-noise",
+        choices=["full", "fast"],
+        default="full",
+        help="with --playout-cap, which searches' roots take the noise: the full ones "
+        "(KataGo's), or the fast ones, so the stored searches' targets are noise-free and "
+        "the unstored moves explore",
     )
     parser.add_argument(
         "--selfplay-cycles",
@@ -1119,6 +1128,11 @@ def main():
             parser.error("--playout-cap goes with --sims, not --sims-schedule")
         if args.playout_cap.fast_iterations >= args.sims:
             parser.error("--playout-cap's fast sims must be fewer than --sims")
+        args.playout_cap = dataclasses.replace(
+            args.playout_cap, noisy=args.playout_cap_noise
+        )
+    elif args.playout_cap_noise != "full":
+        parser.error("--playout-cap-noise goes with --playout-cap")
     collection_steps = 128
     if args.selfplay_cycles is not None:
         if args.sims_schedule is not None:
