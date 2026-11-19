@@ -9,6 +9,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "examples" / "othello"))
 
+import eval_games
 import eval_players
 import evaluate
 from clock_match import UNTIMED, GameRun
@@ -617,6 +618,75 @@ def test_games_in_parallel_are_the_games_one_at_a_time(now):
     play_parallel(spec, "m-x", numbers_of(3), together.append, 4, make=make)
     by_number = {r.number: r.moves for r in together}
     assert by_number == {r.number: r.moves for r in alone}
+
+
+def test_games_in_parallel_share_the_matchs_solve(now):
+    a, b = fake("a", {"level": 1}), fake("b", {"level": 2})
+    spec = MatchSpec(a, b, openings=3, solve_at=50)
+    solved = []
+
+    def solve(me, opp):
+        solved.append((me, opp))
+        return 2
+
+    records: list[GameRecord] = []
+    play_parallel(
+        spec,
+        "m-x",
+        numbers_of(3),
+        records.append,
+        3,
+        make=lambda p, c: lambda: FirstLegal(now),
+        solve=solve,
+    )
+    assert len(solved) == 6
+    assert all(r.solved_at == 50 and abs(r.margin) == 2 for r in records)
+
+
+class FakeSolver:
+    def __init__(self, solve_at):
+        self.solve_at = solve_at
+        self.closed = False
+
+    def __call__(self, me, opp):
+        return 0
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.mark.parametrize("parallel", [1, 4])
+def test_a_match_scores_its_stopped_games_by_one_solver_closed_after(
+    monkeypatch, parallel
+):
+    solvers: list[FakeSolver] = []
+
+    def endgame_solve(solve_at):
+        solvers.append(FakeSolver(solve_at))
+        return solvers[-1]
+
+    given = []
+
+    def playing(spec, match_id, numbers, emit, *args, solve):
+        given.append(solve)
+        raise RuntimeError("a player crashed")
+
+    monkeypatch.setattr(eval_games, "endgame_solve", endgame_solve)
+    monkeypatch.setattr(eval_games, "play_sequential", playing)
+    monkeypatch.setattr(eval_games, "play_parallel", playing)
+    a, b = fake("a", {"level": 1}), fake("b", {"level": 2})
+    with pytest.raises(RuntimeError, match="crashed"):
+        eval_games.play(
+            MatchSpec(a, b, openings=2, solve_at=24), "m-x", [0, 1, 2], print,
+            parallel=parallel,
+        )  # fmt: skip
+    (solver,) = solvers
+    assert given == [solver] and solver.solve_at == 24 and solver.closed
+    with pytest.raises(RuntimeError):
+        eval_games.play(
+            MatchSpec(a, b, openings=2), "m-x", [0], print, parallel=parallel
+        )
+    assert len(solvers) == 1 and given[-1] is None
 
 
 def test_networks_on_the_cpu_play_one_game_at_a_time():

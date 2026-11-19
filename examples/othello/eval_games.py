@@ -31,6 +31,7 @@ from clock_match import (
     UNTIMED,
     Game,
     GameRun,
+    Solve,
     endgame_solve,
     play_synchro,
 )
@@ -226,16 +227,14 @@ def play_sequential(
     match_id: str,
     numbers: Sequence[int],
     emit: Emit,
-    solve: Callable[[int, int], int] | None = None,
+    solve: Solve | None = None,
     make: Callable[[PlayerSpec, Clock], Callable[[], Any]] | None = None,
 ) -> None:
     """Plays the games `numbers` one at a time (with `synchro`, a start's two at once), each
     by fresh players from `make` (`eval_players.maker` of their runtime), emitting each as it
-    ends."""
+    ends; games stopped at a depth are scored by `solve`."""
     openings = spec.choose_openings()
     host = hardware.describe()
-    if spec.solve_at is not None and solve is None:
-        solve = endgame_solve()
     build = make or (lambda p, clock: maker(p.runtime, clock))
     clocks = {p.id: p.clock or UNTIMED for p in (spec.a, spec.b)}
     a, b = (build(p, clocks[p.id]) for p in (spec.a, spec.b))
@@ -296,11 +295,12 @@ def play_parallel(
     emit: Emit,
     parallel: int,
     make: Callable[[PlayerSpec, Clock], Callable[[], Any]] | None = None,
-    solver: Callable[[], Callable[[int, int], int]] | None = None,
+    solve: Solve | None = None,
 ) -> None:
     """Plays the games `numbers` `parallel` at a time, each in a thread by fresh players, on
     the same cores: for players a game's thread can have to itself, engines (a process a game).
-    At fixed budgets the moves are the same as one at a time; on a clock, games slow each other."""
+    At fixed budgets the moves are the same as one at a time; on a clock, games slow each other.
+    Games stopped at a depth are scored by `solve`, which the threads share."""
     if any(p.device == "cpu" for p in (spec.a, spec.b)):
         raise ValueError(
             "networks on the CPU play one game at a time (--jobs: processes)"
@@ -312,7 +312,6 @@ def play_parallel(
     build = make or (lambda p, clock: maker(p.runtime, clock))
     clocks = {p.id: p.clock or UNTIMED for p in (spec.a, spec.b)}
     a, b = (build(p, clocks[p.id]) for p in (spec.a, spec.b))
-    new_solver = solver or endgame_solve
 
     queue = list(reversed(numbers))
     lock = threading.Lock()
@@ -320,8 +319,6 @@ def play_parallel(
     done: Queue[GameRecord] = Queue()
 
     def worker() -> None:
-        # a solver to a thread: one solves a position at a time
-        solve = new_solver() if spec.solve_at is not None else None
         while not errors:
             with lock:
                 if not queue:
@@ -373,7 +370,7 @@ def replay(
     moves: Sequence[int],
     opening_moves: int,
     solve_at: int | None,
-    solve: Callable[[int, int], int] | None,
+    solve: Solve | None,
 ) -> Game:
     """A game from its moves (passes left out), stopped and solved at `solve_at` empties as
     `GameRun` would have."""
@@ -404,11 +401,12 @@ def play_batched(
     emit: Emit,
     record_run: Callable[[dict[str, Any], dict[str, Any]], None] = lambda _i, _h: None,
     games_at_once: int = 64,
-    solve: Callable[[int, int], int] | None = None,
+    solve: Solve | None = None,
 ) -> None:
     """Plays the games `numbers` on the GPU in batches of `games_at_once` starts (each start's
     two games: one batch half with a black, the other b), emitting each batch's games as it
-    ends. `record_run` gets each batch's timing and the host."""
+    ends; games stopped at a depth are scored by `solve`. `record_run` gets each batch's timing
+    and the host."""
     from elo_league import Othello
 
     from core.league.match import Programs, play_batch
@@ -416,8 +414,6 @@ def play_batched(
 
     openings = spec.choose_openings()
     host = hardware.describe(with_gpu=True)
-    if spec.solve_at is not None and solve is None:
-        solve = endgame_solve()
     game = Othello()
     dtype = next(
         (
@@ -503,12 +499,18 @@ def play(
     parallel: int = 1,
 ) -> None:
     """The games `numbers`, batched on the GPU if a network plays there, else one at a time,
-    or `parallel` at a time (`play_parallel`)."""
+    or `parallel` at a time (`play_parallel`), games stopped at a depth scored by one solver
+    (`endgame_solve`) for them all."""
     if not numbers:
         return
-    if spec.batched:
-        play_batched(spec, match_id, numbers, emit, record_run)
-    elif parallel > 1:
-        play_parallel(spec, match_id, numbers, emit, parallel)
-    else:
-        play_sequential(spec, match_id, numbers, emit)
+    solver = endgame_solve(spec.solve_at) if spec.solve_at is not None else None
+    try:
+        if spec.batched:
+            play_batched(spec, match_id, numbers, emit, record_run, solve=solver)
+        elif parallel > 1:
+            play_parallel(spec, match_id, numbers, emit, parallel, solve=solver)
+        else:
+            play_sequential(spec, match_id, numbers, emit, solve=solver)
+    finally:
+        if solver is not None:
+            solver.close()

@@ -23,12 +23,13 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 import numpy as np
 from game import PASS, action, square
@@ -1054,36 +1055,67 @@ class NeuralReversi(GTPEngine):
 _SOLVE_ROW = re.compile(r"\|\s*(\d+)\s*\|\s*\d+\s*\|\s*([+-]\d+)\s*\|")
 
 
-def solve_scores(text: str, positions: int) -> list[int]:
-    """The scores, in order, of `positions` positions in `cli solve`'s output."""
-    scores = {int(m[1]): int(m[2]) for m in _SOLVE_ROW.finditer(text)}
-    if sorted(scores) != list(range(1, positions + 1)):
-        raise RuntimeError(
-            f"cli solve gave {len(scores)} of {positions} scores: {text[-500:]}"
-        )
-    return [scores[i] for i in range(1, positions + 1)]
+class ExactSolver:
+    """Neural Reversi's exact solver (`cli solve --exact`, the fastest public endgame solver),
+    called as solve(the mover's discs, the opponent's): the position's final margin for the
+    player to move, with perfect play by both.
 
+    One process answers every solve, reading positions from its stdin a line at a time: its
+    start-up (loading its networks) takes about 0.75 s, against 5-30 ms for a solve from 20
+    empties. It clears its hash table before each position, so each is solved as if alone.
+    Solves from several threads take turns: each one uses all `threads`."""
 
-def solve_exactly(
-    positions: Sequence[tuple[int, int]], threads: int, engine_dir: Path | None = None
-) -> list[int]:
-    """Neural Reversi's exact solves (`cli solve --exact`, the fastest public endgame solver) of
-    positions given as (the mover's discs, the opponent's): each one's final margin for the
-    player to move, with perfect play by both."""
-    engine_dir = engine_dir or NeuralReversi.default_dir()
-    with tempfile.TemporaryDirectory(prefix="nr-solve-") as tmp:
-        obf = Path(tmp) / "positions.obf"
-        obf.write_text(
-            "".join(
-                f"{board_string(me, opp, 'X', 'O', '-')} X\n" for me, opp in positions
-            )
-        )
-        done = subprocess.run(
-            [str(engine_dir / "target" / "release" / "cli"), "solve", str(obf), "--exact",
-             "--threads", str(threads), "--hash-size", "1024"],
-            cwd=engine_dir, capture_output=True, text=True, check=True,
+    def __init__(
+        self, threads: int, engine_dir: Path | None = None, hash_mb: int = 1024
+    ):
+        engine_dir = engine_dir or NeuralReversi.default_dir()
+        # what it says on stderr, for an error; kept as long as it runs
+        self.errors = tempfile.TemporaryFile("w+")  # noqa: SIM115
+        self.process = subprocess.Popen(
+            [str(engine_dir / "target" / "release" / "cli"), "solve", "/dev/stdin",
+             "--exact", "--threads", str(threads), "--hash-size", str(hash_mb)],
+            cwd=engine_dir, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=self.errors, text=True, bufsize=1,
         )  # fmt: skip
-    return solve_scores(done.stdout, len(positions))
+        self.solved = 0
+        self.lock = threading.Lock()
+
+    def __call__(self, me: int, opp: int) -> int:
+        process = self.process
+        assert process.stdin is not None and process.stdout is not None
+        with self.lock:
+            process.stdin.write(f"{board_string(me, opp, 'X', 'O', '-')} X\n")
+            process.stdin.flush()
+            self.solved += 1
+            output = []
+            while line := process.stdout.readline():
+                output.append(line)
+                row = _SOLVE_ROW.match(line)
+                if row is not None and int(row[1]) == self.solved:
+                    return int(row[2])
+        self.errors.seek(0)
+        raise RuntimeError(
+            f"cli solve ended without solving position {self.solved}: "
+            f"{''.join(output)[-500:]}{self.errors.read()[-500:]}"
+        )
+
+    def close(self) -> None:
+        if self.process.stdin is not None:
+            self.process.stdin.close()
+        try:
+            self.process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait()
+        if self.process.stdout is not None:
+            self.process.stdout.close()
+        self.errors.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
 
 class ClockedNeuralReversi(ClockedEngine):

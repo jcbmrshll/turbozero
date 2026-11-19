@@ -30,9 +30,9 @@ from engines import (
     Board,
     ClockedEgaroucid,
     Egaroucid,
+    ExactSolver,
     GTPEngine,
     default_dir,
-    solve_exactly,
 )
 from ggs import (
     Clock,
@@ -117,16 +117,14 @@ Solve = Callable[[int, int], int]
 UNTIMED = Clock.contest(1e9)
 
 
-def endgame_solve() -> Solve:
-    """What a match's games stopped at a depth are scored by: Neural Reversi's exact solver
-    (`engines.solve_exactly`, the fastest public one) on all the cores we may run on, for a
-    position's final margin with perfect play."""
-    threads = len(cpus())
+def endgame_solve(solve_at: int) -> ExactSolver:
+    """What a match's games stopped at `solve_at` empties are scored by: Neural Reversi's exact
+    solver (`engines.ExactSolver`, the fastest public one) on all the cores we may run on, for a
+    position's final margin with perfect play. One process for the match: close it after.
 
-    def solve(me: int, opp: int) -> int:
-        return solve_exactly([(me, opp)], threads)[0]
-
-    return solve
+    Its hash table is cleared before each solve, which for 1 GB costs about 20 ms, as much as a
+    solve from 20 empties; up to 24 empties 64 MB solves as fast, from 28 a solve takes seconds."""
+    return ExactSolver(len(cpus()), hash_mb=64 if solve_at <= 24 else 1024)
 
 
 class GameRun:
