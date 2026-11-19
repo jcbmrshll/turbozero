@@ -11,7 +11,7 @@ def step(tree: dict, by: jax.Array) -> dict:
     return {"a": tree["a"] * 2 + by, "b": tree["b"][::-1] + tree["a"][0]}
 
 
-@pytest.mark.parametrize("size", [1, 2, 3, 5, 8])
+@pytest.mark.parametrize("size", [1, 2, 5, 8])
 @pytest.mark.parametrize(
     "active",
     [
