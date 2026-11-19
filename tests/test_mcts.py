@@ -708,6 +708,37 @@ def test_iterations_do_not_depend_on_the_trees_capacity(env):
             np.testing.assert_array_equal(x, y[: a.capacity])
 
 
+@pytest.mark.parametrize("traversal_steps", [2, 3])
+def test_iterations_do_not_depend_on_the_traversals_steps_between_checks(
+    env, traversal_steps
+):
+    # batched, the trees' traversals end at different depths, and steps past a traversal's leaf
+    # (to the next check, or until the deepest in the batch is done) must change nothing
+    trees = [build_tree(make_mcts(max_nodes=16), env, nodes) for nodes in SHAPES]
+    trees = jax.tree.map(lambda *x: jnp.stack(x), *trees)
+    keys = jax.random.split(jax.random.PRNGKey(0), len(SHAPES))
+
+    def run(search):
+        cycles = jnp.arange(1, 7)
+        return jax.jit(jax.vmap(search_cycles(search, env, cycles)))(keys, trees)
+
+    assert_trees_equal(
+        run(
+            make_mcts(
+                max_nodes=16,
+                leaf_eval_fn=varying_eval_fn,
+                traversal_steps=traversal_steps,
+            )
+        ),
+        run(make_mcts(max_nodes=16, leaf_eval_fn=varying_eval_fn)),
+    )
+
+
+def test_traversal_steps_is_at_least_1():
+    with pytest.raises(ValueError, match="traversal_steps"):
+        make_mcts(traversal_steps=0)
+
+
 # a search a cycle at a time, as self-play runs it
 
 
