@@ -11,9 +11,10 @@ openings (see xot.py), which keeps them varied.
     uv run examples/othello/train.py --sims-schedule 0:32,50:64,150:128
 
 Every epoch it scores the network on the engine-labelled set, if there is one (see
-engine_set.py and --engine-set), logged as `engine_*`: `engine_exp_regret`, the discs its
-policy gives up against Edax's best move, is the one to watch. `filtered_engine_*` are the same
-over only the positions the network decides, from the XOT opening to the exact solver's 20 empty
+engine_set.py and --engine-set), logged as `engine_*`. `engine_result_change`, how likely the
+prior play's search starts from is to pick a move that worsens the result Edax predicts, is the
+one to watch: it ranks a run's checkpoints by strength. `filtered_engine_*` are the same over
+only the positions the network decides, from the XOT opening to the exact solver's 20 empty
 squares. Games measure strength:
 `evaluate.py` plays checkpoints against engines and each other, and the Elo league rates them.
 
@@ -60,6 +61,7 @@ from engine_set import EngineSet
 from exact_labels import SOLVERS, default_threads, make_solve_fn, solve_slots, stops_at
 from game import (
     DEFAULT_NET,
+    PLAY_PRIOR_TEMPERATURE,
     SGD_WEIGHT_DECAY,
     SYMMETRY_TRANSFORM_FNS,
     TRAVERSAL_STEPS,
@@ -179,6 +181,21 @@ def positive_schedule(text: str) -> list[tuple[int, int]]:
     if any(value < 1 for _, value in schedule):
         raise argparse.ArgumentTypeError(f"values must be positive, got {text!r}")
     return schedule
+
+
+def solve_empties(text: str) -> int | None:
+    """Parses --solve-empties: empty squares in [0, 60), or "off" (None)."""
+    if text == "off":
+        return None
+    try:
+        empties = int(text)
+    except ValueError:
+        empties = -1
+    if not 0 <= empties < 60:
+        raise argparse.ArgumentTypeError(
+            f"empty squares in [0, 60) or off, got {text!r}"
+        )
+    return empties
 
 
 def play_past(text: str) -> float:
@@ -456,7 +473,7 @@ def main():
         "-THRESHOLD: 0.95 (an expected score of 2.5%%) if no threshold is given, 0.9 for "
         "5%%. Saves the searches of decided endgames for more games at "
         "the same compute: on 4x64 at 0.9, 1.26x the games per epoch, +7 ± 17 Elo. "
-        "Default: games are played to the end",
+        "Needs --solve-empties off. Default: no resigning",
     )
     parser.add_argument(
         "--resign-calibration",
@@ -467,31 +484,33 @@ def main():
     )
     parser.add_argument(
         "--solve-empties",
-        type=int,
-        default=None,
+        type=solve_empties,
+        default=20,
         metavar="N",
-        help="exact endgame labels: self-play's games stop at N or fewer empty squares, and "
-        "an exact solver's result for that position is every position's value target (see "
-        "exact_labels.py). A game stopped in an epoch is solved during the next epoch's "
-        "self-play and trained on from then. Default: games are played to the end",
+        help="exact endgame labels: once a self-play game reaches N or fewer empty squares, "
+        "an exact solver's result for that position is every earlier position's value "
+        "target, and with the default --solve-play-past end each stored position from there "
+        "on gets its own exact result (see exact_labels.py). A game cut in an epoch is "
+        "solved during the next epoch's self-play and trained on from then. Default 20; off "
+        "plays games to the end and labels them with the played result",
     )
     parser.add_argument(
         "--solve-share",
         type=float,
         default=1.0,
-        help="with --solve-empties, the fraction of games that stop; the others are played "
-        "to the end, so that training still sees positions past N",
+        help="with --solve-empties, the fraction of games labelled exactly; the others are "
+        "played to the end and labelled with their played result",
     )
     parser.add_argument(
         "--solve-play-past",
         type=play_past,
-        default=0.0,
+        default=math.inf,
         metavar="MEAN",
         help="with --solve-empties, games play on past N empty squares, ending before each "
         "further move with probability 1 / (1 + MEAN): MEAN moves on average; end (or inf) "
         "plays every game to its end. Each position stored past N is solved and labelled on "
         "its own, so the network still trains on positions past N, which searches from above "
-        "N reach. Default 0: games stop at N",
+        "N reach. 0 stops games at N. Default end",
     )
     parser.add_argument(
         "--solver",
@@ -1026,11 +1045,8 @@ def main():
         parser.error("--resign must be in (0, 1]")
     if not 0 <= args.resign_calibration <= 1:
         parser.error("--resign-calibration must be between 0 and 1")
-    if args.solve_empties is not None:
-        if not 0 <= args.solve_empties < 60:
-            parser.error("--solve-empties must be in [0, 60)")
-        if args.resign is not None:
-            parser.error("--solve-empties doesn't go with --resign")
+    if args.solve_empties is not None and args.resign is not None:
+        parser.error("--resign needs --solve-empties off")
     if not 0 <= args.solve_share <= 1:
         parser.error("--solve-share must be between 0 and 1")
     if args.dirichlet_alpha <= 0:
@@ -1162,6 +1178,7 @@ def main():
                 epochs_per_test=args.engine_eval_every,
                 name=name,
                 config=config,
+                prior_temperature=PLAY_PRIOR_TEMPERATURE,
             )
             for name, filtered in (("engine", False), ("filtered_engine", True))
         ]

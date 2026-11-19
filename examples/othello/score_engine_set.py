@@ -16,7 +16,7 @@ import json
 from pathlib import Path
 
 from engine_set import DEFAULT_PATH, EngineSet
-from game import DEFAULT_NET, load_checkpoint
+from game import DEFAULT_NET, PLAY_PRIOR_TEMPERATURE, load_checkpoint
 
 from core.testing.scored_positions import METRICS, ScoredPositionsTester
 
@@ -60,6 +60,7 @@ def main():
                     engine_set.scored_positions(args.by_source, filtered),
                     network,
                     name=name,
+                    prior_temperature=PLAY_PRIOR_TEMPERATURE,
                 )
                 for name, filtered in (("engine", False), ("filtered_engine", True))
             ]

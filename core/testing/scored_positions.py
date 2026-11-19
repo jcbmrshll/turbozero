@@ -11,7 +11,7 @@ from core.networks.utils import apply_nn
 from core.testing.tester import BaseTester, TestState
 
 # what `scored_position_metrics` reports, for all positions and for each group
-METRICS = ("top1", "regret", "exp_regret", "value_mse", "value_sign")
+METRICS = ("top1", "regret", "exp_regret", "value_mse", "value_sign", "result_change")
 
 
 @dataclass(frozen=True)
@@ -39,6 +39,7 @@ def scored_position_metrics(
     legal: ArrayLike,
     scores: ArrayLike,
     groups: ArrayLike,
+    prior_temperature: float = 1.0,
 ) -> jax.Array:
     """How a network's raw outputs (no search) measure up to an engine's scores of positions'
     actions, for each of several groups of the positions:
@@ -47,6 +48,11 @@ def scored_position_metrics(
     - `exp_regret`: the same, expected under its policy: smoother, so less noisy
     - `value_mse`: (value - z)^2, z the sign of the engine's best score (its predicted outcome)
     - `value_sign`: how often its value has z's sign, over positions where z isn't 0
+    - `result_change`: the probability that its prior picks an action that worsens the outcome
+      the engine predicts (an action whose score has a lower sign than the best's: a win to a
+      draw or a loss, or a draw to a loss), the prior being softmax(logits / prior_temperature).
+      Unlike regret, it doesn't count score given up by actions that keep the outcome, which a
+      network trained on outcomes has no reason to avoid
 
     Args:
         logits: (N, A) policy logits
@@ -54,6 +60,8 @@ def scored_position_metrics(
         legal: (N, A) bool, legal actions
         scores: (N, A) the engine's scores, higher better (ignored where illegal)
         groups: (G, N) bool, which positions each group has
+        prior_temperature: the temperature of the prior `result_change` samples from, e.g. the
+            one a search flattens the policy with
 
     Returns:
         jax.Array: (G, len(METRICS)), each group's metrics, in the order of `METRICS`
@@ -69,6 +77,9 @@ def scored_position_metrics(
     exp_regret = jnp.sum(jax.nn.softmax(logits, axis=1) * loss, axis=1)
     z = jnp.sign(best)
     decided = z != 0
+    worsens = legal & (jnp.sign(scores) < z[:, None])
+    prior = jax.nn.softmax(logits / prior_temperature, axis=1)
+    result_change = jnp.sum(jnp.where(worsens, prior, 0.0), axis=1)
     per_position = jnp.stack(
         [
             (regret == 0).astype(jnp.float32),
@@ -76,17 +87,16 @@ def scored_position_metrics(
             exp_regret,
             (value - z) ** 2,
             (jnp.sign(value) == z).astype(jnp.float32),
+            result_change,
         ],
         axis=1,
     )
     # value_sign only counts the positions the engine doesn't call a draw
     weights = groups.astype(jnp.float32)
-    counts = jnp.stack(
-        [weights.sum(axis=1)] * 4 + [(weights * decided).sum(axis=1)], axis=1
-    )
+    counted = [weights] * 4 + [weights * decided, weights]
+    counts = jnp.stack([w.sum(axis=1) for w in counted], axis=1)
     sums = jnp.stack(
-        [weights @ per_position[:, i] for i in range(4)]
-        + [(weights * decided) @ per_position[:, 4]],
+        [w @ per_position[:, i] for i, w in enumerate(counted)],
         axis=1,
     )
     return sums / jnp.maximum(counts, 1)
@@ -108,6 +118,7 @@ class ScoredPositionsTester(BaseTester):
         epochs_per_test: int = 1,
         name: str = "engine",
         config: dict | None = None,
+        prior_temperature: float = 1.0,
     ):
         """
         Args:
@@ -119,6 +130,9 @@ class ScoredPositionsTester(BaseTester):
             name: prefixes the metrics
             config: (optional) recorded with the tester's configuration, e.g. where the
                 positions came from
+            prior_temperature: the temperature of the prior `result_change` is measured under
+                (see `scored_position_metrics`): the one the play search flattens the policy
+                with, so that it measures the prior the search starts from
         """
         super().__init__(num_keys=1, epochs_per_test=epochs_per_test, name=name)
         n = len(positions.legal)
@@ -141,6 +155,7 @@ class ScoredPositionsTester(BaseTester):
         self.num_positions = n
         self.batch_size = batch_size
         self.extra_config = config or {}
+        self.prior_temperature = prior_temperature
         static = eqx.filter(nn, eqx.is_inexact_array, inverse=True)
 
         @jax.jit
@@ -153,7 +168,9 @@ class ScoredPositionsTester(BaseTester):
             )
             logits = logits.reshape(-1, logits.shape[-1])
             value = value.reshape(-1)
-            return scored_position_metrics(logits, value, legal, scores, groups)
+            return scored_position_metrics(
+                logits, value, legal, scores, groups, prior_temperature
+            )
 
         self._evaluate = evaluate
 
@@ -162,6 +179,7 @@ class ScoredPositionsTester(BaseTester):
             **super().get_config(),
             "positions": self.num_positions,
             "groups": self.group_names[1:],
+            "prior_temperature": self.prior_temperature,
             **self.extra_config,
         }
 

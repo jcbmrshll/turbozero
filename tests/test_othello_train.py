@@ -2,6 +2,7 @@
 
 import math
 import sys
+from types import SimpleNamespace
 
 import jax.numpy as jnp
 import numpy as np
@@ -23,8 +24,13 @@ def fake_trainer(**kwargs):
     raise BuiltTrainer(**kwargs)
 
 
+def fake_solve_fn(solver, threads):
+    return lambda positions: np.zeros((len(positions.current_player), 2), np.float32)
+
+
 def run_main(monkeypatch, *args):
     monkeypatch.setattr(train, "Trainer", fake_trainer)
+    monkeypatch.setattr(train, "make_solve_fn", fake_solve_fn)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -54,8 +60,18 @@ def test_root_noise_options_out_of_range_are_refused(monkeypatch, option):
     "options, resignation",
     [
         ((), None),
-        (("--resign",), (0.95, 0.1)),
-        (("--resign", "0.9", "--resign-calibration", "0.2"), (0.9, 0.2)),
+        (("--solve-empties", "off", "--resign"), (0.95, 0.1)),
+        (
+            (
+                "--solve-empties",
+                "off",
+                "--resign",
+                "0.9",
+                "--resign-calibration",
+                "0.2",
+            ),
+            (0.9, 0.2),
+        ),
     ],
 )
 def test_resignation_is_off_unless_asked_for(monkeypatch, options, resignation):
@@ -69,7 +85,13 @@ def test_resignation_is_off_unless_asked_for(monkeypatch, options, resignation):
 
 
 @pytest.mark.parametrize(
-    "option", [("--resign", "0"), ("--resign", "1.5"), ("--resign-calibration", "2")]
+    "option",
+    [
+        ("--solve-empties", "off", "--resign", "0"),
+        ("--solve-empties", "off", "--resign", "1.5"),
+        ("--resign-calibration", "2"),
+        ("--resign",),
+    ],
 )
 def test_resignation_options_out_of_range_are_refused(monkeypatch, option):
     with pytest.raises(SystemExit):
@@ -346,6 +368,7 @@ def test_warm_starts_reach_the_training_loop(monkeypatch):
             loops.append(kwargs)
 
     monkeypatch.setattr(train, "Trainer", Trainer)
+    monkeypatch.setattr(train, "make_solve_fn", fake_solve_fn)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -583,15 +606,35 @@ def test_a_fixed_network_can_play_and_keep_its_moves(monkeypatch, tmp_path):
     assert built.value.kwargs["log_moves"] == str(tmp_path / "moves")
 
 
-def fake_solve_fn(solver, threads):
-    return lambda positions: np.zeros((len(positions.current_player), 2), np.float32)
+def test_every_position_at_20_empties_or_fewer_is_solved_by_default(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch)
+    solve = built.value.kwargs["endgame_solve"]
+    assert solve.play_past == math.inf
+    assert solve.share == 1.0
+    assert solve.get_config()["play_past"] == "end"
+    # the cut is at 20 empty squares: 44 discs on the board
+    for discs, stops in ((43, False), (44, True)):
+        observation = jnp.zeros(128).at[:discs].set(1).reshape(8, 8, 2)
+        assert bool(solve.stop_fn(SimpleNamespace(observation=observation))) is stops
+
+
+def test_solve_empties_off_plays_games_out(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, "--solve-empties", "off")
+    assert built.value.kwargs["endgame_solve"] is None
+
+
+@pytest.mark.parametrize("value", ["-1", "60", "none", "2.5"])
+def test_bad_solve_empties_is_refused(monkeypatch, value):
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, "--solve-empties", value)
 
 
 @pytest.mark.parametrize("value", ["end", "inf"])
 def test_play_past_end_plays_every_game_to_its_end_with_room_for_its_solves(
     monkeypatch, value
 ):
-    monkeypatch.setattr(train, "make_solve_fn", fake_solve_fn)
     with pytest.raises(BuiltTrainer) as built:
         run_main(monkeypatch, "--solve-empties", "20", "--solve-play-past", value)
     solve = built.value.kwargs["endgame_solve"]
