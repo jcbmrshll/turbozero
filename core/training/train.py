@@ -4344,11 +4344,12 @@ class Trainer:
                     self.solve_waiting,
                     jax.tree.map(np.asarray, collection_state.pending),
                 )
-                if not self.memory_buffer.sample_mask(
-                    collection_state.buffer_state
-                ).any():
-                    # nothing to train on yet (e.g. a new run's first epoch, whose games all
-                    # stopped): they're labelled once solved
+                if (
+                    self.memory_buffer.sample_mask(collection_state.buffer_state).sum()
+                    < self.train_batch_size
+                ):
+                    # not a training batch to train on yet (e.g. a new run's first epoch, whose
+                    # games nearly all stopped): they're labelled once solved
                     self.set_activity(f"epoch {cur_epoch}: solving")
                     started_waiting = time.perf_counter()
                     solved.append(solving.result())
