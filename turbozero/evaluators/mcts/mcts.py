@@ -45,6 +45,7 @@ class MCTS(Evaluator):
         count_reused_visits: bool = False,
         min_iterations: int = 0,
         traversal_steps: int = 1,
+        prior_temperature: float = 1.0,
     ):
         """
         Args:
@@ -94,7 +95,16 @@ class MCTS(Evaluator):
                 traversal steps until the deepest in the batch is done: more
                 steps a check wait less and compute more, and which is fastest
                 depends on the trees' depth
+            prior_temperature: (optional) the softmax temperature of the prior, at every node: the
+                network's policy logits are divided by it before the softmax (default: 1.0, the
+                policy itself). Above 1 flattens the prior, so the search tries more of the moves
+                the network rates low (Leela Chess Zero's policy softmax temperature). The root's
+                noise is mixed into the flattened prior
         """
+        if prior_temperature <= 0:
+            raise ValueError(
+                f"prior_temperature must be positive, got {prior_temperature}"
+            )
         assert traversal_steps >= 1
         assert 0 <= min_iterations <= num_iterations
         assert 0 < full_probability <= 1
@@ -114,6 +124,7 @@ class MCTS(Evaluator):
         self.count_reused_visits = count_reused_visits
         self.min_iterations = min_iterations
         self.traversal_steps = traversal_steps
+        self.prior_temperature = prior_temperature
 
     def get_config(self) -> dict:
         return {
@@ -132,6 +143,7 @@ class MCTS(Evaluator):
             "count_reused_visits": self.count_reused_visits,
             "min_iterations": self.min_iterations,
             "traversal_steps": self.traversal_steps,
+            "prior_temperature": self.prior_temperature,
         }
 
     def evaluate(
@@ -347,7 +359,7 @@ class MCTS(Evaluator):
         """
         mask = root_metadata.action_mask
         lowest = jnp.finfo(policy_logits).min
-        policy = jax.nn.softmax(jnp.where(mask, policy_logits, lowest))
+        policy = self.prior(policy_logits, mask)
         prior = policy
         if self.dirichlet_epsilon:
             # the softmax of log-Gamma(alpha) draws is a Dirichlet(alpha) sample,
@@ -371,6 +383,27 @@ class MCTS(Evaluator):
             embedding=root_embedding,
         )
         return tree.set_root(node, write=write)
+
+    def prior(self, policy_logits: jax.Array, action_mask: jax.Array) -> jax.Array:
+        """A node's prior over its legal actions: the softmax of the network's policy logits
+        at `prior_temperature`, 0 for illegal actions.
+
+        Args:
+            policy_logits: the network's policy logits
+            action_mask: the legal actions
+
+        Returns:
+            jax.Array: the prior
+        """
+        # divided before masking, so the masked logits stay finite: dividing the lowest float by a
+        # temperature below 1 would overflow it
+        return jax.nn.softmax(
+            jnp.where(
+                action_mask,
+                policy_logits / self.prior_temperature,
+                jnp.finfo(policy_logits).min,
+            )
+        )
 
     def find_leaf(
         self, key: jax.Array, tree: MCTSTree, env_step_fn: EnvStepFn
@@ -445,11 +478,7 @@ class MCTS(Evaluator):
         node = MCTSNode(
             n=jnp.where(exists, node.n + 1, 1),
             q=jnp.where(exists, (node.q * node.n + value) / (node.n + 1), value),
-            p=jax.nn.softmax(
-                jnp.where(
-                    metadata.action_mask, policy_logits, jnp.finfo(policy_logits).min
-                )
-            ),
+            p=self.prior(policy_logits, metadata.action_mask),
             terminated=metadata.terminated,
             embedding=embedding,
         )
