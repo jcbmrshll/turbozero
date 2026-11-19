@@ -807,6 +807,14 @@ def search_until_done(search, env):
             "count_reused_visits": True,
             "key": 10,
         },
+        {
+            "full_probability": 0.5,
+            "fast_iterations": 2,
+            "count_reused_visits": True,
+            "min_iterations": 1,
+            "traversal_steps": 3,
+            "prior_temperature": 2.0,
+        },
     ],
     ids=[
         "iterations",
@@ -815,6 +823,7 @@ def search_until_done(search, env):
         "visits",
         "visits-min-2",
         "playout-cap-fast-visits",
+        "every-option",
     ],
 )
 def test_a_search_a_cycle_at_a_time_is_evaluate(env, reused, budget):
@@ -896,7 +905,20 @@ def test_batched_cycles_match_each_trees_cycle_alone(env):
         )
 
 
-def test_search_cycles_write_trees_in_place_and_loop_only_to_traverse(env):
+# every option on
+ALL_OPTIONS = {
+    **NOISE,
+    "full_probability": 0.5,
+    "fast_iterations": 2,
+    "count_reused_visits": True,
+    "min_iterations": 1,
+    "traversal_steps": 3,
+    "prior_temperature": 2.0,
+}
+
+
+@pytest.mark.parametrize("options", [NOISE, ALL_OPTIONS], ids=["noise", "every-option"])
+def test_search_cycles_write_trees_in_place_and_loop_only_to_traverse(env, options):
     # a copy of an array of the trees' nodes in a cycle makes each cycle's cost grow
     # with the trees' capacity: e.g. where the root's update reads what the iteration
     # writes (or the other way round) and XLA doesn't order the reads first, it
@@ -905,7 +927,7 @@ def test_search_cycles_write_trees_in_place_and_loop_only_to_traverse(env):
     # noise is drawn once, before the cycles)
     batch, capacity = 5, 24
     search = make_mcts(
-        max_nodes=capacity, leaf_eval_fn=state_eval_fn, num_iterations=6, **NOISE
+        max_nodes=capacity, leaf_eval_fn=state_eval_fn, num_iterations=6, **options
     )
     trees = jax.vmap(lambda _: search.init(template_embedding=env.init_fn(None)[0]))(
         jnp.arange(batch)

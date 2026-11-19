@@ -23,6 +23,7 @@ class MCTS(Evaluator):
     the value up to the root. After `num_iterations` iterations, the move is
     sampled from the root's visit counts. As in AlphaZero, the root's prior can
     take Dirichlet noise, so that self-play tries moves the network rates low.
+    Options can make some searches shorter (see `search_done`).
 
     The search's state is an `MCTSTree`, which methods take and return rather
     than store, so searches can be jitted and vmapped.
@@ -101,11 +102,11 @@ class MCTS(Evaluator):
                 so the search tries more of the actions the network rates low;
                 the root's noise is mixed into the flattened prior
         """
-        assert traversal_steps >= 1
-        assert prior_temperature > 0
-        assert 0 <= min_iterations <= num_iterations
         assert 0 < full_probability <= 1
         assert full_probability == 1 or 0 < fast_iterations < num_iterations
+        assert 0 <= min_iterations <= num_iterations
+        assert traversal_steps >= 1
+        assert prior_temperature > 0
         super().__init__(discount=discount)
         self.leaf_eval_fn = leaf_eval_fn
         self.num_iterations = num_iterations
@@ -154,11 +155,12 @@ class MCTS(Evaluator):
     ) -> EvalOutput:
         """Runs a whole search for one move and picks the move.
 
-        Evaluates the root, runs `num_iterations` iterations, then samples the
-        move from the root's visit counts (see `search_output`). `eval_state` is
-        an empty tree or the subtree kept from the previous move. Uses the same
-        keys as running the search a cycle at a time (`start_search`,
-        `search_cycle`, `search_output`), so both give the same result.
+        Evaluates the root, runs `num_iterations` iterations (or fewer, see
+        `search_done`), then samples the move from the root's visit counts (see
+        `search_output`). `eval_state` is an empty tree or the subtree kept from
+        the previous move. Uses the same keys as running the search a cycle at a
+        time (`start_search`, `search_cycle` until `search_done`,
+        `search_output`), so both give the same result.
         """
         tree = self.start_search(key, eval_state)
         root_key, iterate_key, _ = jax.random.split(key, 3)
@@ -187,8 +189,8 @@ class MCTS(Evaluator):
         )
 
     def search_cycles(self) -> int:
-        """The number of cycles in a search: one to evaluate the root, then one
-        per iteration.
+        """The number of cycles in a full search: one to evaluate the root,
+        then one per iteration.
         """
         return self.num_iterations + 1
 
@@ -262,7 +264,8 @@ class MCTS(Evaluator):
 
         Every cycle calls `leaf_eval_fn` exactly once, so a batch of searches at
         different cycles shares one batched evaluation. Cycles past
-        `num_iterations` keep iterating, each with a key of its own.
+        `search_done` keep iterating (self-play runs them while it waits to
+        play its moves), each with a key of its own.
         """
         root_key, iterate_key, _ = jax.random.split(key, 3)
         # the same key `evaluate` gives this iteration: the i-th key of a split
@@ -355,21 +358,21 @@ class MCTS(Evaluator):
         False (see `Tree.set_root`).
         """
         mask = root_metadata.action_mask
-        lowest = jnp.finfo(policy_logits).min
-        policy = self.prior(policy_logits, mask)
-        prior = policy
+        prior = self.prior(policy_logits, mask)
         if self.dirichlet_epsilon:
             # the softmax of log-Gamma(alpha) draws is a Dirichlet(alpha) sample,
             # here over the legal actions only, as in AlphaZero. Both are
             # distributions over the legal actions, so their mix is too
+            lowest = jnp.finfo(policy_logits).min
             noise = jax.nn.softmax(jnp.where(mask, tree.root_noise, lowest))
             epsilon = self.dirichlet_epsilon
-            prior = (1 - epsilon) * prior + epsilon * noise
-        if self.full_probability < 1:
+            mixed = (1 - epsilon) * prior + epsilon * noise
             # fast searches' roots take no noise. The barrier keeps XLA from
             # fusing the mix into the select, which it does differently in
             # `evaluate` and in a search a cycle at a time, rounding differently
-            prior = jnp.where(tree.fast, policy, jax.lax.optimization_barrier(prior))
+            if self.full_probability < 1:
+                mixed = jnp.where(tree.fast, prior, jax.lax.optimization_barrier(mixed))
+            prior = mixed
         node = tree.data_at(tree.ROOT_INDEX)
         visited = node.n > 0
         node = replace(
