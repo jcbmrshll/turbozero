@@ -939,15 +939,14 @@ void net_add_block(net::Net* n, int pool_channels) {
     n->blocks.back().pool_channels = pool_channels;
 }
 
-// A convolution: "stem", "head" (the heads' three 1x1 convolutions in one), or a block's "conv1" or
-// "conv2". `q`, (cout, cin, k, k), its weights; `scale`
+// A convolution: "head" (the heads' three 1x1 convolutions in one), or a block's "conv1", "conv2",
+// "expand" or "project" (the stem's is `net_set_stem`). `q`, (cout, cin, k, k), its weights; `scale`
 // and `bias`, of each output, what its integer sums are multiplied by and then added to; `inverse`,
 // of each input channel, and `zero_point`, how its input is quantized: round(x * inverse) + zero_point.
 int net_set_conv(net::Net* n, const char* where, int block, int cin, int cout, int k, const int8_t* q,
                  const float* scale, const float* bias, const float* inverse, int zero_point) {
     std::string name(where);
-    net::Conv* c = name == "stem"    ? &n->stem
-                   : name == "head" ? &n->head
+    net::Conv* c = name == "head"    ? &n->head
                    : name == "conv1" ? &n->blocks.at(block).conv1
                    : name == "conv2" ? &n->blocks.at(block).conv2
                    : name == "expand" ? &n->blocks.at(block).expand
@@ -957,10 +956,7 @@ int net_set_conv(net::Net* n, const char* where, int block, int cin, int cout, i
     c->cin = cin;
     c->cout = cout;
     c->k = k;
-    if (c == &n->stem) {
-        if (cin != 4 || k != 3) return -1;
-        net::stem_table(*c, q);
-    } else if (name != "expand" && name != "project") {
+    if (name != "expand" && name != "project") {
         net::pack(*c, q);
     } else if (k != 1 || cin % 16 || (name == "project" && zero_point != 0)) {
         // (a project's input is ReLU's, from 0: AVX2's kernels take its zero point as 0)
@@ -976,6 +972,20 @@ int net_set_conv(net::Net* n, const char* where, int block, int cin, int cout, i
 #endif
         net::pack1x1(*c, q, name == "expand");
     }
+    return 0;
+}
+
+// The stem's convolution: `q`, (cout, 4, 3, 3), its 16-bit weights, the last 2 input channels padding
+// (see `net::stem_table`); `scale` and `bias` as `net_set_conv`'s. Its input, the discs, is 0 or 1.
+int net_set_stem(net::Net* n, int cout, const int16_t* q, const float* scale, const float* bias) {
+    if (cout % 16) return -1;
+    net::Conv& c = n->stem;
+    c.cin = 4;
+    c.cout = cout;
+    c.k = 3;
+    net::stem_table(c, q);
+    c.scale.assign(scale, scale + cout);
+    c.bias.assign(bias, bias + cout);
     return 0;
 }
 

@@ -1047,7 +1047,7 @@ def test_the_native_network_computes_its_quantized_layers(
     lib = library(level, monkeypatch)
     program = cpu_net.extract(*random_network(spec))
     x = (np.random.default_rng(0).random((48, 2, 8, 8)) < 0.3).astype(np.float32)
-    quantized = cpu_net.quantize(program, x)
+    program, quantized = cpu_net.quantize(program, x)
     # saved and loaded as play loads it
     cpu_net.save(tmp_path / "net.npz", program, quantized)
     program, quantized = cpu_net.load(tmp_path / "net.npz")
@@ -1099,7 +1099,7 @@ def test_avx_vnni_sums_as_avx2_does(spec, monkeypatch):
     libs = [library(level, monkeypatch) for level in ("v3-vnni", "v3")]
     program = cpu_net.extract(*random_network(spec))
     x = (np.random.default_rng(0).random((48, 2, 8, 8)) < 0.3).astype(np.float32)
-    quantized = cpu_net.quantize(program, x)
+    program, quantized = cpu_net.quantize(program, x)
     (logits, values), (want_logits, want_values) = [
         cpu_net.NativeNet(program, quantized, lib).forward(x) for lib in libs
     ]
@@ -1115,7 +1115,7 @@ def test_seven_bit_avx2_changes_only_convnext_blocks(spec, monkeypatch):
     libs = [library(level, monkeypatch) for level in ("v3-7bit", "v3")]
     program = cpu_net.extract(*random_network(spec))
     x = (np.random.default_rng(0).random((48, 2, 8, 8)) < 0.3).astype(np.float32)
-    quantized = cpu_net.quantize(program, x)
+    program, quantized = cpu_net.quantize(program, x)
     (logits, values), (want_logits, want_values) = [
         cpu_net.NativeNet(program, quantized, lib).forward(x) for lib in libs
     ]
@@ -1137,7 +1137,7 @@ def test_an_engine_of_the_native_network_searches_as_a_batch_of_one():
         pytest.skip("needs AVX2 or NEON's dot product")
     program = cpu_net.extract(*random_network(NATIVE_SPECS[1]))
     x = (np.random.default_rng(0).random((48, 2, 8, 8)) < 0.3).astype(np.float32)
-    network = cpu_net.NativeNet(program, cpu_net.quantize(program, x))
+    network = cpu_net.NativeNet(*cpu_net.quantize(program, x))
     reference, native = Search(), Search()
     for search in (reference, native):
         for action in (19, 18, 26):

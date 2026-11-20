@@ -144,6 +144,16 @@ def load_library() -> ctypes.CDLL:
             + [ctypes.c_int, ctypes.POINTER(ctypes.c_int8), floats, floats]
             + [floats, ctypes.c_int],
         ),
+        "net_set_stem": (
+            ctypes.c_int,
+            [
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_int16),
+                floats,
+                floats,
+            ],
+        ),
         "net_set_norm": (
             ctypes.c_int,
             [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int]

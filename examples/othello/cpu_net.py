@@ -12,7 +12,9 @@ A checkpoint outside the league is saved under the name evaluate.py's checkpoint
 Each convolution of the trunk takes 8-bit inputs, scaled for the whole tensor by the minimum and
 maximum seen in calibration (with a zero point when the minimum is below 0), and 8-bit weights
 scaled for each output channel, as `quantize.py`'s best OpenVINO model does; and so do the heads'
-first convolutions. The rest of the heads stays in float.
+first convolutions. The rest of the heads stays in float. The stem's weights take 16 bits, as its
+sums are looked up. Each convolution's biases are then corrected for the mean shift quantization
+leaves in its outputs, and so is the value's last bias (`bias_corrected`).
 A normalization of each square's channels runs in the pass that quantizes the next convolution's
 input, where OpenVINO runs it as several ops of its own.
 
@@ -22,6 +24,7 @@ C++ computes, in NumPy, for tests.
 
 import argparse
 import ctypes
+import dataclasses
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -295,7 +298,7 @@ def forward(
     p: Program, observations: np.ndarray, conv, record=None
 ) -> tuple[np.ndarray, np.ndarray]:
     """The network on (n, 2, 8, 8) observations, its trunk's convolutions by `conv(name, conv, x)`;
-    `record(name, x)` sees each one's input."""
+    `record(name, x)` sees each one's input, and the value before its tanh ("value")."""
     record = record or (lambda name, x: None)
     x = np.moveaxis(f32(observations), 1, -1)
 
@@ -340,8 +343,9 @@ def forward(
     squares = (policy @ p.square_w).reshape(len(x), 64)
     logits = np.concatenate([squares, dense(p.pass_linear, pooled)], -1)
     value = board_pool(normalize(p.value_norm, heads[..., 2 * h :], relu=True))
-    value = np.tanh(dense(p.value_out, np.maximum(dense(p.value_hidden, value), 0)))
-    return f32(logits), f32(value[:, 0])
+    value = dense(p.value_out, np.maximum(dense(p.value_hidden, value), 0))
+    record("value", value)
+    return f32(logits), f32(np.tanh(value[:, 0]))
 
 
 def float_forward(p: Program, observations: np.ndarray, record=None):
@@ -370,19 +374,20 @@ def input_ranges(
     return ranges
 
 
-def weights_int8(w: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """(out, ...) float weights as signed 8-bit, symmetric, and each output channel's scale."""
+def weights_int(w: np.ndarray, levels: int = 127) -> tuple[np.ndarray, np.ndarray]:
+    """(out, ...) float weights as signed integers from -`levels` to `levels`, symmetric (8 bits
+    for 127, else 16), and each output channel's scale."""
     flat = np.abs(w.reshape(len(w), -1)).max(1)
-    scale = np.where(flat > 0, flat / 127, 1).astype(np.float32)
-    q = np.clip(np.rint(w / scale.reshape(-1, *([1] * (w.ndim - 1)))), -127, 127)
-    return q.astype(np.int8), scale
+    scale = np.where(flat > 0, flat / levels, 1).astype(np.float32)
+    q = np.clip(np.rint(w / scale.reshape(-1, *([1] * (w.ndim - 1)))), -levels, levels)
+    return q.astype(np.int8 if levels <= 127 else np.int16), scale
 
 
 @dataclass
 class QuantizedConv:
-    """A convolution as the C++ takes it: int8 weights, (cout, cin, k, k), cin a multiple of 4; what
-    its sums are multiplied by and added to; and how its input is quantized: round(x * inverse) +
-    zero_point, `inverse` (cin) a scale for each channel."""
+    """A convolution as the C++ takes it: int8 weights (the stem's int16), (cout, cin, k, k), cin a
+    multiple of 4; what its sums are multiplied by and added to; and how its input is quantized:
+    round(x * inverse) + zero_point, `inverse` (cin) a scale for each channel."""
 
     q: np.ndarray
     scale: np.ndarray
@@ -401,20 +406,16 @@ def quantize_conv(
     c: Conv,
     low: np.ndarray,
     high: np.ndarray,
-    smooth: bool = True,
     alpha: float = ALPHA,
 ) -> QuantizedConv:
     """`c`, its input's channels ranging from `low` to `high`: each channel divided by a scale of
     its own (SmoothQuant's, `alpha`), folded into the weights, and then the whole input by one scale
     and zero point."""
     w = c.w
-    if smooth:
-        reach = np.maximum(np.maximum(-low, high), 1e-3)
-        weights = np.maximum(np.abs(w).max((0, 2, 3)), 1e-6)
-        channel = reach**alpha / weights ** (1 - alpha)
-        channel = f32(channel / channel.max())
-    else:
-        channel = np.ones(w.shape[1], np.float32)
+    reach = np.maximum(np.maximum(-low, high), 1e-3)
+    weights = np.maximum(np.abs(w).max((0, 2, 3)), 1e-6)
+    channel = reach**alpha / weights ** (1 - alpha)
+    channel = f32(channel / channel.max())
     w = w * channel[None, :, None, None]
     low_all = min(float((low / channel).min()), 0.0)
     high_all = max(float((high / channel).max()), 0.0)
@@ -425,12 +426,26 @@ def quantize_conv(
         pad = -w.shape[1] % 4
         w = np.pad(w, ((0, 0), (0, pad), (0, 0), (0, 0)))
         inverse = np.pad(inverse, (0, pad), constant_values=1)
-    q, w_scale = weights_int8(w)
+    q, w_scale = weights_int(w)
     scale = f32(in_scale * w_scale)
     # the zero point's share of each sum, taken back out
     sums = q.reshape(len(q), -1).astype(np.int64).sum(1)
     bias = f32(c.b - scale * zero_point * sums)
     return QuantizedConv(q, scale, bias, inverse, zero_point)
+
+
+# the stem's weights' largest magnitude: its input is the discs, 0 or 1, and its sums are looked up from
+# a table of 16-bit integers (`stem_table` in cpu_net.h), up to 18 weights a sum, so they take this
+# many steps a side where the other convolutions take 127. On one normalized ray 9x64, 8 bits' rounding
+# in the stem alone shifted the value by about 0.012 on average
+STEM_LEVELS = 32767 // 18
+
+
+def quantize_stem(c: Conv) -> QuantizedConv:
+    """The stem, `c`: its input 0 or 1, which the C++ takes as it is, and 16-bit weights."""
+    w = np.pad(c.w, ((0, 0), (0, -c.w.shape[1] % 4), (0, 0), (0, 0)))
+    q, scale = weights_int(w, STEM_LEVELS)
+    return QuantizedConv(q, scale, c.b.copy(), np.ones(w.shape[1], np.float32), 0)
 
 
 def pointwise(qc: QuantizedConv, x: np.ndarray) -> np.ndarray:
@@ -483,10 +498,13 @@ def layer_inputs(
     return seen
 
 
-def quantize(p: Program, positions: np.ndarray) -> dict[str, QuantizedConv]:
-    """The convolutions quantized, by name, their inputs' ranges from `positions`, (n, 2, 8,
-    8) observations (best the leaves of the network's own searches). A ConvNeXt block's 1x1s
-    search their quantization's settings on those inputs (`searched_conv`)."""
+def quantize(
+    p: Program, positions: np.ndarray
+) -> tuple[Program, dict[str, QuantizedConv]]:
+    """The program as the C++ should run it (`bias_corrected`) and its convolutions quantized, by
+    name, their inputs' ranges from `positions`, (n, 2, 8, 8) observations (best the leaves of the
+    network's own searches). A ConvNeXt block's 1x1s search their quantization's settings on those
+    inputs (`searched_conv`)."""
     ranges = input_ranges(p, positions)
     convs = {"stem": p.stem, "head": p.head}
     for i, b in enumerate(p.blocks):
@@ -508,38 +526,80 @@ def quantize(p: Program, positions: np.ndarray) -> dict[str, QuantizedConv]:
         for name, c in convs.items()
         if name != "stem"
     }
-    # the stem's input is 0 or 1, which the C++ writes as it is
-    ones = np.ones(2, np.float32)
-    quantized["stem"] = quantize_conv(p.stem, 0 * ones, 255 * ones, smooth=False)
-    return quantized
+    quantized["stem"] = quantize_stem(p.stem)
+    return bias_corrected(p, quantized, positions)
+
+
+def int8_conv(qc: QuantizedConv, x: np.ndarray) -> np.ndarray:
+    """A quantized convolution of (n, 8, 8, cin) features, as the C++ computes it (its integer sums
+    exact in float64)."""
+    if x.shape[-1] % 4:
+        x = np.pad(x, ((0, 0), (0, 0), (0, 0), (0, -x.shape[-1] % 4)))
+    u = np.clip(np.rint(x * qc.inverse) + qc.zero_point, 0, 255)
+    k = qc.q.shape[-1]
+    edge = k // 2
+    padded = np.pad(
+        u.astype(np.float64),
+        ((0, 0), (edge, edge), (edge, edge), (0, 0)),
+        constant_values=qc.zero_point,
+    )
+    acc = np.zeros(x.shape[:3] + (len(qc.q),), np.float64)
+    w = qc.q.astype(np.float64)
+    for dy in range(k):
+        for dx in range(k):
+            acc += padded[:, dy : dy + 8, dx : dx + 8] @ w[:, :, dy, dx].T
+    return f32(acc) * qc.scale + qc.bias
+
+
+def bias_corrected(
+    p: Program, q: dict[str, QuantizedConv], positions: np.ndarray
+) -> tuple[Program, dict[str, QuantizedConv]]:
+    """Moves each convolution's biases, in order through the network, by how far the mean of each
+    of its outputs over `positions` lies from the float network's, with the convolutions before it
+    already quantized and corrected; then the value's last bias by how far its mean before tanh
+    lies (the bias correction of Nagel et al. 2019, measured on calibration positions rather than
+    derived from BatchNorm's statistics).
+
+    Rounding leaves errors that don't average out, and they seem to add up through the trunk to a
+    shift of the whole value: on three ray 9x64 nets' test leaves, mean errors of 0.018-0.028
+    carried shifts of -0.023 to +0.004, which this left within 0.002 (0.004 on the engine-labelled
+    set) and the mean errors 0.014-0.016."""
+    means: dict[str, np.ndarray] = {}
+
+    def float_conv(name, c, x):
+        out = conv2d(x, c.w) + c.b
+        means[name] = out.reshape(-1, out.shape[-1]).mean(0, dtype=np.float64)
+        return out
+
+    def record_float(name, x):
+        if name == "value":
+            means[name] = x.mean(0, dtype=np.float64)
+
+    forward(p, positions, float_conv, record_float)
+    corrected: dict[str, QuantizedConv] = {}
+    shift = np.zeros(1)
+
+    def conv(name, _c, x):
+        qc = q[name]
+        out = int8_conv(qc, x)
+        delta = f32(
+            out.reshape(-1, out.shape[-1]).mean(0, dtype=np.float64) - means[name]
+        )
+        corrected[name] = dataclasses.replace(qc, bias=f32(qc.bias - delta))
+        return out - delta
+
+    def record(name, x):
+        if name == "value":
+            shift[:] = x.mean(0, dtype=np.float64) - means[name]
+
+    forward(p, positions, conv, record)
+    value_out = Linear(p.value_out.w, f32(p.value_out.b - shift))
+    return dataclasses.replace(p, value_out=value_out), corrected
 
 
 def int8_forward(p: Program, q: dict[str, QuantizedConv], observations: np.ndarray):
     """What the C++ computes, in NumPy."""
-
-    def conv(name, _c, x):
-        qc = q[name]
-        if x.shape[-1] % 4:
-            x = np.pad(x, ((0, 0), (0, 0), (0, 0), (0, -x.shape[-1] % 4)))
-        u = np.clip(np.rint(x * qc.inverse) + qc.zero_point, 0, 255)
-        k = qc.q.shape[-1]
-        edge = k // 2
-        padded = np.pad(
-            u,
-            ((0, 0), (edge, edge), (edge, edge), (0, 0)),
-            constant_values=qc.zero_point,
-        )
-        acc = np.zeros(x.shape[:3] + (len(qc.q),), np.int64)
-        w = qc.q.astype(np.int64)
-        for dy in range(k):
-            for dx in range(k):
-                acc += (
-                    padded[:, dy : dy + 8, dx : dx + 8].astype(np.int64)
-                    @ w[:, :, dy, dx].T
-                )
-        return f32(acc) * qc.scale + qc.bias
-
-    return forward(p, observations, conv)
+    return forward(p, observations, lambda name, _c, x: int8_conv(q[name], x))
 
 
 def save(path: Path, p: Program, q: dict[str, QuantizedConv]) -> None:
@@ -735,7 +795,17 @@ class NativeNet:
 
         for i, b in enumerate(p.blocks):
             lib.net_add_block(self.handle, b.pool_channels)
-        conv("stem", 0, q["stem"])
+        stem = q["stem"]
+        if stem.q.shape[1:] != (4, 3, 3) or lib.net_set_stem(
+            self.handle,
+            len(stem.q),
+            np.ascontiguousarray(stem.q, np.int16).ctypes.data_as(
+                ctypes.POINTER(ctypes.c_int16)
+            ),
+            ptr(stem.scale),
+            ptr(stem.bias),
+        ):
+            raise ValueError(f"the C++ can't take the stem: {stem.q.shape}")
         norm("stem", 0, p.stem_norm, p.channels)
         for i, b in enumerate(p.blocks):
             if isinstance(b, ConvNeXtBlock):
@@ -830,8 +900,7 @@ def main() -> None:
         parser.error("--net or --checkpoint")
     positions = np.load(args.positions)[: args.calibration]
     for name, path, net in nets:
-        program = extract_checkpoint(path, net)
-        save(native_path(name), program, quantize(program, positions))
+        save(native_path(name), *quantize(extract_checkpoint(path, net), positions))
         print(native_path(name), flush=True)
 
 

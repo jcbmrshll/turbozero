@@ -4,7 +4,7 @@
 // `core.networks.azresnet`).
 //
 // Each convolution takes 8-bit unsigned inputs (a scale and a zero point for the whole tensor, from
-// calibration) and 8-bit signed weights (a scale for each output channel), sums in 32-bit integers, and
+// calibration) and 8-bit signed weights (a scale for each output channel; the stem's 16-bit), sums in 32-bit integers, and
 // writes float outputs, acc * scale + bias, which per-square normalizations, the residual sum and the
 // global pooling then take in float, in as few passes over the board as they can: a normalization, its
 // ReLU and the next convolution's quantized input in one, where OpenVINO runs separate ops (see
@@ -1992,8 +1992,8 @@ inline void convnext_block(const Block& b, Scratch& s, float* x, int C) {
 }
 
 // The stem's convolution of the board, `obs`, (2, 8, 8), its discs 0 or 1, to `out`, (64, c.cout): each
-// square's sums are those of its 3 rows of 3 squares' discs' weights, looked up (`stem_table`). The
-// same integers as the convolution kernels sum, scaled the same way, so the same floats.
+// square's sums are those of its 3 rows of 3 squares' discs' weights, looked up (`stem_table`): the
+// integers the convolution summed directly would give, scaled as the other convolutions' are.
 inline void stem(const Conv& c, const float* obs, float* out) {
     // each side's discs, a bit a square
     uint64_t discs[2] = {0, 0};
@@ -2108,8 +2108,9 @@ inline void forward(const Net&, Scratch&, const float*, float*, float*) {
 // The stem's sums, for `stem`, from its weights `q`, (cout, 4, 3, 3), the last 2 input channels padding:
 // for each row of the 3 rows of 3 squares a square's sums take in (above, its own, below) and each
 // pattern of discs on that row's squares (6 bits: the mover's from the left, then the opponent's), the
-// sum of those discs' weights, (3, 64, cout), within 16 bits (and 3 rows' too: 18 weights of at most 127).
-inline void stem_table(Conv& c, const int8_t* q) {
+// sum of those discs' weights, (3, 64, cout), within 16 bits, and 3 rows' too: 18 weights of at most
+// 1820 (`cpu_net.py`'s STEM_LEVELS), finer than the other convolutions' 8 bits at no cost here.
+inline void stem_table(Conv& c, const int16_t* q) {
     c.table.assign((size_t)3 * 64 * c.cout, 0);
     for (int dy = 0; dy < 3; dy++)
         for (int pattern = 0; pattern < 64; pattern++)

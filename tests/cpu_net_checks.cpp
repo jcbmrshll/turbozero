@@ -145,10 +145,11 @@ static void check_stem() {
         c.cin = 4;
         c.cout = cout;
         c.k = 3;
-        std::vector<int8_t> q((size_t)cout * 4 * 9, 0);
+        // weights up to the 16-bit table's limit (`cpu_net.py`'s STEM_LEVELS)
+        std::vector<int16_t> q((size_t)cout * 4 * 9, 0);
         for (int o = 0; o < cout; o++)
             for (int p = 0; p < 2; p++)
-                for (int t = 0; t < 9; t++) q[((size_t)o * 4 + p) * 9 + t] = (int8_t)((int)(rng() % 255) - 127);
+                for (int t = 0; t < 9; t++) q[((size_t)o * 4 + p) * 9 + t] = (int16_t)((int)(rng() % 3641) - 1820);
         stem_table(c, q.data());
         for (int o = 0; o < cout; o++) {
             c.scale.push_back(std::ldexp(1.0f + (rng() % 1000) / 1000.0f, -10));

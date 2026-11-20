@@ -1125,8 +1125,15 @@ otherwise the same.
 The native network's convolutions take each input channel's own scale, folded into the weights
 (SmoothQuant, alpha 0.75), then the tensor's, from the minimum and maximum seen in calibration; their
 normalization of each square's channels runs in the pass that quantizes the next one's input, where
-OpenVINO runs separate ops (`profile_native.cpp` times each stage). Against the float
-network on 2000 search leaves (value's mean error, its 99th percentile, top move):
+OpenVINO runs separate ops (`profile_native.cpp` times each stage). The stem's weights take 16 bits,
+since its sums are looked up from a table of 16-bit integers anyway. After quantizing, each
+convolution's biases, in order through the network, and the value's last bias are moved so that their
+outputs' means on the calibration leaves match the float network's (bias correction): rounding errors
+that don't average out otherwise add up to a shift of the whole value. On five ray and 4x64 nets (2026-11),
+the two cut the value's mean error on held-out search leaves from 0.017-0.028 to 0.013-0.017, and on
+the engine-labelled set from 0.014-0.024 to 0.010-0.014; a normalized ray 9x64's from 0.028 to 0.015,
+of which its 8-bit stem's rounding had made a shift of about -0.012. Against the float
+network on 2000 search leaves, before both (value's mean error, its 99th percentile, top move):
 
 | Network | Native | OpenVINO int8 |
 |---|---|---|
