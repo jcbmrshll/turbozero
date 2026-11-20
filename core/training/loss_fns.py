@@ -14,10 +14,11 @@ def az_default_loss_fn(
     nn_state: eqx.nn.State | None,
     experience: BaseExperience,
     value_target_q: float = 0.0,
+    value_weight: float = 1.0,
 ) -> tuple[jax.Array, tuple[dict, eqx.nn.State | None]]:
     """Implements the default AlphaZero loss function.
 
-    = Policy Loss + Value Loss
+    = Policy Loss + value_weight * Value Loss
     Policy Loss: Cross-entropy loss between predicted policy and target policy
     Value Loss: L2 loss between predicted value and target value
 
@@ -33,6 +34,9 @@ def az_default_loss_fn(
             - stores the observation, target policy, target value
         value_target_q: weight of the search's value in the target value, from 0 (the outcome alone,
             the default) to 1 (the search's value alone)
+        value_weight: the value loss's weight against the policy loss's 1. Under an optimizer that
+            normalizes the gradient's scale (Adam), only this ratio matters: 2 trains like
+            weights of 1/3 policy and 2/3 value
 
     Returns:
         Tuple[jax.Array, Tuple[dict, Optional[eqx.nn.State]]]: (loss, (aux_metrics, nn_state))
@@ -76,7 +80,7 @@ def az_default_loss_fn(
     )
 
     # total loss
-    loss = policy_loss + value_loss
+    loss = policy_loss + value_weight * value_loss
     aux_metrics = {
         "policy_loss": policy_loss,
         "value_loss": value_loss,

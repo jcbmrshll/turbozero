@@ -136,6 +136,27 @@ def test_value_target_mixes_in_the_search_value():
     np.testing.assert_allclose(value_loss(0.5), expected([0.75, -0.4]), rtol=1e-6)
 
 
+def test_value_weight_scales_the_value_loss_in_the_total():
+    batch = experience(
+        rewards=[[1, -1], [1, -1]],
+        cur_player_id=[0, 1],
+        policy_weights=[[0.25, 0.75]] * 2,
+        policy_mask=[[True, True]] * 2,
+    )
+    net = OutputAsParams(
+        jnp.array([[0.3, -0.2], [0.1, 0.4]]), jnp.array([[0.2], [0.5]])
+    )
+    loss, (metrics, _) = az_default_loss_fn(net, None, batch, value_weight=2.0)
+    # the parts are reported unweighted; only the total weighs them
+    _, (unweighted, _) = az_default_loss_fn(net, None, batch)
+    np.testing.assert_allclose(
+        metrics["value_loss"], unweighted["value_loss"], rtol=1e-6
+    )
+    np.testing.assert_allclose(
+        loss, metrics["policy_loss"] + 2.0 * metrics["value_loss"], rtol=1e-6
+    )
+
+
 def two_positions():
     """A batch of two positions, with a network's (made-up) outputs for them."""
     batch = experience(

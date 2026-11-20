@@ -780,6 +780,13 @@ def main():
         "search's root value q: (1 - this) * z + this * q (0, the default, is z alone)",
     )
     parser.add_argument(
+        "--value-loss-weight",
+        type=float,
+        default=1.0,
+        help="the value loss's weight against the policy loss's 1 (1, the default, weighs them "
+        "equally); with Adam only the ratio matters, so 2 is weights of 1/3 policy, 2/3 value",
+    )
+    parser.add_argument(
         "--policy-target",
         choices=["visits", "completed-q"],
         default="visits",
@@ -1364,7 +1371,11 @@ def main():
         fresh_positions=args.fresh_positions,
         nn=network,
         nn_state=network_state,
-        loss_fn=partial(az_default_loss_fn, value_target_q=args.value_target_q),
+        loss_fn=partial(
+            az_default_loss_fn,
+            value_target_q=args.value_target_q,
+            value_weight=args.value_loss_weight,
+        ),
         # decays from --lr to --lr-final over the run, drops at --lr-drops, or on plateaus
         optimizer=make_optimizer(
             args.epochs * args.train_steps,

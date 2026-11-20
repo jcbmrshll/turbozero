@@ -114,6 +114,7 @@ def test_describe_fn():
     assert describe_fn(partial(az_default_loss_fn, value_target_q=0.5)) == {
         "name": "az_default_loss_fn",
         "value_target_q": 0.5,
+        "value_weight": 1.0,
     }
     assert describe_fn(len) == {"name": "len"}
 
