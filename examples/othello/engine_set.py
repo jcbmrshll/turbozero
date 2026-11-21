@@ -1,9 +1,9 @@
-"""Othello positions with every legal move scored by Edax: a fixed set to measure networks
-against a far stronger player (see `label_positions.py` to build one, `score_engine_set.py` to
-score checkpoints on one, and train.py's --engine-set, which scores the network on one as it
-trains, with `core.testing.scored_positions.ScoredPositionsTester`). Networks are measured on
-every position, by game phase (`PHASES`), and on the positions they decide, between the XOT
-opening and the exact solver, logged as filtered_* (`FILTERED_PHASES`).
+"""Othello positions with every legal move scored by a strong engine: a fixed set to measure
+networks against (see `label_positions.py` to build one, `score_engine_set.py` to score
+checkpoints on one, and train.py's --engine-set, which scores the network on one as it trains,
+with `core.testing.scored_positions.ScoredPositionsTester`). Networks are measured on every
+position, by game phase (`PHASES`), and on the positions they decide, between the XOT opening
+and the exact solver, logged as filtered_* (`FILTERED_PHASES`).
 
 A set is an .npz of numpy arrays:
 - obs: (N, 16) uint8, each position's (8, 8, 2) observation (as the network takes it: the
@@ -11,19 +11,19 @@ A set is an .npz of numpy arrays:
 - mask: (N, 9) uint8, its 65 legal actions, bit-packed
 - scores: (N, 65) int16, the engine's score of each legal action: the final disc margin it
   expects after the move, for the player making it; ILLEGAL where the action isn't legal
-- depth: (N, 65) int16, how many moves ahead each action was searched (an exact solve when it
-  reaches the end of the game)
+- depth: (N,) int8, how many moves ahead the position was searched
+- exact: (N,) bool, whether its scores are exact: a search to the end of the game, no pruning
+- labeller: (N,) int8, which of `labeller_names` scored it, e.g. "neural-reversi level 26"
 - source: (N,) int8, which of `source_names` the position came from
-- source_names: (S,) the sources' names, e.g. the run whose games the positions are from
-- source_state_paths: (S,) each source's saved training state (state-<EPOCH>.npz), absolute
-- source_state_envs: (S, 2) the environments of it the positions are from, first to last
-  (exclusive); (-1, -1) for all
+- source_names: (S,) the sources' names
+- source_descriptions: (S,) where each source's positions came from, in words
+- game: (N,) int64, the game the position is from, in its source (e.g. evals.db's game id;
+  positions of one game are alike, so resampling should keep them together); -1 if unknown
 - empties: (N,) int8, empty squares
-- engine, level: the engine and the level it searched at
 """
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -33,7 +33,7 @@ from game import PASS
 from core.testing.scored_positions import ScoredPositions
 
 # where training runs look for a set unless told otherwise
-DEFAULT_PATH = CACHE_DIR / "engine-sets" / "edax-l24.npz"
+DEFAULT_PATH = CACHE_DIR / "engine-sets" / "edax-l24-5k.npz"
 # the score of an illegal action
 ILLEGAL = -999
 # positions with this many empty squares or more are XOT openings' (8 moves from the standard
@@ -48,22 +48,6 @@ FILTERED_PHASES = {"opening": (36, 51), "midgame": (21, 35)}
 
 
 @dataclass(frozen=True)
-class SourceState:
-    """Where a source's positions came from: a saved training state's replay buffer (see
-    `Trainer.save_state`), so that whoever trains on that run's games can leave these positions'
-    games out.
-
-    Attributes:
-        path: the state, state-<EPOCH>.npz, absolute
-        envs: (first, last), the environments the positions are from, last exclusive; None for
-            all of them
-    """
-
-    path: str
-    envs: tuple[int, int] | None = field(default=None)
-
-
-@dataclass(frozen=True)
 class EngineSet:
     """A set of positions with each legal action scored by an engine (see the module's
     docstring for the arrays).
@@ -72,25 +56,29 @@ class EngineSet:
         obs: (N, 8, 8, 2) bool
         legal: (N, 65) bool
         scores: (N, 65) int16, ILLEGAL where illegal
-        depth: (N, 65) int16
+        depth: (N,) int8
+        exact: (N,) bool
+        labeller: (N,) int8
+        labeller_names: what scored the positions, e.g. "neural-reversi level 26"
         source: (N,) int8
         source_names: the sources' names: letters, digits, "-" and "_" (they name metrics)
-        source_states: where each source's positions came from
+        source_descriptions: where each source's positions came from
+        game: (N,) int64, -1 where unknown
         empties: (N,) int8
-        engine: e.g. "edax"
-        level: the engine's level
     """
 
     obs: np.ndarray
     legal: np.ndarray
     scores: np.ndarray
     depth: np.ndarray
+    exact: np.ndarray
+    labeller: np.ndarray
+    labeller_names: list[str]
     source: np.ndarray
     source_names: list[str]
-    source_states: list[SourceState]
+    source_descriptions: list[str]
+    game: np.ndarray
     empties: np.ndarray
-    engine: str
-    level: int
 
     def __post_init__(self):
         for name in self.source_names:
@@ -98,8 +86,8 @@ class EngineSet:
                 raise ValueError(
                     f"source names name metrics: letters, digits, - and _, not {name!r}"
                 )
-        if len(self.source_states) != len(self.source_names):
-            raise ValueError("every source needs its state")
+        if len(self.source_descriptions) != len(self.source_names):
+            raise ValueError("every source needs its description")
         if not ((self.scores != ILLEGAL) == self.legal).all():
             raise ValueError("every legal action needs a score, and only those")
 
@@ -117,16 +105,15 @@ class EngineSet:
             obs=np.packbits(self.obs.reshape(len(self), -1), axis=1),
             mask=np.packbits(self.legal, axis=1),
             scores=self.scores.astype(np.int16),
-            depth=self.depth.astype(np.int16),
+            depth=self.depth.astype(np.int8),
+            exact=self.exact.astype(bool),
+            labeller=self.labeller.astype(np.int8),
+            labeller_names=np.array(self.labeller_names),
             source=self.source.astype(np.int8),
             source_names=np.array(self.source_names),
-            source_state_paths=np.array([s.path for s in self.source_states]),
-            source_state_envs=np.array(
-                [s.envs or (-1, -1) for s in self.source_states], dtype=np.int64
-            ).reshape(-1, 2),
+            source_descriptions=np.array(self.source_descriptions),
+            game=self.game.astype(np.int64),
             empties=self.empties.astype(np.int8),
-            engine=np.array(self.engine),
-            level=np.array(self.level),
         )
         tmp.replace(path)
 
@@ -141,20 +128,23 @@ class EngineSet:
                 legal=np.unpackbits(f["mask"], axis=1)[:, :65].astype(bool),
                 scores=f["scores"],
                 depth=f["depth"],
+                exact=f["exact"],
+                labeller=f["labeller"],
+                labeller_names=[str(s) for s in f["labeller_names"]],
                 source=f["source"],
                 source_names=[str(s) for s in f["source_names"]],
-                source_states=[
-                    SourceState(
-                        str(path), None if first < 0 else (int(first), int(last))
-                    )
-                    for path, (first, last) in zip(
-                        f["source_state_paths"], f["source_state_envs"], strict=True
-                    )
-                ],
+                source_descriptions=[str(s) for s in f["source_descriptions"]],
+                game=f["game"],
                 empties=f["empties"],
-                engine=str(f["engine"]),
-                level=int(f["level"]),
             )
+
+    def subset(self, keep: np.ndarray) -> "EngineSet":
+        """The positions where `keep` (N,) bool is true, with every source and labeller."""
+        per_position = ("obs", "legal", "scores", "depth", "exact", "labeller")
+        per_position += ("source", "game", "empties")
+        return EngineSet(
+            **{**self.__dict__, **{k: getattr(self, k)[keep] for k in per_position}}
+        )
 
     def groups(
         self, by_source: bool = False, phases: dict[str, tuple[int, int]] = PHASES
@@ -193,16 +183,18 @@ class EngineSet:
     def describe(self) -> dict:
         """What the set is, for a run's configuration."""
         return {
-            "engine": self.engine,
-            "level": self.level,
+            "labellers": {
+                name: int((self.labeller == i).sum())
+                for i, name in enumerate(self.labeller_names)
+            },
+            "exact": int(self.exact.sum()),
             "sources": {
                 name: {
                     "positions": int((self.source == i).sum()),
-                    "state": state.path,
-                    "envs": state.envs,
+                    "description": description,
                 }
-                for i, (name, state) in enumerate(
-                    zip(self.source_names, self.source_states, strict=True)
+                for i, (name, description) in enumerate(
+                    zip(self.source_names, self.source_descriptions, strict=True)
                 )
             },
         }
@@ -225,10 +217,3 @@ def selectable(obs: np.ndarray, legal: np.ndarray) -> np.ndarray:
     distinct = np.zeros(len(obs), bool)
     distinct[first] = True
     return ok & distinct
-
-
-def boards(obs: np.ndarray) -> np.ndarray:
-    """Positions as `EdaxAnalyst.analyse` takes them, with the player to move as black: (N, 64),
-    a1, b1, ..., h8: 0 empty, 1 the player to move, 2 the opponent."""
-    flat = obs.reshape(len(obs), 64, 2)
-    return np.where(flat[..., 0], 1, np.where(flat[..., 1], 2, 0)).astype(np.int8)

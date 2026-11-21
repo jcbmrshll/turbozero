@@ -1118,6 +1118,95 @@ class ExactSolver:
         self.close()
 
 
+# `cli solve --all-moves`: a position's header, "Position #3  Depth: 26@73%" (no "@" for a
+# search without ProbCut), and a row per legal move, "|  -08  | h6 H7 a7 B2 ...", best first
+_ALL_MOVES_HEADER = re.compile(r"Position #(\d+)\s+Depth:\s*(\d+)(@\d+%)?")
+_ALL_MOVES_ROW = re.compile(r"\|\s*([+-]?\d+)\s*\|\s*([a-hA-H][1-8])")
+
+
+@dataclass(frozen=True)
+class MoveScores:
+    """Neural Reversi's scores of every legal move of a position (see `NeuralReversiAnalyst`).
+
+    Attributes:
+        scores: each legal move's final disc margin for the player making it, by action
+        depth: how many moves ahead it searched
+        exact: whether that search was exact, the whole rest of the game without ProbCut
+    """
+
+    scores: dict[int, int]
+    depth: int
+    exact: bool
+
+
+class NeuralReversiAnalyst:
+    """Neural Reversi scoring every legal move of positions (`cli solve --all-moves`), one
+    process reading them a line at a time, one search thread. At a level it searches as it
+    plays at that level: at 26, exactly (every move to the end of the game) up to about 29
+    empty squares, and 26 moves ahead with ProbCut beyond. It clears its hash table before
+    each position, so a position's scores don't depend on the ones before it.
+
+    Called as analyse(the mover's discs, the opponent's), a position with a legal move."""
+
+    def __init__(self, level: int, engine_dir: Path | None = None, hash_mb: int = 512):
+        engine_dir = engine_dir or NeuralReversi.default_dir()
+        self.errors = tempfile.TemporaryFile("w+")  # noqa: SIM115
+        self.process = subprocess.Popen(
+            [str(engine_dir / "target" / "release" / "cli"), "solve", "/dev/stdin",
+             "--all-moves", "--level", str(level), "--threads", "1",
+             "--hash-size", str(hash_mb)],
+            cwd=engine_dir, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=self.errors, text=True, bufsize=1,
+        )  # fmt: skip
+        self.analysed = 0
+
+    def analyse(self, me: int, opp: int) -> MoveScores:
+        process = self.process
+        assert process.stdin is not None and process.stdout is not None
+        process.stdin.write(f"{board_string(me, opp, 'X', 'O', '-')} X\n")
+        process.stdin.flush()
+        self.analysed += 1
+        header = None
+        scores: dict[int, int] = {}
+        output = []
+        # the position's header, its rows, then a line "Time: ..." ends it
+        while line := process.stdout.readline():
+            output.append(line)
+            if header is None:
+                found = _ALL_MOVES_HEADER.match(line)
+                if found is not None and int(found[1]) == self.analysed:
+                    header = found
+            elif line.startswith("Time:"):
+                depth = int(header[2])
+                empties = 64 - (me | opp).bit_count()
+                return MoveScores(scores, depth, header[3] is None and depth >= empties)
+            elif (row := _ALL_MOVES_ROW.match(line)) is not None:
+                scores[action(row[2])] = int(row[1])
+        self.errors.seek(0)
+        raise RuntimeError(
+            f"cli solve ended without position {self.analysed}: "
+            f"{''.join(output)[-500:]}{self.errors.read()[-500:]}"
+        )
+
+    def close(self) -> None:
+        if self.process.stdin is not None:
+            self.process.stdin.close()
+        try:
+            self.process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait()
+        if self.process.stdout is not None:
+            self.process.stdout.close()
+        self.errors.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+
 class ClockedNeuralReversi(ClockedEngine):
     """Neural Reversi over GTP, on a clock of the game's seconds and no increment, told what's
     left of it before each move, in whole seconds (its `time_left` takes no fraction)."""

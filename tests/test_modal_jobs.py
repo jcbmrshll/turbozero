@@ -132,7 +132,7 @@ class Scene:
             ".cache/x", b""
         )  # an unrelated object: nothing should trip on it
         self.store.put_bytes(
-            "files/.cache/turbozero/othello/engine-sets/edax-l24.npz", b"set"
+            "files/.cache/turbozero/othello/engine-sets/edax-l24-5k.npz", b"set"
         )
 
     def job(self, *steps: str, hours: float = 1.0, name: str = "j", **more):
