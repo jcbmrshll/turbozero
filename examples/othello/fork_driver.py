@@ -287,8 +287,9 @@ def slope_per_100(values: Sequence[float]) -> float:
 
 
 class Driver:
-    def __init__(self, run_dir: Path, config: Config, backend: Backend, log=print):
-        self.dir, self.config, self.backend, self.log = run_dir, config, backend, log
+    def __init__(self, run_dir: Path, config: Config, backend: Backend, log=None):
+        self.dir, self.config, self.backend = run_dir, config, backend
+        self.log = log or (lambda text: print(text, flush=True))
         self.state_path = run_dir / "driver.json"
         self.state = State.load(self.state_path)
 
@@ -501,6 +502,8 @@ class Driver:
         if not done or done[-1].end < c.rules.fork_from_epoch:
             return
         base = done[-1]
+        if main.end <= base.end:
+            return  # the mainline hasn't decided its learning rates from there yet
         if not self.backend.has_state(self.final_state(base)):
             return  # still on its way to the bucket
         epoch = self.logged_to(main)

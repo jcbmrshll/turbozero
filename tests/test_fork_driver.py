@@ -201,6 +201,25 @@ def test_a_sims_fork_well_ahead_takes_over_the_mainline(run):
     assert driver.state.lines["main"].status == "replaced"
     # the new mainline decides its own learning rate steps from here
     assert driver.state.lines["sims1"].kind == "main"
+    # and the next fork starts only from a segment end the new mainline has decided
+    modal.in_bucket.update(
+        f"{driver.dir}/lines/sims1/seg{e}/state-{e + 10}.npz" for e in (20, 30, 40)
+    )
+    advance(driver, "sims1", 52, value=lambda _: 0.69)
+    assert any(l.kind == "window" for l in driver.state.lines.values())
+    assert_lines_follow_the_mainlines_learning_rates(driver)
+
+
+def assert_lines_follow_the_mainlines_learning_rates(driver):
+    """Every segment of every line still running took the mainline's steps at its start."""
+    for line in driver.state.lines.values():
+        if line.status != "running":
+            continue
+        for segment in line.segments:
+            assert segment.lrs == driver.lrs_at(segment.start), (
+                line.name,
+                segment.start,
+            )
 
 
 def test_a_fork_that_plateaus_level_with_the_mainline_is_killed(run):
@@ -346,3 +365,20 @@ def test_on_modal_lines_are_jobs_that_follow_and_keep_states_in_the_bucket(
     driver.tick()
     resumed = get_json(store, job_key("t-main", "job.json"))
     assert resumed["hours"] == pytest.approx(20) and len(spawned) == 2
+
+
+def test_a_fork_starts_only_from_a_segment_end_the_mainline_has_decided(run):
+    # as after an adoption: the new mainline has logged its segment's end, but hasn't yet
+    # decided its learning rates there (nor added the next segment)
+    driver, modal = run
+    driver.tick()
+    advance(driver, "main", 20)
+    main = driver.state.lines["main"]
+    main.segments = main.segments[:2]
+    log_epochs(driver, "main", {19: 0.7})
+    modal.in_bucket.add(f"{driver.dir}/lines/main/seg10/state-20.npz")
+    driver.maybe_fork(main)
+    assert list(modal.jobs) == ["t-main"]
+    driver.tick()  # decides at 20, adds the next segment, then forks
+    assert "t-window0" in modal.jobs
+    assert_lines_follow_the_mainlines_learning_rates(driver)

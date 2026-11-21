@@ -513,6 +513,8 @@ class Runner:
                 if outcome != "done":
                     break
                 index += 1
+            if outcome == "done" and self._stop_asked():
+                outcome = "stopped"  # while it waited for more steps
             self.status["state"] = "lost" if outcome == "lost" else outcome
         except BaseException:
             self.status["state"] = "interrupted"

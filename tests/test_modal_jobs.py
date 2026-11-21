@@ -733,3 +733,21 @@ def test_extending_a_job_refuses_a_step_it_already_has_or_a_taken_place(scene):
         scene.store, "p", [modal_spec.parse_step(step("c"), home)], hours=3
     )
     assert [Path(s.ckpt_dir).name for s in job.steps] == ["a", "c"] and job.hours == 3
+
+
+def test_a_job_stopped_while_it_waits_for_more_steps_ends_as_stopped(scene):
+    scene.job(step("a", "--epochs 2"), name="p", follow_minutes=0.2)
+    done = scene.root / "c" / "a" / "1.eqx"
+
+    def stop_once_done():
+        while not done.exists():
+            threading.Event().wait(0.05)
+        threading.Event().wait(0.3)
+        modal_store.put_json(
+            scene.store, modal_spec.job_key("p", "stop.json"), {"stop": True}
+        )
+
+    thread = threading.Thread(target=stop_once_done)
+    thread.start()
+    assert scene.runner("p").run() == "stopped"
+    thread.join()
