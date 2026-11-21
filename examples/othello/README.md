@@ -707,6 +707,29 @@ Modal also bills what jobs upload, $0.04/GB: about $0.36/h with `--resume-every 
 at the risk of more to redo after an interruption. Bringing a state of about 0.8 GB here costs about
 $0.10 in GCS egress, which is why states saved only to continue from stay in the bucket.
 
+### A mainline with forks on Modal
+
+`fork_driver.py` runs one long run on Modal as a mainline of segments, usually a growth run
+(`--grow`), and decides as it goes when the replay buffer's window and the sims go up, by forks:
+
+```sh
+uv run examples/othello/fork_driver.py init ~/.cache/turbozero/othello/runs/big --name big
+$EDITOR ~/.cache/turbozero/othello/runs/big/driver.toml    # nets, recipe, ladders, rules
+uv run examples/othello/fork_driver.py run ~/.cache/turbozero/othello/runs/big   # in tmux
+uv run examples/othello/fork_driver.py status ~/.cache/turbozero/othello/runs/big
+```
+
+Each line (the mainline, or a fork) is one Modal job whose steps are segments of
+`segment_epochs`, each branching from the last one's final state (see `extend` above). Between
+segments every network steps down its own learning rate (1e-3, 5e-4, 1e-4 by default, weight decay
+500 times it) once its value error on the engine-labelled set (`metric`) has plateaued. One fork at
+a time branches from the mainline with the buffer window or the sims a step up its ladder, follows
+the mainline's learning rates, and is compared with it at matched epochs: it takes over once it is
+`margin` lower over the last windows, or is killed once it plateaus without that lead. A window
+fork is judged only after a learning rate step (a wider window's gain shows after the rate drops).
+Decisions go to `decisions.jsonl` in the run's directory. The final checkpoints are decayed
+offline.
+
 ## Evaluating a checkpoint
 
 Every game between two players, networks or engines, goes through `evaluate.py`, and every game is
