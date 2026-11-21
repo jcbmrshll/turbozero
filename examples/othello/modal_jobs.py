@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any
 
 from modal_run import engine_set_path
+from modal_run import main as run_job
 from modal_spec import (
     GPU_PER_SECOND,
     Job,
@@ -161,13 +162,6 @@ def build_job(args: argparse.Namespace) -> Job:
     )
 
 
-def _entry(name: str) -> str:
-    """The job, in its container."""
-    from modal_run import main as run_job
-
-    return run_job(name)
-
-
 def spawn(job: Job, store: Store) -> None:
     """Starts the job's own Modal app, which keeps going without this process."""
     import modal
@@ -187,6 +181,8 @@ def spawn(job: Job, store: Store) -> None:
     for module in ("modal_run", "modal_spec", "modal_store"):
         image = image.add_local_file(here / f"{module}.py", f"/root/{module}.py")
     app = modal.App(f"tz-{job.name}")
+    # modal_run's own entry point: the image has that module, so the function goes by
+    # reference to it, whichever script launches the job (fork_driver.py imports this one)
     function = app.function(
         image=image,
         gpu=None if job.gpu == "CPU" else job.gpu,
@@ -199,7 +195,7 @@ def spawn(job: Job, store: Store) -> None:
         # by default a finished job's GPU stays up, billed, for a minute in case of more work
         scaledown_window=2,
         serialized=True,
-    )(_entry)
+    )(run_job)
     with app.run(detach=True):
         call = function.spawn(job.name)
     put_json(

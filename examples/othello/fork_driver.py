@@ -99,8 +99,11 @@ class Config:
     lead_epochs: int = 3
     gpu: str = "L40S"
     cpu: float = 32.0
-    memory_gb: int = 48
-    resume_every: int = 25
+    # the 9000-position buffer's states need about 96 GB of host memory to save
+    memory_gb: int = 96
+    # a state saved to continue from at each segment's end only: with a 9000-position buffer
+    # each is about 10 GB, and Modal bills uploads
+    resume_every: int = 50
     follow_minutes: float = 30.0
     hours_per_line: float = 100.0
     rules: Rules = field(default_factory=Rules)
@@ -732,7 +735,8 @@ segment_epochs = 50
 metric = "avg4/engine_value_mse"
 gpu = "L40S"
 cpu = 32
-memory_gb = 48
+memory_gb = 96
+resume_every = 50               # a state to continue from at each segment's end
 train_args = [{train_args}]
 
 [[nets]]
