@@ -106,6 +106,12 @@ from. Self-play adds 128 an epoch (a position a move), so the default 1125 is ab
 how many of them are distinct, a position's symmetric images counting as one, as
 `buffer_distinct_positions`.
 
+`--buffer-window N` trains on only each environment's newest N of the positions kept, as if
+`--buffer` were N, while the older ones stay stored. A branch can then widen the window at once,
+onto positions the run already has, where a bigger `--buffer` would start empty and take as
+many epochs to fill: keep the largest buffer a run may use (`--buffer 9000 --buffer-window 1125`)
+and branch with a wider window to try one.
+
 The buffer's size sets how old the data training samples is, not how often each position
 is trained on: on average, that's the samples training takes each epoch over the positions
 self-play adds, whatever the size. With the defaults, 256 steps of 4096 samples
@@ -377,7 +383,8 @@ settings a branch continues it exactly. Two branches of one state, one at `--sim
 at `--sims 64`, compare the two at the same point of the same run. It works for runs with
 `--grow`, which can't be forked, and `--take-over` hands self-play to the next network from
 the branch's first epoch. A different `--buffer` resizes the replay buffer at the branch's
-start, each environment keeping its newest positions. The branch logs to a seaglass run of its
+start, each environment keeping its newest positions; a different `--buffer-window` only changes
+which of them training samples. The branch logs to a seaglass run of its
 own, whose config records the state as `parent`.
 
 ```
@@ -397,6 +404,8 @@ train at a time.
 The next network takes over when its `--grow-metric` on the engine-labelled set
 (`engine_value_mse`, scored every epoch) is at or below the playing one's, or with
 `--grow-metric loss` its training loss on the data both train on, as KataGo's rule had it.
+`avg4/engine_value_mse` compares their 4-epoch weight averages instead (`--average-epochs 4`),
+what self-play plays with `--selfplay-average 4`.
 `--grow-margin 0.01` makes the next lead by 1% of the playing one's metric, and `--grow-guard
 engine_value_mse` makes it also no worse on the engine set's value error. Each is averaged over
 the last `--grow-window` (10) epochs, and the next must have trained `--grow-min-epochs` (10) first.

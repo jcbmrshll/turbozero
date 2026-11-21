@@ -133,6 +133,19 @@ def lr_drops(text: str) -> list[tuple[float, float]]:
     return drops
 
 
+GROW_METRIC = re.compile(r"(avg\d+/)?engine_(value_mse|exp_regret)|loss")
+
+
+def grow_metric(text: str) -> str:
+    """Parses --grow-metric and --grow-guard: [avg<H>/]engine_value_mse,
+    [avg<H>/]engine_exp_regret or loss."""
+    if not GROW_METRIC.fullmatch(text):
+        raise argparse.ArgumentTypeError(
+            f"{text!r} isn't [avg<H>/]engine_value_mse, [avg<H>/]engine_exp_regret or loss"
+        )
+    return text
+
+
 def warm_start_spec(text: str) -> tuple[str, str]:
     """Parses --warm-start: NAME=PATH."""
     name, sep, path = text.partition("=")
@@ -307,11 +320,13 @@ def main():
     parser.add_argument(
         "--grow-metric",
         default="engine_value_mse",
-        choices=["engine_value_mse", "engine_exp_regret", "loss"],
+        type=grow_metric,
         help="with --grow, what decides when the next network takes over: its error on the "
-        "engine-labelled set (scored every epoch, --engine-eval-every 1), or its training loss "
-        "on the data both train on (KataGo's rule), averaged over --grow-window epochs, at or "
-        "below the playing network's",
+        "engine-labelled set (engine_value_mse or engine_exp_regret, scored every epoch, "
+        "--engine-eval-every 1), that of its weight average over H epochs (avg<H>/<metric>, "
+        "H one of --average-epochs: what self-play plays with --selfplay-average H), or its "
+        "training loss on the data both train on (KataGo's rule, loss), averaged over "
+        "--grow-window epochs, at or below the playing network's",
     )
     parser.add_argument(
         "--grow-margin",
@@ -356,7 +371,7 @@ def main():
     parser.add_argument(
         "--grow-guard",
         default=None,
-        choices=["engine_value_mse", "engine_exp_regret"],
+        type=grow_metric,
         help="with --grow, a second metric the next network must be no worse on over "
         "--grow-window epochs, e.g. engine_value_mse on positions neither network trains on, "
         "when --grow-metric is the training loss, which a bigger network can lower by "
@@ -626,6 +641,15 @@ def main():
         default=1125,
         help="replay memory: positions kept per environment (1125 is about 9 epochs of "
         "self-play). Training maps each position it samples through a random symmetry",
+    )
+    parser.add_argument(
+        "--buffer-window",
+        type=int,
+        default=None,
+        metavar="N",
+        help="train on only each environment's newest N positions of the --buffer kept, as if "
+        "the buffer held N: a branch (--branch-from) may widen it at once onto positions the "
+        "run already has, e.g. --buffer 9000 --buffer-window 1125. Default all of --buffer",
     )
     parser.add_argument(
         "--lr", type=float, default=1e-3, help="the initial learning rate"
@@ -1086,6 +1110,15 @@ def main():
         and args.selfplay_average not in args.average_epochs
     ):
         parser.error("--selfplay-average must be one of --average-epochs")
+    for option, metric in (
+        ("--grow-metric", args.grow_metric),
+        ("--grow-guard", args.grow_guard),
+    ):
+        horizon = re.match(r"avg(\d+)/", metric or "")
+        if horizon and int(horizon.group(1)) not in args.average_epochs:
+            parser.error(
+                f"{option} {metric}: avg{horizon.group(1)} isn't one of --average-epochs"
+            )
     if args.average_warmup <= 0:
         parser.error("--average-warmup must be positive")
     if sum(x is not None for x in (args.lr_final, args.lr_drops, args.lr_plateau)) > 1:
@@ -1143,6 +1176,8 @@ def main():
             )
         # self-play runs as many cycles as this many moves' searches take at most
         collection_steps = args.selfplay_cycles // (args.sims + 1)
+    if args.buffer_window is not None and not 0 < args.buffer_window <= args.buffer:
+        parser.error("--buffer-window is 1 to --buffer positions")
     if args.resign is not None and not 0 < args.resign <= 1:
         parser.error("--resign must be in (0, 1]")
     if not 0 <= args.resign_calibration <= 1:
@@ -1391,7 +1426,9 @@ def main():
         average_rescale=not args.no_average_rescale,
         evaluator=evaluator,
         # stores `capacity` positions for each of the `batch_size` environments
-        memory_buffer=EpisodeReplayBuffer(capacity=args.buffer),
+        memory_buffer=EpisodeReplayBuffer(
+            capacity=args.buffer, window=args.buffer_window
+        ),
         max_episode_steps=80,
         env_step_fn=step_fn,
         env_init_fn=selfplay_init_fn,

@@ -129,7 +129,8 @@ class Growth:
         first: the name of the Trainer's own network (see `Learner.name`)
         learners: the networks to grow into, in order
         metric: what the rule compares, a metric every learner's testers or training log
-            every epoch
+            every epoch, or a weight average's from a stateless tester (e.g.
+            "avg4/engine_value_mse", see the `Trainer`'s `averages`)
         window: epochs the metric is averaged over
         min_epochs: epochs the next learner trains before it can take over
         switch_at: (optional) instead of the rule, the numbers of epochs done after which each

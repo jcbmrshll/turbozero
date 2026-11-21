@@ -2256,9 +2256,9 @@ class Trainer:
         """Marks the tree positions (see `tree_positions`) training can sample: those stored within
         the replay buffer's span of self-play.
 
-        The replay buffer holds each environment's newest C played positions (C its capacity, which
-        `resize_replay_buffer` may have changed), its last C moves. Tree positions are sampled
-        from the ones stored in as many moves, however many each move stored.
+        The replay buffer samples each environment's newest C played positions (C its capacity, which
+        `resize_replay_buffer` may have changed, or its sampling window), its last C moves. Tree
+        positions are sampled from the ones stored in as many moves, however many each move stored.
 
         Args:
             state: current collection state
@@ -2268,7 +2268,7 @@ class Trainer:
         """
         assert self.tree_buffer is not None
         assert state.tree_buffer_state is not None and state.tree_written_at is not None
-        moves = buffer_capacity(state.buffer_state)
+        moves = self.memory_buffer.window or buffer_capacity(state.buffer_state)
         # positions the last move stored are 1 move old
         age = state.moves[..., None] - state.tree_written_at
         return self.tree_buffer.sample_mask(state.tree_buffer_state) & (age <= moves)
@@ -2584,7 +2584,7 @@ class Trainer:
                 - `moves`: self-play moves played in between, in all environments
                 - `episodes`: episodes that terminated in between
                 - `buffer_capacity`: the replay buffer's capacity, entries per environment (see
-                  `resize_replay_buffer`)
+                  `resize_replay_buffer`), and with a sampling window, `buffer_window`
                 - with `episode_metrics_fn`: `episode_<name>`, each metric's mean over those
                   episodes, omitted if none terminated
                 - `buffer_samples`: experiences in the replay buffer training can sample
@@ -2610,6 +2610,11 @@ class Trainer:
             "moves": moves,
             "episodes": episodes,
             "buffer_capacity": jnp.asarray(buffer_capacity(after.buffer_state)),
+            **(
+                {"buffer_window": jnp.asarray(self.memory_buffer.window)}
+                if self.memory_buffer.window is not None
+                else {}
+            ),
             "buffer_samples": total,
             "buffer_distinct_positions": distinct,
             "buffer_distinct_fraction": distinct / jnp.maximum(total, 1),
@@ -4586,15 +4591,15 @@ class Trainer:
                                     ),
                                 )
                                 if average_metrics:
+                                    average_metrics = {
+                                        f"{average_name(horizon)}/{k}": v.mean()
+                                        for k, v in average_metrics.items()
+                                    }
                                     self.log_learner_metrics(
-                                        {
-                                            f"{average_name(horizon)}/{k}": v.mean()
-                                            for k, v in average_metrics.items()
-                                        },
-                                        cur_epoch,
-                                        i,
-                                        playing,
+                                        average_metrics, cur_epoch, i, playing
                                     )
+                                    # growth's rule may follow an average's metric
+                                    tested[i].update(average_metrics)
                         tester_states[i][j] = new_test_state
                     test_seconds[i] = time.perf_counter() - test_started
             # a tester's metric: the rule follows it once the epoch's tests have run
