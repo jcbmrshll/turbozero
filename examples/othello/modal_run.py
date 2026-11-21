@@ -169,11 +169,14 @@ class Mirror:
         put_json(self.store, key + ".json", {"epoch": epoch})
 
     def tick(self, step: tuple[int, Step] | None) -> None:
-        """Sends what changed. One at a time, so a later tick picks up what this one missed."""
+        """Sends what changed: the running step's files, and what earlier steps' are still to
+        send (a step's last files go on uploading while the next one runs). One at a time, so
+        a later tick picks up what this one missed."""
         with self.lock:
             self._send_seaglass()
             if step is not None:
-                self._send_step(*step)
+                for index, earlier in enumerate(self.job.steps[: step[0] + 1]):
+                    self._send_step(index, earlier)
             if self.manifest != self.manifest_sent:
                 put_json(self.store, job_key(self.name, "manifest.json"), self.manifest)
                 self.manifest_sent = dict(self.manifest)
@@ -240,8 +243,11 @@ class Runner:
         name: str,
         place: Place,
         describe_gpu: Callable[[], dict[str, str]] = gpu_description,
+        status_store: Store | None = None,
     ):
         self.store, self.name, self.place = store, name, place
+        # the heartbeat's own client: it writes while the mirror uploads
+        self.status_store = status_store or store
         job = Job.from_dict(get_json(store, job_key(name, "job.json")))
         self.job = job
         self.status: dict[str, Any] = get_json(store, job_key(name, "status.json")) or {
@@ -264,11 +270,23 @@ class Runner:
         attempt = self.status["attempts"][-1]
         attempt["seconds"] = time.time() - attempt["start"]
         self.status["heartbeat"] = time.time()
-        put_json(self.store, job_key(self.name, "status.json"), self.status)
+        put_json(
+            self.status_store,
+            job_key(self.name, "status.json"),
+            json.loads(json.dumps(self.status)),
+        )
 
     def _mirror_loop(self) -> None:
         while not self.stop_thread.wait(self.place.mirror_seconds):
             self._safe_tick()
+
+    def _heartbeat_loop(self) -> None:
+        """The heartbeat on its own: an upload of a big state mustn't make the job look silent."""
+        while not self.stop_thread.wait(self.place.mirror_seconds):
+            try:
+                self._heartbeat()
+            except Exception as e:  # noqa: BLE001
+                print(f"modal-jobs: heartbeat failed, will retry: {e!r}", flush=True)
 
     def _safe_tick(self) -> bool:
         """A trouble with the bucket mustn't stop training: the next tick tries again."""
@@ -416,7 +434,10 @@ class Runner:
             )
         done["outcome"] = outcome
         self._write_record(index, step, seconds=done.get("seconds"), outcome=outcome)
-        self._flush()
+        if outcome != "done":
+            self._flush()
+        # else the next step starts now, and the mirror goes on sending this one's last files
+        # (its final state can take minutes); the job's end flushes all
         return outcome
 
     def _wait(self, child: subprocess.Popen[bytes]) -> str:
@@ -475,7 +496,26 @@ class Runner:
             return
         for step in self.job.steps[: max(index - 1, 0)]:
             for path in Path(step.ckpt_dir).glob("state-*.npz"):
-                path.unlink()
+                stat = path.stat()
+                key = self.job.key_of(str(path))
+                if self.mirror.sent.get(key) == (stat.st_size, stat.st_mtime_ns):
+                    path.unlink()
+
+    def _unmade_input(self, index: int) -> int | None:
+        """An earlier step of this job whose final state step `index` starts from, when that
+        state is neither here nor in the bucket (a machine lost before it was sent): that step
+        runs again first."""
+        step = self.job.steps[index]
+        made = {s.ckpt_dir: i for i, s in enumerate(self.job.steps[:index])}
+        for _, path in start_states(step.argv):
+            source = made.get(os.path.dirname(path))
+            if (
+                source is not None
+                and not os.path.exists(path)
+                and not self.store.sizes(self.job.key_of(path))
+            ):
+                return source
+        return None
 
     def _stop_asked(self) -> bool:
         stop = get_json(self.store, job_key(self.name, "stop.json"))
@@ -498,6 +538,8 @@ class Runner:
         server = self._start_seaglass()
         thread = threading.Thread(target=self._mirror_loop, daemon=True)
         thread.start()
+        beat = threading.Thread(target=self._heartbeat_loop, daemon=True)
+        beat.start()
         outcome, index = "done", 0
         try:
             self._heartbeat()
@@ -508,6 +550,16 @@ class Runner:
                 if self._stop_asked():
                     outcome = "stopped"
                     break
+                again = self._unmade_input(index)
+                if again is not None:
+                    print(
+                        f"modal-jobs: step {index} starts from step {again}'s final state, "
+                        f"which was never sent: step {again} runs again",
+                        flush=True,
+                    )
+                    self.status["steps"].pop(str(again), None)
+                    index = again
+                    continue
                 self._prune_states(index)
                 outcome = self._run_step(index, step)
                 if outcome != "done":
@@ -524,6 +576,7 @@ class Runner:
             # before the job ended, would otherwise land after it
             self.stop_thread.set()
             thread.join()
+            beat.join()
             self._flush()
             server.terminate()
         print(f"modal-jobs: {self.name}: {outcome}", flush=True)
@@ -534,8 +587,11 @@ class Runner:
 
 def main(name: str) -> str:
     """The container's entry point: the bucket's in the environment (see modal_jobs.py)."""
-    store = GcsStore(os.environ["TZ_MODAL_BUCKET"], os.environ["GCS_KEY_JSON"])
-    return Runner(store, name, Place()).run()
+
+    def open_store() -> GcsStore:
+        return GcsStore(os.environ["TZ_MODAL_BUCKET"], os.environ["GCS_KEY_JSON"])
+
+    return Runner(open_store(), name, Place(), status_store=open_store()).run()
 
 
 if __name__ == "__main__":
