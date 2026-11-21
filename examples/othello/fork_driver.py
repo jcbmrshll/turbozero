@@ -21,7 +21,8 @@ rule); the driver takes it over at the mainline's next segment end, and every fo
 at that same epoch (`--take-over`), as it takes the mainline's learning rate steps, so a fork and
 the mainline always play the same network. Comparisons start again after each take-over.
 
-Forks, one at a time, alternate between the two ladders: the replay buffer's sampling window
+Forks try the next step of either ladder, at most one of each at a time: the replay buffer's
+sampling window
 (`--buffer-window`, the buffer itself kept at its largest, so a wider window has its positions at
 once) and the search's sims (with playout cap randomization's fast searches in proportion). A
 fork branches from the mainline's newest segment end with one setting a step up, runs beside it
@@ -34,7 +35,9 @@ with it at matched epochs on the playing network's metric:
   `after_lr_step` epochs after it, first (or the learning rates at their floor): a wider window's
   gain hides at a constant high rate and shows after it drops;
 - it is killed once its own metric has plateaued without a lead, or at `max_fork_epochs`; its
-  step may be tried again `retry_after` mainline epochs later.
+  step may be tried again `retry_after` mainline epochs later;
+- when the other fork takes over, it starts again from the new mainline (it branched from the
+  old one, so it would differ from the new one in two settings).
 
 Every decision goes to RUN_DIR/decisions.jsonl, the driver's state to RUN_DIR/driver.json. The
 final checkpoints are decayed offline. Metrics come from the segments' logs, which the Modal sync
@@ -502,8 +505,11 @@ class Driver:
         for line in [
             l for l in s.lines.values() if l.status == "running" and l.kind != "main"
         ]:
-            self.judge(line, main)
-            if line.status == "running":
+            # (an adoption just now replaces the mainline and restarts the other fork)
+            if line.status != "running" or line.kind == "main":
+                continue
+            self.judge(line, s.lines[s.main])
+            if line.status == "running" and line.kind != "main":
                 self.extend_fork(line)
         main = s.lines[s.main]
         self.maybe_fork(main)
@@ -571,9 +577,10 @@ class Driver:
         self.append(fork, last.window, last.sims)
 
     def maybe_fork(self, main: Line) -> None:
+        """Starts a fork of each kind not running, if its ladder has a step left and it isn't
+        waiting to try again: at most one window fork and one sims fork at a time."""
         s, c = self.state, self.config
-        if any(l.status == "running" and l.kind != "main" for l in s.lines.values()):
-            return
+        running = {l.kind for l in s.lines.values() if l.status == "running"}
         done = [seg for seg in main.segments if self.logged_to(main) >= seg.end]
         if not done or done[-1].end < c.rules.fork_from_epoch:
             return
@@ -583,17 +590,16 @@ class Driver:
         if not self.backend.has_state(self.final_state(base)):
             return  # still on its way to the bucket
         epoch = self.logged_to(main)
-        options = [
-            kind
-            for kind in KINDS
-            if self.next_index(base, kind) is not None
-            and s.retry_at.get(kind, 0) <= epoch
-        ]
-        if not options:
-            return
-        # alternate: the kind tried least lately first
-        last = s.started[-1] if s.started else None
-        kind = next((k for k in options if k != last), options[0])
+        for kind in KINDS:
+            if (
+                kind not in running
+                and self.next_index(base, kind) is not None
+                and s.retry_at.get(kind, 0) <= epoch
+            ):
+                self.start_fork(main, base, kind)
+
+    def start_fork(self, main: Line, base: Segment, kind: str) -> None:
+        s, c = self.state, self.config
         index = self.next_index(base, kind)
         assert index is not None
         name = f"{kind}{len(s.started)}"
@@ -704,6 +710,15 @@ class Driver:
         ]
         self.state.takeovers = [at for at in self.state.takeovers if at <= applied]
         self.decide("adopt", fork, epoch=latest, windows=means, replaces=main.name)
+        # the other fork branched from the old mainline: it differs from the new one in two
+        # settings now, so it starts again from the new one (no wait to try again)
+        for other in self.state.lines.values():
+            if other.status == "running" and other.kind in KINDS:
+                other.status, other.ended_at = "restarted", time.time()
+                self.backend.stop(other.job)
+                self.decide(
+                    "restart", other, epoch=self.logged_to(other), mainline=fork.name
+                )
 
     def maybe_finish(self, main: Line) -> None:
         """The run ends when every network is at its last learning rate and plateaued there,

@@ -168,7 +168,7 @@ def test_a_network_whose_metric_plateaus_steps_down_its_own_learning_rate(run):
     assert flag(step, "--lr-of") == ["r15=0.001"]
 
 
-def test_forks_start_from_a_segment_end_in_the_bucket_and_alternate(run):
+def test_a_fork_of_each_kind_starts_from_a_segment_end_in_the_bucket(run):
     driver, modal = run
     driver.tick()
     advance(driver, "main", 21)
@@ -176,12 +176,21 @@ def test_forks_start_from_a_segment_end_in_the_bucket_and_alternate(run):
     assert list(modal.jobs) == ["t-main"]
     modal.in_bucket.add(f"{driver.dir}/lines/main/seg10/state-20.npz")
     driver.tick()
-    (step,) = modal.jobs["t-window0"]
-    assert flag(step, "--branch-from") == [
-        f"{driver.dir}/lines/main/seg10/state-20.npz"
+    base = f"{driver.dir}/lines/main/seg10/state-20.npz"
+    (window,) = modal.jobs["t-window0"]
+    assert flag(window, "--branch-from") == [base]
+    assert flag(window, "--buffer-window") == ["2250"] and flag(window, "--sims") == [
+        "128"
     ]
-    assert flag(step, "--buffer-window") == ["2250"] and flag(step, "--sims") == ["128"]
-    assert driver.state.lines["window0"].start == 20
+    (sims,) = modal.jobs["t-sims1"]
+    assert flag(sims, "--branch-from") == [base]
+    assert flag(sims, "--buffer-window") == ["1125"] and flag(sims, "--sims") == ["256"]
+    assert flag(sims, "--playout-cap") == ["0.25:64"]
+    # no more than one of each
+    advance(driver, "main", 31)
+    modal.in_bucket.add(f"{driver.dir}/lines/main/seg20/state-30.npz")
+    driver.tick()
+    assert sorted(modal.jobs) == ["t-main", "t-sims1", "t-window0"]
 
 
 def test_a_sims_fork_well_ahead_takes_over_the_mainline(run):
@@ -189,7 +198,6 @@ def test_a_sims_fork_well_ahead_takes_over_the_mainline(run):
     driver.tick()
     advance(driver, "main", 21)
     modal.in_bucket.add(f"{driver.dir}/lines/main/seg10/state-20.npz")
-    driver.state.started = ["window"]  # so the next is a sims fork
     driver.tick()
     assert "t-sims1" in modal.jobs
     advance(driver, "main", 45)
@@ -199,6 +207,9 @@ def test_a_sims_fork_well_ahead_takes_over_the_mainline(run):
     assert driver.state.main == "sims1"
     assert "t-main" in modal.stopped
     assert driver.state.lines["main"].status == "replaced"
+    # the window fork branched from the old mainline: it starts again from the new one
+    assert driver.state.lines["window0"].status == "restarted"
+    assert "t-window0" in modal.stopped and "window" not in driver.state.retry_at
     # the new mainline decides its own learning rate steps from here
     assert driver.state.lines["sims1"].kind == "main"
     # and the next fork starts only from a segment end the new mainline has decided
@@ -227,7 +238,6 @@ def test_a_fork_that_plateaus_level_with_the_mainline_is_killed(run):
     driver.tick()
     advance(driver, "main", 21)
     modal.in_bucket.add(f"{driver.dir}/lines/main/seg10/state-20.npz")
-    driver.state.started = ["window"]
     driver.tick()
     advance(driver, "main", 45)
     advance(driver, "sims1", 31)
