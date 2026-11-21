@@ -557,14 +557,20 @@ class Driver:
         if main.status != "running" or not self.due(main):
             return
         at = main.end
-        if any(e == at for e, _, _ in self.state.lr_steps):
-            return  # decided already
+        # (a step made here by hand, in driver.json, stands: the rule decides the others)
+        stepped = {net for e, net, _ in self.state.lr_steps if e == at}
         for net in self.lr_plateaus(main, at):
+            if net in stepped:
+                continue
             index = self.lrs_at(at - 1)[net] + 1
             self.state.lr_steps.append((at, net, index))
             self.decide("lr step", main, epoch=at, net=net, lr=self.config.lrs[index])
         playing = self.playing_at(at - 1)
-        if playing + 1 < len(self.config.nets) and self.caught_up(main):
+        if (
+            playing + 1 < len(self.config.nets)
+            and at not in self.state.takeovers
+            and self.caught_up(main)
+        ):
             self.state.takeovers.append(at)
             self.decide(
                 "take over",

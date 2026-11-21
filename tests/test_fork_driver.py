@@ -487,3 +487,15 @@ def test_after_an_adoption_learning_rates_count_the_parents_epochs(run):
     driver.state.main = "sims1"
     log_epochs(driver, "sims1", {e: 0.7 for e in range(30, 38)})
     assert driver.lr_plateaus(fork, 40) == ["r11", "r15"]
+
+
+def test_a_learning_rate_step_made_by_hand_stands_and_the_mainline_goes_on(run):
+    driver, modal = run
+    driver.tick()
+    advance(driver, "main", 5)
+    driver.state.lr_steps.append((10, "r15", 1))
+    advance(driver, "main", 9)
+    assert len(modal.jobs["t-main"]) == 2
+    step = modal.jobs["t-main"][-1]
+    assert flag(step, "--lr-of") == ["r15=0.0005"] and flag(step, "--lr") == ["0.001"]
+    assert driver.state.lr_steps == [(10, "r15", 1)]
