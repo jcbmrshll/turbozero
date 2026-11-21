@@ -342,6 +342,19 @@ class Driver:
         key = self.config.key(net)
         return {e: v[key] for e, v in self.metrics(line).items() if key in v}
 
+    def lineage_series(self, line: Line, net: str | None) -> dict[int, float]:
+        """`series` along the line's history: its parent's (and so on) before it forked, its
+        own from there. A mainline that was a fork has trained since the run's start."""
+        out: dict[int, float] = {}
+        parent = self.state.lines.get(line.parent or "")
+        if parent is not None:
+            out = {
+                e: v
+                for e, v in self.lineage_series(parent, net).items()
+                if e < line.start
+            }
+        return {**out, **self.series(line, net)}
+
     def logged_to(self, line: Line) -> int:
         """The epoch after the last the line has logged its playing network's metric for (its
         start, before any)."""
@@ -401,11 +414,11 @@ class Driver:
                 continue
             since = max(
                 [
-                    main.start,
+                    0,
                     *(e for e, n, _ in self.state.lr_steps if n == name and e < at),
                 ]
             )
-            series = self.series(main, name)
+            series = self.lineage_series(main, name)
             epochs = sorted(e for e in series if e >= since)
             if not epochs or len(epochs) < max(
                 rules.lr_min_epochs, rules.plateau_epochs
@@ -753,7 +766,7 @@ class Driver:
         ):
             return
         rules = self.config.rules
-        series = self.series(main, None)
+        series = self.lineage_series(main, None)
         recent = [series[e] for e in sorted(series)[-rules.plateau_epochs :]]
         if (
             len(recent) < rules.plateau_epochs
