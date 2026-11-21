@@ -166,6 +166,10 @@ def extract(network, state) -> Program:
         return c
 
     def convnext(block, pool: Linear | None) -> ConvNeXtBlock:
+        if not block.plain:
+            raise TypeError(
+                "no native ConvNeXt block but the plain one (a depthwise filter)"
+            )
         if not isinstance(block.norm, eqx.nn.BatchNorm):
             raise unsupported(block.norm)
         scale, offset = inference_affine(block.norm, state)
@@ -180,6 +184,8 @@ def extract(network, state) -> Program:
             pool=pool,
         )
 
+    if network.input_features is not None or network.board_plane:
+        raise TypeError("no native input planes but the discs")
     pre = network.final_norm is not None
     if pre:
         # the pre-activation trunk starts from the stem as it is, or normalized (folded in)

@@ -26,6 +26,7 @@ from onnx import TensorProto, helper, numpy_helper
 
 from core.networks.azresnet import (
     AZResnet,
+    Depthwise,
     FixedScale,
     GroupNorm,
     Norm,
@@ -196,6 +197,8 @@ class Graph:
         """ConvNeXt's block: its depthwise filter a grouped convolution, its kernel the smallest
         square holding its taps, zero off them, with BatchNorm folded in (or another normalization
         after it)."""
+        if not isinstance(block.dw, Depthwise) or not block.plain:
+            raise TypeError("no export of ConvNeXt blocks but the plain one")
         kernel = np.asarray(block.dw.dense(), np.float32)
         channels, size = kernel.shape[0], kernel.shape[-1]
         bias = None
@@ -258,6 +261,8 @@ def to_onnx(network: AZResnet, state: eqx.nn.State) -> onnx.ModelProto:
     if it has any)."""
     if not isinstance(network.heads, PooledHeads):
         raise TypeError("only pooled heads export")
+    if network.input_features is not None or network.board_plane:
+        raise TypeError("no export of input planes but the discs")
     graph = Graph()
     x = "input"
     if network.stem_norm is None:
