@@ -224,12 +224,15 @@ def test_sample_spreads_over_bands_and_caps_each_game():
         label_positions.sample(games[:10], 400, random.Random(3), set(), per_game=3)
 
 
-def write_store(path: Path, games: dict[tuple[str, str], list[list[int]]]) -> None:
-    """An evals store with just what `source_games` reads: players and their games."""
+def write_store(
+    path: Path, games: dict[tuple[str, str], list[list[int]]], start: str
+) -> None:
+    """An evals store with just what `source_games` reads: players and their games, each from
+    `start`."""
     db = sqlite3.connect(path)
     db.execute("CREATE TABLE players (id TEXT, label TEXT, kind TEXT, config TEXT)")
     db.execute(
-        "CREATE TABLE games (id INTEGER, black_id TEXT, white_id TEXT, moves TEXT)"
+        "CREATE TABLE games (id INTEGER, black_id TEXT, white_id TEXT, start TEXT, moves TEXT)"
     )
     clock = {"budget": {"clock": {"ext": None, "inc": 0.0, "ini": 30.0}}}
     players = [
@@ -249,14 +252,17 @@ def write_store(path: Path, games: dict[tuple[str, str], list[list[int]]]) -> No
         for moves in lists:
             gid += 1
             db.execute(
-                "INSERT INTO games VALUES (?, ?, ?, ?)",
-                (gid, black, white, json.dumps(moves)),
+                "INSERT INTO games VALUES (?, ?, ?, ?, ?)",
+                (gid, black, white, start, json.dumps(moves)),
             )
     db.commit()
     db.close()
 
 
 def test_sources_take_their_kind_of_games_from_the_store(tmp_path):
+    from xot import held_out_openings, set_openings
+
+    allowed = f"xot:{set_openings()[0]}"
     write_store(
         tmp_path / "evals.db",
         {
@@ -266,7 +272,16 @@ def test_sources_take_their_kind_of_games_from_the_store(tmp_path):
             ("e1", "e2"): [[26]],
             ("n2", "n1"): [[44]],
         },
+        start=allowed,
     )
+    # a game from an opening evaluation matches draw: never a set's
+    db = sqlite3.connect(tmp_path / "evals.db")
+    db.execute(
+        "INSERT INTO games VALUES (?, ?, ?, ?, ?)",
+        (6, "n1", "e1", f"xot:{held_out_openings()[0]}", "[19]"),
+    )
+    db.commit()
+    db.close()
     sources = [
         label_positions.parse_source("vs=5:net-engine:ray11x64"),
         label_positions.parse_source("engines=5:engine-engine"),

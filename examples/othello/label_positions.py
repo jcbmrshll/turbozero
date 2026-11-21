@@ -14,7 +14,8 @@ each scored by Neural Reversi.
     uv run examples/othello/label_positions.py assemble ~/.cache/.../positions.npz \\
         ~/.cache/.../labels/results-files --out ~/.cache/turbozero/othello/engine-sets/new.npz
 
-A source is NAME=COUNT:KIND[:A[/B]], its positions from the games of one kind of match:
+A source is NAME=COUNT:KIND[:A[/B]], its positions from the games of one kind of match, from
+the XOT openings sets may use (xot-set-openings.txt; evaluation matches draw the others):
 `net-engine` (a network against an engine on a --clock, the network's label containing A),
 `engine-engine` (two engines on a --clock), or `net-net` (two networks, one's label containing A
 and the other's B). From each it samples COUNT positions worth scoring (see
@@ -45,6 +46,7 @@ import numpy as np
 from engine_set import ILLEGAL, OPENING_EMPTIES, EngineSet, selectable
 from engines import CACHE_DIR, Board, MoveScores, NeuralReversiAnalyst
 from exact_labels import bitboards
+from xot import set_openings
 
 EVALS_DB = CACHE_DIR / "evals" / "evals.db"
 LEVEL = 26
@@ -106,7 +108,8 @@ def source_games(
     db: str | Path, sources: list[Source], clock: float
 ) -> dict[str, list[tuple[int, list[int]]]]:
     """Each source's games in the store `db` (read only): (game id, moves from the standard
-    start), by source name. A game goes to the first source it fits."""
+    start), by source name. A game goes to the first source it fits. Only games from the XOT
+    openings sets may use (`xot.set_openings`) count: evaluation matches draw the others."""
     connection = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     players = {
         pid: (label, kind, json.loads(config))
@@ -130,10 +133,13 @@ def source_games(
             (source.a in la and source.b in lb) or (source.a in lb and source.b in la)
         )
 
+    allowed = {f"xot:{i}" for i in set_openings()}
     games: dict[str, list[tuple[int, list[int]]]] = {s.name: [] for s in sources}
-    for gid, black, white, moves in connection.execute(
-        "SELECT id, black_id, white_id, moves FROM games ORDER BY id"
+    for gid, black, white, start, moves in connection.execute(
+        "SELECT id, black_id, white_id, start, moves FROM games ORDER BY id"
     ):
+        if start not in allowed:
+            continue
         for source in sources:
             if fits(source, black, white):
                 games[source.name].append((gid, json.loads(moves)))

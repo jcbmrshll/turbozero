@@ -18,6 +18,10 @@ import numpy as np
 from game import action, env, metadata
 
 XOT_PATH = Path(__file__).parent / "xot-openings.txt"
+# the openings engine-labelled sets take positions from, which evaluation matches leave out
+# (`--starts xot-heldout`), so that a set's positions are never from the games that measure a
+# network; never edited, since a match draws its openings again whenever it continues
+SET_OPENINGS_PATH = Path(__file__).parent / "xot-set-openings.txt"
 
 
 def load_xot(path: str | Path = XOT_PATH) -> np.ndarray:
@@ -32,6 +36,17 @@ def load_xot(path: str | Path = XOT_PATH) -> np.ndarray:
         [[action(line[i : i + 2]) for i in range(0, len(line), 2)] for line in lines],
         dtype=np.int32,
     )
+
+
+def set_openings(path: str | Path = SET_OPENINGS_PATH) -> np.ndarray:
+    """The XOT openings (indices into `load_xot`'s rows) engine-labelled sets may take
+    positions from (see `SET_OPENINGS_PATH`)."""
+    return np.loadtxt(path, dtype=np.int64, comments="#", ndmin=1)
+
+
+def held_out_openings(path: str | Path = SET_OPENINGS_PATH) -> np.ndarray:
+    """Every other XOT opening: those evaluation matches draw from with `xot-heldout`."""
+    return np.setdiff1d(np.arange(len(load_xot())), set_openings(path))
 
 
 def make_xot_init_fn(openings: np.ndarray, standard_start_fraction: float):

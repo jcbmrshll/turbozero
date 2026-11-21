@@ -2,7 +2,8 @@
 `core.evals.store.GameRecord` as it ends.
 
 A match is two players (`eval_players.PlayerSpec`) and its games' setup: `openings` starts drawn
-by `seed` from `starts` (XOT openings, GGS's random starts, or a file's), each played with both
+by `seed` from `starts` (XOT openings, by default only those no engine-labelled set takes
+positions from; GGS's random starts; or a file's), each played with both
 colors; with `solve_at`, each game stopped at its first position with that many empties or fewer
 and solved for the result, the same for both players (`endgame.py`; for a win, a draw or a loss,
 or with `solve_exact` the margin). Start `i`'s games are numbers 2i, a black, and 2i + 1.
@@ -38,12 +39,15 @@ from clock_match import (
 from engines import Board
 from eval_players import CACHE_DIR, PlayerSpec, maker
 from ggs import Clock, Start, disc_result, load_starts, random_start
-from xot import XOT_PATH, load_xot
+from xot import XOT_PATH, held_out_openings, load_xot
 
 from core.evals import hardware
 from core.evals.store import GameRecord, digest
 
 PASS = 64
+# XOT starts: `xot` draws from every opening, `xot-heldout` (the default) from those no
+# engine-labelled set takes positions from (see xot.SET_OPENINGS_PATH)
+XOT_STARTS = ("xot", "xot-heldout")
 
 
 @dataclass(frozen=True)
@@ -64,7 +68,7 @@ class MatchSpec:
     a: PlayerSpec
     b: PlayerSpec
     openings: int
-    starts: str = "xot"
+    starts: str = "xot-heldout"
     seed: int = 0
     solve_at: int | None = None
     solve_exact: bool = False
@@ -85,7 +89,7 @@ class MatchSpec:
                     raise ValueError(f"{p.label}: batched games are at fixed budgets")
                 if p.config["kind"] == "engine" and p.config["threads"] != 1:
                     raise ValueError(f"{p.label}: batched games run an engine a thread")
-            if self.starts != "xot":
+            if self.starts not in XOT_STARTS:
                 raise ValueError("batched games start from XOT openings")
             if self.synchro:
                 raise ValueError("batched games can't be synchro")
@@ -148,9 +152,14 @@ class MatchSpec:
         """The match's starts, drawn by its seed: the same every time."""
         rng = np.random.default_rng(self.seed)
         kind, _, value = self.starts.partition(":")
-        if kind == "xot":
+        if kind in XOT_STARTS:
             pool = load_xot(XOT_PATH)
-            picked = rng.choice(len(pool), size=self.openings, replace=False)
+            if kind == "xot":
+                picked = rng.choice(len(pool), size=self.openings, replace=False)
+            else:
+                picked = rng.choice(
+                    held_out_openings(), size=self.openings, replace=False
+                )
             return [
                 Opening(f"xot:{i}", tuple(int(m) for m in pool[i]), None)
                 for i in picked
