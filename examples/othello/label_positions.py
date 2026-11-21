@@ -22,8 +22,10 @@ and the other's B). From each it samples COUNT positions worth scoring (see
 --bands asks (over the bands its games reach) and at most --per-game from a game (4), none twice.
 
 Neural Reversi at --level 26 scores every legal move: exactly (to the end of the game, no
-pruning) up to about 29 empty squares, 26 moves ahead with ProbCut beyond. On one core a
-position takes about 8 s at 21-26 empties, 20-160 s at 27-29, and 4 s past that.
+pruning) up to 30 empty squares, 26 moves ahead with ProbCut beyond. On one of razorback's
+cores a position takes about 8 s at 21-26 empties, 20-160 s at 27-29, minutes at 30, and 4 s
+past that; Modal's cores take about twice as long. 30,000 positions spread over 21-51 took
+about 600 core-hours on Modal (about $45), most of it on the exact positions at 27-30.
 """
 
 import argparse
@@ -508,7 +510,13 @@ def main() -> None:
     p.add_argument("positions", help="a positions file under the cache")
     p.add_argument("--name", required=True, help="the job's name, unique")
     p.add_argument("--hosts", type=int, default=1, help="containers at once")
-    p.add_argument("--jobs-per-host", type=int, default=1)
+    p.add_argument(
+        "--jobs-per-host",
+        type=int,
+        default=10,
+        help="jobs a container runs in turn: a container Modal replaces (it does, now and "
+        "then) redoes only the job it was on, since each job's labels are kept as it ends",
+    )
     p.add_argument("--cpu", type=int, default=8, help="a container's cores")
     p.add_argument("--memory", type=int, default=16, help="a container's GiB")
     p.add_argument("--hours", type=float, default=2.0, help="a container's limit")

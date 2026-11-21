@@ -33,7 +33,7 @@ from game import PASS
 from core.testing.scored_positions import ScoredPositions
 
 # where training runs look for a set unless told otherwise
-DEFAULT_PATH = CACHE_DIR / "engine-sets" / "edax-l24-5k.npz"
+DEFAULT_PATH = CACHE_DIR / "engine-sets" / "nr26-evals-29k.npz"
 # the score of an illegal action
 ILLEGAL = -999
 # positions with this many empty squares or more are XOT openings' (8 moves from the standard

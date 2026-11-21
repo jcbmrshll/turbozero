@@ -922,7 +922,7 @@ engine-labelled set measures the network more finely, without search or games: t
 fixed positions past the XOT opening and with a choice of move, each legal move of which an
 engine has scored: the disc margin it expects at the end. Sets record what scored each
 position (`labeller_names`): Edax at level 24 (24 moves ahead, the last squares exact), or
-Neural Reversi at level 26 (exact up to about 29 empty squares, 26 moves ahead beyond).
+Neural Reversi at level 26 (exact up to 30 empty squares, 26 moves ahead beyond).
 
 `train.py` scores the network on it every epoch and logs, for all positions and for each
 game phase (`opening`, 40-51 empty squares; `midgame`, 25-39; `endgame`, 1-24):
@@ -946,8 +946,16 @@ reported for all of them and in halves (`opening`, 36-51 empty squares; `midgame
 
 Scoring takes a forward pass over the positions, about 20 ms for 5000 on the GPU.
 `--engine-set PATH` scores on another set, and `--engine-eval-every N` sets the cadence (0
-for never). Without a set at the default path, `~/.cache/turbozero/othello/engine-sets/edax-l24-5k.npz`,
+for never). Without a set at the default path, `~/.cache/turbozero/othello/engine-sets/nr26-evals-29k.npz`,
 training warns and goes on unscored; a missing `--engine-set` is an error.
+
+The default set has 29,100 positions with 21-51 empty squares from the evals store's games of
+2026-11 (networks against six engines at 30 s, the engines' round robin, and 2048-visit head to
+heads between 4x64 and ray-filter networks), scored by Neural Reversi at level 26. Its positions
+are close to even (73% within 2 discs of a draw), so its values and errors run higher than the
+earlier Edax set's (`edax-l24-5k.npz`, 5,000 self-play positions): compare runs on one set. On
+29 rated 11x64 checkpoints its `value_mse` ranked them by 2048-visit Elo at Spearman 0.78
+(0.54 on the Edax set), `top1` at 0.81 (0.13).
 
 To build a set, from the games in the evals store (evaluation games, which nothing trains on):
 sample positions from kinds of match, score every legal move of each with Neural Reversi
@@ -964,9 +972,10 @@ uv run examples/othello/label_positions.py assemble ~/.cache/turbozero/othello/s
     ~/.cache/turbozero/othello/sets/labels --out ~/.cache/turbozero/othello/engine-sets/new.npz
 ```
 
-At level 26, Neural Reversi scores a position's moves exactly up to about 29 empty squares
-(8 s on a core at 21-26, 20-160 s at 27-29) and 26 moves ahead beyond (about 4 s): 30,000
-positions spread over 21-51 empty squares take about 120 core-hours.
+At level 26, Neural Reversi scores a position's moves exactly up to 30 empty squares (on a
+razorback core 8 s at 21-26, 20-160 s at 27-29, minutes at 30) and 26 moves ahead beyond
+(about 4 s); Modal's cores take about twice as long. 30,000 positions spread over 21-51 empty
+squares took about 600 core-hours on Modal, about $45.
 To score saved checkpoints on a set:
 
 ```

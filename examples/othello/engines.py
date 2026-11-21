@@ -1142,7 +1142,7 @@ class MoveScores:
 class NeuralReversiAnalyst:
     """Neural Reversi scoring every legal move of positions (`cli solve --all-moves`), one
     process reading them a line at a time, one search thread. At a level it searches as it
-    plays at that level: at 26, exactly (every move to the end of the game) up to about 29
+    plays at that level: at 26, exactly (every move to the end of the game) up to 30
     empty squares, and 26 moves ahead with ProbCut beyond. It clears its hash table before
     each position, so a position's scores don't depend on the ones before it.
 
