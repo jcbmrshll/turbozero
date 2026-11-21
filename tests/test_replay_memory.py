@@ -403,3 +403,48 @@ def test_buffer_operations_take_the_capacity_of_the_state():
     state = buffer.add_experiences(state, experiences, jnp.array([True, True]))
     assert sampleable(buffer, state) == [4, 5, 6]
     assert state.next_idx == 0
+
+
+@pytest.mark.parametrize(
+    "episodes", [[[1, 2]], [[1, 2, 3], [4, 5]], [[1, 2, 3], [4, 5, 6, 7], [8]]]
+)
+def test_a_window_samples_what_a_buffer_of_that_capacity_would(episodes):
+    # the last episode is left in progress, as self-play leaves one: it takes places but can't
+    # be sampled; buffers wrap around
+    wide, narrow = EpisodeReplayBuffer(capacity=7, window=4), EpisodeReplayBuffer(4)
+    wide_state, narrow_state = init_single(wide), init_single(narrow)
+    for n, episode in enumerate(episodes):
+        wide_state, narrow_state = (
+            add(wide, wide_state, episode),
+            add(narrow, narrow_state, episode),
+        )
+        if n < len(episodes) - 1:
+            wide_state = wide.assign_rewards(wide_state, jnp.ones(2))
+            narrow_state = narrow.assign_rewards(narrow_state, jnp.ones(2))
+        assert sampleable(wide, wide_state) == sampleable(narrow, narrow_state)
+
+
+def test_widening_a_window_samples_the_older_entries_at_once():
+    narrow = EpisodeReplayBuffer(capacity=6, window=2)
+    state = narrow.assign_rewards(
+        add(narrow, init_single(narrow), [1, 2, 3, 4]), jnp.ones(2)
+    )
+    assert sampleable(narrow, state) == [3, 4]
+    assert sampleable(EpisodeReplayBuffer(capacity=6, window=5), state) == [1, 2, 3, 4]
+
+
+def test_a_window_applies_to_every_environment_of_a_batch():
+    buffer = EpisodeReplayBuffer(capacity=6, window=2)
+    state = buffer.init(2, experience(0))
+    step = jax.vmap(buffer.add_experience)
+    for obs in ([1, 10], [2, 20], [3, 30]):
+        state = step(state, jax.vmap(experience)(jnp.array(obs)))
+    state = jax.vmap(buffer.assign_rewards)(state, jnp.ones((2, 2)))
+    assert sampleable(buffer, state) == [2, 3, 20, 30]
+    assert buffer.get_config() == {"capacity": 6, "window": 2}
+
+
+@pytest.mark.parametrize("window", [0, 7])
+def test_a_window_is_at_most_the_capacity(window):
+    with pytest.raises(ValueError, match="sampling window"):
+        EpisodeReplayBuffer(capacity=6, window=window)

@@ -377,6 +377,69 @@ def test_bad_grow_options_are_refused(monkeypatch, options):
         run_main(monkeypatch, *options)
 
 
+def test_growth_can_follow_a_weight_averages_metric(monkeypatch, tmp_path):
+    from test_engine_set import tiny_set
+
+    tiny_set(np.random.default_rng(0)).save(tmp_path / "set.npz")
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(
+            monkeypatch,
+            "--grow",
+            "resnet:2x8",
+            "--grow-metric",
+            "avg4/engine_value_mse",
+            "--grow-guard",
+            "avg4/engine_exp_regret",
+            "--average-epochs",
+            "4",
+            "--engine-eval-every",
+            "1",
+            "--engine-set",
+            str(tmp_path / "set.npz"),
+        )
+    growth = built.value.kwargs["growth"]
+    assert (growth.metric, growth.guard) == (
+        "avg4/engine_value_mse",
+        "avg4/engine_exp_regret",
+    )
+
+
+@pytest.mark.parametrize(
+    "metric",
+    ["avg16/engine_value_mse", "avg4/loss", "engine_top1", "avg/engine_value_mse"],
+)
+def test_growth_metrics_name_a_kept_average_and_an_error(monkeypatch, metric):
+    # (avg16 isn't one of --average-epochs; the rest aren't metrics the rule can follow)
+    with pytest.raises(SystemExit):
+        run_main(
+            monkeypatch,
+            "--grow",
+            "resnet:2x8",
+            "--grow-switch-at",
+            "80",
+            "--average-epochs",
+            "4",
+            "--grow-metric",
+            metric,
+        )
+
+
+def test_a_buffer_window_reaches_the_replay_buffer(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, "--buffer", "9000", "--buffer-window", "1125")
+    buffer = built.value.kwargs["memory_buffer"]
+    assert (buffer.capacity, buffer.window) == (9000, 1125)
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, "--buffer", "9000")
+    assert built.value.kwargs["memory_buffer"].window is None
+
+
+@pytest.mark.parametrize("window", ["0", "9001"])
+def test_a_buffer_window_is_within_the_buffer(monkeypatch, window):
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, "--buffer", "9000", "--buffer-window", window)
+
+
 def test_warm_starts_reach_the_training_loop(monkeypatch):
     built, loops = [], []
 

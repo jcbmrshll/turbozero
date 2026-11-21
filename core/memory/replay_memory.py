@@ -99,23 +99,32 @@ class EpisodeReplayBuffer:
     `capacity` is that of the states `init` makes. Every other method takes the capacity of the
     state it's given (see `buffer_capacity`), so it works on a state of any capacity, e.g. one
     `resized` to another.
+
+    With a `window`, only each environment's newest `window` entries can be sampled, as if the
+    buffer held only that many; the older ones stay stored. So a run can widen its window at
+    once, onto entries it already has, rather than waiting for a bigger buffer to fill.
     """
 
-    def __init__(
-        self,
-        capacity: int,
-    ):
+    def __init__(self, capacity: int, window: int | None = None):
         """Initializes an EpisodeReplayBuffer.
 
         Args:
-            capacity: number of experiences to store in the buffer
+            capacity: number of experiences to store in the buffer, per environment
+            window: (optional) the newest entries per environment that can be sampled, at most
+                `capacity`; default all of them
         """
+        if window is not None and not 0 < window <= capacity:
+            raise ValueError(
+                f"a sampling window is 1 to the capacity ({capacity}) entries: {window}"
+            )
         self.capacity = capacity
+        self.window = window
 
     def get_config(self):
         """Returns the configuration of the replay buffer. Used for logging."""
         return {
             "capacity": self.capacity,
+            **({"window": self.window} if self.window is not None else {}),
         }
 
     def add_experience(
@@ -328,7 +337,9 @@ class EpisodeReplayBuffer:
         return resized, [copy(x) for x in entry_data]
 
     def sample_mask(self, state: ReplayBufferState) -> jax.Array:
-        """Marks the buffer entries that can be sampled: populated, and from a finished episode.
+        """Marks the buffer entries that can be sampled: populated, from a finished episode, and
+        with a `window`, among the environment's newest `window` entries (an episode in
+        progress counts towards them, as it takes places in a buffer of that capacity).
 
         Compatible with `jax.jit`. Works with any number of batch dimensions in front of the
         capacity dimension.
@@ -339,7 +350,13 @@ class EpisodeReplayBuffer:
         Returns:
             jax.Array: boolean mask, same shape as `state.populated`
         """
-        return jnp.logical_and(state.populated, state.has_reward)
+        mask = jnp.logical_and(state.populated, state.has_reward)
+        if self.window is None:
+            return mask
+        capacity = buffer_capacity(state)
+        # the entry just before `next_idx` is the newest, age 0
+        age = (state.next_idx[..., None] - 1 - jnp.arange(capacity)) % capacity
+        return mask & (age < self.window)
 
     def check_can_sample(self, state: ReplayBufferState, sample_size: int = 1) -> None:
         """Checks on the host that an episode has finished, and that there are at least

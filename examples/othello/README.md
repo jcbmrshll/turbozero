@@ -106,6 +106,12 @@ from. Self-play adds 128 an epoch (a position a move), so the default 1125 is ab
 how many of them are distinct, a position's symmetric images counting as one, as
 `buffer_distinct_positions`.
 
+`--buffer-window N` trains on only each environment's newest N of the positions kept, as if
+`--buffer` were N, while the older ones stay stored. A branch can then widen the window at once,
+onto positions the run already has, where a bigger `--buffer` would start empty and take as
+many epochs to fill: keep the largest buffer a run may use (`--buffer 9000 --buffer-window 1125`)
+and branch with a wider window to try one.
+
 The buffer's size sets how old the data training samples is, not how often each position
 is trained on: on average, that's the samples training takes each epoch over the positions
 self-play adds, whatever the size. With the defaults, 256 steps of 4096 samples
@@ -377,7 +383,8 @@ settings a branch continues it exactly. Two branches of one state, one at `--sim
 at `--sims 64`, compare the two at the same point of the same run. It works for runs with
 `--grow`, which can't be forked, and `--take-over` hands self-play to the next network from
 the branch's first epoch. A different `--buffer` resizes the replay buffer at the branch's
-start, each environment keeping its newest positions. The branch logs to a seaglass run of its
+start, each environment keeping its newest positions; a different `--buffer-window` only changes
+which of them training samples. The branch logs to a seaglass run of its
 own, whose config records the state as `parent`.
 
 ```
@@ -397,6 +404,8 @@ train at a time.
 The next network takes over when its `--grow-metric` on the engine-labelled set
 (`engine_value_mse`, scored every epoch) is at or below the playing one's, or with
 `--grow-metric loss` its training loss on the data both train on, as KataGo's rule had it.
+`avg4/engine_value_mse` compares their 4-epoch weight averages instead (`--average-epochs 4`),
+what self-play plays with `--selfplay-average 4`.
 `--grow-margin 0.01` makes the next lead by 1% of the playing one's metric, and `--grow-guard
 engine_value_mse` makes it also no worse on the engine set's value error. Each is averaged over
 the last `--grow-window` (10) epochs, and the next must have trained `--grow-min-epochs` (10) first.
@@ -654,11 +663,22 @@ uv run examples/othello/modal_jobs.py list [--billed today]
 uv run examples/othello/modal_jobs.py stop trunk-a       # or --all; --now doesn't wait for the run to end as stopped
 uv run examples/othello/modal_jobs.py resume trunk-a     # after it ended short; --hours for a new limit
 uv run examples/othello/modal_jobs.py sync               # `launch` keeps one running, in tmux session modal-sync
+uv run examples/othello/modal_jobs.py extend trunk-a --step "..."   # more steps, after its others
 ```
 
+A job can grow while it runs: `extend` appends steps, which it runs after the others, and with
+`launch --follow 20` it waits up to 20 minutes after its last step for more before ending. A
+run in segments (each a step that branches from the last one's final state, with new settings)
+is then one job on one machine: each segment starts from the state on its own disk.
+`--states-in-bucket` keeps saved states in the bucket, where later steps and other jobs (forks)
+start from them, rather than bringing them here, and removes all but the newest segments' from
+the job's disk.
+
 A step is the command as you'd write it here, with `> LOG`; paths must be under
-`~/.cache/turbozero`. `--init-from` names a `state-<EPOCH>.npz`, here, in the bucket, or from an
-earlier step. A job runs without this machine.
+`~/.cache/turbozero`. `--init-from`, `--branch-from` and `--warm-start` name a `state-<EPOCH>.npz`,
+here, in the bucket, or from an earlier step: a staircase of learning rates for a `--grow` run, which
+can't be forked, is steps that each branch from the last one's final state. A job runs without this
+machine.
 Files go to the bucket as they're written: the sync brings them here, and a `--monitor` run appears
 on slick's seaglass while it runs, tagged with `$SEAGLASS_TAGS` and `modal`, its chip in its
 provenance. `modal-job.json` beside the checkpoints records commit, chip, flags and wall time.
@@ -686,6 +706,29 @@ Modal also bills what jobs upload, $0.04/GB: about $0.36/h with `--resume-every 
 1125, and `list` leaves it out (`list --billed` has it). Raise `--resume-every` to send fewer states,
 at the risk of more to redo after an interruption. Bringing a state of about 0.8 GB here costs about
 $0.10 in GCS egress, which is why states saved only to continue from stay in the bucket.
+
+### A mainline with forks on Modal
+
+`fork_driver.py` runs one long run on Modal as a mainline of segments, usually a growth run
+(`--grow`), and decides as it goes when the replay buffer's window and the sims go up, by forks:
+
+```sh
+uv run examples/othello/fork_driver.py init ~/.cache/turbozero/othello/runs/big --name big
+$EDITOR ~/.cache/turbozero/othello/runs/big/driver.toml    # nets, recipe, ladders, rules
+uv run examples/othello/fork_driver.py run ~/.cache/turbozero/othello/runs/big   # in tmux
+uv run examples/othello/fork_driver.py status ~/.cache/turbozero/othello/runs/big
+```
+
+Each line (the mainline, or a fork) is one Modal job whose steps are segments of
+`segment_epochs`, each branching from the last one's final state (see `extend` above). Between
+segments every network steps down its own learning rate (1e-3, 5e-4, 1e-4 by default, weight decay
+500 times it) once its value error on the engine-labelled set (`metric`) has plateaued. One fork at
+a time branches from the mainline with the buffer window or the sims a step up its ladder, follows
+the mainline's learning rates, and is compared with it at matched epochs: it takes over once it is
+`margin` lower over the last windows, or is killed once it plateaus without that lead. A window
+fork is judged only after a learning rate step (a wider window's gain shows after the rate drops).
+Decisions go to `decisions.jsonl` in the run's directory. The final checkpoints are decayed
+offline.
 
 ## Evaluating a checkpoint
 

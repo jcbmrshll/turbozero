@@ -27,11 +27,15 @@ p.add_argument("--ckpt-dir")
 p.add_argument("--keep-every", type=int)
 p.add_argument("--save-state-at", default="")
 p.add_argument("--save-state-every", type=int)
-p.add_argument("--init-from")
+# as train.py's: a run starts one of these ways
+start = p.add_mutually_exclusive_group()
+start.add_argument("--init-from")
+start.add_argument("--resume", action="store_true")
+start.add_argument("--branch-from")
 p.add_argument("--init-without-buffers", action="store_true")
 p.add_argument("--fork-into")
 p.add_argument("--warm-start", action="append", default=[])
-p.add_argument("--resume", action="store_true")
+p.add_argument("--take-over", action="store_true")
 p.add_argument("--monitor", nargs="?", const="")
 p.add_argument("--name")
 p.add_argument("--notes")
@@ -49,6 +53,11 @@ if args.resume:
     print(f"resuming from {start}", flush=True)
 if args.init_from:
     assert Path(args.init_from).exists()
+if args.branch_from:
+    assert Path(args.branch_from).exists()
+    print(f"branching from {args.branch_from}", flush=True)
+if args.take_over and not args.branch_from:
+    sys.exit("--take-over goes with --branch-from")
 if args.fork_into and not args.init_from:
     sys.exit("--fork-into needs --init-from")
 if args.warm_start and args.resume:
@@ -231,6 +240,14 @@ def test_parse_step_takes_a_local_command():
             "examples/othello/train.py --init-from ~/.cache/turbozero/dir --ckpt-dir ~/.cache/turbozero/c > ~/.cache/turbozero/l",
             "state-<EPOCH>",
         ),
+        (
+            "examples/othello/train.py --branch-from ~/.cache/turbozero/dir --ckpt-dir ~/.cache/turbozero/c > ~/.cache/turbozero/l",
+            "--branch-from names a state-<EPOCH>",
+        ),
+        (
+            "examples/othello/train.py --branch-from /tmp/state-1.npz --ckpt-dir ~/.cache/turbozero/c > ~/.cache/turbozero/l",
+            "wouldn't come back",
+        ),
     ],
 )  # fmt: skip
 def test_parse_step_refuses_what_wouldnt_work(text, says):
@@ -378,6 +395,48 @@ def test_a_forked_step_takes_its_states_and_resumes_without_them(scene):
     # the new machine goes on from the step's state, without how the step started
     assert scene.runner("p").run() == "done"
     assert "resuming from 5" in (scene.root / "l" / "t.log").read_text()
+
+
+def test_a_branched_step_takes_its_state_and_resumes_without_it(scene):
+    # a growth run's state here, which the launch uploads: e.g. a step of an LR staircase
+    trunk = f"{scene.home}/.cache/turbozero/c/trunk/state-20.npz"
+    scene.store.put_bytes(trunk.replace(f"{scene.home}/", "files/"), b"{}")
+    job = scene.job(
+        step(
+            "t",
+            f"--epochs 32 --keep-every 5 --die-at 28 --branch-from {trunk} --take-over",
+        ),
+        name="p",
+        resume_every=5,
+    )
+    assert modal_jobs.inputs_to_upload(job)[1:] == [trunk]
+    with pytest.raises(RuntimeError, match="lost"):
+        scene.runner("p").run()
+    assert "branching from" in (scene.root / "l" / "t.log").read_text()
+    died = scene.root / "c" / "t.died"
+    keep = died.read_text()
+    scene.wipe_container()
+    died.parent.mkdir(parents=True)
+    died.write_text(keep)
+
+    # the new machine goes on from the branch's own state: --branch-from and --take-over were
+    # how the branch started (train.py refuses either with --resume)
+    assert scene.runner("p").run() == "done"
+    log = (scene.root / "l" / "t.log").read_text()
+    # (the log goes on from the first machine's)
+    assert "resuming from 25" in log and log.count("branching from") == 1
+
+
+def test_a_branch_of_an_earlier_steps_state_isnt_uploaded(scene):
+    first = f"{scene.home}/.cache/turbozero/c/a"
+    job = scene.job(
+        step("a", "--epochs 4 --save-state-at 4"),
+        step("b", f"--epochs 6 --branch-from {first}/state-4.npz"),
+        name="p",
+    )
+    assert modal_jobs.inputs_to_upload(job)[1:] == []
+    assert scene.runner("p").run() == "done"
+    assert (scene.root / "c" / "b" / "5.eqx").exists()
 
 
 @pytest.mark.parametrize(
@@ -586,3 +645,109 @@ def test_jobs_in_finds_jobs(scene):
     scene.job(step("a"), name="a")
     scene.job(step("b"), name="b")
     assert modal_sync.jobs_in(scene.store) == ["a", "b"]
+
+
+# --- jobs that grow: a driver appends segments as they run
+
+
+def test_a_following_job_runs_steps_added_while_it_waits(scene):
+    home = scene.home
+    first = f"{home}/.cache/turbozero/c/a"
+    scene.job(
+        step("a", "--epochs 3 --save-state-at 3"),
+        name="p",
+        follow_minutes=0.05,
+        states_in_bucket=True,
+    )
+    runner = scene.runner("p")
+    added = threading.Event()
+
+    def driver():
+        # once the first segment is done, as a driver would
+        while not (Path(first) / "state-3.npz").exists():
+            threading.Event().wait(0.05)
+        threading.Event().wait(0.3)
+        modal_jobs.extend_job(
+            scene.store,
+            "p",
+            [
+                modal_spec.parse_step(
+                    step("b", f"--epochs 2 --branch-from {first}/state-3.npz"),
+                    str(home),
+                )
+            ],
+        )
+        added.set()
+
+    thread = threading.Thread(target=driver)
+    thread.start()
+    assert runner.run() == "done"
+    thread.join()
+    assert added.is_set()
+    assert "branching from" in (scene.root / "l" / "b.log").read_text()
+    # its states stay in the bucket: the sync leaves them there
+    scene.wipe_container()
+    scene.sync().run()
+    assert (scene.root / "c" / "a" / "2.eqx").exists()
+    assert not (scene.root / "c" / "a" / "state-3.npz").exists()
+    assert scene.store.sizes("files/.cache/turbozero/c/a/state-3.npz")
+
+
+def test_a_following_job_ends_when_nothing_more_comes(scene):
+    scene.job(step("a", "--epochs 2"), name="p", follow_minutes=0.01)
+    assert scene.runner("p").run() == "done"
+
+
+def test_a_job_of_segments_keeps_only_the_newest_states_on_its_disk(scene):
+    c = f"{scene.home}/.cache/turbozero/c"
+    scene.job(
+        step("s0", "--epochs 2 --save-state-at 2"),
+        step("s1", f"--epochs 2 --save-state-at 2 --branch-from {c}/s0/state-2.npz"),
+        step("s2", f"--epochs 2 --save-state-at 2 --branch-from {c}/s1/state-2.npz"),
+        name="p",
+        states_in_bucket=True,
+    )
+    assert scene.runner("p").run() == "done"
+    # s2 needed only s1's: s0's left the disk, and the bucket keeps every one
+    assert not (scene.root / "c" / "s0" / "state-2.npz").exists()
+    assert (scene.root / "c" / "s1" / "state-2.npz").exists()
+    for name in ("s0", "s1", "s2"):
+        assert scene.store.sizes(f"files/.cache/turbozero/c/{name}/state-2.npz")
+
+
+def test_extending_a_job_refuses_a_step_it_already_has_or_a_taken_place(scene):
+    scene.job(step("a"), name="p")
+    home = str(scene.home)
+    with pytest.raises(SystemExit, match="already a step's"):
+        modal_jobs.extend_job(
+            scene.store, "p", [modal_spec.parse_step(step("a"), home)]
+        )
+    taken = scene.root / "c" / "b"
+    taken.mkdir(parents=True)
+    (taken / "x").write_text("a local run's")
+    with pytest.raises(SystemExit, match="already has files"):
+        modal_jobs.extend_job(
+            scene.store, "p", [modal_spec.parse_step(step("b"), home)]
+        )
+    job = modal_jobs.extend_job(
+        scene.store, "p", [modal_spec.parse_step(step("c"), home)], hours=3
+    )
+    assert [Path(s.ckpt_dir).name for s in job.steps] == ["a", "c"] and job.hours == 3
+
+
+def test_a_job_stopped_while_it_waits_for_more_steps_ends_as_stopped(scene):
+    scene.job(step("a", "--epochs 2"), name="p", follow_minutes=0.2)
+    done = scene.root / "c" / "a" / "1.eqx"
+
+    def stop_once_done():
+        while not done.exists():
+            threading.Event().wait(0.05)
+        threading.Event().wait(0.3)
+        modal_store.put_json(
+            scene.store, modal_spec.job_key("p", "stop.json"), {"stop": True}
+        )
+
+    thread = threading.Thread(target=stop_once_done)
+    thread.start()
+    assert scene.runner("p").run() == "stopped"
+    thread.join()

@@ -2486,12 +2486,14 @@ def growth_trainer(
     grown=(1, 2),
     lr_scales=None,
     hyperparams=None,
+    make_tester=None,
     **kwargs,
 ):
     """A trainer whose MLP (n0, hidden width 8) grows into n1 (width 12) and n2 (width 16), or
     those of `grown`: network i's self-play is TaggedEvaluator(i), its tests'
-    TaggedEvaluator(10 + i), and its tester a ScriptedTester of `scripts[i]`."""
-    testers = [ScriptedTester(script) for script in scripts]
+    TaggedEvaluator(10 + i), and its tester a ScriptedTester of `scripts[i]` (or
+    `make_tester(scripts[i])`)."""
+    testers = [(make_tester or ScriptedTester)(script) for script in scripts]
     learners = [
         Learner(
             name=f"n{i}",
@@ -2615,6 +2617,49 @@ def test_growth_hands_self_play_to_the_next_network(env, tmp_path, fake_loop, ca
         )
     }
     assert not undescribed
+
+
+class AveragedScriptedTester(ScriptedTester):
+    """A stateless `ScriptedTester` (the trainer scores weight averages with it too): the
+    network's `probe_error` is `script(epoch)`, its average's `average_script(epoch)`."""
+
+    stateless = True
+
+    def __init__(self, script, average_script, **kwargs):
+        super().__init__(script, **kwargs)
+        self.average_script = average_script
+
+    def run(self, *args, epoch_num=0, **kwargs):  # pyright: ignore[reportIncompatibleMethodOverride]
+        # the network's test comes first each epoch, then its average's
+        first = not self.calls or self.calls[-1].epoch != epoch_num
+        state, metrics, episode = super().run(*args, epoch_num=epoch_num, **kwargs)
+        if not first:
+            metrics = {
+                "probe_error": jnp.array([self.average_script(epoch_num)], jnp.float32)
+            }
+        return state, metrics, episode
+
+
+def test_growth_can_follow_a_weight_averages_metric(env, tmp_path, fake_loop, capsys):
+    # n1's own weights lead from the start; its average only from epoch 4, as SCRIPTS' n1 does
+    scripts = ((lambda e: 1.0, lambda e: 1.0), (lambda e: 0.5, SCRIPTS[1]))
+    trainer, _ = growth_trainer(
+        env,
+        tmp_path,
+        scripts,
+        growth_kwargs={"metric": "avg1/probe_error"},
+        grown=(1,),
+        make_tester=lambda pair: AveragedScriptedTester(*pair),
+        averages=(1,),
+        average_warmup=1,
+    )
+    fake_loop(trainer)
+
+    output = trainer.train_loop(seed=0, num_epochs=7)
+
+    # the averages decide: n1 takes over after epoch 5, not after its 2 minimum epochs
+    assert "epoch 5: n1 takes over self-play from n0" in capsys.readouterr().out
+    assert output.growth is not None and output.growth.playing == 1
 
 
 def test_growth_can_switch_at_fixed_epochs(env, tmp_path, fake_loop):
