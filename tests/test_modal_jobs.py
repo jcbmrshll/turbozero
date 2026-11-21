@@ -751,3 +751,25 @@ def test_a_job_stopped_while_it_waits_for_more_steps_ends_as_stopped(scene):
     thread.start()
     assert scene.runner("p").run() == "stopped"
     thread.join()
+
+
+def test_a_step_whose_start_was_never_sent_runs_the_step_that_makes_it_again(scene):
+    c = f"{scene.home}/.cache/turbozero/c"
+    scene.job(
+        step("a", "--epochs 3 --save-state-at 3"),
+        step("b", f"--epochs 4 --die-at 1 --branch-from {c}/a/state-3.npz"),
+        name="p",
+        resume_every=10,
+    )
+    with pytest.raises(RuntimeError, match="lost"):
+        scene.runner("p").run()
+    # the machine was lost before a's final state reached the bucket
+    (scene.tmp / "bucket" / "files/.cache/turbozero/c/a/state-3.npz").unlink()
+    died = (scene.root / "c" / "b.died").read_text()
+    scene.wipe_container()
+    (scene.root / "c").mkdir(parents=True)
+    (scene.root / "c" / "b.died").write_text(died)
+
+    assert scene.runner("p").run() == "done"
+    assert "attempt 2, from the start" in (scene.root / "l" / "a.log").read_text()
+    assert scene.store.sizes("files/.cache/turbozero/c/a/state-3.npz")
