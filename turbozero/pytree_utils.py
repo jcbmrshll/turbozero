@@ -7,10 +7,10 @@ from jax.typing import ArrayLike
 
 
 def where_tree(condition: ArrayLike, new: Any, old: Any) -> Any:
-    """`jnp.where(condition, new, old)` leaf by leaf, for two pytrees of the
-    same structure. A leaf that is the same array in both (e.g. one that
-    `dataclasses.replace` left as it was) is kept without a select, which under
-    vmap would read and write the whole leaf.
+    """Selects between two pytrees of the same structure leaf by leaf, as
+    `jnp.where(condition, new, old)`. A leaf that is the same array in both
+    (e.g. one that `dataclasses.replace` left as it was) is kept without a
+    select, which under vmap would read and write the whole leaf.
     """
     return jax.tree.map(
         lambda n, o: o if n is o else jnp.where(condition, n, o), new, old
@@ -20,13 +20,16 @@ def where_tree(condition: ArrayLike, new: Any, old: Any) -> Any:
 def map_where(
     fn: Callable[..., Any], active: jax.Array, tree: Any, *args: Any, size: int
 ) -> Any:
-    """`where_tree(active, jax.vmap(fn)(tree, *args), tree)`, computing `fn`
-    only for the entries where `active` (leaves have a leading batch
-    dimension). The active entries are gathered `size` at a time, mapped and
-    written back in place, and the others aren't read at all; under vmap, or
-    with a select, `fn` would read and write every entry however few are
-    active. Each gather is a loop trip and costs `size` entries' work whether or
-    not that many are left.
+    """Applies `fn` to the entries of `tree` where `active` and leaves the
+    rest unchanged, as `where_tree(active, jax.vmap(fn)(tree, *args), tree)`
+    would, but computing `fn` only for the active entries (leaves have a
+    leading batch dimension).
+
+    The active entries are gathered `size` at a time, mapped and written back
+    in place, and the others aren't read at all; under vmap, or with a select,
+    `fn` would read and write every entry however few are active. Each gather
+    is a loop trip and costs `size` entries' work whether or not that many are
+    left.
     """
     batch = active.shape[0]
     size = min(size, batch)

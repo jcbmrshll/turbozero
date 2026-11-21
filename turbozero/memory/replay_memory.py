@@ -112,13 +112,16 @@ class EpisodeReplayBuffer:
         )
 
     def resize(self, state: ReplayBufferState, capacity: int) -> ReplayBufferState:
-        """`state` with `capacity` places, keeping its newest entries, as many
-        as fit, oldest first, so the next entry written overwrites the oldest.
-        Growing leaves the oldest places empty. An episode in progress carries
-        on: its entries are the newest, so they're kept (its newest, if it has
-        more than fit), and it ends as it would have.
+        """Resizes the buffer to `capacity` places, keeping its newest entries,
+        as many as fit.
+
+        The kept entries end up in the last places, oldest first, and writing
+        starts again at place 0, so the next entry written overwrites the
+        oldest. Growing leaves the first places empty. An episode in progress
+        carries on: its entries are the newest, so they're kept (its newest, if
+        it has more than fit), and it ends as it would have.
         """
-        # place j gets the entry of age capacity - 1 - j
+        # place j gets the entry of age capacity - 1 - j (age 0 is the newest)
         age = capacity - 1 - jnp.arange(capacity)
         source = (state.next_idx - 1 - age) % state.capacity
         kept = age < state.capacity
@@ -142,23 +145,25 @@ class EpisodeReplayBuffer:
         )
 
     def sample_mask(self, state: ReplayBufferState) -> jax.Array:
-        """The entries that can be sampled: populated, from a finished episode.
-        Works with any batch dimensions in front of the capacity dimension.
+        """Returns a mask of the entries that can be sampled: populated, from a
+        finished episode. Works with any batch dimensions in front of the
+        capacity dimension.
         """
         return jnp.logical_and(state.populated, state.has_reward)
 
     def sample_indices(
         self, key: jax.Array, mask: jax.Array, sample_size: int, replace: bool = False
     ) -> jax.Array:
-        """(sample_size,) indices into the flattened `mask`, drawn uniformly
-        from all the entries it marks, whatever environment they're in: `mask`
-        is `sample_mask` of the stacked states, and
+        """Draws `sample_size` indices into the flattened `mask`, uniformly from
+        all the entries it marks, whatever environment they're in. `mask` is
+        `sample_mask` of the stacked states, and
         `jnp.unravel_index(indices, mask.shape)` indexes their buffers. Without
         `replace`, `mask` must mark at least `sample_size` entries, else
         unmarked ones fill the rest of the sample.
         """
-        # over every environment's stacked states: on a single environment's
-        # (e.g. vmapped), each environment would draw its own sample
+        # sample from every environment's stacked states at once: called on a
+        # single environment's state (e.g. under vmap), each environment would
+        # draw its own sample
         assert mask.ndim >= 2 and mask.dtype == jnp.bool_
         mask = mask.reshape(-1)
         return jax.random.choice(
@@ -168,7 +173,7 @@ class EpisodeReplayBuffer:
     def init(
         self, batch_size: int, template_experience: BaseExperience
     ) -> ReplayBufferState:
-        """Empty states for `batch_size` environments, stacked, holding
+        """Creates empty states for `batch_size` environments, stacked, holding
         experiences shaped as `template_experience`.
         """
         shape = (batch_size, self.capacity)
