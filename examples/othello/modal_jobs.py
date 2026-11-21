@@ -39,7 +39,7 @@ from modal_spec import (
     flag,
     job_key,
     parse_step,
-    warm_start_paths,
+    start_states,
 )
 from modal_store import GcsStore, Store, get_json, put_json
 from modal_sync import TERMINAL, Sync, jobs_in
@@ -105,8 +105,8 @@ def inputs_to_upload(job: Job) -> list[str]:
     out = [engine_set_path(job.home)]
     made = {step.ckpt_dir for step in job.steps}
     for step in job.steps:
-        paths = [flag(step.argv, name) for name in ("--init-from", "--engine-set")]
-        for path in [*paths, *warm_start_paths(step.argv)]:
+        paths = [flag(step.argv, "--engine-set")]
+        for path in [*paths, *(path for _, path in start_states(step.argv))]:
             if path is not None and os.path.dirname(path) not in made:
                 out.append(path)
     return out

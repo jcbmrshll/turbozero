@@ -27,11 +27,15 @@ p.add_argument("--ckpt-dir")
 p.add_argument("--keep-every", type=int)
 p.add_argument("--save-state-at", default="")
 p.add_argument("--save-state-every", type=int)
-p.add_argument("--init-from")
+# as train.py's: a run starts one of these ways
+start = p.add_mutually_exclusive_group()
+start.add_argument("--init-from")
+start.add_argument("--resume", action="store_true")
+start.add_argument("--branch-from")
 p.add_argument("--init-without-buffers", action="store_true")
 p.add_argument("--fork-into")
 p.add_argument("--warm-start", action="append", default=[])
-p.add_argument("--resume", action="store_true")
+p.add_argument("--take-over", action="store_true")
 p.add_argument("--monitor", nargs="?", const="")
 p.add_argument("--name")
 p.add_argument("--notes")
@@ -49,6 +53,11 @@ if args.resume:
     print(f"resuming from {start}", flush=True)
 if args.init_from:
     assert Path(args.init_from).exists()
+if args.branch_from:
+    assert Path(args.branch_from).exists()
+    print(f"branching from {args.branch_from}", flush=True)
+if args.take_over and not args.branch_from:
+    sys.exit("--take-over goes with --branch-from")
 if args.fork_into and not args.init_from:
     sys.exit("--fork-into needs --init-from")
 if args.warm_start and args.resume:
@@ -231,6 +240,14 @@ def test_parse_step_takes_a_local_command():
             "examples/othello/train.py --init-from ~/.cache/turbozero/dir --ckpt-dir ~/.cache/turbozero/c > ~/.cache/turbozero/l",
             "state-<EPOCH>",
         ),
+        (
+            "examples/othello/train.py --branch-from ~/.cache/turbozero/dir --ckpt-dir ~/.cache/turbozero/c > ~/.cache/turbozero/l",
+            "--branch-from names a state-<EPOCH>",
+        ),
+        (
+            "examples/othello/train.py --branch-from /tmp/state-1.npz --ckpt-dir ~/.cache/turbozero/c > ~/.cache/turbozero/l",
+            "wouldn't come back",
+        ),
     ],
 )  # fmt: skip
 def test_parse_step_refuses_what_wouldnt_work(text, says):
@@ -378,6 +395,48 @@ def test_a_forked_step_takes_its_states_and_resumes_without_them(scene):
     # the new machine goes on from the step's state, without how the step started
     assert scene.runner("p").run() == "done"
     assert "resuming from 5" in (scene.root / "l" / "t.log").read_text()
+
+
+def test_a_branched_step_takes_its_state_and_resumes_without_it(scene):
+    # a growth run's state here, which the launch uploads: e.g. a step of an LR staircase
+    trunk = f"{scene.home}/.cache/turbozero/c/trunk/state-20.npz"
+    scene.store.put_bytes(trunk.replace(f"{scene.home}/", "files/"), b"{}")
+    job = scene.job(
+        step(
+            "t",
+            f"--epochs 32 --keep-every 5 --die-at 28 --branch-from {trunk} --take-over",
+        ),
+        name="p",
+        resume_every=5,
+    )
+    assert modal_jobs.inputs_to_upload(job)[1:] == [trunk]
+    with pytest.raises(RuntimeError, match="lost"):
+        scene.runner("p").run()
+    assert "branching from" in (scene.root / "l" / "t.log").read_text()
+    died = scene.root / "c" / "t.died"
+    keep = died.read_text()
+    scene.wipe_container()
+    died.parent.mkdir(parents=True)
+    died.write_text(keep)
+
+    # the new machine goes on from the branch's own state: --branch-from and --take-over were
+    # how the branch started (train.py refuses either with --resume)
+    assert scene.runner("p").run() == "done"
+    log = (scene.root / "l" / "t.log").read_text()
+    # (the log goes on from the first machine's)
+    assert "resuming from 25" in log and log.count("branching from") == 1
+
+
+def test_a_branch_of_an_earlier_steps_state_isnt_uploaded(scene):
+    first = f"{scene.home}/.cache/turbozero/c/a"
+    job = scene.job(
+        step("a", "--epochs 4 --save-state-at 4"),
+        step("b", f"--epochs 6 --branch-from {first}/state-4.npz"),
+        name="p",
+    )
+    assert modal_jobs.inputs_to_upload(job)[1:] == []
+    assert scene.runner("p").run() == "done"
+    assert (scene.root / "c" / "b" / "5.eqx").exists()
 
 
 @pytest.mark.parametrize(

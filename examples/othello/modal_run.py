@@ -29,8 +29,8 @@ from modal_spec import (
     Step,
     flag,
     job_key,
+    start_states,
     state_epochs_requested,
-    warm_start_paths,
     with_monitor,
     without_flag,
 )
@@ -343,6 +343,8 @@ class Runner:
             argv = without_flag(argv, "--init-without-buffers", takes_value=False)
             argv = without_flag(argv, "--fork-into", takes_value=True)
             argv = without_flag(argv, "--warm-start", takes_value=True)
+            argv = without_flag(argv, "--branch-from", takes_value=True)
+            argv = without_flag(argv, "--take-over", takes_value=False)
             argv = [*argv, "--resume"]
         if flag(step.argv, "--save-state-every") is None:
             argv = [*argv, "--save-state-every", str(self.job.resume_every)]
@@ -368,9 +370,8 @@ class Runner:
             return "done"
         os.makedirs(step.ckpt_dir, exist_ok=True)
         os.makedirs(os.path.dirname(step.log), exist_ok=True)
-        ensure_input(self.store, job, flag(step.argv, "--init-from"))
         ensure_input(self.store, job, flag(step.argv, "--engine-set"))
-        for path in warm_start_paths(step.argv):
+        for _, path in start_states(step.argv):
             ensure_input(self.store, job, path)
         resume = restore_step(self.store, job, self.name, index, step)
         if not resume:

@@ -42,14 +42,20 @@ def flag(argv: list[str], name: str) -> str | None:
     return None
 
 
-def warm_start_paths(argv: list[str]) -> list[str]:
-    """The saved states `argv`'s --warm-start flags (SIZE=PATH, each) start networks from."""
+def start_states(argv: list[str]) -> list[tuple[str, str]]:
+    """The saved states a step starts from, each as (its flag, its path): --init-from's,
+    --branch-from's and every --warm-start's (NAME=PATH). The job brings them to the machine
+    the step runs on; once the step has a state of its own it resumes without them."""
     out = []
     for i, arg in enumerate(argv):
-        if arg == "--warm-start" and i + 1 < len(argv):
-            out.append(argv[i + 1].partition("=")[2])
-        elif arg.startswith("--warm-start="):
-            out.append(arg.split("=", 1)[1].partition("=")[2])
+        name, sep, value = arg.partition("=")
+        if name not in ("--init-from", "--branch-from", "--warm-start"):
+            continue
+        if not sep:
+            if i + 1 >= len(argv):
+                continue
+            value = argv[i + 1]
+        out.append((name, value.partition("=")[2] if name == "--warm-start" else value))
     return out
 
 
@@ -137,12 +143,9 @@ def parse_step(text: str, home: str) -> Step:
         raise ValueError(f"a step needs a --ckpt-dir: {text!r}")
     if "--resume" in argv:
         raise ValueError("no --resume: a job resumes its steps itself")
-    init_from = flag(argv, "--init-from")
-    if init_from is not None and not re.fullmatch(STATE, Path(init_from).name):
-        raise ValueError(f"--init-from names a state-<EPOCH>.npz: {init_from}")
-    for path in warm_start_paths(argv):
+    for name, path in start_states(argv):
         if not re.fullmatch(STATE, Path(path).name):
-            raise ValueError(f"--warm-start names a state-<EPOCH>.npz: {path}")
+            raise ValueError(f"{name} names a state-<EPOCH>.npz: {path}")
     if flag(argv, "--log-moves") is not None:
         raise ValueError(
             "--log-moves is for local runs: bringing the moves here from the bucket costs more "
@@ -152,9 +155,8 @@ def parse_step(text: str, home: str) -> Step:
     for path in (
         ckpt_dir,
         log,
-        flag(argv, "--init-from"),
         flag(argv, "--engine-set"),
-        *warm_start_paths(argv),
+        *(path for _, path in start_states(argv)),
     ):
         if path is not None and not Path(path).is_relative_to(root):
             raise ValueError(f"{path} isn't under {root}: it wouldn't come back here")

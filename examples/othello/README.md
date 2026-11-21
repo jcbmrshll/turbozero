@@ -657,8 +657,10 @@ uv run examples/othello/modal_jobs.py sync               # `launch` keeps one ru
 ```
 
 A step is the command as you'd write it here, with `> LOG`; paths must be under
-`~/.cache/turbozero`. `--init-from` names a `state-<EPOCH>.npz`, here, in the bucket, or from an
-earlier step. A job runs without this machine.
+`~/.cache/turbozero`. `--init-from`, `--branch-from` and `--warm-start` name a `state-<EPOCH>.npz`,
+here, in the bucket, or from an earlier step: a staircase of learning rates for a `--grow` run, which
+can't be forked, is steps that each branch from the last one's final state. A job runs without this
+machine.
 Files go to the bucket as they're written: the sync brings them here, and a `--monitor` run appears
 on slick's seaglass while it runs, tagged with `$SEAGLASS_TAGS` and `modal`, its chip in its
 provenance. `modal-job.json` beside the checkpoints records commit, chip, flags and wall time.
