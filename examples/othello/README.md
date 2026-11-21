@@ -21,7 +21,7 @@ engines, chiefly [Edax](https://github.com/abulmo/edax-reversi) and
 | `export_onnx.py` | Exports a checkpoint's network to ONNX |
 | `bench_cpu_backends.py` | Evals a second by CPU backend and batch, each checked against JAX's outputs |
 | `quantize.py`, `fidelity.py`, `bench_quantized.py` | Quantizes a network to int8 for playing on CPU, and measures its outputs and speed against bf16 |
-| `engine_set.py`, `label_positions.py`, `score_engine_set.py` | The engine-labelled set: fixed positions with every legal move scored by Edax, to build, and to score checkpoints on (train.py scores the network on it every epoch) |
+| `engine_set.py`, `label_positions.py`, `score_engine_set.py` | The engine-labelled set: fixed positions with every legal move scored by a strong engine, to build, and to score checkpoints on (train.py scores the network on it every epoch) |
 | `distill.py` | Trains a network on a saved training state's replay buffer or a dataset, with no self-play, on a teacher network's values or the games' outcomes |
 | `teacher_dataset.py` | A dataset of whole self-play games from the moves a run kept (`--log-moves`), labelled with exact endgame results |
 | `bench_nets.py` | Times networks on their own: a forward pass at self-play's batch, a training step at training's |
@@ -914,29 +914,30 @@ moves. The engines took about 1.45x their time on razorback's CPUs 16-23 (1.24-1
 Egaroucid a little more than Edax, so these VMs need their own timings rather than razorback's
 scaled.
 
-### Against Edax's scores of fixed positions
+### Against an engine's scores of fixed positions
 
 Games against engines measure strength, but coarsely: 512 games give a score within about
 ±0.02, and a run's score moves by more than that from training randomness alone. The
 engine-labelled set measures the network more finely, without search or games: thousands of
-fixed positions from self-play, past the XOT opening and with a choice of move, each legal
-move of which Edax has scored (the disc margin it expects at the end, searching 24 moves
-ahead and solving the last ~31 squares exactly).
+fixed positions past the XOT opening and with a choice of move, each legal move of which an
+engine has scored: the disc margin it expects at the end. Sets record what scored each
+position (`labeller_names`): Edax at level 24 (24 moves ahead, the last squares exact), or
+Neural Reversi at level 26 (exact up to 30 empty squares, 26 moves ahead beyond).
 
 `train.py` scores the network on it every epoch and logs, for all positions and for each
 game phase (`opening`, 40-51 empty squares; `midgame`, 25-39; `endgame`, 1-24):
 
-- `engine_top1`: how often the network's most likely move is one of Edax's best
-- `engine_regret`: discs its most likely move gives up against Edax's best
+- `engine_top1`: how often the network's most likely move is one of the engine's best
+- `engine_regret`: discs its most likely move gives up against the engine's best
 - `engine_exp_regret`: the same, averaged over its policy: smoother, and about three times
   less noisy than `engine_regret` (a difference between two checkpoints on the same set is
   good to about ±0.015 discs). But it also measures how sharp the policy is, which the
   search and its policy target set (more sims, or `--policy-target completed-q`, train a
   sharper or flatter one): compare it only between runs with the same search and target,
   and across them, `engine_regret` and `engine_value_mse`
-- `engine_value_mse`: its value's squared error against the outcome Edax predicts (±1, 0 for a
+- `engine_value_mse`: its value's squared error against the outcome the engine predicts (±1, 0 for a
   draw)
-- `engine_value_sign`: how often its value calls the winner Edax does
+- `engine_value_sign`: how often its value calls the winner the engine does
 
 It logs the same metrics as `filtered_engine_*` over only the positions the network decides:
 from the XOT opening's to the exact solver's, which plays and labels positions with 20 empty
@@ -945,21 +946,37 @@ reported for all of them and in halves (`opening`, 36-51 empty squares; `midgame
 
 Scoring takes a forward pass over the positions, about 20 ms for 5000 on the GPU.
 `--engine-set PATH` scores on another set, and `--engine-eval-every N` sets the cadence (0
-for never). Without a set at the default path, `~/.cache/turbozero/othello/engine-sets/edax-l24.npz`,
+for never). Without a set at the default path, `~/.cache/turbozero/othello/engine-sets/nr26-evals-29k.npz`,
 training warns and goes on unscored; a missing `--engine-set` is an error.
 
-To build a set, from the replay buffers of saved training states (`--save-state-at`); each
-`--source` is a state, optionally only some of its environments:
+The default set has 29,100 positions with 21-51 empty squares from the evals store's games of
+2026-11 (networks against six engines at 30 s, the engines' round robin, and 2048-visit head to
+heads between 4x64 and ray-filter networks), scored by Neural Reversi at level 26. Its positions
+are close to even (73% within 2 discs of a draw), so its values and errors run higher than the
+earlier Edax set's (`edax-l24-5k.npz`, 5,000 self-play positions): compare runs on one set. On
+29 rated 11x64 checkpoints its `value_mse` ranked them by 2048-visit Elo at Spearman 0.78
+(0.54 on the Edax set), `top1` at 0.81 (0.13).
+
+To build a set, from the games in the evals store (evaluation games, which nothing trains on):
+sample positions from kinds of match, score every legal move of each with Neural Reversi
+(`setup_neural_reversi.sh`, with `ARCH=x86-64-v3` for Modal's CPUs) on Modal's CPUs, and put
+them together (see label_positions.py for the sources and the defaults):
 
 ```
-examples/othello/setup_edax.sh                       # once
-taskset -c 16-23 uv run examples/othello/label_positions.py \
-    --source az10x128=runs/trunk/state-150.npz:896-1024 \
-    --source pooled4x64=runs/p4x64/state-450.npz --per-source 2500 --level 24 --workers 8
+uv run examples/othello/label_positions.py positions --out ~/.cache/turbozero/othello/sets/positions.npz \
+    --source 'engine30-ray11=1300:net-engine:ray11x64' --source 'engines30=2700:engine-engine' \
+    --source 'h2h-ray11-ray9n=4300:net-net:ray11x64/ray9x64n'
+uv run examples/othello/label_positions.py cloud ~/.cache/turbozero/othello/sets/positions.npz \
+    --name set1 --hosts 100 --out ~/.cache/turbozero/othello/sets/labels/results.jsonl
+uv run examples/othello/label_positions.py assemble ~/.cache/turbozero/othello/sets/positions.npz \
+    ~/.cache/turbozero/othello/sets/labels --out ~/.cache/turbozero/othello/engine-sets/new.npz
 ```
 
-At level 24 a position takes about 2 seconds on average (up to a minute), so 5000 took 84
-minutes on 8 Edax processes. To score saved checkpoints on a set:
+At level 26, Neural Reversi scores a position's moves exactly up to 30 empty squares (on a
+razorback core 8 s at 21-26, 20-160 s at 27-29, minutes at 30) and 26 moves ahead beyond
+(about 4 s); Modal's cores take about twice as long. 30,000 positions spread over 21-51 empty
+squares took about 600 core-hours on Modal, about $45.
+To score saved checkpoints on a set:
 
 ```
 uv run examples/othello/score_engine_set.py runs/othello/49.eqx runs/othello/99.eqx --net resnet:10x128

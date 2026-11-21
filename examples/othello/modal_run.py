@@ -228,7 +228,7 @@ def ensure_input(store: Store, job: Job, path: str | None) -> None:
 
 def engine_set_path(home: str) -> str:
     """train.py's default engine-labelled set."""
-    return os.path.join(home, ".cache/turbozero/othello/engine-sets/edax-l24.npz")
+    return os.path.join(home, ".cache/turbozero/othello/engine-sets/nr26-evals-29k.npz")
 
 
 class Runner:

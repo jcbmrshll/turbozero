@@ -1,7 +1,10 @@
 import argparse
 import json
+import random
+import sqlite3
 import sys
 from pathlib import Path
+from typing import ClassVar
 
 import numpy as np
 import pytest
@@ -10,8 +13,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "examples" / "othello"))
 
 import engine_set
 import label_positions
-from engine_set import ILLEGAL, EngineSet, SourceState, boards, selectable
-from engines import Analysis
+from engine_set import ILLEGAL, EngineSet, selectable
+from engines import Board, MoveScores
 
 
 def board_obs(n_discs: int, rng: np.random.Generator) -> np.ndarray:
@@ -32,20 +35,20 @@ def tiny_set(rng: np.random.Generator, n: int = 4) -> EngineSet:
     obs = np.stack([board_obs(20 + i, rng) for i in range(n)])
     legal = np.stack([legal_mask([i, i + 1, i + 7]) for i in range(n)])
     scores = np.where(legal, rng.integers(-20, 20, (n, 65)), ILLEGAL).astype(np.int16)
+    empties = (64 - obs.sum(axis=(1, 2, 3))).astype(np.int8)
     return EngineSet(
         obs=obs,
         legal=legal,
         scores=scores,
-        depth=np.where(legal, 24, 0).astype(np.int16),
+        depth=np.minimum(empties, 26).astype(np.int8),
+        exact=empties <= 26,
+        labeller=np.zeros(n, np.int8),
+        labeller_names=["neural-reversi level 26"],
         source=np.array([0, 0, 1, 1], np.int8)[:n],
-        source_names=["held-out", "self_play"],
-        source_states=[
-            SourceState("/runs/a/state-150.npz", (896, 1024)),
-            SourceState("/runs/b/state-450.npz"),
-        ],
-        empties=(64 - obs.sum(axis=(1, 2, 3))).astype(np.int8),
-        engine="edax",
-        level=24,
+        source_names=["vs-engines", "head_to_head"],
+        source_descriptions=["evals.db games: a", "evals.db games: b"],
+        game=np.array([7, 7, 9, 12], np.int64)[:n],
+        empties=empties,
     )
 
 
@@ -55,21 +58,31 @@ def test_a_set_saves_and_loads_unchanged(tmp_path):
     s.save(tmp_path / "sets" / "set.npz")
     loaded = EngineSet.load(tmp_path / "sets" / "set.npz")
 
-    for field in ("obs", "legal", "scores", "depth", "source", "empties"):
+    for field in ("obs", "legal", "scores", "depth", "exact", "labeller", "source"):
         np.testing.assert_array_equal(getattr(loaded, field), getattr(s, field))
-    assert (loaded.source_names, loaded.engine, loaded.level) == (
-        ["held-out", "self_play"],
-        "edax",
-        24,
-    )
-    # where each source's positions came from, for training data to leave their games out
-    assert loaded.source_states == s.source_states
-    assert loaded.describe()["sources"]["held-out"] == {
-        "positions": 2,
-        "state": "/runs/a/state-150.npz",
-        "envs": (896, 1024),
+    np.testing.assert_array_equal(loaded.game, s.game)
+    np.testing.assert_array_equal(loaded.empties, s.empties)
+    for names in ("labeller_names", "source_names", "source_descriptions"):
+        assert getattr(loaded, names) == getattr(s, names)
+    assert loaded.describe() == {
+        "labellers": {"neural-reversi level 26": 4},
+        "exact": int(s.exact.sum()),
+        "sources": {
+            "vs-engines": {"positions": 2, "description": "evals.db games: a"},
+            "head_to_head": {"positions": 2, "description": "evals.db games: b"},
+        },
     }
     assert not list((tmp_path / "sets").glob("*.tmp*"))
+
+
+def test_a_subset_keeps_its_positions_with_every_source():
+    s = tiny_set(np.random.default_rng(0))
+
+    sub = s.subset(np.array([False, True, False, True]))
+
+    np.testing.assert_array_equal(sub.game, [7, 12])
+    np.testing.assert_array_equal(sub.obs, s.obs[[1, 3]])
+    assert sub.source_names == s.source_names and len(sub) == 2
 
 
 def test_a_set_reports_its_phases_and_on_request_its_sources():
@@ -81,8 +94,14 @@ def test_a_set_reports_its_phases_and_on_request_its_sources():
 
     # metrics by game phase; by source only when asked (for checking a set)
     assert list(groups) == ["opening", "midgame", "endgame"]
-    assert list(by_source) == ["held-out", "self_play", "opening", "midgame", "endgame"]
-    np.testing.assert_array_equal(by_source["self_play"], [False, False, True, True])
+    assert list(by_source) == [
+        "vs-engines",
+        "head_to_head",
+        "opening",
+        "midgame",
+        "endgame",
+    ]
+    np.testing.assert_array_equal(by_source["head_to_head"], [False, False, True, True])
     np.testing.assert_array_equal(groups["opening"], [True, False, False, True])
     np.testing.assert_array_equal(groups["endgame"], [False, False, True, False])
     positions = s.scored_positions()
@@ -90,8 +109,8 @@ def test_a_set_reports_its_phases_and_on_request_its_sources():
     assert positions.observations.shape == (4, 8, 8, 2)
     assert list(positions.groups) == ["opening", "midgame", "endgame"]
     assert list(s.scored_positions(by_source=True).groups)[:2] == [
-        "held-out",
-        "self_play",
+        "vs-engines",
+        "head_to_head",
     ]
 
 
@@ -111,8 +130,8 @@ def test_filtered_positions_are_those_the_network_decides_in_halves():
         "midgame": [False, True, True],
     }
     assert list(s.scored_positions(by_source=True, filtered=True).groups) == [
-        "held-out",
-        "self_play",
+        "vs-engines",
+        "head_to_head",
         "opening",
         "midgame",
     ]
@@ -123,7 +142,7 @@ def test_filtered_positions_are_those_the_network_decides_in_halves():
     [
         ({"source_names": ["a b", "c"]}, "letters, digits"),
         ({"scores": np.zeros((4, 65), np.int16)}, "every legal action needs a score"),
-        ({"source_states": [SourceState("/a.npz")]}, "every source needs its state"),
+        ({"source_descriptions": ["a"]}, "every source needs its description"),
     ],
 )
 def test_a_set_refuses_bad_names_and_missing_scores(change, error):
@@ -156,120 +175,213 @@ def test_only_positions_past_the_opening_with_a_choice_are_selectable_once():
     )
 
 
-def test_boards_put_the_player_to_move_first():
-    obs = np.zeros((1, 8, 8, 2), bool)
-    obs[0, 0, 0, 0] = True  # a1: the player to move
-    obs[0, 7, 7, 1] = True  # h8: the opponent
-
-    board = boards(obs)[0]
-
-    assert board[0] == 1 and board[63] == 2 and (board[1:63] == 0).all()
-
-
-def fake_analyst(level):
-    """Scores each legal move of a board by its square plus the level: an analyst the tests can
-    check. The legal moves are the squares the player to move doesn't hold that a disc of theirs
-    is next to... any rule works, so: the empty squares among the first 8."""
-
-    def analyse(board):
-        return [
-            Analysis([sq], int(sq) + level, level) for sq in range(8) if board[sq] == 0
-        ]
-
-    return analyse
+def random_game(rng: random.Random, plies: int = 60) -> list[int]:
+    """A game of random legal moves from the standard start, as the evals store keeps one."""
+    board, moves = Board(), []
+    while len(moves) < plies and board.legal():
+        move = rng.choice(board.legal())
+        moves.append(move)
+        board.play(move)
+    return moves
 
 
-def test_build_samples_each_source_and_scores_every_legal_move():
-    rng = np.random.default_rng(0)
-    # boards whose empty squares among the first 8 are their legal moves (as fake_analyst sees them)
-    obs, legal = [], []
-    for _ in range(12):
-        o = board_obs(30, rng).reshape(64, 2)
-        o[:8] = False
-        o[3, 0] = True
-        obs.append(o.reshape(8, 8, 2))
-        legal.append(legal_mask([0, 1, 2, 4, 5, 6, 7]))
-    obs, legal = np.stack(obs), np.stack(legal)
-    states = [SourceState("/a.npz", (0, 6)), SourceState("/b.npz")]
-    sources = [
-        ("a", states[0], obs[:6], legal[:6]),
-        ("b", states[1], obs[6:], legal[6:]),
+def test_game_positions_put_the_player_to_move_first():
+    # the standard start, black (d5, e4) to move, then white's turn after d3
+    positions = label_positions.game_positions([19, 18])
+
+    obs, legal = positions[0]
+    assert obs[4, 3, 0] and obs[3, 4, 0] and obs[3, 3, 1] and obs[4, 4, 1]
+    np.testing.assert_array_equal(np.nonzero(legal)[0], [19, 26, 37, 44])
+    # white to move: its discs (now just e5) first
+    obs, legal = positions[1]
+    assert obs[4, 4, 0] and obs.sum() == 5 and obs[:, :, 0].sum() == 1
+    assert legal[18]
+
+
+def test_sample_spreads_over_bands_and_caps_each_game():
+    rng = random.Random(0)
+    games = [(gid, random_game(rng)) for gid in range(60)]
+    taken: set[bytes] = set()
+
+    obs, legal, game = label_positions.sample(
+        games, 100, random.Random(1), taken, per_game=3
+    )
+
+    empties = 64 - obs.sum(axis=(1, 2, 3))
+    assert len(obs) == 100 and (empties >= 21).all() and (empties <= 51).all()
+    assert max(np.unique(game, return_counts=True)[1]) <= 3
+    assert len({o.tobytes() for o in obs}) == 100 and len(taken) == 100
+    assert (legal[:, :64].sum(axis=1) >= 2).all()
+    # about the default shares of 21-27, 28-35, 36-43, 44-51 empties
+    counts = [
+        ((empties >= lo) & (empties <= hi)).sum() for lo, hi in label_positions.BANDS
     ]
-
-    built = label_positions.build(sources, 4, level=10, workers=0, factory=fake_analyst)
-
-    assert len(built) == 8 and built.source_names == ["a", "b"]
-    assert built.source_states == states
-    np.testing.assert_array_equal(built.source, [0] * 4 + [1] * 4)
-    expected = np.where(legal_mask([0, 1, 2, 4, 5, 6, 7]), np.arange(65) + 10, ILLEGAL)
-    for scores in built.scores:
-        np.testing.assert_array_equal(scores, expected)
-    assert (built.depth[built.legal] == 10).all()
-    # sampled without repeats, within and across sources
-    assert len({o.tobytes() for o in built.obs}) == 8
-
-    with pytest.raises(ValueError, match="fewer than 7"):
-        label_positions.build(sources, 7, level=10, workers=0, factory=fake_analyst)
+    assert counts == [20, 35, 30, 15]
+    # none twice across sources, and too few games is an error
+    again, _, _ = label_positions.sample(games, 20, random.Random(2), taken, per_game=3)
+    assert not {o.tobytes() for o in again} & {o.tobytes() for o in obs}
+    with pytest.raises(ValueError, match="not 400"):
+        label_positions.sample(games[:10], 400, random.Random(3), set(), per_game=3)
 
 
-def write_state(path, observation, mask, has_reward, next_idx):
-    """A saved state with just what `buffer_positions` reads (see `Trainer.save_state`)."""
-    leaves = [
-        (".buffer_state.next_idx", next_idx),
-        (".buffer_state.populated", np.ones_like(has_reward)),
-        (".buffer_state.has_reward", has_reward),
-        (".buffer_state.buffer.observation_nn", observation),
-        (".buffer_state.buffer.policy_mask", mask),
+def write_store(
+    path: Path, games: dict[tuple[str, str], list[list[int]]], start: str
+) -> None:
+    """An evals store with just what `source_games` reads: players and their games, each from
+    `start`."""
+    db = sqlite3.connect(path)
+    db.execute("CREATE TABLE players (id TEXT, label TEXT, kind TEXT, config TEXT)")
+    db.execute(
+        "CREATE TABLE games (id INTEGER, black_id TEXT, white_id TEXT, start TEXT, moves TEXT)"
+    )
+    clock = {"budget": {"clock": {"ext": None, "inc": 0.0, "ini": 30.0}}}
+    players = [
+        ("n1", "ray11x64-r1 30s", "net", {}),
+        ("n2", "ray9x64n-r2", "net", {}),
+        ("e1", "edax 30s", "engine", clock),
+        ("e2", "egaroucid 30s", "engine", clock),
+        ("e3", "edax level 4", "engine", {"budget": {"level": 4}}),
     ]
-    meta = {
-        "leaves": {
-            "collection_state": [
-                [name, list(x.shape), str(x.dtype)] for name, x in leaves
-            ]
+    for pid, label, kind, config in players:
+        db.execute(
+            "INSERT INTO players VALUES (?, ?, ?, ?)",
+            (pid, label, kind, json.dumps(config)),
+        )
+    gid = 0
+    for (black, white), lists in games.items():
+        for moves in lists:
+            gid += 1
+            db.execute(
+                "INSERT INTO games VALUES (?, ?, ?, ?, ?)",
+                (gid, black, white, start, json.dumps(moves)),
+            )
+    db.commit()
+    db.close()
+
+
+def test_sources_take_their_kind_of_games_from_the_store(tmp_path):
+    from xot import held_out_openings, set_openings
+
+    allowed = f"xot:{set_openings()[0]}"
+    write_store(
+        tmp_path / "evals.db",
+        {
+            ("n1", "e1"): [[19]],
+            ("e2", "n1"): [[19, 18]],
+            ("n1", "e3"): [[37]],  # an engine at a level, not on the clock
+            ("e1", "e2"): [[26]],
+            ("n2", "n1"): [[44]],
         },
+        start=allowed,
+    )
+    # a game from an opening evaluation matches draw: never a set's
+    db = sqlite3.connect(tmp_path / "evals.db")
+    db.execute(
+        "INSERT INTO games VALUES (?, ?, ?, ?, ?)",
+        (6, "n1", "e1", f"xot:{held_out_openings()[0]}", "[19]"),
+    )
+    db.commit()
+    db.close()
+    sources = [
+        label_positions.parse_source("vs=5:net-engine:ray11x64"),
+        label_positions.parse_source("engines=5:engine-engine"),
+        label_positions.parse_source("h2h=5:net-net:ray11x64/ray9x64n"),
+    ]
+
+    games = label_positions.source_games(tmp_path / "evals.db", sources, clock=30.0)
+
+    assert games == {
+        "vs": [(1, [19]), (2, [19, 18])],
+        "engines": [(4, [26])],
+        "h2h": [(5, [44])],
     }
-    np.savez(
-        path,
-        meta=np.array(json.dumps(meta)),
-        **{f"collection_state.{i}": x for i, (_, x) in enumerate(leaves)},
-    )
-
-
-def test_buffer_positions_are_the_finished_games(tmp_path):
-    # 3 environments, 4 positions each
-    observation = np.arange(3 * 4 * 128).reshape(3, 4, 8, 8, 2) % 2 == 0
-    observation[:, :, 0, 0, 0] = np.arange(12).reshape(3, 4) % 3 == 0
-    mask = np.zeros((3, 4, 65), bool)
-    mask[..., 1] = True
-    has_reward = np.array([[1, 1, 1, 1], [1, 0, 0, 1], [0, 0, 0, 0]], bool)
-    path = tmp_path / "state-1.npz"
-    write_state(path, observation, mask, has_reward, next_idx=np.array([0, 1, 2]))
-
-    obs, legal = label_positions.buffer_positions(path)
-    some_obs, _ = label_positions.buffer_positions(path, envs=(1, 3))
-
-    np.testing.assert_array_equal(
-        obs,
-        np.concatenate([observation[0], observation[1, [0, 3]]]),
-    )
-    assert legal.shape == (6, 65) and legal[:, 1].all()
-    np.testing.assert_array_equal(some_obs, observation[1, [0, 3]])
-
-
-@pytest.mark.parametrize(
-    "text, parsed",
-    [
-        ("az=runs/a/state-150.npz", ("az", "runs/a/state-150.npz", None)),
-        (
-            "az=runs/a/state-150.npz:896-1024",
-            ("az", "runs/a/state-150.npz", (896, 1024)),
-        ),
-    ],
-)
-def test_sources_name_a_state_and_optionally_its_environments(text, parsed):
-    assert label_positions.parse_source(text) == parsed
+    assert "30 s" in sources[0].description(30.0)
     with pytest.raises(argparse.ArgumentTypeError):
-        label_positions.parse_source("runs/a/state-150.npz")
+        label_positions.parse_source("vs=5:self-play")
+
+
+class FakeAnalyst:
+    """Scores each legal move by its square, exact from 26 empty squares down; counts the
+    positions it saw and whether it was closed."""
+
+    made: ClassVar[list["FakeAnalyst"]] = []
+
+    def __init__(self) -> None:
+        self.seen = 0
+        self.closed = False
+        FakeAnalyst.made.append(self)
+
+    def analyse(self, me: int, opp: int) -> MoveScores:
+        board = Board.at(me, opp, "b")
+        self.seen += 1
+        empties = 64 - (me | opp).bit_count()
+        return MoveScores(
+            {m: m - 30 for m in board.legal()}, min(empties, 26), empties <= 26
+        )
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_labels_score_every_legal_move_with_several_analysts():
+    rng = random.Random(0)
+    games = [(gid, random_game(rng)) for gid in range(30)]
+    obs, legal, _ = label_positions.sample(
+        games, 40, random.Random(1), set(), per_game=3
+    )
+    FakeAnalyst.made = []
+
+    scores, depth, exact = label_positions.label(obs, workers=3, analyst=FakeAnalyst)
+
+    assert len(FakeAnalyst.made) == 3 and all(a.closed for a in FakeAnalyst.made)
+    assert sum(a.seen for a in FakeAnalyst.made) == 40
+    np.testing.assert_array_equal(scores != ILLEGAL, legal)
+    np.testing.assert_array_equal(scores[legal], (np.nonzero(legal)[1] - 30))
+    empties = 64 - obs.sum(axis=(1, 2, 3))
+    np.testing.assert_array_equal(exact, empties <= 26)
+    np.testing.assert_array_equal(depth, np.minimum(empties, 26))
+
+
+def test_assemble_needs_every_position_labelled_once(tmp_path):
+    rng = random.Random(0)
+    games = [(gid, random_game(rng)) for gid in range(20)]
+    obs, legal, game = label_positions.sample(
+        games, 10, random.Random(1), set(), per_game=3
+    )
+    path = tmp_path / "positions.npz"
+    label_positions.save_positions(
+        path, obs, legal, game, np.zeros(10, np.int8), ["random"], ["random games"]
+    )
+    positions = label_positions.load_positions(path)
+    scores, depth, exact = label_positions.label(obs, workers=1, analyst=FakeAnalyst)
+    for name, index in (
+        ("labels-0.npz", np.arange(0, 6)),
+        ("labels-1.npz", np.arange(6, 10)),
+    ):
+        np.savez(
+            tmp_path / name,
+            index=index,
+            scores=scores[index],
+            depth=depth[index],
+            exact=exact[index],
+        )
+
+    built = label_positions.assemble(
+        positions, [tmp_path / "labels-0.npz", tmp_path / "labels-1.npz"], 26
+    )
+
+    np.testing.assert_array_equal(built.obs, obs)
+    np.testing.assert_array_equal(built.scores, scores)
+    np.testing.assert_array_equal(built.game, game)
+    assert built.labeller_names == ["neural-reversi level 26"] and len(built) == 10
+    with pytest.raises(ValueError, match="no labels"):
+        label_positions.assemble(positions, [tmp_path / "labels-0.npz"], 26)
+    some = label_positions.assemble(
+        positions, [tmp_path / "labels-0.npz"], 26, partial=True
+    )
+    np.testing.assert_array_equal(some.obs, obs[:6])
+    with pytest.raises(ValueError, match="already labelled"):
+        label_positions.assemble(positions, [tmp_path / "labels-0.npz"] * 2, 26)
 
 
 def test_training_skips_a_missing_default_set_but_not_a_missing_given_one(

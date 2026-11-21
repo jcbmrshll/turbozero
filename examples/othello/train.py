@@ -1,5 +1,5 @@
-"""AlphaZero on Othello, tracked by how close the raw network's moves and values come to
-Edax's on fixed positions.
+"""AlphaZero on Othello, tracked by how close the raw network's moves and values come to a
+strong engine's on fixed positions.
 
 Self-play games are collected in parallel across a batch of environments (and across
 every available GPU), with Monte Carlo Tree Search run on each of them; the network
@@ -12,7 +12,7 @@ openings (see xot.py), which keeps them varied.
 
 Every epoch it scores the network on the engine-labelled set, if there is one (see
 engine_set.py and --engine-set), logged as `engine_*`. `engine_result_change`, how likely the
-prior play's search starts from is to pick a move that worsens the result Edax predicts, is the
+prior play's search starts from is to pick a move that worsens the result the engine predicts, is the
 one to watch: it ranks a run's checkpoints by strength. `filtered_engine_*` are the same over
 only the positions the network decides, from the XOT opening to the exact solver's 20 empty
 squares. Games measure strength:
@@ -241,7 +241,7 @@ def load_engine_set(
     if not DEFAULT_ENGINE_SET.exists():
         warnings.warn(
             f"no engine-labelled set at {DEFAULT_ENGINE_SET}, so the network won't be scored "
-            "against Edax: build one with label_positions.py, or pass --engine-set",
+            "against an engine: build one with label_positions.py, or pass --engine-set",
             stacklevel=2,
         )
         return None
@@ -1250,7 +1250,7 @@ def main():
             ]
         )
 
-    # the network's raw moves and values against Edax's, on the engine-labelled set
+    # the network's raw moves and values against an engine's, on the engine-labelled set
     engine_set = load_engine_set(parser, args)
     if engine_set is None and args.lr_plateau_metric != "loss":
         parser.error(

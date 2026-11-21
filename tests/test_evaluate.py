@@ -347,6 +347,18 @@ def test_the_same_seed_draws_the_same_openings():
     assert all(o.label.startswith("board:") and o.start is not None for o in randoms)
 
 
+def test_matches_leave_out_the_openings_engine_sets_use_unless_asked():
+    from xot import set_openings
+
+    a, b = fake("a", {"level": 1}), fake("b", {"level": 2})
+    used = {f"xot:{i}" for i in set_openings()}
+    held_out = MatchSpec(a, b, openings=400, seed=1).choose_openings()
+    assert not {o.label for o in held_out} & used
+    # the old draw, every XOT opening, is still there for matches started before
+    old = MatchSpec(a, b, openings=400, seed=1, starts="xot").choose_openings()
+    assert {o.label for o in old} <= used  # seed 1's 400 were played for the set
+
+
 # --- games -----------------------------------------------------------------------------------
 
 
