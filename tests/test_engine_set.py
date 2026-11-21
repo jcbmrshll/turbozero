@@ -361,6 +361,10 @@ def test_assemble_needs_every_position_labelled_once(tmp_path):
     assert built.labeller_names == ["neural-reversi level 26"] and len(built) == 10
     with pytest.raises(ValueError, match="no labels"):
         label_positions.assemble(positions, [tmp_path / "labels-0.npz"], 26)
+    some = label_positions.assemble(
+        positions, [tmp_path / "labels-0.npz"], 26, partial=True
+    )
+    np.testing.assert_array_equal(some.obs, obs[:6])
     with pytest.raises(ValueError, match="already labelled"):
         label_positions.assemble(positions, [tmp_path / "labels-0.npz"] * 2, 26)
 

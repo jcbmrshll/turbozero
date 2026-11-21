@@ -314,10 +314,13 @@ def neural_reversi(level: int, engine_dir: Path | None) -> Callable[[], Analyst]
 
 
 def assemble(
-    positions: dict[str, np.ndarray], labels: list[Path], level: int
+    positions: dict[str, np.ndarray],
+    labels: list[Path],
+    level: int,
+    partial: bool = False,
 ) -> EngineSet:
     """The set from the positions and their label files (`label`'s outputs, which together
-    cover every position once)."""
+    cover every position once, or with `partial` some of them: the set is then those)."""
     n = len(positions["game"])
     scores = np.full((n, 65), ILLEGAL, np.int16)
     depth = np.zeros(n, np.int8)
@@ -334,21 +337,21 @@ def assemble(
                 f["exact"],
             )
             done[index] = True
-    if not done.all():
+    if not done.all() and not partial:
         raise ValueError(f"{(~done).sum()} positions have no labels")
-    obs = positions["obs"]
+    obs = positions["obs"][done]
     return EngineSet(
         obs=obs,
-        legal=positions["legal"],
-        scores=scores,
-        depth=depth,
-        exact=exact,
-        labeller=np.zeros(n, np.int8),
+        legal=positions["legal"][done],
+        scores=scores[done],
+        depth=depth[done],
+        exact=exact[done],
+        labeller=np.zeros(len(obs), np.int8),
         labeller_names=[f"neural-reversi level {level}"],
-        source=positions["source"],
+        source=positions["source"][done],
         source_names=[str(s) for s in positions["source_names"]],
         source_descriptions=[str(s) for s in positions["source_descriptions"]],
-        game=positions["game"],
+        game=positions["game"][done],
         empties=(64 - obs.sum(axis=(1, 2, 3))).astype(np.int8),
     )
 
@@ -458,7 +461,9 @@ def cmd_cloud(args: argparse.Namespace) -> None:
 
 def cmd_assemble(args: argparse.Namespace) -> None:
     labels = sorted(p for d in args.labels for p in Path(d).rglob("labels-*.npz"))
-    engine_set = assemble(load_positions(args.positions), labels, args.level)
+    engine_set = assemble(
+        load_positions(args.positions), labels, args.level, args.partial
+    )
     engine_set.save(args.out)
     print(
         json.dumps(
@@ -522,6 +527,11 @@ def main() -> None:
     p = sub.add_parser("assemble", help="the set from the positions and their labels")
     p.add_argument("positions")
     p.add_argument("labels", nargs="+", help="directories of label files")
+    p.add_argument(
+        "--partial",
+        action="store_true",
+        help="keep only the labelled positions (e.g. while some jobs are still running)",
+    )
     p.add_argument("--level", type=int, default=LEVEL)
     p.add_argument("--out", required=True)
     args = parser.parse_args()
