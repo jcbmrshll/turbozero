@@ -722,11 +722,17 @@ uv run examples/othello/fork_driver.py status ~/.cache/turbozero/othello/runs/bi
 Each line (the mainline, or a fork) is one Modal job whose steps are segments of
 `segment_epochs`, each branching from the last one's final state (see `extend` above). Between
 segments every network steps down its own learning rate (1e-3, 5e-4, 1e-4 by default, weight decay
-500 times it) once its value error on the engine-labelled set (`metric`) has plateaued. One fork at
-a time branches from the mainline with the buffer window or the sims a step up its ladder, follows
-the mainline's learning rates, and is compared with it at matched epochs: it takes over once it is
-`margin` lower over the last windows, or is killed once it plateaus without that lead. A window
+500 times it) once its value error on the engine-labelled set (`metric`) has plateaued. Forks, at most
+one of each ladder at a time, branch from the mainline with the buffer window or the sims a step
+up its ladder, follow
+the mainline's learning rates, and are compared with it at matched epochs: one takes over once it
+is `margin` lower over the last windows (and the other starts again from the new mainline), or is
+killed once it plateaus without that lead. A window
 fork is judged only after a learning rate step (a wider window's gain shows after the rate drops).
+With growth, train.py only reports when the next network has caught up (`--grow-manual`): the
+driver takes it over at the mainline's next segment end and in every fork at that same epoch, so
+the lines compared always play the same network; only the network playing and the next train.
+`start_from` starts the first network from a trained one's saved state, with its replay buffer.
 Decisions go to `decisions.jsonl` in the run's directory. The final checkpoints are decayed
 offline.
 
