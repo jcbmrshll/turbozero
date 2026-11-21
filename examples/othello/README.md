@@ -727,6 +727,10 @@ a time branches from the mainline with the buffer window or the sims a step up i
 the mainline's learning rates, and is compared with it at matched epochs: it takes over once it is
 `margin` lower over the last windows, or is killed once it plateaus without that lead. A window
 fork is judged only after a learning rate step (a wider window's gain shows after the rate drops).
+With growth, train.py only reports when the next network has caught up (`--grow-manual`): the
+driver takes it over at the mainline's next segment end and in every fork at that same epoch, so
+the lines compared always play the same network; only the network playing and the next train.
+`start_from` starts the first network from a trained one's saved state, with its replay buffer.
 Decisions go to `decisions.jsonl` in the run's directory. The final checkpoints are decayed
 offline.
 

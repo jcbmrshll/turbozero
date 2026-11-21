@@ -309,12 +309,17 @@ def test_the_template_loads(tmp_path):
         fork_driver.TEMPLATE.format(
             name="r",
             tags="t",
+            home="/h",
             train_args=", ".join(f'"{a}"' for a in fork_driver.RECIPE),
         )
     )
     loaded = fork_driver.Config.load(tmp_path / "driver.toml")
-    assert [n for n, _ in loaded.nets] == ["r11", "r15", "r19"]
-    assert loaded.sims[1] == (256, 64) and loaded.rules.margin == 0.003
+    assert [n for n, _ in loaded.nets] == ["r11", "r13", "r15", "r17"]
+    assert loaded.sims == [(128, 32), (256, 64), (512, 128)]
+    assert loaded.windows == [1125, 2250, 4500, 9000]
+    assert loaded.start_lrs == {"r11": 2} and loaded.start_window == 1
+    assert loaded.start_from.startswith("/h/.cache/turbozero/")
+    assert "--grow-train-retired" not in loaded.train_args
 
 
 def test_on_modal_lines_are_jobs_that_follow_and_keep_states_in_the_bucket(
@@ -382,3 +387,61 @@ def test_a_fork_starts_only_from_a_segment_end_the_mainline_has_decided(run):
     driver.tick()  # decides at 20, adds the next segment, then forks
     assert "t-window0" in modal.jobs
     assert_lines_follow_the_mainlines_learning_rates(driver)
+
+
+def test_a_run_can_start_from_a_trained_network(tmp_path):
+    modal = FakeModal()
+    state = "/h/.cache/turbozero/runs/r11/state-100.npz"
+    driver = fork_driver.Driver(
+        tmp_path,
+        config(start_from=state, start_lrs={"r11": 2}, start_window=1),
+        modal,
+        log=lambda _: None,
+    )
+    driver.tick()
+    (step,) = modal.jobs["t-main"]
+    assert flag(step, "--init-from") == [state] and not flag(step, "--branch-from")
+    # the trained network goes on at 1e-4, the next starts at 1e-3
+    assert flag(step, "--lr") == ["0.0001"] and flag(step, "--weight-decay") == ["0.05"]
+    assert flag(step, "--lr-of") == ["r15=0.001"]
+    assert flag(step, "--buffer-window") == ["2250"]
+    assert "--grow-manual" in argv(step)
+
+
+def test_every_line_takes_the_next_network_over_at_the_mainlines_epoch(run):
+    driver, modal = run
+    driver.tick()
+    advance(driver, "main", 21)
+    modal.in_bucket.add(f"{driver.dir}/lines/main/seg10/state-20.npz")
+    driver.tick()
+    assert "t-window0" in modal.jobs
+    # the mainline's next network catches up in its segment 20-30
+    line = driver.state.lines["main"]
+    log_epochs(driver, "main", {28: 0.7})
+    # (train.py logs growth's line last in an epoch)
+    with open(line.segments[-1].log, "a") as f:
+        f.write("Epoch 28: {'growth_caught_up': '1.0'}\n")
+    driver.tick()
+    assert driver.state.takeovers == [30]
+    assert "--take-over" in argv(modal.jobs["t-main"][-1])
+    assert all("--take-over" not in argv(s) for s in modal.jobs["t-main"][:-1])
+    # the fork takes it over at the same epoch, when it gets there
+    advance(driver, "window0", 29)
+    driver.tick()
+    fork_step = modal.jobs["t-window0"][-1]
+    assert flag(fork_step, "--epochs") == ["40"] and "--take-over" in argv(fork_step)
+    # from there the networks training are the one taking over and the next, not the one before
+    assert driver.training_at(30) == ["r15"] and driver.training_at(29) == [
+        "r11",
+        "r15",
+    ]
+
+
+def test_a_window_fork_waits_for_the_playing_networks_learning_rate_step(run):
+    driver, _ = run
+    fork = fork_driver.Line(name="w", kind="window", job="j", start=20)
+    # the waiting network's step doesn't count: the playing one's metric is compared
+    driver.state.lr_steps = [(40, "r15", 1)]
+    assert not driver.ready(fork, 90)
+    driver.state.lr_steps.append((50, "r11", 1))
+    assert driver.ready(fork, 55) and not driver.ready(fork, 54)

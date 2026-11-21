@@ -12,7 +12,14 @@ the network's held-out value error (`--grow-metric`'s, e.g. avg4/engine_value_ms
 engine-labelled set) stops improving. It runs in segments of `segment_epochs`, each a step of the
 line's Modal job that branches from the last one's final state (`--branch-from`), so settings
 change only between segments and the job never leaves its machine (`modal_jobs.py extend`,
-`Job.follow_minutes`).
+`Job.follow_minutes`). The first segment may start from a trained network's saved state
+(`start_from`, `--init-from`), with its replay buffer.
+
+Growth: the network playing and the next train (those that played before don't). train.py only
+reports when the next has caught up (`--grow-manual`, `growth_caught_up`, by `--grow-metric`'s
+rule); the driver takes it over at the mainline's next segment end, and every fork takes it over
+at that same epoch (`--take-over`), as it takes the mainline's learning rate steps, so a fork and
+the mainline always play the same network. Comparisons start again after each take-over.
 
 Forks, one at a time, alternate between the two ladders: the replay buffer's sampling window
 (`--buffer-window`, the buffer itself kept at its largest, so a wider window has its positions at
@@ -88,7 +95,7 @@ class Config:
     buffer: int = 9000
     windows: list[int] = field(default_factory=lambda: [1125, 2250, 4500, 9000])
     sims: list[tuple[int, int]] = field(
-        default_factory=lambda: [(128, 32), (256, 64), (512, 128), (1024, 256)]
+        default_factory=lambda: [(128, 32), (256, 64), (512, 128)]
     )
     full_share: float = 0.25
     lrs: list[float] = field(default_factory=lambda: [1e-3, 5e-4, 1e-4])
@@ -106,6 +113,13 @@ class Config:
     resume_every: int = 50
     follow_minutes: float = 30.0
     hours_per_line: float = 100.0
+    # (optional) a saved state the first network starts from, with its replay buffer (see
+    # train.py's --init-from), and where on the ladders it is: each network's learning rate
+    # (an index into lrs, by name; the others start at the first), the window and the sims
+    start_from: str | None = None
+    start_lrs: dict[str, int] = field(default_factory=dict)
+    start_window: int = 0
+    start_sims: int = 0
     rules: Rules = field(default_factory=Rules)
 
     @staticmethod
@@ -140,6 +154,10 @@ class Config:
             "--branch-from",
             "--init-from",
             "--resume",
+            "--take-over",
+            "--grow-manual",
+            "--grow-switch-at",
+            "--grow-train-retired",
             "--ckpt-dir",
             "--name",
             "--notes",
@@ -155,6 +173,14 @@ class Config:
             raise ValueError(f"windows go up to the buffer ({self.buffer})")
         if sorted(self.lrs, reverse=True) != self.lrs:
             raise ValueError("lrs step down")
+        names = [name for name, _ in self.nets]
+        unknown = sorted(set(self.start_lrs) - set(names))
+        if unknown or any(not 0 <= i < len(self.lrs) for i in self.start_lrs.values()):
+            raise ValueError(f"start_lrs: indices into lrs, of nets {names}")
+        if not 0 <= self.start_window < len(self.windows) or not (
+            0 <= self.start_sims < len(self.sims)
+        ):
+            raise ValueError("start_window and start_sims are indices into the ladders")
 
     @property
     def growth(self) -> bool:
@@ -177,6 +203,8 @@ class Segment:
     window: int
     sims: int
     lrs: dict[str, int]
+    # the next network plays from its first epoch (train.py's --take-over)
+    take_over: bool = False
 
 
 @dataclass
@@ -207,6 +235,9 @@ class State:
     main: str = ""
     # the mainline's learning rate steps: (epoch, net, index into lrs), in order
     lr_steps: list[tuple[int, str, int]] = field(default_factory=list)
+    # the epochs from which each next network plays, in order: every line takes them over
+    # at the same epochs, as it takes the learning rate steps
+    takeovers: list[int] = field(default_factory=list)
     # forks started, by kind, and when a killed kind may try again (mainline epoch)
     started: list[str] = field(default_factory=list)
     retry_at: dict[str, int] = field(default_factory=dict)
@@ -329,18 +360,39 @@ class Driver:
     def lrs_at(self, epoch: int) -> dict[str, int]:
         """Each network's learning rate (index into lrs) for epochs from `epoch` on, as the
         mainline's steps have them."""
-        lrs = {name: 0 for name, _ in self.config.nets}
+        lrs = {name: self.config.start_lrs.get(name, 0) for name, _ in self.config.nets}
         for at, net, index in self.state.lr_steps:
             if at <= epoch:
                 lrs[net] = index
         return lrs
+
+    def playing_at(self, epoch: int) -> int:
+        """The index of the network playing in epoch `epoch`."""
+        return sum(1 for at in self.state.takeovers if at <= epoch)
+
+    def training_at(self, epoch: int) -> list[str]:
+        """The networks that train in epoch `epoch`: the one playing and the next (those that
+        played before don't)."""
+        playing = self.playing_at(epoch)
+        return [name for name, _ in self.config.nets[playing : playing + 2]]
+
+    def caught_up(self, main: Line) -> bool:
+        """Whether the mainline's next network has caught up with the one playing, by train.py's
+        rule (--grow-metric, --grow-window, --grow-min-epochs), as of its last epoch logged."""
+        metrics = self.metrics(main)
+        caught = [
+            v["growth_caught_up"]
+            for _, v in sorted(metrics.items())
+            if "growth_caught_up" in v
+        ]
+        return bool(caught) and caught[-1] == 1
 
     def lr_plateaus(self, main: Line, at: int) -> list[str]:
         """The mainline's networks whose learning rate steps down at `at`: plateaued, at least
         `lr_min_epochs` at their rate, a lower one left."""
         rules, out = self.config.rules, []
         lrs = self.lrs_at(at - 1)
-        for name, _ in self.config.nets:
+        for name in self.training_at(at - 1):
             if lrs[name] + 1 >= len(self.config.lrs):
                 continue
             since = max(
@@ -405,7 +457,14 @@ class Driver:
             f"fork_driver {c.name}: line {Path(segment.ckpt_dir).parent.name}, epochs "
             f"{segment.start}-{segment.end - 1}, window {c.windows[segment.window]}, "
             f"sims {sims}/{fast}, lr " + ", ".join(f"{n} {v:g}" for n, v in lr.items()),
+            *(["--grow-manual"] if c.growth else []),
+            *(["--take-over"] if segment.take_over else []),
             *(["--branch-from", branch_from] if branch_from else []),
+            *(
+                ["--init-from", c.start_from]
+                if branch_from is None and c.start_from
+                else []
+            ),
         ]
         return (
             " ".join(shlex.quote(a) for a in argv)
@@ -422,6 +481,7 @@ class Driver:
             window=window,
             sims=sims,
             lrs=self.lrs_at(start),
+            take_over=start in self.state.takeovers,
         )
 
     @staticmethod
@@ -455,13 +515,19 @@ class Driver:
 
     def start_main(self) -> None:
         line = Line(name="main", kind="main", job=f"{self.config.name}-main", start=0)
-        segment = self.new_segment(line, 0, window=0, sims=0)
+        segment = self.new_segment(
+            line, 0, window=self.config.start_window, sims=self.config.start_sims
+        )
         line.segments.append(segment)
         self.state.lines[line.name] = line
         self.state.main = line.name
         self.backend.launch(line.job, [self.flags(segment, None)])
         self.decide(
-            "start", line, window=self.config.windows[0], sims=self.config.sims[0]
+            "start",
+            line,
+            window=self.config.windows[segment.window],
+            sims=self.config.sims[segment.sims],
+            start_from=self.config.start_from,
         )
 
     def due(self, line: Line) -> bool:
@@ -477,6 +543,16 @@ class Driver:
             index = self.lrs_at(at - 1)[net] + 1
             self.state.lr_steps.append((at, net, index))
             self.decide("lr step", main, epoch=at, net=net, lr=self.config.lrs[index])
+        playing = self.playing_at(at - 1)
+        if playing + 1 < len(self.config.nets) and self.caught_up(main):
+            self.state.takeovers.append(at)
+            self.decide(
+                "take over",
+                main,
+                epoch=at,
+                net=self.config.nets[playing + 1][0],
+                retires=self.config.nets[playing][0],
+            )
         last = main.segments[-1]
         self.append(main, last.window, last.sims)
 
@@ -551,7 +627,11 @@ class Driver:
         """The last `windows_ahead` windows of matched epochs: (fork's mean, mainline's)."""
         rules = self.config.rules
         theirs, ours = self.series(fork, None), self.series(main, None)
-        matched = sorted(e for e in theirs if e in ours)
+        # from the last take-over: both lines' playing network is the same one from there
+        since = max(
+            [0, *(at for at in self.state.takeovers if at <= self.logged_to(fork))]
+        )
+        matched = sorted(e for e in theirs if e in ours and e >= since)
         out = []
         for w in range(rules.windows_ahead):
             window = matched[len(matched) - (w + 1) * rules.window_epochs :][
@@ -574,11 +654,17 @@ class Driver:
             return False
         if fork.kind != "window":
             return True
-        steps = [e for e, _, _ in self.state.lr_steps if fork.start < e <= latest]
+        # the playing network's steps: its metric is the one compared
+        names = [name for name, _ in self.config.nets]
+        steps = [
+            e
+            for e, net, _ in self.state.lr_steps
+            if fork.start < e <= latest and net == names[self.playing_at(e)]
+        ]
         if steps and latest - steps[-1] >= rules.after_lr_step:
             return True
         floor = len(self.config.lrs) - 1
-        return all(i == floor for i in self.lrs_at(latest).values())
+        return self.lrs_at(latest)[names[self.playing_at(latest)]] == floor
 
     def judge(self, fork: Line, main: Line) -> None:
         rules = self.config.rules
@@ -616,6 +702,7 @@ class Driver:
         self.state.lr_steps = [
             step for step in self.state.lr_steps if step[0] <= applied
         ]
+        self.state.takeovers = [at for at in self.state.takeovers if at <= applied]
         self.decide("adopt", fork, epoch=latest, windows=means, replaces=main.name)
 
     def maybe_finish(self, main: Line) -> None:
@@ -624,8 +711,10 @@ class Driver:
         if main.status != "running" or not self.due(main):
             return
         floor = len(self.config.lrs) - 1
-        lrs = self.lrs_at(main.end)
-        if any(i != floor for i in lrs.values()):
+        playing = self.playing_at(main.end)
+        if playing + 1 < len(self.config.nets):
+            return  # a bigger network is still to take over
+        if self.lrs_at(main.end)[self.config.nets[playing][0]] != floor:
             return
         if any(
             l.status == "running" and l.kind != "main"
@@ -730,7 +819,7 @@ commit = "origin/dev"          # what the jobs run: on GitHub
 tags = "{tags}"
 buffer = 9000                   # kept at its largest; training samples the window's newest
 windows = [1125, 2250, 4500, 9000]
-sims = [[128, 32], [256, 64], [512, 128], [1024, 256]]
+sims = [[128, 32], [256, 64], [512, 128]]
 full_share = 0.25               # playout cap randomization: full searches' share
 lrs = [1e-3, 5e-4, 1e-4]
 wd_per_lr = 500.0
@@ -740,6 +829,11 @@ gpu = "L40S"
 cpu = 32
 memory_gb = 96
 resume_every = 50               # a state to continue from at each segment's end
+# the 11x64 at 1e-4, 128/32, buffer 2250, line 900: it plays first, at 1e-4, window 2250
+start_from = "{home}/.cache/turbozero/othello/smallnet-data/runs/ray11x64n-r800-pcr25x32-lr1e-4-wd5e-2-buf2250/state-100.npz"
+start_lrs = {{ r11 = 2 }}
+start_window = 1
+start_sims = 0
 train_args = [{train_args}]
 
 [[nets]]
@@ -747,12 +841,16 @@ name = "r11"
 spec = "resnet:11x64,pool_every=2,heads=pooled,pool_channels=16,layout=pre,block=convnext,expand=2,dw_taps=rays"
 
 [[nets]]
+name = "r13"
+spec = "resnet:13x64,pool_every=2,heads=pooled,pool_channels=16,layout=pre,block=convnext,expand=2,dw_taps=rays"
+
+[[nets]]
 name = "r15"
 spec = "resnet:15x64,pool_every=2,heads=pooled,pool_channels=16,layout=pre,block=convnext,expand=2,dw_taps=rays"
 
 [[nets]]
-name = "r19"
-spec = "resnet:19x64,pool_every=2,heads=pooled,pool_channels=16,layout=pre,block=convnext,expand=2,dw_taps=rays"
+name = "r17"
+spec = "resnet:17x64,pool_every=2,heads=pooled,pool_channels=16,layout=pre,block=convnext,expand=2,dw_taps=rays"
 
 [rules]
 fork_from_epoch = 100
@@ -768,7 +866,8 @@ plateau_per_100 = 0.001
 lr_min_epochs = 100
 """
 
-# the 11x64 line 1053 recipe's self-play and training, with growth on the averages
+# the 11x64 line 1053 recipe's self-play and training; growth's rule on the averages (the
+# driver takes the networks over, --grow-manual, in every line at once)
 RECIPE = [
     "--train-batch", "4096", "--train-steps", "256", "--sampling-moves", "20",
     "--dirichlet-alpha", "0.3", "--dirichlet-epsilon", "0.25", "--tree-factor", "4",
@@ -776,7 +875,6 @@ RECIPE = [
     "--optimizer", "adamw", "--seed", "0", "--keep-every", "20", "--engine-eval-every", "1",
     "--solve-empties", "20", "--solve-play-past", "end", "--solve-threads", "31",
     "--grow-metric", "avg4/engine_value_mse", "--grow-window", "20", "--grow-min-epochs", "20",
-    "--grow-train-retired",
 ]  # fmt: skip
 
 
@@ -825,6 +923,7 @@ def main() -> None:
             TEMPLATE.format(
                 name=args.name,
                 tags=os.environ.get("SEAGLASS_TAGS", ""),
+                home=str(Path.home()),
                 train_args=", ".join(json.dumps(a) for a in RECIPE),
             )
         )
