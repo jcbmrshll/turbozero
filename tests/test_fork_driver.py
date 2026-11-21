@@ -471,3 +471,19 @@ def test_a_plateaued_fork_just_short_of_the_margin_goes_on(run):
     advance(driver, "main", 65)
     advance(driver, "sims1", 61, value=lambda _: 0.698)
     assert driver.state.lines["sims1"].status == "killed"
+
+
+def test_after_an_adoption_learning_rates_count_the_parents_epochs(run):
+    driver, _ = run
+    driver.tick()
+    advance(driver, "main", 31)
+    driver.state.lr_steps = []
+    # the mainline is now a fork of it from epoch 30, 8 epochs in: flat since epoch 0
+    fork = fork_driver.Line(
+        name="sims1", kind="main", job="t-sims1", start=30, parent="main"
+    )
+    fork.segments.append(driver.new_segment(fork, 30, 0, 1))
+    driver.state.lines["sims1"] = fork
+    driver.state.main = "sims1"
+    log_epochs(driver, "sims1", {e: 0.7 for e in range(30, 38)})
+    assert driver.lr_plateaus(fork, 40) == ["r11", "r15"]
