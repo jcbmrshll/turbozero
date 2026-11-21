@@ -34,8 +34,9 @@ with it at matched epochs on the playing network's metric:
   the mainline's, after `min_epochs`. A window fork needs a learning rate step inside it, and
   `after_lr_step` epochs after it, first (or the learning rates at their floor): a wider window's
   gain hides at a constant high rate and shows after it drops;
-- it is killed once its own metric has plateaued without a lead, or at `max_fork_epochs`; its
-  step may be tried again `retry_after` mainline epochs later;
+- it is killed once its own metric has plateaued while its mean lead over those windows is
+  under half the margin, or at `max_fork_epochs`; its step may be tried again `retry_after`
+  mainline epochs later;
 - when the other fork takes over, it starts again from the new mainline (it branched from the
   old one, so it would differ from the new one in two settings).
 
@@ -690,13 +691,23 @@ class Driver:
         plateaued = len(recent) >= rules.plateau_epochs and (
             slope_per_100(recent) > -rules.plateau_per_100
         )
+        # a plateau ends it only without a lead worth waiting on: at a constant low learning
+        # rate every curve is flat, and a fork just short of the margin may yet clear it
+        lead = sum(ours - theirs for theirs, ours in windows) / max(len(windows), 1)
         if latest - fork.start >= rules.max_fork_epochs or (
-            self.ready(fork, latest) and plateaued
+            self.ready(fork, latest) and plateaued and lead < rules.margin / 2
         ):
             fork.status, fork.ended_at = "killed", time.time()
             self.backend.stop(fork.job)
             self.state.retry_at[fork.kind] = self.logged_to(main) + rules.retry_after
-            self.decide("kill", fork, epoch=latest, windows=means, plateaued=plateaued)
+            self.decide(
+                "kill",
+                fork,
+                epoch=latest,
+                windows=means,
+                plateaued=plateaued,
+                lead=round(lead, 5),
+            )
 
     def adopt(self, fork: Line, main: Line, latest: int, means: list) -> None:
         main.status, main.ended_at = "replaced", time.time()
