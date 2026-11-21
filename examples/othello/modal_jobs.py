@@ -29,6 +29,7 @@ import shlex
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,7 @@ from modal_run import engine_set_path
 from modal_spec import (
     GPU_PER_SECOND,
     Job,
+    Step,
     flag,
     job_key,
     parse_step,
@@ -151,6 +153,8 @@ def build_job(args: argparse.Namespace) -> Job:
         cpu=args.cpu,
         memory_gb=args.memory,
         resume_every=args.resume_every,
+        follow_minutes=args.follow,
+        states_in_bucket=args.states_in_bucket,
         tags=",".join(t for t in (tags, "modal") if t),
         created=time.time(),
         launched_from={"cwd": os.getcwd(), "task": os.environ.get("SLICK_TASK")},
@@ -235,28 +239,80 @@ def ensure_sync() -> None:
     print(f"started the sync, in tmux session {SYNC_SESSION}")
 
 
-def launch(args: argparse.Namespace) -> None:
-    job = build_job(args)
-    store, _ = open_store()
-    if get_json(store, job_key(job.name, "job.json")) is not None:
-        raise SystemExit(
-            f"there's already a job {job.name}: `resume` it or use another name"
-        )
-    check_claims(store, job)
+def upload_inputs(store: Store, job: Job) -> None:
+    """Sends the bucket the files of this machine the job reads that it hasn't already."""
     for path in inputs_to_upload(job):
         if not store.sizes(job.key_of(path)):
             if not os.path.exists(path):
                 raise SystemExit(f"{path} isn't here, nor in the bucket")
             print(f"uploading {path}")
             store.put_file(job.key_of(path), path)
+
+
+def launch_job(store: Store, job: Job, start=None) -> None:
+    """Checks a new job, sends what it reads, and starts it (`start`, by default `spawn`)."""
+    if get_json(store, job_key(job.name, "job.json")) is not None:
+        raise SystemExit(
+            f"there's already a job {job.name}: `resume` it or use another name"
+        )
+    check_claims(store, job)
+    upload_inputs(store, job)
     put_json(store, job_key(job.name, "job.json"), job.to_dict())
-    spawn(job, store)
+    (start or spawn)(job, store)
+
+
+def launch(args: argparse.Namespace) -> None:
+    job = build_job(args)
+    store, _ = open_store()
+    launch_job(store, job)
     print(
         f"launched {job.name}: {len(job.steps)} steps on {job.gpu} at {job.commit[:8]}, "
         f"at most {job.hours} h, about ${job.dollars_per_hour():.2f}/h "
         f"(at most ${job.dollars_per_hour() * job.hours:.2f})"
     )
     ensure_sync()
+
+
+def extend_job(
+    store: Store, name: str, steps: list[Step], hours: float | None = None
+) -> Job:
+    """Appends steps to a job, which runs them after its others: while it's running, or
+    waiting for more (`Job.follow_minutes`), or once it's resumed. With `hours`, its new
+    limit over all attempts. Returns the job as it is now."""
+    data = get_json(store, job_key(name, "job.json"))
+    if data is None:
+        raise SystemExit(f"no job {name}")
+    job = Job.from_dict(data)
+    taken = {step.ckpt_dir for step in job.steps}
+    for step in steps:
+        if step.ckpt_dir in taken:
+            raise SystemExit(f"{step.ckpt_dir} is already a step's of {name}")
+    check_claims(store, replace(job, steps=steps))
+    job = replace(
+        job,
+        steps=[*job.steps, *steps],
+        hours=job.hours if hours is None else hours,
+    )
+    # what the new steps read that no step of the job makes
+    upload_inputs(store, job)
+    put_json(store, job_key(name, "job.json"), job.to_dict())
+    return job
+
+
+def extend(args: argparse.Namespace) -> None:
+    store, _ = open_store()
+    home = str(Path.home())
+    try:
+        steps = [parse_step(text, home) for text in args.step]
+    except ValueError as e:
+        raise SystemExit(str(e)) from None
+    job = extend_job(store, args.name, steps, args.hours)
+    status = get_json(store, job_key(args.name, "status.json")) or {}
+    print(f"{args.name}: {len(job.steps)} steps, at most {job.hours} h")
+    if status.get("state") in TERMINAL:
+        print(
+            f"it has ended ({status['state']}): `resume {args.name}` runs the new steps"
+        )
 
 
 def resume(args: argparse.Namespace) -> None:
@@ -411,7 +467,25 @@ def main() -> None:
         help="epochs between saved states to continue from",
     )
     p.add_argument("--tags", default=None, help="else $SEAGLASS_TAGS")
+    p.add_argument(
+        "--follow",
+        type=float,
+        default=0.0,
+        metavar="MINUTES",
+        help="after its last step, wait this long for steps `extend` adds before ending",
+    )
+    p.add_argument(
+        "--states-in-bucket",
+        action="store_true",
+        help="saved states stay in the bucket, for later steps and jobs, not synced here",
+    )
     p.set_defaults(fn=launch)
+
+    p = commands.add_parser("extend", help="add steps to a job, after its others")
+    p.add_argument("name")
+    p.add_argument("--step", action="append", required=True, help="as launch's")
+    p.add_argument("--hours", type=float, default=None, help="a new limit")
+    p.set_defaults(fn=extend)
 
     p = commands.add_parser("resume", help="run a job that ended short again")
     p.add_argument("name")

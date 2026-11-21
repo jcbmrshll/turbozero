@@ -448,6 +448,35 @@ class Runner:
             os.killpg(child.pid, signal.SIGKILL)
             raise
 
+    def _reload(self) -> Job:
+        """The job as the bucket has it now: steps appended since, a new time limit."""
+        data = get_json(self.store, job_key(self.name, "job.json"))
+        if data is not None:
+            self.job = self.mirror.job = Job.from_dict(data)
+        return self.job
+
+    def _more_steps(self, index: int) -> bool:
+        """After the last step: whether one more comes within `follow_minutes`, before a stop
+        or the time limit."""
+        deadline = time.time() + self.job.follow_minutes * 60
+        while time.time() < deadline and self._spent() < self.job.hours * 3600:
+            if self._stop_asked():
+                return False
+            if index < len(self._reload().steps):
+                return True
+            self._safe_tick()
+            time.sleep(self.place.mirror_seconds)
+        return False
+
+    def _prune_states(self, index: int) -> None:
+        """With `states_in_bucket`, the saved states of steps before the last one leave this
+        disk (the bucket has those asked for): a long run of segments would fill it."""
+        if not self.job.states_in_bucket:
+            return
+        for step in self.job.steps[: max(index - 1, 0)]:
+            for path in Path(step.ckpt_dir).glob("state-*.npz"):
+                path.unlink()
+
     def _stop_asked(self) -> bool:
         stop = get_json(self.store, job_key(self.name, "stop.json"))
         return bool(stop and stop["stop"])
@@ -469,16 +498,21 @@ class Runner:
         server = self._start_seaglass()
         thread = threading.Thread(target=self._mirror_loop, daemon=True)
         thread.start()
-        outcome = "done"
+        outcome, index = "done", 0
         try:
             self._heartbeat()
-            for index, step in enumerate(job.steps):
+            # steps may be added while the job runs (see `Job.follow_minutes`)
+            while index < len(self._reload().steps) or self._more_steps(index):
+                step = self.job.steps[index]
                 self.status["step"] = index
-                outcome = (
-                    "stopped" if self._stop_asked() else self._run_step(index, step)
-                )
+                if self._stop_asked():
+                    outcome = "stopped"
+                    break
+                self._prune_states(index)
+                outcome = self._run_step(index, step)
                 if outcome != "done":
                     break
+                index += 1
             self.status["state"] = "lost" if outcome == "lost" else outcome
         except BaseException:
             self.status["state"] = "interrupted"

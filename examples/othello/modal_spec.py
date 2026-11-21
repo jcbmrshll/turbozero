@@ -178,6 +178,12 @@ class Job:
     memory_gb: int = 16
     # saves the whole state this often, to continue from if the job is interrupted
     resume_every: int = 10
+    # after its last step, the job waits this long for more (see `modal_jobs.py extend`)
+    # before it ends: a driver appends a run's next segment as the last one finishes
+    follow_minutes: float = 0.0
+    # saved states (state-<EPOCH>.npz) stay in the bucket, for later steps and jobs to start
+    # from, rather than coming here with the sync
+    states_in_bucket: bool = False
     tags: str = ""
     created: float = 0.0
     launched_from: dict[str, Any] = field(default_factory=dict)

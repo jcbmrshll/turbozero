@@ -9,12 +9,14 @@ the job wrote at its start. Only complete lines are taken from a file the job is
 import base64
 import json
 import os
+import re
 import shutil
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
 
+from modal_spec import STATE as STATE_PATTERN
 from modal_spec import job_key, path_of
 from modal_store import Store, get_json
 
@@ -23,6 +25,7 @@ SLICK_SEAGLASS = "http://slick/seaglass"
 ABOUT = ("notes", "conclusions", "tags")
 TERMINAL = ("done", "failed", "stopped", "timeout")
 APPEND_ONLY = (".log", ".jsonl")
+STATE = re.compile(STATE_PATTERN)
 
 
 def write_atomic(path: Path, data: bytes) -> None:
@@ -83,10 +86,13 @@ class Sync:
 
     def _files(self, name: str, record: dict[str, Any]) -> list[str]:
         manifest = get_json(self.store, job_key(name, "manifest.json")) or {}
+        job = get_json(self.store, job_key(name, "job.json")) or {}
         files, out = record["files"], []
         for key, sig in manifest.items():
             if files.get(key) == sig:
                 continue
+            if job.get("states_in_bucket") and STATE.fullmatch(key.rsplit("/", 1)[-1]):
+                continue  # the job keeps its states there (see `Job.states_in_bucket`)
             path = path_of(key, self.home)
             if key not in files and os.path.exists(path):
                 out.append(f"{name}: {path} is already here: left alone")

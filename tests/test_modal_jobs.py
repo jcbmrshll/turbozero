@@ -645,3 +645,91 @@ def test_jobs_in_finds_jobs(scene):
     scene.job(step("a"), name="a")
     scene.job(step("b"), name="b")
     assert modal_sync.jobs_in(scene.store) == ["a", "b"]
+
+
+# --- jobs that grow: a driver appends segments as they run
+
+
+def test_a_following_job_runs_steps_added_while_it_waits(scene):
+    home = scene.home
+    first = f"{home}/.cache/turbozero/c/a"
+    scene.job(
+        step("a", "--epochs 3 --save-state-at 3"),
+        name="p",
+        follow_minutes=0.05,
+        states_in_bucket=True,
+    )
+    runner = scene.runner("p")
+    added = threading.Event()
+
+    def driver():
+        # once the first segment is done, as a driver would
+        while not (Path(first) / "state-3.npz").exists():
+            threading.Event().wait(0.05)
+        threading.Event().wait(0.3)
+        modal_jobs.extend_job(
+            scene.store,
+            "p",
+            [
+                modal_spec.parse_step(
+                    step("b", f"--epochs 2 --branch-from {first}/state-3.npz"),
+                    str(home),
+                )
+            ],
+        )
+        added.set()
+
+    thread = threading.Thread(target=driver)
+    thread.start()
+    assert runner.run() == "done"
+    thread.join()
+    assert added.is_set()
+    assert "branching from" in (scene.root / "l" / "b.log").read_text()
+    # its states stay in the bucket: the sync leaves them there
+    scene.wipe_container()
+    scene.sync().run()
+    assert (scene.root / "c" / "a" / "2.eqx").exists()
+    assert not (scene.root / "c" / "a" / "state-3.npz").exists()
+    assert scene.store.sizes("files/.cache/turbozero/c/a/state-3.npz")
+
+
+def test_a_following_job_ends_when_nothing_more_comes(scene):
+    scene.job(step("a", "--epochs 2"), name="p", follow_minutes=0.01)
+    assert scene.runner("p").run() == "done"
+
+
+def test_a_job_of_segments_keeps_only_the_newest_states_on_its_disk(scene):
+    c = f"{scene.home}/.cache/turbozero/c"
+    scene.job(
+        step("s0", "--epochs 2 --save-state-at 2"),
+        step("s1", f"--epochs 2 --save-state-at 2 --branch-from {c}/s0/state-2.npz"),
+        step("s2", f"--epochs 2 --save-state-at 2 --branch-from {c}/s1/state-2.npz"),
+        name="p",
+        states_in_bucket=True,
+    )
+    assert scene.runner("p").run() == "done"
+    # s2 needed only s1's: s0's left the disk, and the bucket keeps every one
+    assert not (scene.root / "c" / "s0" / "state-2.npz").exists()
+    assert (scene.root / "c" / "s1" / "state-2.npz").exists()
+    for name in ("s0", "s1", "s2"):
+        assert scene.store.sizes(f"files/.cache/turbozero/c/{name}/state-2.npz")
+
+
+def test_extending_a_job_refuses_a_step_it_already_has_or_a_taken_place(scene):
+    scene.job(step("a"), name="p")
+    home = str(scene.home)
+    with pytest.raises(SystemExit, match="already a step's"):
+        modal_jobs.extend_job(
+            scene.store, "p", [modal_spec.parse_step(step("a"), home)]
+        )
+    taken = scene.root / "c" / "b"
+    taken.mkdir(parents=True)
+    (taken / "x").write_text("a local run's")
+    with pytest.raises(SystemExit, match="already has files"):
+        modal_jobs.extend_job(
+            scene.store, "p", [modal_spec.parse_step(step("b"), home)]
+        )
+    job = modal_jobs.extend_job(
+        scene.store, "p", [modal_spec.parse_step(step("c"), home)], hours=3
+    )
+    assert [Path(s.ckpt_dir).name for s in job.steps] == ["a", "c"] and job.hours == 3

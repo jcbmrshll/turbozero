@@ -663,7 +663,16 @@ uv run examples/othello/modal_jobs.py list [--billed today]
 uv run examples/othello/modal_jobs.py stop trunk-a       # or --all; --now doesn't wait for the run to end as stopped
 uv run examples/othello/modal_jobs.py resume trunk-a     # after it ended short; --hours for a new limit
 uv run examples/othello/modal_jobs.py sync               # `launch` keeps one running, in tmux session modal-sync
+uv run examples/othello/modal_jobs.py extend trunk-a --step "..."   # more steps, after its others
 ```
+
+A job can grow while it runs: `extend` appends steps, which it runs after the others, and with
+`launch --follow 20` it waits up to 20 minutes after its last step for more before ending. A
+run in segments (each a step that branches from the last one's final state, with new settings)
+is then one job on one machine: each segment starts from the state on its own disk.
+`--states-in-bucket` keeps saved states in the bucket, where later steps and other jobs (forks)
+start from them, rather than bringing them here, and removes all but the newest segments' from
+the job's disk.
 
 A step is the command as you'd write it here, with `> LOG`; paths must be under
 `~/.cache/turbozero`. `--init-from`, `--branch-from` and `--warm-start` name a `state-<EPOCH>.npz`,
