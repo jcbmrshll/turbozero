@@ -455,3 +455,19 @@ def test_a_window_fork_waits_for_the_playing_networks_learning_rate_step(run):
     assert not driver.ready(fork, 90)
     driver.state.lr_steps.append((50, "r11", 1))
     assert driver.ready(fork, 55) and not driver.ready(fork, 54)
+
+
+def test_a_plateaued_fork_just_short_of_the_margin_goes_on(run):
+    driver, modal = run
+    driver.tick()
+    advance(driver, "main", 21)
+    modal.in_bucket.add(f"{driver.dir}/lines/main/seg10/state-20.npz")
+    driver.tick()
+    advance(driver, "main", 45)
+    # 0.002 ahead, flat: under the margin (0.003), over half of it
+    advance(driver, "sims1", 35, value=lambda _: 0.698)
+    assert driver.state.lines["sims1"].status == "running"
+    # until max_fork_epochs, unless it clears the margin
+    advance(driver, "main", 65)
+    advance(driver, "sims1", 61, value=lambda _: 0.698)
+    assert driver.state.lines["sims1"].status == "killed"
