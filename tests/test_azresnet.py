@@ -882,6 +882,119 @@ def test_a_gated_line_stops_at_a_closed_square():
     assert abs(float(both[0, 0, 3] - near[0, 0, 3])) > 0.1
 
 
+def unrolled_scan(scan: GatedScan, x, state, dtype):
+    """GatedScan's definition computed step by step, the reference for its fast form: along
+    each direction, shift and multiply by each square passed."""
+    channels, height, width = x.shape
+    g, state = scan.gates(x, state, dtype)
+    g = jnp.repeat(g, channels // g.shape[0], axis=0)
+    n = scan.length * max(abs(s) for step in scan.steps for s in step)
+    pad = ((0, 0), (n, n), (n, n))
+    xf = x.astype(jnp.float32)
+    xp, gp = jnp.pad(xf, pad), jnp.pad(g, pad)
+
+    def shifted(a, dy, dx):
+        return a[:, n + dy : n + dy + height, n + dx : n + dx + width]
+
+    y = scan.weight[:, 0, None, None] * xf
+    for d, (dy, dx) in enumerate(scan.steps):
+        through = jnp.ones_like(xf)
+        for k in range(1, scan.length + 1):
+            tap = scan.weight[:, 1 + d * scan.length + k - 1, None, None]
+            y = y + tap * through * shifted(xp, k * dy, k * dx)
+            if k < scan.length:
+                through = through * shifted(gp, k * dy, k * dx)
+    return y.astype(dtype), state
+
+
+EIGHT_WAYS = tuple((a, b) for a in (-1, 0, 1) for b in (-1, 0, 1) if a or b)
+
+
+@pytest.mark.parametrize(
+    "steps, length, board, offset",
+    [
+        (EIGHT_WAYS, 7, (8, 8), 2.0),
+        # nearly closed gates, and so closed that their products underflow
+        (EIGHT_WAYS, 7, (8, 8), -4.0),
+        (EIGHT_WAYS, 7, (8, 8), -60.0),
+        # a grid that isn't square, lines longer than it, one way only
+        (((0, 1), (1, 1)), 6, (3, 5), 0.0),
+        # steps that skip squares, and two that reach one square by different paths
+        (((1, 2), (0, 1), (0, 2)), 4, (6, 7), 1.0),
+        # no square between any two: nothing is gated
+        (((0, 1), (-1, 0)), 1, (4, 4), 2.0),
+    ],
+)
+def test_a_gated_scan_is_its_unrolled_definition_with_its_gradients(
+    steps, length, board, offset
+):
+    rng = np.random.default_rng(0)
+    scan, state = eqx.nn.make_with_state(GatedScan)(
+        6,
+        steps,
+        length,
+        3,
+        key=jax.random.PRNGKey(0),
+        make_norm=norm_maker(),
+        stats=(1.0, 1.0),
+    )
+    scan = eqx.tree_at(lambda s: s.gate_offset, scan, jnp.full((3,), offset))
+    params, static = eqx.partition(scan, eqx.is_inexact_array)
+    x = jnp.asarray(rng.normal(size=(3, 6, *board)), jnp.float32)
+    cotangent = jnp.asarray(rng.normal(size=x.shape), jnp.float32)
+
+    def outputs_and_gradients(call):
+        # batched and training, as the trainer runs it
+        def batched(params, x):
+            scan = eqx.combine(params, static)
+            fresh = jax.tree.map(lambda a: a, state)  # a state is used once
+            return jax.vmap(
+                lambda x: call(scan, x, fresh, jnp.dtype(jnp.float32))[0],
+                axis_name=BATCH_AXIS,
+            )(x)
+
+        @jax.jit
+        def run(params, x):
+            y, pull = jax.vjp(batched, params, x)
+            return y, pull(cotangent), batched(params, x)  # also undifferentiated
+
+        return jax.tree.leaves(run(params, x))
+
+    actual = outputs_and_gradients(GatedScan.__call__)
+    expected = outputs_and_gradients(unrolled_scan)
+    for a, b in zip(actual, expected, strict=True):
+        np.testing.assert_allclose(a, b, rtol=1e-5, atol=1e-5)
+
+
+def test_a_gated_scans_matrix_products_ask_for_full_float32():
+    # a GPU computes float32 matrix products with 10-bit mantissas unless asked not to, which
+    # tests on the CPU can't see: the scan was 1e-3 off there
+    scan, state = gated_scan(0.5)
+    params, static = eqx.partition(scan, eqx.is_inexact_array)
+    x = jnp.ones((2, 5, 5))
+
+    def forward_and_backward(params, x):
+        def apply(params, x):
+            fresh = jax.tree.map(lambda a: a, state)
+            scan = eqx.combine(params, static)
+            return scan(x, fresh, jnp.dtype(jnp.float32))[0]
+
+        y, pull = jax.vjp(apply, params, x)
+        return pull(y)
+
+    products = [
+        eqn.params["precision"]
+        for eqn in jax.make_jaxpr(forward_and_backward)(params, x).eqns
+        if eqn.primitive.name == "dot_general"
+    ]
+
+    assert (
+        len(products) >= 3
+    )  # the paths' gates, their transpose, and the taps' weights
+    highest = jax.lax.Precision.HIGHEST
+    assert all(p is not None and set(p) == {highest} for p in products)
+
+
 def test_equal_mlp_experts_are_one_convolution():
     # experts equal to the block's own convolutions: the mixture is that convolution
     net, state = make_variant("expert convnext")
