@@ -1269,8 +1269,7 @@ class PreActConvNeXt(eqx.Module):
 
     @property
     def plain(self) -> bool:
-        """Whether the block is ConvNeXt's with a depthwise filter, without the options (as the
-        native and ONNX exports need)."""
+        """Whether the block is ConvNeXt's with a depthwise filter, without the options."""
         return (
             isinstance(self.dw, Depthwise)
             and self.position is None
