@@ -1018,6 +1018,30 @@ CONVNEXT_SPECS = [
 ]
 
 
+# ConvNeXt blocks of gated scans along the rays (see `core.networks.azresnet.GatedScan`): at the
+# width its direct kernel reads, and off it, a gate's 6 channels splitting vectors of channels
+SCAN_SPECS = [
+    "resnet:2x64,pool_every=2,heads=pooled,pool_channels=16,layout=pre,block=convnext,expand=2,scan=rays",
+    "resnet:2x48,pool_every=1,heads=pooled,pool_channels=8,head_channels=16,layout=pre,block=convnext,scan=rays",
+]
+
+
+@pytest.mark.parametrize("spec", SCAN_SPECS)
+def test_the_native_networks_layers_compute_a_gated_scan_network(spec):
+    import cpu_net
+    import jax.numpy as jnp
+
+    from core.networks.utils import apply_nn
+
+    # against the network itself (the ONNX export takes no gated scans)
+    model, state = random_network(spec)
+    x = (np.random.default_rng(0).random((16, 2, 8, 8)) < 0.3).astype(np.float32)
+    (logits, values), _ = apply_nn(model, state, jnp.moveaxis(x, 1, -1))
+    got_logits, got_values = cpu_net.float_forward(cpu_net.extract(model, state), x)
+    np.testing.assert_allclose(got_logits, np.asarray(logits), atol=1e-4)
+    np.testing.assert_allclose(got_values, np.asarray(values).reshape(-1), atol=1e-5)
+
+
 @pytest.mark.parametrize("spec", NATIVE_SPECS + CONVNEXT_SPECS)
 def test_the_native_networks_layers_compute_the_network(spec):
     import cpu_net
@@ -1038,7 +1062,7 @@ def test_the_native_networks_layers_compute_the_network(spec):
 # each convolution kernel: AVX-512 VNNI's, AVX-VNNI's, AVX2's Winograd, and NEON's with
 # i8mm and with the dot product alone
 @pytest.mark.parametrize("level", ["v4", "v3-vnni", "v3", "arm-i8mm", "arm-dotprod"])
-@pytest.mark.parametrize("spec", NATIVE_SPECS + CONVNEXT_SPECS)
+@pytest.mark.parametrize("spec", NATIVE_SPECS + CONVNEXT_SPECS + SCAN_SPECS)
 def test_the_native_network_computes_its_quantized_layers(
     spec, level, tmp_path, monkeypatch
 ):
