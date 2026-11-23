@@ -2029,34 +2029,60 @@ inline int scan_layout(const Depthwise& d, int C) {
 }
 
 // sigmoid(z) = 1 / (1 + exp(-z)), exp by 2^n (n = round(-z log2 e)) times a polynomial of the rest
-// (relative error about 2e-7)
-inline F sigmoid(F z) {
-    const F t = Lanes::most(Lanes::set1(-87.0f), Lanes::mul(Lanes::set1(-1.0f), z));
-    const F u = Lanes::sub(Lanes::zero(), Lanes::most(Lanes::set1(-87.0f), Lanes::sub(Lanes::zero(), t)));  // t within -87 to 87
+// (relative error about 2e-7), of K vectors `z` in place, each step of all K at once: a vector's steps
+// are one chain of about 12 dependent operations, which one at a time left the pipes idle (Neoverse
+// V2: 8 at once 37% faster)
+template <int K>
+NET_INLINE void sigmoids(F* z) {
+    F n[K], r[K], p[K];
+    NET_UNROLL for (int k = 0; k < K; k++) {
+        const F t = Lanes::most(Lanes::set1(-87.0f), Lanes::mul(Lanes::set1(-1.0f), z[k]));
+        z[k] = Lanes::sub(Lanes::zero(), Lanes::most(Lanes::set1(-87.0f), Lanes::sub(Lanes::zero(), t)));  // within -87 to 87
+    }
+    NET_UNROLL for (int k = 0; k < K; k++) {
 #if NET_ISA == 2
-    const F n = _mm512_roundscale_ps(Lanes::mul(u, Lanes::set1(1.44269504f)), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+        n[k] = _mm512_roundscale_ps(Lanes::mul(z[k], Lanes::set1(1.44269504f)), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
 #elif NET_ISA == 1
-    const F n = _mm256_round_ps(Lanes::mul(u, Lanes::set1(1.44269504f)), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+        n[k] = _mm256_round_ps(Lanes::mul(z[k], Lanes::set1(1.44269504f)), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
 #else
-    const F n = vrndnq_f32(Lanes::mul(u, Lanes::set1(1.44269504f)));
+        n[k] = vrndnq_f32(Lanes::mul(z[k], Lanes::set1(1.44269504f)));
 #endif
-    F r = Lanes::fma(n, Lanes::set1(-0.693145752f), u);
-    r = Lanes::fma(n, Lanes::set1(-1.42860677e-6f), r);
-    F p = Lanes::set1(1.0f / 720);
-    p = Lanes::fma(p, r, Lanes::set1(1.0f / 120));
-    p = Lanes::fma(p, r, Lanes::set1(1.0f / 24));
-    p = Lanes::fma(p, r, Lanes::set1(1.0f / 6));
-    p = Lanes::fma(p, r, Lanes::set1(0.5f));
-    p = Lanes::fma(p, r, Lanes::set1(1.0f));
-    p = Lanes::fma(p, r, Lanes::set1(1.0f));
+    }
+    NET_UNROLL for (int k = 0; k < K; k++) r[k] = Lanes::fma(n[k], Lanes::set1(-0.693145752f), z[k]);
+    NET_UNROLL for (int k = 0; k < K; k++) r[k] = Lanes::fma(n[k], Lanes::set1(-1.42860677e-6f), r[k]);
+    NET_UNROLL for (int k = 0; k < K; k++) p[k] = Lanes::fma(Lanes::set1(1.0f / 720), r[k], Lanes::set1(1.0f / 120));
+    NET_UNROLL for (int k = 0; k < K; k++) p[k] = Lanes::fma(p[k], r[k], Lanes::set1(1.0f / 24));
+    NET_UNROLL for (int k = 0; k < K; k++) p[k] = Lanes::fma(p[k], r[k], Lanes::set1(1.0f / 6));
+    NET_UNROLL for (int k = 0; k < K; k++) p[k] = Lanes::fma(p[k], r[k], Lanes::set1(0.5f));
+    NET_UNROLL for (int k = 0; k < K; k++) p[k] = Lanes::fma(p[k], r[k], Lanes::set1(1.0f));
+    NET_UNROLL for (int k = 0; k < K; k++) p[k] = Lanes::fma(p[k], r[k], Lanes::set1(1.0f));
+    NET_UNROLL for (int k = 0; k < K; k++) {
 #if NET_ISA == 2
-    const F e = _mm512_scalef_ps(p, n);
+        const F e = _mm512_scalef_ps(p[k], n[k]);
 #elif NET_ISA == 1
-    const F e = Lanes::mul(p, _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_add_epi32(_mm256_cvtps_epi32(n), _mm256_set1_epi32(127)), 23)));
+        const F e = Lanes::mul(p[k], _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_add_epi32(_mm256_cvtps_epi32(n[k]), _mm256_set1_epi32(127)), 23)));
 #else
-    const F e = Lanes::mul(p, vreinterpretq_f32_s32(vshlq_n_s32(vaddq_s32(vcvtnq_s32_f32(n), vdupq_n_s32(127)), 23)));
+        const F e = Lanes::mul(p[k], vreinterpretq_f32_s32(vshlq_n_s32(vaddq_s32(vcvtnq_s32_f32(n[k]), vdupq_n_s32(127)), 23)));
 #endif
-    return Lanes::div(Lanes::set1(1.0f), Lanes::add(Lanes::set1(1.0f), e));
+        z[k] = Lanes::div(Lanes::set1(1.0f), Lanes::add(Lanes::set1(1.0f), e));
+    }
+}
+
+// `sigmoids` of `n` floats at `v` in place, n a multiple of W
+inline void sigmoid(float* v, int n) {
+    constexpr int K = NET_ISA == 1 ? 4 : 8;  // AVX2's 16 registers: 3 vectors a sigmoid in flight
+    int j = 0;
+    for (; j + K * W <= n; j += K * W) {
+        F z[K];
+        NET_UNROLL for (int k = 0; k < K; k++) z[k] = Lanes::load(v + j + k * W);
+        sigmoids<K>(z);
+        NET_UNROLL for (int k = 0; k < K; k++) Lanes::store(v + j + k * W, z[k]);
+    }
+    for (; j < n; j += W) {
+        F z = Lanes::load(v + j);
+        sigmoids<1>(&z);
+        Lanes::store(v + j, z);
+    }
 }
 
 // `d`'s gates of the trunk `x`, (64, C), sigmoid(gate_w x + gate_b), to `g` in `scan_layout`'s
@@ -2096,7 +2122,7 @@ inline void scan_gates_of(const Depthwise& d, const float* x, int C, float* gate
             Lanes::store(gates + j, Lanes::add(Lanes::reduce(acc + k), Lanes::load(d.gate_b.data() + j)));
         }
     }
-    for (int j0 = 0; j0 < n; j0 += W) Lanes::store(gates + j0, sigmoid(Lanes::load(gates + j0)));
+    sigmoid(gates, n);
     if (layout == SCAN_DIRECT) {
         // by gate channel, (G, 64)
         if constexpr (G == 1) std::memcpy(g, gates, SQUARES * sizeof(float));
