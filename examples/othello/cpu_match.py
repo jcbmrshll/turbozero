@@ -14,6 +14,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 # a CPU script: JAX would otherwise take the GPU's memory, and the league would give way
 if __name__ == "__main__":
@@ -306,6 +307,8 @@ class NetPlayer:
         # search's root value, -1 to 1), ("margin", the solved final margin in discs), or
         # ("wdl", a solve's sign only, with `exact` off); None if it didn't search
         self.last_value: tuple[str, float] | None = None
+        # the root's visits after the last move's search, and how many of them it added
+        self.last_visits: tuple[int, int] | None = None
 
     def sync(self, color: str) -> None:
         """Passes for the other color if `color` moves out of turn: the game passes for a player
@@ -376,6 +379,7 @@ class NetPlayer:
         solve_from = self.solve_from or 0
         action = None
         self.last_value = None
+        self.last_visits = None
         if self.search.num_legal() == 1:
             action = self.search.first_legal()
         elif self.solving is not None and empties <= solve_from:
@@ -407,6 +411,7 @@ class NetPlayer:
             # the last search before a planned solve has no later search to leave its time to
             stop = self.stop_decided and not (solve_from and empties - 2 <= solve_from)
             nodes = self.search.num_nodes()
+            visits = int(self.search.visits().sum())
             began = time.perf_counter()
             if isinstance(self.evaluate, Engine):
                 self.evaluate.search(
@@ -425,8 +430,27 @@ class NetPlayer:
                 self.used.append(min(searched / seconds, 1.0))
             action = self.search.best_action()
             self.last_value = ("q", self.search.root_q())
+            searched_visits = int(self.search.visits().sum())
+            self.last_visits = (searched_visits, searched_visits - visits)
         self.search.play(action)
         return action
+
+    def info(self) -> dict[str, Any] | None:
+        """What the last move made of its position (`clock_match.Player.info`): the search's
+        root value `q` (-1 to 1) for the player to move, its root's `visits` and how many of
+        them it `added` (the rest kept from earlier searches); or a solve's `margin`, or its
+        `wdl` (the sign alone, with `exact` off). None for a move played without either."""
+        if self.last_value is None:
+            return None
+        kind, value = self.last_value
+        if kind != "q":
+            return {kind: int(value)}
+        assert self.last_visits is not None
+        return {
+            "q": round(value, 4),
+            "visits": self.last_visits[0],
+            "added": self.last_visits[1],
+        }
 
     def reserve(self, added: int, searched: float, seconds_left: float) -> None:
         """Sets aside the tree's room for the rest of the game, the first search having added

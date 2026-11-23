@@ -449,6 +449,7 @@ def test_a_net_player_on_a_fixed_time_solves_only_what_fits():
     # planned from the most empties that fit, no more than asked for
     assert fits.solve_from == 15 and fits.solved == 1
     assert fits.last_value is not None and fits.last_value[0] == "margin"
+    assert fits.info() == {"margin": int(fits.last_value[1])}
     assert move in b.legal()
     short = player()
     start = time.perf_counter()
@@ -456,5 +457,8 @@ def test_a_net_player_on_a_fixed_time_solves_only_what_fits():
     # nothing fits 0.01 s from 14 empties: searched that long, the clock ignored
     assert short.solve_from == 12 and short.solved == 0 and short.gave_up == 0
     assert short.last_value is not None and short.last_value[0] == "q"
+    info = short.info()
+    assert info is not None and set(info) == {"q", "visits", "added"}
+    assert info["visits"] >= info["added"] > 0
     assert time.perf_counter() - start < 1.0
     assert move in b.legal()

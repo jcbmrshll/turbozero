@@ -12,7 +12,9 @@ and solved at so many empties. Its games are numbered, each start's pair of game
 in a row, so a game recorded twice (a job run again, a file imported twice) is kept once.
 
 A game keeps its moves from the standard start (passes aren't moves), the seconds each move after
-the opening took where it was timed alone, how it ended, and the host it ran on. Hosts are kept
+the opening took where it was timed alone, what each player's search made of the positions it
+moved from where it said (in `game_moves`, a row a game that has them), how it ended, and the host
+it ran on. Hosts are kept
 once each, by what they are (`hardware.describe`), not by when they were seen.
 
 Only one process writes at a time (WAL mode lets readers carry on). Remote jobs write lines of
@@ -79,6 +81,10 @@ CREATE TABLE IF NOT EXISTS games (
 );
 CREATE INDEX IF NOT EXISTS games_by_black ON games (black_id);
 CREATE INDEX IF NOT EXISTS games_by_white ON games (white_id);
+CREATE TABLE IF NOT EXISTS game_moves (
+    game_id INTEGER PRIMARY KEY REFERENCES games(id),
+    info TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS match_runs (
     id INTEGER PRIMARY KEY,
     match_id TEXT NOT NULL REFERENCES matches(id),
@@ -123,6 +129,11 @@ class GameRecord:
         opening_moves: how many of `moves` are the opening's
         move_seconds: each move's seconds after the opening, None where moves weren't timed
             alone (games played in batches)
+        move_info: what the player's search made of each of those moves' positions, None where
+            it didn't say (`clock_match.Player.info`); empty if no move's did. A network's: its
+            root value `q`, -1 to 1, for the player to move, the root's `visits` and how many it
+            `added`; or a solve's `margin` or `wdl`. An engine's: its `score`, the disc margin it
+            expects for the player to move, and what else it says (`depth`, `nodes`...)
         ending: "end", played out; "solved", stopped at `solved_at` empties and solved; "timeout",
             ended by a hard timeout (a GGS clock's extension spent)
         solved_at: the empties of the position solved, if it was
@@ -159,6 +170,7 @@ class GameRecord:
     host: dict[str, Any] = field(default_factory=dict)
     load: float | None = None
     finished: float = 0.0
+    move_info: list[dict[str, Any] | None] = field(default_factory=list)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self))
@@ -365,6 +377,11 @@ class Store:
                     ),
                 )
                 added += cursor.rowcount
+                if cursor.rowcount and r.move_info:
+                    db.execute(
+                        "INSERT INTO game_moves (game_id, info) VALUES (?, ?)",
+                        (cursor.lastrowid, json.dumps(r.move_info)),
+                    )
         return added
 
     def import_records(self, lines: Iterable[str]) -> int:
@@ -386,7 +403,8 @@ class Store:
             "SELECT g.match_id, g.number, g.black_id, g.white_id, g.start, g.moves, "
             "g.opening_moves, g.move_seconds, g.ending, g.margin, g.result, g.solved_at, "
             "g.solve_exact, g.flagged, g.hard, g.black_seconds, g.white_seconds, h.info, "
-            "g.load, g.finished FROM games g LEFT JOIN hosts h ON h.id = g.host_id "
+            "g.load, g.finished, gm.info FROM games g LEFT JOIN hosts h ON h.id = g.host_id "
+            "LEFT JOIN game_moves gm ON gm.game_id = g.id "
             "WHERE g.match_id = ? ORDER BY g.number",
             (match,),
         ).fetchall()
@@ -412,6 +430,7 @@ class Store:
                 host=json.loads(r[17]) if r[17] else {},
                 load=r[18],
                 finished=r[19],
+                move_info=json.loads(r[20]) if r[20] else [],
             )
             for r in rows
         ]

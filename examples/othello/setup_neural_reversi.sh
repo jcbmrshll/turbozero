@@ -8,9 +8,15 @@
 #     examples/othello/setup_neural_reversi.sh            # with AVX-512 (ARCH=x86-64-v4)
 #     ARCH=x86-64-v3 examples/othello/setup_neural_reversi.sh
 #
+# Its GTP is patched (neural_reversi_search_log.patch) to write what each genmove's search made of
+# the position to stderr: score, depth, nodes. That doesn't change how it plays, so its identity
+# (`engines.build_digest`) is the upstream build's binary, built first and its sha256 kept in
+# target/release/upstream.sha256, the same build that played before the patch.
+#
 # Needs git, curl and rustup (it builds with the nightly its rust-toolchain.toml names). The
 # build takes about 700 MB of disk under target/.
 set -eu
+HERE=$(cd "$(dirname "$0")" && pwd)
 
 NR_COMMIT=431b7e519e62480824aa67bf75625eec86e5ddf0
 WEIGHTS_URL=https://github.com/natsutteatsuiyone/neural-reversi-weights/releases/download/v5.0.0
@@ -31,7 +37,8 @@ if [ ! -d "$NEURAL_REVERSI_DIR/.git" ]; then
 fi
 cd "$NEURAL_REVERSI_DIR"
 git fetch --quiet origin "$NR_COMMIT" 2>/dev/null || true
-git checkout --quiet "$NR_COMMIT"
+# -f: drop the patch a build before applied
+git checkout --quiet -f "$NR_COMMIT"
 
 # the weights, which the build compiles in from the repository's root
 for pair in "$EVAL $EVAL_SHA256" "$EVAL_SM $EVAL_SM_SHA256"; do
@@ -43,7 +50,13 @@ for pair in "$EVAL $EVAL_SHA256" "$EVAL_SM $EVAL_SM_SHA256"; do
     fi
 done
 
-RUSTFLAGS="-C target-cpu=$ARCH" cargo build --quiet --locked --release -p cli >build.log 2>&1 \
-    || { cat build.log >&2; echo "setup_neural_reversi.sh: build failed (log above)" >&2; exit 1; }
+build() {
+    RUSTFLAGS="-C target-cpu=$ARCH" cargo build --quiet --locked --release -p cli >build.log 2>&1 \
+        || { cat build.log >&2; echo "setup_neural_reversi.sh: build failed (log above)" >&2; exit 1; }
+}
+build
+sha256sum target/release/cli | cut -d' ' -f1 >target/release/upstream.sha256
+git apply "$HERE/neural_reversi_search_log.patch"
+build
 
 echo "Neural Reversi is in $NEURAL_REVERSI_DIR (binary target/release/cli, weights built in)"

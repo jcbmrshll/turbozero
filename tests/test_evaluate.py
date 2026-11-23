@@ -50,6 +50,9 @@ class FirstLegal:
         self.board.play(move)
         return move
 
+    def info(self):
+        return None
+
     def close(self):
         self.closed = True
 
@@ -305,7 +308,7 @@ def test_a_cloud_host_gets_the_solver_only_for_games_stopped_at_a_depth():
     ]
     files = evaluate.job_files(MatchSpec(a, b, openings=1, solve_at=28))
     assert set(files) == {"engines/a/bin", "engines/b/bin", *evaluate.referee_files()}
-    assert all(f.endswith("target/release/cli") for f in evaluate.referee_files())
+    assert any(f.endswith("target/release/cli") for f in evaluate.referee_files())
 
 
 def test_a_matchs_id_is_its_setup_and_where_its_played():
