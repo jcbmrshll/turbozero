@@ -496,7 +496,9 @@ class NetBridge(PlayerBridge):
     options (`net`, `batch`, `solve`, `solve_exact`, `solve_share`, `taper`, ... ; `engine=1`
     is implied: the native int8 engine, a worker to a core). Unlike there, `solve_exact`
     defaults to 1: a game's score is its disc margin, so a won endgame should win by the most
-    and a lost one lose by the least, which the network's win/loss value doesn't see."""
+    and a lost one lose by the least, which the network's win/loss value doesn't see.
+    `reserve_tree=1` sets aside each game's tree room (see `NetPlayer`), twice it with `ponder`:
+    the opponent's time searches it too."""
 
     def __init__(
         self,
@@ -513,6 +515,7 @@ class NetBridge(PlayerBridge):
         options.pop("threads", None)
         ponder = bool(int(options.pop("ponder", 0)))
         ponder_nodes = int(options.pop("ponder_nodes", 0))
+        reserve_tree = float(options.pop("reserve_tree", 0)) * (2 if ponder else 1)
         solving = None
         if "solve" in options:
             solving = Solving(
@@ -528,7 +531,15 @@ class NetBridge(PlayerBridge):
 
         def new_player(seed: int) -> NetPlayer:
             # its engine is set for each move (see `decide`)
-            player = NetPlayer(spec.settings, None, taper, seed, 0, solving)  # type: ignore[arg-type]
+            player = NetPlayer(
+                spec.settings,
+                None,  # type: ignore[arg-type]
+                taper,
+                seed,
+                0,
+                solving,
+                reserve_tree,
+            )
             return player
 
         super().__init__(

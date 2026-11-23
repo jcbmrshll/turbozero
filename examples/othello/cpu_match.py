@@ -228,9 +228,17 @@ class NetPlayer:
         seed: int = 0,
         visits: int = 0,
         solving: Solving | None = None,
+        reserve_tree: float = 0.0,
     ):
-        """`visits`, if any, a move, ignoring the clock."""
+        """`visits`, if any, a move, ignoring the clock. With `reserve_tree` (on a clock), the
+        tree's room is set aside after the first move searched (`Search.reserve`): for this many
+        times the nodes the game's searches are expected to add, at that search's rate, over the
+        clock left. Otherwise the tree grows as it fills, every worker waiting on each copy:
+        about 0.7 s of a 30 s game."""
         self.search = Search(settings, seed)
+        self.reserve_tree = reserve_tree
+        # whether the tree's room has been set aside (`reserve_tree`)
+        self.reserved = False
         self.evaluate = evaluate
         self.taper = taper
         self.visits = visits
@@ -340,16 +348,38 @@ class NetPlayer:
                 seconds = move_budget(
                     max(seconds_left, 0.0), empties, self.taper, solve_from, reserve
                 )
+            nodes = self.search.num_nodes()
+            began = time.perf_counter()
             if isinstance(self.evaluate, Engine):
                 self.evaluate.search(self.search, visits=self.visits, seconds=seconds)
             elif self.visits:
                 self.search.run(self.visits, self.evaluate)
             else:
                 timed_move(self.search, seconds, self.batch, self.evaluate)
+            if self.reserve_tree and not self.reserved and not self.visits:
+                searched = time.perf_counter() - began
+                self.reserve(
+                    self.search.num_nodes() - nodes, searched, seconds_left - searched
+                )
             action = self.search.best_action()
             self.last_value = ("q", self.search.root_q())
         self.search.play(action)
         return action
+
+    def reserve(self, added: int, searched: float, seconds_left: float) -> None:
+        """Sets aside the tree's room for the rest of the game, the first search having added
+        `added` nodes in `searched` seconds, with `seconds_left` on the clock: the table of
+        evaluated positions for the nodes expected at that pace, which it pays for as it fills;
+        half as many again nodes, and edges half again the tree's share of them so far (positions
+        branch more after the opening), their room free until it's used."""
+        self.reserved = True
+        if searched <= 0 or added <= 0:
+            return
+        now = self.search.num_nodes()
+        expected = now + self.reserve_tree * added / searched * max(seconds_left, 0.0)
+        nodes = 1.5 * expected
+        edges = 1.5 * nodes * self.search.num_edges() / now
+        self.search.reserve(int(nodes), int(edges), int(expected))
 
     def close(self) -> None:
         """Nothing outlives the player."""

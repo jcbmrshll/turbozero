@@ -10,12 +10,16 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <openvino/openvino.hpp>
+#include <sys/mman.h>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "cpu_net.h"
@@ -189,16 +193,58 @@ struct Node {
     float value;        // the network's, once it's been evaluated
 };
 
+// Asks for `bytes` from `start` to be backed by huge pages (Linux's transparent ones, where they're
+// granted only to memory that asks): a reserved tree fills its room a page at a time while its workers
+// wait on it, and a 2 MB page is one fault where 4 KB pages are 512, and one TLB entry.
+void prefer_huge_pages(const void* start, size_t bytes) {
+#ifdef MADV_HUGEPAGE
+    const uintptr_t page = 4096;
+    uintptr_t from = ((uintptr_t)start + page - 1) & ~(page - 1);
+    uintptr_t to = ((uintptr_t)start + bytes) & ~(page - 1);
+    if (to > from) madvise((void*)from, to - from, MADV_HUGEPAGE);
+#endif
+}
+
+// Memory handed out zeroed by calloc, its elements default-constructed by doing nothing: a large
+// buffer comes straight from the kernel, its pages zeroed when first touched (`std::vector`'s own
+// allocator would write every element up front).
+template <class T>
+struct ZeroedAllocator {
+    using value_type = T;
+    ZeroedAllocator() = default;
+    template <class U>
+    ZeroedAllocator(const ZeroedAllocator<U>&) {}
+    T* allocate(size_t n) {
+        void* p = std::calloc(n, sizeof(T));
+        if (!p) throw std::bad_alloc();
+        return static_cast<T*>(p);
+    }
+    void deallocate(T* p, size_t) { std::free(p); }
+    template <class U, class... Args>
+    void construct(U* p, Args&&... args) {
+        if constexpr (sizeof...(Args) > 0) ::new ((void*)p) U(std::forward<Args>(args)...);
+    }
+    bool operator==(const ZeroedAllocator&) const { return true; }
+    bool operator!=(const ZeroedAllocator&) const { return false; }
+};
+
 // The nodes evaluated so far, by position: a leaf whose position the game's searches have evaluated
 // before, reached by another order of moves, takes that evaluation instead of the network's
-// (Leela Chess Zero's cache of network evaluations, here the tree itself). Open addressing.
+// (Leela Chess Zero's cache of network evaluations, here the tree itself). Open addressing; a slot of
+// all zeros is empty, so a fresh table is calloc's, its pages zeroed by the kernel as they're touched.
+// Its entries spread over the whole table, so unlike the tree's vectors, room reserved here is paid for
+// as it fills, not as it's used up.
 struct Evaluated {
     struct Slot {
         uint64_t me, opp;
-        int32_t node;  // -1 for an empty slot
+        int32_t node_plus_one;  // 0 for an empty slot
     };
-    std::vector<Slot> slots = std::vector<Slot>(1024, Slot{0, 0, -1});
+    using Slots = std::vector<Slot, ZeroedAllocator<Slot>>;
+    static constexpr size_t SMALLEST = 1024;
+    Slots slots = Slots(SMALLEST);
     size_t used = 0;
+    // the size `reserve` asked for, which `clear` keeps
+    size_t reserved = SMALLEST;
 
     static uint64_t hash(uint64_t me, uint64_t opp) {
         uint64_t z = me ^ (opp * 0x9e3779b97f4a7c15ULL) ^ (opp >> 29);
@@ -211,24 +257,27 @@ struct Evaluated {
         size_t mask = slots.size() - 1;
         for (size_t i = hash(me, opp) & mask;; i = (i + 1) & mask) {
             const Slot& slot = slots[i];
-            if (slot.node < 0) return -1;
-            if (slot.me == me && slot.opp == opp) return slot.node;
+            if (slot.node_plus_one == 0) return -1;
+            if (slot.me == me && slot.opp == opp) return slot.node_plus_one - 1;
         }
     }
 
+    // to a table of `size` slots (a power of 2), every entry kept
+    void resize(size_t size) {
+        Slots old(size);
+        old.swap(slots);
+        used = 0;
+        for (const Slot& slot : old)
+            if (slot.node_plus_one) insert(slot.me, slot.opp, slot.node_plus_one - 1);
+    }
+
     void insert(uint64_t me, uint64_t opp, int32_t node) {
-        if (2 * (used + 1) > slots.size()) {
-            std::vector<Slot> old(slots.size() * 2, Slot{0, 0, -1});
-            old.swap(slots);
-            used = 0;
-            for (const Slot& slot : old)
-                if (slot.node >= 0) insert(slot.me, slot.opp, slot.node);
-        }
+        if (2 * (used + 1) > slots.size()) resize(slots.size() * 2);
         size_t mask = slots.size() - 1;
         for (size_t i = hash(me, opp) & mask;; i = (i + 1) & mask) {
             Slot& slot = slots[i];
-            if (slot.node < 0) {
-                slot = Slot{me, opp, node};
+            if (slot.node_plus_one == 0) {
+                slot = Slot{me, opp, node + 1};
                 used++;
                 return;
             }
@@ -236,8 +285,18 @@ struct Evaluated {
         }
     }
 
+    // room for `entries` without growing, which rehashes every entry at once
+    void reserve(size_t entries) {
+        size_t size = SMALLEST;
+        while (size < 2 * entries) size *= 2;
+        reserved = std::max(reserved, size);
+        if (size > slots.size()) resize(size);
+        prefer_huge_pages(slots.data(), slots.size() * sizeof(Slot));
+    }
+
     void clear() {
-        slots.assign(1024, Slot{0, 0, -1});
+        slots = Slots(reserved);
+        if (reserved > SMALLEST) prefer_huge_pages(slots.data(), reserved * sizeof(Slot));
         used = 0;
     }
 };
@@ -697,6 +756,34 @@ void search_play(Search* s, int action) {
     Position next = play(root.position, action);
     s->root = new_node(*s, next);
 }
+
+// Room for `nodes` nodes and `edges` edges, and the table of evaluated positions for `positions`, set
+// aside now, and kept when the tree is started afresh (`search_set_position`). Grown as the tree fills
+// instead, each is copied (the table rehashed) whole at once while an engine's workers wait on the
+// tree: up to about a second in a long game. The nodes and edges fill their room in order, so what isn't
+// used yet costs no memory; the table's entries land all over it (see `Evaluated`). All of it asks for
+// huge pages (`prefer_huge_pages`). Returns 0 if the
+// memory couldn't be had, what was set aside kept, the rest grown as before.
+int search_reserve(Search* s, long nodes, long edges, long positions) {
+    try {
+        s->nodes.reserve((size_t)nodes);
+        s->edges.reserve((size_t)edges);
+        s->evaluated.reserve((size_t)positions);
+        prefer_huge_pages(s->nodes.data(), s->nodes.capacity() * sizeof(Node));
+        prefer_huge_pages(s->edges.data(), s->edges.capacity() * sizeof(Edge));
+        return 1;
+    } catch (const std::exception&) {
+        return 0;
+    }
+}
+
+// (nodes, edges) the tree has room for without growing
+void search_capacity(const Search* s, long* out) {
+    out[0] = (long)s->nodes.capacity();
+    out[1] = (long)s->edges.capacity();
+}
+
+long search_num_edges(const Search* s) { return (long)s->edges.size(); }
 
 // Ends an engine's search of `s` under way, and any started while it's set, at once (the batches in
 // flight finished); safe from any thread. 0 lets searches run again.

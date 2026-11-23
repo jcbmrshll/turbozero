@@ -1213,3 +1213,57 @@ def test_a_clone_searches_on_by_itself_as_the_original_would():
     assert np.array_equal(copy.visits(), search.visits())
     other.run(200, fake_eval)
     assert other.descended() > 0 and search.descended() == 0
+
+
+def test_room_reserved_ahead_searches_the_same_tree_and_outlives_a_new_position():
+    from cpu_search import Search, SearchSettings
+
+    def game(reserve: bool) -> list:
+        search = Search(SearchSettings(batch=4, random_symmetry=True), seed=3)
+        if reserve:
+            # less than the game makes: it outgrows the room, and grows on as before
+            search.reserve(500, 2000)
+        seen = []
+        while not search.terminated() and len(seen) < 12:
+            if reserve and len(seen) == 6:
+                search.reserve(4 * search.num_nodes(), 8 * search.num_edges())
+            search.run(200, fake_eval)
+            seen.append((search.visits().tolist(), search.root_q(), search.reused()))
+            search.play(search.best_action())
+        return seen
+
+    assert game(reserve=True) == game(reserve=False)
+    search = Search()
+    assert search.reserve(100_000, 1_000_000)
+    assert search.capacity() == (100_000, 1_000_000)
+    search.run(300, fake_eval)
+    search.set_position(*search.position()[:2])
+    assert search.num_nodes() == 1 and search.capacity() == (100_000, 1_000_000)
+    search.run(300, fake_eval)
+    assert search.reused() > 0
+    # more than there is: refused, the tree as it was
+    assert not search.reserve(1 << 62, 1 << 62)
+    assert search.capacity() == (100_000, 1_000_000)
+    search.run(300, fake_eval)
+
+
+def test_a_net_player_on_a_clock_reserves_its_tree_after_its_first_search():
+    from cpu_match import NetPlayer
+    from cpu_search import SearchSettings
+
+    player = NetPlayer(SearchSettings(), fake_eval, reserve_tree=1.0)
+    player.move("b", 2.0)
+    nodes, edges = player.search.capacity()
+    # the first search's pace over the rest of the clock: far more than it made
+    assert player.reserved and nodes > 4 * player.search.num_nodes()
+    assert edges > nodes
+    player.play("w", int(np.flatnonzero(player.search.legal())[0]))
+    player.move("b", 1.9)
+    assert player.search.capacity() == (nodes, edges)
+    # at fixed visits or without the setting, the tree grows as it fills
+    for unreserved in (
+        NetPlayer(SearchSettings(), fake_eval, visits=50, reserve_tree=1.0),
+        NetPlayer(SearchSettings(), fake_eval),
+    ):
+        unreserved.move("b", 2.0)
+        assert not unreserved.reserved
