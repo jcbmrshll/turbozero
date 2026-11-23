@@ -181,6 +181,10 @@ struct Depthwise {
     int length = 0, gates = 0;
     std::vector<float, Aligned<float>> gate_w;  // (gates, channels)
     std::vector<float, Aligned<float>> gate_b;  // (64 gates): each square's gate_b in turn
+    // the first block of a pre net: its gates' sums as a function of the discs (`fold_disc_gates`),
+    // (3, 64, gates), each of a square's 3 rows' patterns' sums as `stem_table`'s, then (gates)
+    // constants: the stem's bias's sums and gate_b
+    std::vector<float, Aligned<float>> disc_gates;
     // the scan's weights by vectors of channels, (channels / V, 1 + 8 length, V): the square's own,
     // then each direction's, from 1 step to `length`
     std::vector<float, Aligned<float>> scan_w;
@@ -319,6 +323,7 @@ struct Scratch {
     // a gated scan's gates: each square's, (64, gates); spread over their channels, then the trunk,
     // both by vectors of channels (see `scan_gates`), (2, channels / W, 64, W)
     std::vector<float, Aligned<float>> gates, gate_x;
+    int patterns[10 * 8];  // `stem`'s rows' patterns of discs
     explicit Scratch(const Net& n) {
         int c = std::max(n.channels, 4), hidden = 0, most_gates = 0;
         for (const Block& b : n.blocks) hidden = std::max(hidden, b.expand.cout);
@@ -2085,18 +2090,17 @@ inline void sigmoid(float* v, int n) {
     }
 }
 
-// `d`'s gates of the trunk `x`, (64, C), sigmoid(gate_w x + gate_b), to `g` in `scan_layout`'s
-// layout, and for SCAN_BLOCKED the trunk copied to `xb` (see `SCAN_BLOCKED`). `gates`, (64, G), the
-// sums W at a time (squares by gate channels, in order), each a vector of channels' products, then
-// the vectors' lanes summed (`Lanes::reduce`)
+// `d`'s gates' sums of the trunk `x`, (64, C), gate_w x + gate_b, to `gates`, (64, G), and for
+// SCAN_BLOCKED the trunk copied to `xb` (see `SCAN_BLOCKED`): W sums at a time (squares by gate
+// channels, in order), each a vector of channels' products, then the vectors' lanes summed
+// (`Lanes::reduce`)
 template <int G>
-inline void scan_gates_of(const Depthwise& d, const float* x, int C, float* gates, float* g, float* xb) {
-    constexpr int n = SQUARES * G;
+inline void gate_sums(const Depthwise& d, const float* x, int C, float* gates, float* xb) {
     // the sums of S squares' gates at once, each weight's vector loaded once for them all, in
     // registers: 16 sums (AVX2: 8), S G a multiple of W for `Lanes::reduce`
     constexpr int sums = NET_ISA == 1 ? 8 : 16, S = G >= sums ? 1 : sums / G;
     static_assert(S * G % W == 0);
-    const int size = C / G, layout = scan_layout(d, C);
+    const bool blocked = scan_layout(d, C) == SCAN_BLOCKED;
     const float* gate_w = d.gate_w.data();
     for (int sq0 = 0; sq0 < SQUARES; sq0 += S) {
         F acc[S * G];
@@ -2105,7 +2109,7 @@ inline void scan_gates_of(const Depthwise& d, const float* x, int C, float* gate
             F xs[S];
             NET_UNROLL for (int s = 0; s < S; s++) {
                 xs[s] = Lanes::load(x + (size_t)(sq0 + s) * C + i);
-                if (layout == SCAN_BLOCKED) Lanes::store(xb + (size_t)i * SQUARES + (sq0 + s) * W, xs[s]);
+                if (blocked) Lanes::store(xb + (size_t)i * SQUARES + (sq0 + s) * W, xs[s]);
             }
             NET_UNROLL for (int o = 0; o < G; o++) {
                 F w = Lanes::load(gate_w + (size_t)o * C + i);
@@ -2122,6 +2126,49 @@ inline void scan_gates_of(const Depthwise& d, const float* x, int C, float* gate
             Lanes::store(gates + j, Lanes::add(Lanes::reduce(acc + k), Lanes::load(d.gate_b.data() + j)));
         }
     }
+}
+
+// The first block's gates' sums from the discs, as `fold_disc_gates` tabled them: a square's 3 rows'
+// patterns (`stem`'s `rows`) each look up G sums, added to the constants'. For SCAN_BLOCKED the trunk
+// `x` copied to `xb` as `gate_sums` does.
+template <int G>
+inline void disc_gate_sums(const Depthwise& d, const int* rows, const float* x, int C, float* gates, float* xb) {
+    const float* table = d.disc_gates.data();
+    const float* constant = table + 3 * 64 * G;
+    for (int sq = 0; sq < SQUARES; sq++) {
+        const int y = sq / 8, x0 = sq % 8;
+        const float* r0 = table + (size_t)rows[y * 8 + x0] * G;
+        const float* r1 = table + (size_t)(64 + rows[(y + 1) * 8 + x0]) * G;
+        const float* r2 = table + (size_t)(128 + rows[(y + 2) * 8 + x0]) * G;
+        float* out = gates + sq * G;
+        // by vectors of 8 (x86) or 4 (NEON) gates where they fill them: else GCC vectorizes over the
+        // squares, by gathers
+#if NET_ISA == 2 || NET_ISA == 1
+        if constexpr (G % 8 == 0) {
+            NET_UNROLL for (int o = 0; o < G; o += 8)
+                _mm256_storeu_ps(out + o, _mm256_add_ps(_mm256_add_ps(_mm256_add_ps(_mm256_loadu_ps(constant + o), _mm256_loadu_ps(r0 + o)),
+                                                                      _mm256_loadu_ps(r1 + o)), _mm256_loadu_ps(r2 + o)));
+            continue;
+        }
+#else
+        if constexpr (G % 4 == 0) {
+            NET_UNROLL for (int o = 0; o < G; o += 4)
+                vst1q_f32(out + o, vaddq_f32(vaddq_f32(vaddq_f32(vld1q_f32(constant + o), vld1q_f32(r0 + o)), vld1q_f32(r1 + o)), vld1q_f32(r2 + o)));
+            continue;
+        }
+#endif
+        NET_UNROLL for (int o = 0; o < G; o++) out[o] = ((constant[o] + r0[o]) + r1[o]) + r2[o];
+    }
+    if (scan_layout(d, C) == SCAN_BLOCKED)
+        for (int sq = 0; sq < SQUARES; sq++)
+            for (int i = 0; i < C; i += W) Lanes::store(xb + (size_t)i * SQUARES + sq * W, Lanes::load(x + (size_t)sq * C + i));
+}
+
+// `d`'s gates from their sums `gates`, (64, G), sigmoid of each, to `g` in `scan_layout`'s layout
+template <int G>
+inline void finish_gates(const Depthwise& d, int C, float* gates, float* g) {
+    constexpr int n = SQUARES * G;
+    const int size = C / G, layout = scan_layout(d, C);
     sigmoid(gates, n);
     if (layout == SCAN_DIRECT) {
         // by gate channel, (G, 64)
@@ -2162,13 +2209,24 @@ inline void scan_gates_of(const Depthwise& d, const float* x, int C, float* gate
 #endif
 }
 
-inline void scan_gates(const Depthwise& d, const float* x, int C, float* gates, float* g, float* xb) {
+
+// `d`'s gates of the trunk `x`, (64, C), sigmoid(gate_w x + gate_b), to `g` in `scan_layout`'s layout,
+// `gates` the sums, (64, gates), and for SCAN_BLOCKED the trunk copied to `xb`; from the discs' rows'
+// patterns `rows` instead when `d` has `disc_gates`
+template <int G>
+inline void scan_gates_of(const Depthwise& d, const float* x, const int* rows, int C, float* gates, float* g, float* xb) {
+    if (d.disc_gates.empty()) gate_sums<G>(d, x, C, gates, xb);
+    else disc_gate_sums<G>(d, rows, x, C, gates, xb);
+    finish_gates<G>(d, C, gates, g);
+}
+
+inline void scan_gates(const Depthwise& d, const float* x, const int* rows, int C, float* gates, float* g, float* xb) {
     switch (d.gates) {
-        case 1: return scan_gates_of<1>(d, x, C, gates, g, xb);
-        case 2: return scan_gates_of<2>(d, x, C, gates, g, xb);
-        case 4: return scan_gates_of<4>(d, x, C, gates, g, xb);
-        case 8: return scan_gates_of<8>(d, x, C, gates, g, xb);
-        default: return scan_gates_of<16>(d, x, C, gates, g, xb);
+        case 1: return scan_gates_of<1>(d, x, rows, C, gates, g, xb);
+        case 2: return scan_gates_of<2>(d, x, rows, C, gates, g, xb);
+        case 4: return scan_gates_of<4>(d, x, rows, C, gates, g, xb);
+        case 8: return scan_gates_of<8>(d, x, rows, C, gates, g, xb);
+        default: return scan_gates_of<16>(d, x, rows, C, gates, g, xb);
     }
 }
 
@@ -2284,7 +2342,7 @@ inline void convnext_block(const Block& b, Scratch& s, float* x, int C) {
     alignas(64) float pooled[2 * 512], bias[1024];
     const Quantizer quantize(b.expand);
     if (b.dw.scan) {
-        scan_gates(b.dw, x, C, s.gates.data(), s.gate_x.data(), s.gate_x.data() + (size_t)C * SQUARES);
+        scan_gates(b.dw, x, s.patterns, C, s.gates.data(), s.gate_x.data(), s.gate_x.data() + (size_t)C * SQUARES);
         NET_STAGE("gates");
     }
     mix(b.dw, x, s.gate_x.data(), C, P, pooled, [&](int sq, int ch, F v) { quantize1(quantize, v, sq, ch, C, expand_in); });
@@ -2321,7 +2379,7 @@ inline void convnext_block(const Block& b, Scratch& s, float* x, int C) {
 // The stem's convolution of the board, `obs`, (2, 8, 8), its discs 0 or 1, to `out`, (64, c.cout): each
 // square's sums are those of its 3 rows of 3 squares' discs' weights, looked up (`stem_table`): the
 // integers the convolution summed directly would give, scaled as the other convolutions' are.
-inline void stem(const Conv& c, const float* obs, float* out) {
+inline void stem(const Conv& c, const float* obs, float* out, int* rows = nullptr) {
     // each side's discs, a bit a square
     uint64_t discs[2] = {0, 0};
     for (int p = 0; p < 2; p++)
@@ -2334,6 +2392,7 @@ inline void stem(const Conv& c, const float* obs, float* out) {
         const int mine = (int)((discs[0] >> (8 * y)) & 0xff) << 1, theirs = (int)((discs[1] >> (8 * y)) & 0xff) << 1;
         for (int x = 0; x < 8; x++) patterns[y + 1][x] = ((mine >> x) & 7) | ((theirs >> x) & 7) << 3;
     }
+    if (rows) std::memcpy(rows, patterns, sizeof(patterns));
     const int C = c.cout;
     const float* scale = c.scale.data();
     const float* bias = c.bias.data();
@@ -2376,7 +2435,7 @@ inline void forward(const Net& n, Scratch& s, const float* obs, float* logits, f
     float* x = s.x.data();
     float* y = s.y.data();
     Activation* padded = s.padded.data();
-    stem(n.stem, obs, x);
+    stem(n.stem, obs, x, s.patterns);
     NET_STAGE("stem");
     // what takes the trunk's output next: the next block's first convolution, or the heads'
     auto next = [&](size_t i) -> const Conv& { return i < n.blocks.size() ? n.blocks[i].conv1 : n.head; };
@@ -2447,6 +2506,31 @@ inline void stem_table(Conv& c, const int16_t* q) {
                     if (pattern >> k & 1) sum += q[(((size_t)o * c.cin + k / 3) * 3 + dy) * 3 + k % 3];
                 c.table[((size_t)dy * 64 + pattern) * c.cout + o] = (int16_t)sum;
             }
+}
+
+// In a pre net the first block's input is the stem's output, linear in the discs, (table sums) scale +
+// bias (`stem`), so its gates' sums gate_w x + gate_b are too: tabled by the stem's rows' patterns
+// for that block's `Depthwise::disc_gates` (in double, rounded once), when the stem and a gated scan
+// in the first block are both set.
+inline void fold_disc_gates(Net& n) {
+    if (!n.pre || n.blocks.empty() || n.stem.table.empty() || n.stem.cout != n.channels) return;
+    Depthwise& d = n.blocks[0].dw;
+    if (!d.scan) return;
+    const int C = n.channels, G = d.gates;
+    d.disc_gates.assign((size_t)(3 * 64 + 1) * G, 0);
+    for (int o = 0; o < G; o++) {
+        const float* w = d.gate_w.data() + (size_t)o * C;
+        for (int dy = 0; dy < 3; dy++)
+            for (int pattern = 0; pattern < 64; pattern++) {
+                double sum = 0;
+                for (int c = 0; c < C; c++)
+                    sum += (double)w[c] * n.stem.scale[c] * n.stem.table[((size_t)dy * 64 + pattern) * C + c];
+                d.disc_gates[((size_t)dy * 64 + pattern) * G + o] = (float)sum;
+            }
+        double sum = d.gate_b[o];
+        for (int c = 0; c < C; c++) sum += (double)w[c] * n.stem.bias[c];
+        d.disc_gates[(size_t)3 * 64 * G + o] = (float)sum;
+    }
 }
 
 inline void pack(Conv& c, const int8_t* q, bool head = true) {
