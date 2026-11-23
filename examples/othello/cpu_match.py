@@ -119,21 +119,61 @@ def make_engine(name: str, backend: str, cores: int, batch: int) -> Engine:
 
 
 def timed_move(
-    search: Search, seconds: float, batch: np.ndarray, evaluate: Eval
+    search: Search,
+    seconds: float,
+    batch: np.ndarray,
+    evaluate: Eval,
+    stop_decided: bool = False,
 ) -> tuple[int, int]:
     """Searches until `seconds` have passed, finishing the batch in flight (all of them, as
-    `Engine.search` does). Returns the leaves evaluated and the visits."""
+    `Engine.search` does), or with `stop_decided`, until its move can't change in the time left
+    at the rate it has searched, as `Engine.search` does. Returns the leaves evaluated and the
+    visits."""
     start = time.perf_counter()
     before = search.total_visits()
     leaves = 0
+    batches = 0
     search.begin(1 << 30)
-    while time.perf_counter() - start < seconds:
+    while (now := time.perf_counter()) - start < seconds:
+        if (
+            stop_decided
+            and batches % 16 == 0
+            and decided(search, before, now - start, seconds)
+        ):
+            break
         count = search.collect(batch)
         logits, values = evaluate(batch[:count])
         search.apply(logits, values)
         leaves += count
+        batches += 1
     search.begin(0)
     return leaves, search.total_visits() - before
+
+
+def decided(search: Search, before: int, elapsed: float, seconds: float) -> bool:
+    """Whether `search`'s move can't change in what's left of `seconds`: its most visited move
+    leads every other by more than the visits the time left brings at the rate the search has
+    gone since it had `before` visits (`decided_on_clock` in `cpu_search.cpp`)."""
+    done = search.total_visits() - before
+    if done < 256 or elapsed <= 0:
+        return False
+    visits = np.sort(search.visits())
+    extra = int(done / elapsed * (seconds - elapsed)) + 1
+    return visits[-1] > visits[-2] + extra
+
+
+# what a search that stops once decided is first expected to use of its budget, as if seen on so
+# many moves, and the least it's ever expected to use (`expected_use`)
+USE_PRIOR, USE_PRIOR_MOVES, USE_FLOOR = 0.5, 2, 0.25
+
+
+def expected_use(used: list[float]) -> float:
+    """What a search that stops once its move is decided will use of its budget, judged by the
+    game's searches so far (`used`, each's share of its budget), from a prior of `USE_PRIOR`.
+    Budgets planned as if spent whole would leave the time such searches save to the end of the
+    game: a 30 s game cut at 28 empties used 15.6 s of it (2026-11-23)."""
+    expected = (sum(used) + USE_PRIOR * USE_PRIOR_MOVES) / (len(used) + USE_PRIOR_MOVES)
+    return max(expected, USE_FLOOR)
 
 
 def move_budget(
@@ -229,18 +269,24 @@ class NetPlayer:
         visits: int = 0,
         solving: Solving | None = None,
         reserve_tree: float = 0.0,
+        stop_decided: bool = False,
     ):
         """`visits`, if any, a move, ignoring the clock. With `reserve_tree` (on a clock), the
         tree's room is set aside after the first move searched (`Search.reserve`): for this many
         times the nodes the game's searches are expected to add, at that search's rate, over the
         clock left. Otherwise the tree grows as it fills, every worker waiting on each copy:
-        about 0.7 s of a 30 s game."""
+        about 0.7 s of a 30 s game. On a clock, with `stop_decided` a move's search ends once its
+        move can't change (`Engine.search`), and budgets are planned on what the game's searches
+        have used of theirs (`expected_use`)."""
         self.search = Search(settings, seed)
         self.reserve_tree = reserve_tree
         # whether the tree's room has been set aside (`reserve_tree`)
         self.reserved = False
         self.evaluate = evaluate
         self.taper = taper
+        self.stop_decided = stop_decided
+        # with `stop_decided`, each of the game's searches' share of its budget used
+        self.used: list[float] = []
         self.visits = visits
         self.batch = np.empty((settings.batch, 2, 8, 8), np.float32)
         self.to_move = "b"
@@ -346,21 +392,37 @@ class NetPlayer:
                     else 0.0
                 )
                 seconds = move_budget(
-                    max(seconds_left, 0.0), empties, self.taper, solve_from, reserve
+                    max(seconds_left, 0.0),
+                    empties,
+                    self.taper,
+                    solve_from,
+                    reserve,
                 )
+                if self.stop_decided:
+                    # planned on what such searches use, never more than all there is
+                    seconds = min(
+                        seconds / expected_use(self.used),
+                        0.95 * max(seconds_left - reserve, 0.0),
+                    )
+            # the last search before a planned solve has no later search to leave its time to
+            stop = self.stop_decided and not (solve_from and empties - 2 <= solve_from)
             nodes = self.search.num_nodes()
             began = time.perf_counter()
             if isinstance(self.evaluate, Engine):
-                self.evaluate.search(self.search, visits=self.visits, seconds=seconds)
+                self.evaluate.search(
+                    self.search, visits=self.visits, seconds=seconds, stop_decided=stop
+                )
             elif self.visits:
                 self.search.run(self.visits, self.evaluate)
             else:
-                timed_move(self.search, seconds, self.batch, self.evaluate)
+                timed_move(self.search, seconds, self.batch, self.evaluate, stop)
+            searched = time.perf_counter() - began
             if self.reserve_tree and not self.reserved and not self.visits:
-                searched = time.perf_counter() - began
                 self.reserve(
                     self.search.num_nodes() - nodes, searched, seconds_left - searched
                 )
+            if stop and not self.visits and per_move <= 0 and seconds > 0:
+                self.used.append(min(searched / seconds, 1.0))
             action = self.search.best_action()
             self.last_value = ("q", self.search.root_q())
         self.search.play(action)

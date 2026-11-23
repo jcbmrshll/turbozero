@@ -182,7 +182,7 @@ def load_library() -> ctypes.CDLL:
         ),
         "engine_search": (
             ctypes.c_long,
-            [ctypes.c_void_p, Search, ctypes.c_int, ctypes.c_double],
+            [ctypes.c_void_p, Search, ctypes.c_int, ctypes.c_double, ctypes.c_int],
         ),
         "engine_stats": (None, [ctypes.c_void_p, ctypes.POINTER(ctypes.c_double)]),
     }
@@ -469,11 +469,22 @@ class Engine:
         if getattr(self, "handle", None):
             LIB.engine_free(self.handle)
 
-    def search(self, search: "Search", visits: int = 0, seconds: float = 0.0) -> int:
+    def search(
+        self,
+        search: "Search",
+        visits: int = 0,
+        seconds: float = 0.0,
+        stop_decided: bool = False,
+    ) -> int:
         """`visits` visits of `search`'s tree, or with none, as many as `seconds` allow, all of
         them: on a clock, time a search leaves is worth little to the moves after it, as a tree
-        with nothing left to evaluate is theirs too. Returns the leaves evaluated."""
-        return LIB.engine_search(self.handle, search.handle, visits, seconds)
+        with nothing left to evaluate is theirs too. With `stop_decided`, a search on a clock ends once its move can't
+        change in the time left at the rate it has searched (its most visited move leads every
+        other by more than the visits still to come), leaving the rest of the time unspent.
+        Returns the leaves evaluated."""
+        return LIB.engine_search(
+            self.handle, search.handle, visits, seconds, int(stop_decided)
+        )
 
     def stats(self) -> dict[str, float]:
         """Calls of the network, leaves and seconds inferring summed over workers, so far."""

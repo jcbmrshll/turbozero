@@ -776,3 +776,21 @@ def test_every_command_formats_its_help(capsys):
             parser.parse_args([*command, "--help"])
         assert raised.value.code == 0
     assert "--require-idle" in capsys.readouterr().out
+
+
+def test_stop_decided_is_on_at_a_clock_and_off_is_the_player_from_before(tmp_path):
+    checkpoint = tmp_path / "1.eqx"
+    checkpoint.write_bytes(b"params")
+    base = f"net:checkpoint={checkpoint},spec=s,clock=30"
+    on = resolve(base, 8)
+    assert on.config["search"]["stop_decided"] == 1
+    assert on.label.endswith(" stop-decided")
+    assert resolve(f"{base},stop_decided=1", 8).id == on.id
+    # off is the player from before the option: not in its config
+    off = resolve(f"{base},stop_decided=0", 8)
+    assert "stop_decided" not in off.config["search"] and off.id != on.id
+    # at fixed visits there's no clock to stop on
+    fixed = f"net:checkpoint={checkpoint},spec=s,visits=100"
+    assert "stop_decided" not in resolve(fixed, 8).config["search"]
+    with pytest.raises(ValueError, match="needs a clock"):
+        resolve(f"{fixed},stop_decided=1", 8)

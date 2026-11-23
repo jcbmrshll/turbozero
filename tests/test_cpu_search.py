@@ -735,6 +735,22 @@ def test_move_budget_shares_the_clock():
     )
 
 
+def test_searches_that_stop_when_decided_plan_on_what_they_use():
+    from clock_match import play_game
+    from cpu_match import NetPlayer, expected_use
+    from cpu_search import SearchSettings
+    from xot import XOT_PATH, load_xot
+
+    assert expected_use([]) == 0.5
+    assert expected_use([0.2, 0.2]) == pytest.approx(0.35)
+    assert expected_use([0.0] * 20) == 0.25
+    stopping = NetPlayer(SearchSettings(batch=2), fake_eval, stop_decided=True)
+    plain = NetPlayer(SearchSettings(batch=2), fake_eval, seed=1)
+    game = play_game(stopping, plain, load_xot(XOT_PATH)[0], 1.0)
+    assert game.flagged is None and max(game.seconds) < 1.0
+    assert len(stopping.used) > 5 and all(0 <= u <= 1 for u in stopping.used)
+
+
 def test_a_planned_solve_takes_its_moves_and_reserve_out_of_the_budget():
     from cpu_match import Solving, move_budget
 
@@ -883,6 +899,38 @@ def test_a_timed_search_stops_at_its_time(tiny_model):
     engine.search(search, seconds=0.05)
     assert 0.05 <= time.perf_counter() - start < 0.5
     assert search.total_visits() > 10
+
+
+def test_a_timed_search_stops_once_its_move_is_decided(tiny_model):
+    """With `stop_decided`, a search on a clock ends when no other move could catch the most
+    visited in the time left at the rate it has gone, on its own loop or an `Engine`'s."""
+    import time
+
+    from cpu_match import timed_move
+    from cpu_search import Engine, Search, SearchSettings
+
+    engine = Engine.openvino(tiny_model, 2, 2)
+    batch = np.empty((2, 2, 8, 8), np.float32)
+    for run in (
+        lambda search, stop: engine.search(search, seconds=1.0, stop_decided=stop),
+        lambda search, stop: timed_move(search, 1.0, batch, fake_eval, stop),
+    ):
+        early = 0
+        for me, opp in game_positions(8, seed=7)[4:]:
+            search = Search(SearchSettings(batch=2, virtual_loss="visit"))
+            search.set_position(me, opp)
+            start = time.perf_counter()
+            run(search, True)
+            if time.perf_counter() - start < 0.9:
+                early += 1
+                visits = np.sort(search.visits())
+                assert visits[-1] > visits[-2]
+        assert early > 0
+    # without it, the whole time
+    search = Search(SearchSettings(batch=2, virtual_loss="visit"))
+    start = time.perf_counter()
+    engine.search(search, seconds=0.2)
+    assert time.perf_counter() - start >= 0.2
 
 
 def test_a_timed_search_takes_its_time_with_nothing_left_to_evaluate(tiny_model):
