@@ -11,14 +11,21 @@ import pytest
 from core.evals.page import Evals, make_handler
 from core.evals.store import GameRecord, Store
 
+# a contest's clock: games between players on it are competition games
+CLOCK = {"clock": {"ini": 30.0, "inc": 0.0, "ext": None}}
 
-def game(match, number, black, white, result, finished):
+
+def engine(store, name, budget=CLOCK):
+    return store.add_player({"kind": "engine", "n": name, "budget": budget}, name)
+
+
+def game(match, number, black, white, result, finished, start="xot:0"):
     return GameRecord(
         match=match,
         number=number,
         black=black,
         white=white,
-        start="xot:0",
+        start=start,
         moves=[19],
         opening_moves=1,
         move_seconds=[],
@@ -34,8 +41,8 @@ def game(match, number, black, white, result, finished):
 def path(tmp_path):
     path = tmp_path / "evals.db"
     store = Store(path)
-    x, y, z = (store.add_player({"kind": "engine", "n": n}, n) for n in "xyz")
-    store.add_player({"kind": "engine", "n": "idle"}, "idle")
+    x, y, z = (engine(store, n) for n in "xyz")
+    engine(store, "idle")
     for match, a, b in (("m-xy", x, y), ("m-xz", x, z)):
         store.start_match(match, a, b, {}, "local", "abc", 2)
     store.record_games(
@@ -95,7 +102,7 @@ def test_a_players_page_has_its_record_against_each_opponent(path):
 
 def test_players_who_never_met_even_through_others_are_rated_apart(path):
     store = Store(path)
-    v, w = (store.add_player({"kind": "engine", "n": n}, n) for n in "vw")
+    v, w = (engine(store, n) for n in "vw")
     store.start_match("m-vw", v, w, {}, "local", "abc", 2)
     store.record_games([game("m-vw", i, v, w, 2, 5.0 + i) for i in range(4)])
     store.close()
@@ -177,4 +184,80 @@ def test_the_server_answers_the_page_and_its_questions(url, path):
     assert status(url, "/api/game?id=1")[0] == 200
     assert status(url, "/api/game?id=999")[0] == 404
     assert status(url, "/api/game?id=x")[0] == 404
+    code, body = status(url, "/api/openings")
+    assert code == 200 and json.loads(body)["openings"][0]["start"] == "xot:0"
+    assert status(url, "/api/opening?start=xot%3A0")[0] == 200
+    assert status(url, "/api/opening?start=xot%3A9")[0] == 404
+    assert json.loads(status(url, "/api/summary?games=all")[1])["games"] == 4
     assert status(url, "/nothing")[0] == 404
+
+
+def test_competition_games_alone_count_unless_every_game_is_asked_for(path):
+    store = Store(path)
+    x = ids(path)["x"]
+    fast = engine(store, "fast", {"visits": 128})
+    short = engine(store, "short", {"clock": {"ini": 5.0, "inc": 0.0, "ext": None}})
+    for match, other in (("m-fast", fast), ("m-short", short)):
+        store.start_match(match, x, other, {}, "local", "abc", 2)
+        store.record_games([game(match, 0, x, other, 2, 5.0)])
+    store.close()
+    evals = Evals(path)
+    shown = {p["name"]: p["games"] for p in evals.summary()["players"]}
+    assert shown["x"] == 4 and shown["fast"] == shown["short"] == 0
+    every = evals.summary("all")
+    assert every["games"] == 6
+    assert {p["name"]: p["games"] for p in every["players"]}["fast"] == 1
+    assert len(evals.player(x)["opponents"]) == 2  # pyright: ignore[reportOptionalSubscript]
+    assert len(evals.player(x, "all")["opponents"]) == 4  # pyright: ignore[reportOptionalSubscript]
+    page = evals.player(fast)
+    assert page is not None and page["player"]["elo"] is None and page["games"] == []
+
+
+def test_an_opening_favours_a_color_when_black_scores_far_from_half(path):
+    store = Store(path)
+    found = ids(path)
+    x, y = found["x"], found["y"]
+    store.start_match("m-open", x, y, {}, "local", "abc", 20)
+    # black wins all 8 of xot:1's games, each player black in half, solved for their margin;
+    # xot:2 is split
+    favoured = [
+        game("m-open", i, *((x, y) if i % 2 else (y, x)), 6, 10.0 + i, "xot:1")
+        for i in range(8)
+    ]
+    for record in favoured:
+        record.solve_exact = True
+    store.record_games(
+        favoured
+        + [
+            game("m-open", 8 + i, x, y, 4 if i % 2 else -4, 20.0 + i, "xot:2")
+            for i in range(8)
+        ]
+    )
+    store.close()
+    evals = Evals(path)
+    openings = {o["start"]: o for o in evals.openings()["openings"]}
+    one, two = openings["xot:1"], openings["xot:2"]
+    assert (one["games"], one["black"], one["score"], one["favours"]) == (
+        8,
+        8,
+        1.0,
+        "black",
+    )
+    assert one["sd"] == pytest.approx(0.5 / 8**0.5) and one["margin"] == 6
+    assert (two["score"], two["favours"]) == (0.5, None)
+    # the most played first
+    assert next(iter(openings)) in ("xot:1", "xot:2")
+
+    shown = evals.opening("xot:1")
+    assert shown is not None
+    assert shown["moves"] == [19] and len(shown["games"]) == 8
+    players = {p["name"]: (p["black"], p["white"]) for p in shown["players"]}
+    assert players == {"x": ([4, 0, 0], [0, 0, 4]), "y": ([4, 0, 0], [0, 0, 4])}
+    assert evals.opening("xot:404") is None
+
+    first = Store(path)
+    game_id = first.db.execute(
+        "SELECT id FROM games WHERE start = 'xot:1' LIMIT 1"
+    ).fetchone()[0]
+    first.close()
+    assert evals.game(game_id)["game"]["opening"]["favours"] == "black"  # pyright: ignore[reportOptionalSubscript]
