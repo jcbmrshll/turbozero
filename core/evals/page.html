@@ -19,10 +19,16 @@
   th, td { padding: 3px 8px; border-bottom: 1px solid #ececec; text-align: right; white-space: nowrap; }
   th { position: sticky; top: 0; background: #f2f2f2; font-weight: 600; cursor: pointer; user-select: none; }
   td.name, th.name { text-align: left; white-space: normal; word-break: break-all; }
+  td.left, th.left { text-align: left; }
   a { color: #0b57d0; text-decoration: none; }
   a:hover { text-decoration: underline; }
   .win { color: #137333; } .loss { color: #b3261e; }
-  input { font: inherit; padding: 3px 6px; width: 260px; }
+  input[type=text] { font: inherit; padding: 3px 6px; width: 260px; }
+  header nav { display: flex; gap: 12px; }
+  header label { margin-left: auto; user-select: none; }
+  .disc { display: inline-block; width: 10px; height: 10px; border-radius: 50%; box-sizing: border-box; vertical-align: -1px; margin-right: 6px; }
+  .disc.black { background: #1d1d1f; } .disc.white { background: #fff; border: 1px solid #8e8e93; }
+  .opening-moves { margin: 8px 0 16px; }
   .stats { display: flex; gap: 24px; margin: 0 0 16px; }
   .stats div b { display: block; font-size: 18px; }
   .game { display: grid; grid-template-columns: 340px minmax(0, 1fr); gap: 24px; align-items: start; }
@@ -33,7 +39,6 @@
   .chart { position: relative; margin: 0 0 16px; }
   .chart svg { width: 100%; height: auto; display: block; }
   .legend { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 0 0 8px; }
-  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
   .tip { position: absolute; pointer-events: none; background: #fff; border: 1px solid #d2d2d7; border-radius: 6px;
          padding: 6px 8px; font-size: 12px; line-height: 1.5; box-shadow: 0 2px 8px rgba(0,0,0,.08); white-space: nowrap; display: none; z-index: 1; }
   .moves { max-height: 70vh; overflow: auto; }
@@ -41,16 +46,38 @@
   .moves tbody tr { cursor: pointer; }
   .moves tr.opening td { color: #6e6e73; }
   .moves tr.sel td { background: #e8f0fe; }
+  .tag { display: inline-block; width: 12px; height: 12px; border-radius: 50%; border: 3px solid; box-sizing: border-box;
+         vertical-align: -1px; margin-right: 6px; flex: none; }
+  .who { display: inline-block; max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
+  .sides { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); gap: 16px; align-items: center; margin: 0 0 16px; }
+  .side { display: flex; align-items: center; gap: 12px; background: #fff; border: 1px solid #ececec; border-radius: 8px; padding: 10px 14px; min-width: 0; }
+  .side.won { border-color: #137333; }
+  .side .count { font-size: 26px; font-weight: 600; min-width: 2ch; text-align: right; }
+  .side .line { display: flex; align-items: center; min-width: 0; }
+  .side .who { max-width: none; font-weight: 600; }
+  .side > div { min-width: 0; }
 </style>
 </head>
 <body>
 <main>
-  <header><h1><a href="#">Evals</a></h1><span id="totals" class="muted"></span></header>
+  <header>
+    <h1><a href="#">Evals</a></h1>
+    <nav><a href="#">Players</a><a href="#openings">Openings</a></nav>
+    <span id="totals" class="muted"></span>
+    <label><input type="checkbox" id="competition"> Competition games only</label>
+  </header>
   <div id="view"></div>
 </main>
 <script>
 const view = document.getElementById("view");
 const totals = document.getElementById("totals");
+// competition games alone (both players on a contest's clock), unless unticked
+const competition = document.getElementById("competition");
+competition.checked = localStorage.getItem("games") !== "all";
+competition.addEventListener("change", () => {
+  localStorage.setItem("games", competition.checked ? "competition" : "all");
+  route();
+});
 
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 const elo = (x) => x.toFixed(0);
@@ -65,7 +92,7 @@ const ago = (t) => {
 };
 
 async function get(path) {
-  const response = await fetch(path);
+  const response = await fetch(competition.checked ? path : path + (path.includes("?") ? "&" : "?") + "games=all");
   if (!response.ok) throw new Error((await response.json()).error || response.statusText);
   return response.json();
 }
@@ -102,7 +129,17 @@ function table(columns, rows, sort) {
 // the two players of a game, by who moved first: their colors on the charts
 const SIDE_COLOR = { 1: "#2a78d6", 2: "#eb6834" };
 const SIDE_NAME = { 1: "black", 2: "white" };
+const DISC = { 1: "#1d1d1f", 2: "#fff" };
+// a player in a game: its chart color around its disc's
+const tag = (side) => `<span class="tag" style="border-color:${SIDE_COLOR[side]};background:${DISC[side]}"></span>`;
+const who = (name) => `<span class="who" title="${esc(name)}">${esc(name)}</span>`;
 const gameLink = (g, text) => `<a href="#game/${g.id}">${text}</a>`;
+const disc = (color) => `<span class="disc ${color}"></span>`;
+const openingName = (start) => (start.startsWith("board:") ? "board" : start);
+const openingLink = (start) => `<a href="#opening/${encodeURIComponent(start)}">${esc(openingName(start))}</a>`;
+const favoursCell = (o) => (o.favours ? disc(o.favours) + o.favours : "");
+const blackRecord = (o) => `${o.black}-${o.draws}-${o.white}`;
+const wdl = (r) => `<span class="win">${r[0]}</span>-${r[1]}-<span class="loss">${r[2]}</span>`;
 const record = (r) => `<span class="win">${r.wins}</span>-${r.draws}-<span class="loss">${r.losses}</span>`;
 
 function playerColumns(rank) {
@@ -119,8 +156,13 @@ function playerColumns(rank) {
 
 const resultCell = (g) => (g.result > 0 ? "1-0" : g.result < 0 ? "0-1" : "½-½");
 const marginCell = (g) => (g.margin === null ? "" : (g.margin > 0 ? "+" : "") + g.margin);
-const endingCell = (g) =>
-  (g.ending === "solved" ? `solved at ${g.solved_at}` : g.ending) + (g.flagged ? ` · ${g.flagged === "b" ? "black" : "white"} flagged` : "");
+const sideName = (g, side) => (side === "b" ? g.black_name : g.white_name);
+const endingText = (g) =>
+  (g.ending === "solved" ? `solved at ${g.solved_at}` : g.ending) + (g.flagged ? ` · ${sideName(g, g.flagged)} flagged` : "");
+const endingCell = (g) => esc(endingText(g));
+// who won, by name, and by how much where that's known
+const resultText = (g) =>
+  g.result === 0 ? "draw" : `${g.result > 0 ? g.black_name : g.white_name} won${g.margin === null ? "" : ` by ${Math.abs(g.margin)}`}`;
 
 function gameColumns() {
   return [
@@ -130,6 +172,7 @@ function gameColumns() {
     { key: "result", label: "Result", value: (g) => Math.sign(g.result), cell: resultCell },
     { key: "margin", label: "Discs", value: (g) => g.margin ?? 0, cell: marginCell },
     { key: "ending", label: "Ended", value: (g) => g.ending, cell: endingCell, dir: 1 },
+    { key: "start", label: "Opening", cls: "left", value: (g) => g.start, cell: (g) => openingLink(g.start), dir: 1 },
   ];
 }
 
@@ -140,6 +183,7 @@ async function showLeague() {
   totals.textContent = `${s.players.length} players · ${s.games.toLocaleString()} games`;
 
   const filter = document.createElement("input");
+  filter.type = "text";
   filter.placeholder = "filter";
   filter.value = sessionStorage.getItem("filter") || "";
   const holder = document.createElement("div");
@@ -158,7 +202,7 @@ async function showLeague() {
   filter.addEventListener("input", drawPlayers);
   drawPlayers();
 
-  const recent = table(gameColumns(), s.recent, { key: "finished", dir: -1 });
+  const recent = table(gameColumns().filter((c) => c.key !== "start"), s.recent, { key: "finished", dir: -1 });
 
   const left = document.createElement("section");
   left.innerHTML = "<h2>Players</h2>";
@@ -176,9 +220,9 @@ async function showPlayer(id) {
   const { player: p, opponents, games } = await get(`/api/player?id=${encodeURIComponent(id)}`);
   document.title = p.name;
   view.innerHTML = `
-    <h2>${esc(p.name)} <span class="muted">${esc(p.id)} · pool ${p.pool}</span></h2>
+    <h2>${esc(p.name)} <span class="muted">${esc(p.id)}${p.pool === null ? "" : ` · pool ${p.pool}`}</span></h2>
     <div class="stats">
-      <div><span class="muted">Elo</span><b>${elo(p.elo)} ± ${p.sd.toFixed(0)}</b></div>
+      <div><span class="muted">Elo</span><b>${p.elo === null ? "" : `${elo(p.elo)} ± ${p.sd.toFixed(0)}`}</b></div>
       <div><span class="muted">Games</span><b>${p.games}</b></div>
       <div><span class="muted">W-D-L</span><b>${record(p)}</b></div>
       <div><span class="muted">Score</span><b>${pct(p.score)}</b></div>
@@ -191,6 +235,66 @@ async function showPlayer(id) {
   const title = document.createElement("h3");
   title.textContent = "Latest games";
   view.append(title, table(gameColumns(), games, { key: "finished", dir: -1 }));
+}
+
+// ---- openings: black's record from each ----
+
+function openingColumns() {
+  return [
+    { key: "start", label: "Opening", cls: "name", value: (o) => o.start, cell: (o) => openingLink(o.start), dir: 1 },
+    { key: "games", label: "Games", value: (o) => o.games, cell: (o) => o.games },
+    { key: "record", label: "Black-draw-white", value: (o) => o.black - o.white, cell: blackRecord },
+    { key: "score", label: "Black score", value: (o) => o.score, cell: (o) => pct(o.score) },
+    { key: "sd", label: "±", value: (o) => o.sd, cell: (o) => (100 * o.sd).toFixed(1), dir: 1 },
+    { key: "favours", label: "Favours", cls: "name", value: (o) => (o.favours === "black" ? 1 : o.favours === "white" ? -1 : 0), cell: favoursCell },
+    { key: "margin", label: "Black discs", value: (o) => o.margin ?? -99, cell: (o) => signed(o.margin) },
+  ];
+}
+
+async function showOpenings() {
+  const { openings } = await get("/api/openings");
+  document.title = "Openings";
+  const favoured = (color) => openings.filter((o) => o.favours === color).length;
+  view.innerHTML = `
+    <h2>Openings</h2>
+    <div class="stats">
+      <div><span class="muted">Openings</span><b>${openings.length}</b></div>
+      <div><span class="muted">Favour black</span><b>${disc("black")}${favoured("black")}</b></div>
+      <div><span class="muted">Favour white</span><b>${disc("white")}${favoured("white")}</b></div>
+    </div>`;
+  view.append(table(openingColumns(), openings, { key: "games", dir: -1 }));
+}
+
+async function showOpening(start) {
+  const { opening: o, moves, players, games } = await get(`/api/opening?start=${encodeURIComponent(start)}`);
+  document.title = openingName(start);
+  const { start: first, plies } = replayGame({ start, moves, opening_moves: moves.length, move_seconds: [], move_info: [] });
+  const last = plies.length ? plies[plies.length - 1] : null;
+  view.innerHTML = `
+    <h2>${esc(openingName(start))}</h2>
+    <div class="stats">
+      <div><span class="muted">Games</span><b>${o.games}</b></div>
+      <div><span class="muted">Black-draw-white</span><b>${blackRecord(o)}</b></div>
+      <div><span class="muted">Black score</span><b>${pct(o.score)} ± ${(100 * o.sd).toFixed(1)}</b></div>
+      <div><span class="muted">Favours</span><b>${favoursCell(o) || "neither"}</b></div>
+      <div><span class="muted">Black discs</span><b>${signed(o.margin)}</b></div>
+    </div>
+    <div class="game">
+      <section>
+        <div class="board">${boardSvg(last ? last.cells : first, last ? last.move : null)}</div>
+        <div class="opening-moves muted">${plies.map((p) => `${disc(SIDE_NAME[p.side])}${squareName(p.move)}`).join(" ")}</div>
+      </section>
+      <section><h3 style="margin-top:0">Players</h3><div class="players"></div></section>
+    </div>
+    <h3>Games</h3>`;
+  view.querySelector(".players").append(table([
+    { key: "name", label: "Player", cls: "name", value: (r) => r.name, cell: (r) => playerLink(r.id, r.name), dir: 1 },
+    { key: "black", label: `${disc("black")}W-D-L`, value: (r) => r.black[0] - r.black[2], cell: (r) => wdl(r.black) },
+    { key: "white", label: `${disc("white")}W-D-L`, value: (r) => r.white[0] - r.white[2], cell: (r) => wdl(r.white) },
+    { key: "games", label: "Games", value: (r) => r.games, cell: (r) => r.games },
+    { key: "score", label: "Score", value: (r) => r.score, cell: (r) => pct(r.score) },
+  ], players, { key: "games", dir: -1 }));
+  view.append(table(gameColumns().filter((c) => c.key !== "start"), games, { key: "finished", dir: -1 }));
 }
 
 // ---- a game, move by move ----
@@ -353,17 +457,24 @@ async function showGame(id) {
   const names = { 1: g.black_name, 2: g.white_name };
   const ids = { 1: g.black, 2: g.white };
   document.title = `${g.black_name} vs ${g.white_name}`;
-  const ended = endingCell(g) + (g.hard ? ` · ${g.hard === "b" ? "black" : "white"} out of time` : "");
+  const ended = endingText(g) + (g.hard ? ` · ${sideName(g, g.hard)} out of time` : "");
+  const sideCard = (side) => {
+    const used = side === 1 ? g.black_seconds : g.white_seconds;
+    const won = Math.sign(g.result) === (side === 1 ? 1 : -1);
+    return `<div class="side${won ? " won" : ""}">
+      <span class="count" data-count="${side}"></span>
+      <div><div class="line">${tag(side)}<a href="#player/${encodeURIComponent(ids[side])}" class="who" title="${esc(names[side])}">${esc(names[side])}</a></div>
+        <div class="muted">${SIDE_NAME[side]}${used === null ? "" : ` · ${secs(used)} s`}${won ? ` · <span class="win">won</span>` : ""}</div></div>
+    </div>`;
+  };
   const host = g.host ? `${g.host.cpu || g.host.machine || ""}${g.host.hostname ? " · " + g.host.hostname : ""}` : "";
 
   view.innerHTML = `
-    <h2>${playerLink(g.black, g.black_name)} <span class="muted">vs</span> ${playerLink(g.white, g.white_name)}</h2>
+    <div class="sides">${sideCard(1)}<span class="muted">vs</span>${sideCard(2)}</div>
     <div class="stats">
-      <div><span class="muted">Result</span><b>${resultCell(g)}${g.margin === null ? "" : ` (${marginCell(g)})`}</b></div>
+      <div><span class="muted">Result</span><b>${esc(resultText(g))}</b></div>
       <div><span class="muted">Ended</span><b>${esc(ended)}</b></div>
-      <div><span class="muted">Black's time</span><b>${g.black_seconds === null ? "" : secs(g.black_seconds) + " s"}</b></div>
-      <div><span class="muted">White's time</span><b>${g.white_seconds === null ? "" : secs(g.white_seconds) + " s"}</b></div>
-      <div><span class="muted">Start</span><b>${esc(g.start.startsWith("board:") ? "board" : g.start)}</b></div>
+      <div><span class="muted">Opening</span><b>${openingLink(g.start)}</b>${g.opening ? `<span class="muted">${g.opening.favours ? `favours ${tag(g.opening.favours === "black" ? 1 : 2)}${g.opening.favours}` : "favours neither"} · black ${pct(g.opening.score)} ± ${(100 * g.opening.sd).toFixed(1)} · ${g.opening.games} games</span>` : ""}</div>
       <div><span class="muted">Played</span><b><span title="${new Date(g.finished * 1000).toLocaleString()}">${ago(g.finished)}</span></b></div>
     </div>
     <div class="muted" style="margin: -8px 0 16px">${esc(g.match)} #${g.number}${host ? " · " + esc(host) : ""}</div>
@@ -377,8 +488,8 @@ async function showGame(id) {
         </div>
       </section>
       <section>
-        <div class="legend">${[1, 2].map((s) => `<span><span class="swatch" style="background:${SIDE_COLOR[s]}"></span>${SIDE_NAME[s]}: ${esc(names[s])}</span>`).join("")}</div>
-        <h3 class="value-part" style="margin-top:0">Value for black</h3>
+        <div class="legend">${[1, 2].map((s) => `<span>${tag(s)}${who(names[s])}</span>`).join("")}</div>
+        <h3 class="value-part" style="margin-top:0">Value for ${tag(1)}${who(names[1])}</h3>
         <div class="chart value value-part"><div class="tip"></div></div>
         <h3>Seconds</h3>
         <div class="chart time"><div class="tip"></div></div>
@@ -406,18 +517,6 @@ async function showGame(id) {
         out += `<polyline points="${points.map((q) => q.join(",")).join(" ")}" fill="none" stroke="${SIDE_COLOR[side]}" stroke-width="2" stroke-linejoin="round"/>`;
         for (const [px, py] of points) out += `<circle cx="${px}" cy="${py}" r="4" fill="${SIDE_COLOR[side]}" stroke="#fff" stroke-width="2"/>`;
       }
-      // direct labels at each line's last point, kept apart
-      const ends = [1, 2].map((side) => {
-        const i = plies.map((p, k) => (p.side === side && values[k] !== null ? k : -1)).filter((k) => k >= 0).pop();
-        return i === undefined ? null : { side, y: y(values[i]) };
-      }).filter(Boolean);
-      if (ends.length === 2 && Math.abs(ends[0].y - ends[1].y) < 13) {
-        const mid = (ends[0].y + ends[1].y) / 2, up = ends[0].y <= ends[1].y ? 0 : 1;
-        ends[up].y = mid - 7;
-        ends[1 - up].y = mid + 7;
-      }
-      const labelX = x(count) + 10;
-      for (const e of ends) out += `<text x="${labelX}" y="${e.y + 4}" font-size="11" fill="#1d1d1f">${SIDE_NAME[e.side]}</text>`;
       out += `<rect x="${x(count) - 5}" y="${y(final) - 5}" width="10" height="10" transform="rotate(45 ${x(count)} ${y(final)})" fill="#6e6e73" stroke="#fff" stroke-width="2"/>`;
       return out;
     },
@@ -450,14 +549,14 @@ async function showGame(id) {
     return -1;
   };
   const tipFor = (i) => {
-    if (i > n) return `End · ${resultCell(g)}${g.margin === null ? "" : ` (${marginCell(g)})`}${g.ending === "solved" ? ` · solved at ${g.solved_at}` : ""}`;
+    if (i > n) return `End · ${esc(resultText(g))}${g.ending === "solved" ? ` · solved at ${g.solved_at}` : ""}`;
     const p = plies[i - 1];
-    let out = `<b>${i}. ${squareName(p.move)}</b> ${SIDE_NAME[p.side]}${p.opening ? " · opening" : ""}`;
+    let out = `<b>${i}. ${squareName(p.move)}</b> ${tag(p.side)}${who(names[p.side])}${p.opening ? " · opening" : ""}`;
     if (p.seconds !== null) out += ` · ${secs(p.seconds)} s`;
     if (p.info) out += `<br>${esc(searchText(p.info))}`;
     for (const side of [1, 2]) {
       const k = latest(side, i);
-      if (k >= 0) out += `<br><span class="swatch" style="background:${SIDE_COLOR[side]}"></span>${signed(values[k], 2)} <span class="muted">${esc(ownText(plies[k].info))}${k === i - 1 ? "" : ` · move ${k + 1}`}</span>`;
+      if (k >= 0) out += `<br>${tag(side)}${signed(values[k], 2)} <span class="muted">${esc(ownText(plies[k].info))}${k === i - 1 ? "" : ` · move ${k + 1}`}</span>`;
     }
     return out;
   };
@@ -472,7 +571,7 @@ async function showGame(id) {
     const info = p.info || {};
     return `<tr data-ply="${p.n}" class="${p.opening ? "opening" : ""}">
       <td>${p.n}</td>
-      <td class="name"><span class="swatch" style="background:${SIDE_COLOR[p.side]}"></span>${SIDE_NAME[p.side]}</td>
+      <td class="name">${tag(p.side)}${who(names[p.side])}</td>
       <td class="name">${squareName(p.move)}</td>
       <td>${secs(p.seconds)}</td>
       <td>${signed(v, 2)}</td>
@@ -486,7 +585,7 @@ async function showGame(id) {
     </tr>`;
   }).join("");
   movesBox.innerHTML = `<table><thead><tr>
-    <th>#</th><th class="name">Side</th><th class="name">Move</th><th>Seconds</th><th>Value</th><th>q</th><th>Discs</th>
+    <th>#</th><th class="name">Player</th><th class="name">Move</th><th>Seconds</th><th>Value</th><th>q</th><th>Discs</th>
     <th>Visits</th><th>New visits</th><th>Depth</th><th>Nodes</th><th class="name"></th>
     </tr></thead><tbody>${rows}</tbody></table>`;
 
@@ -494,8 +593,8 @@ async function showGame(id) {
     selected = Math.max(0, Math.min(n, i));
     const cells = selected === 0 ? start : plies[selected - 1].cells;
     board.innerHTML = boardSvg(cells, selected === 0 ? null : plies[selected - 1].move);
-    const b = cells.filter((c) => c === 1).length, w = cells.filter((c) => c === 2).length;
-    where.textContent = selected === 0 ? `start · ${b}-${w}` : `${selected} / ${n} · ${squareName(plies[selected - 1].move)} · ${b}-${w}`;
+    for (const side of [1, 2]) view.querySelector(`[data-count="${side}"]`).textContent = cells.filter((c) => c === side).length;
+    where.textContent = selected === 0 ? "start" : `${selected} / ${n} · ${squareName(plies[selected - 1].move)}`;
     for (const [el, chart] of charts) {
       const line = el.querySelector("line.sel");
       const cx = selected === 0 ? -10 : chart.x(selected);
@@ -565,10 +664,14 @@ document.addEventListener("keydown", (event) => keys && keys(event));
 async function route() {
   const match = location.hash.match(/^#player\/(.+)$/);
   const game = location.hash.match(/^#game\/(\d+)$/);
+  const opening = location.hash.match(/^#opening\/(.+)$/);
   keys = null;
+  totals.textContent = "";
   try {
     if (match) await showPlayer(decodeURIComponent(match[1]));
     else if (game) await showGame(game[1]);
+    else if (opening) await showOpening(decodeURIComponent(opening[1]));
+    else if (location.hash === "#openings") await showOpenings();
     else await showLeague();
   } catch (e) {
     view.textContent = String(e.message || e);
