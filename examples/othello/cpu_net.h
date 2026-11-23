@@ -2082,7 +2082,12 @@ inline void scan_gates_of(const Depthwise& d, const float* x, int C, float* gate
                 if (layout == SCAN_BLOCKED) Lanes::store(xb + (size_t)i * SQUARES + (sq0 + s) * W, xs[s]);
             }
             NET_UNROLL for (int o = 0; o < G; o++) {
-                const F w = Lanes::load(gate_w + (size_t)o * C + i);
+                F w = Lanes::load(gate_w + (size_t)o * C + i);
+#if NET_ISA == 2 || NET_ISA == 1
+                // in a register for the S squares: GCC would fold the load into each fma, S loads for one,
+                // and loads, not fmas, would bound the sums (v4: 72 a 64 fmas)
+                if constexpr (S > 1) asm("" : "+v"(w));
+#endif
                 NET_UNROLL for (int s = 0; s < S; s++) acc[s * G + o] = Lanes::fma(w, xs[s], acc[s * G + o]);
             }
         }
@@ -2095,7 +2100,15 @@ inline void scan_gates_of(const Depthwise& d, const float* x, int C, float* gate
     if (layout == SCAN_DIRECT) {
         // by gate channel, (G, 64)
         if constexpr (G == 1) std::memcpy(g, gates, SQUARES * sizeof(float));
-        else for (int sq = 0; sq < SQUARES; sq++) NET_UNROLL for (int o = 0; o < G; o++) g[o * SQUARES + sq] = gates[sq * G + o];
+        else if constexpr (G % W == 0) {
+            // W squares by W gates at a time, transposed in registers
+            for (int sq = 0; sq < SQUARES; sq += W) NET_UNROLL for (int o = 0; o < G; o += W) {
+                F r[W];
+                NET_UNROLL for (int k = 0; k < W; k++) r[k] = Lanes::load(gates + (sq + k) * G + o);
+                Lanes::transpose(r);
+                NET_UNROLL for (int k = 0; k < W; k++) Lanes::store(g + (o + k) * SQUARES + sq, r[k]);
+            }
+        } else for (int sq = 0; sq < SQUARES; sq++) NET_UNROLL for (int o = 0; o < G; o++) g[o * SQUARES + sq] = gates[sq * G + o];
         return;
     }
     auto at = [&](int sq, int i) { return layout == SCAN_BLOCKED ? g + (size_t)i * SQUARES + sq * W : g + (size_t)sq * C + i; };
@@ -2196,9 +2209,13 @@ constexpr int SCAN_VECTORS = NET_SCAN_VECTORS;
 // board skipped.
 // GCC on ARM schedules instructions before it allocates registers, which spilled the two vectors'
 // sums (Neoverse V2: depthwise 41 -> 34 us of a 7x64 without it; its 1x1s are faster with it). x86
-// GCC doesn't schedule then by default, and clang has no such pass.
+// GCC doesn't schedule then by default, and clang has no such pass. GCC also unswitches the rows'
+// loop on the pooled flag, which copies the whole unrolled filter: twice the code (a gated scan's
+// pass is 20-30 KB) for one branch a row.
 #if defined(__aarch64__) && defined(__GNUC__) && !defined(__clang__)
-#define NET_DEPTHWISE_ATTRIBUTES __attribute__((optimize("no-schedule-insns")))
+#define NET_DEPTHWISE_ATTRIBUTES __attribute__((optimize("no-schedule-insns", "no-unswitch-loops")))
+#elif defined(__GNUC__) && !defined(__clang__)
+#define NET_DEPTHWISE_ATTRIBUTES __attribute__((optimize("no-unswitch-loops")))
 #else
 #define NET_DEPTHWISE_ATTRIBUTES
 #endif
@@ -2209,7 +2226,8 @@ NET_DEPTHWISE_ATTRIBUTES inline void depthwise(const Depthwise& d, const float* 
     constexpr int CV = N > 0 ? SCAN_VECTORS : DEPTHWISE_VECTORS;
     int ch = 0;
     for (; ch + CV * W <= C; ch += CV * W) depthwise_vectors<CV, N, LAYOUT>(d, x, g, C, P, ch, pooled, store);
-    for (; ch < C; ch += W) depthwise_vectors<1, N, LAYOUT>(d, x, g, C, P, ch, pooled, store);
+    if constexpr (CV > 1)  // (with one vector at a time a second copy of the unrolled filter would never run)
+        for (; ch < C; ch += W) depthwise_vectors<1, N, LAYOUT>(d, x, g, C, P, ch, pooled, store);
 }
 
 // `depthwise`, or `d`'s gated scan (`Depthwise::scan`) from `scan_gates`'s output `g`
