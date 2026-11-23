@@ -868,6 +868,49 @@ def test_workers_visit_exactly_and_leave_nothing_in_flight(tiny_model, mode):
     assert stats["calls"] > 0 and stats["leaves"] >= leaves
 
 
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"batch": 1, "virtual_loss": "visit"},
+        {"batch": 2, "virtual_loss": "loss", "random_symmetry": True},
+        {"batch": 1, "virtual_loss": "draw", "reuse": False, "descend": 2},
+    ],
+)
+def test_many_workers_lose_no_visit_and_leave_nothing_in_flight(tiny_model, settings):
+    # the workers share the tree with no lock over it: whatever their interleaving, every visit is
+    # counted once at each node and edge it took, and each virtual visit is taken back
+    from cpu_search import Engine, Search, SearchSettings
+
+    engine = Engine.openvino(tiny_model, 8, settings["batch"])
+    search = Search(SearchSettings(**settings), seed=3)
+    for move in range(4):
+        before = search.total_visits()
+        engine.search(search, visits=3000)
+        assert search.total_visits() == before + 3000
+        audit = search.audit()
+        assert audit["checked"] > 1000
+        assert (audit["uneven"], audit["flying"], audit["unevaluated"]) == (0, 0, 0)
+        assert audit["gap"] < 1e-2
+        search.play(search.best_action())
+    # and on a clock, stopped with batches in flight
+    engine.search(search, seconds=0.2)
+    audit = search.audit()
+    assert (audit["uneven"], audit["flying"], audit["unevaluated"]) == (0, 0, 0)
+
+
+def test_an_audit_finds_a_tree_whose_visits_dont_add_up(tiny_model):
+    from cpu_search import Search, openvino_eval
+
+    search = Search()
+    search.run(200, openvino_eval(tiny_model, 1, "f32"))
+    assert search.audit()["uneven"] == 0
+    # a batch collected and not applied: its leaves are in flight, not evaluated
+    search.begin(4)
+    search.collect(np.empty((4, 2, 8, 8), np.float32))
+    audit = search.audit()
+    assert audit["flying"] > 0 and audit["unevaluated"] > 0
+
+
 def test_workers_descend_without_changing_the_move(tiny_model):
     from cpu_search import Engine, Search, SearchSettings
 
@@ -1283,15 +1326,17 @@ def test_room_reserved_ahead_searches_the_same_tree_and_outlives_a_new_position(
     assert game(reserve=True) == game(reserve=False)
     search = Search()
     assert search.reserve(100_000, 1_000_000)
-    assert search.capacity() == (100_000, 1_000_000)
+    # (whole segments of it)
+    room = search.capacity()
+    assert room[0] >= 100_000 and room[1] >= 1_000_000
     search.run(300, fake_eval)
     search.set_position(*search.position()[:2])
-    assert search.num_nodes() == 1 and search.capacity() == (100_000, 1_000_000)
+    assert search.num_nodes() == 1 and search.capacity() == room
     search.run(300, fake_eval)
     assert search.reused() > 0
     # more than there is: refused, the tree as it was
     assert not search.reserve(1 << 62, 1 << 62)
-    assert search.capacity() == (100_000, 1_000_000)
+    assert search.capacity() == room
     search.run(300, fake_eval)
 
 

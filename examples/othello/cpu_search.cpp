@@ -7,7 +7,6 @@
 #include <chrono>
 #include <climits>
 #include <cmath>
-#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -16,8 +15,8 @@
 #include <mutex>
 #include <new>
 #include <openvino/openvino.hpp>
-#include <sys/mman.h>
 #include <string>
+#include <sys/mman.h>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -173,29 +172,70 @@ Position play(const Position& p, int action) {
     return next;
 }
 
+// The tree is searched by several threads at once (an engine's workers, see `engine_search`) with no
+// lock over it: a node's and an edge's counters change by atomic operations, read as they stand by
+// the others' traversals (Leela Chess Zero's and KataGo's way). These are GCC's and Clang's builtins
+// on plain fields, so the tree stays plain data that a copy of the search (`search_clone`) copies.
+template <class T>
+inline T relaxed(const T& x) {
+    T v;
+    __atomic_load(&x, &v, __ATOMIC_RELAXED);
+    return v;
+}
+
+// a field another thread published (`publish`), and what it wrote before
+template <class T>
+inline T acquired(const T& x) {
+    T v;
+    __atomic_load(&x, &v, __ATOMIC_ACQUIRE);
+    return v;
+}
+
+template <class T>
+inline void publish(T& x, T v) {
+    __atomic_store(&x, &v, __ATOMIC_RELEASE);
+}
+
+inline void bump(int32_t& x, int32_t by) { __atomic_fetch_add(&x, by, __ATOMIC_RELAXED); }
+
+inline void bump(float& x, float by) {
+    float old = relaxed(x), sum;
+    do {
+        sum = old + by;
+    } while (!__atomic_compare_exchange(&x, &old, &sum, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+}
+
+// a traversal's virtual visit taken back: released, so that a traversal claiming a leaf (`collect`)
+// after it sees the leaf's evaluation, if that's why it ended
+inline void land(int32_t& in_flight) { __atomic_fetch_sub(&in_flight, 1, __ATOMIC_RELEASE); }
+
 struct Edge {
     float prior;
     // from the parent's side
     float w;
     int32_t n;
     int32_t in_flight;
-    int32_t child;
+    int32_t child;  // -1 until a traversal takes the edge
     int32_t action;
 };
 
+// A node's visits (`n`, `w`, `in_flight`) are those of the edge to it, from the other side, but for the
+// root's, which has none: only the root's are kept up to date, and taken from its edge when it's made the
+// root (`search_play`), so a visit changes half as many shared counters. A leaf's `in_flight` claims it
+// for evaluation (see `collect`).
 struct Node {
     Position position;
     int32_t n;
     int32_t in_flight;
     int32_t first_edge;
-    int32_t num_edges;  // 0 until it's been evaluated
+    int32_t num_edges;  // 0 until it's been evaluated; published once its edges and value are written
     float w;            // for the player to move
     float value;        // the network's, once it's been evaluated
 };
 
 // Asks for `bytes` from `start` to be backed by huge pages (Linux's transparent ones, where they're
-// granted only to memory that asks): a reserved tree fills its room a page at a time while its workers
-// wait on it, and a 2 MB page is one fault where 4 KB pages are 512, and one TLB entry.
+// granted only to memory that asks): the tree fills its room a page at a time, and a 2 MB page is one
+// fault where 4 KB pages are 512, and one TLB entry.
 void prefer_huge_pages(const void* start, size_t bytes) {
 #ifdef MADV_HUGEPAGE
     const uintptr_t page = 4096;
@@ -204,6 +244,109 @@ void prefer_huge_pages(const void* start, size_t bytes) {
     if (to > from) madvise((void*)from, to - from, MADV_HUGEPAGE);
 #endif
 }
+
+// An array that grows a segment at a time and never moves, so that threads read it while others add to
+// it: no growth copies the whole of it at once, with every worker waiting. `allocate` hands out indices
+// contiguous within a segment (a node's edges are read as one run); an allocation that would cross a
+// segment's end skips to the next one. A segment is a whole number of 2 MB pages, on huge pages if the
+// system grants them; its memory is used only as its elements are.
+template <class T>
+struct Segments {
+    static constexpr size_t HUGE_PAGE = size_t(1) << 21;
+    static constexpr int SHIFT = std::max(16, 21 - __builtin_ctzll(sizeof(T)));
+    static constexpr int64_t SIZE = int64_t(1) << SHIFT;
+    static constexpr int64_t COUNT = (int64_t(1) << 31) / SIZE;
+    static constexpr size_t BYTES = (SIZE * sizeof(T) + HUGE_PAGE - 1) / HUGE_PAGE * HUGE_PAGE;
+    T** table;
+    // indices handed out, those skipped included
+    int64_t used = 0;
+
+    Segments() : table(static_cast<T**>(std::calloc(COUNT, sizeof(T*)))) {
+        if (!table) throw std::bad_alloc();
+    }
+    Segments(const Segments& other) : Segments() { copy(other); }
+    Segments& operator=(const Segments& other) {
+        if (this != &other) {
+            release();
+            copy(other);
+        }
+        return *this;
+    }
+    ~Segments() {
+        release();
+        std::free(table);
+    }
+
+    T& operator[](int64_t i) const { return relaxed(table[i >> SHIFT])[i & (SIZE - 1)]; }
+
+    static T* fresh() {
+        T* segment = static_cast<T*>(std::aligned_alloc(HUGE_PAGE, BYTES));
+        if (!segment) throw std::bad_alloc();
+        prefer_huge_pages(segment, BYTES);
+        return segment;
+    }
+
+    // segment `k`, made now if no thread has
+    void ensure(int64_t k) {
+        if (acquired(table[k])) return;
+        T* made = fresh();
+        T* none = nullptr;
+        if (!__atomic_compare_exchange_n(&table[k], &none, made, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            std::free(made);
+    }
+
+    int32_t allocate(int count) {
+        while (true) {
+            int64_t first = __atomic_fetch_add(&used, (int64_t)count, __ATOMIC_RELAXED);
+            int64_t segment = first >> SHIFT;
+            if (segment == (first + count - 1) >> SHIFT) {
+                if (first + count > (int64_t(1) << 31)) throw std::bad_alloc();
+                ensure(segment);
+                return (int32_t)first;
+            }
+        }
+    }
+
+    // the segments for `count` elements made now, rather than as they fill; false if they can't be
+    // (those made kept)
+    bool reserve(int64_t count) {
+        if (count > (int64_t(1) << 31)) return false;
+        try {
+            for (int64_t k = 0; k < (count + SIZE - 1) >> SHIFT; k++) ensure(k);
+        } catch (const std::bad_alloc&) {
+            return false;
+        }
+        return true;
+    }
+
+    // the elements the segments made so far hold
+    int64_t capacity() const {
+        int64_t made = 0;
+        for (int64_t k = 0; k < COUNT; k++) made += table[k] != nullptr;
+        return made * SIZE;
+    }
+
+    // no indices handed out (the segments kept for the next)
+    void clear() { used = 0; }
+
+    void copy(const Segments& other) {
+        used = other.used;
+        for (int64_t k = 0; k < COUNT; k++) {
+            if (!other.table[k]) continue;
+            table[k] = fresh();
+            int64_t filled = std::min(SIZE, std::max(int64_t(0), used - k * SIZE));
+            std::memcpy(static_cast<void*>(table[k]), other.table[k], filled * sizeof(T));
+        }
+    }
+
+    void release() {
+        for (int64_t k = 0; k < COUNT; k++) {
+            std::free(table[k]);
+            table[k] = nullptr;
+        }
+        used = 0;
+    }
+};
 
 // Memory handed out zeroed by calloc, its elements default-constructed by doing nothing: a large
 // buffer comes straight from the kernel, its pages zeroed when first touched (`std::vector`'s own
@@ -230,21 +373,35 @@ struct ZeroedAllocator {
 
 // The nodes evaluated so far, by position: a leaf whose position the game's searches have evaluated
 // before, reached by another order of moves, takes that evaluation instead of the network's
-// (Leela Chess Zero's cache of network evaluations, here the tree itself). Open addressing; a slot of
-// all zeros is empty, so a fresh table is calloc's, its pages zeroed by the kernel as they're touched.
-// Its entries spread over the whole table, so unlike the tree's vectors, room reserved here is paid for
-// as it fills, not as it's used up.
+// (Leela Chess Zero's cache of network evaluations, here the tree itself). Open addressing, in
+// shards of their own lock each, by the hash's top bits: workers seldom meet at one, and one growing
+// (rehashed whole) holds up only those that do. A slot of all zeros is empty, so a fresh shard is
+// calloc's, its pages zeroed by the kernel as they're touched; its entries spread over the whole of it,
+// so room reserved here is paid for as it fills, not as it's used up.
 struct Evaluated {
     struct Slot {
         uint64_t me, opp;
         int32_t node_plus_one;  // 0 for an empty slot
     };
     using Slots = std::vector<Slot, ZeroedAllocator<Slot>>;
-    static constexpr size_t SMALLEST = 1024;
-    Slots slots = Slots(SMALLEST);
-    size_t used = 0;
-    // the size `reserve` asked for, which `clear` keeps
-    size_t reserved = SMALLEST;
+    static constexpr size_t SMALLEST = 64;
+    struct alignas(64) Shard {
+        std::mutex lock;
+        Slots slots = Slots(SMALLEST);
+        size_t used = 0;
+        // the size `reserve` asked for, which `clear` keeps
+        size_t reserved = SMALLEST;
+        Shard() = default;
+        Shard(const Shard& other) : slots(other.slots), used(other.used), reserved(other.reserved) {}
+        Shard& operator=(const Shard& other) {
+            slots = other.slots;
+            used = other.used;
+            reserved = other.reserved;
+            return *this;
+        }
+    };
+    static constexpr int SHARD_BITS = 6;
+    std::vector<Shard> shards = std::vector<Shard>(1 << SHARD_BITS);
 
     static uint64_t hash(uint64_t me, uint64_t opp) {
         uint64_t z = me ^ (opp * 0x9e3779b97f4a7c15ULL) ^ (opp >> 29);
@@ -253,57 +410,86 @@ struct Evaluated {
         return z ^ (z >> 31);
     }
 
-    int32_t find(uint64_t me, uint64_t opp) const {
-        size_t mask = slots.size() - 1;
-        for (size_t i = hash(me, opp) & mask;; i = (i + 1) & mask) {
-            const Slot& slot = slots[i];
+    Shard& shard_of(uint64_t h) { return shards[h >> (64 - SHARD_BITS)]; }
+
+    int32_t find(uint64_t me, uint64_t opp) {
+        uint64_t h = hash(me, opp);
+        Shard& shard = shard_of(h);
+        std::lock_guard<std::mutex> held(shard.lock);
+        size_t mask = shard.slots.size() - 1;
+        for (size_t i = h & mask;; i = (i + 1) & mask) {
+            const Slot& slot = shard.slots[i];
             if (slot.node_plus_one == 0) return -1;
             if (slot.me == me && slot.opp == opp) return slot.node_plus_one - 1;
         }
     }
 
-    // to a table of `size` slots (a power of 2), every entry kept
-    void resize(size_t size) {
-        Slots old(size);
-        old.swap(slots);
-        used = 0;
-        for (const Slot& slot : old)
-            if (slot.node_plus_one) insert(slot.me, slot.opp, slot.node_plus_one - 1);
-    }
-
-    void insert(uint64_t me, uint64_t opp, int32_t node) {
-        if (2 * (used + 1) > slots.size()) resize(slots.size() * 2);
-        size_t mask = slots.size() - 1;
-        for (size_t i = hash(me, opp) & mask;; i = (i + 1) & mask) {
-            Slot& slot = slots[i];
+    static void put(Shard& shard, uint64_t h, const Slot& entry) {
+        size_t mask = shard.slots.size() - 1;
+        for (size_t i = h & mask;; i = (i + 1) & mask) {
+            Slot& slot = shard.slots[i];
             if (slot.node_plus_one == 0) {
-                slot = Slot{me, opp, node + 1};
-                used++;
+                slot = entry;
+                shard.used++;
                 return;
             }
-            if (slot.me == me && slot.opp == opp) return;
+            if (slot.me == entry.me && slot.opp == entry.opp) return;
         }
     }
 
-    // room for `entries` without growing, which rehashes every entry at once
+    // a shard to `size` slots (a power of 2), every entry kept; its lock held
+    static void resize(Shard& shard, size_t size) {
+        Slots old(size);
+        old.swap(shard.slots);
+        shard.used = 0;
+        for (const Slot& slot : old)
+            if (slot.node_plus_one) put(shard, hash(slot.me, slot.opp), slot);
+    }
+
+    void insert(uint64_t me, uint64_t opp, int32_t node) {
+        uint64_t h = hash(me, opp);
+        Shard& shard = shard_of(h);
+        std::lock_guard<std::mutex> held(shard.lock);
+        if (2 * (shard.used + 1) > shard.slots.size()) resize(shard, shard.slots.size() * 2);
+        put(shard, h, Slot{me, opp, node + 1});
+    }
+
+    // room for about `entries` without growing (a shard's share, and a quarter more for the shards
+    // the hash favours)
     void reserve(size_t entries) {
+        size_t share = (entries >> SHARD_BITS) + (entries >> (SHARD_BITS + 2));
         size_t size = SMALLEST;
-        while (size < 2 * entries) size *= 2;
-        reserved = std::max(reserved, size);
-        if (size > slots.size()) resize(size);
-        prefer_huge_pages(slots.data(), slots.size() * sizeof(Slot));
+        while (size < 2 * share) size *= 2;
+        for (Shard& shard : shards) {
+            std::lock_guard<std::mutex> held(shard.lock);
+            shard.reserved = std::max(shard.reserved, size);
+            if (size > shard.slots.size()) resize(shard, size);
+            prefer_huge_pages(shard.slots.data(), shard.slots.size() * sizeof(Slot));
+        }
     }
 
     void clear() {
-        slots = Slots(reserved);
-        if (reserved > SMALLEST) prefer_huge_pages(slots.data(), reserved * sizeof(Slot));
-        used = 0;
+        for (Shard& shard : shards) {
+            shard.slots = Slots(shard.reserved);
+            if (shard.reserved > SMALLEST) prefer_huge_pages(shard.slots.data(), shard.reserved * sizeof(Slot));
+            shard.used = 0;
+        }
     }
 };
 
 struct PathStep {
     int32_t node;
     int32_t edge;  // the edge taken to the node, -1 for the root
+};
+
+// what a caller's traversals came to, added to the search's totals when it's done (rather than
+// as they happen, by every worker on one cache line)
+struct Tally {
+    long visits = 0;
+    long collisions = 0;
+    long reused = 0;
+    long descended = 0;
+    long descended_deeper = 0;
 };
 
 // the paths of a batch collected, end to end, for one caller at a time: a search's own (see
@@ -315,6 +501,9 @@ struct Batch {
     std::vector<int32_t> leaf_ends;       // where each leaf's path ends in `paths`
     std::vector<int32_t> collision_ends;  // and each collision's, after the leaves'
     std::vector<uint8_t> leaf_symmetries;  // the symmetry each leaf was shown in
+    // a leaf's edges as they're made, before they go into the tree
+    std::vector<Edge> made;
+    Tally tally;
 };
 
 // A flag set from another thread; a copy of it (`search_clone`) starts unset.
@@ -338,18 +527,19 @@ struct Search {
     // a `Descend`: whether a fixed number of visits, once its move is decided, goes on under that
     // move only (see `leading_edge`)
     int descend;
-    // the root's edge the search's move is decided on, -1 until it is
+    // the root's edge the search's move is decided on, -1 until it is (set once, atomically)
     int32_t decided;
     // the visits of this search, and so of each search to come (0 on a clock)
     int budget;
     // positions with so many empties or fewer the player solves rather than searches: their move
     // isn't the most visited, so `DESCEND_RECURSIVE` never takes it as decided
     int solved_from;
-    uint64_t rng;  // splitmix64's state
+    uint64_t rng;  // splitmix64's state, advanced atomically
     int32_t root;
+    // visits not yet taken by a traversal (each takes one atomically as it starts)
     int remaining;
-    std::vector<Node> nodes;
-    std::vector<Edge> edges;
+    Segments<Node> nodes;
+    Segments<Edge> edges;
     Batch batch;
     Evaluated evaluated;
     int collisions_total;
@@ -365,31 +555,36 @@ struct Search {
     Halt halted;
 };
 
-inline float edge_q(const Search& s, const Edge& e) {
-    // q in [-1, 1] mapped to [0, 1], as core's `bounded_q_values`; unvisited edges are 0, a loss
+// q in [-1, 1] mapped to [0, 1], as core's `bounded_q_values`; unvisited edges are 0, a loss. Of an
+// edge's counters as one traversal read them.
+inline float edge_q(const Search& s, float w, int32_t n, int32_t in_flight) {
     if (s.mode == VL_VISIT) {
-        return e.n > 0 ? (e.w / e.n + 1) / 2 : 0;
+        return n > 0 ? (w / n + 1) / 2 : 0;
     }
-    float flying = s.weight * e.in_flight;
-    float n = e.n + flying;
-    if (n <= 0) return 0;
-    float w = s.mode == VL_LOSS ? e.w - flying : e.w;
-    return (w / n + 1) / 2;
+    float flying = s.weight * in_flight;
+    float visits = n + flying;
+    if (visits <= 0) return 0;
+    float wins = s.mode == VL_LOSS ? w - flying : w;
+    return (wins / visits + 1) / 2;
 }
 
-inline int select(const Search& s, const Node& node) {
-    float visits = node.n + s.weight * node.in_flight;
+// PUCT's edge of an evaluated node, of its `count` edges, reached by edge `from` (-1 for the root):
+// the node's visits are the edge's, but for the traversal choosing, in flight on it already
+inline int select(const Search& s, const Node& node, int count, int32_t from) {
+    float visits = from < 0 ? relaxed(node.n) + s.weight * relaxed(node.in_flight)
+                            : relaxed(s.edges[from].n) + s.weight * (relaxed(s.edges[from].in_flight) - 1);
     float c = s.c_init + std::log((visits + C_BASE + 1) / C_BASE);
     float scale = c * std::sqrt(visits);
     int best = node.first_edge;
     float best_score = -1e30f;
-    const Edge* edges = s.edges.data();
-    for (int i = node.first_edge; i < node.first_edge + node.num_edges; i++) {
+    const Edge* edges = &s.edges[node.first_edge];
+    for (int i = 0; i < count; i++) {
         const Edge& e = edges[i];
-        float score = edge_q(s, e) + scale * e.prior / (e.n + s.weight * e.in_flight + 1);
+        int32_t n = relaxed(e.n), in_flight = relaxed(e.in_flight);
+        float score = edge_q(s, relaxed(e.w), n, in_flight) + scale * e.prior / (n + s.weight * in_flight + 1);
         if (score > best_score) {
             best_score = score;
-            best = i;
+            best = node.first_edge + i;
         }
     }
     return best;
@@ -400,17 +595,21 @@ inline int select(const Search& s, const Node& node) {
 // (`search_best_action`'s choice) however they go. -1 if none is. Once every traversal through the
 // node takes it, no other edge gains, and the decision holds.
 int leading_edge(const Search& s, const Node& node, long extra) {
-    int top = node.first_edge;
-    for (int i = node.first_edge + 1; i < node.first_edge + node.num_edges; i++) {
-        const Edge& e = s.edges[i];
-        if (e.n > s.edges[top].n || (e.n == s.edges[top].n && e.prior > s.edges[top].prior)) top = i;
+    const Edge* edges = &s.edges[node.first_edge];
+    int count = acquired(node.num_edges);
+    int top = 0;
+    int32_t most = relaxed(edges[0].n);
+    for (int i = 1; i < count; i++) {
+        int32_t n = relaxed(edges[i].n);
+        if (n > most || (n == most && edges[i].prior > edges[top].prior)) {
+            top = i;
+            most = n;
+        }
     }
-    long most = s.edges[top].n;
-    for (int i = node.first_edge; i < node.first_edge + node.num_edges; i++) {
-        const Edge& e = s.edges[i];
-        if (i != top && (long)e.n + e.in_flight + extra >= most) return -1;
+    for (int i = 0; i < count; i++) {
+        if (i != top && (long)relaxed(edges[i].n) + relaxed(edges[i].in_flight) + extra >= most) return -1;
     }
-    return top;
+    return node.first_edge + top;
 }
 
 // With `descend`, the root's edge once the search's move is decided, against the `left` visits still
@@ -418,40 +617,55 @@ int leading_edge(const Search& s, const Node& node, long extra) {
 // them, rather than to moves that can't be played. -1 until then, and always without a fixed number
 // of visits (`remaining` then is unbounded).
 int decided_edge(Search& s, const Node& root, int left) {
-    if (s.decided < 0 && s.descend != DESCEND_OFF) s.decided = leading_edge(s, root, left);
-    return s.decided;
+    int32_t decided = relaxed(s.decided);
+    if (decided < 0 && s.descend != DESCEND_OFF) {
+        decided = leading_edge(s, root, left);
+        int32_t none = -1;
+        // the first worker's to decide it
+        if (decided >= 0 && !__atomic_compare_exchange_n(&s.decided, &none, decided, false, __ATOMIC_RELAXED,
+                                                          __ATOMIC_RELAXED))
+            decided = none;
+    }
+    return decided;
 }
 
 inline int empties(const Position& p) { return 64 - __builtin_popcountll(p.me | p.opp); }
 
 int32_t new_node(Search& s, const Position& p) {
-    Node node{};
+    int32_t index = s.nodes.allocate(1);
+    Node& node = s.nodes[index];
+    node = Node{};
     node.position = p;
-    s.nodes.push_back(node);
-    return (int32_t)s.nodes.size() - 1;
+    return index;
 }
 
-// the visit of a whole path, of a value for the player to move at its end
-void back_up(Search& s, const PathStep* path, int length, float value, bool was_flying) {
+// The node `edge` of `node` leads to, made now if it's the first traversal to take it. Of two at once,
+// the node of the one that publishes it first; the other's is left unused.
+int32_t child_of(Search& s, const Node& node, Edge& edge) {
+    int32_t child = acquired(edge.child);
+    if (child >= 0) return child;
+    int32_t made = new_node(s, play(node.position, edge.action));
+    if (__atomic_compare_exchange_n(&edge.child, &child, made, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return made;
+    return child;
+}
+
+// the visit of a whole path in flight, of a value for the player to move at its end
+void back_up(Search& s, const PathStep* path, int length, float value) {
     for (int i = length - 1; i >= 0; i--) {
         Node& node = s.nodes[path[i].node];
-        node.n++;
-        node.w += value;
-        if (was_flying) node.in_flight--;
+        if (i == 0) {
+            bump(node.n, 1);
+            bump(node.w, value);
+        }
+        if (i == 0 || i == length - 1) land(node.in_flight);
         if (path[i].edge >= 0) {
             Edge& e = s.edges[path[i].edge];
-            e.n++;
-            e.w -= value;
-            if (was_flying) e.in_flight--;
+            bump(e.n, 1);
+            bump(e.w, -value);
+            land(e.in_flight);
         }
         value = -value;
-    }
-}
-
-void fly(Search& s, const std::vector<PathStep>& path, int delta) {
-    for (const PathStep& step : path) {
-        s.nodes[step.node].in_flight += delta;
-        if (step.edge >= 0) s.edges[step.edge].in_flight += delta;
     }
 }
 
@@ -464,34 +678,42 @@ void write_observation(uint64_t me, uint64_t opp, float* out) {
 
 // a random one of the 8, the top bits of splitmix64
 inline int draw_symmetry(Search& s) {
-    uint64_t z = (s.rng += 0x9e3779b97f4a7c15ULL);
+    uint64_t z = __atomic_add_fetch(&s.rng, 0x9e3779b97f4a7c15ULL, __ATOMIC_RELAXED);
     z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
     z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
     return (int)((z ^ (z >> 31)) >> 61);
 }
 
+// A leaf's edges, `count` of them made in `made`, put into the tree with its value: published, its
+// evaluation is there for every traversal (and, with `reuse`, every leaf of the same position).
+void expand(Search& s, int32_t index, const Edge* made, int count, float value) {
+    int32_t first = s.edges.allocate(count);
+    std::copy(made, made + count, &s.edges[first]);
+    Node& node = s.nodes[index];
+    node.first_edge = first;
+    node.value = value;
+    publish(node.num_edges, (int32_t)count);
+}
 
 // Expands a leaf from the evaluation of a node of the same position, if there's one. Its edges list the
 // same legal moves in the same order.
-bool reuse_evaluation(Search& s, int32_t index) {
+bool reuse_evaluation(Search& s, Batch& b, int32_t index) {
     const Position& p = s.nodes[index].position;
     int32_t source = s.evaluated.find(p.me, p.opp);
     if (source < 0) return false;
-    int first = (int)s.edges.size();
-    int from = s.nodes[source].first_edge, count = s.nodes[source].num_edges;
-    for (int i = 0; i < count; i++) {
-        const Edge& e = s.edges[from + i];
-        s.edges.push_back(Edge{e.prior, 0, 0, 0, -1, e.action});
-    }
-    Node& node = s.nodes[index];
-    node.first_edge = first;
-    node.num_edges = count;
-    node.value = s.nodes[source].value;
+    const Node& from = s.nodes[source];
+    int count = acquired(from.num_edges);
+    const Edge* edges = &s.edges[from.first_edge];
+    b.made.clear();
+    for (int i = 0; i < count; i++) b.made.push_back(Edge{edges[i].prior, 0, 0, 0, -1, edges[i].action});
+    expand(s, index, b.made.data(), count, from.value);
     return true;
 }
 
 // `search_collect`'s traversals, their paths kept in `b` until `apply`; each leaf's observation written
-// to `out` as (2, 8, 8) floats
+// to `out` as (2, 8, 8) floats. A traversal takes a visit of those left as it starts, and adds a
+// virtual visit to each node and edge as it goes; reaching a leaf, it claims it (its virtual visit the
+// first), or, if another traversal has, collides there.
 int collect(Search& s, Batch& b, int batch, float* out) {
     b.paths.clear();
     b.collisions.clear();
@@ -499,8 +721,13 @@ int collect(Search& s, Batch& b, int batch, float* out) {
     b.collision_ends.clear();
     b.leaf_symmetries.clear();
     int leaves = 0, visits = 0, collided = 0;
-    int want = std::min(batch, s.remaining);
-    while (visits < want && collided <= s.max_collisions) {
+    while (visits < batch && collided <= s.max_collisions) {
+        // the visits left as this one is taken, it included
+        int left = __atomic_fetch_sub(&s.remaining, 1, __ATOMIC_RELAXED);
+        if (left <= 0) {
+            __atomic_fetch_add(&s.remaining, 1, __ATOMIC_RELAXED);
+            break;
+        }
         b.path.clear();
         int32_t index = s.root;
         b.path.push_back({index, -1});
@@ -513,16 +740,28 @@ int collect(Search& s, Batch& b, int batch, float* out) {
         while (true) {
             Node& node = s.nodes[index];
             if (node.position.terminated) {
+                // (in flight at the root and at its end, as a leaf would be)
+                bump(node.in_flight, 1);
                 outcome = END;
                 break;
             }
-            if (node.num_edges == 0) {
-                outcome = node.in_flight > 0 ? COLLISION : LEAF;
-                break;
+            int count = acquired(node.num_edges);
+            if (count == 0) {
+                if (__atomic_fetch_add(&node.in_flight, 1, __ATOMIC_ACQ_REL) > 0) {
+                    outcome = COLLISION;
+                    break;
+                }
+                count = acquired(node.num_edges);
+                if (count == 0) {
+                    outcome = LEAF;
+                    break;
+                }
+                // evaluated since: on through it
+                land(node.in_flight);
             }
             int e = -1;
             if (chain && depth == 0) {
-                e = decided_edge(s, node, s.remaining - visits);
+                e = decided_edge(s, node, left);
                 descended = e >= 0;
                 chain = descended;
             } else if (chain && depth % 2 == 0) {
@@ -530,33 +769,28 @@ int collect(Search& s, Batch& b, int batch, float* out) {
                 // whole of each search up to it: their root rule keeps it, so visits to its other
                 // moves would be lost by then
                 if (s.descend == DESCEND_RECURSIVE && empties(node.position) > s.solved_from)
-                    e = leading_edge(s, node, (long)(s.remaining - visits) + (long)(depth / 2) * s.budget);
+                    e = leading_edge(s, node, (long)left + (long)(depth / 2) * s.budget);
                 deeper = deeper || e >= 0;
                 chain = e >= 0;
             }
             depth++;
-            if (e < 0) e = select(s, node);
-            int32_t child = s.edges[e].child;
-            if (child < 0) {
-                Position next = play(node.position, s.edges[e].action);
-                // (new_node may move `nodes`: `node` isn't used again)
-                child = new_node(s, next);
-                s.edges[e].child = child;
-            }
-            index = child;
+            if (e < 0) e = select(s, node, count, b.path.back().edge);
+            Edge& edge = s.edges[e];
+            if (b.path.size() == 1) bump(node.in_flight, 1);
+            bump(edge.in_flight, 1);
+            index = child_of(s, node, edge);
             b.path.push_back({index, e});
         }
-        if (outcome != COLLISION && descended) s.descended_total++;
-        if (outcome != COLLISION && deeper) s.descended_deeper_total++;
+        if (outcome != COLLISION && descended) b.tally.descended++;
+        if (outcome != COLLISION && deeper) b.tally.descended_deeper++;
         if (outcome == END) {
-            back_up(s, b.path.data(), (int)b.path.size(), s.nodes[index].position.reward, false);
+            back_up(s, b.path.data(), (int)b.path.size(), s.nodes[index].position.reward);
             visits++;
-        } else if (outcome == LEAF && s.reuse && reuse_evaluation(s, index)) {
-            back_up(s, b.path.data(), (int)b.path.size(), s.nodes[index].value, false);
+        } else if (outcome == LEAF && s.reuse && reuse_evaluation(s, b, index)) {
+            back_up(s, b.path.data(), (int)b.path.size(), s.nodes[index].value);
             visits++;
-            s.reused_total++;
+            b.tally.reused++;
         } else if (outcome == LEAF) {
-            fly(s, b.path, 1);
             b.paths.insert(b.paths.end(), b.path.begin(), b.path.end());
             b.leaf_ends.push_back((int32_t)b.paths.size());
             int symmetry = s.random_symmetry ? draw_symmetry(s) : 0;
@@ -567,15 +801,15 @@ int collect(Search& s, Batch& b, int batch, float* out) {
             leaves++;
             visits++;
         } else {
-            fly(s, b.path, 1);
+            // a visit of none: given back
+            __atomic_fetch_add(&s.remaining, 1, __ATOMIC_RELAXED);
             b.collisions.insert(b.collisions.end(), b.path.begin(), b.path.end());
             b.collision_ends.push_back((int32_t)b.collisions.size());
             collided++;
         }
     }
-    s.remaining -= visits;
-    s.visits_total += visits;
-    s.collisions_total += collided;
+    b.tally.visits += visits;
+    b.tally.collisions += collided;
     return leaves;
 }
 
@@ -590,7 +824,6 @@ void apply(Search& s, Batch& b, const float* logits, const float* values) {
         const float* l = logits + (size_t)i * 65;
         const uint8_t* shown_at = SYMMETRIC_ACTIONS.to[b.leaf_symmetries[i]];
         uint64_t legal = legal_moves(p.me, p.opp);
-        int first = (int)s.edges.size();
         float top = -1e30f;
         if (legal) {
             for (uint64_t m = legal; m; m &= m - 1) top = std::max(top, l[shown_at[__builtin_ctzll(m)]]);
@@ -598,28 +831,42 @@ void apply(Search& s, Batch& b, const float* logits, const float* values) {
             top = l[PASS];
         }
         float total = 0;
+        b.made.clear();
         auto add = [&](int action) {
             float prior = std::exp((l[shown_at[action]] - top) * s.inverse_temperature);
             total += prior;
-            s.edges.push_back(Edge{prior, 0, 0, 0, -1, action});
+            b.made.push_back(Edge{prior, 0, 0, 0, -1, action});
         };
         if (legal) {
             for (uint64_t m = legal; m; m &= m - 1) add(__builtin_ctzll(m));
         } else {
             add(PASS);
         }
-        for (size_t e = first; e < s.edges.size(); e++) s.edges[e].prior /= total;
-        s.nodes[index].first_edge = first;
-        s.nodes[index].num_edges = (int32_t)s.edges.size() - first;
-        s.nodes[index].value = values[i];
+        for (Edge& e : b.made) e.prior /= total;
+        expand(s, index, b.made.data(), (int)b.made.size(), values[i]);
         s.evaluated.insert(p.me, p.opp, index);
-        back_up(s, b.paths.data() + start, end - start, values[i], true);
+        back_up(s, b.paths.data() + start, end - start, values[i]);
         start = end;
     }
-    for (const PathStep& step : b.collisions) {
-        s.nodes[step.node].in_flight--;
-        if (step.edge >= 0) s.edges[step.edge].in_flight--;
+    int from = 0;
+    for (int32_t end : b.collision_ends) {
+        for (int i = from; i < end; i++) {
+            const PathStep& step = b.collisions[i];
+            if (i == from || i == end - 1) land(s.nodes[step.node].in_flight);
+            if (step.edge >= 0) land(s.edges[step.edge].in_flight);
+        }
+        from = end;
     }
+}
+
+// a caller's traversals added to the search's totals
+void count_up(Search& s, Tally& tally) {
+    s.visits_total += (int)tally.visits;
+    s.collisions_total += (int)tally.collisions;
+    s.reused_total += tally.reused;
+    s.descended_total += tally.descended;
+    s.descended_deeper_total += tally.descended_deeper;
+    tally = Tally{};
 }
 
 }  // namespace
@@ -694,7 +941,11 @@ int search_remaining(const Search* s) { return s->remaining; }
 // end, which counts as a visit without one. A traversal ending in a leaf already in flight is a
 // collision: it visits nothing, but counts against the edges it took until `search_apply`. After
 // `max_collisions` of them the batch stops short. Returns the leaves.
-int search_collect(Search* s, int batch, float* out) { return collect(*s, s->batch, batch, out); }
+int search_collect(Search* s, int batch, float* out) {
+    int leaves = collect(*s, s->batch, batch, out);
+    count_up(*s, s->batch.tally);
+    return leaves;
+}
 
 // The evaluations of the leaves `search_collect` returned, (leaves, 65) policy logits and (leaves) values.
 void search_apply(Search* s, const float* logits, const float* values) { apply(*s, s->batch, logits, values); }
@@ -748,8 +999,14 @@ void search_play(Search* s, int action) {
     s->decided = -1;
     Node& root = s->nodes[s->root];
     for (int i = root.first_edge; i < root.first_edge + root.num_edges; i++) {
-        if (s->edges[i].action == action && s->edges[i].child >= 0) {
-            s->root = s->edges[i].child;
+        const Edge& e = s->edges[i];
+        if (e.action == action && e.child >= 0) {
+            // its visits, the root's to keep (see `Node`)
+            Node& child = s->nodes[e.child];
+            child.n = e.n;
+            child.w = -e.w;
+            child.in_flight = e.in_flight;
+            s->root = e.child;
             return;
         }
     }
@@ -757,33 +1014,29 @@ void search_play(Search* s, int action) {
     s->root = new_node(*s, next);
 }
 
-// Room for `nodes` nodes and `edges` edges, and the table of evaluated positions for `positions`, set
-// aside now, and kept when the tree is started afresh (`search_set_position`). Grown as the tree fills
-// instead, each is copied (the table rehashed) whole at once while an engine's workers wait on the
-// tree: up to about a second in a long game. The nodes and edges fill their room in order, so what isn't
-// used yet costs no memory; the table's entries land all over it (see `Evaluated`). All of it asks for
-// huge pages (`prefer_huge_pages`). Returns 0 if the
-// memory couldn't be had, what was set aside kept, the rest grown as before.
+// Room for `nodes` nodes and `edges` edges made now, and the table of evaluated positions for
+// `positions`, all kept when the tree is started afresh (`search_set_position`). The tree's storage
+// never moves, so growing it holds up no one; reserved, it's on hand at once rather than a segment at a
+// time. Its nodes and edges cost memory only as they're used; the table's entries land all over it (see
+// `Evaluated`). Returns 0 if the memory couldn't be had, what was made kept.
 int search_reserve(Search* s, long nodes, long edges, long positions) {
+    if (!s->nodes.reserve(nodes) || !s->edges.reserve(edges)) return 0;
     try {
-        s->nodes.reserve((size_t)nodes);
-        s->edges.reserve((size_t)edges);
         s->evaluated.reserve((size_t)positions);
-        prefer_huge_pages(s->nodes.data(), s->nodes.capacity() * sizeof(Node));
-        prefer_huge_pages(s->edges.data(), s->edges.capacity() * sizeof(Edge));
         return 1;
     } catch (const std::exception&) {
         return 0;
     }
 }
 
-// (nodes, edges) the tree has room for without growing
+// (nodes, edges) the tree has room for before it makes more
 void search_capacity(const Search* s, long* out) {
     out[0] = (long)s->nodes.capacity();
     out[1] = (long)s->edges.capacity();
 }
 
-long search_num_edges(const Search* s) { return (long)s->edges.size(); }
+// the edges handed out, those an allocation skipped at a segment's end included
+long search_num_edges(const Search* s) { return (long)s->edges.used; }
 
 // Ends an engine's search of `s` under way, and any started while it's set, at once (the batches in
 // flight finished); safe from any thread. 0 lets searches run again.
@@ -812,7 +1065,7 @@ long search_reused(const Search* s) { return s->reused_total; }
 long search_descended(const Search* s) { return s->descended_total; }
 long search_descended_deeper(const Search* s) { return s->descended_deeper_total; }
 
-long search_num_nodes(const Search* s) { return (long)s->nodes.size(); }
+long search_num_nodes(const Search* s) { return (long)s->nodes.used; }
 
 // the nodes of the tree under the root, the root's own included: what a search from it starts with
 long search_subtree_nodes(const Search* s) {
@@ -826,6 +1079,53 @@ long search_subtree_nodes(const Search* s) {
             if (s->edges[i].child >= 0) stack.push_back(s->edges[i].child);
     }
     return count;
+}
+
+// Checks the tree under the root against what its visits imply, for tests of searches with several
+// workers: an evaluated node's visits are its evaluation's and its edges' (each visit to it but the
+// first goes on down one), and so are its values; a game's end's are its result each; nothing is in
+// flight once a search is done; and every node an edge leads to has been evaluated or ends the game.
+// `out`: nodes checked, those whose visits don't add up, counters still in flight, nodes linked but
+// not evaluated, and the largest gap between a node's sum of values and its parts' (float rounding
+// apart, 0).
+void search_audit(const Search* s, double* out) {
+    long checked = 0, uneven = 0, flying = 0, unevaluated = 0;
+    double gap = 0;
+    // (node, the edge to it, -1 for the root)
+    std::vector<std::pair<int32_t, int32_t>> stack{{s->root, -1}};
+    while (!stack.empty()) {
+        auto [index, from] = stack.back();
+        stack.pop_back();
+        const Node& node = s->nodes[index];
+        checked++;
+        long n = from < 0 ? node.n : s->edges[from].n;
+        double w = from < 0 ? node.w : -s->edges[from].w;
+        if (node.in_flight || (from >= 0 && s->edges[from].in_flight)) flying++;
+        if (node.position.terminated) {
+            gap = std::max(gap, std::fabs(w - (double)n * node.position.reward));
+            continue;
+        }
+        if (node.num_edges == 0) {
+            if (from >= 0 || n > 0) unevaluated++;
+            continue;
+        }
+        long below = 0;
+        double parts = node.value;
+        for (int i = node.first_edge; i < node.first_edge + node.num_edges; i++) {
+            const Edge& e = s->edges[i];
+            below += e.n;
+            parts += e.w;
+            if (e.child >= 0) stack.push_back({e.child, i});
+            else if (e.n || e.in_flight) uneven++;
+        }
+        if (n != 1 + below) uneven++;
+        gap = std::max(gap, std::fabs(w - parts));
+    }
+    out[0] = (double)checked;
+    out[1] = (double)uneven;
+    out[2] = (double)flying;
+    out[3] = (double)unevaluated;
+    out[4] = gap;
 }
 
 void search_legal(const Search* s, int32_t* out) {
@@ -842,8 +1142,8 @@ int search_symmetric_action(int action, int symmetry) { return SYMMETRIC_ACTIONS
 
 // An engine: a network compiled by OpenVINO for `threads` workers, each with its own requests on a core,
 // which search a tree together, each collecting up to `batch` leaves, evaluating them while the others
-// go on, and backing them up. The tree is shared under a lock; its virtual visits keep their
-// traversals apart, as a batch's are. Python only starts a move's search and reads its result.
+// go on, and backing them up. The tree is shared with no lock over it (see `relaxed`); its virtual
+// visits keep their traversals apart, as a batch's are. Python only starts a move's search and reads its result.
 struct Worker {
     std::vector<float> observations;  // (batch, 2, 8, 8)
     // a request for each number of leaves, 1 to batch, their input `observations`, with OpenVINO
@@ -925,16 +1225,37 @@ Engine* engine_new_net(const net::Net* n, int threads, int batch) {
 
 void engine_free(Engine* engine) { delete engine; }
 
+// Waits until a leaf the batch collided on is evaluated (the traversal in flight to it applied),
+// the search stops, or 2 ms pass: tried again at once, the same traversal would likely collide again.
+// It spins for about an evaluation's time, then sleeps, so as not to keep a core from the worker it
+// waits on.
+void await_collided(const Search& s, const Batch& b, const std::atomic<bool>& stop) {
+    using clock = std::chrono::steady_clock;
+    auto start = clock::now();
+    while (!stop.load(std::memory_order_relaxed)) {
+        for (int32_t end : b.collision_ends)
+            if (acquired(s.nodes[b.collisions[end - 1].node].num_edges) > 0) return;
+        auto waited = clock::now() - start;
+        if (waited >= std::chrono::milliseconds(2)) return;
+        if (waited < std::chrono::microseconds(50))
+            std::this_thread::yield();
+        else
+            std::this_thread::sleep_for(std::chrono::microseconds(20));
+    }
+}
+
 // A search on a clock with `stop_decided` ends once its move can't change: the root's most visited
 // edge leads every other by more than the visits the time left would bring at the rate it has gone
-// so far (`leading_edge`). It checks every so many backups, once the rate means something.
+// so far (`leading_edge`). Each worker checks every so many of its backups, once the rate means
+// something.
 constexpr long DECIDED_CHECK_EVERY = 16;
 constexpr long DECIDED_MIN_VISITS = 256;
 
 static bool decided_on_clock(const Search& s, long visits_before, double elapsed, double left) {
     const Node& root = s.nodes[s.root];
-    long done = (long)root.n - visits_before;
-    if (root.num_edges < 2 || done < DECIDED_MIN_VISITS || elapsed <= 0) return root.num_edges == 1;
+    int count = acquired(root.num_edges);
+    long done = (long)relaxed(root.n) - visits_before;
+    if (count < 2 || done < DECIDED_MIN_VISITS || elapsed <= 0) return count == 1;
     long extra = (long)(done / elapsed * left) + 1;
     return leading_edge(s, root, extra) >= 0;
 }
@@ -952,41 +1273,36 @@ long engine_search(Engine* engine, Search* s, int visits, double seconds, int st
     s->decided = -1;
     bool watch = timed && stop_decided && s->root >= 0;
     long visits_before = watch ? (long)s->nodes[s->root].n : 0;
-    std::mutex lock;
-    std::condition_variable applied;
-    long generation = 0;
-    bool stop = false;
-    long leaves = 0;
-    auto decided = [&](clock::time_point now) {
-        if (!watch || generation % DECIDED_CHECK_EVERY != 0) return false;
-        return decided_on_clock(*s, visits_before, std::chrono::duration<double>(now - start).count(),
-                                std::chrono::duration<double>(deadline - now).count());
-    };
-    auto work = [&](Worker& w) {
-        long calls = 0, mine = 0;
+    std::atomic<bool> stop{false};
+    struct Done {
+        long calls = 0, leaves = 0;
         double inferring = 0;
-        std::unique_lock<std::mutex> held(lock);
+    };
+    std::vector<Done> done(engine->workers.size());
+    auto work = [&](size_t t) {
+        Worker& w = engine->workers[t];
+        Done& mine = done[t];
         while (true) {
             auto now = timed ? clock::now() : start;
-            if (stop || s->remaining <= 0 || s->halted.on.load(std::memory_order_relaxed) ||
-                (timed && (now >= deadline || decided(now)))) {
-                stop = true;
-                applied.notify_all();
+            bool check = watch && mine.calls % DECIDED_CHECK_EVERY == 0;
+            if (stop.load(std::memory_order_relaxed) || s->halted.on.load(std::memory_order_relaxed) ||
+                (timed && now >= deadline) ||
+                (check && decided_on_clock(*s, visits_before, std::chrono::duration<double>(now - start).count(),
+                                           std::chrono::duration<double>(deadline - now).count()))) {
+                stop.store(true, std::memory_order_relaxed);
                 break;
             }
+            // (not a stop for the others: a traversal of theirs that collides gives its visit back,
+            // and goes on to make it)
+            if (relaxed(s->remaining) <= 0) break;
             int n = collect(*s, w.batch, engine->batch, w.observations.data());
             if (n == 0) {
                 bool collided = !w.batch.collisions.empty();
                 apply(*s, w.batch, nullptr, nullptr);
-                if (collided) {
-                    // every leaf it found is another's in flight: wait for one of them
-                    long seen = generation;
-                    applied.wait_for(held, std::chrono::milliseconds(2),
-                                     [&] { return generation != seen || stop; });
-                }
+                // every leaf it found is another's in flight: wait for one of them
+                if (collided) await_collided(*s, w.batch, stop);
                 continue;
             }
-            held.unlock();
             auto t0 = clock::now();
             const float *logits, *values;
             if (engine->network) {
@@ -1001,23 +1317,24 @@ long engine_search(Engine* engine, Search* s, int visits, double seconds, int st
                 logits = request.get_output_tensor(0).data<float>();
                 values = request.get_output_tensor(1).data<float>();
             }
-            inferring += std::chrono::duration<double>(clock::now() - t0).count();
-            held.lock();
+            mine.inferring += std::chrono::duration<double>(clock::now() - t0).count();
             apply(*s, w.batch, logits, values);
-            generation++;
-            applied.notify_all();
-            calls++;
-            mine += n;
+            mine.calls++;
+            mine.leaves += n;
         }
-        leaves += mine;
-        engine->calls += calls;
-        engine->infer_seconds += inferring;
     };
     std::vector<std::thread> threads;
-    for (size_t t = 1; t < engine->workers.size(); t++) threads.emplace_back(work, std::ref(engine->workers[t]));
-    work(engine->workers[0]);
+    for (size_t t = 1; t < engine->workers.size(); t++) threads.emplace_back(work, t);
+    work(0);
     for (auto& t : threads) t.join();
     s->remaining = 0;
+    long leaves = 0;
+    for (size_t t = 0; t < engine->workers.size(); t++) {
+        count_up(*s, engine->workers[t].batch.tally);
+        leaves += done[t].leaves;
+        engine->calls += done[t].calls;
+        engine->infer_seconds += done[t].inferring;
+    }
     engine->leaves += leaves;
     return leaves;
 }
