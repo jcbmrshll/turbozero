@@ -124,6 +124,7 @@ def load_library() -> ctypes.CDLL:
         ),
         "search_capacity": (None, [Search, ctypes.POINTER(ctypes.c_long)]),
         "search_subtree_nodes": (ctypes.c_long, [Search]),
+        "search_audit": (None, [Search, ctypes.POINTER(ctypes.c_double)]),
         "search_clone": (Search, [Search, ctypes.c_int]),
         "search_reused": (ctypes.c_long, [Search]),
         "search_descended": (ctypes.c_long, [Search]),
@@ -379,17 +380,16 @@ class Search:
 
     def reserve(self, nodes: int, edges: int, positions: int | None = None) -> bool:
         """Room for `nodes` nodes and `edges` edges, and the table of evaluated positions for
-        `positions` (by default `nodes`), set aside now and kept through `set_position`. Grown as
-        the tree fills instead, each is copied (the table rehashed) whole at once, an `Engine`'s
-        workers all waiting: up to about a second in a long game. The nodes and edges cost no
-        memory until they're used; the table, 48-96 bytes a position, costs it as it fills, its
-        entries spread all over it. False if the memory couldn't be had: the tree grows as it
-        would have."""
+        `positions` (by default `nodes`), made now and kept through `set_position`, rather than a
+        segment at a time as the tree fills (its storage never moves, so growing holds up no
+        worker). The nodes and edges cost no memory until they're used; the table, 48-96 bytes a
+        position, costs it as it fills, its entries spread all over it. False if the memory
+        couldn't be had: the tree grows as it would have."""
         positions = nodes if positions is None else positions
         return bool(LIB.search_reserve(self.handle, nodes, edges, positions))
 
     def capacity(self) -> tuple[int, int]:
-        """(nodes, edges) the tree has room for without growing."""
+        """(nodes, edges) the tree has room for before it makes more: whole segments."""
         out = (ctypes.c_long * 2)()
         LIB.search_capacity(self.handle, out)
         return out[0], out[1]
@@ -397,6 +397,16 @@ class Search:
     def subtree_nodes(self) -> int:
         """The nodes under the root, its own included: what the next search starts with."""
         return LIB.search_subtree_nodes(self.handle)
+
+    def audit(self) -> dict[str, float]:
+        """The tree under the root checked against what its visits imply (see `search_audit`):
+        `checked` nodes; `uneven`, those whose visits don't add up; `flying`, counters still in
+        flight; `unevaluated`, nodes linked but never evaluated; and `gap`, the largest difference
+        between a node's sum of values and its parts' (float rounding only). All but `checked`
+        are 0 for a consistent tree with no search under way."""
+        out = (ctypes.c_double * 5)()
+        LIB.search_audit(self.handle, out)
+        return dict(zip(("checked", "uneven", "flying", "unevaluated", "gap"), out))
 
     def clone(self, descend: int | None = None) -> "Search":
         """A copy, tree and all, that goes on by itself; with `descend`, that setting changed."""
