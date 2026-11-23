@@ -117,6 +117,12 @@ def load_library() -> ctypes.CDLL:
         "search_collisions": (ctypes.c_long, [Search]),
         "search_total_visits": (ctypes.c_long, [Search]),
         "search_num_nodes": (ctypes.c_long, [Search]),
+        "search_num_edges": (ctypes.c_long, [Search]),
+        "search_reserve": (
+            ctypes.c_int,
+            [Search, ctypes.c_long, ctypes.c_long, ctypes.c_long],
+        ),
+        "search_capacity": (None, [Search, ctypes.POINTER(ctypes.c_long)]),
         "search_subtree_nodes": (ctypes.c_long, [Search]),
         "search_clone": (Search, [Search, ctypes.c_int]),
         "search_reused": (ctypes.c_long, [Search]),
@@ -367,6 +373,26 @@ class Search:
 
     def num_nodes(self) -> int:
         return LIB.search_num_nodes(self.handle)
+
+    def num_edges(self) -> int:
+        return LIB.search_num_edges(self.handle)
+
+    def reserve(self, nodes: int, edges: int, positions: int | None = None) -> bool:
+        """Room for `nodes` nodes and `edges` edges, and the table of evaluated positions for
+        `positions` (by default `nodes`), set aside now and kept through `set_position`. Grown as
+        the tree fills instead, each is copied (the table rehashed) whole at once, an `Engine`'s
+        workers all waiting: up to about a second in a long game. The nodes and edges cost no
+        memory until they're used; the table, 48-96 bytes a position, costs it as it fills, its
+        entries spread all over it. False if the memory couldn't be had: the tree grows as it
+        would have."""
+        positions = nodes if positions is None else positions
+        return bool(LIB.search_reserve(self.handle, nodes, edges, positions))
+
+    def capacity(self) -> tuple[int, int]:
+        """(nodes, edges) the tree has room for without growing."""
+        out = (ctypes.c_long * 2)()
+        LIB.search_capacity(self.handle, out)
+        return out[0], out[1]
 
     def subtree_nodes(self) -> int:
         """The nodes under the root, its own included: what the next search starts with."""
