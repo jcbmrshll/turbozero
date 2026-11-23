@@ -925,10 +925,24 @@ Engine* engine_new_net(const net::Net* n, int threads, int batch) {
 
 void engine_free(Engine* engine) { delete engine; }
 
+// A search on a clock with `stop_decided` ends once its move can't change: the root's most visited
+// edge leads every other by more than the visits the time left would bring at the rate it has gone
+// so far (`leading_edge`). It checks every so many backups, once the rate means something.
+constexpr long DECIDED_CHECK_EVERY = 16;
+constexpr long DECIDED_MIN_VISITS = 256;
+
+static bool decided_on_clock(const Search& s, long visits_before, double elapsed, double left) {
+    const Node& root = s.nodes[s.root];
+    long done = (long)root.n - visits_before;
+    if (root.num_edges < 2 || done < DECIDED_MIN_VISITS || elapsed <= 0) return root.num_edges == 1;
+    long extra = (long)(done / elapsed * left) + 1;
+    return leading_edge(s, root, extra) >= 0;
+}
+
 // Searches `s`'s tree with all the engine's workers: `visits` visits, or with none, until `seconds`
-// pass, or either way until halted (`search_halt`). Batches in flight then are finished. Returns the
-// leaves evaluated.
-long engine_search(Engine* engine, Search* s, int visits, double seconds) {
+// pass (or, with `stop_decided`, its move is decided: `decided_on_clock`), or either way until
+// halted (`search_halt`). Batches in flight then are finished. Returns the leaves evaluated.
+long engine_search(Engine* engine, Search* s, int visits, double seconds, int stop_decided) {
     using clock = std::chrono::steady_clock;
     auto start = clock::now();
     auto deadline = start + std::chrono::duration_cast<clock::duration>(std::chrono::duration<double>(seconds));
@@ -936,18 +950,26 @@ long engine_search(Engine* engine, Search* s, int visits, double seconds) {
     s->remaining = timed ? INT_MAX : visits;
     s->budget = timed ? 0 : visits;
     s->decided = -1;
+    bool watch = timed && stop_decided && s->root >= 0;
+    long visits_before = watch ? (long)s->nodes[s->root].n : 0;
     std::mutex lock;
     std::condition_variable applied;
     long generation = 0;
     bool stop = false;
     long leaves = 0;
+    auto decided = [&](clock::time_point now) {
+        if (!watch || generation % DECIDED_CHECK_EVERY != 0) return false;
+        return decided_on_clock(*s, visits_before, std::chrono::duration<double>(now - start).count(),
+                                std::chrono::duration<double>(deadline - now).count());
+    };
     auto work = [&](Worker& w) {
         long calls = 0, mine = 0;
         double inferring = 0;
         std::unique_lock<std::mutex> held(lock);
         while (true) {
+            auto now = timed ? clock::now() : start;
             if (stop || s->remaining <= 0 || s->halted.on.load(std::memory_order_relaxed) ||
-                (timed && clock::now() >= deadline)) {
+                (timed && (now >= deadline || decided(now)))) {
                 stop = true;
                 applied.notify_all();
                 break;

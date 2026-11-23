@@ -352,7 +352,7 @@ def net_player(options: dict[str, str]) -> Callable[[], Player]:
     `solve_cost` its expected seconds at 24 empties on 8 threads (on a clock, it solves from as
     many empties as that affords). `reserve_tree=1` sets aside the tree's room for the game once
     its first search shows its pace (see `NetPlayer`), sparing the workers a wait each time it
-    grows."""
+    grows. On a clock, `stop_decided=1` ends a move's search once its move can't change."""
     from cpu_match import NetPlayer, Solving, make_engine, make_eval
     from cpu_match import Player as NetSpec
 
@@ -370,6 +370,7 @@ def net_player(options: dict[str, str]) -> Callable[[], Player]:
             threads=cores,
             cost_at_24=float(options.pop("solve_cost", Solving.cost_at_24)),
         )
+    stop_decided = bool(int(options.pop("stop_decided", 0)))
     fields = ",".join(f"{k}={v}" for k, v in options.items())
     spec = NetSpec.parse(f"visits=0,{fields}", options["net"], "bf16")
     evaluate = (
@@ -381,7 +382,14 @@ def net_player(options: dict[str, str]) -> Callable[[], Player]:
     # a seed to a game, for its draws of symmetries
     seeds = itertools.count()
     return lambda: NetPlayer(
-        spec.settings, evaluate, taper, next(seeds), spec.visits, solving, reserve_tree
+        spec.settings,
+        evaluate,
+        taper,
+        next(seeds),
+        spec.visits,
+        solving,
+        reserve_tree,
+        stop_decided,
     )
 
 

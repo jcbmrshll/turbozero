@@ -263,6 +263,16 @@ def resolve_net(
         # it, off, keep their ids
         if "visits" in budget and descend != 0:
             search["descend"] = 2 if descend is None else descend
+        # on a clock, a move's search ends once its move can't change (`cpu_match.NetPlayer`):
+        # on unless said, and in the config only when on, so the players from before it, off,
+        # keep their ids
+        stop = _typed("stop_decided", options.pop("stop_decided", None), int)
+        if stop not in (None, 0, 1):
+            raise ValueError(f"stop_decided={stop}: 0 or 1")
+        if stop and "visits" in budget:
+            raise ValueError("stop_decided needs a clock: at fixed visits see descend")
+        if "visits" not in budget and stop != 0:
+            search["stop_decided"] = 1
     if options:
         raise ValueError(f"unknown options for a {device} network: {sorted(options)}")
     config: dict[str, Any] = {
@@ -287,6 +297,7 @@ def resolve_net(
     where = device + (f"/{search['backend']}" if device == "cpu" else "")
     solve = f" solve{search['solve']}" if "solve" in search else ""
     solve += {0: "", 1: " descend", 2: " descend-recursive"}[search.get("descend", 0)]
+    solve += " stop-decided" if search.get("stop_decided") else ""
     temperature = search.get("prior_temperature")
     prior = f" T{temperature:g}" if temperature != known["prior_temperature"][1] else ""
     if device == "gpu-batched" and "c_init" in search:
