@@ -25,6 +25,22 @@
   input { font: inherit; padding: 3px 6px; width: 260px; }
   .stats { display: flex; gap: 24px; margin: 0 0 16px; }
   .stats div b { display: block; font-size: 18px; }
+  .game { display: grid; grid-template-columns: 340px minmax(0, 1fr); gap: 24px; align-items: start; }
+  @media (max-width: 1000px) { .game { grid-template-columns: 1fr; } }
+  .board svg { width: 100%; height: auto; display: block; }
+  .nav { display: flex; align-items: center; gap: 8px; margin: 8px 0 16px; }
+  .nav button { font: inherit; padding: 2px 10px; }
+  .chart { position: relative; margin: 0 0 16px; }
+  .chart svg { width: 100%; height: auto; display: block; }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 0 0 8px; }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
+  .tip { position: absolute; pointer-events: none; background: #fff; border: 1px solid #d2d2d7; border-radius: 6px;
+         padding: 6px 8px; font-size: 12px; line-height: 1.5; box-shadow: 0 2px 8px rgba(0,0,0,.08); white-space: nowrap; display: none; z-index: 1; }
+  .moves { max-height: 70vh; overflow: auto; }
+  .moves th { cursor: default; }
+  .moves tbody tr { cursor: pointer; }
+  .moves tr.opening td { color: #6e6e73; }
+  .moves tr.sel td { background: #e8f0fe; }
 </style>
 </head>
 <body>
@@ -83,6 +99,10 @@ function table(columns, rows, sort) {
   return el;
 }
 
+// the two players of a game, by who moved first: their colors on the charts
+const SIDE_COLOR = { 1: "#2a78d6", 2: "#eb6834" };
+const SIDE_NAME = { 1: "black", 2: "white" };
+const gameLink = (g, text) => `<a href="#game/${g.id}">${text}</a>`;
 const record = (r) => `<span class="win">${r.wins}</span>-${r.draws}-<span class="loss">${r.losses}</span>`;
 
 function playerColumns(rank) {
@@ -101,6 +121,17 @@ const resultCell = (g) => (g.result > 0 ? "1-0" : g.result < 0 ? "0-1" : "½-½"
 const marginCell = (g) => (g.margin === null ? "" : (g.margin > 0 ? "+" : "") + g.margin);
 const endingCell = (g) =>
   (g.ending === "solved" ? `solved at ${g.solved_at}` : g.ending) + (g.flagged ? ` · ${g.flagged === "b" ? "black" : "white"} flagged` : "");
+
+function gameColumns() {
+  return [
+    { key: "finished", label: "When", value: (g) => g.finished, cell: (g) => gameLink(g, `<span title="${new Date(g.finished * 1000).toLocaleString()}">${ago(g.finished)}</span>`) },
+    { key: "black", label: "Black", cls: "name", value: (g) => g.black_name, cell: (g) => playerLink(g.black, g.black_name), dir: 1 },
+    { key: "white", label: "White", cls: "name", value: (g) => g.white_name, cell: (g) => playerLink(g.white, g.white_name), dir: 1 },
+    { key: "result", label: "Result", value: (g) => Math.sign(g.result), cell: resultCell },
+    { key: "margin", label: "Discs", value: (g) => g.margin ?? 0, cell: marginCell },
+    { key: "ending", label: "Ended", value: (g) => g.ending, cell: endingCell, dir: 1 },
+  ];
+}
 
 async function showLeague() {
   const s = await get("/api/summary");
@@ -127,18 +158,7 @@ async function showLeague() {
   filter.addEventListener("input", drawPlayers);
   drawPlayers();
 
-  const recent = table(
-    [
-      { key: "finished", label: "When", value: (g) => g.finished, cell: (g) => `<span title="${new Date(g.finished * 1000).toLocaleString()}">${ago(g.finished)}</span>` },
-      { key: "black", label: "Black", cls: "name", value: (g) => g.black_name, cell: (g) => playerLink(g.black, g.black_name), dir: 1 },
-      { key: "white", label: "White", cls: "name", value: (g) => g.white_name, cell: (g) => playerLink(g.white, g.white_name), dir: 1 },
-      { key: "result", label: "Result", value: (g) => Math.sign(g.result), cell: resultCell },
-      { key: "margin", label: "Discs", value: (g) => g.margin ?? 0, cell: marginCell },
-      { key: "ending", label: "Ended", value: (g) => g.ending, cell: endingCell, dir: 1 },
-    ],
-    s.recent,
-    { key: "finished", dir: -1 },
-  );
+  const recent = table(gameColumns(), s.recent, { key: "finished", dir: -1 });
 
   const left = document.createElement("section");
   left.innerHTML = "<h2>Players</h2>";
@@ -153,7 +173,7 @@ async function showLeague() {
 }
 
 async function showPlayer(id) {
-  const { player: p, opponents } = await get(`/api/player?id=${encodeURIComponent(id)}`);
+  const { player: p, opponents, games } = await get(`/api/player?id=${encodeURIComponent(id)}`);
   document.title = p.name;
   view.innerHTML = `
     <h2>${esc(p.name)} <span class="muted">${esc(p.id)} · pool ${p.pool}</span></h2>
@@ -168,12 +188,387 @@ async function showPlayer(id) {
   columns.splice(3, 0, { key: "diff", label: "Diff", value: (r) => r.elo - p.elo, cell: (r) => `${r.elo >= p.elo ? "+" : ""}${elo(r.elo - p.elo)} ± ${r.diff_sd.toFixed(0)}` });
   columns[0].label = "Opponent";
   view.append(table(columns, opponents, { key: "games", dir: -1 }));
+  const title = document.createElement("h3");
+  title.textContent = "Latest games";
+  view.append(title, table(gameColumns(), games, { key: "finished", dir: -1 }));
 }
+
+// ---- a game, move by move ----
+
+const FILES = "abcdefgh";
+const squareName = (m) => FILES[m % 8] + (Math.floor(m / 8) + 1);
+const DIRECTIONS = [[0, 1], [0, -1], [1, 0], [-1, 0], [1, 1], [1, -1], [-1, 1], [-1, -1]];
+
+// the discs `me` (1 black, 2 white) turns by playing `m` on `cells` (64, a1 first: 0 empty)
+function flipsOf(cells, me, m) {
+  if (cells[m]) return [];
+  const row = Math.floor(m / 8), col = m % 8, out = [];
+  for (const [dr, dc] of DIRECTIONS) {
+    const line = [];
+    let r = row + dr, c = col + dc;
+    while (r >= 0 && r < 8 && c >= 0 && c < 8 && cells[r * 8 + c] === 3 - me) {
+      line.push(r * 8 + c);
+      r += dr;
+      c += dc;
+    }
+    if (line.length && r >= 0 && r < 8 && c >= 0 && c < 8 && cells[r * 8 + c] === me) out.push(...line);
+  }
+  return out;
+}
+const hasMove = (cells, me) => cells.some((_, m) => flipsOf(cells, me, m).length > 0);
+
+function startPosition(start) {
+  const cells = Array(64).fill(0);
+  if (start.startsWith("board:")) {
+    const text = start.slice("board:".length);
+    for (let i = 0; i < 64; i++) cells[i] = text[i] === "*" ? 1 : text[i] === "O" ? 2 : 0;
+    return { cells, toMove: text[64] === "*" ? 1 : 2 };
+  }
+  cells[28] = cells[35] = 1;
+  cells[27] = cells[36] = 2;
+  return { cells, toMove: 1 };
+}
+
+// each move: who made it, the board after it, its seconds and what its search made of it;
+// passes aren't moves, so who moved is whoever had a move
+function replayGame(g) {
+  let { cells, toMove } = startPosition(g.start);
+  const start = cells;
+  const plies = g.moves.map((m, i) => {
+    if (!hasMove(cells, toMove)) toMove = 3 - toMove;
+    const flipped = flipsOf(cells, toMove, m);
+    cells = [...cells];
+    cells[m] = toMove;
+    for (const f of flipped) cells[f] = toMove;
+    const k = i - g.opening_moves;
+    const ply = {
+      n: i + 1, move: m, side: toMove, cells, opening: k < 0,
+      seconds: k >= 0 ? g.move_seconds[k] ?? null : null,
+      info: k >= 0 ? g.move_info[k] ?? null : null,
+    };
+    toMove = 3 - toMove;
+    return ply;
+  });
+  return { start, plies };
+}
+
+// a search's value for the player to move, -1 to 1, a network's own scale (about P(win) -
+// P(loss)): its root value; a solve's result; an engine's disc score as ggs_player.value_discs
+// relates the two, tanh(discs / 6.5) (10 discs about a 90% win)
+function value(info) {
+  if (!info) return null;
+  if ("q" in info) return info.q;
+  if ("margin" in info) return Math.sign(info.margin);
+  if ("wdl" in info) return Math.sign(info.wdl);
+  if ("score" in info) return Math.tanh(info.score / 6.5);
+  return null;
+}
+// black's view of a move's value
+const blackValue = (ply) => {
+  const v = value(ply.info);
+  return v === null ? null : ply.side === 1 ? v : -v;
+};
+// what the search said itself, for the player to move: a network's q, an engine's discs
+const ownText = (info) =>
+  !info ? "" : "q" in info ? `q ${signed(info.q, 3)}` : "margin" in info ? `${signed(info.margin, 0)} discs` : "score" in info ? `${signed(info.score)} discs` : "";
+
+const signed = (x, digits = 1) => {
+  if (x === null || x === undefined) return "";
+  const text = Math.abs(x).toFixed(digits);
+  return (+text === 0 ? "" : x > 0 ? "+" : "−") + text;
+};
+const compact = (x) => (x === null || x === undefined ? "" : x >= 1e6 ? (x / 1e6).toFixed(2) + "M" : x >= 1e4 ? (x / 1e3).toFixed(1) + "k" : x.toLocaleString());
+const secs = (x) => (x === null || x === undefined ? "" : x.toFixed(x < 10 ? 2 : 1));
+const searchText = (info) => {
+  if (!info) return "";
+  if ("visits" in info) return `${compact(info.visits)} visits (${compact(info.added)} new)`;
+  if ("margin" in info) return "solved";
+  if ("wdl" in info) return "solved (win/draw/loss)";
+  const parts = [];
+  if ("depth" in info) parts.push(`depth ${info.depth}${info.probability !== undefined && info.probability < 100 ? "@" + info.probability + "%" : ""}`);
+  if ("nodes" in info) parts.push(`${compact(info.nodes)} nodes`);
+  return parts.join(" · ");
+};
+
+function boardSvg(cells, last) {
+  const S = 40, P = 18, size = P + 8 * S + 1;
+  let out = `<svg viewBox="0 0 ${size} ${size}" role="img">`;
+  out += `<rect x="${P}" y="${P}" width="${8 * S}" height="${8 * S}" fill="#2f7d4f"/>`;
+  for (let i = 0; i <= 8; i++) {
+    out += `<line x1="${P + i * S}" y1="${P}" x2="${P + i * S}" y2="${P + 8 * S}" stroke="#1d5634"/>`;
+    out += `<line x1="${P}" y1="${P + i * S}" x2="${P + 8 * S}" y2="${P + i * S}" stroke="#1d5634"/>`;
+  }
+  for (let i = 0; i < 8; i++) {
+    out += `<text x="${P + i * S + S / 2}" y="${P - 5}" font-size="11" text-anchor="middle" fill="#6e6e73">${FILES[i]}</text>`;
+    out += `<text x="${P / 2}" y="${P + i * S + S / 2 + 4}" font-size="11" text-anchor="middle" fill="#6e6e73">${i + 1}</text>`;
+  }
+  cells.forEach((c, m) => {
+    if (!c) return;
+    const x = P + (m % 8) * S + S / 2, y = P + Math.floor(m / 8) * S + S / 2;
+    out += `<circle cx="${x}" cy="${y}" r="${S * 0.41}" fill="${c === 1 ? "#1d1d1f" : "#fafafa"}" stroke="${c === 1 ? "#000" : "#c7c7cc"}"/>`;
+  });
+  if (last !== null) {
+    const x = P + (last % 8) * S + S / 2, y = P + Math.floor(last / 8) * S + S / 2;
+    out += `<circle cx="${x}" cy="${y}" r="4.5" fill="#e5484d"/>`;
+  }
+  return out + "</svg>";
+}
+
+// a chart over the game's moves, 1 to `n` (and `n` + 1, the end, with `end`): `body` draws its
+// marks given x of a move and y of a value; one cursor at the selected move, one on hover
+function moveChart({ n, domain, ticks, tickText, height, body, shade }) {
+  const W = 800, L = 44, R = 64, T = 8, B = 22, H = height;
+  const x = (i) => L + ((i - 0.5) / n) * (W - L - R);
+  const y = (v) => T + (1 - (v - domain[0]) / (domain[1] - domain[0])) * (H - T - B);
+  let out = `<svg viewBox="0 0 ${W} ${H}">`;
+  if (shade) out += `<rect x="${L}" y="${T}" width="${x(shade + 0.5) - L}" height="${H - T - B}" fill="#f2f2f2"/>`;
+  for (const t of ticks) {
+    out += `<line x1="${L}" x2="${W - R}" y1="${y(t)}" y2="${y(t)}" stroke="${t === 0 ? "#c7c7cc" : "#ececec"}"/>`;
+    out += `<text x="${L - 6}" y="${y(t) + 4}" font-size="11" text-anchor="end" fill="#6e6e73">${tickText(t)}</text>`;
+  }
+  const every = n > 40 ? 10 : 5;
+  for (let i = every; i <= n; i += every) {
+    out += `<text x="${x(i)}" y="${H - 6}" font-size="11" text-anchor="middle" fill="#6e6e73">${i}</text>`;
+  }
+  out += body(x, y);
+  out += `<line class="sel" y1="${T}" y2="${H - B}" stroke="#1d1d1f" stroke-opacity="0.35"/>`;
+  out += `<line class="hover" y1="${T}" y2="${H - B}" stroke="#1d1d1f" stroke-opacity="0.2" stroke-dasharray="3 3" visibility="hidden"/>`;
+  out += `<rect class="hit" x="${L}" y="0" width="${W - L - R}" height="${H}" fill="transparent"/>`;
+  out += "</svg>";
+  return { svg: out, x, n, L, R, W };
+}
+
+function niceTicks(limit, count) {
+  const raw = limit / count;
+  const step = [1, 2, 4, 5, 8, 10, 16, 20, 32].find((s) => s >= raw) || 64;
+  const top = Math.ceil(limit / step) * step;
+  const out = [];
+  for (let t = 0; t <= top + 1e-9; t += step) out.push(t);
+  return { top, ticks: out };
+}
+
+async function showGame(id) {
+  const { game: g } = await get(`/api/game?id=${encodeURIComponent(id)}`);
+  const { start, plies } = replayGame(g);
+  const names = { 1: g.black_name, 2: g.white_name };
+  const ids = { 1: g.black, 2: g.white };
+  document.title = `${g.black_name} vs ${g.white_name}`;
+  const ended = endingCell(g) + (g.hard ? ` · ${g.hard === "b" ? "black" : "white"} out of time` : "");
+  const host = g.host ? `${g.host.cpu || g.host.machine || ""}${g.host.hostname ? " · " + g.host.hostname : ""}` : "";
+
+  view.innerHTML = `
+    <h2>${playerLink(g.black, g.black_name)} <span class="muted">vs</span> ${playerLink(g.white, g.white_name)}</h2>
+    <div class="stats">
+      <div><span class="muted">Result</span><b>${resultCell(g)}${g.margin === null ? "" : ` (${marginCell(g)})`}</b></div>
+      <div><span class="muted">Ended</span><b>${esc(ended)}</b></div>
+      <div><span class="muted">Black's time</span><b>${g.black_seconds === null ? "" : secs(g.black_seconds) + " s"}</b></div>
+      <div><span class="muted">White's time</span><b>${g.white_seconds === null ? "" : secs(g.white_seconds) + " s"}</b></div>
+      <div><span class="muted">Start</span><b>${esc(g.start.startsWith("board:") ? "board" : g.start)}</b></div>
+      <div><span class="muted">Played</span><b><span title="${new Date(g.finished * 1000).toLocaleString()}">${ago(g.finished)}</span></b></div>
+    </div>
+    <div class="muted" style="margin: -8px 0 16px">${esc(g.match)} #${g.number}${host ? " · " + esc(host) : ""}</div>
+    <div class="game">
+      <section>
+        <div class="board"></div>
+        <div class="nav">
+          <button data-step="first">⏮</button><button data-step="-1">◀</button>
+          <button data-step="1">▶</button><button data-step="last">⏭</button>
+          <span class="where"></span>
+        </div>
+      </section>
+      <section>
+        <div class="legend">${[1, 2].map((s) => `<span><span class="swatch" style="background:${SIDE_COLOR[s]}"></span>${SIDE_NAME[s]}: ${esc(names[s])}</span>`).join("")}</div>
+        <h3 class="value-part" style="margin-top:0">Value for black</h3>
+        <div class="chart value value-part"><div class="tip"></div></div>
+        <h3>Seconds</h3>
+        <div class="chart time"><div class="tip"></div></div>
+      </section>
+    </div>
+    <h3>Moves</h3>
+    <div class="moves"></div>`;
+
+  const n = plies.length;
+  // black's result, on the value's scale, after the last move
+  const final = Math.sign(g.result);
+  const count = n + 1;
+
+  // value chart
+  const values = plies.map(blackValue);
+  const valueChart = moveChart({
+    n: count, domain: [-1, 1], height: 240, shade: g.opening_moves,
+    ticks: [-1, -0.5, 0, 0.5, 1],
+    tickText: (t) => signed(t, 1),
+    body: (x, y) => {
+      let out = "";
+      for (const side of [1, 2]) {
+        const points = plies.map((p, i) => (p.side === side && values[i] !== null ? [x(p.n), y(values[i])] : null)).filter(Boolean);
+        if (!points.length) continue;
+        out += `<polyline points="${points.map((q) => q.join(",")).join(" ")}" fill="none" stroke="${SIDE_COLOR[side]}" stroke-width="2" stroke-linejoin="round"/>`;
+        for (const [px, py] of points) out += `<circle cx="${px}" cy="${py}" r="4" fill="${SIDE_COLOR[side]}" stroke="#fff" stroke-width="2"/>`;
+      }
+      // direct labels at each line's last point, kept apart
+      const ends = [1, 2].map((side) => {
+        const i = plies.map((p, k) => (p.side === side && values[k] !== null ? k : -1)).filter((k) => k >= 0).pop();
+        return i === undefined ? null : { side, y: y(values[i]) };
+      }).filter(Boolean);
+      if (ends.length === 2 && Math.abs(ends[0].y - ends[1].y) < 13) {
+        const mid = (ends[0].y + ends[1].y) / 2, up = ends[0].y <= ends[1].y ? 0 : 1;
+        ends[up].y = mid - 7;
+        ends[1 - up].y = mid + 7;
+      }
+      const labelX = x(count) + 10;
+      for (const e of ends) out += `<text x="${labelX}" y="${e.y + 4}" font-size="11" fill="#1d1d1f">${SIDE_NAME[e.side]}</text>`;
+      out += `<rect x="${x(count) - 5}" y="${y(final) - 5}" width="10" height="10" transform="rotate(45 ${x(count)} ${y(final)})" fill="#6e6e73" stroke="#fff" stroke-width="2"/>`;
+      return out;
+    },
+  });
+
+  // time chart
+  const seconds = plies.map((p) => p.seconds);
+  const tt = niceTicks(Math.max(0.01, ...seconds.filter((s) => s !== null)), 3);
+  const timeChart = moveChart({
+    n: count, domain: [0, tt.top], height: 150, shade: g.opening_moves,
+    ticks: tt.ticks, tickText: (t) => (tt.top < 1 ? t.toFixed(2) : String(+t.toFixed(2))),
+    body: (x, y) => {
+      const band = x(2) - x(1), w = Math.max(1, Math.min(band - 2, 14));
+      return plies.map((p) => (p.seconds === null ? "" :
+        `<rect x="${x(p.n) - w / 2}" y="${y(p.seconds)}" width="${w}" height="${Math.max(0, y(0) - y(p.seconds))}" rx="${Math.min(2, w / 2)}" fill="${SIDE_COLOR[p.side]}"/>`)).join("");
+    },
+  });
+
+  const charts = [[view.querySelector(".chart.value"), valueChart], [view.querySelector(".chart.time"), timeChart]];
+  if (values.every((v) => v === null)) {
+    // a game whose moves' searches weren't recorded
+    for (const el of view.querySelectorAll(".value-part")) el.remove();
+    charts.shift();
+  }
+  for (const [el, chart] of charts) el.insertAdjacentHTML("beforeend", chart.svg);
+
+  // what each side last made of the game, up to move i
+  const latest = (side, i) => {
+    for (let k = i - 1; k >= 0; k--) if (plies[k].side === side && values[k] !== null) return k;
+    return -1;
+  };
+  const tipFor = (i) => {
+    if (i > n) return `End · ${resultCell(g)}${g.margin === null ? "" : ` (${marginCell(g)})`}${g.ending === "solved" ? ` · solved at ${g.solved_at}` : ""}`;
+    const p = plies[i - 1];
+    let out = `<b>${i}. ${squareName(p.move)}</b> ${SIDE_NAME[p.side]}${p.opening ? " · opening" : ""}`;
+    if (p.seconds !== null) out += ` · ${secs(p.seconds)} s`;
+    if (p.info) out += `<br>${esc(searchText(p.info))}`;
+    for (const side of [1, 2]) {
+      const k = latest(side, i);
+      if (k >= 0) out += `<br><span class="swatch" style="background:${SIDE_COLOR[side]}"></span>${signed(values[k], 2)} <span class="muted">${esc(ownText(plies[k].info))}${k === i - 1 ? "" : ` · move ${k + 1}`}</span>`;
+    }
+    return out;
+  };
+
+  let selected = n;
+  const board = view.querySelector(".board");
+  const where = view.querySelector(".where");
+  const movesBox = view.querySelector(".moves");
+
+  const rows = plies.map((p, i) => {
+    const v = values[i];
+    const info = p.info || {};
+    return `<tr data-ply="${p.n}" class="${p.opening ? "opening" : ""}">
+      <td>${p.n}</td>
+      <td class="name"><span class="swatch" style="background:${SIDE_COLOR[p.side]}"></span>${SIDE_NAME[p.side]}</td>
+      <td class="name">${squareName(p.move)}</td>
+      <td>${secs(p.seconds)}</td>
+      <td>${signed(v, 2)}</td>
+      <td>${"q" in info ? signed(info.q, 3) : ""}</td>
+      <td>${"score" in info ? signed(info.score) : "margin" in info ? signed(info.margin, 0) : ""}</td>
+      <td>${compact(info.visits)}</td>
+      <td>${compact(info.added)}</td>
+      <td>${info.depth ?? ""}${info.probability !== undefined && info.probability < 100 ? "@" + info.probability + "%" : ""}</td>
+      <td>${compact(info.nodes)}</td>
+      <td class="name">${"margin" in info ? "solved" : "wdl" in info ? "solved (wdl)" : p.opening ? "opening" : ""}</td>
+    </tr>`;
+  }).join("");
+  movesBox.innerHTML = `<table><thead><tr>
+    <th>#</th><th class="name">Side</th><th class="name">Move</th><th>Seconds</th><th>Value</th><th>q</th><th>Discs</th>
+    <th>Visits</th><th>New visits</th><th>Depth</th><th>Nodes</th><th class="name"></th>
+    </tr></thead><tbody>${rows}</tbody></table>`;
+
+  const select = (i) => {
+    selected = Math.max(0, Math.min(n, i));
+    const cells = selected === 0 ? start : plies[selected - 1].cells;
+    board.innerHTML = boardSvg(cells, selected === 0 ? null : plies[selected - 1].move);
+    const b = cells.filter((c) => c === 1).length, w = cells.filter((c) => c === 2).length;
+    where.textContent = selected === 0 ? `start · ${b}-${w}` : `${selected} / ${n} · ${squareName(plies[selected - 1].move)} · ${b}-${w}`;
+    for (const [el, chart] of charts) {
+      const line = el.querySelector("line.sel");
+      const cx = selected === 0 ? -10 : chart.x(selected);
+      line.setAttribute("x1", cx);
+      line.setAttribute("x2", cx);
+    }
+    movesBox.querySelectorAll("tr.sel").forEach((r) => r.classList.remove("sel"));
+    const row = movesBox.querySelector(`tr[data-ply="${selected}"]`);
+    if (row) {
+      row.classList.add("sel");
+      if (row.offsetTop < movesBox.scrollTop + 30 || row.offsetTop > movesBox.scrollTop + movesBox.clientHeight - 30) {
+        movesBox.scrollTop = row.offsetTop - movesBox.clientHeight / 2;
+      }
+    }
+  };
+
+  for (const [el, chart] of charts) {
+    const svg = el.querySelector("svg"), tip = el.querySelector(".tip"), hover = el.querySelector("line.hover");
+    const plyAt = (event) => {
+      const box = svg.getBoundingClientRect();
+      const px = ((event.clientX - box.left) / box.width) * chart.W;
+      return Math.max(1, Math.min(count, Math.round(((px - chart.L) / (chart.W - chart.L - chart.R)) * count + 0.5)));
+    };
+    svg.addEventListener("mousemove", (event) => {
+      const i = plyAt(event);
+      hover.setAttribute("x1", chart.x(i));
+      hover.setAttribute("x2", chart.x(i));
+      hover.setAttribute("visibility", "visible");
+      tip.innerHTML = tipFor(i);
+      tip.style.display = "block";
+      const box = el.getBoundingClientRect();
+      const left = event.clientX - box.left + 14;
+      tip.style.left = `${Math.min(left, box.width - tip.offsetWidth - 4)}px`;
+      tip.style.top = `${event.clientY - box.top + 14}px`;
+    });
+    svg.addEventListener("mouseleave", () => {
+      hover.setAttribute("visibility", "hidden");
+      tip.style.display = "none";
+    });
+    svg.addEventListener("click", (event) => select(Math.min(plyAt(event), n)));
+  }
+  movesBox.addEventListener("click", (event) => {
+    const row = event.target.closest("tr[data-ply]");
+    if (row) select(+row.dataset.ply);
+  });
+  view.querySelector(".nav").addEventListener("click", (event) => {
+    const step = event.target.closest("button")?.dataset.step;
+    if (!step) return;
+    select(step === "first" ? 0 : step === "last" ? n : selected + +step);
+  });
+  keys = (event) => {
+    if (event.target.closest("input")) return;
+    const moves = { ArrowLeft: -1, ArrowRight: 1, ArrowUp: -1, ArrowDown: 1 };
+    if (event.key in moves) select(selected + moves[event.key]);
+    else if (event.key === "Home") select(0);
+    else if (event.key === "End") select(n);
+    else return;
+    event.preventDefault();
+  };
+  select(n);
+}
+
+// the game view's keys, while it's showing
+let keys = null;
+document.addEventListener("keydown", (event) => keys && keys(event));
 
 async function route() {
   const match = location.hash.match(/^#player\/(.+)$/);
+  const game = location.hash.match(/^#game\/(\d+)$/);
+  keys = null;
   try {
     if (match) await showPlayer(decodeURIComponent(match[1]));
+    else if (game) await showGame(game[1]);
     else await showLeague();
   } catch (e) {
     view.textContent = String(e.message || e);

@@ -135,6 +135,37 @@ def status(url, path):
         return e.code, e.read()
 
 
+def test_a_game_is_there_move_by_move_with_what_its_searches_said(path):
+    store = Store(path)
+    found = {p.label: p.id for p in store.players()}
+    store.start_match("m-yz", found["y"], found["z"], {}, "local", "abc", 2)
+    said = [{"q": 0.25, "visits": 100, "added": 60}, None]
+    record = game("m-yz", 0, found["y"], found["z"], -6, 5.0)
+    record.moves, record.move_seconds, record.move_info = (
+        [19, 18, 17],
+        [0.5, 0.25],
+        said,
+    )
+    store.record_games([record, game("m-yz", 1, found["z"], found["y"], 2, 6.0)])
+    # kept as it came, and only for the game that had it
+    assert [g.move_info for g in store.games("m-yz")] == [said, []]
+    ids_ = [
+        r[0] for r in store.db.execute("SELECT id FROM games WHERE match_id = 'm-yz'")
+    ]
+    store.close()
+    evals = Evals(path)
+    shown = evals.game(ids_[0])
+    assert shown is not None
+    g = shown["game"]
+    assert (g["black_name"], g["white_name"], g["moves"]) == ("y", "z", [19, 18, 17])
+    assert (g["move_seconds"], g["move_info"]) == ([0.5, 0.25], said)
+    assert evals.game(ids_[1])["game"]["move_info"] == []  # pyright: ignore[reportOptionalSubscript]
+    assert evals.game(10**9) is None
+    # and on its players' pages, latest first
+    games = evals.player(found["y"])["games"]  # pyright: ignore[reportOptionalSubscript]
+    assert [x["finished"] for x in games] == [6.0, 5.0, 2.0, 1.0]
+
+
 def test_the_server_answers_the_page_and_its_questions(url, path):
     code, page = status(url, "/")
     assert code == 200 and b"<html" in page
@@ -143,4 +174,7 @@ def test_the_server_answers_the_page_and_its_questions(url, path):
     assert status(url, f"/api/player?id={ids(path)['x']}")[0] == 200
     assert status(url, "/api/player?id=p-nobody")[0] == 404
     assert status(url, "/api/player")[0] == 404
+    assert status(url, "/api/game?id=1")[0] == 200
+    assert status(url, "/api/game?id=999")[0] == 404
+    assert status(url, "/api/game?id=x")[0] == 404
     assert status(url, "/nothing")[0] == 404

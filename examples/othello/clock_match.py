@@ -21,7 +21,7 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 import numpy as np
 from engines import (
@@ -59,6 +59,11 @@ class Player(Protocol):
 
     def move(self, color: str, seconds_left: float) -> int: ...
 
+    def info(self) -> dict[str, Any] | None:
+        """What its search made of its last move's position, if it says: for the game's record
+        (`core.evals.store.GameRecord.move_info`)."""
+        ...
+
     def close(self) -> None: ...
 
 
@@ -77,6 +82,9 @@ class LevelEngine:
     def move(self, color: str, seconds_left: float) -> int:
         return self.engine.genmove(color)
 
+    def info(self) -> dict[str, Any] | None:
+        return self.engine.move_info()
+
     def close(self) -> None:
         self.engine.close()
 
@@ -91,6 +99,8 @@ class Game:
             timeouts' losses (`ggs.game_result`)
         seconds: each side's time used, black's then white's
         move_seconds: the time of each move searched, as (empties, black?, seconds)
+        move_info: what the player's search made of each of those moves' positions, if it said
+            (`Player.info`)
         flagged: who ran out of time first, "b" or "w", if anyone did (a soft timeout)
         hard: who ran out of a GGS clock's extension too, which ended the game
         start: the position it started from, if not the standard one (`ggs.Start.text`)
@@ -103,6 +113,7 @@ class Game:
     result: int = 0
     seconds: list[float] = field(default_factory=lambda: [0.0, 0.0])
     move_seconds: list[tuple[int, bool, float]] = field(default_factory=list)
+    move_info: list[dict[str, Any] | None] = field(default_factory=list)
     flagged: str | None = None
     hard: str | None = None
     start: str | None = None
@@ -200,6 +211,7 @@ class GameRun:
         clock.charge(spent)
         game.seconds[side] += spent
         game.move_seconds.append((empties, not side, spent))
+        game.move_info.append(self.players[side].info())
         if game.flagged is None and clock.soft:
             game.flagged = color
         board.play(move)

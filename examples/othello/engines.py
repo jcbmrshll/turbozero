@@ -292,6 +292,16 @@ class GTPEngine:
         """What the search that chose `move` made of the position, from its logs."""
         raise NotImplementedError
 
+    def move_info(self) -> dict[str, Any] | None:
+        """What the search of its last move made of the position, for a game's record, if it
+        says: its `score`, the final disc margin it expects for the player who moved, and what
+        else it tells of its search."""
+        return None
+
+    def binary_sha256(self, binary: Path) -> str:
+        """What its binary is (see `IDENTITY_FILES`)."""
+        return file_sha256(binary)
+
     def weights(self) -> list[Path]:
         """The files it evaluates positions with."""
         raise NotImplementedError
@@ -316,7 +326,7 @@ class GTPEngine:
             "book": book,
             "hash": hash_size,
             "command": arguments[1:],
-            "binary_sha256": file_sha256(Path(arguments[0])),
+            "binary_sha256": self.binary_sha256(Path(arguments[0])),
             "weights_sha256": {p.name: file_sha256(p) for p in self.weights()},
         }
 
@@ -653,6 +663,10 @@ class ClockedEngine:
     def move(self, color: str, seconds_left: float) -> int:
         """The engine's move for `color`, which it also plays."""
         raise NotImplementedError
+
+    def info(self) -> dict[str, Any] | None:
+        """What its search made of its last move's position, if it says (`GTPEngine.move_info`)."""
+        return None
 
     def close(self) -> None:
         raise NotImplementedError
@@ -998,7 +1012,8 @@ class NeuralReversi(GTPEngine):
     searches like Edax with a neural network's evaluation, built with
     `setup_neural_reversi.sh`, over GTP. Its levels are its own (up to 30): up to 10, L moves
     ahead and exact from 2L empties, as Edax's, but with ProbCut at 86% in the middle game.
-    It has no opening book, and doesn't say what its search made of the position."""
+    It has no opening book. Our build's GTP writes what each genmove's search made of the position
+    to stderr (setup_neural_reversi.sh), read into `move_info`."""
 
     name = "neural-reversi"
     setup_script = "setup_neural_reversi.sh"
@@ -1013,12 +1028,43 @@ class NeuralReversi(GTPEngine):
     def installed(cls, engine_dir: Path) -> bool:
         return (engine_dir / "target" / "release" / "cli").exists()
 
+    def __init__(
+        self,
+        engine_dir: Path,
+        level: int,
+        analyse: bool = True,
+        args: Sequence[str] = (),
+        threads: int = 1,
+    ):
+        # its stderr in line with its replies, for its searches' lines
+        super().__init__(engine_dir, level, analyse, args, threads)
+
     def command_line(self, engine_dir: Path, level: int) -> list[str]:
         return [str(engine_dir / "target" / "release" / "cli"), "gtp",
                 "--level", str(level), "--threads", str(self.threads)]  # fmt: skip
 
     def read_analysis(self, move: int) -> list[Analysis] | None:
         return None
+
+    def move_info(self) -> dict[str, Any] | None:
+        # "search score 2.37 depth 18 probability 86 endgame false nodes 123456", before the
+        # reply to genmove: the score for the player to move, in discs; ProbCut's confidence
+        # in percent (100 for none)
+        found = [m for line in self.log if (m := _NR_SEARCH.match(line))]
+        # depth 0: a move it played without searching, the start's random one
+        if not found or found[-1][2] == "0":
+            return None
+        m = found[-1]
+        return {
+            "score": float(m[1]),
+            "depth": int(m[2]),
+            "probability": int(m[3]),
+            "endgame": m[4] == "true",
+            "nodes": int(m[5]),
+        }
+
+    def binary_sha256(self, binary: Path) -> str:
+        return (binary.parent / "upstream.sha256").read_text().strip()
 
     def weights(self) -> list[Path]:
         # compiled into the binary, from these
@@ -1050,6 +1096,10 @@ class NeuralReversi(GTPEngine):
         return black.bit_count(), white.bit_count()
 
 
+# what our build's GTP writes of each genmove's search (see `NeuralReversi.move_info`)
+_NR_SEARCH = re.compile(
+    r"search score (-?[\d.]+) depth (\d+) probability (\d+) endgame (true|false) nodes (\d+)"
+)
 # a row of `cli solve`'s table, "|     2 |   15   |  +00  |    0:00.002 | ...": the position's
 # number, from 1, and its exact score for the player to move
 _SOLVE_ROW = re.compile(r"\|\s*(\d+)\s*\|\s*\d+\s*\|\s*([+-]\d+)\s*\|")
@@ -1231,6 +1281,9 @@ class ClockedNeuralReversi(ClockedEngine):
         self.engine.command(f"time_left {color} {int(max(seconds_left, 0))} 0")
         return self.engine.genmove(color)
 
+    def info(self) -> dict[str, Any] | None:
+        return self.engine.move_info()
+
     def close(self) -> None:
         self.engine.close()
 
@@ -1369,8 +1422,8 @@ RUNTIME: dict[str, tuple[str, ...]] = {
         "build/Melody",
         *(f"weight_{w}" for w in ("v11.bin", "0_v12.txt", "Va_v12.bin", "Vb_v12.bin")),
     ),
-    # its weights are in the binary
-    NeuralReversi.name: ("target/release/cli",),
+    # its weights are in the binary; upstream.sha256 is what the binary is (see `build_digest`)
+    NeuralReversi.name: ("target/release/cli", "target/release/upstream.sha256"),
     ClockedYmatioun.name: ("bin", "data"),
 }
 
@@ -1391,13 +1444,30 @@ def runtime_files(name: str, engine_dir: Path | None = None) -> list[Path]:
     return files
 
 
+# files whose identity is another's content: Neural Reversi's binary is its upstream build's,
+# whose sha256 its setup script keeps before patching it to log its searches, which doesn't change
+# how it plays (setup_neural_reversi.sh)
+IDENTITY_FILES: dict[str, dict[str, str]] = {
+    NeuralReversi.name: {"target/release/cli": "target/release/upstream.sha256"},
+}
+
+
 def build_digest(name: str, engine_dir: Path | None = None) -> str:
     """What `name`'s build is, by what's in the files it plays with: a rebuild that changes
-    any of them is another build."""
+    any of them is another build (but see `IDENTITY_FILES`)."""
     root = engine_dir if engine_dir is not None else default_dir(name)
+    standing_in = IDENTITY_FILES.get(name, {})
     digest = hashlib.sha256()
     for path in runtime_files(name, root):
-        digest.update(f"{path.relative_to(root)}\0{file_sha256(path)}\n".encode())
+        part = str(path.relative_to(root))
+        if part in standing_in.values():
+            continue
+        sha = (
+            (root / standing_in[part]).read_text().strip()
+            if part in standing_in
+            else file_sha256(path)
+        )
+        digest.update(f"{part}\0{sha}\n".encode())
     return digest.hexdigest()[:16]
 
 

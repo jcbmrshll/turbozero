@@ -1,0 +1,20 @@
+diff --git a/crates/cli/src/gtp.rs b/crates/cli/src/gtp.rs
+index 747c127..6884201 100644
+--- a/crates/cli/src/gtp.rs
++++ b/crates/cli/src/gtp.rs
+@@ -631,6 +631,15 @@ impl GtpEngine {
+             mode => SearchRunOptions::with_time(mode),
+         };
+         let result = self.search.run(self.game.board(), &options);
++        // what the search made of the position, for the referee's record of the game
++        eprintln!(
++            "search score {:.2} depth {} probability {} endgame {} nodes {}",
++            result.score().unwrap_or(0.0),
++            result.depth(),
++            result.probability(),
++            result.is_endgame(),
++            result.n_nodes()
++        );
+ 
+         if let Some(computer_move) = result.best_move() {
+             self.game

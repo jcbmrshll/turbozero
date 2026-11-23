@@ -52,6 +52,9 @@ class FirstLegal:
         self.board.play(move)
         return move
 
+    def info(self) -> dict[str, Any] | None:
+        return None
+
     def close(self):
         pass
 
@@ -376,3 +379,21 @@ def test_a_single_pair_has_no_intervals_and_writes_as_strict_json():
     assert pairs["disc_sum_ci95"] is None and pairs["game_elo_ci95"] is None
     assert pairs["decisive_elo"] is None and pairs["decisive_elo_ci95"] is None
     json.dumps(pairs, allow_nan=False)
+
+
+def test_a_game_keeps_what_each_players_search_said_of_its_moves(clock):
+    class Saying(FirstLegal):
+        def info(self):
+            return {"score": len(self.seconds_left)}
+
+    game = play_game(Saying(clock, 0), FirstLegal(clock, 0), (), 60.0)
+    assert len(game.move_info) == len(game.move_seconds) == len(game.moves)
+    said = [
+        (info, black) for info, (_, black, _) in zip(game.move_info, game.move_seconds)
+    ]
+    assert [info for info, black in said if black][:3] == [
+        {"score": 1},
+        {"score": 2},
+        {"score": 3},
+    ]
+    assert all(info is None for info, black in said if not black)

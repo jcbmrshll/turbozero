@@ -19,6 +19,7 @@ from engines import (
     ExactSolver,
     Melody,
     NeuralReversi,
+    build_digest,
     default_dir,
     edax_level,
 )
@@ -151,6 +152,43 @@ def test_neural_reversi_takes_a_board_with_setboard_and_whole_seconds_left():
     assert setboard.split()[0] == "setboard" and setboard.split()[2] == "W"
     assert setboard.split()[1][action("f5")] == "X"
     assert (time_left, genmove) == ("time_left w 7 0", "genmove w")
+
+
+def test_neural_reversi_says_what_its_search_made_of_its_move():
+    clocked: Any = ClockedNeuralReversi.__new__(ClockedNeuralReversi)
+    engine: Any = NeuralReversi.__new__(NeuralReversi)
+    engine.analyse = True
+    search = "search score -2.37 depth 18 probability 86 endgame false nodes 123456\n"
+    random = "search score 0.00 depth 0 probability 100 endgame false nodes 0\n"
+    engine.process = Script(
+        ["= \n", "\n", search, "= f5\n", "\n", "= \n", "\n", random, "= d3\n", "\n"]
+    )
+    clocked.engine = engine
+    assert clocked.move("b", 9.0) == action("f5")
+    assert clocked.info() == {
+        "score": -2.37,
+        "depth": 18,
+        "probability": 86,
+        "endgame": False,
+        "nodes": 123456,
+    }
+    # its first move from the start is a random one, not searched
+    assert clocked.move("w", 9.0) == action("d3")
+    assert clocked.info() is None
+
+
+def test_neural_reversi_is_its_upstream_build_whatever_patch_logs_its_searches(
+    tmp_path,
+):
+    release = tmp_path / "target" / "release"
+    release.mkdir(parents=True)
+    (release / "cli").write_bytes(b"patched")
+    (release / "upstream.sha256").write_text("ab" * 32 + "\n")
+    first = build_digest(NeuralReversi.name, tmp_path)
+    (release / "cli").write_bytes(b"patched again")
+    assert build_digest(NeuralReversi.name, tmp_path) == first
+    (release / "upstream.sha256").write_text("cd" * 32 + "\n")
+    assert build_digest(NeuralReversi.name, tmp_path) != first
 
 
 def test_neural_reversi_reads_its_board():

@@ -213,6 +213,7 @@ def record_of(
         moves=[int(m) for m in game.moves],
         opening_moves=len(opening.moves),
         move_seconds=[round(s, 6) if timed else None for _, _, s in game.move_seconds],
+        move_info=game.move_info if any(game.move_info) else [],
         ending=ending,
         margin=int(game.margin),
         result=int(game.result),

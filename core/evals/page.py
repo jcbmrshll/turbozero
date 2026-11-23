@@ -1,5 +1,6 @@
-"""The evaluation store's web page: every player's Elo and record, the latest games, and each
-player's record against everyone it has played. It only reads the store.
+"""The evaluation store's web page: every player's Elo and record, the latest games, each
+player's record against everyone it has played and its latest games, and a game move by move:
+each move's time and what each player's search made of its position. It only reads the store.
 
 Elo is fit to every game in the store (`core.league.ratings`), whatever its match's setup. Players
 who are linked by games, directly or through others, make a pool; pools are fit apart, each with
@@ -8,7 +9,8 @@ the biggest.
 
     GET /                  the page
     GET /api/summary       {"games", "players": [...], "recent": [...]}
-    GET /api/player?id=ID  {"player": {...}, "opponents": [...]}
+    GET /api/player?id=ID  {"player": {...}, "opponents": [...], "games": [...]}
+    GET /api/game?id=ID    {"game": {...}}: its moves, their seconds and `move_info`
 """
 
 import json
@@ -131,12 +133,18 @@ class Evals:
                 "recent": self._recent(db),
             }
 
-    def _recent(self, db: sqlite3.Connection) -> list[dict[str, Any]]:
+    def _recent(
+        self, db: sqlite3.Connection, player: str | None = None
+    ) -> list[dict[str, Any]]:
+        """The latest games, or `player`'s."""
         names = {id_: label for id_, label, _ in self.players}
+        where, args = "", ()
+        if player is not None:
+            where, args = "WHERE black_id = ? OR white_id = ? ", (player, player)
         rows = db.execute(
             "SELECT id, finished, black_id, white_id, result, margin, ending, solved_at, "
-            "flagged, solve_exact FROM games ORDER BY finished DESC, id DESC LIMIT ?",
-            (RECENT_GAMES,),
+            f"flagged, solve_exact FROM games {where}ORDER BY finished DESC, id DESC LIMIT ?",
+            (*args, RECENT_GAMES),
         ).fetchall()
         return [
             {
@@ -180,7 +188,57 @@ class Evals:
                 )
                 opponents.append(row)
             opponents.sort(key=lambda row: -row["elo"])
-            return {"player": self._row(index[player], total), "opponents": opponents}
+            return {
+                "player": self._row(index[player], total),
+                "opponents": opponents,
+                "games": self._recent(db, player),
+            }
+
+    def game(self, game: int) -> dict[str, Any] | None:
+        """Game `game` move by move, or None if there's no such game."""
+        with self.lock, self._connect() as db:
+            self._refresh(db)
+            row = db.execute(
+                "SELECT g.id, g.match_id, g.number, g.black_id, g.white_id, g.start, g.moves, "
+                "g.opening_moves, g.move_seconds, g.ending, g.solved_at, g.solve_exact, "
+                "g.margin, g.result, g.flagged, g.hard, g.black_seconds, g.white_seconds, "
+                "h.info, g.load, g.finished, gm.info "
+                "FROM games g LEFT JOIN hosts h ON h.id = g.host_id "
+                "LEFT JOIN game_moves gm ON gm.game_id = g.id WHERE g.id = ?",
+                (game,),
+            ).fetchone()
+            if row is None:
+                return None
+            names = {id_: label for id_, label, _ in self.players}
+            return {
+                "game": {
+                    "id": row[0],
+                    "match": row[1],
+                    "number": row[2],
+                    "black": row[3],
+                    "black_name": names.get(row[3], row[3]),
+                    "white": row[4],
+                    "white_name": names.get(row[4], row[4]),
+                    "start": row[5],
+                    "moves": json.loads(row[6]),
+                    "opening_moves": row[7],
+                    "move_seconds": json.loads(row[8]),
+                    "ending": row[9],
+                    "solved_at": row[10],
+                    "solve_exact": None if row[11] is None else bool(row[11]),
+                    # a solve for the result alone gives a margin whose sign alone is right
+                    "margin": None if row[9] == "solved" and not row[11] else row[12],
+                    "result": row[13],
+                    "flagged": row[14],
+                    "hard": row[15],
+                    "black_seconds": row[16],
+                    "white_seconds": row[17],
+                    "host": json.loads(row[18]) if row[18] else None,
+                    "load": row[19],
+                    "finished": row[20],
+                    "move_info": json.loads(row[21]) if row[21] else [],
+                }
+            }
 
 
 def make_handler(evals: Evals) -> type[BaseHTTPRequestHandler]:
@@ -213,6 +271,13 @@ def make_handler(evals: Evals) -> type[BaseHTTPRequestHandler]:
                         self._json({"error": "no such player"}, 404)
                     else:
                         self._json(found)
+                elif url.path == "/api/game":
+                    ids = parse_qs(url.query).get("id")
+                    game = evals.game(int(ids[0])) if ids and ids[0].isdigit() else None
+                    if game is None:
+                        self._json({"error": "no such game"}, 404)
+                    else:
+                        self._json(game)
                 else:
                     self._json({"error": "not found"}, 404)
             except BrokenPipeError:
