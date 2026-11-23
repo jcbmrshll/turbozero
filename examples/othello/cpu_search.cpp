@@ -986,6 +986,7 @@ int net_set_stem(net::Net* n, int cout, const int16_t* q, const float* scale, co
     net::stem_table(c, q);
     c.scale.assign(scale, scale + cout);
     c.bias.assign(bias, bias + cout);
+    net::fold_disc_gates(*n);
     return 0;
 }
 
@@ -1062,6 +1063,7 @@ int net_set_scan(net::Net* n, int block, int length, int gates, const float* w, 
     net::Block& b = n->blocks.at(block);
     b.convnext = true;
     net::prepare_scan(b.dw, n->channels, length, gates, w, bias, gate_w, gate_b);
+    net::fold_disc_gates(*n);
     return 0;
 }
 
