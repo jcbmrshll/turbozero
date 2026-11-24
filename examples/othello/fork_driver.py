@@ -109,9 +109,13 @@ class Config:
     # the next segment is added this many epochs before the last one ends
     lead_epochs: int = 3
     gpu: str = "L40S"
-    cpu: float = 32.0
-    # the 9000-position buffer's states need about 96 GB of host memory to save
-    memory_gb: int = 96
+    # cores asked for. The exact solver (--solve-threads 31) runs in bursts of about 20 s
+    # beside 30-50 s of self-play, and the host is nearly idle otherwise. Modal bills the
+    # request or the use, whichever is higher, and lets a container use 16 cores past its
+    # request, so the bursts still get 32 cores.
+    cpu: float = 16.0
+    # GiB of host memory; None sizes it by the buffer (see job_memory_gb)
+    memory_gb: int | None = None
     # a state saved to continue from at each segment's end only: with a 9000-position buffer
     # each is about 10 GB, and Modal bills uploads
     resume_every: int = 50
@@ -125,6 +129,19 @@ class Config:
     start_window: int = 0
     start_sims: int = 0
     rules: Rules = field(default_factory=Rules)
+
+    def job_memory_gb(self) -> int:
+        """Host memory a line's job asks for: memory_gb if set, otherwise enough for the
+        buffer. Saving a state is the peak: a scan 9x64 with a 2250-position buffer held
+        about 12 GB and peaked at 15.4 GB in a save, and states grow with the buffer (about
+        5 GB at 2250, 12-19 GB at 9000), so 32, 48 and 96 GB for 2250, 4500 and 9000."""
+        if self.memory_gb is not None:
+            return self.memory_gb
+        if self.buffer <= 2250:
+            return 32
+        if self.buffer <= 4500:
+            return 48
+        return 96
 
     @staticmethod
     def load(path: Path) -> "Config":
@@ -821,7 +838,7 @@ class ModalBackend:
                 home=self.home,
                 steps=self._steps(steps),
                 cpu=c.cpu,
-                memory_gb=c.memory_gb,
+                memory_gb=c.job_memory_gb(),
                 resume_every=c.resume_every,
                 follow_minutes=c.follow_minutes,
                 states_in_bucket=True,
@@ -871,8 +888,8 @@ wd_per_lr = 500.0
 segment_epochs = 50
 metric = "avg4/engine_value_mse"
 gpu = "L40S"
-cpu = 32
-memory_gb = 96
+cpu = 16                        # the solver's bursts use up to 16 more
+# memory_gb = 96                # host GiB; by default sized by the buffer
 resume_every = 50               # a state to continue from at each segment's end
 # the 11x64 at 1e-4, 128/32, buffer 2250, line 900: it plays first, at 1e-4, window 2250
 start_from = "{home}/.cache/turbozero/othello/smallnet-data/runs/ray11x64n-r800-pcr25x32-lr1e-4-wd5e-2-buf2250/state-100.npz"
