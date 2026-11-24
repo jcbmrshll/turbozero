@@ -274,3 +274,22 @@ def test_each_machine_gets_its_image_disk_and_threads():
     # an environment holds one architecture's packages and venv
     assert gcp_cpu_jobs.env_key(machine="c4a-standard-8") != gcp_cpu_jobs.env_key()
     assert gcp_cpu_jobs.env_key(machine="c2d-standard-16") == gcp_cpu_jobs.env_key()
+
+
+def test_a_hosts_memory_in_use_leaves_out_what_caches_hold(tmp_path):
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text(
+        "MemTotal:       8388608 kB\nMemFree:        1048576 kB\n"
+        "MemAvailable:   4194304 kB\nCached:         3145728 kB\n"
+    )
+    assert gcp_cpu_runner.memory_used(meminfo) == 4.0
+    assert gcp_cpu_runner.memory_used(tmp_path / "none") is None
+
+
+def test_a_jobs_memory_peak_is_the_most_seen_while_it_ran():
+    readings = iter([1.0, 3.5, 2.0])
+    peak = gcp_cpu_runner.MemoryPeak(lambda: next(readings, 0.5), every=0.0)
+    with peak:
+        while peak.peak is None or peak.peak < 3.5:
+            pass
+    assert peak.peak == 3.5

@@ -945,7 +945,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--machine", default="n4d-highcpu-16", help="a GCP machine type")
     p.add_argument("--gpu", default="CPU", help="Modal's GPU, or CPU")
     p.add_argument("--modal-cpu", type=int, default=8, help="a Modal host's cores")
-    p.add_argument("--modal-memory", type=int, default=16, help="its GiB")
+    p.add_argument(
+        "--modal-memory",
+        type=int,
+        default=8,
+        # a 10 s game against NR used about 6 GiB (our engine 2.8, NR 2.2, the referee's
+        # solver 1.6); Modal bills the larger of this and what's used. Jobs record their peak
+        help="its GiB: what's billed at least",
+    )
     p.add_argument(
         "--modal-cpu-model",
         default=hardware.AVX512_VNNI,
