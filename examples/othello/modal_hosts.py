@@ -47,7 +47,9 @@ def _slot(
     from core.evals.hardware import cpu_id, fits
 
     if cpu is not None and not fits(cpu):
-        return f"{WRONG_CPU}{cpu_id()}"
+        return (
+            f"{WRONG_CPU}{cpu_id()} in {os.environ.get('MODAL_TASK_ID', 'a container')}"
+        )
     cache = Path(HOME) / ".cache" / "turbozero" / "othello"
     cache.mkdir(parents=True, exist_ok=True)
     for key in inputs:
@@ -142,7 +144,7 @@ class ModalHosts:
             # a container that dies is replaced by the launcher, which knows what's left
             retries=0,
             # a container a call: one on the wrong CPU mustn't take the call made in its place
-            max_inputs=1,
+            single_use_containers=True,
             scaledown_window=2,
             serialized=True,
         )(_slot)
