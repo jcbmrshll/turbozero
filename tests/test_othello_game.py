@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "examples" / "othello"))
 from game import (
     MARGINS,
     PASS,
+    RAY_BRANCHES,
     RAY_TAPS,
     SYMMETRY_TRANSFORM_FNS,
     WEIGHT_DECAY,
@@ -22,12 +23,19 @@ from game import (
     load_checkpoint,
     make_network,
     make_optimizer,
+    move_planes,
     scores,
     weight_decay_mask,
 )
 
 from core.memory.replay_memory import BaseExperience
-from core.networks.azresnet import AZResnet, Depthwise, PreActConvNeXt
+from core.networks.azresnet import (
+    AZResnet,
+    BranchedDepthwise,
+    Depthwise,
+    GatedScan,
+    PreActConvNeXt,
+)
 
 
 def save_checkpoint(path: Path, net: str):
@@ -203,7 +211,8 @@ def test_a_spec_names_the_ray_taps():
     network, state = make_network(RAY_NET)
     assert isinstance(network, AZResnet)
     for block in network.blocks:
-        assert isinstance(block, PreActConvNeXt) and block.dw.taps == RAY_TAPS
+        assert isinstance(block, PreActConvNeXt)
+        assert isinstance(block.dw, Depthwise) and block.dw.taps == RAY_TAPS
     obs = jnp.zeros((3, 8, 8, 2), bool)
     (policy, value), _ = jax.vmap(lambda o: network(o, state), axis_name="batch")(obs)
     assert policy.shape == (3, 65) and value.shape == (3, 1)
@@ -308,3 +317,49 @@ def test_a_spec_names_a_value_head_over_the_final_margin():
     assert value.shape == (3, 1) and logits.shape == (3, 65)
     with pytest.raises(ValueError, match="margin"):
         make_network("resnet:1x16,heads=pooled,outcomes=parity")
+
+
+def test_move_planes_are_the_legal_moves_of_both_players():
+    # along a random game: the first plane is the player to move's legal moves as pgx has them,
+    # the second the first plane of the same board with the players' discs swapped
+    rng = np.random.default_rng(0)
+    state = env.init(jax.random.PRNGKey(0))
+    moves = 0
+    while not bool(state.terminated):
+        planes = np.asarray(move_planes(state.observation))
+        mask = np.asarray(state.legal_action_mask)
+        np.testing.assert_array_equal(planes[..., 0].reshape(-1), mask[:64])
+        swapped = np.asarray(move_planes(state.observation[..., ::-1]))
+        np.testing.assert_array_equal(planes[..., 1], swapped[..., 0])
+        state = env.step(state, int(rng.choice(np.flatnonzero(mask))))
+        moves += 1
+    assert moves > 50
+
+
+def test_the_ray_branches_fold_into_the_ray_taps():
+    assert set().union(*map(set, RAY_BRANCHES)) == set(RAY_TAPS)
+
+
+@pytest.mark.parametrize(
+    "setting, mixer",
+    [("dw_branches=rays", BranchedDepthwise), ("scan=rays", GatedScan)],
+)
+def test_a_spec_names_othellos_steps_between_squares(setting, mixer):
+    network, state = make_network(RAY_NET.replace("dw_taps=rays", setting))
+    assert isinstance(network, AZResnet)
+    for block in network.blocks:
+        assert isinstance(block, PreActConvNeXt) and isinstance(block.dw, mixer)
+    obs = jnp.zeros((3, 8, 8, 2), bool)
+    (policy, value), _ = jax.vmap(lambda o: network(o, state), axis_name="batch")(obs)
+    assert policy.shape == (3, 65) and value.shape == (3, 1)
+
+
+def test_a_spec_names_the_legal_move_planes():
+    network, state = make_network(RAY_NET + ",inputs=moves")
+    assert isinstance(network, AZResnet)
+    assert network.stem_conv.weight.shape[1] == 4
+    obs = jnp.zeros((3, 8, 8, 2), bool)
+    (policy, value), _ = jax.vmap(lambda o: network(o, state), axis_name="batch")(obs)
+    assert policy.shape == (3, 65) and value.shape == (3, 1)
+    with pytest.raises(ValueError, match="moves"):
+        make_network(RAY_NET + ",inputs=stability")

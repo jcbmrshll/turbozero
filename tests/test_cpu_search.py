@@ -1,5 +1,6 @@
 """cpu_search.py's rules and search, against pgx's Othello and core's MCTS, with fake networks."""
 
+import json
 import shutil
 import sys
 import tempfile
@@ -623,6 +624,12 @@ def test_a_player_parses_random_symmetry():
         "layer,layout=pre,block=convnext,dw_kernel=3,expand=3",
         # and without normalizations after the stem, expand and project
         "batch,layout=pre,block=convnext,dw_kernel=3,stem_norm=false,expand_norm=false,project_norm=false",
+        # gated scans along the rays, a gate to each channel or to several, of other lengths (with
+        # one step there's nothing between to gate), and with another normalization
+        "batch,layout=pre,block=convnext,expand=2,scan=rays",
+        "batch,layout=pre,block=convnext,expand=2,scan=rays,scan_gates=1,scan_length=3",
+        "batch,layout=pre,block=convnext,expand=2,scan=rays,scan_gates=2,scan_length=1",
+        "layer,layout=pre,block=convnext,scan=rays,scan_gates=4,scan_length=5",
     ],
 )
 def test_export_matches_the_network(norm):
@@ -661,6 +668,80 @@ def test_export_matches_the_network(norm):
         got_logits, got_values = evaluate(channels_first)
         np.testing.assert_allclose(got_logits, np.asarray(logits), atol=1e-5)
         np.testing.assert_allclose(got_values, np.asarray(values)[:, 0], atol=1e-5)
+
+
+def test_export_takes_a_gated_scan_along_any_lines():
+    from cpu_search import openvino_eval, ort_eval, ort_session
+    from export_onnx import to_onnx
+
+    from core.networks.azresnet import AZResnetConfig
+    from core.networks.spec import make_network
+    from core.networks.utils import apply_nn
+
+    # steps that jump, one leaving the board sooner than its opposite, and longer than the board
+    config = AZResnetConfig(
+        policy_head_out_size=65,
+        num_blocks=2,
+        num_channels=8,
+        block="convnext",
+        layout="pre",
+        heads="pooled",
+        head_channels=4,
+        scan_steps=((1, 2), (-3, 0), (0, 1)),
+        scan_length=9,
+        scan_gates=2,
+    )
+    model, state = perturbed(*make_network(config, (8, 8, 2), jax.random.PRNGKey(0)))
+    x = (np.random.default_rng(0).random((5, 2, 8, 8)) < 0.3).astype(np.float32)
+    (logits, values), _ = apply_nn(model, state, jnp.moveaxis(x, 1, -1))
+    graph = to_onnx(model, state).SerializeToString()
+    for evaluate in (ort_eval(ort_session(graph, 1)), openvino_eval(graph, 1, "f32")):
+        got_logits, got_values = evaluate(x)
+        np.testing.assert_allclose(got_logits, np.asarray(logits), atol=1e-5)
+        np.testing.assert_allclose(got_values, np.asarray(values)[:, 0], atol=1e-5)
+
+
+def test_a_gated_scans_bf16_stays_close_to_f32():
+    from cpu_search import openvino_eval
+    from export_onnx import to_onnx
+
+    graph = to_onnx(
+        *random_network(
+            "resnet:2x8,heads=pooled,head_channels=4,layout=pre,block=convnext,scan=rays"
+        )
+    ).SerializeToString()
+    x = (np.random.default_rng(0).random((16, 2, 8, 8)) < 0.3).astype(np.float32)
+    logits, values = openvino_eval(graph, 1, "bf16")(x)
+    f32_logits, f32_values = openvino_eval(graph, 1, "f32")(x)
+    np.testing.assert_allclose(logits, f32_logits, atol=0.1)
+    np.testing.assert_allclose(values, f32_values, atol=0.05)
+
+
+@pytest.mark.parametrize(
+    "setting, named",
+    [
+        ("dw_branches=rays", "BranchedDepthwise"),
+        ("dw_experts=2", "DynamicDepthwise"),
+        ("attention_last=1", "BoardAttention"),
+        ("position_bias=true", "position_bias"),
+        ("mlp_experts=2", "mlp_experts"),
+        ("scan=rays,position_bias=true", "position_bias"),
+        ("scan=rays,mlp_experts=2", "mlp_experts"),
+        ("scan=rays,board_plane=true", "input planes"),
+        ("scan=rays,inputs=moves", "input planes"),
+    ],
+)
+def test_export_refuses_the_options_it_lacks(setting, named):
+    import equinox as eqx
+    from export_onnx import to_onnx
+    from game import make_network
+
+    network, state = make_network(
+        "resnet:1x8,heads=pooled,head_channels=4,layout=pre,block=convnext,"
+        f"attention_heads=2,{setting}"
+    )
+    with pytest.raises(TypeError, match=named):
+        to_onnx(eqx.nn.inference_mode(network), state)
 
 
 def test_an_arm_names_a_quantized_model_and_a_precision():
@@ -1070,13 +1151,44 @@ def library(level: str, monkeypatch):
     return _LIBRARIES[level]
 
 
+def test_a_gated_scan_stays_unquantized():
+    from export_onnx import SCAN_SCOPE, to_onnx
+    from quantize import BEST, quantize_graph
+
+    graph = to_onnx(
+        *random_network(
+            "resnet:1x8,heads=pooled,head_channels=4,layout=pre,block=convnext,scan=rays"
+        )
+    ).SerializeToString()
+    x = (np.random.default_rng(0).random((32, 2, 8, 8)) < 0.3).astype(np.float32)
+    ops = quantize_graph(graph, BEST, x).get_ops()
+    # the products of gates and taps, and the gates
+    scanned = [
+        op
+        for op in ops
+        if op.get_friendly_name().startswith(SCAN_SCOPE)
+        and op.get_type_name() in ("Multiply", "Sigmoid")
+    ]
+    assert scanned
+    for op in scanned:
+        for value in op.inputs():
+            source = value.get_source_output().get_node()
+            assert source.get_type_name() != "FakeQuantize", op.get_friendly_name()
+    assert any(op.get_type_name() == "FakeQuantize" for op in ops)  # the trunk's are
+
+
 def random_network(spec: str, seed: int = 1):
     """A network of `spec` in inference mode, every weight nonzero and normalizations not the
     identity, with its state."""
-    import equinox as eqx
     from game import make_network
 
-    network, state = make_network(spec)
+    return perturbed(*make_network(spec), seed)
+
+
+def perturbed(network, state, seed: int = 1):
+    """`network` as `random_network` makes it, with its state."""
+    import equinox as eqx
+
     rng = np.random.default_rng(seed)
     params, static = eqx.partition(network, eqx.is_inexact_array)
     params = jax.tree.map(
@@ -1109,6 +1221,30 @@ CONVNEXT_SPECS = [
 ]
 # a value head over the final margin (see game.py's OUTCOMES)
 OUTCOME_SPEC = "resnet:2x32,pool_every=2,heads=pooled,pool_channels=16,head_channels=16,outcomes=margin"
+
+
+# ConvNeXt blocks of gated scans along the rays (see `core.networks.azresnet.GatedScan`): at the
+# width its direct kernel reads, and off it, a gate's 6 channels splitting vectors of channels
+SCAN_SPECS = [
+    "resnet:2x64,pool_every=2,heads=pooled,pool_channels=16,layout=pre,block=convnext,expand=2,scan=rays",
+    "resnet:2x48,pool_every=1,heads=pooled,pool_channels=8,head_channels=16,layout=pre,block=convnext,scan=rays",
+]
+
+
+@pytest.mark.parametrize("spec", SCAN_SPECS)
+def test_the_native_networks_layers_compute_a_gated_scan_network(spec):
+    import cpu_net
+    import jax.numpy as jnp
+
+    from core.networks.utils import apply_nn
+
+    # against the network itself
+    model, state = random_network(spec)
+    x = (np.random.default_rng(0).random((16, 2, 8, 8)) < 0.3).astype(np.float32)
+    (logits, values), _ = apply_nn(model, state, jnp.moveaxis(x, 1, -1))
+    got_logits, got_values = cpu_net.float_forward(cpu_net.extract(model, state), x)
+    np.testing.assert_allclose(got_logits, np.asarray(logits), atol=1e-4)
+    np.testing.assert_allclose(got_values, np.asarray(values).reshape(-1), atol=1e-5)
 
 
 @pytest.mark.parametrize("spec", NATIVE_SPECS + CONVNEXT_SPECS)
@@ -1147,7 +1283,13 @@ def test_the_native_networks_value_over_the_final_margin_is_the_networks():
 # each convolution kernel: AVX-512 VNNI's, AVX-VNNI's, AVX2's Winograd, and NEON's with
 # i8mm and with the dot product alone
 @pytest.mark.parametrize("level", ["v4", "v3-vnni", "v3", "arm-i8mm", "arm-dotprod"])
-@pytest.mark.parametrize("spec", NATIVE_SPECS + CONVNEXT_SPECS + [OUTCOME_SPEC])
+@pytest.mark.parametrize(
+    "spec",
+    NATIVE_SPECS
+    + CONVNEXT_SPECS
+    + SCAN_SPECS
+    + [OUTCOME_SPEC, SCAN_SPECS[0] + ",outcomes=margin"],
+)
 def test_the_native_network_computes_its_quantized_layers(
     spec, level, tmp_path, monkeypatch
 ):
@@ -1258,6 +1400,56 @@ def test_an_engine_of_the_native_network_searches_as_a_batch_of_one():
     parallel = Search()
     Engine.native(network, 3, 2).search(parallel, visits=400)
     assert parallel.total_visits() == 400
+
+
+def test_fidelitys_leaves_export_and_comparison_run_on_a_gated_scan_network(
+    tmp_path, monkeypatch
+):
+    import bench_cpu_backends
+    import cpu_net
+    import equinox as eqx
+    import fidelity
+    import quantize
+
+    if not native_supported():
+        pytest.skip("this CPU has no native network")
+    spec = (
+        "resnet:1x16,pool_every=1,heads=pooled,pool_channels=4,head_channels=16,layout=pre,"
+        "block=convnext,expand=2,scan=rays,scan_gates=4,scan_length=4"
+    )
+    checkpoint = tmp_path / "1.eqx"
+    model, state = random_network(spec)
+    eqx.tree_serialise_leaves(
+        checkpoint, (eqx.filter(model, eqx.is_inexact_array), state)
+    )
+    monkeypatch.setitem(bench_cpu_backends.NETWORKS, "tiny", (str(checkpoint), spec))
+    monkeypatch.setattr(quantize, "QUANTIZED_DIR", tmp_path / "quantized")
+    labelled = (np.random.default_rng(0).random((576, 2, 8, 8)) < 0.3).astype(
+        np.float32
+    )
+    monkeypatch.setattr(fidelity, "engine_positions", lambda count: labelled)
+    monkeypatch.setattr(fidelity.os, "sched_getaffinity", lambda pid: {0, 1})
+
+    def run(main, *args) -> None:
+        monkeypatch.setattr(sys, "argv", ["script", *map(str, args)])
+        main()
+
+    sampled = ("--games", 1, "--visits", 8, "--keep", 64)
+    run(fidelity.main, "leaves", "--net", "tiny", "--out", tmp_path, *sampled)
+    calibration = ("--positions", tmp_path / "calibration.npy")
+    run(cpu_net.main, "--net", "tiny", *calibration)
+    results = tmp_path / "results.jsonl"
+    compared = ("--reference", "f32", "--arm", "ort", "bf16", "native")
+    leaves = ("--leaves", tmp_path / "test.npy", "--results", results)
+    run(fidelity.main, "compare", "--net", "tiny", *leaves, *compared)
+    records = [json.loads(line) for line in results.read_text().splitlines()]
+    assert {(r["arm"], r["set"]) for r in records} == {
+        (arm, label)
+        for arm in ("ort", "bf16", "native")
+        for label in ("engine", "leaves")
+    }
+    for r in records:
+        assert r["value_mae"] < {"ort": 1e-5, "bf16": 0.05, "native": 0.1}[r["arm"]]
 
 
 def test_the_search_is_built_for_a_standard_level(monkeypatch):

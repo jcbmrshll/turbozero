@@ -176,29 +176,75 @@ DW_TAPS = {"rays": RAY_TAPS}
 # one ahead: the discs and empties always add to 64, so a margin is even
 MARGINS = tuple(float(m) for m in range(64, -65, -2))
 
-# the scores a value head predicts, as a spec names them, e.g. "resnet:7x64,outcomes=margin":
-# a distribution over the final margin in place of a value (see
-# core.networks.azresnet.AZResnetConfig.outcome_scores)
-OUTCOMES = {"margin": MARGINS}
+# Othello's 8 directions, and the ray taps as branches, one for each line through the square, one
+# for the square itself and one for its 3 x 3 neighbourhood: trained apart, each normalized on its
+# own, they fold into one filter of the ray taps (see core.networks.azresnet.BranchedDepthwise)
+DIRECTIONS = tuple((dy, dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1) if dy or dx)
+RAY_BRANCHES = (
+    *(
+        tuple((k * dy, k * dx) for s in (-1, 1) for k in range(s, 8 * s, s))
+        for dy, dx in ((0, 1), (1, 0), (1, 1), (1, -1))
+    ),
+    ((0, 0),),
+    tuple((dy, dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1)),
+)
 
-# the settings a spec names that select an option from a table here
-NAMED_OPTIONS = {"dw_taps": DW_TAPS, "outcomes": OUTCOMES}
-OPTION_FIELDS = {"dw_taps": "dw_taps", "outcomes": "outcome_scores"}
+
+def shift(plane: jax.Array, dy: int, dx: int) -> jax.Array:
+    """`plane` (height, width) moved by (dy, dx): out[i, j] = plane[i - dy, j - dx], 0 off the
+    board."""
+    height, width = plane.shape
+    padded = jnp.pad(plane, 1)
+    return padded[1 - dy : 1 - dy + height, 1 - dx : 1 - dx + width]
+
+
+def legal_moves(me: jax.Array, opp: jax.Array) -> jax.Array:
+    """The squares where `me` (height, width, 0/1 discs) may move against `opp`: empty squares at
+    the end of a run of `opp`'s discs that starts next to one of `me`'s, along a line."""
+    empty = 1 - jnp.maximum(me, opp)
+    moves = jnp.zeros_like(me)
+    for dy, dx in DIRECTIONS:
+        run = shift(me, dy, dx) * opp
+        for _ in range(5):
+            run = jnp.maximum(run, shift(run, dy, dx) * opp)
+        moves = jnp.maximum(moves, shift(run, dy, dx) * empty)
+    return moves
+
+
+def move_planes(obs: jax.Array) -> jax.Array:
+    """The legal moves of the player to move and of the opponent, (8, 8, 2), from an observation's
+    two disc planes: mobility, every Othello evaluation's first feature, without the network
+    having to find it."""
+    obs = obs.astype(jnp.float32)
+    me, opp = obs[..., 0], obs[..., 1]
+    return jnp.stack([legal_moves(me, opp), legal_moves(opp, me)], axis=-1)
+
+
+# the network spec's Othello settings: name=value -> configuration options
+SPEC_OPTIONS = {
+    "dw_taps": {name: {"dw_taps": taps} for name, taps in DW_TAPS.items()},
+    "dw_branches": {"rays": {"dw_taps": RAY_TAPS, "dw_branches": RAY_BRANCHES}},
+    "scan": {"rays": {"scan_steps": DIRECTIONS}},
+    "inputs": {"moves": {"input_features": move_planes}},
+    # a value head over the final margin in place of a value (see
+    # core.networks.azresnet.AZResnetConfig.outcome_scores)
+    "outcomes": {"margin": {"outcome_scores": MARGINS}},
+}
 
 
 def network_options(net: str) -> tuple[str, dict]:
-    """`net` without its settings by name (taps, see DW_TAPS; outcomes, see OUTCOMES), and
-    those settings as configuration options."""
+    """`net` without its Othello settings (see SPEC_OPTIONS), e.g. its taps by name (see DW_TAPS),
+    and those settings as configuration options."""
     kept, options = [], {}
     for setting in net.split(","):
         name, _, value = setting.partition("=")
-        if name not in NAMED_OPTIONS:
+        if name not in SPEC_OPTIONS:
             kept.append(setting)
-        elif value in NAMED_OPTIONS[name]:
-            options[OPTION_FIELDS[name]] = NAMED_OPTIONS[name][value]
+        elif value in SPEC_OPTIONS[name]:
+            options.update(SPEC_OPTIONS[name][value])
         else:
             raise ValueError(
-                f"{name} is one of {', '.join(NAMED_OPTIONS[name])}, not {value!r}"
+                f"{name} is one of {', '.join(SPEC_OPTIONS[name])}, not {value!r}"
             )
     return ",".join(kept), options
 
@@ -217,9 +263,10 @@ def make_network(
     state). It computes in `inference_dtype` when it isn't training, e.g. in self-play,
     and in `train_dtype` in training (mixed precision, see AZResnetConfig). With `remat`,
     training computes each block's activations again in the backward pass instead of
-    keeping them. Othello's depthwise filter taps are named in the spec as dw_taps=NAME (see
-    DW_TAPS), and a value head that predicts the final margin as outcomes=margin (see
-    OUTCOMES)."""
+    keeping them. Othello's settings are named in the spec (see SPEC_OPTIONS): the depthwise
+    filter taps as dw_taps=rays (see DW_TAPS), the ray filter in branches as dw_branches=rays,
+    gated lines as scan=rays, legal-move input planes as inputs=moves, and a value head over the
+    final margin as outcomes=margin (see MARGINS)."""
     net, options = network_options(net)
     config = network_config(
         net,

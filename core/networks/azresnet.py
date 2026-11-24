@@ -2,7 +2,7 @@ import functools
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, NamedTuple
 
 import equinox as eqx
 import jax
@@ -52,6 +52,29 @@ class AZResnetConfig:
         dw_taps: the depthwise filters' taps instead, as (row, column) offsets from the square
             filtered (see `Depthwise`): a sparse filter of long reach, e.g. along chosen lines.
             Not settable in a spec: an application names its own sets and passes them in
+        dw_branches: the ConvNeXt blocks' depthwise filters as branches instead, each of its own
+            taps and normalized on its own, summed (see `BranchedDepthwise`): in inference they
+            fold into one filter on the union of the taps. Not settable in a spec
+        dw_experts: the ConvNeXt blocks' depthwise filters each a mixture of this many, chosen for
+            each input from its features pooled over the board (see `DynamicDepthwise`); 0 for one
+        scan_steps: the ConvNeXt blocks filter along lines from each square instead, in these
+            (row, column) steps, each line gated by the squares it passes (see `GatedScan`). Not
+            settable in a spec
+        scan_length: the lines' length in steps; 0 for the board's longer side less one
+        scan_gates: the gated lines' gate channels, each shared by a group of channels
+        attention_last: the last this many ConvNeXt blocks step between squares by attention (see
+            `BoardAttention`) instead of a filter
+        attention_heads: their attention heads
+        position_bias: each ConvNeXt block adds a learned bias for each square and channel to its
+            step between squares' output (absolute position embedding, as CoordConv's coordinates
+            or a vision transformer's), starting at zero
+        mlp_experts: each ConvNeXt block's 1x1 convolutions a mixture of this many, chosen for each
+            input from its normalized features pooled over the board (CondConv); 0 for one
+        board_plane: the input gets one more plane, all ones (KataGo's on-board plane): the
+            stem's zero padding then marks where the board ends, for empty squares too
+        input_features: planes computed from the input and added to it, as a function of one
+            (height, width, channels) input to (height, width, more channels), e.g. features a
+            game knows how to compute. Not settable in a spec
         pool_every: every `pool_every`-th basic block (counting those inside bottleneck blocks) has
             KataGo's global pooling bias: `pool_channels` of its first convolution's channels are
             pooled over the board (mean and max), and a linear map of them biases the others, which
@@ -127,6 +150,17 @@ class AZResnetConfig:
     project_norm: bool | None = None
     dw_kernel: int = 7
     dw_taps: tuple[tuple[int, int], ...] | None = None
+    dw_branches: tuple[tuple[tuple[int, int], ...], ...] | None = None
+    dw_experts: int = 0
+    scan_steps: tuple[tuple[int, int], ...] | None = None
+    scan_length: int = 0
+    scan_gates: int = 8
+    attention_last: int = 0
+    attention_heads: int = 4
+    position_bias: bool = False
+    mlp_experts: int = 0
+    board_plane: bool = False
+    input_features: Callable[[jax.Array], jax.Array] | None = None
     pool_every: int = 0
     pool_channels: int = 32
     heads: Literal["alphazero", "pooled"] = "alphazero"
@@ -706,6 +740,444 @@ def tap_index(taps: tuple[tuple[int, int], ...], height: int, width: int) -> np.
     return index
 
 
+def zero_linear(linear: eqx.nn.Linear) -> eqx.nn.Linear:
+    """`linear` with its weights and bias at zero: a router starting from it weighs its experts
+    equally (see `DynamicDepthwise`)."""
+    assert linear.bias is not None
+    return eqx.tree_at(
+        lambda lin: (lin.weight, lin.bias),
+        linear,
+        (jnp.zeros_like(linear.weight), jnp.zeros_like(linear.bias)),
+    )
+
+
+class BranchedDepthwise(eqx.Module):
+    """Depthwise filters (see `Depthwise`) side by side, each normalized on its own, their
+    outputs summed: sum over branches b of norm_b(depthwise_b(x)). In training each branch
+    learns at its own scale (RepVGG's and MobileOne's train-time branches); in inference, with
+    BatchNorm, each is a per-channel affine map of a linear filter, so together they fold into one
+    depthwise filter on the union of their taps plus a bias (see `fold`), costing what that one
+    filter does."""
+
+    branches: list[Depthwise]
+    norms: list[Norm]
+
+    def __init__(
+        self,
+        channels: int,
+        branches: tuple[tuple[tuple[int, int], ...], ...],
+        *,
+        key: jax.Array,
+        make_norm: NormMaker,
+        stats: Stats,
+    ):
+        keys = jax.random.split(key, len(branches))
+        self.branches = [
+            Depthwise(channels, taps, key=k) for taps, k in zip(branches, keys)
+        ]
+        self.norms = [
+            make_norm(channels, stats, dw.kernel_size) for dw in self.branches
+        ]
+
+    @property
+    def kernel_size(self) -> int:
+        return max(dw.kernel_size for dw in self.branches)
+
+    def __call__(
+        self, x: jax.Array, state: eqx.nn.State, dtype: jnp.dtype
+    ) -> tuple[jax.Array, eqx.nn.State]:
+        total = None
+        for dw, norm in zip(self.branches, self.norms, strict=True):
+            y, state = norm_act(norm, dw(x, dtype), state, dtype, relu=False)
+            total = y if total is None else total + y
+        assert total is not None
+        return total, state
+
+    def fold(self, state: eqx.nn.State) -> tuple[Depthwise, jax.Array]:
+        """The branches in inference as one filter on the union of their taps and a bias per
+        channel: what `__call__` computes in inference mode, for BatchNorm."""
+        taps = tuple(dict.fromkeys(t for dw in self.branches for t in dw.taps))
+        weight = jnp.zeros((self.branches[0].weight.shape[0], len(taps)))
+        bias = jnp.zeros(weight.shape[0])
+        for dw, norm in zip(self.branches, self.norms, strict=True):
+            if not isinstance(norm, eqx.nn.BatchNorm):
+                raise TypeError("only BatchNorm branches fold into one filter")
+            scale, offset = inference_affine(norm, state)
+            columns = np.array([taps.index(t) for t in dw.taps])
+            weight = weight.at[:, columns].add(dw.weight * scale[:, None])
+            bias = bias + offset
+        folded = Depthwise(weight.shape[0], taps, key=jax.random.PRNGKey(0))
+        return eqx.tree_at(lambda d: d.weight, folded, weight), bias
+
+
+class DynamicDepthwise(eqx.Module):
+    """A depthwise filter (see `Depthwise`) chosen for each input: `experts` filters on the same
+    taps, mixed by a softmax of a linear map of the input's features pooled over the board (mean and
+    max, see `board_pool`). The conv form of dynamic convolution (CondConv, DynamicConv) and of Lc0's
+    smolgen, which makes the mixing between squares depend on the position. The router starts at
+    zero: the experts start equally weighted. In inference it costs one filter plus mixing the
+    experts' weights."""
+
+    weight: jax.Array
+    router: eqx.nn.Linear
+    taps: tuple[tuple[int, int], ...] = eqx.field(static=True)
+
+    def __init__(
+        self,
+        channels: int,
+        taps: tuple[tuple[int, int], ...],
+        experts: int,
+        *,
+        key: jax.Array,
+    ):
+        keys = jax.random.split(key, experts + 1)
+        self.weight = jnp.stack(
+            [Depthwise(channels, taps, key=k).weight for k in keys[:experts]]
+        )
+        self.taps = Depthwise(channels, taps, key=keys[0]).taps
+        self.router = zero_linear(eqx.nn.Linear(2 * channels, experts, key=keys[-1]))
+
+    @property
+    def kernel_size(self) -> int:
+        return 2 * max(max(abs(dy), abs(dx)) for dy, dx in self.taps) + 1
+
+    def mixing(self, x: jax.Array) -> jax.Array:
+        """The experts' weights for input `x`, (experts,), summing to 1."""
+        return jax.nn.softmax(self.router(board_pool(x)))
+
+    def __call__(
+        self, x: jax.Array, state: eqx.nn.State, dtype: jnp.dtype
+    ) -> tuple[jax.Array, eqx.nn.State]:
+        channels, height, width = x.shape
+        index = tap_index(self.taps, height, width)
+        # each expert's output, then mixed: a weight matrix per input would be the batch times
+        # larger than these, which every input shares
+        weight = jnp.pad(self.weight, ((0, 0), (0, 0), (0, 1)))[:, :, index]
+        y = jnp.einsum(
+            "kcpq,cq->kcp",
+            weight.astype(dtype),
+            x.reshape(channels, height * width).astype(dtype),
+        )
+        y = jnp.einsum("k,kcp->cp", self.mixing(x).astype(dtype), y)
+        return y.reshape(channels, height, width), state
+
+
+class GatedScan(eqx.Module):
+    """A depthwise filter along lines that the board can block: from each square, `length` squares
+    each way along each of `steps` (dy, dx) directions, as `Depthwise`'s taps along them would, but
+    each tap's weight multiplied by the gates of the squares between it and the square filtered:
+    y[c, p] = w[c, 0] x[c, p] + sum over directions d and distances k of
+    w[c, d, k] * g[p + d] ... g[p + (k - 1) d] * x[c, p + k d].
+    A gate is in (0, 1), a sigmoid of a 1x1 convolution of the input, normalized, so a line can
+    stop at a square, e.g. an empty one (a selective scan along lines, as VMamba's along rows and
+    columns). `gates` gate channels, each shared by a group of consecutive channels. Gates start
+    near 1 (an offset of 2): the filter starts close to the plain filter along the lines."""
+
+    weight: jax.Array
+    gate_conv: eqx.nn.Conv2d
+    gate_norm: Norm
+    gate_offset: jax.Array
+    steps: tuple[tuple[int, int], ...] = eqx.field(static=True)
+    length: int = eqx.field(static=True)
+
+    def __init__(
+        self,
+        channels: int,
+        steps: tuple[tuple[int, int], ...],
+        length: int,
+        gates: int,
+        *,
+        key: jax.Array,
+        make_norm: NormMaker,
+        stats: Stats,
+    ):
+        if channels % gates:
+            raise ValueError(f"{gates} gates don't divide {channels} channels")
+        keys = jax.random.split(key, 2)
+        self.steps = tuple((int(dy), int(dx)) for dy, dx in steps)
+        self.length = length
+        taps = 1 + len(steps) * length
+        bound = 1 / math.sqrt(taps)
+        self.weight = jax.random.uniform(
+            keys[0], (channels, taps), minval=-bound, maxval=bound
+        )
+        self.gate_conv = conv(channels, gates, 1, keys[1])
+        self.gate_norm = make_norm(gates, stats, 1)
+        self.gate_offset = jnp.full((gates,), 2.0)
+
+    @property
+    def kernel_size(self) -> int:
+        return 2 * self.length + 1
+
+    def gate_logits(
+        self, x: jax.Array, state: eqx.nn.State, dtype: jnp.dtype
+    ) -> tuple[jax.Array, eqx.nn.State]:
+        """Each gate channel's logit at each square, (gates, height, width), float32."""
+        g, state = conv_norm(self.gate_conv, self.gate_norm, x, state, dtype)
+        offset = self.gate_offset.reshape(-1, 1, 1)
+        return g.astype(jnp.float32) + offset, state
+
+    def gates(
+        self, x: jax.Array, state: eqx.nn.State, dtype: jnp.dtype
+    ) -> tuple[jax.Array, eqx.nn.State]:
+        """Each gate channel's gate at each square, (gates, height, width), float32."""
+        logits, state = self.gate_logits(x, state, dtype)
+        return jax.nn.sigmoid(logits), state
+
+    def __call__(
+        self, x: jax.Array, state: eqx.nn.State, dtype: jnp.dtype
+    ) -> tuple[jax.Array, eqx.nn.State]:
+        """The scan applied to `x`, computing in float32. Each path's product of gates is the exp
+        of its gates' log-sigmoids summed, one matrix product for all paths, which also keeps the
+        gradient's digits where gates are near 1 (a sigmoid's, g (1 - g), loses them). The sum
+        along the lines is `line_sum`. Its matrix products ask for full precision: a GPU's
+        default for float32 ones (TF32, 10-bit mantissas) was 1e-3 off."""
+        channels, height, width = x.shape
+        logits, state = self.gate_logits(x, state, dtype)
+        gates, squares = logits.shape[0], height * width
+        shape = (self.steps, self.length, height, width)
+        through = jnp.exp(
+            jnp.einsum(
+                "eq,gq->ge",
+                scan_lines(*shape).between,
+                jax.nn.log_sigmoid(logits.reshape(gates, squares)),
+                precision="highest",
+            )
+        )
+        group = channels // gates
+        y = line_sum(
+            shape,
+            self.weight.astype(jnp.float32).reshape(gates, group, -1),
+            through,
+            x.astype(jnp.float32).reshape(gates, group, squares),
+        )
+        return y.reshape(x.shape).astype(dtype), state
+
+
+class Slots(NamedTuple):
+    """The terms of some sums of products, a row a sum, short rows padded with terms of mask 0:
+    each term's three indices. For `slot_sum` they are into the first factor, into the second and
+    into the paths' gate products. `ScanLines.by_path` holds (p, q, tap) in the same fields."""
+
+    first: np.ndarray
+    second: np.ndarray
+    path: np.ndarray
+    mask: np.ndarray
+
+
+class ScanLines(NamedTuple):
+    """What `GatedScan` sums, as tables over its (square p, tap t) pairs that stay inside, tap t
+    joining p to square q along a path of the squares between them.
+
+    Attributes:
+        between: (paths, squares), how many times each path passes each square. Path 0 passes
+            none (it is always open), and the two ways along a line share a path.
+        forward: a row for each p, its terms weight[t] * x[q]
+        backward: a row for each q, its terms weight[t] * ybar[p]: the transpose
+        by_path: a row for each path but 0's (empty), its terms' (p, q, t): the paths' cotangents
+        by_tap: rows of up to `TAP_ROW` terms ybar[p] * x[q], each row one tap's
+        tap_rows: (rows of by_tap, taps), 1 where the row is the tap's
+    """
+
+    between: np.ndarray
+    forward: Slots
+    backward: Slots
+    by_path: Slots
+    by_tap: Slots
+    tap_rows: np.ndarray
+
+
+# the terms in a row of the weights' cotangent: on a GPU 8 to 32 ran alike, 64 over 3x slower
+TAP_ROW = 16
+
+
+@functools.cache
+def scan_lines(
+    steps: tuple[tuple[int, int], ...], length: int, height: int, width: int
+) -> ScanLines:
+    """The tables of a `GatedScan` of `steps` and `length` on (height, width) inputs."""
+    squares = height * width
+    taps = [((0, 0), 0)] + [(step, k) for step in steps for k in range(1, length + 1)]
+    paths: dict[tuple, int] = {(): 0}
+    between = [np.zeros(squares, np.float32)]
+    pairs = []  # (p, q, tap, path)
+    for t, ((dy, dx), k) in enumerate(taps):
+        for p in range(squares):
+            row, col = divmod(p, width)
+            if not (0 <= row + k * dy < height and 0 <= col + k * dx < width):
+                continue
+            q = p + k * (dy * width + dx)
+            passed = tuple(sorted(p + j * (dy * width + dx) for j in range(1, k)))
+            line = (min(p, q), max(p, q), passed) if passed else ()
+            if line not in paths:
+                paths[line] = len(between)
+                counts = np.bincount(np.array(passed), minlength=squares)
+                between.append(counts.astype(np.float32))
+            pairs.append((p, q, t, paths[line]))
+
+    by_p = [[] for _ in range(squares)]
+    by_q = [[] for _ in range(squares)]
+    by_path = [[] for _ in between]
+    by_t = [[] for _ in taps]
+    for p, q, t, path in pairs:
+        by_p[p].append((t, q, path))
+        by_q[q].append((t, p, path))
+        if path:
+            by_path[path].append((p, q, t))
+        by_t[t].append((p, q, path))
+    tap_rows, owners = [], []
+    for t, terms in enumerate(by_t):
+        for i in range(0, len(terms), TAP_ROW):
+            tap_rows.append(terms[i : i + TAP_ROW])
+            owners.append(t)
+    return ScanLines(
+        between=np.stack(between),
+        forward=slots(by_p),
+        backward=slots(by_q),
+        by_path=slots(by_path),
+        by_tap=slots(tap_rows),
+        tap_rows=np.eye(len(taps), dtype=np.float32)[owners],
+    )
+
+
+def slots(rows: list[list[tuple[int, int, int]]]) -> Slots:
+    """`rows` of (first, second, third index) terms as `Slots`."""
+    table = np.zeros((3, len(rows), max(1, *map(len, rows))), np.int32)
+    mask = np.zeros(table.shape[1:], np.float32)
+    for r, row in enumerate(rows):
+        for s, term in enumerate(row):
+            table[:, r, s] = term
+            mask[r, s] = 1
+    return Slots(table[0], table[1], table[2], mask)
+
+
+def slot_sum(
+    table: Slots, first: jax.Array, second: jax.Array, through: jax.Array
+) -> jax.Array:
+    """For each row of `table`, the sum over its terms of first * second * through at the term's
+    indices, (gates, group, rows), `first` and `second` (gates, group, ...) and `through`
+    (gates, paths).
+
+    It is written for how XLA compiles it on a GPU, into one kernel: the terms added one by one
+    (a reduce over them ran 5x slower, its loads one after another), and `through` broadcast to
+    the channels before it is indexed (indexed first, each term's is an array of its own)."""
+    through = jnp.broadcast_to(through[:, None], (*first.shape[:2], through.shape[-1]))
+    total = None
+    for s in range(table.mask.shape[1]):
+        left = first[:, :, table.first[:, s]]
+        if not table.mask[:, s].all():
+            left = left * table.mask[:, s]
+        term = left * through[:, :, table.path[:, s]] * second[:, :, table.second[:, s]]
+        total = term if total is None else total + term
+    assert total is not None
+    return total
+
+
+def line_sum_primal(
+    shape: tuple, weight: jax.Array, through: jax.Array, x: jax.Array
+) -> jax.Array:
+    """`GatedScan`'s sum along the lines, y[g, m, p] = sum over the taps t from square p that
+    stay inside, to square q by path e, of weight[g, m, t] * through[g, e] * x[g, m, q], for
+    gate g and its group's channel m. `shape` is `scan_lines`' arguments.
+
+    Its transpose is written out (so it has no forward-mode derivative): autodiff's has a
+    scatter for each lookup, and a training step took 18x as long with it. The optimization
+    barriers keep each kernel on its own: without them XLA fuses them into the normalization's
+    reduces and the block's sum, where they ran 2 to 4 times slower."""
+    return slot_sum(scan_lines(*shape).forward, weight, x, through)
+
+
+line_sum = jax.custom_vjp(line_sum_primal, nondiff_argnums=(0,))
+
+
+def line_sum_fwd(shape: tuple, weight: jax.Array, through: jax.Array, x: jax.Array):
+    y = jax.lax.optimization_barrier(line_sum(shape, weight, through, x))
+    return y, (weight, through, x)
+
+
+def line_sum_bwd(shape: tuple, saved: tuple, ybar: jax.Array):
+    weight, through, x = saved
+    lines = scan_lines(*shape)
+    xbar = slot_sum(lines.backward, weight, ybar, through)
+    p, q, t, mask = lines.by_path
+    through_bar = jnp.sum(
+        mask * weight[:, :, t] * ybar[:, :, p] * x[:, :, q], axis=(1, 3)
+    )
+    by_row = slot_sum(lines.by_tap, ybar, x, through)
+    # flattened under its barrier, so the kernel keeps the batch first and reads coherently;
+    # without one, XLA merges it with the batch's sum and writes gigabytes of intermediates
+    by_row = jax.lax.optimization_barrier(by_row.reshape(-1)).reshape(by_row.shape)
+    xbar, through_bar = jax.lax.optimization_barrier((xbar, through_bar))
+    weight_bar = jnp.matmul(by_row, lines.tap_rows, precision="highest")
+    return weight_bar, through_bar, xbar
+
+
+line_sum.defvjp(line_sum_fwd, line_sum_bwd)
+
+
+@functools.cache
+def offset_index(height: int, width: int) -> np.ndarray:
+    """(squares, squares): the index of square q's offset from square p, among the
+    (2 height - 1) (2 width - 1) offsets, row by row."""
+    rows, cols = np.divmod(np.arange(height * width), width)
+    dy = rows[None, :] - rows[:, None] + height - 1
+    dx = cols[None, :] - cols[:, None] + width - 1
+    return dy * (2 * width - 1) + dx
+
+
+class BoardAttention(eqx.Module):
+    """Multi-head self-attention between the squares, as a block's step between squares (in place
+    of a depthwise filter: a MetaFormer block, attention then the block's MLP): the input
+    normalized, a 1x1 convolution to queries, keys and values, and each head's attention logits
+    biased by a learned bias for each offset between two squares (relative position bias, Swin's;
+    zero at the start). The heads' outputs are concatenated, with no projection: the block's MLP
+    follows."""
+
+    norm: Norm
+    qkv: eqx.nn.Conv2d
+    bias: jax.Array
+    heads: int = eqx.field(static=True)
+
+    def __init__(
+        self,
+        channels: int,
+        heads: int,
+        board: tuple[int, int],
+        *,
+        key: jax.Array,
+        make_norm: NormMaker,
+        stats: Stats,
+    ):
+        if channels % heads:
+            raise ValueError(f"{heads} heads don't divide {channels} channels")
+        height, width = board
+        self.norm = make_norm(channels, stats, 1)
+        self.qkv = conv(channels, 3 * channels, 1, key)
+        self.bias = jnp.zeros((heads, (2 * height - 1) * (2 * width - 1)))
+        self.heads = heads
+
+    @property
+    def kernel_size(self) -> int:
+        # the offsets span 2 height - 1 rows, as a filter that reaches the whole board would
+        return math.isqrt(self.bias.shape[1])
+
+    def __call__(
+        self, x: jax.Array, state: eqx.nn.State, dtype: jnp.dtype
+    ) -> tuple[jax.Array, eqx.nn.State]:
+        channels, height, width = x.shape
+        h, state = norm_act(self.norm, x, state, dtype, relu=False)
+        qkv = convolve(self.qkv, h, dtype).astype(jnp.float32)
+        q, k, v = qkv.reshape(3, self.heads, channels // self.heads, height * width)
+        logits = jnp.einsum("hdp,hdq->hpq", q, k) / math.sqrt(q.shape[1])
+        logits = logits + self.bias[:, offset_index(height, width)]
+        attention = jax.nn.softmax(logits, axis=-1)
+        y = jnp.einsum("hpq,hdq->hdp", attention, v)
+        return y.reshape(channels, height, width).astype(dtype), state
+
+
+Mixer = Depthwise | BranchedDepthwise | DynamicDepthwise | GatedScan | BoardAttention
+
+
 class PreActConvNeXt(eqx.Module):
     """ConvNeXt's block: x + project(relu(expand(norm(depthwise(x))))), a depthwise filter of the
     trunk itself (see `Depthwise`), one normalization, then a per-square MLP of 1x1 convolutions
@@ -713,15 +1185,25 @@ class PreActConvNeXt(eqx.Module):
     features, pooled over the board, bias the hidden channels. project starts at zero (see
     `zeroed`). Optionally normalized after expand and after project too, `expand_norm` and
     `project_norm`: x + project_norm(project(relu(expand_norm(expand(y)) + pool bias))),
-    project_norm's scale then starting at zero instead (see `zero_scale`)."""
+    project_norm's scale then starting at zero instead (see `zero_scale`).
 
-    dw: Depthwise
+    Options (see `AZResnetConfig`): another step between squares in place of the depthwise filter
+    (`mixer`); a learned bias for each square and channel added to its output, before the
+    normalization (`position`); and expand and project each a mixture of `mlp_experts`
+    convolutions, mixed for each input by a softmax of a linear map of the normalized features
+    pooled over the board (CondConv), the router starting at zero."""
+
+    dw: Mixer
     norm: Norm
     expand: eqx.nn.Conv2d
     expand_norm: Norm | None
     pool_linear: eqx.nn.Linear | None
     project: eqx.nn.Conv2d
     project_norm: Norm | None
+    position: jax.Array | None
+    mlp_router: eqx.nn.Linear | None
+    expand_experts: jax.Array | None
+    project_experts: jax.Array | None
     pool_channels: int = eqx.field(static=True)
 
     def __init__(
@@ -736,6 +1218,9 @@ class PreActConvNeXt(eqx.Module):
         stats: Stats,
         expand_norm: bool = False,
         project_norm: bool = False,
+        mixer: Mixer | None = None,
+        position: tuple[int, int] | None = None,
+        mlp_experts: int = 0,
     ):
         """
         Args:
@@ -749,9 +1234,13 @@ class PreActConvNeXt(eqx.Module):
             stats: unused: the normalizations need none
             expand_norm: normalize the hidden channels before their ReLU
             project_norm: normalize the output, its scale starting at zero
+            mixer: the step between squares, in place of a depthwise filter of `taps`
+            position: the board's (height, width), for a learned bias per square, starting at 0
+            mlp_experts: expand and project as mixtures of this many convolutions each (0 or 1:
+                one each)
         """
         keys = jax.random.split(key, 4)
-        self.dw = Depthwise(channels, taps, key=keys[0])
+        self.dw = Depthwise(channels, taps, key=keys[0]) if mixer is None else mixer
         self.norm = make_norm(channels, stats, self.dw.kernel_size)
         self.expand = conv(channels, hidden, 1, keys[1])
         self.expand_norm = make_norm(hidden, stats, 1) if expand_norm else None
@@ -766,24 +1255,83 @@ class PreActConvNeXt(eqx.Module):
         else:
             self.project, self.project_norm = zeroed(self.project), None
         self.pool_channels = pool_channels
+        self.position = None if position is None else jnp.zeros((channels, *position))
+        self.mlp_router = self.expand_experts = self.project_experts = None
+        if mlp_experts > 1:
+            # more keys from the block's own, so that the other parameters start as without them
+            more = jax.random.split(jax.random.fold_in(key, 1), 2 * mlp_experts - 1)
+            self.mlp_router = zero_linear(
+                eqx.nn.Linear(2 * channels, mlp_experts, key=more[0])
+            )
+            self.expand_experts = jnp.stack(
+                [conv(channels, hidden, 1, k).weight for k in more[1:mlp_experts]]
+            )
+            project_experts = jnp.stack(
+                [conv(hidden, channels, 1, k).weight for k in more[mlp_experts:]]
+            )
+            # a zeroed project's experts start at zero too: the branch starts adding nothing
+            self.project_experts = (
+                project_experts if project_norm else jnp.zeros_like(project_experts)
+            )
+
+    @property
+    def plain(self) -> bool:
+        """Whether the block is ConvNeXt's with a depthwise filter, without the options."""
+        return (
+            isinstance(self.dw, Depthwise)
+            and self.position is None
+            and self.mlp_router is None
+        )
+
+    def experts(self, y: jax.Array) -> jax.Array | None:
+        """With `mlp_experts`, the experts' weights for the input whose normalized features are
+        `y`, (experts,), summing to 1."""
+        if self.mlp_router is None:
+            return None
+        return jax.nn.softmax(self.mlp_router(board_pool(y)))
+
+    @staticmethod
+    def mixture(
+        c: eqx.nn.Conv2d,
+        experts: jax.Array | None,
+        weights: jax.Array | None,
+        x: jax.Array,
+    ) -> tuple[eqx.nn.Conv2d, jax.Array]:
+        """The convolution `c`, mixed with its `experts` by `weights`, and its input `x`: as one
+        convolution of the experts side by side, of the input scaled by each expert's weight,
+        sum_k w_k W_k x = [W_1 ... W_K] [w_1 x; ...; w_K x]. Mixing the weights instead makes
+        a convolution per input, about 40x slower in batched training."""
+        if experts is None or weights is None:
+            return c, x
+        stacked = jnp.concatenate([c.weight, *experts], axis=1)
+        x = jnp.concatenate([w * x for w in weights.astype(x.dtype)])
+        return eqx.tree_at(lambda c: c.weight, c, stacked), x
 
     def __call__(
         self, x: jax.Array, state: eqx.nn.State, dtype: jnp.dtype
     ) -> tuple[jax.Array, eqx.nn.State]:
-        y = self.dw(x, dtype)
-        y, state = norm_act(self.norm, y, state, dtype, relu=False)
-        if self.expand_norm is None:
-            h = convolve(self.expand, y, dtype)
+        if isinstance(self.dw, Depthwise):
+            y = self.dw(x, dtype)
         else:
-            h, state = conv_norm(self.expand, self.expand_norm, y, state, dtype)
+            y, state = self.dw(x, state, dtype)
+        if self.position is not None:
+            y = y + self.position.astype(y.dtype)
+        y, state = norm_act(self.norm, y, state, dtype, relu=False)
+        weights = self.experts(y)
+        expand, z = self.mixture(self.expand, self.expand_experts, weights, y)
+        if self.expand_norm is None:
+            h = convolve(expand, z, dtype)
+        else:
+            h, state = conv_norm(expand, self.expand_norm, z, state, dtype)
         if self.pool_linear is not None:
             bias = self.pool_linear(board_pool(y[-self.pool_channels :]))
             h = h + bias.reshape(-1, 1, 1).astype(h.dtype)
         h = jax.nn.relu(h)
+        project, h = self.mixture(self.project, self.project_experts, weights, h)
         if self.project_norm is None:
-            y = convolve(self.project, h, dtype)
+            y = convolve(project, h, dtype)
         else:
-            y, state = conv_norm(self.project, self.project_norm, h, state, dtype)
+            y, state = conv_norm(project, self.project_norm, h, state, dtype)
         return x + y.astype(x.dtype), state
 
 
@@ -919,6 +1467,57 @@ class PooledHeads(eqx.Module):
         return (policy, self.value_linear(value)), state
 
 
+def mixer(
+    config: AZResnetConfig,
+    attention: bool,
+    taps: tuple[tuple[int, int], ...],
+    board: tuple[int, int],
+    key: jax.Array,
+    make_norm: NormMaker,
+    stats: Stats,
+) -> Mixer | None:
+    """A ConvNeXt block's step between squares as `config` sets it (with `attention`, attention's),
+    or None for the plain depthwise filter of `taps`."""
+    channels = config.num_channels
+    chosen = [
+        name
+        for name, on in (
+            ("dw_branches", config.dw_branches),
+            ("dw_experts", config.dw_experts),
+            ("scan_steps", config.scan_steps),
+        )
+        if on
+    ]
+    if len(chosen) > 1:
+        raise ValueError(f"one step between squares, not {' and '.join(chosen)}")
+    if attention:
+        return BoardAttention(
+            channels,
+            config.attention_heads,
+            board,
+            key=key,
+            make_norm=make_norm,
+            stats=stats,
+        )
+    if config.dw_branches:
+        return BranchedDepthwise(
+            channels, config.dw_branches, key=key, make_norm=make_norm, stats=stats
+        )
+    if config.dw_experts > 1:
+        return DynamicDepthwise(channels, taps, config.dw_experts, key=key)
+    if config.scan_steps:
+        return GatedScan(
+            channels,
+            config.scan_steps,
+            config.scan_length or max(board) - 1,
+            config.scan_gates,
+            key=key,
+            make_norm=make_norm,
+            stats=stats,
+        )
+    return None
+
+
 class AZResnet(eqx.Module):
     """Implements the AlphaZero ResNet model, and KataGo's variants of it (see `AZResnetConfig`).
 
@@ -936,6 +1535,8 @@ class AZResnet(eqx.Module):
     inference_dtype: str = eqx.field(static=True)
     train_dtype: str = eqx.field(static=True)
     remat: bool = eqx.field(static=True)
+    board_plane: bool = eqx.field(static=True)
+    input_features: Callable[[jax.Array], jax.Array] | None = eqx.field(static=True)
 
     def __init__(
         self,
@@ -975,7 +1576,27 @@ class AZResnet(eqx.Module):
             raise ValueError(
                 'expand_norm and project_norm are block="convnext"\'s options'
             )
-        self.stem_conv = conv(in_channels, channels, 3, stem_key)
+        convnext_options = (
+            config.dw_branches,
+            config.dw_experts,
+            config.scan_steps,
+            config.attention_last,
+            config.position_bias,
+            config.mlp_experts,
+        )
+        if any(convnext_options) and not convnext:
+            raise ValueError(
+                "dw_branches, dw_experts, scan_steps, attention_last, position_bias and "
+                'mlp_experts are block="convnext"\'s options'
+            )
+        more_inputs = 1 if config.board_plane else 0
+        if config.input_features is not None:
+            features = jax.eval_shape(
+                config.input_features,
+                jax.ShapeDtypeStruct(input_shape, jnp.float32),
+            )
+            more_inputs += features.shape[-1]
+        self.stem_conv = conv(in_channels + more_inputs, channels, 3, stem_key)
         self.stem_norm = (
             make_norm(channels, INPUT_STATS, 3) if stem_norm or not pre else None
         )
@@ -1008,9 +1629,20 @@ class AZResnet(eqx.Module):
                     stats=block_stats,
                     expand_norm=expand_norm,
                     project_norm=project_norm,
+                    mixer=mixer(
+                        config,
+                        i >= config.num_blocks - config.attention_last,
+                        taps,
+                        (height, width),
+                        jax.random.fold_in(k, 2),
+                        make_norm,
+                        block_stats,
+                    ),
+                    position=(height, width) if config.position_bias else None,
+                    mlp_experts=config.mlp_experts,
                 )
-                for pool, k, block_stats in zip(
-                    pool_channels, block_keys, stats[:-1], strict=True
+                for i, (pool, k, block_stats) in enumerate(
+                    zip(pool_channels, block_keys, stats[:-1], strict=True)
                 )
             ]
         elif config.block == "basic":
@@ -1068,6 +1700,8 @@ class AZResnet(eqx.Module):
         self.inference_dtype = config.inference_dtype
         self.train_dtype = config.train_dtype
         self.remat = config.remat
+        self.board_plane = config.board_plane
+        self.input_features = config.input_features
 
     def __call__(
         self, x: jax.Array, state: eqx.nn.State, outcome_logits: bool = False
@@ -1078,6 +1712,13 @@ class AZResnet(eqx.Module):
         # the convolutions compute in the inference dtype in inference mode (and so do the activations
         # between them), in the train dtype in training
         dtype = jnp.dtype(self.inference_dtype if self.inference else self.train_dtype)
+        planes = [x]
+        if self.input_features is not None:
+            planes.append(self.input_features(x))
+        if self.board_plane:
+            planes.append(jnp.ones((*x.shape[:-1], 1)))
+        if len(planes) > 1:
+            x = jnp.concatenate([p.astype(jnp.float32) for p in planes], axis=-1)
         # inputs are channels-last (and may be e.g. boolean), equinox convolutions are channels-first
         x = jnp.moveaxis(x, -1, 0).astype(dtype)
         # initial conv layer

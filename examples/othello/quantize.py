@@ -17,7 +17,7 @@ from pathlib import Path
 
 import numpy as np
 from bench_cpu_backends import network_path
-from export_onnx import export_checkpoint
+from export_onnx import SCAN_SCOPE, export_checkpoint
 
 QUANTIZED_DIR = (
     Path(
@@ -87,7 +87,8 @@ def quantize_graph(graph: bytes, variant: str, calibration: np.ndarray):
     trunk's last two, "noof" gives the first layer's weights all 8 bits (VNNI doesn't overflow),
     "minmax" takes activations' ranges over all the calibration rather than each position's mean,
     "pertensor" a scale per weight rather than per channel, and any other just labels, e.g. the
-    calibration."""
+    calibration. Gated scans stay in float, as in the native network (`cpu_net.py`): with their
+    products of gates quantized, a 4x64 scan net's value was off by 0.17 on average."""
     import nncf
     import openvino as ov
 
@@ -102,16 +103,23 @@ def quantize_graph(graph: bytes, variant: str, calibration: np.ndarray):
         "performance": nncf.QuantizationPreset.PERFORMANCE,
     }
     preset, *options = variant.split("_")
+    scans = [
+        op.get_friendly_name()
+        for op in model.get_ordered_ops()
+        if op.get_friendly_name().startswith(SCAN_SCOPE)
+    ]
     ignored = []
     if "value" in options:
         ignored = head_ops(model, ["value"])
     if "heads" in options:
         ignored = head_ops(model, ["value", "policy"])
+    ignored = [*ignored, *scans]
     trunk_convs = [
         op.get_friendly_name()
         for op in model.get_ordered_ops()
         if op.get_type_name() == "Convolution"
         and op.get_friendly_name() not in head_ops(model, ["value", "policy"])
+        and op.get_friendly_name() not in scans
     ]
     if "stem" in options:
         ignored = [*ignored, trunk_convs[0]]
