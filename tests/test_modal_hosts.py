@@ -1,5 +1,5 @@
 """Modal containers as cloud hosts, with stand-ins for Modal's app and calls: one app a launch, a
-call a host, and a container on another CPU model than the one asked for is swapped for a new call
+call a host, and a container on another CPU than the one asked for is swapped for a new call
 without costing its slot an attempt."""
 
 from typing import Any
@@ -29,8 +29,8 @@ class Call:
 
 
 class Hosts(modal_hosts.ModalHosts):
-    def __init__(self, cpu_id: str | None = "GenuineIntel-6-173"):
-        super().__init__("CPU", 8, 16, cpu_id)
+    def __init__(self, cpu: str | None = "avx512-vnni"):
+        super().__init__("CPU", 8, 16, cpu)
         self.opened: list[tuple[str, float]] = []
         self.started: list[Call] = []
 

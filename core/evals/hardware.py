@@ -23,6 +23,12 @@ ISA_FLAGS = (
     "avx_vnni",
     "amx_tile",
 )
+# a CPU requirement (`fits`) met by any CPU with what x86-64-v4 needs and AVX-512 VNNI: where an
+# AVX-512 build of every program runs, and int8 networks take their VNNI kernels
+AVX512_VNNI = "avx512-vnni"
+AVX512_VNNI_FLAGS = frozenset(
+    {"avx512f", "avx512bw", "avx512vl", "avx512dq", "avx512cd", "avx512_vnni"}
+)
 # set by the cloud launchers: where the host is, e.g. "gcp:n4d-highcpu-16" or "modal:L40S"
 PLACEMENT_ENV = "TZ_EVAL_PLACEMENT"
 # set by the cloud launchers: the commit their files are from
@@ -68,6 +74,17 @@ def cpu_id(text: str | None = None) -> str | None:
     if not all(parts):
         return None
     return "-".join(p for p in parts if p)
+
+
+def fits(want: str, text: str | None = None) -> bool:
+    """Whether this CPU (or the one /proc/cpuinfo's `text` is of) meets `want`: `AVX512_VNNI`, or
+    a model as `cpu_id` names it."""
+    if text is None:
+        path = Path("/proc/cpuinfo")
+        text = path.read_text() if path.exists() else ""
+    if want == AVX512_VNNI:
+        return AVX512_VNNI_FLAGS <= _cpuinfo(text)[1]
+    return cpu_id(text) == want
 
 
 def physical_cores(cpus: list[int]) -> int:

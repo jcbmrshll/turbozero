@@ -4,9 +4,9 @@ as it would on a Spot VM, from the same bucket, by the same runner (`gcp_cpu_run
 The image holds the environment, built from `uv.lock`, and Modal keeps it until the lock changes; a
 container takes the job's code and inputs from the bucket, as a VM does. On a GPU, JAX runs on
 it. Modal's CPUs are a mix of models that changes from day to day (some without AVX-512, which the
-engines' default builds need), and seconds from different models don't compare: with a `cpu_id`,
-a container on another model leaves at once, and another call is made in its place, up to
-`REROLLS` times a host. A container that ends without its slot done is replaced by
+engines' default builds need). Given a CPU requirement (`hardware.fits`: AVX-512 with VNNI, or one
+model), a container on a CPU that doesn't meet it leaves at once, and another call is made in its
+place, up to `REROLLS` times a host. Each game records the model it ran on. A container that ends without its slot done is replaced by
 `gcp_cpu_jobs.watch`, the replacement skipping what's done.
 """
 
@@ -29,10 +29,10 @@ def _slot(
     slot: int,
     inputs: list[str],
     gpu: bool,
-    cpu_id: str | None = None,
+    cpu: str | None = None,
 ) -> str | None:
     """A container's work: the job's code and inputs from the bucket, then its slot's jobs; on a
-    CPU that isn't `cpu_id` (see `hardware.cpu_id`), nothing but saying which it is."""
+    CPU that doesn't meet `cpu` (see `hardware.fits`), nothing but saying which it is."""
     import io
     import sys
 
@@ -44,11 +44,10 @@ def _slot(
     with tarfile.open(fileobj=io.BytesIO(code), mode="r:gz") as tar:
         tar.extractall("/src", filter="data")
     sys.path.insert(0, "/src")
-    from core.evals.hardware import cpu_id as this_cpu
+    from core.evals.hardware import cpu_id, fits
 
-    found = this_cpu()
-    if cpu_id is not None and found != cpu_id:
-        return f"{WRONG_CPU}{found}"
+    if cpu is not None and not fits(cpu):
+        return f"{WRONG_CPU}{cpu_id()}"
     cache = Path(HOME) / ".cache" / "turbozero" / "othello"
     cache.mkdir(parents=True, exist_ok=True)
     for key in inputs:
@@ -83,14 +82,14 @@ def _slot(
 class ModalHosts:
     """`gcp_cpu_jobs.Cloud` on Modal: one app for the launch, a call of its function (each in a
     container of its own) a host, with `gpu` ("CPU" for none), `cpu` cores and `memory` GiB, on
-    CPU model `cpu_id` if one is given. It knows the calls it made, in this process: a launcher
+    a CPU meeting `cpu` if one is given (`hardware.fits`). It knows the calls it made, in this process: a launcher
     run again starts new ones for what's left. `close` stops the app."""
 
-    def __init__(self, gpu: str, cpu: int, memory: int, cpu_id: str | None = None):
+    def __init__(self, gpu: str, cpus: int, memory: int, cpu: str | None = None):
         self.gpu = gpu
-        self.cpu = cpu
+        self.cpus = cpus
         self.memory = memory
-        self.cpu_id = cpu_id
+        self.cpu = cpu
         # each host's: (slot, job, its call)
         self.calls: dict[str, tuple[str, str, Any]] = {}
         # each host's metadata, for another call in its place, and how many were on other CPUs
@@ -136,7 +135,7 @@ class ModalHosts:
         function = app.function(
             image=self.image(),
             gpu=None if self.gpu == "CPU" else self.gpu,
-            cpu=float(self.cpu),
+            cpu=float(self.cpus),
             memory=self.memory * 1024,
             secrets=[modal.Secret.from_name(SECRET)],
             timeout=int(hours * 3600),
@@ -158,7 +157,7 @@ class ModalHosts:
             int(metadata["tz-slot"]),
             metadata["tz-inputs"].split(),
             self.gpu != "CPU",
-            self.cpu_id,
+            self.cpu,
         )
 
     def create(

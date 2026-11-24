@@ -26,10 +26,10 @@ Where (`--on`):
 
 - `local`: here, on `--cores` (else all this process may use; quiet ones, for timed games)
 - `gcp`: Spot VMs of one CPU model (`gcp_cpu_jobs.py`, 8 cores of AMD Turin), `--jobs` of them
-- `modal`: Modal containers, `--gpu CPU` or a GPU, `--modal-cpu` cores each, on one CPU model
-  (`--modal-cpu-model`, Intel Granite Rapids by default; Modal's mix changes from day to day, and
-  a container on another model is swapped for a new one). Not the GCP VMs' CPU: a clock there
-  is its own condition
+- `modal`: Modal containers, `--gpu CPU` or a GPU, `--modal-cpu` cores each, on CPUs meeting
+  `--modal-cpu-model`: by default any with AVX-512 and VNNI (a mix of models that changes from
+  hour to hour, each game recording its own), or one model; a container on another CPU is
+  swapped for a new one. Not the GCP VMs' CPU: a clock there is its own condition
 
 Cloud hosts write their games to the bucket as they go, and they're brought into the store while
 the match runs; `sync MATCH` brings in what's there later. Every game records its moves, each
@@ -101,9 +101,6 @@ SYNC_SECONDS = 60.0
 BUSY_TO_START = 0.15
 QUIET_SECONDS = 15.0
 LEAGUE_TIMINGS = CACHE_DIR / "league" / "timings.json"
-# the CPU model Modal's CPU containers were all on when it was chosen (2026-11-24): Intel Xeon 6
-# (Granite Rapids), AVX-512 with VNNI
-MODAL_CPU = "GenuineIntel-6-173"
 
 
 def parse_cores(text: str) -> list[int]:
@@ -925,8 +922,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--modal-memory", type=int, default=16, help="its GiB")
     p.add_argument(
         "--modal-cpu-model",
-        default=MODAL_CPU,
-        help="the CPU model (`hardware.cpu_id`) a Modal host must be on, or any",
+        default=hardware.AVX512_VNNI,
+        help=f"what a Modal host's CPU must be: {hardware.AVX512_VNNI}, a model as "
+        "`hardware.cpu_id` names it (e.g. GenuineIntel-6-173), or any",
     )
     p.add_argument(
         "--fresh-jobs",

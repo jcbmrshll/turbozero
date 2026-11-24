@@ -529,8 +529,21 @@ def test_a_cpu_whose_name_is_hidden_is_named_by_its_vendor_family_and_model():
     assert hardware.cpu_id("Features\t: neon\n") is None
 
 
+def test_a_cpu_fits_avx512_vnni_by_its_flags_or_a_model_by_its_id():
+    assert hardware.fits("GenuineIntel-6-173", GVISOR_CPUINFO)
+    assert not hardware.fits("AuthenticAMD-25-17", GVISOR_CPUINFO)
+    assert not hardware.fits(hardware.AVX512_VNNI, GVISOR_CPUINFO)
+    v4 = " ".join(sorted(hardware.AVX512_VNNI_FLAGS))
+    full = GVISOR_CPUINFO.replace("fpu avx2 avx512f avx512_vnni", f"fpu avx2 {v4}")
+    assert hardware.fits(hardware.AVX512_VNNI, full)
+
+
 def test_a_modal_match_is_placed_on_its_cpu_model():
     args = evaluate.build_parser().parse_args(["run", "--on", "modal"])
+    assert evaluate.placement_of(args) == ("modal:CPU:8c:avx512-vnni", 8)
+    args = evaluate.build_parser().parse_args(
+        ["run", "--on", "modal", "--modal-cpu-model", "GenuineIntel-6-173"]
+    )
     assert evaluate.placement_of(args) == ("modal:CPU:8c:GenuineIntel-6-173", 8)
     args = evaluate.build_parser().parse_args(
         ["run", "--on", "modal", "--modal-cpu-model", "any"]
