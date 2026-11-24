@@ -868,6 +868,34 @@ def test_a_net_player_passes_when_the_game_does():
     assert (me | opp).bit_count() == 4 + sum(m != PASS for m in moves) + 1
 
 
+def test_a_net_player_records_its_searched_roots_only_when_asked():
+    from cpu_match import NetPlayer
+    from cpu_search import SearchSettings
+
+    def root(temperature: float, record: bool) -> dict:
+        player = NetPlayer(
+            SearchSettings(prior_temperature=temperature),
+            fake_eval,
+            visits=40,
+            record_search=record,
+        )
+        legal = np.flatnonzero(player.search.legal()).tolist()
+        player.move("b", 1.0)
+        info = player.info()
+        assert info is not None
+        if record:
+            assert info["actions"] == legal
+        return info
+
+    assert set(root(2.0, False)) == {"q", "visits", "added"}
+    flat, sharp = root(2.0, True), root(1.0, True)
+    assert sum(flat["counts"]) == flat["visits"]
+    assert sum(flat["priors"]) == pytest.approx(1, abs=1e-5)
+    # the priors as the search used them: the network's own, at the temperature
+    tempered = np.array(sharp["priors"]) ** 0.5
+    assert flat["priors"] == pytest.approx(tempered / tempered.sum(), rel=1e-4)
+
+
 @pytest.fixture(scope="module")
 def tiny_model(tmp_path_factory):
     """A small random network's ONNX graph, on disk, as an `Engine` reads it."""

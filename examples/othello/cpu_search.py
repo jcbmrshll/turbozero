@@ -109,6 +109,10 @@ def load_library() -> ctypes.CDLL:
         "search_best_action": (ctypes.c_int, [Search]),
         "search_visits": (None, [Search, ints]),
         "search_legal": (None, [Search, ints]),
+        "search_priors": (
+            None,
+            [Search, np.ctypeslib.ndpointer(np.float32, flags="C_CONTIGUOUS")],
+        ),
         "search_root_q": (ctypes.c_float, [Search]),
         "search_play": (None, [Search, ctypes.c_int]),
         "search_halt": (None, [Search, ctypes.c_int]),
@@ -326,6 +330,14 @@ class Search:
         """(65) the visits of each of the root's actions."""
         out = np.zeros(65, np.int32)
         LIB.search_visits(self.handle, out)
+        return out
+
+    def priors(self) -> np.ndarray:
+        """(65) the prior of each of the root's actions as the search uses it, the network's policy
+        at the prior temperature; 0 for an action the root has no edge for (illegal, or the root
+        not yet expanded)."""
+        out = np.zeros(65, np.float32)
+        LIB.search_priors(self.handle, out)
         return out
 
     def legal(self) -> np.ndarray:

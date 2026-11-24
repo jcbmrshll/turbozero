@@ -37,7 +37,9 @@ Where (`--on`):
 
 Cloud hosts write their games to the bucket as they go, and they're brought into the store while
 the match runs; `sync MATCH` brings in what's there later. Every game records its moves, each
-move's seconds (when timed alone), how it ended, and the host it ran on.
+move's seconds (when timed alone), what each side's search said of them, how it ended, and the
+host it ran on; a network's searched moves also the root's legal actions with their priors and
+visits (not in GPU batches), unless `--no-record-search`.
 """
 
 import argparse
@@ -98,6 +100,7 @@ MATCH_KEYS = (
     "match_type",
     "since",
     "tag",
+    "record_search",
 )
 SYNC_SECONDS = 60.0
 # `run --require-idle`: over which a CPU (or its SMT sibling) is too busy to start on, and how
@@ -152,7 +155,7 @@ def match_setup(args: argparse.Namespace) -> dict[str, Any]:
         setup = tomllib.loads(text) if path.suffix == ".toml" else json.loads(text)
     for key in ("a", "b", "note", *MATCH_KEYS):
         value = getattr(args, key, None)
-        if value is not None and value is not False:
+        if value is not None:
             setup[key] = value
     for side in ("a", "b"):
         if side not in setup:
@@ -916,6 +919,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=None,
         help="a start's two games at once, on the same cores, as GGS plays them",
+    )
+    p.add_argument(
+        "--record-search",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="keep each network move's root actions, priors and visits (on by default)",
     )
     p.add_argument("--match-type", help="a file's starts of (GGS archives)")
     p.add_argument("--since", help="a file's starts from, e.g. 2024")
