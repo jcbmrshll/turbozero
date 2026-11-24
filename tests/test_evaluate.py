@@ -854,3 +854,14 @@ def test_stop_decided_is_on_at_a_clock_and_off_is_the_player_from_before(tmp_pat
     assert "stop_decided" not in resolve(fixed, 8).config["search"]
     with pytest.raises(ValueError, match="needs a clock"):
         resolve(f"{fixed},stop_decided=1", 8)
+
+
+def test_a_solve_reserve_is_recorded_only_when_set(tmp_path):
+    checkpoint = tmp_path / "1.eqx"
+    checkpoint.write_bytes(b"params")
+    base = f"net:checkpoint={checkpoint},spec=s,clock=10,solve=28"
+    before = resolve(base, 8)
+    assert "solve_reserve" not in before.config["search"]
+    set_ = resolve(f"{base},solve_reserve=0", 8)
+    assert set_.config["search"]["solve_reserve"] == 0.0
+    assert set_.id != before.id and set_.label.endswith(" reserve0")

@@ -253,6 +253,12 @@ def resolve_net(
             search["solve_cost"] = _typed(
                 "solve_cost", options.pop("solve_cost", SOLVE_COST), float
             )
+            # the fewest seconds kept for the solve (`cpu_match.Solving.reserve`): in the config
+            # only when set, so the players from before it was an option keep their ids
+            if "solve_reserve" in options:
+                search["solve_reserve"] = _typed(
+                    "solve_reserve", options.pop("solve_reserve"), float
+                )
     if device == "cpu":
         descend = _typed("descend", options.pop("descend", None), int)
         if descend not in (None, 0, 1, 2):
@@ -298,6 +304,8 @@ def resolve_net(
     solve = f" solve{search['solve']}" if "solve" in search else ""
     solve += {0: "", 1: " descend", 2: " descend-recursive"}[search.get("descend", 0)]
     solve += " stop-decided" if search.get("stop_decided") else ""
+    if "solve_reserve" in search:
+        solve += f" reserve{search['solve_reserve']:g}"
     temperature = search.get("prior_temperature")
     prior = f" T{temperature:g}" if temperature != known["prior_temperature"][1] else ""
     if device == "gpu-batched" and "c_init" in search:
