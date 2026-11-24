@@ -314,6 +314,12 @@ def test_the_driver_sets_its_own_flags():
         config(buffer=2000).check()
 
 
+def test_host_memory_follows_the_buffer_unless_set():
+    sizes = {b: config(buffer=b).job_memory_gb() for b in (1125, 2250, 4500, 9000)}
+    assert sizes == {1125: 32, 2250: 32, 4500: 48, 9000: 96}
+    assert config(buffer=2250, memory_gb=64).job_memory_gb() == 64
+
+
 def test_the_template_loads(tmp_path):
     (tmp_path / "driver.toml").write_text(
         fork_driver.TEMPLATE.format(
@@ -359,6 +365,7 @@ def test_on_modal_lines_are_jobs_that_follow_and_keep_states_in_the_bucket(
     driver.tick()
     job = Job.from_dict(get_json(store, job_key("t-main", "job.json")))
     assert job.states_in_bucket and job.follow_minutes == 30 and job.hours == 10
+    assert job.cpu == 16 and job.memory_gb == 96
     assert spawned == [job]
     (step,) = job.steps
     assert step.ckpt_dir == f"{run_dir}/lines/main/seg0"
