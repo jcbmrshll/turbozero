@@ -192,6 +192,16 @@ DW_TAPS = {"rays": RAY_TAPS}
 # one ahead: the discs and empties always add to 64, so a margin is even
 MARGINS = tuple(float(m) for m in range(64, -65, -2))
 
+# a win and a loss: a value head over them is KataGo's, a draw's target half of each (see
+# core.training.loss_fns.score_target)
+RESULTS = (1.0, -1.0)
+
+# the scores a value head predicts, as a spec names them, e.g. "resnet:7x64,outcomes=margin":
+# a distribution over them in place of a value (see
+# core.networks.azresnet.AZResnetConfig.outcome_scores). The final margin's train on the
+# margins games end on, solved exactly; a win and a loss's ("result") on their results
+OUTCOMES = {"margin": MARGINS, "result": RESULTS}
+
 # Othello's 8 directions, and the ray taps as branches, one for each line through the square, one
 # for the square itself and one for its 3 x 3 neighbourhood: trained apart, each normalized on its
 # own, they fold into one filter of the ray taps (see core.networks.azresnet.BranchedDepthwise)
@@ -244,7 +254,7 @@ SPEC_OPTIONS = {
     "inputs": {"moves": {"input_features": move_planes}},
     # a value head over the final margin in place of a value (see
     # core.networks.azresnet.AZResnetConfig.outcome_scores)
-    "outcomes": {"margin": {"outcome_scores": MARGINS}},
+    "outcomes": {name: {"outcome_scores": scores} for name, scores in OUTCOMES.items()},
 }
 
 
@@ -282,7 +292,7 @@ def make_network(
     keeping them. Othello's settings are named in the spec (see SPEC_OPTIONS): the depthwise
     filter taps as dw_taps=rays (see DW_TAPS), the ray filter in branches as dw_branches=rays,
     gated lines as scan=rays, legal-move input planes as inputs=moves, and a value head over the
-    final margin as outcomes=margin (see MARGINS)."""
+    final margin or over a win and a loss as outcomes=margin or outcomes=result (see OUTCOMES)."""
     net, options = network_options(net)
     config = network_config(
         net,
