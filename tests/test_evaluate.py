@@ -362,6 +362,21 @@ def test_matches_leave_out_the_openings_engine_sets_use_unless_asked():
     assert {o.label for o in old} <= used  # seed 1's 400 were played for the set
 
 
+def test_balanced_starts_are_held_out_openings_valued_nearest_even(tmp_path):
+    from xot import BALANCED_DISCS, balanced_openings, held_out_openings, opening_values
+
+    values = tmp_path / "values.txt"
+    values.write_text("# index value\n3 0\n5 -2\n8 1\n13 -1\n")
+    assert list(balanced_openings(0, values)) == [3]
+    assert list(balanced_openings(1, values)) == [3, 8, 13]
+    index, value = opening_values()
+    assert set(index) == set(held_out_openings())
+    a, b = fake("a", {"level": 1}), fake("b", {"level": 2})
+    picked = MatchSpec(a, b, openings=50, starts="xot-balanced").choose_openings()
+    by_index = dict(zip(index, value))
+    assert all(abs(by_index[int(o.label[4:])]) <= BALANCED_DISCS for o in picked)
+
+
 # --- games -----------------------------------------------------------------------------------
 
 
@@ -502,6 +517,63 @@ def test_a_hosts_description_is_the_same_each_time():
     assert {"cpu", "isa", "affinity", "physical_cores", "placement"} <= set(
         hardware.describe()
     )
+
+
+GVISOR_CPUINFO = """processor\t: 0
+vendor_id\t: GenuineIntel
+cpu family\t: 6
+model\t\t: 173
+model name\t: unknown
+flags\t\t: fpu avx2 avx512f avx512_vnni
+
+processor\t: 1
+vendor_id\t: GenuineIntel
+cpu family\t: 6
+model\t\t: 173
+model name\t: unknown
+"""
+
+
+def test_a_cpu_whose_name_is_hidden_is_named_by_its_vendor_family_and_model():
+    assert hardware.cpu_id(GVISOR_CPUINFO) == "GenuineIntel-6-173"
+    model, flags = hardware._cpuinfo(GVISOR_CPUINFO)
+    assert model == "GenuineIntel-6-173"
+    assert {"avx512f", "avx512_vnni"} <= flags
+    named = GVISOR_CPUINFO.replace("unknown", "AMD EPYC 9B45")
+    assert hardware._cpuinfo(named)[0] == "AMD EPYC 9B45"
+    assert hardware.cpu_id("Features\t: neon\n") is None
+
+
+def test_a_cpu_fits_avx512_vnni_by_its_flags_or_a_model_by_its_id():
+    assert hardware.fits("GenuineIntel-6-173", GVISOR_CPUINFO)
+    assert not hardware.fits("AuthenticAMD-25-17", GVISOR_CPUINFO)
+    assert not hardware.fits(hardware.AVX512_VNNI, GVISOR_CPUINFO)
+    v4 = " ".join(sorted(hardware.AVX512_VNNI_FLAGS))
+    full = GVISOR_CPUINFO.replace("fpu avx2 avx512f avx512_vnni", f"fpu avx2 {v4}")
+    assert hardware.fits(hardware.AVX512_VNNI, full)
+
+
+def test_a_modal_match_is_placed_on_its_cpu_model():
+    args = evaluate.build_parser().parse_args(["run", "--on", "modal"])
+    assert evaluate.placement_of(args) == ("modal:CPU:8c:avx512-vnni", 8)
+    args = evaluate.build_parser().parse_args(
+        ["run", "--on", "modal", "--modal-cpu-model", "GenuineIntel-6-173"]
+    )
+    assert evaluate.placement_of(args) == ("modal:CPU:8c:GenuineIntel-6-173", 8)
+    args = evaluate.build_parser().parse_args(
+        ["run", "--on", "modal", "--modal-cpu-model", "any"]
+    )
+    assert evaluate.placement_of(args) == ("modal:CPU:8c", 8)
+
+
+def test_a_modal_match_has_a_host_every_ten_games_left_unless_told():
+    parse = evaluate.build_parser().parse_args
+    assert evaluate.cloud_hosts(parse(["run", "--on", "modal"]), 300) == 30
+    assert evaluate.cloud_hosts(parse(["run", "--on", "modal"]), 41) == 5
+    assert (
+        evaluate.cloud_hosts(parse(["run", "--on", "modal", "--jobs", "75"]), 300) == 75
+    )
+    assert evaluate.cloud_hosts(parse(["run", "--on", "gcp"]), 300) == 1
 
 
 # --- the CLI ---------------------------------------------------------------------------------
@@ -797,3 +869,19 @@ def test_stop_decided_is_on_at_a_clock_and_off_is_the_player_from_before(tmp_pat
     assert "stop_decided" not in resolve(fixed, 8).config["search"]
     with pytest.raises(ValueError, match="needs a clock"):
         resolve(f"{fixed},stop_decided=1", 8)
+
+
+def test_a_clock_players_solve_reserve_is_0_unless_said_and_4_is_the_player_from_before(
+    tmp_path,
+):
+    checkpoint = tmp_path / "1.eqx"
+    checkpoint.write_bytes(b"params")
+    base = f"net:checkpoint={checkpoint},spec=s,clock=10,solve=28"
+    now = resolve(base, 8)
+    assert now.config["search"]["solve_reserve"] == 0.0
+    assert now.label.endswith(" reserve0")
+    assert resolve(f"{base},solve_reserve=0", 8).id == now.id
+    before = resolve(f"{base},solve_reserve=4", 8)
+    assert "solve_reserve" not in before.config["search"] and before.id != now.id
+    fixed = resolve(f"net:checkpoint={checkpoint},spec=s,visits=100,solve=28", 8)
+    assert "solve_reserve" not in fixed.config["search"]

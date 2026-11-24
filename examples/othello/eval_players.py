@@ -89,6 +89,10 @@ OPTIONS: dict[str, dict[str, tuple[type, Any]]] = {
 SOLVE = {"solve_exact": (int, 0), "solve_share": (float, 0.25)}
 # a CPU network's expected seconds for a solve at 24 empties on 8 threads: Edax's (`cpu_match.Solving`)
 SOLVE_COST = 0.19
+# a net player's fewest seconds kept for its solve on a clock, and what it was before it was an
+# option (`cpu_match.Solving.reserve`)
+SOLVE_RESERVE = 0.0
+OLD_SOLVE_RESERVE = 4.0
 # what names a network and where it is: not options of its search
 NETWORK_KEYS = ("net", "checkpoint", "spec", "device")
 
@@ -253,6 +257,19 @@ def resolve_net(
             search["solve_cost"] = _typed(
                 "solve_cost", options.pop("solve_cost", SOLVE_COST), float
             )
+            # the fewest seconds kept for the solve (`cpu_match.Solving.reserve`). On a clock 0
+            # unless said: the 4 s floor from before was 40% of a 10 s game, and in an eval cut
+            # at the solve depth the referee solves instead. In the config only when not 4, so
+            # the players from before it was an option keep their ids
+            reserve = _typed(
+                "solve_reserve",
+                options.pop(
+                    "solve_reserve", SOLVE_RESERVE if "clock" in budget else None
+                ),
+                float,
+            )
+            if reserve is not None and reserve != OLD_SOLVE_RESERVE:
+                search["solve_reserve"] = reserve
     if device == "cpu":
         descend = _typed("descend", options.pop("descend", None), int)
         if descend not in (None, 0, 1, 2):
@@ -298,6 +315,8 @@ def resolve_net(
     solve = f" solve{search['solve']}" if "solve" in search else ""
     solve += {0: "", 1: " descend", 2: " descend-recursive"}[search.get("descend", 0)]
     solve += " stop-decided" if search.get("stop_decided") else ""
+    if "solve_reserve" in search:
+        solve += f" reserve{search['solve_reserve']:g}"
     temperature = search.get("prior_temperature")
     prior = f" T{temperature:g}" if temperature != known["prior_temperature"][1] else ""
     if device == "gpu-batched" and "c_init" in search:

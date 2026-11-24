@@ -11,11 +11,12 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 from modal_store import GcsStore, Store, get_json, put_json
 
@@ -30,6 +31,8 @@ STREAM_SECONDS = 20.0
 IDLE_SHARE = 0.97
 IDLE_WINDOW = 5.0
 SETTLE_LIMIT = 180.0
+# how often a running job's host memory is looked at, for its peak
+MEMORY_SECONDS = 2.0
 
 
 def result_key(prefix: str, slot: int, name: str) -> str:
@@ -78,6 +81,59 @@ def settle(
     return share
 
 
+def memory_used(meminfo: Path = Path("/proc/meminfo")) -> float | None:
+    """The host's memory in use, in GiB: all of it but what's free or could be freed (caches),
+    as `free` counts it. None where there's no /proc/meminfo."""
+    try:
+        text = meminfo.read_text()
+    except OSError:
+        return None
+    kib = {
+        key: int(value.split()[0])
+        for key, _, value in (line.partition(":") for line in text.splitlines())
+        if value.strip()
+    }
+    if "MemTotal" not in kib or "MemAvailable" not in kib:
+        return None
+    return (kib["MemTotal"] - kib["MemAvailable"]) / 2**20
+
+
+class MemoryPeak:
+    """The most memory the host had in use while it ran, looked at every `every` seconds in a
+    thread: what a container's memory request can be sized by."""
+
+    def __init__(
+        self,
+        used: Callable[[], float | None] = memory_used,
+        every: float = MEMORY_SECONDS,
+    ):
+        self.used = used
+        self.every = every
+        self.peak: float | None = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._watch, daemon=True)
+
+    def _look(self) -> None:
+        now = self.used()
+        if now is not None and (self.peak is None or now > self.peak):
+            self.peak = now
+
+    def _watch(self) -> None:
+        while True:
+            self._look()
+            if self._stop.wait(self.every):
+                return
+
+    def __enter__(self) -> Self:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self._stop.set()
+        self._thread.join()
+        self._look()
+
+
 class Outputs:
     """Sends a job's output files to the bucket when they've changed."""
 
@@ -106,7 +162,11 @@ def run_job(
     """Runs `job["cmd"]` in examples/othello, sending its outputs as they grow: its last line of
     JSON on stdout is its result."""
     begun = time.time()
-    with tempfile.TemporaryFile("w+") as out, tempfile.TemporaryFile("w+") as err:
+    with (
+        MemoryPeak() as memory,
+        tempfile.TemporaryFile("w+") as out,
+        tempfile.TemporaryFile("w+") as err,
+    ):
         process = subprocess.Popen(
             job["cmd"], cwd=HERE, stdout=out, stderr=err, text=True
         )
@@ -124,6 +184,7 @@ def run_job(
     record: dict[str, Any] = {
         "returncode": process.returncode,
         "seconds": round(time.time() - begun, 1),
+        "memory_peak_gib": None if memory.peak is None else round(memory.peak, 2),
         "result": json.loads(lines[-1]) if lines else None,
     }
     log = f"$ {' '.join(job['cmd'])}\n--- stdout\n{stdout}\n--- stderr\n{stderr}"

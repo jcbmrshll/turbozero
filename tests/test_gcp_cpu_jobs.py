@@ -63,6 +63,9 @@ class FakeCloud:
     """Compute Engine whose VMs, on the next look, have run their slot's jobs and deleted
     themselves, or vanished half-way (preempted) when listed in `preempt`."""
 
+    poll_seconds = 20.0
+    queues = False
+
     def __init__(self, store, prefix: str, preempt=(), no_capacity=()):
         self.store = store
         self.prefix = prefix
@@ -99,6 +102,9 @@ class FakeCloud:
 
     def delete(self, names):
         self.deleted += [name for name, _ in names]
+
+    def close(self):
+        self.closed = True
 
 
 def watch(store, cloud, spec, out, attempts=3):
@@ -154,6 +160,34 @@ def test_a_slot_fails_on_a_boot_failure_or_when_out_of_attempts(tmp_path):
     outcome = watch(store, cloud, spec(slots), tmp_path / "out.jsonl", attempts=2)
     assert outcome == {"0": "failed", "1": "failed"}
     assert [vm for vm, _ in cloud.created] == ["tz-t-1-0", "tz-t-1-1"]
+
+
+class Queued(FakeCloud):
+    """A cloud whose hosts wait in its queue: each host starts only on its second look."""
+
+    queues = True
+
+
+def test_a_launch_runs_out_of_time_unless_its_hosts_wait_in_a_queue(tmp_path):
+    store = modal_store.DirStore(tmp_path / "bucket")
+    prefix = "cpu-jobs/t"
+    slots = {"0": [job("a", 1)]}
+    modal_store.put_json(store, f"{prefix}/spec.json", {"slots": slots})
+    # a clock past the launch's hours at every look after the first
+    times = iter([0.0])
+
+    def late() -> float:
+        return next(times, 1e9)
+
+    def run(cloud):
+        return gcp_cpu_jobs.watch(
+            store, cloud, "t", spec(slots), tmp_path / f"{type(cloud).__name__}.jsonl",
+            3, clock=late, pause=lambda s: None,
+        )  # fmt: skip
+
+    assert run(FakeCloud(store, prefix)) == {"0": "out of time"}
+    times = iter([0.0])
+    assert run(Queued(store, prefix)) == {"0": "done"}
 
 
 def test_inputs_are_uploaded_once_until_they_change(tmp_path):
@@ -271,3 +305,22 @@ def test_each_machine_gets_its_image_disk_and_threads():
     # an environment holds one architecture's packages and venv
     assert gcp_cpu_jobs.env_key(machine="c4a-standard-8") != gcp_cpu_jobs.env_key()
     assert gcp_cpu_jobs.env_key(machine="c2d-standard-16") == gcp_cpu_jobs.env_key()
+
+
+def test_a_hosts_memory_in_use_leaves_out_what_caches_hold(tmp_path):
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text(
+        "MemTotal:       8388608 kB\nMemFree:        1048576 kB\n"
+        "MemAvailable:   4194304 kB\nCached:         3145728 kB\n"
+    )
+    assert gcp_cpu_runner.memory_used(meminfo) == 4.0
+    assert gcp_cpu_runner.memory_used(tmp_path / "none") is None
+
+
+def test_a_jobs_memory_peak_is_the_most_seen_while_it_ran():
+    readings = iter([1.0, 3.5, 2.0])
+    peak = gcp_cpu_runner.MemoryPeak(lambda: next(readings, 0.5), every=0.0)
+    with peak:
+        while peak.peak is None or peak.peak < 3.5:
+            pass
+    assert peak.peak == 3.5

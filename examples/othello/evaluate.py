@@ -5,6 +5,8 @@ kept in one store (`core.evals.store`, in ~/.cache/turbozero/othello/evals/evals
         --b edax:level=24 --openings 50 --solve-at 24 --cores 16-23
     uv run examples/othello/evaluate.py run --a net:net=NAME,clock=10,engine=1,backend=native \\
         --b edax:clock=10 --openings 50 --on gcp --jobs 4
+    uv run examples/othello/evaluate.py run --a net:net=NAME,clock=30,engine=1,backend=native \\
+        --b neural-reversi:clock=30,threads=8 --openings 150 --solve-at 28 --on modal
     uv run --extra cuda examples/othello/evaluate.py run \\
         --a net:net=NAME,device=gpu-batched,visits=1000 --b edax:level=20 --openings 256
     uv run examples/othello/evaluate.py run --config match.toml
@@ -17,8 +19,9 @@ or on a `clock`, on the CPU, the GPU a game at a time, or the GPU in batches; or
 settings are the same player wherever they play, and a changed one is a new player.
 
 A match (see `eval_games.py`) plays `--openings` starts, each with both colors, from `--starts`
-(`xot-heldout`, the XOT openings no engine-labelled set takes positions from; `xot`, every XOT
-opening; `random:N`; `file:PATH`), drawn by `--seed`; with `--solve-at N`, every game stops at N
+(`xot-balanced`, the XOT openings no engine-labelled set takes positions from whose starts are
+valued even, where colour decides least; `xot-heldout`, all of those held-out openings; `xot`, every
+XOT opening; `random:N`; `file:PATH`), drawn by `--seed`; with `--solve-at N`, every game stops at N
 empties and is solved for its result. A match's id is its setup's and where it's played: running
 it again continues it, and `--tag` makes another.
 
@@ -26,8 +29,11 @@ Where (`--on`):
 
 - `local`: here, on `--cores` (else all this process may use; quiet ones, for timed games)
 - `gcp`: Spot VMs of one CPU model (`gcp_cpu_jobs.py`, 8 cores of AMD Turin), `--jobs` of them
-- `modal`: Modal containers, `--gpu CPU` or a GPU, `--modal-cpu` cores each (a mix of CPU models:
-  don't compare their seconds)
+- `modal`: Modal containers, `--gpu CPU` or a GPU, `--modal-cpu` cores each, on CPUs meeting
+  `--modal-cpu-model`: by default any with AVX-512 and VNNI (a mix of models that changes from
+  hour to hour, each game recording its own), or one model; a container on another CPU is
+  swapped for a new one. A host for every 10 games unless `--jobs` says. Not the GCP VMs' CPU:
+  a clock there is its own condition
 
 Cloud hosts write their games to the bucket as they go, and they're brought into the store while
 the match runs; `sync MATCH` brings in what's there later. Every game records its moves, each
@@ -99,6 +105,13 @@ SYNC_SECONDS = 60.0
 BUSY_TO_START = 0.15
 QUIET_SECONDS = 15.0
 LEAGUE_TIMINGS = CACHE_DIR / "league" / "timings.json"
+# a Modal host's share of a match by default: each container costs about a minute before its
+# first game (code, inputs, the native build) and a few tries to land on a CPU that fits, so a
+# host that has one keeps it for a while; 30 hosts a 300-game match
+MODAL_GAMES_PER_HOST = 10
+# a cloud host's time limit by default, in hours: a GCP VM's, and a Modal container's (ten 30 s
+# games take about 10 minutes)
+HOURS = {"gcp": 2.0, "modal": 0.5}
 
 
 def parse_cores(text: str) -> list[int]:
@@ -120,12 +133,13 @@ def placement_of(args: argparse.Namespace) -> tuple[str, int]:
     """Where the games are played, and the cores a player has by default there."""
     if args.on == "local":
         # each job's share of the cores
-        return "local", max(len(os.sched_getaffinity(0)) // args.jobs, 1)
+        return "local", max(len(os.sched_getaffinity(0)) // (args.jobs or 1), 1)
     if args.on == "gcp":
         # one thread a core: half the machine's vCPUs (gcp_cpu_jobs.machine_options)
         return f"gcp:{args.machine}", int(args.machine.split("-")[-1]) // 2
     if args.on == "modal":
-        return f"modal:{args.gpu}:{args.modal_cpu}c", args.modal_cpu
+        model = "" if args.modal_cpu_model == "any" else f":{args.modal_cpu_model}"
+        return f"modal:{args.gpu}:{args.modal_cpu}c{model}", args.modal_cpu
     raise SystemExit(f"--on {args.on}: local, gcp or modal")
 
 
@@ -210,7 +224,7 @@ def run(args: argparse.Namespace) -> None:
             )
     store = Store(args.store)
     register(store, spec, placement, setup.get("note", ""))
-    if args.on == "local" and args.jobs > 1:
+    if args.on == "local" and (args.jobs or 1) > 1:
         play_here_in_jobs(store, spec, match_id, args.jobs, args.store)
     elif args.on == "local":
         play_here(store, spec, match_id, args.parallel)
@@ -403,6 +417,14 @@ def sync_bucket(store: Store, bucket: Any, match_id: str) -> int:
     return sync_lines(store, lines)
 
 
+def cloud_hosts(args: argparse.Namespace, left: int) -> int:
+    """How many hosts play a cloud match's `left` games: `--jobs`, else on Modal one every
+    `MODAL_GAMES_PER_HOST`, else one."""
+    if args.jobs:
+        return args.jobs
+    return math.ceil(left / MODAL_GAMES_PER_HOST) if args.on == "modal" else 1
+
+
 def play_in_cloud(
     store: Store,
     spec: MatchSpec,
@@ -421,13 +443,15 @@ def play_in_cloud(
     # a match's jobs, continued as they were when run again, unless asked for new ones for
     # what's left (e.g. after a job failed): the store keeps a game once whichever ran it
     name = match_id if not args.fresh_jobs else f"{match_id}-r{int(time.time())}"
-    jobs = cloud_jobs(spec, match_id, placement, args.jobs, done, args.parallel)
+    hosts = cloud_hosts(args, spec.games - len(done))
+    jobs = cloud_jobs(spec, match_id, placement, hosts, done, args.parallel)
     if args.on == "gcp":
         cloud: Any = Gcloud(project(), args.machine)
     else:
         from modal_hosts import ModalHosts
 
-        cloud = ModalHosts(args.gpu, args.modal_cpu, args.modal_memory)
+        model = None if args.modal_cpu_model == "any" else args.modal_cpu_model
+        cloud = ModalHosts(args.gpu, args.modal_cpu, args.modal_memory, model)
     finished = threading.Event()
 
     def keep_syncing() -> None:
@@ -447,8 +471,8 @@ def play_in_cloud(
             name,
             jobs,
             CACHE_DIR / "evals" / "cloud" / f"{name}.jsonl",
-            vms=args.jobs,
-            hours=args.hours,
+            vms=hosts,
+            hours=args.hours or HOURS[args.on],
             attempts=args.attempts,
             files=job_files(spec),
             machine=args.machine,
@@ -872,8 +896,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--openings", type=int, help="starts, each played with both colors")
     p.add_argument(
         "--starts",
-        help="xot-heldout (default: XOT openings no engine-labelled set takes positions "
-        "from), xot (every XOT opening, as matches before 2026-11-21), random:N or file:PATH",
+        help="xot-balanced (default: held-out XOT openings whose starts are valued even), "
+        "xot-heldout (every XOT opening no engine-labelled set takes positions from, as matches "
+        "before 2026-11-24), xot (every XOT opening, as matches before 2026-11-21), random:N or "
+        "file:PATH",
     )
     p.add_argument("--seed", type=int)
     p.add_argument(
@@ -907,15 +933,35 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--jobs",
         type=int,
-        default=1,
-        help="processes here (each on a share of the cores), or cloud hosts: each a share",
+        default=None,
+        help="processes here (each on a share of the cores), or cloud hosts, each a share: by "
+        f"default 1, or on Modal a host every {MODAL_GAMES_PER_HOST} games left",
     )
-    p.add_argument("--hours", type=float, default=2.0, help="a cloud host's limit")
+    p.add_argument(
+        "--hours",
+        type=float,
+        default=None,
+        help="a cloud host's limit: by default "
+        + ", ".join(f"{h} on {on}" for on, h in HOURS.items()),
+    )
     p.add_argument("--attempts", type=int, default=3, help="hosts a job may start")
     p.add_argument("--machine", default="n4d-highcpu-16", help="a GCP machine type")
     p.add_argument("--gpu", default="CPU", help="Modal's GPU, or CPU")
     p.add_argument("--modal-cpu", type=int, default=8, help="a Modal host's cores")
-    p.add_argument("--modal-memory", type=int, default=32, help="its GiB")
+    p.add_argument(
+        "--modal-memory",
+        type=int,
+        default=8,
+        # a 10 s game against NR used about 6 GiB (our engine 2.8, NR 2.2, the referee's
+        # solver 1.6); Modal bills the larger of this and what's used. Jobs record their peak
+        help="its GiB: what's billed at least",
+    )
+    p.add_argument(
+        "--modal-cpu-model",
+        default=hardware.AVX512_VNNI,
+        help=f"what a Modal host's CPU must be: {hardware.AVX512_VNNI}, a model as "
+        "`hardware.cpu_id` names it (e.g. GenuineIntel-6-173), or any",
+    )
     p.add_argument(
         "--fresh-jobs",
         action="store_true",

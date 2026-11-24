@@ -362,7 +362,7 @@ def net_player(options: dict[str, str]) -> Callable[[], Player]:
     fewer empties are solved on the same cores (see `cpu_match.Solving`), `solve_exact=1` for the
     best margin, `solve_share` what of the game's clock a solve may be expected to take,
     `solve_cost` its expected seconds at 24 empties on 8 threads (on a clock, it solves from as
-    many empties as that affords). `reserve_tree=1` sets aside the tree's room for the game once
+    many empties as that affords), `solve_reserve` the fewest seconds kept for it. `reserve_tree=1` sets aside the tree's room for the game once
     its first search shows its pace (see `NetPlayer`), sparing the workers a wait each time it
     grows. On a clock, `stop_decided=1` ends a move's search once its move can't change."""
     from cpu_match import NetPlayer, Solving, make_engine, make_eval
@@ -381,6 +381,7 @@ def net_player(options: dict[str, str]) -> Callable[[], Player]:
             share=float(options.pop("solve_share", Solving.share)),
             threads=cores,
             cost_at_24=float(options.pop("solve_cost", Solving.cost_at_24)),
+            reserve=float(options.pop("solve_reserve", Solving.reserve)),
         )
     stop_decided = bool(int(options.pop("stop_decided", 0)))
     fields = ",".join(f"{k}={v}" for k, v in options.items())

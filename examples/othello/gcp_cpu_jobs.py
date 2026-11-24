@@ -150,6 +150,12 @@ def machine_options(machine: str) -> list[str]:
 
 
 class Cloud(Protocol):
+    # how often `watch` looks at the hosts and the bucket
+    poll_seconds: float
+    # whether a host may wait in the cloud's queue before it starts: then each host's time
+    # limit counts from its start, and a launch has no deadline of its own
+    queues: bool
+
     def create(
         self,
         name: str,
@@ -160,10 +166,14 @@ class Cloud(Protocol):
     ) -> str | None: ...
     def instances(self, job: str | None) -> list[dict[str, str]]: ...
     def delete(self, names: list[tuple[str, str]]) -> None: ...
+    def close(self) -> None: ...
 
 
 class Gcloud:
     """Compute Engine by the gcloud CLI, in one project."""
+
+    poll_seconds = POLL_SECONDS
+    queues = False
 
     def __init__(self, project: str, machine: str = MACHINE):
         self.project = project
@@ -233,6 +243,9 @@ class Gcloud:
         for zone in {zone for _, zone in names}:
             here = [name for name, z in names if z == zone]
             self._run("compute", "instances", "delete", *here, f"--zone={zone}")
+
+    def close(self) -> None:
+        """Nothing to do: each VM is its own, and deleted."""
 
 
 def split_jobs(
@@ -336,7 +349,7 @@ def watch(
     writing results to `out` as they come, and the files jobs name as `outputs` beside it. Each
     slot's outcome: done, failed or out of time."""
     prefix = f"{PREFIX}/{name}"
-    deadline = clock() + spec["hours"] * 3600 + 600
+    deadline = None if cloud.queues else clock() + spec["hours"] * 3600 + 600
     launched = {slot: 0 for slot in spec["slots"]}
     zone_at = 0
     seen = (
@@ -403,9 +416,9 @@ def watch(
                 launched[slot] += 1
         if len(outcome) == len(spec["slots"]):
             return outcome
-        if clock() > deadline:
+        if deadline is not None and clock() > deadline:
             return {slot: outcome.get(slot, "out of time") for slot in spec["slots"]}
-        pause(POLL_SECONDS)
+        pause(cloud.poll_seconds)
 
 
 def new_lines(store: Store, prefix: str, offsets: dict[str, int]) -> list[str]:
@@ -505,6 +518,7 @@ def launch(
         if left:
             cloud.delete([(vm["name"], vm["zone"]) for vm in left])
             print(f"deleted {', '.join(vm['name'] for vm in left)}")
+        cloud.close()
     print(json.dumps(outcome))
     for slot, how in outcome.items():
         log = (
