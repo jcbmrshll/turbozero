@@ -152,6 +152,9 @@ def machine_options(machine: str) -> list[str]:
 class Cloud(Protocol):
     # how often `watch` looks at the hosts and the bucket
     poll_seconds: float
+    # whether a host may wait in the cloud's queue before it starts: then each host's time
+    # limit counts from its start, and a launch has no deadline of its own
+    queues: bool
 
     def create(
         self,
@@ -170,6 +173,7 @@ class Gcloud:
     """Compute Engine by the gcloud CLI, in one project."""
 
     poll_seconds = POLL_SECONDS
+    queues = False
 
     def __init__(self, project: str, machine: str = MACHINE):
         self.project = project
@@ -345,7 +349,7 @@ def watch(
     writing results to `out` as they come, and the files jobs name as `outputs` beside it. Each
     slot's outcome: done, failed or out of time."""
     prefix = f"{PREFIX}/{name}"
-    deadline = clock() + spec["hours"] * 3600 + 600
+    deadline = None if cloud.queues else clock() + spec["hours"] * 3600 + 600
     launched = {slot: 0 for slot in spec["slots"]}
     zone_at = 0
     seen = (
@@ -412,7 +416,7 @@ def watch(
                 launched[slot] += 1
         if len(outcome) == len(spec["slots"]):
             return outcome
-        if clock() > deadline:
+        if deadline is not None and clock() > deadline:
             return {slot: outcome.get(slot, "out of time") for slot in spec["slots"]}
         pause(cloud.poll_seconds)
 

@@ -64,6 +64,7 @@ class FakeCloud:
     themselves, or vanished half-way (preempted) when listed in `preempt`."""
 
     poll_seconds = 20.0
+    queues = False
 
     def __init__(self, store, prefix: str, preempt=(), no_capacity=()):
         self.store = store
@@ -159,6 +160,34 @@ def test_a_slot_fails_on_a_boot_failure_or_when_out_of_attempts(tmp_path):
     outcome = watch(store, cloud, spec(slots), tmp_path / "out.jsonl", attempts=2)
     assert outcome == {"0": "failed", "1": "failed"}
     assert [vm for vm, _ in cloud.created] == ["tz-t-1-0", "tz-t-1-1"]
+
+
+class Queued(FakeCloud):
+    """A cloud whose hosts wait in its queue: each host starts only on its second look."""
+
+    queues = True
+
+
+def test_a_launch_runs_out_of_time_unless_its_hosts_wait_in_a_queue(tmp_path):
+    store = modal_store.DirStore(tmp_path / "bucket")
+    prefix = "cpu-jobs/t"
+    slots = {"0": [job("a", 1)]}
+    modal_store.put_json(store, f"{prefix}/spec.json", {"slots": slots})
+    # a clock past the launch's hours at every look after the first
+    times = iter([0.0])
+
+    def late() -> float:
+        return next(times, 1e9)
+
+    def run(cloud):
+        return gcp_cpu_jobs.watch(
+            store, cloud, "t", spec(slots), tmp_path / f"{type(cloud).__name__}.jsonl",
+            3, clock=late, pause=lambda s: None,
+        )  # fmt: skip
+
+    assert run(FakeCloud(store, prefix)) == {"0": "out of time"}
+    times = iter([0.0])
+    assert run(Queued(store, prefix)) == {"0": "done"}
 
 
 def test_inputs_are_uploaded_once_until_they_change(tmp_path):

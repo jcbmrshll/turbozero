@@ -88,6 +88,9 @@ class ModalHosts:
 
     # a call's state is a quick look: often, so a container on the wrong CPU is replaced soon
     poll_seconds = 3.0
+    # calls wait in Modal's queue until it starts their containers, and each call's timeout
+    # counts from its start
+    queues = True
 
     def __init__(self, gpu: str, cpus: int, memory: int, cpu: str | None = None):
         self.gpu = gpu
