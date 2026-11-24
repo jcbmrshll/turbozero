@@ -71,6 +71,12 @@ class AZResnetConfig:
             the expected result, for a game won on a positive score. Trained on the score (see
             `core.training.loss_fns.az_default_loss_fn`). Not settable in a spec: an application
             names its own and passes them in
+        aux_scores: an auxiliary head that predicts the game's final score for the player to move,
+            as a distribution over these scores (a logit each) from the value head's hidden layer,
+            beside a value head over results (`outcome_scores`, needed with it, whose targets are
+            then the scores' results): KataGo's score belief. Only with the pooled heads. Training
+            only (see `core.training.loss_fns.az_default_loss_fn`'s `aux_score_weight`). Not
+            settable in a spec: an application names its own and passes them in
         ownership: an auxiliary head that predicts who owns each input location when the game
             ends, from the side of the player to move (KataGo's ownership head): a 1x1
             convolution to one channel from the value head's convolution, before its pooling,
@@ -139,6 +145,7 @@ class AZResnetConfig:
     head_channels: int = 32
     value_hidden_size: int = 256
     outcome_scores: tuple[float, ...] | None = None
+    aux_scores: tuple[float, ...] | None = None
     ownership: bool = False
     inference_dtype: str = "float32"
     train_dtype: str = "float32"
@@ -866,7 +873,7 @@ class PooledHeads(eqx.Module):
     """KataGo's policy and value heads, on features pooled over the board (see
     `AZResnetConfig.heads`): the policy logits, the value's `value_outputs` logits (see
     `AZResnet.__call__`), and the auxiliary heads' outputs by name: with `ownership`, each
-    location's ownership before its tanh."""
+    location's ownership before its tanh; with `aux_scores`, the scores' logits."""
 
     policy_conv: eqx.nn.Conv2d
     policy_norm: Norm
@@ -880,6 +887,7 @@ class PooledHeads(eqx.Module):
     value_hidden: eqx.nn.Linear
     value_linear: eqx.nn.Linear
     ownership_conv: eqx.nn.Conv2d | None
+    score_linear: eqx.nn.Linear | None
 
     def __init__(
         self,
@@ -892,8 +900,9 @@ class PooledHeads(eqx.Module):
         make_norm: NormMaker,
         stats: Stats,
         ownership: bool = False,
+        aux_scores: int = 0,
     ):
-        keys = jax.random.split(key, 9)
+        keys = jax.random.split(key, 10)
         self.policy_conv = conv(channels, head_channels, 1, keys[0])
         self.policy_norm = make_norm(head_channels, stats, 1)
         self.policy_pool_conv = conv(channels, head_channels, 1, keys[1])
@@ -912,6 +921,12 @@ class PooledHeads(eqx.Module):
         # KataGo's: from the value head's convolution, before it's pooled
         self.ownership_conv = (
             eqx.nn.Conv2d(head_channels, 1, 1, key=keys[8]) if ownership else None
+        )
+        # KataGo's score belief: from the value head's hidden layer
+        self.score_linear = (
+            eqx.nn.Linear(value_hidden_size, aux_scores, key=keys[9])
+            if aux_scores
+            else None
         )
 
     def __call__(
@@ -935,6 +950,8 @@ class PooledHeads(eqx.Module):
             aux["ownership"] = ownership.reshape(-1)
         value = board_pool(value)
         value = jax.nn.relu(self.value_hidden(value))
+        if self.score_linear is not None:
+            aux["scores"] = self.score_linear(value)
         return (policy, self.value_linear(value), aux), state
 
 
@@ -952,6 +969,7 @@ class AZResnet(eqx.Module):
     heads: AlphaZeroHeads | PooledHeads
     inference: bool
     outcome_scores: tuple[float, ...] | None = eqx.field(static=True)
+    aux_scores: tuple[float, ...] | None = eqx.field(static=True)
     ownership: bool = eqx.field(static=True)
     inference_dtype: str = eqx.field(static=True)
     train_dtype: str = eqx.field(static=True)
@@ -1060,7 +1078,15 @@ class AZResnet(eqx.Module):
         value_outputs = len(config.outcome_scores) if config.outcome_scores else 1
         if config.ownership and config.heads != "pooled":
             raise ValueError('ownership is the pooled heads\' option: heads="pooled"')
+        if config.aux_scores and config.heads != "pooled":
+            raise ValueError('aux_scores is the pooled heads\' option: heads="pooled"')
+        if config.aux_scores and not config.outcome_scores:
+            raise ValueError(
+                "aux_scores goes with a value head over results (outcome_scores), which "
+                "trains on the scores' results"
+            )
         self.ownership = config.ownership
+        self.aux_scores = config.aux_scores
         if config.heads == "alphazero":
             self.heads = AlphaZeroHeads(
                 channels,
@@ -1087,6 +1113,7 @@ class AZResnet(eqx.Module):
                 make_norm=make_norm,
                 stats=stats[-1],
                 ownership=config.ownership,
+                aux_scores=len(config.aux_scores or ()),
             )
         self.inference = False
         self.inference_dtype = config.inference_dtype
@@ -1101,7 +1128,8 @@ class AZResnet(eqx.Module):
         With `train_outputs`, what training needs: (policy logits, value, auxiliary outputs), the
         value as the value head's logits, one for each score, with
         `AZResnetConfig.outcome_scores`, and the auxiliary outputs by name: with
-        `AZResnetConfig.ownership`, "ownership", each location's before its tanh."""
+        `AZResnetConfig.ownership`, "ownership", each location's before its tanh; with
+        `AZResnetConfig.aux_scores`, "scores", their logits."""
         # the convolutions compute in the inference dtype in inference mode (and so do the activations
         # between them), in the train dtype in training
         dtype = jnp.dtype(self.inference_dtype if self.inference else self.train_dtype)

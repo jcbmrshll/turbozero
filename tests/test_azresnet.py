@@ -791,3 +791,45 @@ def test_an_ownership_head_is_the_pooled_heads_option():
     )
     with pytest.raises(ValueError, match="pooled"):
         eqx.nn.make_with_state(AZResnet)(config, INPUT_SHAPE, key=jax.random.PRNGKey(0))
+
+
+def test_an_aux_score_head_gives_its_logits_beside_a_value_head_over_results():
+    config = AZResnetConfig(
+        policy_head_out_size=10,
+        num_blocks=1,
+        num_channels=8,
+        heads="pooled",
+        head_channels=8,
+        outcome_scores=(1.0, -1.0),
+        aux_scores=(4.0, 2.0, 0.0, -2.0, -4.0),
+    )
+    net, state = eqx.nn.make_with_state(AZResnet)(
+        config, INPUT_SHAPE, key=jax.random.PRNGKey(0)
+    )
+    net = eqx.nn.inference_mode(net)
+    x = jax.random.normal(jax.random.PRNGKey(1), (4, *INPUT_SHAPE))
+    (_, value), _ = apply_nn(net, state, x)
+    (_, logits, aux), _ = apply_nn(lambda x, s: net(x, s, train_outputs=True), state, x)
+    assert value.shape == (4, 1) and logits.shape == (4, 2)
+    assert aux["scores"].shape == (4, 5)
+
+
+@pytest.mark.parametrize(
+    "options, match",
+    [
+        ({"heads": "pooled"}, "outcome_scores"),
+        ({"outcome_scores": (1.0, -1.0)}, "pooled"),
+    ],
+)
+def test_an_aux_score_head_needs_pooled_heads_and_a_value_head_over_results(
+    options, match
+):
+    config = AZResnetConfig(
+        policy_head_out_size=10,
+        num_blocks=1,
+        num_channels=8,
+        aux_scores=(2.0, 0.0, -2.0),
+        **options,
+    )
+    with pytest.raises(ValueError, match=match):
+        eqx.nn.make_with_state(AZResnet)(config, INPUT_SHAPE, key=jax.random.PRNGKey(0))

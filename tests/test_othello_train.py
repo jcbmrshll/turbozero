@@ -101,6 +101,16 @@ def test_an_ownership_head_refuses_what_has_no_final_board(
     assert "ownership" in capsys.readouterr().err
 
 
+def test_an_aux_margin_head_trains_on_exactly_solved_margins_at_its_weight(monkeypatch):
+    net = "resnet:1x4,heads=pooled,outcomes=result,aux_outcomes=margin"
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, "--net", net, "--aux-score-weight", "0.05")
+    kwargs = built.value.kwargs
+    assert kwargs["score_targets"]
+    assert kwargs["endgame_solve"].solve_fn.scores
+    assert kwargs["loss_fn"].keywords["aux_score_weight"] == 0.05
+
+
 def test_a_win_loss_head_trains_on_results_solved_as_before(monkeypatch):
     with pytest.raises(BuiltTrainer) as built:
         run_main(monkeypatch, "--net", "resnet:1x4,outcomes=result")
