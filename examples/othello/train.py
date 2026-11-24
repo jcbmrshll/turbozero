@@ -814,6 +814,13 @@ def main():
         "summed over the squares (KataGo's 1.5 / b^2 on a b x b board: about 0.023 here)",
     )
     parser.add_argument(
+        "--aux-score-weight",
+        type=float,
+        default=0.02,
+        help="with an auxiliary score head (aux_outcomes=margin in the --net spec, beside "
+        "outcomes=result), the weight of its cross-entropy",
+    )
+    parser.add_argument(
         "--policy-target",
         choices=["visits", "completed-q"],
         default="visits",
@@ -1345,7 +1352,11 @@ def main():
     def predicts(spec: str) -> tuple[bool, bool]:
         config = config_of(spec)
         return (
-            getattr(config, "outcome_scores", None) == MARGINS,
+            MARGINS
+            in (
+                getattr(config, "outcome_scores", None),
+                getattr(config, "aux_scores", None),
+            ),
             getattr(config, "ownership", False),
         )
 
@@ -1455,6 +1466,7 @@ def main():
             az_default_loss_fn,
             value_target_q=args.value_target_q,
             ownership_weight=args.ownership_weight,
+            aux_score_weight=args.aux_score_weight,
         ),
         # decays from --lr to --lr-final over the run, drops at --lr-drops, or on plateaus
         optimizer=make_optimizer(

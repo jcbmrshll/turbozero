@@ -327,3 +327,56 @@ def test_a_win_loss_head_trains_a_draw_toward_half_of_each():
     log_probs = jax.nn.log_softmax(jnp.array([[0.0, 0.0], [2.0, -1.0]]))
     want = (-(0.5 * log_probs[0, 0] + 0.5 * log_probs[0, 1]) - log_probs[1, 0]) / 2
     np.testing.assert_allclose(metrics["outcome_loss"], want, rtol=1e-6)
+
+
+class ResultAndScoresAsParams(eqx.Module):
+    """A win/loss value head (`outcome_scores` (1, -1)) and an auxiliary score head (see
+    `AZResnetConfig.aux_scores`), their logits as params."""
+
+    logits: jax.Array
+    result_logits: jax.Array
+    score_logits: jax.Array
+    outcome_scores: tuple[float, ...] = eqx.field(static=True, default=(1.0, -1.0))
+    aux_scores: tuple[float, ...] = eqx.field(
+        static=True, default=(4.0, 2.0, 0.0, -2.0, -4.0)
+    )
+
+    def __call__(self, x, train_outputs=False):
+        if train_outputs:
+            return (
+                self.logits[x],
+                self.result_logits[x],
+                {"scores": self.score_logits[x]},
+            )
+        return self.logits[x], outcome_value(self.result_logits[x], self.outcome_scores)
+
+
+def test_an_aux_score_head_trains_on_the_score_and_the_value_head_on_its_result():
+    result_logits = jnp.array([[0.5, -0.5], [0.0, 1.0]])
+    score_logits = jnp.array([[0.0, 1.0, 0.0, 0.0, -1.0], [0.3, 0.0, 0.2, 0.0, 0.0]])
+    net = ResultAndScoresAsParams(jnp.zeros((2, 2)), result_logits, score_logits)
+    # the mover won by 2, then drew
+    batch = experience(
+        rewards=[[2, -2], [0, 0]],
+        cur_player_id=[0, 1],
+        policy_weights=[[0.5, 0.5], [0.5, 0.5]],
+        policy_mask=jnp.ones((2, 2), bool),
+    )
+
+    loss, (metrics, _) = az_default_loss_fn(net, None, batch, aux_score_weight=0.1)
+
+    result_lp = jax.nn.log_softmax(result_logits)
+    # a margin of 2 is a win; a draw half a win, half a loss
+    outcome = (-result_lp[0, 0] - 0.5 * (result_lp[1, 0] + result_lp[1, 1])) / 2
+    score_lp = jax.nn.log_softmax(score_logits)
+    aux = -(score_lp[0, 1] + score_lp[1, 2]) / 2
+    np.testing.assert_allclose(metrics["outcome_loss"], outcome, rtol=1e-6)
+    np.testing.assert_allclose(metrics["aux_score_loss"], aux, rtol=1e-6)
+    np.testing.assert_allclose(
+        loss, metrics["policy_loss"] + outcome + 0.1 * aux, rtol=1e-6
+    )
+    # the value head's expected result against the result it could express (a win: 1)
+    expected = jax.nn.softmax(result_logits) @ jnp.array([1.0, -1.0])
+    np.testing.assert_allclose(
+        metrics["score_error"], (abs(expected[0] - 1) + abs(expected[1])) / 2, rtol=1e-5
+    )

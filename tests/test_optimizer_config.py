@@ -115,6 +115,7 @@ def test_describe_fn():
         "name": "az_default_loss_fn",
         "value_target_q": 0.5,
         "ownership_weight": 0.02,
+        "aux_score_weight": 0.02,
     }
     assert describe_fn(len) == {"name": "len"}
 

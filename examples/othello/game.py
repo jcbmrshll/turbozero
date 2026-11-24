@@ -255,6 +255,10 @@ SPEC_OPTIONS = {
     # a value head over the final margin in place of a value (see
     # core.networks.azresnet.AZResnetConfig.outcome_scores)
     "outcomes": {name: {"outcome_scores": scores} for name, scores in OUTCOMES.items()},
+    # an auxiliary score head beside a value head over results, e.g.
+    # "outcomes=result,aux_outcomes=margin": KataGo's value head and score belief (see
+    # core.networks.azresnet.AZResnetConfig.aux_scores)
+    "aux_outcomes": {name: {"aux_scores": scores} for name, scores in OUTCOMES.items()},
 }
 
 
@@ -291,8 +295,9 @@ def make_network(
     training computes each block's activations again in the backward pass instead of
     keeping them. Othello's settings are named in the spec (see SPEC_OPTIONS): the depthwise
     filter taps as dw_taps=rays (see DW_TAPS), the ray filter in branches as dw_branches=rays,
-    gated lines as scan=rays, legal-move input planes as inputs=moves, and a value head over the
-    final margin or over a win and a loss as outcomes=margin or outcomes=result (see OUTCOMES)."""
+    gated lines as scan=rays, legal-move input planes as inputs=moves, a value head over the
+    final margin or over a win and a loss as outcomes=margin or outcomes=result (see OUTCOMES),
+    and an auxiliary head over the final margin beside the latter as aux_outcomes=margin."""
     net, options = network_options(net)
     config = network_config(
         net,

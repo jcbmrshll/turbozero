@@ -543,6 +543,7 @@ def test_config_records_the_loss_testers_and_injected_hyperparameters(env, tmp_p
         "name": "az_default_loss_fn",
         "value_target_q": 0.0,
         "ownership_weight": 0.02,
+        "aux_score_weight": 0.02,
     }
     assert config["testers"] == [
         {
