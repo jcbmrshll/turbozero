@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import equinox as eqx
 import jax
 import jax.numpy as jnp
@@ -171,16 +173,16 @@ def test_network_state_comes_back_updated():
 
 class ScoreLogitsAsParams(eqx.Module):
     """`OutputAsParams` whose value head predicts the final score (see
-    `AZResnetConfig.outcome_scores`): with `outcome_logits`, its logits over `outcome_scores`, else
-    their value."""
+    `AZResnetConfig.outcome_scores`): with `train_outputs`, its logits over `outcome_scores` and no
+    auxiliary outputs, else their value."""
 
     logits: jax.Array
     score_logits: jax.Array
     outcome_scores: tuple[float, ...] = eqx.field(static=True)
 
-    def __call__(self, x, outcome_logits=False):
-        if outcome_logits:
-            return self.logits[x], self.score_logits[x]
+    def __call__(self, x, train_outputs=False):
+        if train_outputs:
+            return self.logits[x], self.score_logits[x], {}
         return self.logits[x], outcome_value(self.score_logits[x], self.outcome_scores)
 
 
@@ -226,3 +228,66 @@ def test_a_network_predicting_the_score_refuses_a_mixed_value_target():
     )
     with pytest.raises(ValueError, match="value_target_q"):
         az_default_loss_fn(net, None, batch, value_target_q=0.5)
+
+
+class OwnershipAsParams(eqx.Module):
+    """`OutputAsParams` with an ownership head (see `AZResnetConfig.ownership`): with
+    `train_outputs`, its ownership before tanh too."""
+
+    logits: jax.Array
+    value: jax.Array
+    owned: jax.Array
+    ownership: bool = eqx.field(static=True, default=True)
+
+    def __call__(self, x, train_outputs=False):
+        if train_outputs:
+            return self.logits[x], self.value[x], {"ownership": self.owned[x]}
+        return self.logits[x], self.value[x]
+
+
+def test_an_ownership_head_trains_on_katagos_ownership_loss_weighted():
+    owned = jnp.array([[0.5, -1.0, 2.0], [0.0, 0.3, -0.4]])
+    net = OwnershipAsParams(jnp.zeros((2, 2)), jnp.zeros((2, 1)), owned)
+    batch = replace(
+        experience(
+            rewards=[[1, -1], [-1, 1]],
+            cur_player_id=[0, 1],
+            policy_weights=[[0.5, 0.5], [0.5, 0.5]],
+            policy_mask=jnp.ones((2, 2), bool),
+        ),
+        # the final owners, from each player's side: the loss takes the mover's
+        ownership=jnp.array(
+            [[[1, -1, 0], [-1, 1, 0]], [[1, 1, 1], [-1, -1, 1]]], jnp.int8
+        ),
+    )
+
+    loss, (metrics, _) = az_default_loss_fn(net, None, batch, ownership_weight=0.1)
+    plain, (plain_metrics, _) = az_default_loss_fn(
+        OutputAsParams(jnp.zeros((2, 2)), jnp.zeros((2, 1))), None, batch
+    )
+
+    o = jnp.array([[1.0, -1.0, 0.0], [-1.0, -1.0, 1.0]])
+    pred = jnp.tanh(owned)
+    # KataGo's: -sum over locations of (1+o)/2 log((1+pred)/2) + (1-o)/2 log((1-pred)/2)
+    per_location = -(
+        (1 + o) / 2 * jnp.log((1 + pred) / 2) + (1 - o) / 2 * jnp.log((1 - pred) / 2)
+    )
+    np.testing.assert_allclose(
+        metrics["ownership_loss"], per_location.mean(), rtol=1e-5
+    )
+    np.testing.assert_allclose(
+        loss, plain + 0.1 * per_location.sum(-1).mean(), rtol=1e-5
+    )
+    assert "ownership_loss" not in plain_metrics
+
+
+def test_an_ownership_head_needs_experiences_with_their_ownership():
+    net = OwnershipAsParams(jnp.zeros((1, 2)), jnp.zeros((1, 1)), jnp.zeros((1, 3)))
+    batch = experience(
+        rewards=[[1, -1]],
+        cur_player_id=[0],
+        policy_weights=[[0.5, 0.5]],
+        policy_mask=jnp.ones((1, 2), bool),
+    )
+    with pytest.raises(ValueError, match="ownership"):
+        az_default_loss_fn(net, None, batch)

@@ -22,6 +22,10 @@ STOP = 3
 
 def mover_wins(positions):
     """The fake solver: the player to move at each stopped position wins."""
+    return {"reward": mover_results(positions)}
+
+
+def mover_results(positions):
     player = np.asarray(positions.current_player)
     results = np.full((len(player), 2), -1.0, dtype=np.float32)
     results[np.arange(len(player)), player] = 1.0
@@ -136,9 +140,9 @@ def test_a_solve_reports_each_games_result_from_the_oldest(
     solved = trainer.endgame_solve.solve(jax.tree.map(np.asarray, state.pending))
 
     np.testing.assert_array_equal(solved.counts, [2])
-    np.testing.assert_array_equal(solved.solves, [[-1.0, 1.0]] * 2)
+    np.testing.assert_array_equal(solved.solves["reward"], [[-1.0, 1.0]] * 2)
     # by slot: the 2nd game's in slot 1, the 3rd's in slot 0
-    np.testing.assert_array_equal(solved.results[0], [[-1.0, 1.0]] * 2)
+    np.testing.assert_array_equal(solved.results["reward"][0], [[-1.0, 1.0]] * 2)
 
 
 def test_a_game_finding_every_slot_full_plays_on(
@@ -318,7 +322,7 @@ def test_a_game_played_to_its_end_says_so_in_the_config():
 
 def mover_wins_by(margin):
     """A fake solver of scores: the player to move at each stopped position wins by `margin`."""
-    return lambda positions: mover_wins(positions) * margin
+    return lambda positions: {"reward": mover_results(positions) * margin}
 
 
 def test_with_score_targets_a_played_out_game_is_labelled_with_its_scores(
@@ -391,5 +395,108 @@ def test_score_targets_refuse_resignation(
             max_episode_steps=16,
             ckpt_dir=tmp_path,
             score_targets=True,
+            resignation=Resignation(0.9),
+        )
+
+
+# the fake env's final ownership of its 3 locations, from each player's side
+OWNERSHIP = ((1, -1, 0), (-1, 1, 0))
+
+
+def mover_owns_all(positions):
+    """A fake solver of ownership too: the player to move wins and owns every location."""
+    player = np.asarray(positions.current_player)
+    ownership = np.full((len(player), 2, 3), -1, np.int8)
+    ownership[np.arange(len(player)), player] = 1
+    return {"reward": mover_results(positions), "ownership": ownership}
+
+
+def test_with_ownership_targets_a_played_out_game_is_labelled_with_its_final_ownership(
+    fixed_length_env, make_collector, scripted, tmp_path
+):
+    env = fixed_length_env(length=LENGTH, ownership=OWNERSHIP)
+    collect = make_collector(
+        env,
+        scripted.first_legal,
+        max_episode_steps=16,
+        ckpt_dir=tmp_path,
+        ownership_targets=True,
+    )
+
+    state = collect(LENGTH)
+
+    ownership = state.buffer_state.buffer.ownership
+    assert ownership.dtype == np.int8
+    np.testing.assert_array_equal(ownership[0, :LENGTH], [OWNERSHIP] * LENGTH)
+    np.testing.assert_array_equal(
+        state.buffer_state.buffer.reward[0, :LENGTH], [[1.0, -1.0]] * LENGTH
+    )
+
+
+def test_with_ownership_targets_a_solved_game_is_labelled_with_its_solved_ownership(
+    fixed_length_env, make_collector, scripted, tmp_path
+):
+    env = fixed_length_env(length=LENGTH, ownership=OWNERSHIP)
+    collect = make_collector(
+        env,
+        scripted.first_legal,
+        max_episode_steps=16,
+        ckpt_dir=tmp_path,
+        endgame_solve=replace(endgame_solve(), solve_fn=mover_owns_all),
+        ownership_targets=True,
+    )
+
+    state = solve_and_label(collect.trainer, collect(STOP + 1))
+
+    # player 1 moves at the stopped position, so owns everything there
+    np.testing.assert_array_equal(
+        state.buffer_state.buffer.ownership[0, : STOP + 1],
+        [[[-1, -1, -1], [1, 1, 1]]] * (STOP + 1),
+    )
+    np.testing.assert_array_equal(
+        state.buffer_state.buffer.reward[0, : STOP + 1], [[-1.0, 1.0]] * (STOP + 1)
+    )
+
+
+def test_ownership_targets_need_a_solver_that_gives_ownership(
+    fixed_length_env, make_collector, scripted, tmp_path
+):
+    collect = make_collector(
+        fixed_length_env(length=LENGTH, ownership=OWNERSHIP),
+        scripted.first_legal,
+        max_episode_steps=16,
+        ckpt_dir=tmp_path,
+        endgame_solve=endgame_solve(),
+        ownership_targets=True,
+    )
+    with pytest.raises(ValueError, match="ownership"):
+        solve_and_label(collect.trainer, collect(STOP + 1))
+
+
+def test_ownership_targets_need_the_environments_ownership(
+    fixed_length_env, make_collector, scripted, tmp_path
+):
+    with pytest.raises(ValueError, match="ownership"):
+        make_collector(
+            fixed_length_env(length=LENGTH),
+            scripted.first_legal,
+            max_episode_steps=16,
+            ckpt_dir=tmp_path,
+            ownership_targets=True,
+        )(1)
+
+
+def test_ownership_targets_refuse_resignation(
+    fixed_length_env, make_collector, scripted, tmp_path
+):
+    from core.training.resignation import Resignation
+
+    with pytest.raises(ValueError, match="ownership_targets"):
+        make_collector(
+            fixed_length_env(length=LENGTH, ownership=OWNERSHIP),
+            scripted.first_legal,
+            max_episode_steps=16,
+            ckpt_dir=tmp_path,
+            ownership_targets=True,
             resignation=Resignation(0.9),
         )

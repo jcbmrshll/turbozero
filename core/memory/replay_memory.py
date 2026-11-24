@@ -20,6 +20,9 @@ class BaseExperience:
         cur_player_id: current player id
         search_value: the search's value of the position, for the player to move (for a position
             played in self-play, the root value of the search that chose its move)
+        ownership: (optional) for each player, who owns each of the network's input locations
+            when the episode ends, from that player's side (1 the player, -1 another, 0 no one),
+            int8: the targets of an ownership head (see `Trainer`'s `ownership_targets`)
     """
 
     reward: jax.Array
@@ -28,11 +31,13 @@ class BaseExperience:
     observation_nn: jax.Array
     cur_player_id: jax.Array
     search_value: jax.Array
+    ownership: jax.Array | None = None
 
 
 # a data transform (e.g. one of a board's symmetries): maps an experience, without batch
 # dimensions, to another as valid, e.g. the board rotated with its policy target and legal actions
-# to match. The value targets (`reward`, `search_value`) and `cur_player_id` stay as they are.
+# to match, and so must `ownership`, which is laid out as the input's locations. The value targets
+# (`reward`, `search_value`) and `cur_player_id` stay as they are.
 DataTransformFn = Callable[[BaseExperience], BaseExperience]
 
 
@@ -204,27 +209,38 @@ class EpisodeReplayBuffer:
         return jnp.where(valid, (state.next_idx + offsets) % capacity, capacity)
 
     def assign_rewards(
-        self, state: ReplayBufferState, reward: jax.Array
+        self,
+        state: ReplayBufferState,
+        reward: jax.Array,
+        ownership: jax.Array | None = None,
     ) -> ReplayBufferState:
         """Assign rewards to the current episode.
 
         Args:
             state: replay buffer state
             reward: rewards to assign (for each player)
+            ownership: (optional) the episode's final ownership to assign (see
+                `BaseExperience.ownership`), for a buffer that stores it
 
         Returns:
             ReplayBufferState: updated replay buffer state
         """
+
+        def assign(stored: jax.Array, value: jax.Array) -> jax.Array:
+            waiting = (~state.has_reward).reshape(-1, *([1] * value.ndim))
+            return jnp.where(waiting, value.astype(stored.dtype)[None, ...], stored)
+
+        buffer = replace(state.buffer, reward=assign(state.buffer.reward, reward))
+        if ownership is not None:
+            assert state.buffer.ownership is not None
+            buffer = replace(
+                buffer, ownership=assign(state.buffer.ownership, ownership)
+            )
         return replace(
             state,
             episode_start_idx=state.next_idx,
             has_reward=jnp.full_like(state.has_reward, True),
-            buffer=replace(
-                state.buffer,
-                reward=jnp.where(
-                    ~state.has_reward[..., None], reward[None, ...], state.buffer.reward
-                ),
-            ),
+            buffer=buffer,
         )
 
     def truncate(

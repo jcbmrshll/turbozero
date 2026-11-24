@@ -81,20 +81,24 @@ class Solved:
     """Solves done on the host (see `EndgameSolve.solve`).
 
     Attributes:
-        results: (environments, slots, players) the results, by the slots the solves are in
-            (zeros in the others)
+        results: the targets the solves give (see `EndgameSolve.solve_fn`), each (environments,
+            slots, ...) by the slots the solves are in (zeros in the others)
         counts: (environments,) how many solves each environment had waiting: its oldest, those
             `EndgameSolve.label` labels with these results
-        solves: (solves, players) the results, a solve at a time
+        solves: the same targets, each (solves, ...), a solve at a time
         whole: (solves,) whether each is a game's, at its solve point
         seconds: the solve's wall time
     """
 
-    results: np.ndarray
+    results: dict[str, np.ndarray]
     counts: np.ndarray
-    solves: np.ndarray
+    solves: dict[str, np.ndarray]
     whole: np.ndarray
     seconds: float = 0.0
+
+    def __len__(self) -> int:
+        """The number of solves."""
+        return len(self.whole)
 
 
 @dataclass(frozen=True)
@@ -115,9 +119,12 @@ class EndgameSolve:
         stop_fn: (environment state) -> whether it's at or past the solve point; compatible with
             `jax.jit`
         solve_fn: on the host, a batch of positions, environment states as a pytree of numpy
-            arrays with a leading batch dimension -> (batch, players) each one's exact result for
-            each player, as the environment's rewards for the game's end would be (its scores,
-            with the trainer's `score_targets`)
+            arrays with a leading batch dimension -> the targets their exact solves give, by the
+            replay buffer's field (see `BaseExperience`), each with a leading batch dimension:
+            "reward", (batch, players) each one's exact result for each player, as the
+            environment's rewards for the game's end would be (its scores, with the trainer's
+            `score_targets`); and with the trainer's `ownership_targets`, "ownership", (batch,
+            players, locations) the final ownership of a game played perfectly from it
         slots: solves each environment can hold while they wait for their results. Results come
             once an epoch, for the solves added before its self-play, so this needs two epochs'
             worth. A game whose solve point finds every slot full is played to the end instead,
@@ -131,7 +138,7 @@ class EndgameSolve:
     """
 
     stop_fn: Callable[[Any], jax.Array]
-    solve_fn: Callable[[Any], np.ndarray]
+    solve_fn: Callable[[Any], dict[str, np.ndarray]]
     slots: int
     share: float = 1.0
     play_past: float = 0.0
@@ -280,12 +287,14 @@ class EndgameSolve:
         positions, env, slot, whole = self.waiting(pending)
         counts = np.asarray(pending.added) - np.asarray(pending.labelled)
         solves = (
-            np.asarray(self.solve_fn(positions), dtype=np.float32)
+            {name: np.asarray(x) for name, x in self.solve_fn(positions).items()}
             if len(env)
-            else np.zeros((0, 0), np.float32)
+            else {}
         )
-        results = np.zeros((len(counts), self.slots, solves.shape[-1]), np.float32)
-        results[env, slot] = solves
+        results = {}
+        for name, x in solves.items():
+            results[name] = np.zeros((len(counts), self.slots, *x.shape[1:]), x.dtype)
+            results[name][env, slot] = x
         return Solved(
             results,
             counts.astype(np.int32),
@@ -297,26 +306,26 @@ class EndgameSolve:
     def label(
         self,
         pending: PendingSolves,
-        rewards: jax.Array,
+        targets: dict[str, jax.Array],
         populated: jax.Array,
-        results: jax.Array,
+        results: dict[str, jax.Array],
         count: jax.Array,
-    ) -> tuple[PendingSolves, jax.Array, jax.Array, jax.Array]:
+    ) -> tuple[PendingSolves, dict[str, jax.Array], jax.Array, jax.Array]:
         """Labels the oldest `count` waiting solves' entries with their `results` (an
         environment's).
 
         Args:
             pending: the environment's pending solves
-            rewards: (capacity, players) its replay buffer's rewards
+            targets: its replay buffer's targets that the solves give, each (capacity, ...) by
+                name (see `solve_fn`)
             populated: (capacity,) its replay buffer's populated mask
-            results: (slots, players) the results, by slot
+            results: the solves' targets, each (slots, ...) by slot
             count: how many of the oldest waiting solves to label
 
         Returns:
-            Tuple[PendingSolves, jax.Array, jax.Array, jax.Array]: the pending solves, the
-                buffer's rewards and populated mask with the solves' entries labelled and
-                populated, and (slots,) the slots labelled that are games' solves at their solve
-                points
+            Tuple[PendingSolves, dict, jax.Array, jax.Array]: the pending solves, the buffer's
+                targets and populated mask with the solves' entries labelled and populated, and
+                (slots,) the slots labelled that are games' solves at their solve points
         """
         nth = (jnp.arange(self.slots) - pending.labelled) % self.slots
         labelled_slots = nth < count
@@ -324,14 +333,21 @@ class EndgameSolve:
         # match, which takes gigabytes at PCR's slot counts
         solve = pending.entry_solve
         hit = (solve >= pending.labelled) & (solve < pending.labelled + count)
-        result = results[jnp.where(hit, solve, 0) % self.slots]
+        slot = jnp.where(hit, solve, 0) % self.slots
+
+        def labelled(stored: jax.Array, by_slot: jax.Array) -> jax.Array:
+            result = by_slot[slot].astype(stored.dtype)
+            return jnp.where(
+                hit.reshape(-1, *([1] * (stored.ndim - 1))), result, stored
+            )
+
         return (
             replace(
                 pending,
                 labelled=pending.labelled + count,
                 entry_solve=jnp.where(hit, -1, pending.entry_solve),
             ),
-            jnp.where(hit[:, None], result.astype(rewards.dtype), rewards),
+            {name: labelled(targets[name], results[name]) for name in targets},
             populated | hit,
             labelled_slots & pending.whole,
         )

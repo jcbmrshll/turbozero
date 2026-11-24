@@ -542,6 +542,7 @@ def test_config_records_the_loss_testers_and_injected_hyperparameters(env, tmp_p
     assert config["loss_fn"] == {
         "name": "az_default_loss_fn",
         "value_target_q": 0.0,
+        "ownership_weight": 0.02,
     }
     assert config["testers"] == [
         {
@@ -2913,7 +2914,7 @@ def solving_trainer(env, ckpt_dir, **kwargs):
         ckpt_dir,
         endgame_solve=EndgameSolve(
             stop_fn=lambda state: state.step >= 2,
-            solve_fn=lambda positions: np.zeros((len(positions.step), 2)),
+            solve_fn=lambda positions: {"reward": np.zeros((len(positions.step), 2))},
             slots=2,
         ),
         **kwargs,
@@ -2943,9 +2944,9 @@ def test_games_waiting_for_solves_are_solved_during_self_play_and_labelled_after
         # on the solver's thread
         solved.append(np.array(pending.added))
         return Solved(
-            np.ones((2, 2, 2), np.float32),
+            {"reward": np.ones((2, 2, 2), np.float32)},
             np.array([1, 0], np.int32),
-            np.ones((1, 2), np.float32),
+            {"reward": np.ones((1, 2), np.float32)},
             np.array([True]),
             0.5,
         )
@@ -2996,7 +2997,13 @@ def test_with_nothing_to_train_on_the_games_just_stopped_are_solved_at_once(
         counts = np.asarray(pending.added - pending.labelled)
         games = np.zeros((counts.sum(), 2), np.float32)
         whole = np.ones(len(games), bool)
-        return Solved(np.zeros((2, 2, 2), np.float32), counts, games, whole, 0.5)
+        return Solved(
+            {"reward": np.zeros((2, 2, 2), np.float32)},
+            counts,
+            {"reward": games},
+            whole,
+            0.5,
+        )
 
     def label_solved(state, results, counts):
         # the games labelled are trained on
@@ -3049,7 +3056,13 @@ def test_with_less_than_a_batch_to_train_on_the_games_just_stopped_are_solved_at
         counts = np.asarray(pending.added - pending.labelled)
         games = np.zeros((counts.sum(), 2), np.float32)
         whole = np.ones(len(games), bool)
-        return Solved(np.zeros((2, 2, 2), np.float32), counts, games, whole, 0.5)
+        return Solved(
+            {"reward": np.zeros((2, 2, 2), np.float32)},
+            counts,
+            {"reward": games},
+            whole,
+            0.5,
+        )
 
     def label_solved(state, results, counts):
         # the games labelled are trained on: enough for a batch

@@ -748,7 +748,7 @@ def test_a_value_head_over_scores_gives_the_chance_of_a_win_less_a_loss(heads):
 
     (policy, value), _ = apply_nn(net, state, x)
     (same_policy, logits), _ = apply_nn(
-        lambda x, s: net(x, s, outcome_logits=True), state, x
+        lambda x, s: ((o := net(x, s, train_outputs=True))[0][:2], o[1]), state, x
     )
 
     assert value.shape == (4, 1) and logits.shape == (4, len(scores))
@@ -757,3 +757,37 @@ def test_a_value_head_over_scores_gives_the_chance_of_a_win_less_a_loss(heads):
     np.testing.assert_allclose(
         value[:, 0], probs[:, :2].sum(-1) - probs[:, 3:].sum(-1), atol=1e-6
     )
+
+
+def test_an_ownership_head_predicts_each_location_from_the_value_heads_convolution():
+    config = AZResnetConfig(
+        policy_head_out_size=10,
+        num_blocks=1,
+        num_channels=8,
+        heads="pooled",
+        head_channels=8,
+        ownership=True,
+    )
+    net, state = eqx.nn.make_with_state(AZResnet)(
+        config, INPUT_SHAPE, key=jax.random.PRNGKey(0)
+    )
+    net = eqx.nn.inference_mode(net)
+    x = jax.random.normal(jax.random.PRNGKey(1), (4, *INPUT_SHAPE))
+
+    (policy, value), _ = apply_nn(net, state, x)
+    (same_policy, same_value, aux), _ = apply_nn(
+        lambda x, s: net(x, s, train_outputs=True), state, x
+    )
+
+    # a location each; the policy and value are as without it
+    assert aux["ownership"].shape == (4, INPUT_SHAPE[0] * INPUT_SHAPE[1])
+    np.testing.assert_array_equal(policy, same_policy)
+    np.testing.assert_array_equal(value, same_value)
+
+
+def test_an_ownership_head_is_the_pooled_heads_option():
+    config = AZResnetConfig(
+        policy_head_out_size=10, num_blocks=1, num_channels=8, ownership=True
+    )
+    with pytest.raises(ValueError, match="pooled"):
+        eqx.nn.make_with_state(AZResnet)(config, INPUT_SHAPE, key=jax.random.PRNGKey(0))

@@ -8,7 +8,9 @@ Solvers:
 - `native`: endgame.py's C++ solver, a win/draw/loss solve (only the result's sign is needed),
   or an exact solve of the margin for a network that predicts it (about 9x slower at 20 empties,
   2.5x for each empty square more: an exact solve at 18 costs about what a win/draw/loss one at
-  20 does), compiled on first use with g++ (Modal's training image too).
+  20 does), compiled on first use with g++ (Modal's training image too). For an ownership head
+  its solves are exact, each game played on perfectly to its end for its final board (about 1.05x
+  an exact solve).
 - `edax`: Edax's -solve on a batch file, one process per batch of positions (setup_edax.sh
   builds it; Modal's training image doesn't). For prototyping.
 """
@@ -109,13 +111,39 @@ def edax_margins(
         return np.array([m for b in pool.map(solve, batches) for m in b], np.int32)
 
 
+def ownership(
+    final_me: np.ndarray,
+    final_opp: np.ndarray,
+    margins: np.ndarray,
+    current_player: np.ndarray,
+) -> np.ndarray:
+    """(n, 2, 64) each player's ownership of the squares at the games' ends (as
+    `game.ownership`), int8, from the final positions' discs (uint64) of the players to move and
+    of the opponents, and the margins (which give the empty squares to the one ahead)."""
+    bits = np.uint64(1) << np.arange(64, dtype=np.uint64)
+    mine = (np.asarray(final_me, np.uint64)[:, None] & bits) != 0
+    theirs = (np.asarray(final_opp, np.uint64)[:, None] & bits) != 0
+    lead = np.sign(np.asarray(margins)).astype(np.int8)[:, None]
+    own = np.where(mine, 1, np.where(theirs, -1, lead)).astype(np.int8)
+    out = np.empty((len(own), 2, 64), np.int8)
+    rows = np.arange(len(own))
+    player = np.asarray(current_player)
+    out[rows, player] = own
+    out[rows, 1 - player] = -own
+    return out
+
+
 def make_solve_fn(
-    solver: str, threads: int, scores: bool = False
-) -> Callable[[Any], np.ndarray]:
+    solver: str, threads: int, scores: bool = False, with_ownership: bool = False
+) -> Callable[[Any], dict[str, np.ndarray]]:
     """The solve function (see `EndgameSolve.solve_fn`) of `solver`, on `threads` cores: the
-    players' results, or with `scores` their exact margins (see `results`)."""
+    players' results, or with `scores` their exact margins (see `results`), as "reward"; and
+    with `with_ownership`, the final ownership of the game played on perfectly (see
+    `ownership`), as "ownership", which needs the native solver's exact solves."""
     if solver not in SOLVERS:
         raise ValueError(f"solver must be one of {SOLVERS}, got {solver!r}")
+    if with_ownership and solver != "native":
+        raise ValueError("only the native solver plays a solve's game to its end")
 
     if solver == "native":
         import endgame
@@ -127,9 +155,18 @@ def make_solve_fn(
         def margins(me: np.ndarray, opp: np.ndarray) -> np.ndarray:
             return edax_margins(me, opp, threads)
 
-    def solve(positions: Any) -> np.ndarray:
+    def solve(positions: Any) -> dict[str, np.ndarray]:
         me, opp = bitboards(positions.observation)
-        return results(margins(me, opp), positions.current_player, scores)
+        player = positions.current_player
+        if not with_ownership:
+            return {"reward": results(margins(me, opp), player, scores)}
+        import endgame
+
+        exact, _, final_me, final_opp = endgame.solve_lines(me, opp, threads=threads)
+        return {
+            "reward": results(exact, player, scores),
+            "ownership": ownership(final_me, final_opp, exact, player),
+        }
 
     return solve
 

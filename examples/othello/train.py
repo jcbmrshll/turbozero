@@ -87,6 +87,7 @@ from core.evaluators.mcts.mcts import MCTS, PlayoutCap
 from core.evaluators.mcts.policy_targets import CompletedQ, VisitCounts
 from core.memory.replay_memory import EpisodeReplayBuffer
 from core.monitoring import DEFAULT_URL, Monitor
+from core.networks.spec import network_config
 from core.testing.scored_positions import ScoredPositionsTester
 from core.testing.tester import BaseTester
 from core.training.endgame_solve import EndgameSolve
@@ -805,6 +806,13 @@ def main():
         "search's root value q: (1 - this) * z + this * q (0, the default, is z alone)",
     )
     parser.add_argument(
+        "--ownership-weight",
+        type=float,
+        default=0.02,
+        help="with an ownership head (ownership=true in the --net spec), the weight of its loss, "
+        "summed over the squares (KataGo's 1.5 / b^2 on a b x b board: about 0.023 here)",
+    )
+    parser.add_argument(
         "--policy-target",
         choices=["visits", "completed-q"],
         default="visits",
@@ -1324,24 +1332,42 @@ def main():
 
     network, network_state = make_net(args.net)
 
-    # a network that predicts the final margin (outcomes=margin, see game.py's OUTCOMES) trains
-    # on the margins games end on, exactly solved where solved, in place of their results
-    def predicts_margin(spec: str) -> bool:
-        return "outcome_scores" in network_options(named_spec(spec)[1])[1]
+    def config_of(spec: str):
+        net, options = network_options(named_spec(spec)[1])
+        return network_config(net, env.num_actions, **options)
 
-    score_targets = predicts_margin(args.net)
-    if any(predicts_margin(spec) != score_targets for spec in args.grow):
-        parser.error("--grow's networks and --net must all predict the margin, or none")
-    if score_targets and args.resign is not None:
-        parser.error("a network that predicts the margin can't train on resigned games")
-    if score_targets and args.tree_positions > 0:
-        parser.error(
-            "a network that predicts the margin can't train on --tree-positions"
+    # a network that predicts the final margin (outcomes=margin, see game.py's OUTCOMES) trains
+    # on the margins games end on, exactly solved where solved, in place of their results; one
+    # with an ownership head (ownership=true) on the final board too, a solved game's played on
+    # perfectly from where it's solved
+    def predicts(spec: str) -> tuple[bool, bool]:
+        config = config_of(spec)
+        return (
+            getattr(config, "outcome_scores", None) is not None,
+            getattr(config, "ownership", False),
         )
+
+    score_targets, ownership_targets = predicts(args.net)
+    if any(predicts(spec) != (score_targets, ownership_targets) for spec in args.grow):
+        parser.error(
+            "--grow's networks and --net must all have the same heads: outcomes=margin and "
+            "ownership=true on all or none"
+        )
+    for on, what in ((score_targets, "the margin"), (ownership_targets, "ownership")):
+        if on and args.resign is not None:
+            parser.error(
+                f"a network that predicts {what} can't train on resigned games"
+            )
+        if on and args.tree_positions > 0:
+            parser.error(
+                f"a network that predicts {what} can't train on --tree-positions"
+            )
     if score_targets and args.value_target_q:
         parser.error(
             "a network that predicts the margin trains on it alone: no --value-target-q"
         )
+    if ownership_targets and args.solve_empties is not None and args.solver != "native":
+        parser.error("an ownership head's solves need --solver native")
     evaluator = make_selfplay(network)
     evaluator_test = make_test_evaluator(make_nn_eval_fn(network, state_to_nn_input))
     # with --grow, the bigger networks, each with its own searches and testers
@@ -1391,7 +1417,10 @@ def main():
         endgame_solve = EndgameSolve(
             stop_fn=stops_at(args.solve_empties),
             solve_fn=make_solve_fn(
-                args.solver, args.solve_threads or default_threads(), score_targets
+                args.solver,
+                args.solve_threads or default_threads(),
+                score_targets,
+                ownership_targets,
             ),
             slots=solve_slots(
                 max(collection_steps * e.search_cycles() for e in stages),
@@ -1419,7 +1448,11 @@ def main():
         fresh_positions=args.fresh_positions,
         nn=network,
         nn_state=network_state,
-        loss_fn=partial(az_default_loss_fn, value_target_q=args.value_target_q),
+        loss_fn=partial(
+            az_default_loss_fn,
+            value_target_q=args.value_target_q,
+            ownership_weight=args.ownership_weight,
+        ),
         # decays from --lr to --lr-final over the run, drops at --lr-drops, or on plateaus
         optimizer=make_optimizer(
             args.epochs * args.train_steps,
@@ -1480,6 +1513,7 @@ def main():
         else None,
         endgame_solve=endgame_solve,
         score_targets=score_targets,
+        ownership_targets=ownership_targets,
         save_state_at=args.save_state_at,
         save_state_every=args.save_state_every,
         log_moves=args.log_moves,

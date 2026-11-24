@@ -71,6 +71,12 @@ class AZResnetConfig:
             the expected result, for a game won on a positive score. Trained on the score (see
             `core.training.loss_fns.az_default_loss_fn`). Not settable in a spec: an application
             names its own and passes them in
+        ownership: an auxiliary head that predicts who owns each input location when the game
+            ends, from the side of the player to move (KataGo's ownership head): a 1x1
+            convolution to one channel from the value head's convolution, before its pooling,
+            through tanh. Only with the pooled heads. Training only: the value and policy don't
+            use it, so search doesn't either (see `core.training.loss_fns.az_default_loss_fn`'s
+            `ownership_weight`)
         inference_dtype: dtype the network computes in, in inference mode (see `eqx.nn.inference_mode`),
             e.g. "bfloat16" for faster self-play
         train_dtype: dtype the convolutions compute in, in training, e.g. "bfloat16" for mixed precision:
@@ -133,6 +139,7 @@ class AZResnetConfig:
     head_channels: int = 32
     value_hidden_size: int = 256
     outcome_scores: tuple[float, ...] | None = None
+    ownership: bool = False
     inference_dtype: str = "float32"
     train_dtype: str = "float32"
     norm: Literal["batch", "layer", "group", "rms", "channel", "fixed", "ws"] = "batch"
@@ -809,8 +816,8 @@ def checkpointed(
 
 
 class AlphaZeroHeads(eqx.Module):
-    """AlphaZero's policy and value heads (see `AZResnetConfig.heads`): the policy logits, and the
-    value's `value_outputs` logits (see `AZResnet.__call__`)."""
+    """AlphaZero's policy and value heads (see `AZResnetConfig.heads`): the policy logits, the
+    value's `value_outputs` logits (see `AZResnet.__call__`), and no auxiliary heads' outputs."""
 
     policy_conv: eqx.nn.Conv2d
     policy_norm: Norm
@@ -844,7 +851,7 @@ class AlphaZeroHeads(eqx.Module):
 
     def __call__(
         self, x: jax.Array, state: eqx.nn.State, dtype: jnp.dtype
-    ) -> tuple[tuple[jax.Array, jax.Array], eqx.nn.State]:
+    ) -> tuple[tuple[jax.Array, jax.Array, dict[str, jax.Array]], eqx.nn.State]:
         policy, state = conv_norm(self.policy_conv, self.policy_norm, x, state, dtype)
         policy = jax.nn.relu(policy)
         policy = self.policy_linear(policy.reshape(-1).astype(jnp.float32))
@@ -852,13 +859,14 @@ class AlphaZeroHeads(eqx.Module):
         value, state = conv_norm(self.value_conv, self.value_norm, x, state, dtype)
         value = jax.nn.relu(value)
         value = jax.nn.relu(self.value_hidden(value.reshape(-1).astype(jnp.float32)))
-        return (policy, self.value_linear(value)), state
+        return (policy, self.value_linear(value), {}), state
 
 
 class PooledHeads(eqx.Module):
     """KataGo's policy and value heads, on features pooled over the board (see
-    `AZResnetConfig.heads`): the policy logits, and the value's `value_outputs` logits (see
-    `AZResnet.__call__`)."""
+    `AZResnetConfig.heads`): the policy logits, the value's `value_outputs` logits (see
+    `AZResnet.__call__`), and the auxiliary heads' outputs by name: with `ownership`, each
+    location's ownership before its tanh."""
 
     policy_conv: eqx.nn.Conv2d
     policy_norm: Norm
@@ -871,6 +879,7 @@ class PooledHeads(eqx.Module):
     value_norm: Norm
     value_hidden: eqx.nn.Linear
     value_linear: eqx.nn.Linear
+    ownership_conv: eqx.nn.Conv2d | None
 
     def __init__(
         self,
@@ -882,8 +891,9 @@ class PooledHeads(eqx.Module):
         key: jax.Array,
         make_norm: NormMaker,
         stats: Stats,
+        ownership: bool = False,
     ):
-        keys = jax.random.split(key, 8)
+        keys = jax.random.split(key, 9)
         self.policy_conv = conv(channels, head_channels, 1, keys[0])
         self.policy_norm = make_norm(head_channels, stats, 1)
         self.policy_pool_conv = conv(channels, head_channels, 1, keys[1])
@@ -899,10 +909,14 @@ class PooledHeads(eqx.Module):
             2 * head_channels, value_hidden_size, key=keys[6]
         )
         self.value_linear = eqx.nn.Linear(value_hidden_size, value_outputs, key=keys[7])
+        # KataGo's: from the value head's convolution, before it's pooled
+        self.ownership_conv = (
+            eqx.nn.Conv2d(head_channels, 1, 1, key=keys[8]) if ownership else None
+        )
 
     def __call__(
         self, x: jax.Array, state: eqx.nn.State, dtype: jnp.dtype
-    ) -> tuple[tuple[jax.Array, jax.Array], eqx.nn.State]:
+    ) -> tuple[tuple[jax.Array, jax.Array, dict[str, jax.Array]], eqx.nn.State]:
         policy, state = conv_norm(self.policy_conv, self.policy_norm, x, state, dtype)
         pooled, state = conv_norm(
             self.policy_pool_conv, self.policy_pool_norm, x, state, dtype
@@ -914,9 +928,14 @@ class PooledHeads(eqx.Module):
         policy = jnp.concatenate([squares, self.pass_linear(pooled)])
 
         value, state = conv_norm(self.value_conv, self.value_norm, x, state, dtype)
-        value = board_pool(jax.nn.relu(value))
+        value = jax.nn.relu(value)
+        aux = {}
+        if self.ownership_conv is not None:
+            ownership = self.ownership_conv(value.astype(jnp.float32))
+            aux["ownership"] = ownership.reshape(-1)
+        value = board_pool(value)
         value = jax.nn.relu(self.value_hidden(value))
-        return (policy, self.value_linear(value)), state
+        return (policy, self.value_linear(value), aux), state
 
 
 class AZResnet(eqx.Module):
@@ -933,6 +952,7 @@ class AZResnet(eqx.Module):
     heads: AlphaZeroHeads | PooledHeads
     inference: bool
     outcome_scores: tuple[float, ...] | None = eqx.field(static=True)
+    ownership: bool = eqx.field(static=True)
     inference_dtype: str = eqx.field(static=True)
     train_dtype: str = eqx.field(static=True)
     remat: bool = eqx.field(static=True)
@@ -1038,6 +1058,9 @@ class AZResnet(eqx.Module):
 
         self.outcome_scores = config.outcome_scores
         value_outputs = len(config.outcome_scores) if config.outcome_scores else 1
+        if config.ownership and config.heads != "pooled":
+            raise ValueError('ownership is the pooled heads\' option: heads="pooled"')
+        self.ownership = config.ownership
         if config.heads == "alphazero":
             self.heads = AlphaZeroHeads(
                 channels,
@@ -1063,6 +1086,7 @@ class AZResnet(eqx.Module):
                 key=heads_key,
                 make_norm=make_norm,
                 stats=stats[-1],
+                ownership=config.ownership,
             )
         self.inference = False
         self.inference_dtype = config.inference_dtype
@@ -1070,11 +1094,14 @@ class AZResnet(eqx.Module):
         self.remat = config.remat
 
     def __call__(
-        self, x: jax.Array, state: eqx.nn.State, outcome_logits: bool = False
-    ) -> tuple[tuple[jax.Array, jax.Array], eqx.nn.State]:
-        """The policy logits and the value, (1,) in [-1, 1], with the network's state. With
-        `outcome_logits` (and `AZResnetConfig.outcome_scores`), the value head's logits, one for
-        each score, in place of the value."""
+        self, x: jax.Array, state: eqx.nn.State, train_outputs: bool = False
+    ) -> tuple[tuple, eqx.nn.State]:
+        """The policy logits and the value, (1,) in [-1, 1], with the network's state.
+
+        With `train_outputs`, what training needs: (policy logits, value, auxiliary outputs), the
+        value as the value head's logits, one for each score, with
+        `AZResnetConfig.outcome_scores`, and the auxiliary outputs by name: with
+        `AZResnetConfig.ownership`, "ownership", each location's before its tanh."""
         # the convolutions compute in the inference dtype in inference mode (and so do the activations
         # between them), in the train dtype in training
         dtype = jnp.dtype(self.inference_dtype if self.inference else self.train_dtype)
@@ -1099,9 +1126,11 @@ class AZResnet(eqx.Module):
 
         if self.final_norm is not None:
             x, state = norm_act(self.final_norm, x, state, dtype)
-        (policy, value), state = self.heads(x, state, dtype)
+        (policy, value, aux), state = self.heads(x, state, dtype)
         if self.outcome_scores is None:
-            return (policy, jnp.tanh(value)), state
-        if outcome_logits:
-            return (policy, value), state
-        return (policy, outcome_value(value, self.outcome_scores)[None]), state
+            value = jnp.tanh(value)
+        elif not train_outputs:
+            value = outcome_value(value, self.outcome_scores)[None]
+        if train_outputs:
+            return (policy, value, aux), state
+        return (policy, value), state
