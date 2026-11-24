@@ -6,7 +6,8 @@ The graph is written by hand from the network's layers: its input is a float32 b
 channels-first observations, (batch, 2, 8, 8), its outputs the policy logits, (batch, 65), and the
 value, (batch, 1). BatchNorm, and the norm-free networks' fixed scales, are folded into the
 convolutions, as in the network's inference mode (see `core.networks.azresnet.conv_norm`); the other
-normalizations (LayerNorm, GroupNorm, RMSNorm) follow them.
+normalizations (LayerNorm, GroupNorm, RMSNorm) follow them. ConvNeXt blocks export with a
+depthwise filter or a gated scan, without their other options.
 """
 
 import argparse
@@ -26,7 +27,9 @@ from onnx import TensorProto, helper, numpy_helper
 
 from core.networks.azresnet import (
     AZResnet,
+    Depthwise,
     FixedScale,
+    GatedScan,
     GroupNorm,
     Norm,
     PooledHeads,
@@ -38,6 +41,9 @@ from core.networks.azresnet import (
 
 OPSET = 17
 IR_VERSION = 8
+SIDE = 8  # the board's squares a side
+# starts the names of a gated scan's nodes, so that `quantize.py` can keep them in float
+SCAN_SCOPE = "scan_"
 
 
 class Graph:
@@ -47,10 +53,11 @@ class Graph:
         self.nodes: list[onnx.NodeProto] = []
         self.weights: list[onnx.TensorProto] = []
         self.count = 0
+        self.scope = ""  # starts the names given
 
     def name(self, stem: str) -> str:
         self.count += 1
-        return f"{stem}_{self.count}"
+        return f"{self.scope}{stem}_{self.count}"
 
     def weight(self, array, stem: str = "w") -> str:
         name = self.name(stem)
@@ -192,27 +199,157 @@ class Graph:
             y = self.add(y, self.board_bias(self.linear(block.pool_linear, pooled)))
         return self.add(x, self.conv(block.conv2, y))
 
-    def convnext_block(self, block: PreActConvNeXt, state: eqx.nn.State, x: str) -> str:
-        """ConvNeXt's block: its depthwise filter a grouped convolution, its kernel the smallest
-        square holding its taps, zero off them, with BatchNorm folded in (or another normalization
-        after it)."""
-        kernel = np.asarray(block.dw.dense(), np.float32)
+    def depthwise(
+        self,
+        dw: Depthwise,
+        x: str,
+        scale: np.ndarray | None,
+        bias: np.ndarray | None,
+    ) -> str:
+        """A depthwise filter, its outputs times `scale` plus `bias`, as a grouped convolution, its
+        kernel the smallest square holding its taps, zero off them."""
+        kernel = np.asarray(dw.dense(), np.float32)
         channels, size = kernel.shape[0], kernel.shape[-1]
-        bias = None
-        if isinstance(block.norm, eqx.nn.BatchNorm):
-            scale, offset = inference_affine(block.norm, state)
-            kernel = kernel * np.asarray(scale, np.float32).reshape(-1, 1, 1, 1)
-            bias = np.asarray(offset, np.float32)
+        if scale is not None:
+            kernel = kernel * scale.reshape(-1, 1, 1, 1)
         inputs = [x, self.weight(kernel)]
         if bias is not None:
             inputs.append(self.weight(bias))
-        y = self.node(
+        return self.node(
             "Conv",
             *inputs,
             kernel_shape=[size, size],
             pads=[size // 2] * 4,
             group=channels,
         )
+
+    def gated_scan(
+        self,
+        scan: GatedScan,
+        state: eqx.nn.State,
+        x: str,
+        scale: np.ndarray | None,
+        bias: np.ndarray | None,
+    ) -> str:
+        """A gated scan (see `azresnet.GatedScan`), its outputs times `scale` plus `bias`, by
+        Horner's scheme from each line's far end: s = w_k x_k + g_k s, down to a step from the
+        square filtered. Only lines on the board are computed, as rows of channels, (batch, lines,
+        channels), longest first: those still running at a step are the first rows, so a step
+        pads the sums of the step before."""
+        weight = np.asarray(scan.weight, np.float32)
+        if scale is not None:
+            weight = weight * scale[:, None]
+        channels, length = weight.shape[0], scan.length
+        reaches = {}  # each line's steps on the board, by (square filtered, direction)
+        for p in range(SIDE * SIDE):
+            for d, (dy, dx) in enumerate(scan.steps):
+                row, col, reach = p // SIDE, p % SIDE, 0
+                while reach < length:
+                    row, col = row + dy, col + dx
+                    if not (0 <= row < SIDE and 0 <= col < SIDE):
+                        break
+                    reach += 1
+                if reach:
+                    reaches[p, d] = reach
+        lines = sorted(reaches, key=lambda line: -reaches[line])
+        flat = self.weight(np.array([0, channels, -1]), "shape")
+        squares = self.node("Transpose", self.node("Reshape", x, flat), perm=[0, 2, 1])
+        y = self.node("Mul", squares, self.weight(weight[:, 0], "own"))
+        longest = max(reaches.values(), default=0)
+        gates = None
+        if longest > 1:
+            logits = self.conv_norm(scan.gate_conv, scan.gate_norm, state, x)
+            offset = np.asarray(scan.gate_offset, np.float32).reshape(-1, 1, 1)
+            gates = self.node(
+                "Sigmoid", self.add(logits, self.weight(offset, "offset"))
+            )
+            count = len(offset)
+            if count < channels:  # each gate spread over its group of channels
+                group = np.arange(channels) // (channels // count)
+                gates = self.node("Gather", gates, self.weight(group, "group"), axis=1)
+            gates = self.node(
+                "Transpose", self.node("Reshape", gates, flat), perm=[0, 2, 1]
+            )
+        total, running = None, 0
+        for k in range(longest, 0, -1):
+            here = [line for line in lines if reaches[line] >= k]
+            reached, taps = [], []
+            for p, d in here:
+                dy, dx = scan.steps[d]
+                reached.append(p + k * (dy * SIDE + dx))
+                taps.append(1 + d * length + k - 1)
+            at = self.weight(np.array(reached), "reached")
+            term = self.node(
+                "Mul",
+                self.node("Gather", squares, at, axis=1),
+                self.weight(weight[:, taps].T, "taps"),
+            )
+            if total is not None:
+                assert gates is not None
+                through = self.weight(np.array(reached[:running]), "through")
+                gate = self.node("Gather", gates, through, axis=1)
+                carried = self.node("Mul", gate, total)
+                if running < len(here):
+                    carried = self.pad_rows(carried, len(here) - running)
+                term = self.add(term, carried)
+            total, running = term, len(here)
+        if total is not None:
+            # each square's lines, by their rows, the row past the last one zeros
+            ends = [
+                [r for r, (p, _) in enumerate(lines) if p == square]
+                for square in range(SIDE * SIDE)
+            ]
+            most = max(map(len, ends))
+            rows = np.array([r + [len(lines)] * (most - len(r)) for r in ends])
+            ending = self.node(
+                "Gather", self.pad_rows(total, 1), self.weight(rows, "ends"), axis=1
+            )
+            axis = self.weight(np.array([2]), "axes")
+            y = self.add(y, self.node("ReduceSum", ending, axis, keepdims=0))
+        if bias is not None:
+            y = self.add(y, self.weight(bias, "bias"))
+        board = self.weight(np.array([0, channels, SIDE, SIDE]), "shape")
+        return self.node("Reshape", self.node("Transpose", y, perm=[0, 2, 1]), board)
+
+    def pad_rows(self, x: str, count: int) -> str:
+        """`count` rows of zeros after (batch, rows, channels) `x`'s."""
+        pads = self.weight(np.array([0, 0, 0, 0, count, 0]), "pads")
+        return self.node("Pad", x, pads)
+
+    def convnext_block(self, block: PreActConvNeXt, state: eqx.nn.State, x: str) -> str:
+        """ConvNeXt's block, of a depthwise filter (see `depthwise`) or a gated scan (see
+        `gated_scan`), with BatchNorm folded into it (or another normalization after it)."""
+        unsupported = [
+            option
+            for option, on in (
+                (
+                    type(block.dw).__name__,
+                    not isinstance(block.dw, Depthwise | GatedScan),
+                ),
+                ("position_bias", block.position is not None),
+                ("mlp_experts", block.mlp_router is not None),
+            )
+            if on
+        ]
+        if unsupported:
+            raise TypeError(
+                f"no export of ConvNeXt blocks with {', '.join(unsupported)}: only with a "
+                "depthwise filter or a gated scan"
+            )
+        scale = bias = None
+        if isinstance(block.norm, eqx.nn.BatchNorm):
+            scale, offset = inference_affine(block.norm, state)
+            scale = np.asarray(scale, np.float32)
+            bias = np.asarray(offset, np.float32)
+        if isinstance(block.dw, GatedScan):
+            self.scope = SCAN_SCOPE
+            y = self.gated_scan(block.dw, state, x, scale, bias)
+            self.scope = ""
+        else:
+            assert isinstance(block.dw, Depthwise)
+            y = self.depthwise(block.dw, x, scale, bias)
+        channels = block.expand.in_channels
+        assert isinstance(channels, int)
         if bias is None:
             if not isinstance(block.norm, GroupNorm):
                 raise TypeError(
@@ -258,6 +395,8 @@ def to_onnx(network: AZResnet, state: eqx.nn.State) -> onnx.ModelProto:
     if it has any)."""
     if not isinstance(network.heads, PooledHeads):
         raise TypeError("only pooled heads export")
+    if network.input_features is not None or network.board_plane:
+        raise TypeError("no export of input planes but the discs")
     graph = Graph()
     x = "input"
     if network.stem_norm is None:

@@ -177,6 +177,11 @@ def load_library() -> ctypes.CDLL:
             [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
             + [floats, floats],
         ),
+        "net_set_scan": (
+            ctypes.c_int,
+            [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+            + [floats, floats, floats, floats],
+        ),
         "net_forward": (
             None,
             [ctypes.c_void_p, ctypes.c_int, floats, floats, floats, ctypes.c_int],

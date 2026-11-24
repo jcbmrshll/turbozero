@@ -64,6 +64,24 @@ class Block:
     pool: Linear | None = None
 
 
+# the gated scan's directions in the C++'s order (`SCAN_DY`, `SCAN_DX` in cpu_net.h)
+SCAN_DIRECTIONS = tuple((dy, dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1) if dy or dx)
+
+
+@dataclass
+class Scan:
+    """A gated scan in place of a ConvNeXt block's depthwise filter (see
+    `core.networks.azresnet.GatedScan`), its BatchNorm folded in: y = dw_bias + w[:, 0] x + the
+    taps along each direction of `SCAN_DIRECTIONS`, from 1 step to `length`, each weighted by the
+    gates of the squares between; the gates sigmoid(gate_w x + gate_b), each shared by a run of
+    channels / gates channels."""
+
+    length: int
+    w: np.ndarray  # (channels, 1 + 8 length)
+    gate_w: np.ndarray  # (gates, channels)
+    gate_b: np.ndarray  # (gates)
+
+
 @dataclass
 class ConvNeXtBlock:
     """ConvNeXt's block (see `core.networks.azresnet.PreActConvNeXt`): x + project(relu(expand(y) +
@@ -78,6 +96,7 @@ class ConvNeXtBlock:
     project: Conv
     pool_channels: int = 0
     pool: Linear | None = None
+    scan: Scan | None = None  # in place of the taps
 
 
 @dataclass
@@ -118,6 +137,7 @@ def extract(network, state) -> Program:
 
     from core.networks.azresnet import (
         FixedScale,
+        GatedScan,
         GroupNorm,
         PooledHeads,
         PreActBlock,
@@ -165,10 +185,45 @@ def extract(network, state) -> Program:
             raise unsupported(norm)
         return c
 
+    def scan(dw, scale) -> Scan:
+        """A gated scan, the BatchNorm after it of `scale`, its directions in the C++'s order."""
+        if sorted(dw.steps) != sorted(SCAN_DIRECTIONS):
+            raise TypeError(f"no native gated scan along {dw.steps}")
+        n = dw.length
+        w = f32(dw.weight)
+        order = [dw.steps.index(d) for d in SCAN_DIRECTIONS]
+        taps = [0] + [1 + d * n + k for d in order for k in range(n)]
+        gate_conv, _ = conv_norm(dw.gate_conv, dw.gate_norm)
+        return Scan(
+            length=n,
+            w=w[:, taps] * f32(scale)[:, None],
+            gate_w=gate_conv.w[:, :, 0, 0],
+            gate_b=gate_conv.b + f32(dw.gate_offset),
+        )
+
     def convnext(block, pool: Linear | None) -> ConvNeXtBlock:
+        gated = isinstance(block.dw, GatedScan)
+        if not (
+            block.plain
+            or (gated and block.position is None and block.mlp_router is None)
+        ):
+            raise TypeError(
+                "no native ConvNeXt block but the plain one (a depthwise filter) or a gated scan"
+            )
         if not isinstance(block.norm, eqx.nn.BatchNorm):
             raise unsupported(block.norm)
         scale, offset = inference_affine(block.norm, state)
+        if gated:
+            return ConvNeXtBlock(
+                taps=np.zeros((0, 2), np.int32),
+                dw=np.zeros((len(offset), 0), np.float32),
+                dw_bias=f32(offset),
+                expand=folded(block.expand, block.expand_norm),
+                project=folded(block.project, block.project_norm),
+                pool_channels=block.pool_channels,
+                pool=pool,
+                scan=scan(block.dw, scale),
+            )
         order = sorted(range(len(block.dw.taps)), key=lambda t: block.dw.taps[t])
         return ConvNeXtBlock(
             taps=np.array([block.dw.taps[t] for t in order], np.int32).reshape(-1, 2),
@@ -180,6 +235,8 @@ def extract(network, state) -> Program:
             pool=pool,
         )
 
+    if network.input_features is not None or network.board_plane:
+        raise TypeError("no native input planes but the discs")
     pre = network.final_norm is not None
     if pre:
         # the pre-activation trunk starts from the stem as it is, or normalized (folded in)
@@ -265,9 +322,38 @@ def conv2d(x: np.ndarray, w: np.ndarray) -> np.ndarray:
     return out
 
 
+def sigmoid(x: np.ndarray) -> np.ndarray:
+    return f32(1 / (1 + np.exp(-x)))
+
+
+def gated_scan(b: ConvNeXtBlock, x: np.ndarray) -> np.ndarray:
+    """`b`'s gated scan of (n, 8, 8, channels) features (see `Scan`)."""
+    assert b.scan is not None
+    sc, n = b.scan, b.scan.length
+    gates = sigmoid(x @ sc.gate_w.T + sc.gate_b)
+    gates = np.repeat(gates, x.shape[-1] // gates.shape[-1], axis=-1)
+    pad = ((0, 0), (n, n), (n, n), (0, 0))
+    xp, gp = np.pad(x, pad), np.pad(gates, pad)
+
+    def shifted(a, dy, dx):
+        return a[:, n + dy : n + dy + 8, n + dx : n + dx + 8]
+
+    out = b.dw_bias + sc.w[:, 0] * x
+    for d, (dy, dx) in enumerate(SCAN_DIRECTIONS):
+        through = np.ones_like(x)
+        for k in range(1, n + 1):
+            out = out + sc.w[:, 1 + d * n + k - 1] * through * shifted(
+                xp, k * dy, k * dx
+            )
+            through = through * shifted(gp, k * dy, k * dx)
+    return f32(out)
+
+
 def depthwise(b: ConvNeXtBlock, x: np.ndarray) -> np.ndarray:
     """`b`'s depthwise filter of (n, 8, 8, channels) features, its bias added first, then each tap's
-    product in order, taps off the board adding nothing."""
+    product in order, taps off the board adding nothing (or its gated scan)."""
+    if b.scan is not None:
+        return gated_scan(b, x)
     out = np.broadcast_to(b.dw_bias, x.shape).astype(np.float32)
     padded = np.pad(x, ((0, 0), (7, 7), (7, 7), (0, 0)))
     for t, (dy, dx) in enumerate(b.taps):
@@ -638,6 +724,11 @@ def save(path: Path, p: Program, q: dict[str, QuantizedConv]) -> None:
         if isinstance(b, ConvNeXtBlock):
             arrays[f"b{i}.taps"], arrays[f"b{i}.dw"] = b.taps, b.dw
             arrays[f"b{i}.dw_bias"] = b.dw_bias
+            if b.scan is not None:
+                arrays[f"b{i}.scan_length"] = np.array(b.scan.length)
+                arrays[f"b{i}.scan_w"] = b.scan.w
+                arrays[f"b{i}.scan_gate_w"] = b.scan.gate_w
+                arrays[f"b{i}.scan_gate_b"] = b.scan.gate_b
             for part in ("expand", "project", "pool"):
                 if getattr(b, part) is not None:
                     put(f"b{i}.{part}", getattr(b, part))
@@ -685,6 +776,14 @@ def load(path: Path) -> tuple[Program, dict[str, QuantizedConv]]:
                 conv(f"b{i}.project"),
                 pool_channels,
                 pool,
+                Scan(
+                    int(a[f"b{i}.scan_length"]),
+                    a[f"b{i}.scan_w"],
+                    a[f"b{i}.scan_gate_w"],
+                    a[f"b{i}.scan_gate_b"],
+                )
+                if f"b{i}.scan_w" in a
+                else None,
             )
         return Block(
             conv(f"b{i}.conv1"),
@@ -808,7 +907,20 @@ class NativeNet:
             raise ValueError(f"the C++ can't take the stem: {stem.q.shape}")
         norm("stem", 0, p.stem_norm, p.channels)
         for i, b in enumerate(p.blocks):
-            if isinstance(b, ConvNeXtBlock):
+            if isinstance(b, ConvNeXtBlock) and b.scan is not None:
+                sc = b.scan
+                if lib.net_set_scan(
+                    self.handle,
+                    i,
+                    sc.length,
+                    len(sc.gate_b),
+                    ptr(sc.w),
+                    ptr(b.dw_bias),
+                    ptr(sc.gate_w),
+                    ptr(sc.gate_b),
+                ):
+                    raise ValueError(f"the C++ can't take block {i}'s gated scan")
+            elif isinstance(b, ConvNeXtBlock):
                 taps = np.ascontiguousarray(b.taps, np.int32)
                 if lib.net_set_depthwise(
                     self.handle,
@@ -819,6 +931,7 @@ class NativeNet:
                     ptr(b.dw_bias),
                 ):
                     raise ValueError(f"the C++ can't take block {i}'s taps")
+            if isinstance(b, ConvNeXtBlock):
                 conv("expand", i, q[f"{i}.expand"])
                 conv("project", i, q[f"{i}.project"])
                 if b.pool is not None:
