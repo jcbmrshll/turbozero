@@ -218,7 +218,13 @@ struct Net {
     Norm policy_norm, pool_norm, value_norm;
     Linear pool_linear, pass_linear, value_hidden, value_out;
     std::vector<float> square_w;  // (head_channels)
+    // a value head over a game's final scores: each score's value, the sign of the score; the value is
+    // their mean under the softmax of value_out's logits. Empty: value_out's one output, through tanh
+    std::vector<float> value_weights;
 };
+
+// the largest number of scores a value head predicts
+constexpr int MAX_OUTCOMES = 256;
 
 // `l` of `in` inputs and `out` outputs, `w` (out, in) and `b` (out), with its packed weights
 inline void set_linear(Linear& l, int in, int out, const float* w, const float* b) {
@@ -2026,7 +2032,7 @@ inline void heads(const Net& n, float* h, float* logits, float* value) {
     const int H = n.head_channels, H3 = 3 * H;
     // each part normalized, of its own channels: the pooled part's and the value's pooled as they go
     // (out: a vector of outputs, as `linear` writes them, though it takes 1)
-    alignas(64) float pooled[256], bias[128], hidden[1024], out[16];
+    alignas(64) float pooled[256], bias[128], hidden[1024], out[MAX_OUTCOMES];
     normalize_pool(n.pool_norm, h + H, H3, H, pooled);
     linear(n.pool_linear, pooled, bias);
     NET_STAGE("head policy pool");
@@ -2038,7 +2044,20 @@ inline void heads(const Net& n, float* h, float* logits, float* value) {
     linear(n.value_hidden, pooled, hidden);
     relu(hidden, n.value_hidden.out);
     linear(n.value_out, hidden, out);
-    *value = std::tanh(out[0]);
+    if (n.value_weights.empty()) {
+        *value = std::tanh(out[0]);
+    } else {
+        // the scores' softmax, from the largest logit, and their values' mean under it
+        const int k = n.value_out.out;
+        const float top = *std::max_element(out, out + k);
+        float total = 0, weighted = 0;
+        for (int i = 0; i < k; i++) {
+            const float e = std::exp(out[i] - top);
+            total += e;
+            weighted += e * n.value_weights[i];
+        }
+        *value = weighted / total;
+    }
     NET_STAGE("head pass and value");
 }
 

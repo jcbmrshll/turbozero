@@ -6,7 +6,9 @@ to its end, each position stored past the solve point getting its own solved res
 
 Solvers:
 - `native`: endgame.py's C++ solver, a win/draw/loss solve (only the result's sign is needed),
-  compiled on first use with g++ (Modal's training image too).
+  or an exact solve of the margin for a network that predicts it (about 9x slower at 20 empties,
+  2.5x for each empty square more: an exact solve at 18 costs about what a win/draw/loss one at
+  20 does), compiled on first use with g++ (Modal's training image too).
 - `edax`: Edax's -solve on a batch file, one process per batch of positions (setup_edax.sh
   builds it; Modal's training image doesn't). For prototyping.
 """
@@ -50,10 +52,14 @@ def bitboards(observation: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     )
 
 
-def results(margins: np.ndarray, current_player: np.ndarray) -> np.ndarray:
+def results(
+    margins: np.ndarray, current_player: np.ndarray, scores: bool = False
+) -> np.ndarray:
     """(n, 2) each player's result, as the environment's rewards at a game's end: 1 for a win, -1
-    for a loss, 0 for a draw, from the exact final margins of the players to move."""
-    sign = np.sign(np.asarray(margins)).astype(np.float32)
+    for a loss, 0 for a draw, from the exact final margins of the players to move. With `scores`,
+    each player's margin, as the environment's scores at a game's end (see `game.metadata`)."""
+    margins = np.asarray(margins)
+    sign = (margins if scores else np.sign(margins)).astype(np.float32)
     out = np.empty((len(sign), 2), np.float32)
     rows = np.arange(len(sign))
     player = np.asarray(current_player)
@@ -103,8 +109,11 @@ def edax_margins(
         return np.array([m for b in pool.map(solve, batches) for m in b], np.int32)
 
 
-def make_solve_fn(solver: str, threads: int) -> Callable[[Any], np.ndarray]:
-    """The solve function (see `EndgameSolve.solve_fn`) of `solver`, on `threads` cores."""
+def make_solve_fn(
+    solver: str, threads: int, scores: bool = False
+) -> Callable[[Any], np.ndarray]:
+    """The solve function (see `EndgameSolve.solve_fn`) of `solver`, on `threads` cores: the
+    players' results, or with `scores` their exact margins (see `results`)."""
     if solver not in SOLVERS:
         raise ValueError(f"solver must be one of {SOLVERS}, got {solver!r}")
 
@@ -112,7 +121,7 @@ def make_solve_fn(solver: str, threads: int) -> Callable[[Any], np.ndarray]:
         import endgame
 
         def margins(me: np.ndarray, opp: np.ndarray) -> np.ndarray:
-            return endgame.solve_batch(me, opp, threads=threads, exact=False)[0]
+            return endgame.solve_batch(me, opp, threads=threads, exact=scores)[0]
     else:
 
         def margins(me: np.ndarray, opp: np.ndarray) -> np.ndarray:
@@ -120,7 +129,7 @@ def make_solve_fn(solver: str, threads: int) -> Callable[[Any], np.ndarray]:
 
     def solve(positions: Any) -> np.ndarray:
         me, opp = bitboards(positions.observation)
-        return results(margins(me, opp), positions.current_player)
+        return results(margins(me, opp), positions.current_player, scores)
 
     return solve
 

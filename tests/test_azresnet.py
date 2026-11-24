@@ -727,3 +727,33 @@ def test_a_convnext_trunk_is_normalized_after_every_convolution_by_default():
     # other pre-activation trunks start from the stem as it is
     plain, _ = make_variant("global pooling", layout="pre")
     assert plain.stem_norm is None
+
+
+@pytest.mark.parametrize("heads", ["alphazero", "pooled"])
+def test_a_value_head_over_scores_gives_the_chance_of_a_win_less_a_loss(heads):
+    scores = (2.0, 1.0, 0.0, -1.0, -2.0)
+    config = AZResnetConfig(
+        policy_head_out_size=10,
+        num_blocks=1,
+        num_channels=8,
+        heads=heads,
+        head_channels=8,
+        outcome_scores=scores,
+    )
+    net, state = eqx.nn.make_with_state(AZResnet)(
+        config, INPUT_SHAPE, key=jax.random.PRNGKey(0)
+    )
+    x = jax.random.normal(jax.random.PRNGKey(1), (4, *INPUT_SHAPE))
+    net = eqx.nn.inference_mode(net)
+
+    (policy, value), _ = apply_nn(net, state, x)
+    (same_policy, logits), _ = apply_nn(
+        lambda x, s: net(x, s, outcome_logits=True), state, x
+    )
+
+    assert value.shape == (4, 1) and logits.shape == (4, len(scores))
+    np.testing.assert_array_equal(policy, same_policy)
+    probs = jax.nn.softmax(logits)
+    np.testing.assert_allclose(
+        value[:, 0], probs[:, :2].sum(-1) - probs[:, 3:].sum(-1), atol=1e-6
+    )

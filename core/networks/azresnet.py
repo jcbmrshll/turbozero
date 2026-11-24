@@ -9,7 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from core.networks.utils import BATCH_AXIS
+from core.networks.utils import BATCH_AXIS, outcome_value
 
 
 @dataclass
@@ -65,6 +65,12 @@ class AZResnetConfig:
             row by row, then a pass
         head_channels: the pooled heads' channels
         value_hidden_size: width of the value head's hidden layer (AlphaZero's: 256)
+        outcome_scores: the value head predicts the game's final score for the player to move,
+            as a distribution over these scores, a logit each, in place of a value through tanh.
+            The value is then the probability of a positive score less that of a negative one:
+            the expected result, for a game won on a positive score. Trained on the score (see
+            `core.training.loss_fns.az_default_loss_fn`). Not settable in a spec: an application
+            names its own and passes them in
         inference_dtype: dtype the network computes in, in inference mode (see `eqx.nn.inference_mode`),
             e.g. "bfloat16" for faster self-play
         train_dtype: dtype the convolutions compute in, in training, e.g. "bfloat16" for mixed precision:
@@ -126,6 +132,7 @@ class AZResnetConfig:
     heads: Literal["alphazero", "pooled"] = "alphazero"
     head_channels: int = 32
     value_hidden_size: int = 256
+    outcome_scores: tuple[float, ...] | None = None
     inference_dtype: str = "float32"
     train_dtype: str = "float32"
     norm: Literal["batch", "layer", "group", "rms", "channel", "fixed", "ws"] = "batch"
@@ -802,7 +809,8 @@ def checkpointed(
 
 
 class AlphaZeroHeads(eqx.Module):
-    """AlphaZero's policy and value heads (see `AZResnetConfig.heads`)."""
+    """AlphaZero's policy and value heads (see `AZResnetConfig.heads`): the policy logits, and the
+    value's `value_outputs` logits (see `AZResnet.__call__`)."""
 
     policy_conv: eqx.nn.Conv2d
     policy_norm: Norm
@@ -818,6 +826,7 @@ class AlphaZeroHeads(eqx.Module):
         squares: int,
         num_actions: int,
         value_hidden_size: int,
+        value_outputs: int,
         *,
         key: jax.Array,
         make_norm: NormMaker,
@@ -831,7 +840,7 @@ class AlphaZeroHeads(eqx.Module):
         self.value_conv = conv(channels, 1, 1, keys[2])
         self.value_norm = make_norm(1, stats, 1)
         self.value_hidden = eqx.nn.Linear(squares, value_hidden_size, key=keys[3])
-        self.value_linear = eqx.nn.Linear(value_hidden_size, 1, key=keys[4])
+        self.value_linear = eqx.nn.Linear(value_hidden_size, value_outputs, key=keys[4])
 
     def __call__(
         self, x: jax.Array, state: eqx.nn.State, dtype: jnp.dtype
@@ -843,13 +852,13 @@ class AlphaZeroHeads(eqx.Module):
         value, state = conv_norm(self.value_conv, self.value_norm, x, state, dtype)
         value = jax.nn.relu(value)
         value = jax.nn.relu(self.value_hidden(value.reshape(-1).astype(jnp.float32)))
-        value = jnp.tanh(self.value_linear(value))
-        return (policy, value), state
+        return (policy, self.value_linear(value)), state
 
 
 class PooledHeads(eqx.Module):
     """KataGo's policy and value heads, on features pooled over the board (see
-    `AZResnetConfig.heads`)."""
+    `AZResnetConfig.heads`): the policy logits, and the value's `value_outputs` logits (see
+    `AZResnet.__call__`)."""
 
     policy_conv: eqx.nn.Conv2d
     policy_norm: Norm
@@ -868,6 +877,7 @@ class PooledHeads(eqx.Module):
         channels: int,
         head_channels: int,
         value_hidden_size: int,
+        value_outputs: int,
         *,
         key: jax.Array,
         make_norm: NormMaker,
@@ -888,7 +898,7 @@ class PooledHeads(eqx.Module):
         self.value_hidden = eqx.nn.Linear(
             2 * head_channels, value_hidden_size, key=keys[6]
         )
-        self.value_linear = eqx.nn.Linear(value_hidden_size, 1, key=keys[7])
+        self.value_linear = eqx.nn.Linear(value_hidden_size, value_outputs, key=keys[7])
 
     def __call__(
         self, x: jax.Array, state: eqx.nn.State, dtype: jnp.dtype
@@ -906,8 +916,7 @@ class PooledHeads(eqx.Module):
         value, state = conv_norm(self.value_conv, self.value_norm, x, state, dtype)
         value = board_pool(jax.nn.relu(value))
         value = jax.nn.relu(self.value_hidden(value))
-        value = jnp.tanh(self.value_linear(value))
-        return (policy, value), state
+        return (policy, self.value_linear(value)), state
 
 
 class AZResnet(eqx.Module):
@@ -923,6 +932,7 @@ class AZResnet(eqx.Module):
     final_norm: Norm | None
     heads: AlphaZeroHeads | PooledHeads
     inference: bool
+    outcome_scores: tuple[float, ...] | None = eqx.field(static=True)
     inference_dtype: str = eqx.field(static=True)
     train_dtype: str = eqx.field(static=True)
     remat: bool = eqx.field(static=True)
@@ -1026,12 +1036,15 @@ class AZResnet(eqx.Module):
         # the pre-activation trunk's end: normalized, and a ReLU, before the heads
         self.final_norm = make_norm(channels, stats[-1], 1) if pre else None
 
+        self.outcome_scores = config.outcome_scores
+        value_outputs = len(config.outcome_scores) if config.outcome_scores else 1
         if config.heads == "alphazero":
             self.heads = AlphaZeroHeads(
                 channels,
                 height * width,
                 config.policy_head_out_size,
                 config.value_hidden_size,
+                value_outputs,
                 key=heads_key,
                 make_norm=make_norm,
                 stats=stats[-1],
@@ -1046,6 +1059,7 @@ class AZResnet(eqx.Module):
                 channels,
                 config.head_channels,
                 config.value_hidden_size,
+                value_outputs,
                 key=heads_key,
                 make_norm=make_norm,
                 stats=stats[-1],
@@ -1056,8 +1070,11 @@ class AZResnet(eqx.Module):
         self.remat = config.remat
 
     def __call__(
-        self, x: jax.Array, state: eqx.nn.State
+        self, x: jax.Array, state: eqx.nn.State, outcome_logits: bool = False
     ) -> tuple[tuple[jax.Array, jax.Array], eqx.nn.State]:
+        """The policy logits and the value, (1,) in [-1, 1], with the network's state. With
+        `outcome_logits` (and `AZResnetConfig.outcome_scores`), the value head's logits, one for
+        each score, in place of the value."""
         # the convolutions compute in the inference dtype in inference mode (and so do the activations
         # between them), in the train dtype in training
         dtype = jnp.dtype(self.inference_dtype if self.inference else self.train_dtype)
@@ -1082,4 +1099,9 @@ class AZResnet(eqx.Module):
 
         if self.final_norm is not None:
             x, state = norm_act(self.final_norm, x, state, dtype)
-        return self.heads(x, state, dtype)
+        (policy, value), state = self.heads(x, state, dtype)
+        if self.outcome_scores is None:
+            return (policy, jnp.tanh(value)), state
+        if outcome_logits:
+            return (policy, value), state
+        return (policy, outcome_value(value, self.outcome_scores)[None]), state

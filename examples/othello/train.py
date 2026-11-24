@@ -72,6 +72,7 @@ from game import (
     make_network,
     make_optimizer,
     make_test_evaluator,
+    network_options,
     state_to_nn_input,
     step_fn,
 )
@@ -1322,6 +1323,25 @@ def main():
         ]
 
     network, network_state = make_net(args.net)
+
+    # a network that predicts the final margin (outcomes=margin, see game.py's OUTCOMES) trains
+    # on the margins games end on, exactly solved where solved, in place of their results
+    def predicts_margin(spec: str) -> bool:
+        return "outcome_scores" in network_options(named_spec(spec)[1])[1]
+
+    score_targets = predicts_margin(args.net)
+    if any(predicts_margin(spec) != score_targets for spec in args.grow):
+        parser.error("--grow's networks and --net must all predict the margin, or none")
+    if score_targets and args.resign is not None:
+        parser.error("a network that predicts the margin can't train on resigned games")
+    if score_targets and args.tree_positions > 0:
+        parser.error(
+            "a network that predicts the margin can't train on --tree-positions"
+        )
+    if score_targets and args.value_target_q:
+        parser.error(
+            "a network that predicts the margin trains on it alone: no --value-target-q"
+        )
     evaluator = make_selfplay(network)
     evaluator_test = make_test_evaluator(make_nn_eval_fn(network, state_to_nn_input))
     # with --grow, the bigger networks, each with its own searches and testers
@@ -1371,7 +1391,7 @@ def main():
         endgame_solve = EndgameSolve(
             stop_fn=stops_at(args.solve_empties),
             solve_fn=make_solve_fn(
-                args.solver, args.solve_threads or default_threads()
+                args.solver, args.solve_threads or default_threads(), score_targets
             ),
             slots=solve_slots(
                 max(collection_steps * e.search_cycles() for e in stages),
@@ -1459,6 +1479,7 @@ def main():
         if args.resign is not None
         else None,
         endgame_solve=endgame_solve,
+        score_targets=score_targets,
         save_state_at=args.save_state_at,
         save_state_every=args.save_state_every,
         log_moves=args.log_moves,

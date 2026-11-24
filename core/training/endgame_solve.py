@@ -116,7 +116,8 @@ class EndgameSolve:
             `jax.jit`
         solve_fn: on the host, a batch of positions, environment states as a pytree of numpy
             arrays with a leading batch dimension -> (batch, players) each one's exact result for
-            each player, as the environment's rewards for the game's end would be
+            each player, as the environment's rewards for the game's end would be (its scores,
+            with the trainer's `score_targets`)
         slots: solves each environment can hold while they wait for their results. Results come
             once an epoch, for the solves added before its self-play, so this needs two epochs'
             worth. A game whose solve point finds every slot full is played to the end instead,

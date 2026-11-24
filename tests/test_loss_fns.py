@@ -2,8 +2,10 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from core.memory.replay_memory import BaseExperience
+from core.networks.utils import outcome_value
 from core.training.loss_fns import az_default_loss_fn
 
 
@@ -165,3 +167,62 @@ def test_network_state_comes_back_updated():
 
     assert nn_state is not None
     assert int(nn_state.get(net.calls)) == 1
+
+
+class ScoreLogitsAsParams(eqx.Module):
+    """`OutputAsParams` whose value head predicts the final score (see
+    `AZResnetConfig.outcome_scores`): with `outcome_logits`, its logits over `outcome_scores`, else
+    their value."""
+
+    logits: jax.Array
+    score_logits: jax.Array
+    outcome_scores: tuple[float, ...] = eqx.field(static=True)
+
+    def __call__(self, x, outcome_logits=False):
+        if outcome_logits:
+            return self.logits[x], self.score_logits[x]
+        return self.logits[x], outcome_value(self.score_logits[x], self.outcome_scores)
+
+
+def test_a_network_predicting_the_score_trains_on_the_scores_cross_entropy():
+    scores = (4.0, 2.0, 0.0, -2.0, -4.0)
+    score_logits = jnp.array([[0.0, 2.0, 0.0, -1.0, 0.0], [1.0, 0.0, 0.0, 0.0, 3.0]])
+    net = ScoreLogitsAsParams(jnp.zeros((2, 2)), score_logits, scores)
+    # the first's mover (player 0) won by 2, the second's (player 1) lost by 4
+    batch = experience(
+        rewards=[[2, -2], [4, -4]],
+        cur_player_id=[0, 1],
+        policy_weights=[[0.5, 0.5], [0.5, 0.5]],
+        policy_mask=jnp.ones((2, 2), bool),
+    )
+
+    loss, (metrics, _) = az_default_loss_fn(net, None, batch)
+
+    log_probs = jax.nn.log_softmax(score_logits)
+    outcome_loss = -(log_probs[0, 1] + log_probs[1, 4]) / 2
+    np.testing.assert_allclose(metrics["outcome_loss"], outcome_loss, rtol=1e-6)
+    np.testing.assert_allclose(loss, metrics["policy_loss"] + outcome_loss, rtol=1e-6)
+    # the value, P(win) - P(loss), is measured against the result
+    probs = jax.nn.softmax(score_logits)
+    values = probs[:, :2].sum(-1) - probs[:, 3:].sum(-1)
+    np.testing.assert_allclose(
+        metrics["value_loss"],
+        ((values - jnp.array([1, -1])) ** 2 / 2).mean(),
+        rtol=1e-6,
+    )
+    expected = probs @ jnp.array(scores)
+    np.testing.assert_allclose(
+        metrics["score_error"], jnp.abs(expected - jnp.array([2, -4])).mean(), rtol=1e-6
+    )
+
+
+def test_a_network_predicting_the_score_refuses_a_mixed_value_target():
+    net = ScoreLogitsAsParams(jnp.zeros((1, 2)), jnp.zeros((1, 3)), (1.0, 0.0, -1.0))
+    batch = experience(
+        rewards=[[1, -1]],
+        cur_player_id=[0],
+        policy_weights=[[0.5, 0.5]],
+        policy_mask=jnp.ones((1, 2), bool),
+    )
+    with pytest.raises(ValueError, match="value_target_q"):
+        az_default_loss_fn(net, None, batch, value_target_q=0.5)

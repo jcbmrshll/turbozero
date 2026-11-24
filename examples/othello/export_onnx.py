@@ -258,6 +258,8 @@ def to_onnx(network: AZResnet, state: eqx.nn.State) -> onnx.ModelProto:
     if it has any)."""
     if not isinstance(network.heads, PooledHeads):
         raise TypeError("only pooled heads export")
+    if network.outcome_scores is not None:
+        raise TypeError("a value head over the final scores doesn't export to ONNX")
     graph = Graph()
     x = "input"
     if network.stem_norm is None:

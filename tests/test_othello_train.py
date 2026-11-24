@@ -24,8 +24,18 @@ def fake_trainer(**kwargs):
     raise BuiltTrainer(**kwargs)
 
 
-def fake_solve_fn(solver, threads):
-    return lambda positions: np.zeros((len(positions.current_player), 2), np.float32)
+class FakeSolve:
+    """A solve function solving nothing, recording whether it was asked for scores."""
+
+    def __init__(self, scores):
+        self.scores = scores
+
+    def __call__(self, positions):
+        return np.zeros((len(positions.current_player), 2), np.float32)
+
+
+def fake_solve_fn(solver, threads, scores=False):
+    return FakeSolve(scores)
 
 
 def run_main(monkeypatch, *args):
@@ -46,6 +56,35 @@ def test_root_noise_options_reach_self_play_only(monkeypatch):
     assert evaluator.dirichlet_alpha == 1.0
     assert evaluator.dirichlet_epsilon == 0.1
     assert built.value.kwargs["evaluator_test"].dirichlet_alpha == 0.3
+
+
+@pytest.mark.parametrize("outcomes", [False, True])
+def test_a_network_over_the_final_margin_trains_on_exactly_solved_margins(
+    monkeypatch, outcomes
+):
+    net = "resnet:1x4" + (",outcomes=margin" if outcomes else "")
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, "--net", net, "--solve-empties", "18")
+    kwargs = built.value.kwargs
+    assert kwargs["score_targets"] == outcomes
+    assert kwargs["endgame_solve"].solve_fn.scores == outcomes
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ("--solve-empties", "off", "--resign"),
+        ("--tree-positions", "2"),
+        ("--value-target-q", "0.5"),
+        ("--grow", "resnet:2x4", "--grow-switch-at", "3"),
+    ],
+)
+def test_a_network_over_the_final_margin_refuses_targets_that_are_not_margins(
+    monkeypatch, capsys, options
+):
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, "--net", "resnet:1x4,outcomes=margin", *options)
+    assert "margin" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(

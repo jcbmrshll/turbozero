@@ -152,14 +152,18 @@ class FixedLengthState:
     current_player: jax.Array
 
 
-def make_fixed_length_env(length, rewards=(1.0, -1.0), num_actions=2, action_mask=None):
+def make_fixed_length_env(
+    length, rewards=(1.0, -1.0), num_actions=2, action_mask=None, scores=None
+):
     """Two-player environment that terminates after exactly `length` steps, whatever the actions.
 
     Players alternate, starting with player 0. The legal actions are `action_mask`'s at every step
     (by default, every action), and the terminal step pays `rewards` (indexed by player id); every
-    other step pays 0.
+    other step pays 0. With `scores`, the terminal step scores them (see `StepMetadata.scores`),
+    every other step 0.
     """
     rewards = jnp.asarray(rewards, dtype=jnp.float32)
+    final_scores = None if scores is None else jnp.asarray(scores, dtype=jnp.float32)
     action_mask = (
         jnp.ones((num_actions,), dtype=jnp.bool_)
         if action_mask is None
@@ -174,6 +178,9 @@ def make_fixed_length_env(length, rewards=(1.0, -1.0), num_actions=2, action_mas
             terminated=terminated,
             cur_player_id=state.current_player,
             step=state.step,
+            scores=None
+            if final_scores is None
+            else jnp.where(terminated, final_scores, 0.0),
         )
 
     def init_fn(key):  # pylint: disable=unused-argument

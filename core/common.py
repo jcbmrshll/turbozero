@@ -108,17 +108,28 @@ def search_and_step(
         params=params,
         env_step_fn=env_step_fn,
     )
-    return step_with_output(
-        key,
+    output, env_state, env_state_metadata, terminated, truncated, final, searched = (
+        step_with_output(
+            key,
+            output,
+            env_state,
+            env_state_metadata,
+            evaluator,
+            env_step_fn,
+            env_init_fn,
+            max_steps,
+            reset,
+            choose_action,
+        )
+    )
+    return (
         output,
         env_state,
         env_state_metadata,
-        evaluator,
-        env_step_fn,
-        env_init_fn,
-        max_steps,
-        reset,
-        choose_action,
+        terminated,
+        truncated,
+        final.rewards,
+        searched,
     )
 
 
@@ -136,7 +147,7 @@ def step_with_output(
     active: ArrayLike = True,
     end: ArrayLike = False,
     step_evaluator: bool = True,
-) -> tuple[EvalOutput, Any, StepMetadata, jax.Array, jax.Array, jax.Array, Any]:
+) -> tuple[EvalOutput, Any, StepMetadata, jax.Array, jax.Array, StepMetadata, Any]:
     """`search_and_step` after its evaluation: steps the environment and evaluator with the
     evaluator's `output` for `env_state`.
 
@@ -154,8 +165,9 @@ def step_with_output(
         others: see `step_env_and_evaluator`.
 
     Returns:
-        Tuple[EvalOutput, Any, StepMetadata, jax.Array, jax.Array, jax.Array, Any]: see
-            `search_and_step`
+        Tuple[EvalOutput, Any, StepMetadata, jax.Array, jax.Array, StepMetadata, Any]: as
+            `search_and_step`, but in place of the rewards the metadata of the state the move
+            led to, before any reset: an ended episode's rewards, and its scores
     """
     if choose_action is not None:
         choose_key, key = jax.random.split(key)
@@ -172,7 +184,7 @@ def step_with_output(
     ended = terminated | truncated | end
     # reset the environment and evaluator state if the episode ended
     # else, update the evaluator state
-    rewards = env_state_metadata.rewards
+    final = env_state_metadata
     if not step_evaluator:
         eval_state = output.eval_state
     elif reset:
@@ -201,7 +213,7 @@ def step_with_output(
         env_state_metadata,
         terminated,
         truncated,
-        rewards,
+        final,
         searched_eval_state,
     )
 

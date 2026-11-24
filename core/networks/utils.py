@@ -1,7 +1,8 @@
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import equinox as eqx
 import jax
+import jax.numpy as jnp
 
 # name of the vmapped axis networks are applied over;
 # layers that compute statistics across the batch (e.g. eqx.nn.BatchNorm) should use it as their `axis_name`
@@ -32,3 +33,11 @@ def apply_nn(
     return jax.vmap(nn, axis_name=BATCH_AXIS, in_axes=(0, None), out_axes=(0, None))(
         x, nn_state
     )
+
+
+def outcome_value(logits: jax.Array, scores: Sequence[float] | jax.Array) -> jax.Array:
+    """The value of a distribution over a game's final scores, `logits` (..., scores) a logit for
+    each of `scores`: the probability of a positive score less that of a negative one, the expected
+    result of a game won on a positive score."""
+    signs = jnp.sign(jnp.asarray(scores, jnp.float32))
+    return jax.nn.softmax(logits.astype(jnp.float32), axis=-1) @ signs

@@ -20,6 +20,9 @@ class StepMetadata:
         terminated: whether the environment is terminated
         cur_player_id: current player id
         step: step number
+        scores: (optional) for a game decided by score, each player's final score once it has
+            terminated (e.g. its disc margin): the value targets of a network that predicts the
+            score (see `Trainer`'s `score_targets`)
     """
 
     rewards: jax.Array
@@ -27,6 +30,7 @@ class StepMetadata:
     terminated: jax.Array
     cur_player_id: jax.Array
     step: jax.Array
+    scores: jax.Array | None = None
 
 
 @jax.tree_util.register_dataclass

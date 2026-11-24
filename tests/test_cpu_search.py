@@ -1107,6 +1107,8 @@ CONVNEXT_SPECS = [
     ),
     "resnet:2x48,pool_every=1,heads=pooled,pool_channels=8,head_channels=16,layout=pre,block=convnext,expand=3,dw_kernel=5",
 ]
+# a value head over the final margin (see game.py's OUTCOMES)
+OUTCOME_SPEC = "resnet:2x32,pool_every=2,heads=pooled,pool_channels=16,head_channels=16,outcomes=margin"
 
 
 @pytest.mark.parametrize("spec", NATIVE_SPECS + CONVNEXT_SPECS)
@@ -1126,10 +1128,26 @@ def test_the_native_networks_layers_compute_the_network(spec):
     np.testing.assert_allclose(got_values, values, atol=1e-5)
 
 
+def test_the_native_networks_value_over_the_final_margin_is_the_networks():
+    import cpu_net
+    from game import MARGINS
+
+    from core.networks.utils import apply_nn
+
+    model, state = random_network(OUTCOME_SPEC)
+    x = (np.random.default_rng(0).random((16, 2, 8, 8)) < 0.3).astype(np.float32)
+    program = cpu_net.extract(model, state)
+    np.testing.assert_array_equal(program.value_weights, np.sign(MARGINS))
+    (logits, values), _ = apply_nn(model, state, jnp.moveaxis(x, 1, -1))
+    got_logits, got_values = cpu_net.float_forward(program, x)
+    np.testing.assert_allclose(got_logits, logits, atol=1e-4)
+    np.testing.assert_allclose(got_values, values[:, 0], atol=1e-5)
+
+
 # each convolution kernel: AVX-512 VNNI's, AVX-VNNI's, AVX2's Winograd, and NEON's with
 # i8mm and with the dot product alone
 @pytest.mark.parametrize("level", ["v4", "v3-vnni", "v3", "arm-i8mm", "arm-dotprod"])
-@pytest.mark.parametrize("spec", NATIVE_SPECS + CONVNEXT_SPECS)
+@pytest.mark.parametrize("spec", NATIVE_SPECS + CONVNEXT_SPECS + [OUTCOME_SPEC])
 def test_the_native_network_computes_its_quantized_layers(
     spec, level, tmp_path, monkeypatch
 ):

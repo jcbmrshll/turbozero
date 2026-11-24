@@ -314,3 +314,82 @@ def test_settings_out_of_range_are_rejected(kwargs):
 def test_a_game_played_to_its_end_says_so_in_the_config():
     assert endgame_solve(play_past=FOREVER).get_config()["play_past"] == "end"
     assert endgame_solve(play_past=2.0).get_config()["play_past"] == 2.0
+
+
+def mover_wins_by(margin):
+    """A fake solver of scores: the player to move at each stopped position wins by `margin`."""
+    return lambda positions: mover_wins(positions) * margin
+
+
+def test_with_score_targets_a_played_out_game_is_labelled_with_its_scores(
+    fixed_length_env, make_collector, scripted, tmp_path
+):
+    env = fixed_length_env(length=LENGTH, rewards=(1.0, -1.0), scores=(10.0, -10.0))
+    collect = make_collector(
+        env,
+        scripted.first_legal,
+        max_episode_steps=16,
+        ckpt_dir=tmp_path,
+        score_targets=True,
+    )
+
+    state = collect(LENGTH)
+
+    np.testing.assert_array_equal(sampleable(state), np.arange(LENGTH))
+    np.testing.assert_array_equal(
+        state.buffer_state.buffer.reward[0, :LENGTH], [[10.0, -10.0]] * LENGTH
+    )
+
+
+def test_with_score_targets_a_solved_game_is_labelled_with_its_solved_scores(
+    fixed_length_env, make_collector, scripted, tmp_path
+):
+    env = fixed_length_env(length=LENGTH, rewards=(1.0, -1.0), scores=(10.0, -10.0))
+    collect = make_collector(
+        env,
+        scripted.first_legal,
+        max_episode_steps=16,
+        ckpt_dir=tmp_path,
+        endgame_solve=replace(endgame_solve(), solve_fn=mover_wins_by(6.0)),
+        score_targets=True,
+        episode_metrics_fn=lambda rewards: {"won": rewards[1] == 1.0},
+    )
+
+    state = solve_and_label(collect.trainer, collect(STOP + 1))
+
+    # player 1 moves at the stopped position, so wins by the solver's margin; the episode's
+    # metrics see its result, not its score
+    np.testing.assert_array_equal(
+        state.buffer_state.buffer.reward[0, : STOP + 1], [[-6.0, 6.0]] * (STOP + 1)
+    )
+    np.testing.assert_array_equal(state.episode_metrics["won"], [1.0])
+
+
+def test_score_targets_need_the_environments_scores(
+    fixed_length_env, make_collector, scripted, tmp_path
+):
+    collect = make_collector(
+        fixed_length_env(length=LENGTH),
+        scripted.first_legal,
+        max_episode_steps=16,
+        ckpt_dir=tmp_path,
+        score_targets=True,
+    )
+    with pytest.raises(ValueError, match="scores"):
+        collect(1)
+
+
+def test_score_targets_refuse_resignation(
+    fixed_length_env, make_collector, scripted, tmp_path
+):
+    from core.training.resignation import Resignation
+
+    with pytest.raises(ValueError, match="score_targets"):
+        make_collector(
+            fixed_length_env(length=LENGTH, scores=(1.0, -1.0)),
+            scripted.first_legal,
+            max_episode_steps=16,
+            ckpt_dir=tmp_path,
+            score_targets=True,
+            resignation=Resignation(0.9),
+        )

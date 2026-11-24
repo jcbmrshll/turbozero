@@ -696,6 +696,7 @@ class Trainer:
         exploration: Exploration | None = None,
         resignation: Resignation | None = None,
         endgame_solve: EndgameSolve | None = None,
+        score_targets: bool = False,
         episode_metrics_fn: Callable[[jax.Array], dict[str, jax.Array]] | None = None,
         data_transform_fns: Sequence[DataTransformFn] = (),
         tree_positions: TreePositions | None = None,
@@ -792,6 +793,11 @@ class Trainer:
                 target; the game stops there, or plays on a few moves, each position stored past it
                 solved on its own. Positions solved in an epoch are labelled after the next epoch's
                 self-play, so training samples them from then on. Not with `resignation`.
+            score_targets: the value targets are the games' final scores (`StepMetadata.scores`)
+                in place of their rewards, for a network that predicts the score (see
+                `core.networks.azresnet.AZResnetConfig.outcome_scores`); with `endgame_solve`,
+                its solver's results are the scores too. The environment must give its scores.
+                Not with `resignation` or `tree_positions`, whose targets aren't scores.
             episode_metrics_fn: (optional) metrics of a finished episode to track, from its final rewards (one per
                 player) to a dict of scalars, e.g. `lambda rewards: {"draw": (rewards == 0).all()}`. Each is logged
                 every epoch as `episode_<name>`, its mean over the episodes that terminated that epoch (truncated
@@ -968,6 +974,12 @@ class Trainer:
         if endgame_solve is not None and resignation is not None:
             raise ValueError("endgame_solve doesn't go with resignation")
         self.endgame_solve = endgame_solve
+        if score_targets and (resignation is not None or tree_positions is not None):
+            raise ValueError(
+                "score_targets doesn't go with resignation or tree_positions: their value "
+                "targets aren't scores"
+            )
+        self.score_targets = score_targets
         self.episode_metrics_fn = episode_metrics_fn
         if tree_positions is not None and not all(
             isinstance(e, MCTS) for _, e in self.collection_schedule.stages
@@ -1545,7 +1557,7 @@ class Trainer:
             new_metadata,
             terminated,
             truncated,
-            rewards,
+            final,
             searched_eval_state,
         ) = step_with_output(
             key=key,
@@ -1564,6 +1576,7 @@ class Trainer:
             step_evaluator=False,
         )
         terminated, truncated = done & terminated, done & truncated
+        rewards = final.rewards
         resign_state = state.resign_state
         if self.resignation is not None and resign_state is not None:
             resign_state = self.resignation.update(
@@ -1634,10 +1647,15 @@ class Trainer:
             pending = self.endgame_solve.next_game(
                 jax.random.fold_in(key, 2), pending, terminated | truncated | stopped
             )
-        # assign rewards to buffer if episode is terminated
+        # assign rewards to buffer if episode is terminated: its rewards, or its scores
+        targets = rewards
+        if self.score_targets:
+            if final.scores is None:
+                raise ValueError("score_targets needs the environment's scores")
+            targets = final.scores.astype(rewards.dtype)
         buffer_state = where_tree(
             terminated,
-            self.memory_buffer.assign_rewards(buffer_state, rewards),
+            self.memory_buffer.assign_rewards(buffer_state, targets),
             buffer_state,
         )
         # discard the episode's experiences if it hit the step limit without terminating
@@ -1929,8 +1947,10 @@ class Trainer:
                 count,
             )
             zeros = {name: jnp.zeros((), jnp.float32) for name in state.episode_metrics}
+            # the metrics are of the games' results: with score targets, the scores' signs
+            rewards = jnp.sign(results) if self.score_targets else results
             added = jax.vmap(lambda r, t: self.add_episode_metrics(zeros, r, t))(
-                results, games
+                rewards, games
             )
             return replace(
                 state,

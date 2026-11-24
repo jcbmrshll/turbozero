@@ -103,6 +103,9 @@ class Program:
     value_hidden: Linear
     value_out: Linear
     square_w: np.ndarray  # (head_channels)
+    # a value head over the final scores (see `AZResnetConfig.outcome_scores`): each score's value,
+    # its sign, the value their mean under value_out's softmax. None: value_out's one output, tanh'd
+    value_weights: np.ndarray | None = None
     # how each convolution's input is quantized, by `quantize`: (scale, zero point), by name
     inputs: dict[str, tuple[float, int]] = field(default_factory=dict)
 
@@ -237,6 +240,9 @@ def extract(network, state) -> Program:
         value_hidden=linear(heads.value_hidden),
         value_out=linear(heads.value_linear),
         square_w=f32(heads.policy_square_conv.weight).reshape(-1),
+        value_weights=None
+        if network.outcome_scores is None
+        else np.sign(f32(network.outcome_scores)),
     )
 
 
@@ -298,7 +304,8 @@ def forward(
     p: Program, observations: np.ndarray, conv, record=None
 ) -> tuple[np.ndarray, np.ndarray]:
     """The network on (n, 2, 8, 8) observations, its trunk's convolutions by `conv(name, conv, x)`;
-    `record(name, x)` sees each one's input, and the value before its tanh ("value")."""
+    `record(name, x)` sees each one's input, and value_out's output ("value", before its tanh or
+    softmax)."""
     record = record or (lambda name, x: None)
     x = np.moveaxis(f32(observations), 1, -1)
 
@@ -345,7 +352,16 @@ def forward(
     value = board_pool(normalize(p.value_norm, heads[..., 2 * h :], relu=True))
     value = dense(p.value_out, np.maximum(dense(p.value_hidden, value), 0))
     record("value", value)
-    return f32(logits), f32(np.tanh(value[:, 0]))
+    return f32(logits), value_of(p, value)
+
+
+def value_of(p: Program, out: np.ndarray) -> np.ndarray:
+    """(n) values from value_out's (n, outputs): its one output through tanh, or the scores'
+    values' mean under its softmax (see `Program.value_weights`)."""
+    if p.value_weights is None:
+        return f32(np.tanh(out[:, 0]))
+    e = np.exp(out - out.max(-1, keepdims=True))
+    return f32((e @ p.value_weights) / e.sum(-1))
 
 
 def float_forward(p: Program, observations: np.ndarray, record=None):
@@ -556,9 +572,9 @@ def bias_corrected(
 ) -> tuple[Program, dict[str, QuantizedConv]]:
     """Moves each convolution's biases, in order through the network, by how far the mean of each
     of its outputs over `positions` lies from the float network's, with the convolutions before it
-    already quantized and corrected; then the value's last bias by how far its mean before tanh
-    lies (the bias correction of Nagel et al. 2019, measured on calibration positions rather than
-    derived from BatchNorm's statistics).
+    already quantized and corrected; then the value's last biases by how far their means before
+    tanh or softmax lie (the bias correction of Nagel et al. 2019, measured on calibration positions
+    rather than derived from BatchNorm's statistics).
 
     Rounding leaves errors that don't average out, and they seem to add up through the trunk to a
     shift of the whole value: on three ray 9x64 nets' test leaves, mean errors of 0.018-0.028
@@ -577,7 +593,7 @@ def bias_corrected(
 
     forward(p, positions, float_conv, record_float)
     corrected: dict[str, QuantizedConv] = {}
-    shift = np.zeros(1)
+    shift = np.zeros(len(p.value_out.b))
 
     def conv(name, _c, x):
         qc = q[name]
@@ -608,6 +624,8 @@ def save(path: Path, p: Program, q: dict[str, QuantizedConv]) -> None:
         "meta": np.array([p.channels, int(p.pre), p.head_channels, len(p.blocks)]),
         "square_w": p.square_w,
     }
+    if p.value_weights is not None:
+        arrays["value_weights"] = p.value_weights
 
     def put(name, value):
         if isinstance(value, Conv):
@@ -712,6 +730,7 @@ def load(path: Path) -> tuple[Program, dict[str, QuantizedConv]]:
         value_hidden=linear("value_hidden"),
         value_out=linear("value_out"),
         square_w=a["square_w"],
+        value_weights=a.get("value_weights"),
     )
     names = {k[2:].rsplit(".", 1)[0] for k in a.files if k.startswith("q.")}
     quantized = {
@@ -841,6 +860,12 @@ class NativeNet:
         linear("value_out", -1, p.value_out)
         conv("head", 0, q["head"])
         lib.net_set_heads(self.handle, ptr(p.square_w))
+        if p.value_weights is not None and lib.net_set_value_weights(
+            self.handle, len(p.value_weights), ptr(p.value_weights)
+        ):
+            raise ValueError(
+                f"the C++ can't take a value head over {len(p.value_weights)} scores"
+            )
 
     def __del__(self) -> None:
         if getattr(self, "handle", None):

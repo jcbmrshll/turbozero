@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import equinox as eqx
@@ -12,6 +13,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "examples" / "othello"))
 
 from game import (
+    MARGINS,
     PASS,
     RAY_TAPS,
     SYMMETRY_TRANSFORM_FNS,
@@ -20,6 +22,7 @@ from game import (
     load_checkpoint,
     make_network,
     make_optimizer,
+    scores,
     weight_decay_mask,
 )
 
@@ -258,3 +261,50 @@ def test_a_symmetry_of_a_ray_filter_is_a_ray_filter(quarter_turns, transpose):
         image(np.asarray(dw(jnp.asarray(x), f32))),
         atol=1e-5,
     )
+
+
+def position(mover: int, opponent: int, current_player: int = 0):
+    """A state of `mover` discs for the player to move and `opponent` for the other, as `scores`
+    reads one."""
+    discs = np.zeros((64, 2), bool)
+    discs[:mover, 0] = True
+    discs[64 - opponent :, 1] = True
+    return SimpleNamespace(
+        observation=jnp.asarray(discs.reshape(8, 8, 2)),
+        current_player=jnp.int32(current_player),
+    )
+
+
+@pytest.mark.parametrize(
+    "mover, opponent, current_player, expected",
+    [
+        # the 14 empty squares go to the one ahead
+        (30, 20, 0, (24.0, -24.0)),
+        (20, 30, 1, (24.0, -24.0)),
+        (32, 32, 0, (0.0, 0.0)),
+        (0, 13, 0, (-64.0, 64.0)),
+        (40, 24, 1, (-16.0, 16.0)),
+    ],
+)
+def test_scores_are_the_margins_with_the_empty_squares_to_the_one_ahead(
+    mover, opponent, current_player, expected
+):
+    np.testing.assert_array_equal(
+        scores(position(mover, opponent, current_player)), expected
+    )
+
+
+def test_a_spec_names_a_value_head_over_the_final_margin():
+    network, state = make_network("resnet:1x16,heads=pooled,outcomes=margin")
+    assert isinstance(network, AZResnet)
+    assert network.outcome_scores == MARGINS
+    assert MARGINS[0] == 64 and MARGINS[-1] == -64 and len(MARGINS) == 65
+    network = eqx.nn.inference_mode(network)
+    obs = jnp.zeros((3, 8, 8, 2), bool)
+    (_, value), _ = jax.vmap(lambda o: network(o, state), axis_name="batch")(obs)
+    (_, logits), _ = jax.vmap(
+        lambda o: network(o, state, outcome_logits=True), axis_name="batch"
+    )(obs)
+    assert value.shape == (3, 1) and logits.shape == (3, 65)
+    with pytest.raises(ValueError, match="margin"):
+        make_network("resnet:1x16,heads=pooled,outcomes=parity")

@@ -56,7 +56,18 @@ def metadata(state) -> StepMetadata:
         terminated=state.terminated,
         cur_player_id=state.current_player,
         step=state._step_count,
+        scores=scores(state),
     )
+
+
+def scores(state) -> jax.Array:
+    """(2) each player's disc margin, the empty squares going to the one ahead (as the endgame
+    solvers score a game): the final scores, once the game has ended."""
+    discs = jnp.sum(state.observation, axis=(0, 1), dtype=jnp.int32)
+    lead = discs[0] - discs[1]
+    margin = lead + jnp.sign(lead) * (64 - discs.sum())
+    mover = jnp.arange(2) == state.current_player
+    return jnp.where(mover, margin, -margin).astype(jnp.float32)
 
 
 def state_to_nn_input(state):
@@ -161,19 +172,34 @@ RAY_TAPS = tuple(
 # core.networks.azresnet.AZResnetConfig.dw_taps)
 DW_TAPS = {"rays": RAY_TAPS}
 
+# the final disc margins of the player to move, from +64 to -64, the empty squares going to the
+# one ahead: the discs and empties always add to 64, so a margin is even
+MARGINS = tuple(float(m) for m in range(64, -65, -2))
+
+# the scores a value head predicts, as a spec names them, e.g. "resnet:7x64,outcomes=margin":
+# a distribution over the final margin in place of a value (see
+# core.networks.azresnet.AZResnetConfig.outcome_scores)
+OUTCOMES = {"margin": MARGINS}
+
+# the settings a spec names that select an option from a table here
+NAMED_OPTIONS = {"dw_taps": DW_TAPS, "outcomes": OUTCOMES}
+OPTION_FIELDS = {"dw_taps": "dw_taps", "outcomes": "outcome_scores"}
+
 
 def network_options(net: str) -> tuple[str, dict]:
-    """`net` without its setting of taps by name (see DW_TAPS), and that setting as a
-    configuration option."""
+    """`net` without its settings by name (taps, see DW_TAPS; outcomes, see OUTCOMES), and
+    those settings as configuration options."""
     kept, options = [], {}
     for setting in net.split(","):
         name, _, value = setting.partition("=")
-        if name != "dw_taps":
+        if name not in NAMED_OPTIONS:
             kept.append(setting)
-        elif value in DW_TAPS:
-            options["dw_taps"] = DW_TAPS[value]
+        elif value in NAMED_OPTIONS[name]:
+            options[OPTION_FIELDS[name]] = NAMED_OPTIONS[name][value]
         else:
-            raise ValueError(f"dw_taps is one of {', '.join(DW_TAPS)}, not {value!r}")
+            raise ValueError(
+                f"{name} is one of {', '.join(NAMED_OPTIONS[name])}, not {value!r}"
+            )
     return ",".join(kept), options
 
 
@@ -192,7 +218,8 @@ def make_network(
     and in `train_dtype` in training (mixed precision, see AZResnetConfig). With `remat`,
     training computes each block's activations again in the backward pass instead of
     keeping them. Othello's depthwise filter taps are named in the spec as dw_taps=NAME (see
-    DW_TAPS)."""
+    DW_TAPS), and a value head that predicts the final margin as outcomes=margin (see
+    OUTCOMES)."""
     net, options = network_options(net)
     config = network_config(
         net,

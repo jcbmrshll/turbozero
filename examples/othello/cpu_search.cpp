@@ -1479,6 +1479,14 @@ int net_set_depthwise(net::Net* n, int block, int taps, const int* at, const flo
 // The policy's last 1x1 convolution, `square_w` (head_channels).
 void net_set_heads(net::Net* n, const float* square_w) { n->square_w.assign(square_w, square_w + n->head_channels); }
 
+// A value head over a game's final scores: `weights`, (count), each score's value, value_out's
+// `count` outputs its logits (see `Net::value_weights`); count 0 for a value through tanh.
+int net_set_value_weights(net::Net* n, int count, const float* weights) {
+    if (count < 0 || count > net::MAX_OUTCOMES || (count && count != n->value_out.out)) return -1;
+    n->value_weights.assign(weights, weights + count);
+    return 0;
+}
+
 // `count` positions, (count, 2, 8, 8), to (count, 65) logits and (count) values, split over `threads`.
 void net_forward(const net::Net* n, int count, const float* obs, float* logits, float* values, int threads) {
     auto part = [&](int t) {
