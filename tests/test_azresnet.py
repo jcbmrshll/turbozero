@@ -12,12 +12,14 @@ from core.networks.azresnet import (
     Depthwise,
     FixedScale,
     GroupNorm,
+    Norm,
     PreActConvNeXt,
     ResidualBlock,
     batch_norm,
     conv,
     conv_norm,
     inference_affine,
+    norm_act,
     norm_maker,
     residual_stats,
     square_taps,
@@ -311,6 +313,31 @@ PRE_VARIANTS = {
         "pool_channels": 2,
         "layout": "pre",
     },
+}
+
+
+class NormedFilter(eqx.Module):
+    """A ConvNeXt block's step between squares for the tests of `AZResnetConfig.mixer`: a
+    depthwise filter, then a normalization of its own (with state, for BatchNorm)."""
+
+    dw: Depthwise
+    norm: Norm
+
+    def __init__(self, channels: int, *, key, make_norm, stats):
+        self.dw = Depthwise(channels, square_taps(3), key=key)
+        self.norm = make_norm(channels, stats, 3)
+
+    @property
+    def kernel_size(self) -> int:
+        return 3
+
+    def __call__(self, x, state, dtype):
+        return norm_act(self.norm, self.dw(x, dtype), state, dtype, relu=False)
+
+
+PRE_VARIANTS["mixed convnext"] = {
+    **PRE_VARIANTS["normalized convnext"],
+    "mixer": NormedFilter,
 }
 
 
@@ -622,7 +649,8 @@ def test_convnext_blocks_take_their_taps_from_the_config():
     for options, expected in [({"dw_taps": taps}, taps), ({}, square_taps(3))]:
         net, _ = make_variant("convnext", **options)
         for block in net.blocks:
-            assert isinstance(block, PreActConvNeXt) and block.dw.taps == expected
+            assert isinstance(block, PreActConvNeXt)
+            assert isinstance(block.dw, Depthwise) and block.dw.taps == expected
 
 
 def test_normalizations_are_options_of_the_layouts_and_blocks_that_have_them():
@@ -727,3 +755,14 @@ def test_a_convnext_trunk_is_normalized_after_every_convolution_by_default():
     # other pre-activation trunks start from the stem as it is
     plain, _ = make_variant("global pooling", layout="pre")
     assert plain.stem_norm is None
+
+
+def test_the_mixer_takes_the_depthwise_filters_place():
+    net, _ = make_variant("mixed convnext")
+    for block in net.blocks:
+        assert isinstance(block, PreActConvNeXt) and isinstance(block.dw, NormedFilter)
+
+
+def test_the_mixer_belongs_to_convnext_blocks():
+    with pytest.raises(ValueError, match="convnext"):
+        make_variant("global pooling", mixer=NormedFilter)

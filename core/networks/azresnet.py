@@ -2,7 +2,7 @@ import functools
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Protocol
 
 import equinox as eqx
 import jax
@@ -52,6 +52,9 @@ class AZResnetConfig:
         dw_taps: the depthwise filters' taps instead, as (row, column) offsets from the square
             filtered (see `Depthwise`): a sparse filter of long reach, e.g. along chosen lines.
             Not settable in a spec: an application names its own sets and passes them in
+        mixer: the ConvNeXt blocks' step between squares instead of a depthwise filter: makes one,
+            as mixer(channels, key=, make_norm=, stats=) (see `Mixer`). Not settable in a spec:
+            an application passes its own in
         pool_every: every `pool_every`-th basic block (counting those inside bottleneck blocks) has
             KataGo's global pooling bias: `pool_channels` of its first convolution's channels are
             pooled over the board (mean and max), and a linear map of them biases the others, which
@@ -121,6 +124,7 @@ class AZResnetConfig:
     project_norm: bool | None = None
     dw_kernel: int = 7
     dw_taps: tuple[tuple[int, int], ...] | None = None
+    mixer: Callable[..., "Mixer"] | None = None
     pool_every: int = 0
     pool_channels: int = 32
     heads: Literal["alphazero", "pooled"] = "alphazero"
@@ -699,6 +703,19 @@ def tap_index(taps: tuple[tuple[int, int], ...], height: int, width: int) -> np.
     return index
 
 
+class Mixer(Protocol):
+    """A ConvNeXt block's step between squares in place of its depthwise filter, an equinox module
+    an application supplies (see `AZResnetConfig.mixer`). `kernel_size` is the reach its
+    normalization's initialization counts as a filter's size (see `norm_maker`)."""
+
+    @property
+    def kernel_size(self) -> int: ...
+
+    def __call__(
+        self, x: jax.Array, state: eqx.nn.State, dtype: jnp.dtype
+    ) -> tuple[jax.Array, eqx.nn.State]: ...
+
+
 class PreActConvNeXt(eqx.Module):
     """ConvNeXt's block: x + project(relu(expand(norm(depthwise(x))))), a depthwise filter of the
     trunk itself (see `Depthwise`), one normalization, then a per-square MLP of 1x1 convolutions
@@ -706,9 +723,10 @@ class PreActConvNeXt(eqx.Module):
     features, pooled over the board, bias the hidden channels. project starts at zero (see
     `zeroed`). Optionally normalized after expand and after project too, `expand_norm` and
     `project_norm`: x + project_norm(project(relu(expand_norm(expand(y)) + pool bias))),
-    project_norm's scale then starting at zero instead (see `zero_scale`)."""
+    project_norm's scale then starting at zero instead (see `zero_scale`). An application's own
+    step between squares may stand in for the depthwise filter (`mixer`)."""
 
-    dw: Depthwise
+    dw: Depthwise | Mixer
     norm: Norm
     expand: eqx.nn.Conv2d
     expand_norm: Norm | None
@@ -729,6 +747,7 @@ class PreActConvNeXt(eqx.Module):
         stats: Stats,
         expand_norm: bool = False,
         project_norm: bool = False,
+        mixer: Mixer | None = None,
     ):
         """
         Args:
@@ -742,9 +761,10 @@ class PreActConvNeXt(eqx.Module):
             stats: unused: the normalizations need none
             expand_norm: normalize the hidden channels before their ReLU
             project_norm: normalize the output, its scale starting at zero
+            mixer: the step between squares, in place of a depthwise filter of `taps`
         """
         keys = jax.random.split(key, 4)
-        self.dw = Depthwise(channels, taps, key=keys[0])
+        self.dw = Depthwise(channels, taps, key=keys[0]) if mixer is None else mixer
         self.norm = make_norm(channels, stats, self.dw.kernel_size)
         self.expand = conv(channels, hidden, 1, keys[1])
         self.expand_norm = make_norm(hidden, stats, 1) if expand_norm else None
@@ -763,7 +783,10 @@ class PreActConvNeXt(eqx.Module):
     def __call__(
         self, x: jax.Array, state: eqx.nn.State, dtype: jnp.dtype
     ) -> tuple[jax.Array, eqx.nn.State]:
-        y = self.dw(x, dtype)
+        if isinstance(self.dw, Depthwise):
+            y = self.dw(x, dtype)
+        else:
+            y, state = self.dw(x, state, dtype)
         y, state = norm_act(self.norm, y, state, dtype, relu=False)
         if self.expand_norm is None:
             h = convolve(self.expand, y, dtype)
@@ -965,6 +988,8 @@ class AZResnet(eqx.Module):
             raise ValueError(
                 'expand_norm and project_norm are block="convnext"\'s options'
             )
+        if config.mixer is not None and not convnext:
+            raise ValueError('mixer is block="convnext"\'s option')
         self.stem_conv = conv(in_channels, channels, 3, stem_key)
         self.stem_norm = (
             make_norm(channels, INPUT_STATS, 3) if stem_norm or not pre else None
@@ -998,6 +1023,14 @@ class AZResnet(eqx.Module):
                     stats=block_stats,
                     expand_norm=expand_norm,
                     project_norm=project_norm,
+                    mixer=None
+                    if config.mixer is None
+                    else config.mixer(
+                        channels,
+                        key=jax.random.fold_in(k, 2),
+                        make_norm=make_norm,
+                        stats=block_stats,
+                    ),
                 )
                 for pool, k, block_stats in zip(
                     pool_channels, block_keys, stats[:-1], strict=True

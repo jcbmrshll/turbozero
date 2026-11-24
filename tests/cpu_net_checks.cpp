@@ -459,7 +459,7 @@ static void check_depthwise() {
             expect(d.rays == (T == 57), "depthwise rays", T);
             std::vector<float> x((size_t)SQUARES * C), got((size_t)SQUARES * C), pooled(2 * P);
             for (auto& v : x) v = any_float();
-            depthwise(d, x.data(), C, P, pooled.data(), [&](int sq, int ch, F v) { Lanes::store(got.data() + (size_t)sq * C + ch, v); });
+            mix(d, x.data(), nullptr, C, P, pooled.data(), [&](int sq, int ch, F v) { Lanes::store(got.data() + (size_t)sq * C + ch, v); });
             std::vector<float> sum(P, 0.0f), top(P, -INFINITY);
             for (int sq = 0; sq < SQUARES; sq++)
                 for (int ch = 0; ch < C; ch++) {

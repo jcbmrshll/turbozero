@@ -1412,6 +1412,7 @@ int net_set_stem(net::Net* n, int cout, const int16_t* q, const float* scale, co
     net::stem_table(c, q);
     c.scale.assign(scale, scale + cout);
     c.bias.assign(bias, bias + cout);
+    net::fold_disc_gates(*n);
     return 0;
 }
 
@@ -1473,6 +1474,22 @@ int net_set_depthwise(net::Net* n, int block, int taps, const int* at, const flo
     b.dw.w.assign(w, w + (size_t)taps * n->channels);
     b.dw.bias.assign(bias, bias + n->channels);
     net::prepare(b.dw);
+    return 0;
+}
+
+// Makes block `block` ConvNeXt's with a gated scan in place of its depthwise filter (see
+// `net::Depthwise::scan`): `length` steps along each of the 8 directions, `gates` gate channels;
+// `w`, (channels, 1 + 8 length), its BatchNorm's scale folded in, `bias`, (channels), its offset;
+// `gate_w`, (gates, channels), and `gate_b`, (gates), the gates' 1x1 convolution with their
+// BatchNorm and offset folded in.
+int net_set_scan(net::Net* n, int block, int length, int gates, const float* w, const float* bias, const float* gate_w,
+                 const float* gate_b) {
+    const bool power = gates == 1 || gates == 2 || gates == 4 || gates == 8 || gates == 16;
+    if (!n->pre || !net::scan_length_compiled(length) || !power || n->channels % gates || n->channels / gates < 4) return -1;
+    net::Block& b = n->blocks.at(block);
+    b.convnext = true;
+    net::prepare_scan(b.dw, n->channels, length, gates, w, bias, gate_w, gate_b);
+    net::fold_disc_gates(*n);
     return 0;
 }
 

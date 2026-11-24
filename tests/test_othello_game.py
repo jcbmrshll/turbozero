@@ -22,6 +22,7 @@ from game import (
     make_optimizer,
     weight_decay_mask,
 )
+from gated_scan import GatedScan
 
 from core.memory.replay_memory import BaseExperience
 from core.networks.azresnet import AZResnet, Depthwise, PreActConvNeXt
@@ -200,7 +201,8 @@ def test_a_spec_names_the_ray_taps():
     network, state = make_network(RAY_NET)
     assert isinstance(network, AZResnet)
     for block in network.blocks:
-        assert isinstance(block, PreActConvNeXt) and block.dw.taps == RAY_TAPS
+        assert isinstance(block, PreActConvNeXt)
+        assert isinstance(block.dw, Depthwise) and block.dw.taps == RAY_TAPS
     obs = jnp.zeros((3, 8, 8, 2), bool)
     (policy, value), _ = jax.vmap(lambda o: network(o, state), axis_name="batch")(obs)
     assert policy.shape == (3, 65) and value.shape == (3, 1)
@@ -258,3 +260,18 @@ def test_a_symmetry_of_a_ray_filter_is_a_ray_filter(quarter_turns, transpose):
         image(np.asarray(dw(jnp.asarray(x), f32))),
         atol=1e-5,
     )
+
+
+def test_a_spec_names_the_gated_scan_along_the_rays():
+    network, state = make_network(
+        RAY_NET.replace("dw_taps=rays", "scan=rays,scan_length=4,scan_gates=2")
+    )
+    assert isinstance(network, AZResnet)
+    for block in network.blocks:
+        assert isinstance(block, PreActConvNeXt) and isinstance(block.dw, GatedScan)
+        assert block.dw.length == 4 and block.dw.gate_offset.shape == (2,)
+    obs = jnp.zeros((3, 8, 8, 2), bool)
+    (policy, value), _ = jax.vmap(lambda o: network(o, state), axis_name="batch")(obs)
+    assert policy.shape == (3, 65) and value.shape == (3, 1)
+    with pytest.raises(ValueError, match="scan=rays"):
+        make_network(RAY_NET + ",scan_gates=2")

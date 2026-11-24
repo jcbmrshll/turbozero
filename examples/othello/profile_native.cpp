@@ -101,8 +101,9 @@ Linear make_linear(int in, int out) {
 }
 
 // a ConvNeXt block of Othello's ray filters (57 taps: the row, the column and both diagonals, 7
-// squares each way), expand 2; with a pooling bias from `pool_channels` if `pooled`
-Block make_ray_block(int channels, bool pooled, int pool_channels) {
+// squares each way), expand 2; with a pooling bias from `pool_channels` if `pooled`; with
+// `scan_length`, a gated scan of that many steps and `scan_gates` gate channels instead
+Block make_ray_block(int channels, bool pooled, int pool_channels, int scan_length = 0, int scan_gates = 8) {
     Block b;
     b.convnext = true;
     for (int dy = -7; dy <= 7; dy++)
@@ -130,6 +131,16 @@ Block make_ray_block(int channels, bool pooled, int pool_channels) {
         pack1x1(c, q.data(), cin < cout);
         return c;
     };
+    if (scan_length) {
+        // a gated scan in place of the rays' filter
+        const int T = 1 + 8 * scan_length;
+        std::vector<float> w((size_t)channels * T), bias(channels), gate_w((size_t)scan_gates * channels), gate_b(scan_gates);
+        for (auto& v : w) v = 0.1f * normal();
+        for (auto& v : bias) v = 0.1f * normal();
+        for (auto& v : gate_w) v = normal() / std::sqrt((float)channels);
+        for (auto& v : gate_b) v = 2 + 0.1f * normal();
+        prepare_scan(b.dw, channels, scan_length, scan_gates, w.data(), bias.data(), gate_w.data(), gate_b.data());
+    }
     b.expand = conv1x1(channels, 2 * channels, 128);
     b.project = conv1x1(2 * channels, channels, 0);
     if (pooled) {
@@ -142,7 +153,7 @@ Block make_ray_block(int channels, bool pooled, int pool_channels) {
 // as `core.networks.azresnet` builds a ResNet of pooled heads, pool_every=2; with `ray`, of
 // ConvNeXt blocks (`make_ray_block`), pre layout
 Net make_net(int blocks, int channels, bool pre, int norm, int pool_channels, int head_channels, int hidden,
-             bool ray = false) {
+             bool ray = false, int scan_length = 0, int scan_gates = 8, int scan_every = 1) {
     Net n;
     n.channels = channels;
     n.pre = pre;
@@ -157,7 +168,8 @@ Net make_net(int blocks, int channels, bool pre, int norm, int pool_channels, in
         // a pooling bias's block: its second convolution takes the channels not pooled
         const bool pooled = (i + 1) % 2 == 0;
         if (ray) {
-            n.blocks.push_back(make_ray_block(channels, pooled, pool_channels));
+            const bool scan = scan_length && (i + 1) % scan_every == 0;
+            n.blocks.push_back(make_ray_block(channels, pooled, pool_channels, scan ? scan_length : 0, scan_gates));
             continue;
         }
         b.conv1 = make_conv(channels, channels, 3, pre ? 0 : 0);
@@ -189,12 +201,24 @@ int main(int argc, char** argv) {
         return 2;
     }
     int blocks = std::atoi(argv[1]), channels = std::atoi(argv[2]);
-    const bool ray = std::string(argv[3]) == "ray";
+    // "scan" or "scan:GATES:LENGTH:EVERY": ray blocks with gated scans (8 gates, 7 steps, in every
+    // block by default; EVERY 2 puts them in every second block, the others the rays' filter)
+    const std::string kind = argv[3];
+    int scan_gates = 8, scan_length = 0, scan_every = 1;
+    if (kind.rfind("scan", 0) == 0) {
+        scan_length = 7;
+        std::sscanf(kind.c_str(), "scan:%d:%d:%d", &scan_gates, &scan_length, &scan_every);
+    }
+    if (scan_length && !scan_length_compiled(scan_length)) {
+        std::fprintf(stderr, "no gated scan of length %d compiled\n", scan_length);
+        return 2;
+    }
+    const bool ray = kind == "ray" || scan_length;
     bool pre = ray || std::string(argv[3]) == "pre";
     int norm = std::string(argv[4]) == "channel" ? NORM_CHANNEL : NORM_AFFINE;
     int rounds = argc > 5 ? std::atoi(argv[5]) : 15;
     int hidden = argc > 6 ? std::atoi(argv[6]) : 256;
-    Net n = make_net(blocks, channels, pre, norm, channels >= 96 ? 32 : 16, 32, hidden, ray);
+    Net n = make_net(blocks, channels, pre, norm, channels >= 96 ? 32 : 16, 32, hidden, ray, scan_length, scan_gates, scan_every);
     Scratch s(n);
     // positions of random discs, the same every run
     const int P = 1024;
@@ -231,7 +255,7 @@ int main(int argc, char** argv) {
     double ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count();
     double per_ns = (profile::now() - c0) / ns;
     std::printf("{\"shape\": \"%dx%d%s\", \"pre\": %d, \"norm\": \"%s\", \"ns\": %.1f, \"min_ns\": %.1f, \"marked_ns\": %.1f, \"stages\": {",
-                blocks, channels, ray ? " ray" : "", (int)pre, argv[4], times[times.size() / 2], times[0], ns / marked);
+                blocks, channels, scan_length ? (" " + kind).c_str() : ray ? " ray" : "", (int)pre, argv[4], times[times.size() / 2], times[0], ns / marked);
     for (size_t i = 0; i < profile::names.size(); i++)
         std::printf("%s\"%s\": %.1f", i ? ", " : "", profile::names[i].c_str(), profile::ticks[i] / per_ns / marked);
     std::printf("}, \"check\": %g}\n", (double)check);

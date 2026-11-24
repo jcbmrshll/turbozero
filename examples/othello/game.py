@@ -12,6 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pgx
+from gated_scan import DIRECTIONS, scan_mixer
 
 from core.evaluators.alphazero import AlphaZero
 from core.evaluators.mcts.action_selection import PUCTSelector
@@ -163,17 +164,31 @@ DW_TAPS = {"rays": RAY_TAPS}
 
 
 def network_options(net: str) -> tuple[str, dict]:
-    """`net` without its setting of taps by name (see DW_TAPS), and that setting as a
-    configuration option."""
-    kept, options = [], {}
+    """`net` without its Othello settings, and those settings as configuration options: the
+    depthwise filters' taps by name, dw_taps=rays (see DW_TAPS), and the gated scan along the rays
+    in their place, scan=rays, with its scan_length=STEPS (7) and scan_gates=CHANNELS (8) (see
+    `gated_scan.GatedScan`)."""
+    kept, options, scan = [], {}, {}
     for setting in net.split(","):
         name, _, value = setting.partition("=")
-        if name != "dw_taps":
-            kept.append(setting)
-        elif value in DW_TAPS:
+        if name == "dw_taps":
+            if value not in DW_TAPS:
+                raise ValueError(
+                    f"dw_taps is one of {', '.join(DW_TAPS)}, not {value!r}"
+                )
             options["dw_taps"] = DW_TAPS[value]
+        elif name == "scan":
+            if value != "rays":
+                raise ValueError(f"scan is rays, not {value!r}")
+            scan["steps"] = DIRECTIONS
+        elif name in ("scan_length", "scan_gates"):
+            scan[name.removeprefix("scan_")] = int(value)
         else:
-            raise ValueError(f"dw_taps is one of {', '.join(DW_TAPS)}, not {value!r}")
+            kept.append(setting)
+    if scan:
+        if "steps" not in scan:
+            raise ValueError("scan_length and scan_gates are scan=rays's options")
+        options["mixer"] = scan_mixer(**scan)
     return ",".join(kept), options
 
 
@@ -191,8 +206,7 @@ def make_network(
     state). It computes in `inference_dtype` when it isn't training, e.g. in self-play,
     and in `train_dtype` in training (mixed precision, see AZResnetConfig). With `remat`,
     training computes each block's activations again in the backward pass instead of
-    keeping them. Othello's depthwise filter taps are named in the spec as dw_taps=NAME (see
-    DW_TAPS)."""
+    keeping them. Othello's own settings in the spec are `network_options`'."""
     net, options = network_options(net)
     config = network_config(
         net,
