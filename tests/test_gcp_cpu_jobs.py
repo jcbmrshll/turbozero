@@ -100,6 +100,9 @@ class FakeCloud:
     def delete(self, names):
         self.deleted += [name for name, _ in names]
 
+    def close(self):
+        self.closed = True
+
 
 def watch(store, cloud, spec, out, attempts=3):
     return gcp_cpu_jobs.watch(

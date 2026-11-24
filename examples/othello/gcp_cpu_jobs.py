@@ -160,6 +160,7 @@ class Cloud(Protocol):
     ) -> str | None: ...
     def instances(self, job: str | None) -> list[dict[str, str]]: ...
     def delete(self, names: list[tuple[str, str]]) -> None: ...
+    def close(self) -> None: ...
 
 
 class Gcloud:
@@ -233,6 +234,9 @@ class Gcloud:
         for zone in {zone for _, zone in names}:
             here = [name for name, z in names if z == zone]
             self._run("compute", "instances", "delete", *here, f"--zone={zone}")
+
+    def close(self) -> None:
+        """Nothing to do: each VM is its own, and deleted."""
 
 
 def split_jobs(
@@ -505,6 +509,7 @@ def launch(
         if left:
             cloud.delete([(vm["name"], vm["zone"]) for vm in left])
             print(f"deleted {', '.join(vm['name'] for vm in left)}")
+        cloud.close()
     print(json.dumps(outcome))
     for slot, how in outcome.items():
         log = (
