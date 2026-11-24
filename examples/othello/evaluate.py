@@ -5,6 +5,8 @@ kept in one store (`core.evals.store`, in ~/.cache/turbozero/othello/evals/evals
         --b edax:level=24 --openings 50 --solve-at 24 --cores 16-23
     uv run examples/othello/evaluate.py run --a net:net=NAME,clock=10,engine=1,backend=native \\
         --b edax:clock=10 --openings 50 --on gcp --jobs 4
+    uv run examples/othello/evaluate.py run --a net:net=NAME,clock=30,engine=1,backend=native \\
+        --b neural-reversi:clock=30,threads=8 --openings 150 --solve-at 28 --on modal
     uv run --extra cuda examples/othello/evaluate.py run \\
         --a net:net=NAME,device=gpu-batched,visits=1000 --b edax:level=20 --openings 256
     uv run examples/othello/evaluate.py run --config match.toml
@@ -29,7 +31,8 @@ Where (`--on`):
 - `modal`: Modal containers, `--gpu CPU` or a GPU, `--modal-cpu` cores each, on CPUs meeting
   `--modal-cpu-model`: by default any with AVX-512 and VNNI (a mix of models that changes from
   hour to hour, each game recording its own), or one model; a container on another CPU is
-  swapped for a new one. Not the GCP VMs' CPU: a clock there is its own condition
+  swapped for a new one. A host for every 10 games unless `--jobs` says. Not the GCP VMs' CPU:
+  a clock there is its own condition
 
 Cloud hosts write their games to the bucket as they go, and they're brought into the store while
 the match runs; `sync MATCH` brings in what's there later. Every game records its moves, each
@@ -101,6 +104,13 @@ SYNC_SECONDS = 60.0
 BUSY_TO_START = 0.15
 QUIET_SECONDS = 15.0
 LEAGUE_TIMINGS = CACHE_DIR / "league" / "timings.json"
+# a Modal host's share of a match by default: each container costs about a minute before its
+# first game (code, inputs, the native build) and a few tries to land on a CPU that fits, so a
+# host that has one keeps it for a while; 30 hosts a 300-game match
+MODAL_GAMES_PER_HOST = 10
+# a cloud host's time limit by default, in hours: a GCP VM's, and a Modal container's (ten 30 s
+# games take about 10 minutes)
+HOURS = {"gcp": 2.0, "modal": 0.5}
 
 
 def parse_cores(text: str) -> list[int]:
@@ -122,7 +132,7 @@ def placement_of(args: argparse.Namespace) -> tuple[str, int]:
     """Where the games are played, and the cores a player has by default there."""
     if args.on == "local":
         # each job's share of the cores
-        return "local", max(len(os.sched_getaffinity(0)) // args.jobs, 1)
+        return "local", max(len(os.sched_getaffinity(0)) // (args.jobs or 1), 1)
     if args.on == "gcp":
         # one thread a core: half the machine's vCPUs (gcp_cpu_jobs.machine_options)
         return f"gcp:{args.machine}", int(args.machine.split("-")[-1]) // 2
@@ -213,7 +223,7 @@ def run(args: argparse.Namespace) -> None:
             )
     store = Store(args.store)
     register(store, spec, placement, setup.get("note", ""))
-    if args.on == "local" and args.jobs > 1:
+    if args.on == "local" and (args.jobs or 1) > 1:
         play_here_in_jobs(store, spec, match_id, args.jobs, args.store)
     elif args.on == "local":
         play_here(store, spec, match_id, args.parallel)
@@ -406,6 +416,14 @@ def sync_bucket(store: Store, bucket: Any, match_id: str) -> int:
     return sync_lines(store, lines)
 
 
+def cloud_hosts(args: argparse.Namespace, left: int) -> int:
+    """How many hosts play a cloud match's `left` games: `--jobs`, else on Modal one every
+    `MODAL_GAMES_PER_HOST`, else one."""
+    if args.jobs:
+        return args.jobs
+    return math.ceil(left / MODAL_GAMES_PER_HOST) if args.on == "modal" else 1
+
+
 def play_in_cloud(
     store: Store,
     spec: MatchSpec,
@@ -424,7 +442,8 @@ def play_in_cloud(
     # a match's jobs, continued as they were when run again, unless asked for new ones for
     # what's left (e.g. after a job failed): the store keeps a game once whichever ran it
     name = match_id if not args.fresh_jobs else f"{match_id}-r{int(time.time())}"
-    jobs = cloud_jobs(spec, match_id, placement, args.jobs, done, args.parallel)
+    hosts = cloud_hosts(args, spec.games - len(done))
+    jobs = cloud_jobs(spec, match_id, placement, hosts, done, args.parallel)
     if args.on == "gcp":
         cloud: Any = Gcloud(project(), args.machine)
     else:
@@ -451,8 +470,8 @@ def play_in_cloud(
             name,
             jobs,
             CACHE_DIR / "evals" / "cloud" / f"{name}.jsonl",
-            vms=args.jobs,
-            hours=args.hours,
+            vms=hosts,
+            hours=args.hours or HOURS[args.on],
             attempts=args.attempts,
             files=job_files(spec),
             machine=args.machine,
@@ -911,10 +930,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--jobs",
         type=int,
-        default=1,
-        help="processes here (each on a share of the cores), or cloud hosts: each a share",
+        default=None,
+        help="processes here (each on a share of the cores), or cloud hosts, each a share: by "
+        f"default 1, or on Modal a host every {MODAL_GAMES_PER_HOST} games left",
     )
-    p.add_argument("--hours", type=float, default=2.0, help="a cloud host's limit")
+    p.add_argument(
+        "--hours",
+        type=float,
+        default=None,
+        help="a cloud host's limit: by default "
+        + ", ".join(f"{h} on {on}" for on, h in HOURS.items()),
+    )
     p.add_argument("--attempts", type=int, default=3, help="hosts a job may start")
     p.add_argument("--machine", default="n4d-highcpu-16", help="a GCP machine type")
     p.add_argument("--gpu", default="CPU", help="Modal's GPU, or CPU")

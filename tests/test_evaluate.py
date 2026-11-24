@@ -551,6 +551,16 @@ def test_a_modal_match_is_placed_on_its_cpu_model():
     assert evaluate.placement_of(args) == ("modal:CPU:8c", 8)
 
 
+def test_a_modal_match_has_a_host_every_ten_games_left_unless_told():
+    parse = evaluate.build_parser().parse_args
+    assert evaluate.cloud_hosts(parse(["run", "--on", "modal"]), 300) == 30
+    assert evaluate.cloud_hosts(parse(["run", "--on", "modal"]), 41) == 5
+    assert (
+        evaluate.cloud_hosts(parse(["run", "--on", "modal", "--jobs", "75"]), 300) == 75
+    )
+    assert evaluate.cloud_hosts(parse(["run", "--on", "gcp"]), 300) == 1
+
+
 # --- the CLI ---------------------------------------------------------------------------------
 
 
