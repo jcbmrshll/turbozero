@@ -1,4 +1,5 @@
 from collections.abc import Callable, Sequence
+from typing import Any
 
 import equinox as eqx
 import jax
@@ -11,7 +12,7 @@ BATCH_AXIS = "batch"
 
 def apply_nn(
     nn: Callable, nn_state: eqx.nn.State | None, x: jax.Array
-) -> tuple[tuple[jax.Array, jax.Array], eqx.nn.State | None]:
+) -> tuple[tuple[Any, ...], eqx.nn.State | None]:
     """Applies a neural network to a batch of inputs.
 
     As is the convention in equinox, networks act on a single (unbatched) input:
@@ -25,8 +26,9 @@ def apply_nn(
         x: batch of inputs
 
     Returns:
-        Tuple[Tuple[jax.Array, jax.Array], Optional[eqx.nn.State]]: ((policy_logits, value), nn_state),
-            the batched outputs and the updated network state
+        Tuple[Tuple, Optional[eqx.nn.State]]: ((policy_logits, value), nn_state), the batched
+            outputs (whatever the network returns, e.g. more with `AZResnet`'s `train_outputs`)
+            and the updated network state
     """
     if nn_state is None:
         return jax.vmap(nn)(x), None

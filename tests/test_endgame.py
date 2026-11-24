@@ -462,3 +462,52 @@ def test_a_net_player_on_a_fixed_time_solves_only_what_fits():
     assert info["visits"] >= info["added"] > 0
     assert time.perf_counter() - start < 1.0
     assert move in b.legal()
+
+
+def final_margin(me: int, opp: int) -> int:
+    """A finished board's margin for `me`, the empty squares going to the one ahead."""
+    mine, theirs = int(me).bit_count(), int(opp).bit_count()
+    lead = mine - theirs
+    return lead + (64 - mine - theirs) * (lead > 0) - (64 - mine - theirs) * (lead < 0)
+
+
+def test_a_line_plays_each_solve_on_to_a_final_board_that_scores_it():
+    import endgame
+
+    positions = random_positions(list(range(6, 15)), 90, seed=7)
+    me = np.array([p[0] for p in positions], np.uint64)
+    opp = np.array([p[1] for p in positions], np.uint64)
+
+    margins, moves, final_me, final_opp = endgame.solve_lines(me, opp, threads=3)
+
+    want, want_moves = endgame.solve_batch(me, opp, threads=3)
+    np.testing.assert_array_equal(margins, want)
+    np.testing.assert_array_equal(moves, want_moves)
+    for m, o, fm, fo, margin in zip(me, opp, final_me, final_opp, margins):
+        # a finished game: neither side can move, no square held twice, every square held still held
+        assert not int(fm) & int(fo)
+        assert not endgame.LIB.endgame_moves(int(fm), int(fo))
+        assert not endgame.LIB.endgame_moves(int(fo), int(fm))
+        assert (int(m) | int(o)) & ~(int(fm) | int(fo)) == 0
+        assert final_margin(fm, fo) == margin
+
+
+def test_ownership_gives_the_empty_squares_to_the_one_ahead():
+    from exact_labels import ownership
+
+    # square 0 the mover's, 1 the opponent's, the rest empty; the mover ahead by 62
+    got = ownership(
+        np.array([1], np.uint64),
+        np.array([2], np.uint64),
+        np.array([62]),
+        np.array([1]),
+    )
+    assert got.shape == (1, 2, 64) and got.dtype == np.int8
+    np.testing.assert_array_equal(got[0, 1, :2], [1, -1])
+    np.testing.assert_array_equal(got[0, 1, 2:], 1)
+    np.testing.assert_array_equal(got[0, 0], -got[0, 1])
+    # level: the empty squares are no one's
+    level = ownership(
+        np.array([1], np.uint64), np.array([2], np.uint64), np.array([0]), np.array([0])
+    )
+    np.testing.assert_array_equal(level[0, 0, 2:], 0)

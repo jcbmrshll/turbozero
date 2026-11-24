@@ -57,7 +57,20 @@ def metadata(state) -> StepMetadata:
         cur_player_id=state.current_player,
         step=state._step_count,
         scores=scores(state),
+        ownership=ownership(state),
     )
+
+
+def ownership(state) -> jax.Array:
+    """(2, 64) each player's ownership of the squares, from its side: 1 its disc, -1 the other's,
+    an empty square the one ahead's (as the endgame solvers score a game; 0 when level), int8:
+    the final ownership, once the game has ended."""
+    discs = state.observation.reshape(64, 2).astype(jnp.int8)
+    lead = jnp.sign(discs[:, 0].sum(dtype=jnp.int32) - discs[:, 1].sum(dtype=jnp.int32))
+    empty = 1 - discs[:, 0] - discs[:, 1]
+    mine = discs[:, 0] - discs[:, 1] + empty * lead.astype(jnp.int8)
+    mover = (jnp.arange(2) == state.current_player)[:, None]
+    return jnp.where(mover, mine, -mine).astype(jnp.int8)
 
 
 def scores(state) -> jax.Array:
@@ -101,7 +114,7 @@ def make_symmetry_transform_fn(quarter_turns: int, transpose: bool):
     change under any of the board's 8 symmetries, so training draws one at random for each
     sample it takes from the replay buffer. The policy mask and weights are mapped to match
     the observation's board planes: only the first 64 actions are board squares, the 65th
-    (pass) stays where it is."""
+    (pass) stays where it is. So is the ownership target's square axis."""
     # idxs[r, c] is the square that ends up at (r, c)
     idxs = np.arange(64).reshape(8, 8)
     if transpose:
@@ -118,6 +131,9 @@ def make_symmetry_transform_fn(quarter_turns: int, transpose: bool):
             observation_nn=jnp.rot90(obs, quarter_turns, axes=(-3, -2)),
             policy_mask=experience.policy_mask[..., action_ids],
             policy_weights=experience.policy_weights[..., action_ids],
+            ownership=None
+            if experience.ownership is None
+            else experience.ownership[..., idxs.flatten()],
         )
 
     return transform_fn

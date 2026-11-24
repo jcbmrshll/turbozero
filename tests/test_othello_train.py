@@ -27,15 +27,16 @@ def fake_trainer(**kwargs):
 class FakeSolve:
     """A solve function solving nothing, recording whether it was asked for scores."""
 
-    def __init__(self, scores):
+    def __init__(self, scores, with_ownership):
         self.scores = scores
+        self.with_ownership = with_ownership
 
     def __call__(self, positions):
-        return np.zeros((len(positions.current_player), 2), np.float32)
+        return {"reward": np.zeros((len(positions.current_player), 2), np.float32)}
 
 
-def fake_solve_fn(solver, threads, scores=False):
-    return FakeSolve(scores)
+def fake_solve_fn(solver, threads, scores=False, with_ownership=False):
+    return FakeSolve(scores, with_ownership)
 
 
 def run_main(monkeypatch, *args):
@@ -68,6 +69,36 @@ def test_a_network_over_the_final_margin_trains_on_exactly_solved_margins(
     kwargs = built.value.kwargs
     assert kwargs["score_targets"] == outcomes
     assert kwargs["endgame_solve"].solve_fn.scores == outcomes
+
+
+@pytest.mark.parametrize("ownership", [False, True])
+def test_an_ownership_head_trains_on_final_boards_at_its_weight(monkeypatch, ownership):
+    net = "resnet:1x4,heads=pooled" + (",ownership=true" if ownership else "")
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, "--net", net, "--ownership-weight", "0.05")
+    kwargs = built.value.kwargs
+    assert kwargs["ownership_targets"] == ownership
+    assert kwargs["endgame_solve"].solve_fn.with_ownership == ownership
+    assert kwargs["loss_fn"].keywords["ownership_weight"] == 0.05
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ("--solve-empties", "off", "--resign"),
+        ("--tree-positions", "2"),
+        ("--solver", "edax"),
+        ("--grow", "resnet:2x4,heads=pooled", "--grow-switch-at", "3"),
+    ],
+)
+def test_an_ownership_head_refuses_what_has_no_final_board(
+    monkeypatch, capsys, options
+):
+    with pytest.raises(SystemExit):
+        run_main(
+            monkeypatch, "--net", "resnet:1x4,heads=pooled,ownership=true", *options
+        )
+    assert "ownership" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(

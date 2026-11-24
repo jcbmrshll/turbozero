@@ -23,6 +23,10 @@ class StepMetadata:
         scores: (optional) for a game decided by score, each player's final score once it has
             terminated (e.g. its disc margin): the value targets of a network that predicts the
             score (see `Trainer`'s `score_targets`)
+        ownership: (optional) for a game played on the network's input locations, (players,
+            locations) who owns each location once it has terminated, from each player's side (1
+            the player, -1 another, 0 no one): the targets of an ownership head (see `Trainer`'s
+            `ownership_targets`)
     """
 
     rewards: jax.Array
@@ -31,6 +35,7 @@ class StepMetadata:
     cur_player_id: jax.Array
     step: jax.Array
     scores: jax.Array | None = None
+    ownership: jax.Array | None = None
 
 
 @jax.tree_util.register_dataclass

@@ -153,17 +153,26 @@ class FixedLengthState:
 
 
 def make_fixed_length_env(
-    length, rewards=(1.0, -1.0), num_actions=2, action_mask=None, scores=None
+    length,
+    rewards=(1.0, -1.0),
+    num_actions=2,
+    action_mask=None,
+    scores=None,
+    ownership=None,
 ):
     """Two-player environment that terminates after exactly `length` steps, whatever the actions.
 
     Players alternate, starting with player 0. The legal actions are `action_mask`'s at every step
     (by default, every action), and the terminal step pays `rewards` (indexed by player id); every
     other step pays 0. With `scores`, the terminal step scores them (see `StepMetadata.scores`),
-    every other step 0.
+    every other step 0; with `ownership`, (players, locations), the terminal step's ownership (see
+    `StepMetadata.ownership`), every other step's 0.
     """
     rewards = jnp.asarray(rewards, dtype=jnp.float32)
     final_scores = None if scores is None else jnp.asarray(scores, dtype=jnp.float32)
+    final_ownership = (
+        None if ownership is None else jnp.asarray(ownership, dtype=jnp.int8)
+    )
     action_mask = (
         jnp.ones((num_actions,), dtype=jnp.bool_)
         if action_mask is None
@@ -181,6 +190,9 @@ def make_fixed_length_env(
             scores=None
             if final_scores is None
             else jnp.where(terminated, final_scores, 0.0),
+            ownership=None
+            if final_ownership is None
+            else jnp.where(terminated, final_ownership, 0).astype(jnp.int8),
         )
 
     def init_fn(key):  # pylint: disable=unused-argument

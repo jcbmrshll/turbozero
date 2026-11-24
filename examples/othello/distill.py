@@ -68,9 +68,11 @@ def load_positions(path: str) -> BaseExperience:
             return saved[f"collection_state.{index['.buffer_state' + name]}"]
 
         valid = leaf(".populated") & leaf(".has_reward")
+        # the fields the buffer stores: the optional ones (e.g. ownership) only if it has them
         fields: dict[str, Any] = {
             field.name: leaf(f".buffer.{field.name}")[valid]
             for field in dataclasses.fields(BaseExperience)
+            if f".buffer_state.buffer.{field.name}" in index
         }
         return BaseExperience(**fields)
 

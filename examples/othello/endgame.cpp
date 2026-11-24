@@ -783,6 +783,51 @@ void endgame_solve_batch(const uint64_t* me, const uint64_t* opp, int n, int thr
     for (auto& t : pool) t.join();
 }
 
+// As `endgame_solve_batch`, exact, and each position's game played on perfectly to its end: each move a
+// best one, found by solving the position it's played from in a window around its score, which the
+// position before it gave (cheap: the thread's table holds most of what the solve below it saw). The
+// final position into `final_me` and `final_opp`, from the side of the player to move at the start, its
+// score (empties to the winner) that position's.
+void endgame_solve_batch_lines(const uint64_t* me, const uint64_t* opp, int n, int threads, int table_bits,
+                               int8_t* scores, int8_t* moves, uint64_t* final_me, uint64_t* final_opp) {
+    std::atomic<int> next{0};
+    auto work = [&] {
+        Table table(table_bits, false);
+        std::atomic<bool> stop{false};
+        Context c;
+        c.table = &table;
+        c.stop = &stop;
+        for (int i = next++; i < n; i = next++) {
+            Result r = solve_root(c, me[i], opp[i], -INF, INF);
+            scores[i] = (int8_t)r.score;
+            moves[i] = (int8_t)r.move;
+            u64 P = me[i], O = opp[i];
+            bool mover = true;  // whether P is the starting player's discs
+            int score = r.score, move = r.move;
+            while (move != NO_MOVE) {
+                if (move != PASS) {
+                    u64 f = flips(move, P, O);
+                    u64 next_P = O ^ f;
+                    O = P ^ f ^ (1ULL << move);
+                    P = next_P;
+                } else {
+                    std::swap(P, O);
+                }
+                mover = !mover;
+                score = -score;
+                move = solve_root(c, P, O, score - 1, score + 1).move;
+            }
+            final_me[i] = mover ? P : O;
+            final_opp[i] = mover ? O : P;
+        }
+    };
+    threads = std::max(1, std::min(threads, n));
+    std::vector<std::thread> pool;
+    for (int t = 1; t < threads; t++) pool.emplace_back(work);
+    work();
+    for (auto& t : pool) t.join();
+}
+
 // The exact score of each legal move of the position, from the mover's side, into `out` (65): -128 for
 // those that aren't legal; a pass is 64, legal only with no other move. All -128 once the game's over.
 void endgame_move_scores(uint64_t me, uint64_t opp, int table_bits, int8_t* out) {

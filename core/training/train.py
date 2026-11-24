@@ -631,11 +631,11 @@ def solve_summary(solved: Sequence[Solved], waited: float) -> dict[str, jax.Arra
     """An epoch's metrics of exact endgame labels (see `Trainer.collection_metrics`), from its
     solves and the seconds self-play waited for them."""
     whole = np.concatenate(
-        [s.solves[s.whole] for s in solved if len(s.solves)] or [np.zeros((0, 0))]
+        [s.solves["reward"][s.whole] for s in solved if len(s)] or [np.zeros((0, 0))]
     )
     return {
         "solve_games": jnp.asarray(len(whole)),
-        "solve_positions": jnp.asarray(sum(len(s.solves) for s in solved)),
+        "solve_positions": jnp.asarray(sum(len(s) for s in solved)),
         "solve_seconds": jnp.asarray(sum(s.seconds for s in solved)),
         "solve_wait_seconds": jnp.asarray(waited),
         **(
@@ -697,6 +697,7 @@ class Trainer:
         resignation: Resignation | None = None,
         endgame_solve: EndgameSolve | None = None,
         score_targets: bool = False,
+        ownership_targets: bool = False,
         episode_metrics_fn: Callable[[jax.Array], dict[str, jax.Array]] | None = None,
         data_transform_fns: Sequence[DataTransformFn] = (),
         tree_positions: TreePositions | None = None,
@@ -798,6 +799,12 @@ class Trainer:
                 `core.networks.azresnet.AZResnetConfig.outcome_scores`); with `endgame_solve`,
                 its solver's results are the scores too. The environment must give its scores.
                 Not with `resignation` or `tree_positions`, whose targets aren't scores.
+            ownership_targets: the replay buffer also stores each game's final ownership
+                (`StepMetadata.ownership`), the targets of an ownership head (see
+                `core.networks.azresnet.AZResnetConfig.ownership`); with `endgame_solve`, its
+                solver gives the ownership of a game played perfectly from the position it
+                solves. The environment must give it. Not with `resignation` or
+                `tree_positions`, which have no final positions.
             episode_metrics_fn: (optional) metrics of a finished episode to track, from its final rewards (one per
                 player) to a dict of scalars, e.g. `lambda rewards: {"draw": (rewards == 0).all()}`. Each is logged
                 every epoch as `episode_<name>`, its mean over the episodes that terminated that epoch (truncated
@@ -980,6 +987,14 @@ class Trainer:
                 "targets aren't scores"
             )
         self.score_targets = score_targets
+        if ownership_targets and (
+            resignation is not None or tree_positions is not None
+        ):
+            raise ValueError(
+                "ownership_targets doesn't go with resignation or tree_positions: they have "
+                "no final positions"
+            )
+        self.ownership_targets = ownership_targets
         self.episode_metrics_fn = episode_metrics_fn
         if tree_positions is not None and not all(
             isinstance(e, MCTS) for _, e in self.collection_schedule.stages
@@ -1613,6 +1628,7 @@ class Trainer:
                 reward=jnp.empty_like(state.metadata.rewards),
                 cur_player_id=state.metadata.cur_player_id,
                 search_value=search_value,
+                ownership=self.empty_ownership(state.metadata),
             ),
             valid=stored,
         )
@@ -1653,9 +1669,14 @@ class Trainer:
             if final.scores is None:
                 raise ValueError("score_targets needs the environment's scores")
             targets = final.scores.astype(rewards.dtype)
+        ownership = None
+        if self.ownership_targets:
+            if final.ownership is None:
+                raise ValueError("ownership_targets needs the environment's ownership")
+            ownership = final.ownership
         buffer_state = where_tree(
             terminated,
-            self.memory_buffer.assign_rewards(buffer_state, targets),
+            self.memory_buffer.assign_rewards(buffer_state, targets, ownership),
             buffer_state,
         )
         # discard the episode's experiences if it hit the step limit without terminating
@@ -1917,7 +1938,10 @@ class Trainer:
 
     @partial(jax.jit, static_argnums=(0,), donate_argnames=("state",))
     def label_solved(
-        self, state: CollectionState, results: jax.Array, counts: jax.Array
+        self,
+        state: CollectionState,
+        results: dict[str, jax.Array],
+        counts: jax.Array,
     ) -> CollectionState:
         """Labels the games waiting for exact solves with their results (see `endgame_solve`):
         every stored position of each game gets its game's result, and training can sample it.
@@ -1925,8 +1949,8 @@ class Trainer:
 
         Args:
             state: collection state, donated (see `collect_steps`)
-            results: (environments, slots, players) the results, by slot, from
-                `EndgameSolve.solve`
+            results: the solves' targets, each (environments, slots, ...) by slot, from
+                `EndgameSolve.solve`: "reward", and with `ownership_targets` "ownership"
             counts: (environments,) how many of each environment's oldest waiting games to label
 
         Returns:
@@ -1936,19 +1960,21 @@ class Trainer:
         endgame_solve = self.endgame_solve
 
         def label(
-            state: CollectionState, results: jax.Array, count: jax.Array
+            state: CollectionState, results: dict[str, jax.Array], count: jax.Array
         ) -> CollectionState:
             assert state.pending is not None
-            pending, reward, populated, games = endgame_solve.label(
+            buffer = state.buffer_state.buffer
+            pending, targets, populated, games = endgame_solve.label(
                 state.pending,
-                state.buffer_state.buffer.reward,
+                {name: getattr(buffer, name) for name in results},
                 state.buffer_state.populated,
                 results,
                 count,
             )
             zeros = {name: jnp.zeros((), jnp.float32) for name in state.episode_metrics}
             # the metrics are of the games' results: with score targets, the scores' signs
-            rewards = jnp.sign(results) if self.score_targets else results
+            reward = results["reward"]
+            rewards = jnp.sign(reward) if self.score_targets else reward
             added = jax.vmap(lambda r, t: self.add_episode_metrics(zeros, r, t))(
                 rewards, games
             )
@@ -1957,7 +1983,7 @@ class Trainer:
                 pending=pending,
                 buffer_state=replace(
                     state.buffer_state,
-                    buffer=replace(state.buffer_state.buffer, reward=reward),
+                    buffer=replace(buffer, **targets),
                     populated=populated,
                 ),
                 episodes=state.episodes + games.sum(),
@@ -1973,10 +1999,16 @@ class Trainer:
         self, state: CollectionState, solved: Solved
     ) -> CollectionState:
         """`label_solved` with a solve's results, if it solved anything."""
-        if not len(solved.solves):
+        if not len(solved):
             return state
+        targets = ("reward", "ownership") if self.ownership_targets else ("reward",)
+        missing = [name for name in targets if name not in solved.results]
+        if missing:
+            raise ValueError(f"the endgame solver gave no {', '.join(missing)}")
         return self.label_solved(
-            state, jnp.asarray(solved.results), jnp.asarray(solved.counts)
+            state,
+            {name: jnp.asarray(solved.results[name]) for name in targets},
+            jnp.asarray(solved.counts),
         )
 
     def solve_waiting(self, pending: PendingSolves) -> Solved:
@@ -3713,7 +3745,17 @@ class Trainer:
             reward=jnp.zeros_like(metadata.rewards),
             cur_player_id=metadata.cur_player_id,
             search_value=jnp.zeros((), dtype=jnp.float32),
+            ownership=self.empty_ownership(metadata),
         )
+
+    def empty_ownership(self, metadata: StepMetadata) -> jax.Array | None:
+        """An experience's ownership before its game ends, for a buffer that stores it (see
+        `ownership_targets`): zeros, int8, as the environment's ownership is shaped."""
+        if not self.ownership_targets:
+            return None
+        if metadata.ownership is None:
+            raise ValueError("ownership_targets needs the environment's ownership")
+        return jnp.zeros(metadata.ownership.shape, jnp.int8)
 
     def init_eval_state(self, evaluator: Evaluator, batch_size: int) -> Any:
         """Initializes a self-play evaluator's states, one per environment.

@@ -24,6 +24,7 @@ from game import (
     make_network,
     make_optimizer,
     move_planes,
+    ownership,
     scores,
     weight_decay_mask,
 )
@@ -106,6 +107,7 @@ def test_symmetries_map_a_position_to_a_consistent_one():
         observation_nn=state.observation,
         cur_player_id=state.current_player,
         search_value=jnp.array(0.5),
+        ownership=ownership(state),
     )
     # a disc on each square in turn, and each square's action
     squares = np.eye(64, dtype=bool).reshape(64, 8, 8)
@@ -130,6 +132,16 @@ def test_symmetries_map_a_position_to_a_consistent_one():
             np.testing.assert_array_equal(
                 getattr(image, field), getattr(experience, field)
             )
+        # the ownership of the board's image is the image of its ownership
+        np.testing.assert_array_equal(
+            image.ownership,
+            ownership(
+                SimpleNamespace(
+                    observation=image.observation_nn,
+                    current_player=state.current_player,
+                )
+            ),
+        )
         # the square a disc moves to is the one whose action takes its square's
         moved = transform_fn(probes)
         to = np.asarray(moved.observation_nn[..., 0]).reshape(64, 64).argmax(axis=1)
@@ -311,8 +323,8 @@ def test_a_spec_names_a_value_head_over_the_final_margin():
     network = eqx.nn.inference_mode(network)
     obs = jnp.zeros((3, 8, 8, 2), bool)
     (_, value), _ = jax.vmap(lambda o: network(o, state), axis_name="batch")(obs)
-    (_, logits), _ = jax.vmap(
-        lambda o: network(o, state, outcome_logits=True), axis_name="batch"
+    (_, logits, _), _ = jax.vmap(
+        lambda o: network(o, state, train_outputs=True), axis_name="batch"
     )(obs)
     assert value.shape == (3, 1) and logits.shape == (3, 65)
     with pytest.raises(ValueError, match="margin"):
@@ -363,3 +375,34 @@ def test_a_spec_names_the_legal_move_planes():
     assert policy.shape == (3, 65) and value.shape == (3, 1)
     with pytest.raises(ValueError, match="moves"):
         make_network(RAY_NET + ",inputs=stability")
+
+
+@pytest.mark.parametrize(
+    "mover, opponent, current_player, lead",
+    [(30, 20, 0, 1), (20, 30, 1, -1), (32, 32, 0, 0), (40, 24, 1, 1)],
+)
+def test_ownership_is_each_players_discs_and_the_empty_squares_to_the_one_ahead(
+    mover, opponent, current_player, lead
+):
+    got = np.asarray(ownership(position(mover, opponent, current_player)))
+    assert got.shape == (2, 64) and got.dtype == np.int8
+    mine = got[current_player]
+    np.testing.assert_array_equal(mine[:mover], 1)
+    np.testing.assert_array_equal(mine[64 - opponent :], -1)
+    np.testing.assert_array_equal(mine[mover : 64 - opponent], lead)
+    np.testing.assert_array_equal(got[1 - current_player], -mine)
+    # it sums to the margin the scores give
+    np.testing.assert_array_equal(
+        got.sum(-1), scores(position(mover, opponent, current_player))
+    )
+
+
+def test_a_spec_names_an_ownership_head():
+    network, state = make_network("resnet:1x16,heads=pooled,ownership=true")
+    assert isinstance(network, AZResnet) and network.ownership
+    network = eqx.nn.inference_mode(network)
+    obs = jnp.zeros((3, 8, 8, 2), bool)
+    (_, _, aux), _ = jax.vmap(
+        lambda o: network(o, state, train_outputs=True), axis_name="batch"
+    )(obs)
+    assert aux["ownership"].shape == (3, 64)

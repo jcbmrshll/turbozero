@@ -15,6 +15,7 @@ def az_default_loss_fn(
     nn_state: eqx.nn.State | None,
     experience: BaseExperience,
     value_target_q: float = 0.0,
+    ownership_weight: float = 0.02,
 ) -> tuple[jax.Array, tuple[dict, eqx.nn.State | None]]:
     """Implements the default AlphaZero loss function.
 
@@ -34,6 +35,13 @@ def az_default_loss_fn(
     against the game's result (the score's sign), comparable to a network's that predicts the result
     directly, and `score_error` as the mean absolute error of its expected score.
 
+    A network with an ownership head (see `AZResnetConfig.ownership`) also trains it on the game's
+    final ownership, from the side of the player to move (the experience's `ownership`, see
+    `Trainer`'s `ownership_targets`), as KataGo does: `ownership_weight` times the sum over
+    locations of the cross-entropy of (1 + o) / 2 with (1 + tanh(x)) / 2, o the target and x the
+    head's output. KataGo's weight is 1.5 / b^2 on a board of side b. `ownership_loss` is logged
+    as that cross-entropy's mean over locations, unweighted.
+
     Args:
         nn: the neural network (an equinox module, see core.networks.utils.apply_nn), differentiated with respect to its floating point arrays
         nn_state: state of the neural network (e.g. BatchNorm statistics), None for stateless networks
@@ -41,6 +49,7 @@ def az_default_loss_fn(
             - stores the observation, target policy, target value
         value_target_q: weight of the search's value in the target value, from 0 (the outcome alone,
             the default) to 1 (the search's value alone)
+        ownership_weight: weight of the ownership head's loss, summed over locations
 
     Returns:
         Tuple[jax.Array, Tuple[dict, Optional[eqx.nn.State]]]: (loss, (aux_metrics, nn_state))
@@ -50,16 +59,24 @@ def az_default_loss_fn(
     """
 
     scores = getattr(nn, "outcome_scores", None)
+    ownership = getattr(nn, "ownership", False)
     if scores is not None and value_target_q:
         raise ValueError(
             "a network that predicts the score trains on the score alone: no value_target_q"
         )
-    # get predictions: the value head's logits over the scores, for a network that predicts them
-    (pred_policy, pred_value), nn_state = apply_nn(
-        nn if scores is None else partial(nn, outcome_logits=True),
-        nn_state,
-        experience.observation_nn,
-    )
+    if ownership and experience.ownership is None:
+        raise ValueError("an ownership head needs experiences with their ownership")
+    # get predictions; with heads training sees more of (the value head's logits over the scores,
+    # an ownership head), what it needs
+    aux = {}
+    if scores is None and not ownership:
+        (pred_policy, pred_value), nn_state = apply_nn(
+            nn, nn_state, experience.observation_nn
+        )
+    else:
+        (pred_policy, pred_value, aux), nn_state = apply_nn(
+            partial(nn, train_outputs=True), nn_state, experience.observation_nn
+        )
 
     # set invalid actions in policy to -inf
     pred_policy = jnp.where(
@@ -107,6 +124,19 @@ def az_default_loss_fn(
     target_entropy = (
         -jnp.where(targets > 0, targets * jnp.log(targets), 0.0).sum(-1).mean()
     )
+
+    if ownership:
+        assert experience.ownership is not None
+        # the player to move's ownership; (1 + tanh(x)) / 2 = sigmoid(2x)
+        target = experience.ownership[
+            jnp.arange(experience.ownership.shape[0]), current_player
+        ].astype(jnp.float32)
+        per_location = optax.sigmoid_binary_cross_entropy(
+            2 * aux["ownership"], (1 + target) / 2
+        )
+        ownership_loss = per_location.mean()
+        loss_value = loss_value + ownership_weight * per_location.sum(-1).mean()
+        metrics["ownership_loss"] = ownership_loss
 
     # total loss
     loss = policy_loss + loss_value

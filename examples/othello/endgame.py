@@ -74,6 +74,10 @@ def load_library() -> ctypes.CDLL:
             None,
             [pointer, pointer, c_int, c_int, c_int, c_int, pointer, pointer],
         ),
+        "endgame_solve_batch_lines": (
+            None,
+            [pointer, pointer, c_int, c_int, c_int] + [pointer] * 4,
+        ),
         "endgame_move_scores": (None, [u64, u64, c_int, pointer]),
         "endgame_moves": (u64, [u64, u64]),
         "endgame_moves_scalar": (u64, [u64, u64]),
@@ -125,6 +129,42 @@ def solve_batch(
         moves.ctypes.data,
     )
     return margins, moves
+
+
+def solve_lines(
+    me: np.ndarray,
+    opp: np.ndarray,
+    threads: int = 1,
+    table_bits: int = BATCH_TABLE_BITS,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """As `solve_batch`, exact, and each position's game played on to its end by best moves: returns
+    (margins, moves, final_me, final_opp), the last two the final position's discs (uint64) of the
+    player to move at the start and of the opponent. The final position's margin, empties to the
+    winner, is the position's."""
+    me = np.ascontiguousarray(me, np.uint64)
+    opp = np.ascontiguousarray(opp, np.uint64)
+    if me.shape != opp.shape or me.ndim != 1:
+        raise ValueError(
+            f"me {me.shape} and opp {opp.shape} must be the same 1-d shape"
+        )
+    if np.any(me & opp):
+        raise ValueError("a square has both players' discs")
+    margins = np.zeros(len(me), np.int8)
+    moves = np.zeros(len(me), np.int8)
+    final_me = np.zeros(len(me), np.uint64)
+    final_opp = np.zeros(len(me), np.uint64)
+    LIB.endgame_solve_batch_lines(
+        me.ctypes.data,
+        opp.ctypes.data,
+        len(me),
+        threads,
+        table_bits,
+        margins.ctypes.data,
+        moves.ctypes.data,
+        final_me.ctypes.data,
+        final_opp.ctypes.data,
+    )
+    return margins, moves, final_me, final_opp
 
 
 def move_margins(me: int, opp: int, table_bits: int = BATCH_TABLE_BITS) -> np.ndarray:
