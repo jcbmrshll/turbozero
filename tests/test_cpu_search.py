@@ -673,6 +673,7 @@ def test_export_matches_the_network(norm):
 def test_export_takes_a_gated_scan_along_any_lines():
     from cpu_search import openvino_eval, ort_eval, ort_session
     from export_onnx import to_onnx
+    from gated_scan import scan_mixer
 
     from core.networks.azresnet import AZResnetConfig
     from core.networks.spec import make_network
@@ -687,9 +688,7 @@ def test_export_takes_a_gated_scan_along_any_lines():
         layout="pre",
         heads="pooled",
         head_channels=4,
-        scan_steps=((1, 2), (-3, 0), (0, 1)),
-        scan_length=9,
-        scan_gates=2,
+        mixer=scan_mixer(((1, 2), (-3, 0), (0, 1)), length=9, gates=2),
     )
     model, state = perturbed(*make_network(config, (8, 8, 2), jax.random.PRNGKey(0)))
     x = (np.random.default_rng(0).random((5, 2, 8, 8)) < 0.3).astype(np.float32)
@@ -715,33 +714,6 @@ def test_a_gated_scans_bf16_stays_close_to_f32():
     f32_logits, f32_values = openvino_eval(graph, 1, "f32")(x)
     np.testing.assert_allclose(logits, f32_logits, atol=0.1)
     np.testing.assert_allclose(values, f32_values, atol=0.05)
-
-
-@pytest.mark.parametrize(
-    "setting, named",
-    [
-        ("dw_branches=rays", "BranchedDepthwise"),
-        ("dw_experts=2", "DynamicDepthwise"),
-        ("attention_last=1", "BoardAttention"),
-        ("position_bias=true", "position_bias"),
-        ("mlp_experts=2", "mlp_experts"),
-        ("scan=rays,position_bias=true", "position_bias"),
-        ("scan=rays,mlp_experts=2", "mlp_experts"),
-        ("scan=rays,board_plane=true", "input planes"),
-        ("scan=rays,inputs=moves", "input planes"),
-    ],
-)
-def test_export_refuses_the_options_it_lacks(setting, named):
-    import equinox as eqx
-    from export_onnx import to_onnx
-    from game import make_network
-
-    network, state = make_network(
-        "resnet:1x8,heads=pooled,head_channels=4,layout=pre,block=convnext,"
-        f"attention_heads=2,{setting}"
-    )
-    with pytest.raises(TypeError, match=named):
-        to_onnx(eqx.nn.inference_mode(network), state)
 
 
 def test_an_arm_names_a_quantized_model_and_a_precision():
@@ -1221,7 +1193,7 @@ CONVNEXT_SPECS = [
 ]
 
 
-# ConvNeXt blocks of gated scans along the rays (see `core.networks.azresnet.GatedScan`): at the
+# ConvNeXt blocks of gated scans along the rays (see `gated_scan.GatedScan`): at the
 # width its direct kernel reads, and off it, a gate's 6 channels splitting vectors of channels
 SCAN_SPECS = [
     "resnet:2x64,pool_every=2,heads=pooled,pool_channels=16,layout=pre,block=convnext,expand=2,scan=rays",

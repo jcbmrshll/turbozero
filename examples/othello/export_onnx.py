@@ -23,13 +23,13 @@ import jax
 import numpy as np
 import onnx
 from game import load_checkpoint
+from gated_scan import GatedScan
 from onnx import TensorProto, helper, numpy_helper
 
 from core.networks.azresnet import (
     AZResnet,
     Depthwise,
     FixedScale,
-    GatedScan,
     GroupNorm,
     Norm,
     PooledHeads,
@@ -231,7 +231,7 @@ class Graph:
         scale: np.ndarray | None,
         bias: np.ndarray | None,
     ) -> str:
-        """A gated scan (see `azresnet.GatedScan`), its outputs times `scale` plus `bias`, by
+        """A gated scan (see `gated_scan.GatedScan`), its outputs times `scale` plus `bias`, by
         Horner's scheme from each line's far end: s = w_k x_k + g_k s, down to a step from the
         square filtered. Only lines on the board are computed, as rows of channels, (batch, lines,
         channels), longest first: those still running at a step are the first rows, so a step
@@ -319,21 +319,9 @@ class Graph:
     def convnext_block(self, block: PreActConvNeXt, state: eqx.nn.State, x: str) -> str:
         """ConvNeXt's block, of a depthwise filter (see `depthwise`) or a gated scan (see
         `gated_scan`), with BatchNorm folded into it (or another normalization after it)."""
-        unsupported = [
-            option
-            for option, on in (
-                (
-                    type(block.dw).__name__,
-                    not isinstance(block.dw, Depthwise | GatedScan),
-                ),
-                ("position_bias", block.position is not None),
-                ("mlp_experts", block.mlp_router is not None),
-            )
-            if on
-        ]
-        if unsupported:
+        if not isinstance(block.dw, Depthwise | GatedScan):
             raise TypeError(
-                f"no export of ConvNeXt blocks with {', '.join(unsupported)}: only with a "
+                f"no export of ConvNeXt blocks with a {type(block.dw).__name__}: only with a "
                 "depthwise filter or a gated scan"
             )
         scale = bias = None
@@ -395,8 +383,6 @@ def to_onnx(network: AZResnet, state: eqx.nn.State) -> onnx.ModelProto:
     if it has any)."""
     if not isinstance(network.heads, PooledHeads):
         raise TypeError("only pooled heads export")
-    if network.input_features is not None or network.board_plane:
-        raise TypeError("no export of input planes but the discs")
     graph = Graph()
     x = "input"
     if network.stem_norm is None:

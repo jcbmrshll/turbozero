@@ -71,7 +71,7 @@ SCAN_DIRECTIONS = tuple((dy, dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1) if dy
 @dataclass
 class Scan:
     """A gated scan in place of a ConvNeXt block's depthwise filter (see
-    `core.networks.azresnet.GatedScan`), its BatchNorm folded in: y = dw_bias + w[:, 0] x + the
+    `gated_scan.GatedScan`), its BatchNorm folded in: y = dw_bias + w[:, 0] x + the
     taps along each direction of `SCAN_DIRECTIONS`, from 1 step to `length`, each weighted by the
     gates of the squares between; the gates sigmoid(gate_w x + gate_b), each shared by a run of
     channels / gates channels."""
@@ -134,10 +134,11 @@ def extract(network, state) -> Program:
     """The layers of `network`, an `AZResnet` of basic blocks and pooled heads in inference mode, with
     its `state` (BatchNorm's)."""
     import equinox as eqx
+    from gated_scan import GatedScan
 
     from core.networks.azresnet import (
+        Depthwise,
         FixedScale,
-        GatedScan,
         GroupNorm,
         PooledHeads,
         PreActBlock,
@@ -203,10 +204,7 @@ def extract(network, state) -> Program:
 
     def convnext(block, pool: Linear | None) -> ConvNeXtBlock:
         gated = isinstance(block.dw, GatedScan)
-        if not (
-            block.plain
-            or (gated and block.position is None and block.mlp_router is None)
-        ):
+        if not (gated or isinstance(block.dw, Depthwise)):
             raise TypeError(
                 "no native ConvNeXt block but the plain one (a depthwise filter) or a gated scan"
             )
@@ -235,8 +233,6 @@ def extract(network, state) -> Program:
             pool=pool,
         )
 
-    if network.input_features is not None or network.board_plane:
-        raise TypeError("no native input planes but the discs")
     pre = network.final_norm is not None
     if pre:
         # the pre-activation trunk starts from the stem as it is, or normalized (folded in)

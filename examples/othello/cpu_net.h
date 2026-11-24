@@ -173,7 +173,7 @@ struct Depthwise {
     // and the rays' weights by vectors of channels, each vector's taps in one run: (channels / V,
     // taps, V) for the level's vector width V, read in order
     std::vector<float, Aligned<float>> ray_w;
-    // Or a gated scan (see `core.networks.azresnet.GatedScan`), when `scan`: along the 8 directions
+    // Or a gated scan (see `gated_scan.GatedScan`), when `scan`: along the 8 directions
     // `SCAN_DY`/`SCAN_DX`, `length` steps each, every tap's weight multiplied by the gates of the
     // squares between it and the output. The gates sigmoid(gate_w x + gate_b) of the trunk x, the
     // gate BatchNorm and offset folded in, each shared by `channels / gates` channels in a row
@@ -190,7 +190,7 @@ struct Depthwise {
     std::vector<float, Aligned<float>> scan_w;
 };
 
-// the gated scan's directions, as `examples/othello/game.py`'s DIRECTIONS
+// the gated scan's directions, as `examples/othello/gated_scan.py`'s DIRECTIONS
 constexpr int SCAN_DY[8] = {-1, -1, -1, 0, 0, 1, 1, 1};
 constexpr int SCAN_DX[8] = {-1, 0, 1, -1, 1, -1, 0, 1};
 
