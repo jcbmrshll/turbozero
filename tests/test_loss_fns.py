@@ -8,7 +8,7 @@ import pytest
 
 from core.memory.replay_memory import BaseExperience
 from core.networks.utils import outcome_value
-from core.training.loss_fns import az_default_loss_fn
+from core.training.loss_fns import az_default_loss_fn, score_target
 
 
 class OutputAsParams(eqx.Module):
@@ -291,3 +291,39 @@ def test_an_ownership_head_needs_experiences_with_their_ownership():
     )
     with pytest.raises(ValueError, match="ownership"):
         az_default_loss_fn(net, None, batch)
+
+
+def test_a_score_target_is_its_bin_or_shared_between_the_two_nearest():
+    # a win and a loss: a draw is half of each, as KataGo's targets have it
+    np.testing.assert_allclose(
+        score_target((1.0, -1.0), jnp.array([1.0, 0.0, -1.0, 0.5])),
+        [[1, 0], [0.5, 0.5], [0, 1], [0.75, 0.25]],
+    )
+    # descending scores: a score is its own bin; beyond the ends, the nearest end
+    np.testing.assert_allclose(
+        score_target((4.0, 2.0, 0.0, -2.0), jnp.array([2.0, 1.5, 9.0, -5.0])),
+        [[0, 1, 0, 0], [0, 0.75, 0.25, 0], [1, 0, 0, 0], [0, 0, 0, 1]],
+    )
+    # in any order
+    np.testing.assert_allclose(
+        score_target((0.0, 1.0, -1.0), jnp.array([-0.5])), [[0.5, 0, 0.5]]
+    )
+
+
+def test_a_win_loss_head_trains_a_draw_toward_half_of_each():
+    net = ScoreLogitsAsParams(
+        jnp.zeros((2, 2)), jnp.array([[0.0, 0.0], [2.0, -1.0]]), (1.0, -1.0)
+    )
+    # a draw, then a win for the player to move (player 1)
+    batch = experience(
+        rewards=[[0, 0], [-1, 1]],
+        cur_player_id=[0, 1],
+        policy_weights=[[0.5, 0.5], [0.5, 0.5]],
+        policy_mask=jnp.ones((2, 2), bool),
+    )
+
+    _, (metrics, _) = az_default_loss_fn(net, None, batch)
+
+    log_probs = jax.nn.log_softmax(jnp.array([[0.0, 0.0], [2.0, -1.0]]))
+    want = (-(0.5 * log_probs[0, 0] + 0.5 * log_probs[0, 1]) - log_probs[1, 0]) / 2
+    np.testing.assert_allclose(metrics["outcome_loss"], want, rtol=1e-6)

@@ -192,10 +192,15 @@ DW_TAPS = {"rays": RAY_TAPS}
 # one ahead: the discs and empties always add to 64, so a margin is even
 MARGINS = tuple(float(m) for m in range(64, -65, -2))
 
+# a win and a loss: a value head over them is KataGo's, a draw's target half of each (see
+# core.training.loss_fns.score_target)
+RESULTS = (1.0, -1.0)
+
 # the scores a value head predicts, as a spec names them, e.g. "resnet:7x64,outcomes=margin":
-# a distribution over the final margin in place of a value (see
-# core.networks.azresnet.AZResnetConfig.outcome_scores)
-OUTCOMES = {"margin": MARGINS}
+# a distribution over them in place of a value (see
+# core.networks.azresnet.AZResnetConfig.outcome_scores). The final margin's train on the
+# margins games end on, solved exactly; a win and a loss's ("result") on their results
+OUTCOMES = {"margin": MARGINS, "result": RESULTS}
 
 # the settings a spec names that select an option from a table here
 NAMED_OPTIONS = {"dw_taps": DW_TAPS, "outcomes": OUTCOMES}
@@ -234,8 +239,8 @@ def make_network(
     and in `train_dtype` in training (mixed precision, see AZResnetConfig). With `remat`,
     training computes each block's activations again in the backward pass instead of
     keeping them. Othello's depthwise filter taps are named in the spec as dw_taps=NAME (see
-    DW_TAPS), and a value head that predicts the final margin as outcomes=margin (see
-    OUTCOMES)."""
+    DW_TAPS), and a value head over the final margin, or over a win and a loss, as
+    outcomes=margin or outcomes=result (see OUTCOMES)."""
     net, options = network_options(net)
     config = network_config(
         net,

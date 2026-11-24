@@ -1,13 +1,30 @@
+from collections.abc import Sequence
 from functools import partial
 from typing import Any
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 
 from core.memory.replay_memory import BaseExperience
 from core.networks.utils import apply_nn, outcome_value
+
+
+def score_target(scores: Sequence[float], target: jax.Array) -> jax.Array:
+    """(batch, scores) the distribution over `scores` (distinct, in any order) a value head over
+    them trains toward, for (batch,) `target` scores: all on the score equal to it, or for one
+    between two scores, shared between them in proportion to its nearness to each (a draw, 0,
+    half a win at 1 and half a loss at -1, as KataGo's value targets have it); all on the nearest
+    end beyond them."""
+    order = np.argsort(scores)
+    ascending = jnp.asarray(np.asarray(scores, np.float32)[order])
+    # each score's share is its hat function: 1 there, falling to 0 at its neighbours
+    shares = jax.vmap(
+        lambda column: jnp.interp(target, ascending, column), out_axes=-1
+    )(jnp.eye(len(scores), dtype=jnp.float32))
+    return shares[:, np.argsort(order)]
 
 
 def az_default_loss_fn(
@@ -31,7 +48,8 @@ def az_default_loss_fn(
     A network whose value head predicts the game's final score (see `AZResnetConfig.outcome_scores`)
     trains on the score instead, which the experience's `reward` holds (see `Trainer`'s
     `score_targets`): the value loss is the cross-entropy of its distribution over the scores with
-    the score the game ended on. `value_loss` is then logged as the mean squared error of its value
+    the score the game ended on (see `score_target`). Its scores may be the results themselves,
+    e.g. a win and a loss, the experience's `reward` then as it is. `value_loss` is then logged as the mean squared error of its value
     against the game's result (the score's sign), comparable to a network's that predicts the result
     directly, and `score_error` as the mean absolute error of its expected score.
 
@@ -62,7 +80,7 @@ def az_default_loss_fn(
     ownership = getattr(nn, "ownership", False)
     if scores is not None and value_target_q:
         raise ValueError(
-            "a network that predicts the score trains on the score alone: no value_target_q"
+            "a value head over scores trains on them alone: no value_target_q"
         )
     if ownership and experience.ownership is None:
         raise ValueError("an ownership head needs experiences with their ownership")
@@ -102,12 +120,12 @@ def az_default_loss_fn(
         value_loss = optax.l2_loss(pred_value.squeeze(), target_value).mean()
         loss_value = value_loss
     else:
-        # the target is the score's bin; the value's error is against the result, its sign
-        scores = jnp.asarray(scores, jnp.float32)
-        target_bin = jnp.argmin(jnp.abs(scores - target_value[:, None]), axis=-1)
-        loss_value = optax.softmax_cross_entropy_with_integer_labels(
-            pred_value, target_bin
+        # the target is the score's bin, or between two the two nearest in proportion; the
+        # value's error is against the result, its sign
+        loss_value = optax.softmax_cross_entropy(
+            pred_value, score_target(scores, target_value)
         ).mean()
+        scores = jnp.asarray(scores, jnp.float32)
         value_loss = optax.l2_loss(
             outcome_value(pred_value, scores), jnp.sign(target_value)
         ).mean()

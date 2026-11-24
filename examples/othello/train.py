@@ -62,6 +62,7 @@ from engine_set import EngineSet
 from exact_labels import SOLVERS, default_threads, make_solve_fn, solve_slots, stops_at
 from game import (
     DEFAULT_NET,
+    MARGINS,
     PLAY_PRIOR_TEMPERATURE,
     SGD_WEIGHT_DECAY,
     SYMMETRY_TRANSFORM_FNS,
@@ -1337,13 +1338,14 @@ def main():
         return network_config(net, env.num_actions, **options)
 
     # a network that predicts the final margin (outcomes=margin, see game.py's OUTCOMES) trains
-    # on the margins games end on, exactly solved where solved, in place of their results; one
-    # with an ownership head (ownership=true) on the final board too, a solved game's played on
-    # perfectly from where it's solved
+    # on the margins games end on, exactly solved where solved, in place of their results (one
+    # over a win and a loss, outcomes=result, on the results); one with an ownership head
+    # (ownership=true) on the final board too, a solved game's played on perfectly from where
+    # it's solved
     def predicts(spec: str) -> tuple[bool, bool]:
         config = config_of(spec)
         return (
-            getattr(config, "outcome_scores", None) is not None,
+            getattr(config, "outcome_scores", None) == MARGINS,
             getattr(config, "ownership", False),
         )
 
@@ -1362,9 +1364,10 @@ def main():
             parser.error(
                 f"a network that predicts {what} can't train on --tree-positions"
             )
-    if score_targets and args.value_target_q:
+    if args.value_target_q and getattr(config_of(args.net), "outcome_scores", None):
         parser.error(
-            "a network that predicts the margin trains on it alone: no --value-target-q"
+            "a value head over outcomes (outcomes=margin or result) trains on them alone: "
+            "no --value-target-q"
         )
     if ownership_targets and args.solve_empties is not None and args.solver != "native":
         parser.error("an ownership head's solves need --solver native")

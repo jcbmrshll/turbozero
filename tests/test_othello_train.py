@@ -101,6 +101,22 @@ def test_an_ownership_head_refuses_what_has_no_final_board(
     assert "ownership" in capsys.readouterr().err
 
 
+def test_a_win_loss_head_trains_on_results_solved_as_before(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, "--net", "resnet:1x4,outcomes=result")
+    kwargs = built.value.kwargs
+    assert not kwargs["score_targets"]
+    assert not kwargs["endgame_solve"].solve_fn.scores
+    with pytest.raises(SystemExit):
+        run_main(
+            monkeypatch,
+            "--net",
+            "resnet:1x4,outcomes=result",
+            "--value-target-q",
+            "0.5",
+        )
+
+
 @pytest.mark.parametrize(
     "options",
     [
