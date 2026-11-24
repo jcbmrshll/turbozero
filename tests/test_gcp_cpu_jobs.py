@@ -63,6 +63,8 @@ class FakeCloud:
     """Compute Engine whose VMs, on the next look, have run their slot's jobs and deleted
     themselves, or vanished half-way (preempted) when listed in `preempt`."""
 
+    poll_seconds = 20.0
+
     def __init__(self, store, prefix: str, preempt=(), no_capacity=()):
         self.store = store
         self.prefix = prefix

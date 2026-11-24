@@ -32,9 +32,15 @@ def _slot(
     cpu: str | None = None,
 ) -> str | None:
     """A container's work: the job's code and inputs from the bucket, then its slot's jobs; on a
-    CPU that doesn't meet `cpu` (see `hardware.fits`), nothing but saying which it is."""
+    CPU that doesn't meet `cpu` (see `hardware.fits`), nothing but saying which it is, before
+    anything else (the image has `hardware`)."""
+    from core.evals.hardware import cpu_id, fits
+
+    if cpu is not None and not fits(cpu):
+        return (
+            f"{WRONG_CPU}{cpu_id()} in {os.environ.get('MODAL_TASK_ID', 'a container')}"
+        )
     import io
-    import sys
 
     from modal_store import GcsStore
 
@@ -43,13 +49,6 @@ def _slot(
     assert code is not None, f"no code for {prefix}"
     with tarfile.open(fileobj=io.BytesIO(code), mode="r:gz") as tar:
         tar.extractall("/src", filter="data")
-    sys.path.insert(0, "/src")
-    from core.evals.hardware import cpu_id, fits
-
-    if cpu is not None and not fits(cpu):
-        return (
-            f"{WRONG_CPU}{cpu_id()} in {os.environ.get('MODAL_TASK_ID', 'a container')}"
-        )
     cache = Path(HOME) / ".cache" / "turbozero" / "othello"
     cache.mkdir(parents=True, exist_ok=True)
     for key in inputs:
@@ -87,6 +86,9 @@ class ModalHosts:
     a CPU meeting `cpu` if one is given (`hardware.fits`). It knows the calls it made, in this process: a launcher
     run again starts new ones for what's left. `close` stops the app."""
 
+    # a call's state is a quick look: often, so a container on the wrong CPU is replaced soon
+    poll_seconds = 3.0
+
     def __init__(self, gpu: str, cpus: int, memory: int, cpu: str | None = None):
         self.gpu = gpu
         self.cpus = cpus
@@ -120,9 +122,13 @@ class ModalHosts:
                 "cd /src && uv sync --frozen --no-install-project --extra cuda"
             )
         )
-        # the container's function is this module's, and what it imports
+        # the container's function is this module's, and what it imports: the CPU check's
+        # module too (standard library only, in packages whose __init__s are empty), so a
+        # container on the wrong CPU leaves before fetching anything
         for module in ("modal_hosts", "modal_store"):
             image = image.add_local_file(here / f"{module}.py", f"/root/{module}.py")
+        for module in ("core/__init__", "core/evals/__init__", "core/evals/hardware"):
+            image = image.add_local_file(repo / f"{module}.py", f"/root/{module}.py")
         return image
 
     def _open(self, job: str, hours: float) -> None:

@@ -150,6 +150,9 @@ def machine_options(machine: str) -> list[str]:
 
 
 class Cloud(Protocol):
+    # how often `watch` looks at the hosts and the bucket
+    poll_seconds: float
+
     def create(
         self,
         name: str,
@@ -165,6 +168,8 @@ class Cloud(Protocol):
 
 class Gcloud:
     """Compute Engine by the gcloud CLI, in one project."""
+
+    poll_seconds = POLL_SECONDS
 
     def __init__(self, project: str, machine: str = MACHINE):
         self.project = project
@@ -409,7 +414,7 @@ def watch(
             return outcome
         if clock() > deadline:
             return {slot: outcome.get(slot, "out of time") for slot in spec["slots"]}
-        pause(POLL_SECONDS)
+        pause(cloud.poll_seconds)
 
 
 def new_lines(store: Store, prefix: str, offsets: dict[str, int]) -> list[str]:
