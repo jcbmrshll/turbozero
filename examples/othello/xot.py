@@ -22,6 +22,12 @@ XOT_PATH = Path(__file__).parent / "xot-openings.txt"
 # (`--starts xot-heldout`), so that a set's positions are never from the games that measure a
 # network; never edited, since a match draws its openings again whenever it continues
 SET_OPENINGS_PATH = Path(__file__).parent / "xot-set-openings.txt"
+# each held-out opening's start valued by Neural Reversi at level 26, for the player to move
+# (black), in discs: XOT's own check (Edax, 16 moves ahead) leaves many starts 2+ discs from
+# even at that depth, and a game from those is mostly decided by its colour
+VALUES_PATH = Path(__file__).parent / "xot-heldout-values.txt"
+# the starts `xot-balanced` draws from: valued within this many discs of even
+BALANCED_DISCS = 0
 
 
 def load_xot(path: str | Path = XOT_PATH) -> np.ndarray:
@@ -47,6 +53,22 @@ def set_openings(path: str | Path = SET_OPENINGS_PATH) -> np.ndarray:
 def held_out_openings(path: str | Path = SET_OPENINGS_PATH) -> np.ndarray:
     """Every other XOT opening: those evaluation matches draw from with `xot-heldout`."""
     return np.setdiff1d(np.arange(len(load_xot())), set_openings(path))
+
+
+def opening_values(path: str | Path = VALUES_PATH) -> tuple[np.ndarray, np.ndarray]:
+    """The held-out openings (indices into `load_xot`'s rows) and their starts' values (see
+    `VALUES_PATH`)."""
+    table = np.loadtxt(path, dtype=np.int64, comments="#", ndmin=2)
+    return table[:, 0], table[:, 1]
+
+
+def balanced_openings(
+    discs: int = BALANCED_DISCS, path: str | Path = VALUES_PATH
+) -> np.ndarray:
+    """The held-out openings whose starts are valued within `discs` of even: those evaluation
+    matches draw from with `xot-balanced`, where a game is decided by play more than by colour."""
+    index, value = opening_values(path)
+    return index[np.abs(value) <= discs]
 
 
 def make_xot_init_fn(openings: np.ndarray, standard_start_fraction: float):

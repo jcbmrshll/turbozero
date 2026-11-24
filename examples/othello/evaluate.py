@@ -19,8 +19,9 @@ or on a `clock`, on the CPU, the GPU a game at a time, or the GPU in batches; or
 settings are the same player wherever they play, and a changed one is a new player.
 
 A match (see `eval_games.py`) plays `--openings` starts, each with both colors, from `--starts`
-(`xot-heldout`, the XOT openings no engine-labelled set takes positions from; `xot`, every XOT
-opening; `random:N`; `file:PATH`), drawn by `--seed`; with `--solve-at N`, every game stops at N
+(`xot-balanced`, the XOT openings no engine-labelled set takes positions from whose starts are
+valued even, where colour decides least; `xot-heldout`, all of those held-out openings; `xot`, every
+XOT opening; `random:N`; `file:PATH`), drawn by `--seed`; with `--solve-at N`, every game stops at N
 empties and is solved for its result. A match's id is its setup's and where it's played: running
 it again continues it, and `--tag` makes another.
 
@@ -895,8 +896,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--openings", type=int, help="starts, each played with both colors")
     p.add_argument(
         "--starts",
-        help="xot-heldout (default: XOT openings no engine-labelled set takes positions "
-        "from), xot (every XOT opening, as matches before 2026-11-21), random:N or file:PATH",
+        help="xot-balanced (default: held-out XOT openings whose starts are valued even), "
+        "xot-heldout (every XOT opening no engine-labelled set takes positions from, as matches "
+        "before 2026-11-24), xot (every XOT opening, as matches before 2026-11-21), random:N or "
+        "file:PATH",
     )
     p.add_argument("--seed", type=int)
     p.add_argument(

@@ -362,6 +362,21 @@ def test_matches_leave_out_the_openings_engine_sets_use_unless_asked():
     assert {o.label for o in old} <= used  # seed 1's 400 were played for the set
 
 
+def test_balanced_starts_are_held_out_openings_valued_nearest_even(tmp_path):
+    from xot import BALANCED_DISCS, balanced_openings, held_out_openings, opening_values
+
+    values = tmp_path / "values.txt"
+    values.write_text("# index value\n3 0\n5 -2\n8 1\n13 -1\n")
+    assert list(balanced_openings(0, values)) == [3]
+    assert list(balanced_openings(1, values)) == [3, 8, 13]
+    index, value = opening_values()
+    assert set(index) == set(held_out_openings())
+    a, b = fake("a", {"level": 1}), fake("b", {"level": 2})
+    picked = MatchSpec(a, b, openings=50, starts="xot-balanced").choose_openings()
+    by_index = dict(zip(index, value))
+    assert all(abs(by_index[int(o.label[4:])]) <= BALANCED_DISCS for o in picked)
+
+
 # --- games -----------------------------------------------------------------------------------
 
 

@@ -39,15 +39,17 @@ from clock_match import (
 from engines import Board
 from eval_players import CACHE_DIR, PlayerSpec, maker
 from ggs import Clock, Start, disc_result, load_starts, random_start
-from xot import XOT_PATH, held_out_openings, load_xot
+from xot import XOT_PATH, balanced_openings, held_out_openings, load_xot
 
 from core.evals import hardware
 from core.evals.store import GameRecord, digest
 
 PASS = 64
-# XOT starts: `xot` draws from every opening, `xot-heldout` (the default) from those no
-# engine-labelled set takes positions from (see xot.SET_OPENINGS_PATH)
-XOT_STARTS = ("xot", "xot-heldout")
+# XOT starts: `xot` draws from every opening, `xot-heldout` from those no engine-labelled set
+# takes positions from (see xot.SET_OPENINGS_PATH), `xot-balanced` (the default) from those of
+# them whose starts are valued even (see xot.VALUES_PATH): on today's games a start valued even
+# split six nets' results 3x as often as one valued 3+ discs from it
+XOT_STARTS = ("xot", "xot-heldout", "xot-balanced")
 
 
 @dataclass(frozen=True)
@@ -68,7 +70,7 @@ class MatchSpec:
     a: PlayerSpec
     b: PlayerSpec
     openings: int
-    starts: str = "xot-heldout"
+    starts: str = "xot-balanced"
     seed: int = 0
     solve_at: int | None = None
     solve_exact: bool = False
@@ -156,6 +158,10 @@ class MatchSpec:
             pool = load_xot(XOT_PATH)
             if kind == "xot":
                 picked = rng.choice(len(pool), size=self.openings, replace=False)
+            elif kind == "xot-balanced":
+                picked = rng.choice(
+                    balanced_openings(), size=self.openings, replace=False
+                )
             else:
                 picked = rng.choice(
                     held_out_openings(), size=self.openings, replace=False
