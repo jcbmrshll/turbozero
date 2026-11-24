@@ -29,19 +29,45 @@ PLACEMENT_ENV = "TZ_EVAL_PLACEMENT"
 CODE_ENV = "TZ_EVAL_CODE"
 
 
-def _cpuinfo() -> tuple[str | None, set[str]]:
-    path = Path("/proc/cpuinfo")
-    if not path.exists():
-        return platform.processor() or None, set()
-    model, flags = None, set()
-    for line in path.read_text().splitlines():
+def _cpuinfo(text: str | None = None) -> tuple[str | None, set[str]]:
+    """The CPU's model name and flags, from /proc/cpuinfo's text. Where the name is hidden (Modal's
+    gVisor says "unknown"), the CPU is named by its vendor, family and model (`cpu_id`)."""
+    if text is None:
+        path = Path("/proc/cpuinfo")
+        if not path.exists():
+            return platform.processor() or None, set()
+        text = path.read_text()
+    fields = _first_fields(text)
+    model = fields.get("model name")
+    if model in (None, "", "unknown"):
+        model = cpu_id(text) or model
+    flags = set(fields.get("flags", fields.get("Features", "")).split())
+    return model, flags
+
+
+def _first_fields(text: str) -> dict[str, str]:
+    """The first logical CPU's fields in /proc/cpuinfo's text."""
+    fields: dict[str, str] = {}
+    for line in text.splitlines():
         key, _, value = line.partition(":")
         key = key.strip()
-        if key == "model name" and model is None:
-            model = value.strip()
-        elif key in ("flags", "Features") and not flags:
-            flags = set(value.split())
-    return model, flags
+        if key and key not in fields:
+            fields[key] = value.strip()
+    return fields
+
+
+def cpu_id(text: str | None = None) -> str | None:
+    """The CPU model as x86 identifies it, e.g. "GenuineIntel-6-173": vendor, family and model,
+    which a sandbox that hides the model name still shows. None where /proc/cpuinfo hasn't them
+    (ARM, macOS)."""
+    if text is None:
+        path = Path("/proc/cpuinfo")
+        text = path.read_text() if path.exists() else ""
+    fields = _first_fields(text)
+    parts = [fields.get(k) for k in ("vendor_id", "cpu family", "model")]
+    if not all(parts):
+        return None
+    return "-".join(p for p in parts if p)
 
 
 def physical_cores(cpus: list[int]) -> int:

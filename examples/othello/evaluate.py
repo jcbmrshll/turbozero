@@ -26,8 +26,10 @@ Where (`--on`):
 
 - `local`: here, on `--cores` (else all this process may use; quiet ones, for timed games)
 - `gcp`: Spot VMs of one CPU model (`gcp_cpu_jobs.py`, 8 cores of AMD Turin), `--jobs` of them
-- `modal`: Modal containers, `--gpu CPU` or a GPU, `--modal-cpu` cores each (a mix of CPU models:
-  don't compare their seconds)
+- `modal`: Modal containers, `--gpu CPU` or a GPU, `--modal-cpu` cores each, on one CPU model
+  (`--modal-cpu-model`, Intel Granite Rapids by default; Modal's mix changes from day to day, and
+  a container on another model is swapped for a new one). Not the GCP VMs' CPU: a clock there
+  is its own condition
 
 Cloud hosts write their games to the bucket as they go, and they're brought into the store while
 the match runs; `sync MATCH` brings in what's there later. Every game records its moves, each
@@ -99,6 +101,9 @@ SYNC_SECONDS = 60.0
 BUSY_TO_START = 0.15
 QUIET_SECONDS = 15.0
 LEAGUE_TIMINGS = CACHE_DIR / "league" / "timings.json"
+# the CPU model Modal's CPU containers were all on when it was chosen (2026-11-24): Intel Xeon 6
+# (Granite Rapids), AVX-512 with VNNI
+MODAL_CPU = "GenuineIntel-6-173"
 
 
 def parse_cores(text: str) -> list[int]:
@@ -125,7 +130,8 @@ def placement_of(args: argparse.Namespace) -> tuple[str, int]:
         # one thread a core: half the machine's vCPUs (gcp_cpu_jobs.machine_options)
         return f"gcp:{args.machine}", int(args.machine.split("-")[-1]) // 2
     if args.on == "modal":
-        return f"modal:{args.gpu}:{args.modal_cpu}c", args.modal_cpu
+        model = "" if args.modal_cpu_model == "any" else f":{args.modal_cpu_model}"
+        return f"modal:{args.gpu}:{args.modal_cpu}c{model}", args.modal_cpu
     raise SystemExit(f"--on {args.on}: local, gcp or modal")
 
 
@@ -427,7 +433,8 @@ def play_in_cloud(
     else:
         from modal_hosts import ModalHosts
 
-        cloud = ModalHosts(args.gpu, args.modal_cpu, args.modal_memory)
+        model = None if args.modal_cpu_model == "any" else args.modal_cpu_model
+        cloud = ModalHosts(args.gpu, args.modal_cpu, args.modal_memory, model)
     finished = threading.Event()
 
     def keep_syncing() -> None:
@@ -915,7 +922,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--machine", default="n4d-highcpu-16", help="a GCP machine type")
     p.add_argument("--gpu", default="CPU", help="Modal's GPU, or CPU")
     p.add_argument("--modal-cpu", type=int, default=8, help="a Modal host's cores")
-    p.add_argument("--modal-memory", type=int, default=32, help="its GiB")
+    p.add_argument("--modal-memory", type=int, default=16, help="its GiB")
+    p.add_argument(
+        "--modal-cpu-model",
+        default=MODAL_CPU,
+        help="the CPU model (`hardware.cpu_id`) a Modal host must be on, or any",
+    )
     p.add_argument(
         "--fresh-jobs",
         action="store_true",

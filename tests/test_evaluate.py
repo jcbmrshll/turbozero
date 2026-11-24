@@ -504,6 +504,40 @@ def test_a_hosts_description_is_the_same_each_time():
     )
 
 
+GVISOR_CPUINFO = """processor\t: 0
+vendor_id\t: GenuineIntel
+cpu family\t: 6
+model\t\t: 173
+model name\t: unknown
+flags\t\t: fpu avx2 avx512f avx512_vnni
+
+processor\t: 1
+vendor_id\t: GenuineIntel
+cpu family\t: 6
+model\t\t: 173
+model name\t: unknown
+"""
+
+
+def test_a_cpu_whose_name_is_hidden_is_named_by_its_vendor_family_and_model():
+    assert hardware.cpu_id(GVISOR_CPUINFO) == "GenuineIntel-6-173"
+    model, flags = hardware._cpuinfo(GVISOR_CPUINFO)
+    assert model == "GenuineIntel-6-173"
+    assert {"avx512f", "avx512_vnni"} <= flags
+    named = GVISOR_CPUINFO.replace("unknown", "AMD EPYC 9B45")
+    assert hardware._cpuinfo(named)[0] == "AMD EPYC 9B45"
+    assert hardware.cpu_id("Features\t: neon\n") is None
+
+
+def test_a_modal_match_is_placed_on_its_cpu_model():
+    args = evaluate.build_parser().parse_args(["run", "--on", "modal"])
+    assert evaluate.placement_of(args) == ("modal:CPU:8c:GenuineIntel-6-173", 8)
+    args = evaluate.build_parser().parse_args(
+        ["run", "--on", "modal", "--modal-cpu-model", "any"]
+    )
+    assert evaluate.placement_of(args) == ("modal:CPU:8c", 8)
+
+
 # --- the CLI ---------------------------------------------------------------------------------
 
 
