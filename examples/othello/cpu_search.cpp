@@ -989,6 +989,16 @@ void search_visits(const Search* s, int32_t* out) {
     }
 }
 
+// `out`, (65): the root's edges' priors, as its search used them (at its prior temperature); 0 for
+// actions it has no edge for
+void search_priors(const Search* s, float* out) {
+    std::memset(out, 0, 65 * sizeof(float));
+    const Node& root = s->nodes[s->root];
+    for (int i = root.first_edge; i < root.first_edge + root.num_edges; i++) {
+        out[s->edges[i].action] = s->edges[i].prior;
+    }
+}
+
 float search_root_q(const Search* s) {
     const Node& root = s->nodes[s->root];
     return root.n ? root.w / root.n : 0;

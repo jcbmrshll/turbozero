@@ -294,6 +294,8 @@ def test_a_network_runs_where_its_runtime_says(monkeypatch, tmp_path):
         "device": "cpu",
         "net": "n",
     }
+    eval_players.maker(runtime, UNTIMED, record_search=True)
+    assert made["options"]["record_search"] == "1"
 
 
 # --- matches ---------------------------------------------------------------------------------
@@ -332,6 +334,33 @@ def test_batched_matches_are_at_fixed_budgets_and_an_engine_a_game():
     cpu_net = fake("c", {"visits": 10}, kind="net", device="cpu")
     with pytest.raises(ValueError, match="gpu-batched too"):
         MatchSpec(net, cpu_net, openings=1)
+
+
+def test_recording_searches_is_the_same_match_and_reaches_its_players(now, monkeypatch):
+    a, b = fake("a", {"level": 1}), fake("b", {"level": 2})
+    spec = MatchSpec(a, b, openings=1)
+    assert spec.record_search
+    off = MatchSpec(a, b, openings=1, record_search=False)
+    assert spec.id("local") == off.id("local")
+    assert MatchSpec.from_dict(json.loads(json.dumps(spec.to_dict()))) == spec
+    asked = []
+
+    def maker(runtime, clock, record_search=False):
+        asked.append(record_search)
+        return lambda: FirstLegal(now)
+
+    monkeypatch.setattr(eval_games, "maker", maker)
+    play_sequential(spec, "m-x", [0], lambda _: None)
+    assert asked == [True, True]
+    # batched games keep no move's search, and play all the same
+    net = fake(
+        "n", {"visits": 10}, kind="net", device="gpu-batched", search={"dtype": "x"}
+    )
+    assert MatchSpec(net, fake("e", {"level": 1}, threads=1), 1).batched
+    parser = evaluate.build_parser()
+    for flag, wanted in (([], None), (["--no-record-search"], False)):
+        args = parser.parse_args(["run", "--a", "x", "--b", "y", *flag])
+        assert evaluate.match_setup(args).get("record_search") is wanted
 
 
 def test_jobs_share_a_matchs_starts_each_with_both_colors():

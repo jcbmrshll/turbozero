@@ -433,15 +433,20 @@ def register_network(runtime: dict[str, Any]) -> None:
     NETWORKS[network["name"]] = (str(path), network["net"])
 
 
-def maker(runtime: dict[str, Any], clock: Clock) -> Callable[[], Any]:
+def maker(
+    runtime: dict[str, Any], clock: Clock, record_search: bool = False
+) -> Callable[[], Any]:
     """What builds a player (`clock_match.Player`) from its `runtime` for each game; engines
-    plan for `clock`."""
+    plan for `clock`. With `record_search`, a network's moves' info keeps its searches' roots
+    (`cpu_match.NetPlayer.info`); an engine has no priors to keep."""
     from clock_match import player_maker
 
     options = {k: str(v) for k, v in runtime["options"].items()}
     if runtime["player"] == "net":
         register_network(runtime)
         options["net"] = runtime["network"]["name"]
+        if record_search:
+            options["record_search"] = "1"
         return player_maker("net", options, clock)
     path = Path(runtime["dir"])
     options["dir"] = str(path if path.is_absolute() else CACHE_DIR / path)

@@ -271,6 +271,7 @@ class NetPlayer:
         solving: Solving | None = None,
         reserve_tree: float = 0.0,
         stop_decided: bool = False,
+        record_search: bool = False,
     ):
         """`visits`, if any, a move, ignoring the clock. With `reserve_tree` (on a clock), the
         tree's room is set aside after the first move searched (`Search.reserve`): for this many
@@ -278,8 +279,10 @@ class NetPlayer:
         clock left. Otherwise the tree grows as it fills, every worker waiting on each copy:
         about 0.7 s of a 30 s game. On a clock, with `stop_decided` a move's search ends once its
         move can't change (`Engine.search`), and budgets are planned on what the game's searches
-        have used of theirs (`expected_use`)."""
+        have used of theirs (`expected_use`). With `record_search`, `info` has each searched
+        root's actions with their priors and visits."""
         self.search = Search(settings, seed)
+        self.record_search = record_search
         self.reserve_tree = reserve_tree
         # whether the tree's room has been set aside (`reserve_tree`)
         self.reserved = False
@@ -309,6 +312,9 @@ class NetPlayer:
         self.last_value: tuple[str, float] | None = None
         # the root's visits after the last move's search, and how many of them it added
         self.last_visits: tuple[int, int] | None = None
+        # with `record_search`, the last move's searched root: its legal actions, their priors
+        # and their visits
+        self.last_root: tuple[list[int], list[float], list[int]] | None = None
 
     def sync(self, color: str) -> None:
         """Passes for the other color if `color` moves out of turn: the game passes for a player
@@ -380,6 +386,7 @@ class NetPlayer:
         action = None
         self.last_value = None
         self.last_visits = None
+        self.last_root = None
         if self.search.num_legal() == 1:
             action = self.search.first_legal()
         elif self.solving is not None and empties <= solve_from:
@@ -432,6 +439,15 @@ class NetPlayer:
             self.last_value = ("q", self.search.root_q())
             searched_visits = int(self.search.visits().sum())
             self.last_visits = (searched_visits, searched_visits - visits)
+            if self.record_search:
+                actions = np.flatnonzero(self.search.legal())
+                priors = self.search.priors()[actions]
+                counts = self.search.visits()[actions]
+                self.last_root = (
+                    actions.tolist(),
+                    [float(f"{p:.6g}") for p in priors],
+                    counts.tolist(),
+                )
         self.search.play(action)
         return action
 
@@ -439,18 +455,25 @@ class NetPlayer:
         """What the last move made of its position (`clock_match.Player.info`): the search's
         root value `q` (-1 to 1) for the player to move, its root's `visits` and how many of
         them it `added` (the rest kept from earlier searches); or a solve's `margin`, or its
-        `wdl` (the sign alone, with `exact` off). None for a move played without either."""
+        `wdl` (the sign alone, with `exact` off). None for a move played without either. With
+        `record_search`, a search's also has the root's legal `actions` (squares), each one's
+        `priors` as the search used them (the policy at the prior temperature: the network's own
+        is these to the power of the temperature, renormalized) and its visit `counts`, kept ones
+        included."""
         if self.last_value is None:
             return None
         kind, value = self.last_value
         if kind != "q":
             return {kind: int(value)}
         assert self.last_visits is not None
-        return {
+        info: dict[str, Any] = {
             "q": round(value, 4),
             "visits": self.last_visits[0],
             "added": self.last_visits[1],
         }
+        if self.last_root is not None:
+            info["actions"], info["priors"], info["counts"] = self.last_root
+        return info
 
     def reserve(self, added: int, searched: float, seconds_left: float) -> None:
         """Sets aside the tree's room for the rest of the game, the first search having added

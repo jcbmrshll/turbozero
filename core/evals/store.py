@@ -132,7 +132,9 @@ class GameRecord:
         move_info: what the player's search made of each of those moves' positions, None where
             it didn't say (`clock_match.Player.info`); empty if no move's did. A network's: its
             root value `q`, -1 to 1, for the player to move, the root's `visits` and how many it
-            `added`; or a solve's `margin` or `wdl`. An engine's: its `score`, the disc margin it
+            `added`, and where the match asked for them, the root's legal `actions`, each one's
+            `priors` as its search used them and its visit `counts`; or a solve's `margin` or
+            `wdl`. An engine's: its `score`, the disc margin it
             expects for the player to move, and what else it says (`depth`, `nodes`...)
         ending: "end", played out; "solved", stopped at `solved_at` empties and solved; "timeout",
             ended by a hard timeout (a GGS clock's extension spent)

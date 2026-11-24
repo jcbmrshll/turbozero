@@ -18,6 +18,10 @@ Games are played one way or the other:
   (a process a game) or another such network. Moves aren't timed alone: a batch's timing is the
   match's. A game to be solved is played out and cut where it would have stopped, which at fixed
   budgets is the same game
+
+With `record_search` (on by default), each move a network searched keeps its root's legal
+actions, their priors and their visits in the game's `move_info` (`cpu_match.NetPlayer.info`):
+games played one at a time or in parallel; batched games keep no move's search.
 """
 
 import threading
@@ -65,7 +69,9 @@ class Opening:
 @dataclass(frozen=True)
 class MatchSpec:
     """A match: its players and its games' setup (see the module's docstring). `tag` sets apart
-    matches otherwise the same, to play them again rather than continue them."""
+    matches otherwise the same, to play them again rather than continue them. `record_search`
+    keeps more of what networks' searches made of their moves; as it doesn't change how they
+    play, it isn't part of the match's id, and a match continued with it on or off is the same."""
 
     a: PlayerSpec
     b: PlayerSpec
@@ -78,6 +84,7 @@ class MatchSpec:
     match_type: str = "s8r14"
     since: str = ""
     tag: str = ""
+    record_search: bool = True
 
     def __post_init__(self) -> None:
         if self.batched:
@@ -251,7 +258,7 @@ def play_sequential(
     ends; games stopped at a depth are scored by `solve`."""
     openings = spec.choose_openings()
     host = hardware.describe()
-    build = make or (lambda p, clock: maker(p.runtime, clock))
+    build = make or (lambda p, clock: maker(p.runtime, clock, spec.record_search))
     clocks = {p.id: p.clock or UNTIMED for p in (spec.a, spec.b)}
     a, b = (build(p, clocks[p.id]) for p in (spec.a, spec.b))
     wanted = set(numbers)
@@ -325,7 +332,7 @@ def play_parallel(
         raise ValueError("synchro pairs are already two games at once")
     openings = spec.choose_openings()
     host = hardware.describe()
-    build = make or (lambda p, clock: maker(p.runtime, clock))
+    build = make or (lambda p, clock: maker(p.runtime, clock, spec.record_search))
     clocks = {p.id: p.clock or UNTIMED for p in (spec.a, spec.b)}
     a, b = (build(p, clocks[p.id]) for p in (spec.a, spec.b))
 
