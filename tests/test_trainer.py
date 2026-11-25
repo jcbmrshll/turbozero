@@ -4434,6 +4434,194 @@ def test_fresh_positions_must_fill_micro_batches(env, tmp_path):
         )
 
 
+# held-out games: memorization of the replay buffer, and progress on new games
+
+
+def held_out_trainer(env, tmp_path, **kwargs):
+    """A trainer of 2 environments that holds out the second one's games, scoring 2
+    micro-batches of 4 positions of each side."""
+    return make_trainer(
+        env, tmp_path, holdout_envs=1, holdout_positions=8, train_batch_size=4, **kwargs
+    )
+
+
+def buffer_of(trainer, env, experience, populated, has_reward=None):
+    """A replay buffer of 2 environments holding `experience` (one position, without batch
+    dimensions) in every place `populated` (2, capacity) marks, written up to place 0 (the newest
+    is the last place); finished games unless `has_reward` says otherwise."""
+    state = trainer.memory_buffer.init(2, experience)
+    capacity = state.populated.shape[1]
+    return replace(
+        state,
+        next_idx=jnp.zeros(2, jnp.int32),
+        buffer=jax.tree.map(
+            lambda x, b: jnp.broadcast_to(x, b.shape).astype(b.dtype),
+            experience,
+            state.buffer,
+        ),
+        populated=jnp.asarray(populated).reshape(2, capacity),
+        has_reward=jnp.ones((2, capacity), bool)
+        if has_reward is None
+        else jnp.asarray(has_reward),
+    )
+
+
+def one_position(env, key=1):
+    return jax.tree.map(
+        lambda x: x[0], random_batch(env, jax.random.PRNGKey(key), size=1)
+    )
+
+
+def test_training_never_samples_the_held_out_games(env, tmp_path):
+    trainer = held_out_trainer(env, tmp_path)
+    full = np.ones((2, 8), bool)
+    state = buffer_of(trainer, env, one_position(env), full)
+
+    np.testing.assert_array_equal(
+        trainer.training_mask(state), [[True] * 8, [False] * 8]
+    )
+    # only the held-out environment has finished games: nothing to train on
+    unfinished = buffer_of(
+        trainer, env, one_position(env), full, has_reward=[[False] * 8, [True] * 8]
+    )
+    with pytest.raises(ValueError, match="no episodes have finished"):
+        trainer.check_can_train(unfinished, 4)
+
+
+def test_a_loop_starts_the_held_out_buffers_with_untrained_positions_only(
+    env, tmp_path
+):
+    trainer = held_out_trainer(env, tmp_path)
+    unfinished = np.zeros((2, 8), bool)
+    unfinished[:, :2] = True
+    state = buffer_of(
+        trainer, env, one_position(env), np.ones((2, 8), bool), has_reward=~unfinished
+    )
+
+    cleared = trainer.without_holdout_positions(state)
+
+    # the trained-on environment keeps everything; the held-out one only its game in progress
+    np.testing.assert_array_equal(cleared.populated[0], [True] * 8)
+    np.testing.assert_array_equal(cleared.populated[1], [True] * 2 + [False] * 6)
+
+
+def test_held_out_positions_are_compared_with_trained_on_ones_of_their_ages(
+    env, tmp_path
+):
+    trainer = held_out_trainer(env, tmp_path)
+    new, old = one_position(env, key=1), one_position(env, key=2)
+    # the newest place is the last (next_idx 0): the held-out environment has only its 3 newest
+    # positions, as after a loop's start; the trained-on one has older positions of another kind
+    populated = np.ones((2, 8), bool)
+    populated[1, :5] = False
+    state = buffer_of(trainer, env, new, populated)
+    is_old = jnp.arange(8) < 5
+    state = replace(
+        state,
+        buffer=jax.tree.map(
+            lambda b, o: jnp.where(
+                (is_old & jnp.array([True, False])[:, None]).reshape(
+                    (2, 8) + (1,) * (b.ndim - 2)
+                ),
+                o.astype(b.dtype),
+                b,
+            ),
+            state.buffer,
+            old,
+        ),
+    )
+    params = eqx.filter(trainer.nn, eqx.is_inexact_array)
+
+    metrics = trainer.holdout_metrics(
+        jax.random.PRNGKey(0), state, {"raw": (params, None)}
+    )
+
+    # both sides sample the newest positions only, which are alike: nothing memorized
+    for metric in ("policy_kl", "value_loss"):
+        assert metrics[f"heldout_{metric}_raw"] == pytest.approx(
+            metrics[f"seen_{metric}_raw"]
+        )
+        assert metrics[f"memorized_{metric}_raw"] == pytest.approx(0.0, abs=1e-6)
+        assert metrics[f"memorized_{metric}_raw_se"] == pytest.approx(0.0, abs=1e-6)
+    assert int(metrics["heldout_stored"]) == 3
+    assert "progress_policy_kl" not in metrics
+
+
+def test_progress_is_the_lagged_weights_excess_on_held_out_positions(env, tmp_path):
+    trainer = held_out_trainer(env, tmp_path)
+    position = one_position(env)
+    state = buffer_of(trainer, env, position, np.ones((2, 8), bool))
+    now = eqx.filter(trainer.nn, eqx.is_inexact_array)
+    before = eqx.filter(
+        MLP(2, env.num_actions, key=jax.random.PRNGKey(7)), eqx.is_inexact_array
+    )
+
+    metrics = trainer.holdout_metrics(
+        jax.random.PRNGKey(0),
+        state,
+        {"raw": (now, None)},
+        lagged=(before, None),
+        current="raw",
+    )
+
+    def losses(params):
+        nn = eqx.combine(
+            params, eqx.filter(trainer.nn, eqx.is_inexact_array, inverse=True)
+        )
+        batch = jax.tree.map(lambda x: jnp.stack([x, x]), position)
+        _, (aux, _) = az_default_loss_fn(nn, None, batch)
+        return aux
+
+    for metric in ("policy_kl", "value_loss"):
+        expected = float(losses(before)[metric] - losses(now)[metric])
+        assert metrics[f"progress_{metric}"] == pytest.approx(expected, abs=1e-5)
+        assert metrics[f"progress_{metric}_se"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_the_playing_network_is_scored_on_held_out_games(env, tmp_path):
+    monitor = FakeMonitor()
+    trainer = held_out_trainer(
+        env,
+        tmp_path,
+        progress_lag=1,
+        warmup_steps=2 * STEPS,
+        averages=(2,),
+        selfplay_average=2,
+        monitor=monitor,
+    )
+
+    trainer.train_loop(seed=0, num_epochs=3)
+
+    for name in ("policy_kl", "value_loss"):
+        for weights in ("raw", "avg"):
+            held = logged(monitor, f"heldout_{name}_{weights}")
+            seen = logged(monitor, f"seen_{name}_{weights}")
+            memorized = logged(monitor, f"memorized_{name}_{weights}")
+            assert held and set(held) == set(seen) == set(memorized)
+            for epoch in held:
+                assert memorized[epoch] == pytest.approx(
+                    held[epoch] - seen[epoch], abs=1e-6
+                )
+        # the weights of an epoch before: from the second scored epoch on
+        progress = logged(monitor, f"progress_{name}")
+        assert progress and min(progress) > min(held)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"holdout_envs": 2, "holdout_positions": 4},
+        {"holdout_envs": 1, "holdout_positions": 3},
+        {"holdout_envs": 1, "holdout_positions": 0},
+        {"progress_lag": 2},
+        {"holdout_envs": 1, "holdout_positions": 4, "progress_lag": -1},
+    ],
+)
+def test_bad_holdout_settings_are_refused(env, tmp_path, kwargs):
+    with pytest.raises(ValueError):
+        make_trainer(env, tmp_path, train_batch_size=4, **kwargs)
+
+
 def test_self_play_logs_every_move_of_whole_games(env, tmp_path):
     moves_dir = tmp_path / "moves"
     trainer = make_trainer(
