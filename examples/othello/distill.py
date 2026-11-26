@@ -213,6 +213,7 @@ def train(
     weight_decay: float,
     value_target_q: float,
     seed: int,
+    warmup_steps: int = 0,
     eval_every: int,
     train_probe_size: int,
     ckpt_dir: Path | None,
@@ -232,6 +233,13 @@ def train(
             f"{len(positions.reward)} positions are too few for batches of {batch_size}"
         )
     optimizer = make_optimizer(passes * steps_per_pass, lr, lr_final, weight_decay)
+    if warmup_steps:
+        # a fresh Adam's first steps move every weight by about lr, whatever its gradient:
+        # from a trained network, ramp the updates up instead
+        optimizer = optax.chain(
+            optimizer,
+            optax.scale_by_schedule(optax.linear_schedule(0.0, 1.0, warmup_steps)),
+        )
     params, static = eqx.partition(network, eqx.is_inexact_array)
     opt_state = optimizer.init(params)
     step = make_train_step(optimizer, value_target_q)
@@ -404,6 +412,7 @@ def train_command(args) -> None:
             lr=args.lr,
             lr_final=args.lr_final,
             weight_decay=args.weight_decay,
+            warmup_steps=args.warmup_steps,
             value_target_q=args.value_target_q,
             seed=args.seed,
             eval_every=args.eval_every,
@@ -504,6 +513,12 @@ def main():
     fit.add_argument("--lr", type=float, default=1e-3)
     fit.add_argument("--lr-final", type=float, default=1e-4)
     fit.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY)
+    fit.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=0,
+        help="ramp the updates up from 0 over this many steps (from a trained --init-from)",
+    )
     fit.add_argument("--train-dtype", default="bfloat16")
     fit.add_argument("--seed", type=int, default=0)
     fit.add_argument("--eval-every", type=int, default=2, help="in passes")
