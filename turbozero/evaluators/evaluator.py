@@ -69,9 +69,9 @@ class Evaluator:
         raise NotImplementedError()
 
     def search_cycles(self) -> int:
-        """Returns the number of cycles a move's search takes. Cycles are
-        self-play's unit of compute: it plays a move once its search has run
-        this many.
+        """Returns the number of cycles a move's search takes (at most, if its
+        searches vary in length, see `search_done`). Cycles are self-play's unit
+        of compute.
         """
         return 1
 
