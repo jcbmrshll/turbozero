@@ -230,7 +230,7 @@ def run(args: argparse.Namespace) -> None:
     if args.on == "local" and (args.jobs or 1) > 1:
         play_here_in_jobs(store, spec, match_id, args.jobs, args.store)
     elif args.on == "local":
-        play_here(store, spec, match_id, args.parallel)
+        play_here(store, spec, match_id, args.parallel, args.batch_starts)
     else:
         play_in_cloud(store, spec, match_id, placement, args)
     report(store, match_id)
@@ -244,7 +244,13 @@ def run(args: argparse.Namespace) -> None:
         raise SystemExit(f"{played} of {spec.games} games played{where}")
 
 
-def play_here(store: Store, spec: MatchSpec, match_id: str, parallel: int = 1) -> None:
+def play_here(
+    store: Store,
+    spec: MatchSpec,
+    match_id: str,
+    parallel: int = 1,
+    batch_starts: int = 64,
+) -> None:
     check_devices(spec)
     done = store.numbers(match_id)
     numbers = [n for n in numbers_of(spec.openings) if n not in done]
@@ -264,6 +270,7 @@ def play_here(store: Store, spec: MatchSpec, match_id: str, parallel: int = 1) -
         emit,
         lambda info, host: store.add_run(match_id, info, host),
         parallel,
+        batch_starts,
     )
 
 
@@ -938,6 +945,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="games at once in a process, each in a thread on the same cores: for engines. "
         "Same moves at fixed budgets",
+    )
+    p.add_argument(
+        "--batch-starts",
+        type=int,
+        default=64,
+        help="with a gpu-batched network, here: the starts played at once (each half of a "
+        "batch moves this many games in step). The GPU is mostly idle at 64; each game holds "
+        "both sides' search trees, about 10 MB each at 2048 visits",
     )
     p.add_argument(
         "--jobs",
