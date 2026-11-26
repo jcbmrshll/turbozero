@@ -20,11 +20,12 @@ def node(n):
     )
 
 
-def test_init_mcts_tree_starts_without_root_noise():
+def test_init_mcts_tree_starts_without_root_noise_as_a_full_search():
     tree = init_mcts_tree(5, 3, node(0))
 
     assert isinstance(tree, MCTSTree)
     np.testing.assert_array_equal(tree.root_noise, jnp.zeros(3, dtype=jnp.float32))
+    assert not bool(tree.fast)
 
 
 def test_tree_methods_keep_the_mcts_tree_and_its_root_noise():
