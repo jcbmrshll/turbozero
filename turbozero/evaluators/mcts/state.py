@@ -32,7 +32,7 @@ class MCTSTree(Tree[MCTSNode]):
 def init_mcts_tree(
     max_nodes: int, branching_factor: int, template_data: MCTSNode
 ) -> MCTSTree:
-    """An empty MCTSTree, see `init_tree`."""
+    """Creates an empty MCTSTree with zero root noise (see `init_tree`)."""
     return MCTSTree(
         **vars(init_tree(max_nodes, branching_factor, template_data)),
         root_noise=jnp.zeros((branching_factor,), dtype=jnp.float32),
