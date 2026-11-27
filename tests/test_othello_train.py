@@ -48,6 +48,13 @@ def test_root_noise_options_reach_self_play_only(monkeypatch):
     assert built.value.kwargs["evaluator_test"].dirichlet_alpha == 0.3
 
 
+@pytest.mark.parametrize("options, envs", [((), 1024), (("--envs", "2048"), 2048)])
+def test_envs_sets_the_self_play_environments(monkeypatch, options, envs):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, *options)
+    assert built.value.kwargs["batch_size"] == envs
+
+
 @pytest.mark.parametrize(
     "option", [("--dirichlet-alpha", "0"), ("--dirichlet-epsilon", "1.5")]
 )
