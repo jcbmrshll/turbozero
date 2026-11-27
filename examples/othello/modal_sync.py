@@ -35,11 +35,17 @@ def write_atomic(path: Path, data: bytes) -> None:
 
 
 def jobs_in(store: Store) -> list[str]:
-    return sorted(
-        key.split("/")[1]
-        for key in store.sizes("jobs/")
+    return sorted(statuses_in(store))
+
+
+def statuses_in(store: Store) -> dict[str, int | None]:
+    """Each job, with the size of its status.json (None before it has one)."""
+    listing = store.sizes("jobs/")
+    return {
+        key.split("/")[1]: listing.get(key.removesuffix("job.json") + "status.json")
+        for key in sorted(listing)
         if key.count("/") == 2 and key.endswith("/job.json")
-    )
+    }
 
 
 class Sync:
@@ -58,29 +64,65 @@ class Sync:
         self.state: dict[str, Any] = (
             json.loads(self.state_path.read_text()) if self.state_path.exists() else {}
         )
+        # bundles slick has: one never changes once there, so it's asked about once
+        self.bundles_known: set[str] = set()
+        # jobs whose last pass failed
+        self.failed: list[str] = []
 
     def _save(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         write_atomic(self.state_path, json.dumps(self.state).encode())
 
     def run(self) -> list[str]:
-        """Brings what's new of every job not yet done; what it did, a line each."""
-        out = []
-        for name in jobs_in(self.store):
+        """Brings what's new of every job not yet done; what it did, a line each. A job that
+        fails (the bucket or slick away) is a line too, and tried again next time; the others
+        go on."""
+        out: list[str] = []
+        self.failed = []
+        for name, status_size in statuses_in(self.store).items():
             record = self.state.setdefault(name, {"files": {}, "runs": {}})
-            if record.get("complete"):
-                continue
-            out += self._job(name, record)
+            try:
+                if record.get("complete"):
+                    if not self._resumed(name, record, status_size):
+                        continue
+                    out.append(f"{name}: running again")
+                out += self._job(name, record, status_size)
+            except Exception as e:  # noqa: BLE001
+                self.failed.append(name)
+                out.append(f"{name}: sync failed, will retry: {e!r}")
+            # what it brought before a failure is here: the record says so
             self._save()
         return out
 
-    def _job(self, name: str, record: dict[str, Any]) -> list[str]:
+    def _resumed(
+        self, name: str, record: dict[str, Any], status_size: int | None
+    ) -> bool:
+        """Whether a job synced to its end has run again since (`resume`): its status.json,
+        read only when it has changed size, has attempts the end didn't."""
+        if status_size == record.get("status_size"):
+            return False
+        status = get_json(self.store, job_key(name, "status.json")) or {}
+        attempts = len(status.get("attempts", []))
+        if status.get("state") in TERMINAL and attempts <= record.get(
+            "attempts", attempts
+        ):
+            record["status_size"], record["attempts"] = status_size, attempts
+            return False
+        del record["complete"]
+        return True
+
+    def _job(
+        self, name: str, record: dict[str, Any], status_size: int | None
+    ) -> list[str]:
         # read before anything else: if it says the job is over, what follows is all there is
         status = get_json(self.store, job_key(name, "status.json")) or {}
         out = self._files(name, record)
         out += self._seaglass(name, record, status)
         if status.get("state") in TERMINAL:
             record["complete"] = True
+            # the size listed may be an older status's: then the next pass reads it again
+            record["status_size"] = status_size
+            record["attempts"] = len(status.get("attempts", []))
             out.append(f"{name}: {status['state']}, all here")
         return out
 
@@ -128,12 +170,15 @@ class Sync:
         }
         out: list[str] = []
         by_run: dict[str, dict[str, int]] = {}
+        bundles: set[str] = set()
         for rel, size in sizes.items():
             top, _, rest = rel.partition("/")
             if top == "bundles":
-                self._bundle(prefix, rest.partition("/")[0], sizes)
+                bundles.add(rest.partition("/")[0])
             else:
                 by_run.setdefault(top, {})[rest] = size
+        for bundle in sorted(bundles):
+            self._bundle(prefix, bundle, sizes)
         for run, files in sorted(by_run.items()):
             if "meta.json" in files:
                 out += self._run(prefix, name, run, files, record, status)
@@ -141,16 +186,22 @@ class Sync:
 
     def _bundle(self, prefix: str, bundle: str, sizes: dict[str, int]) -> None:
         """A run's views, over slick's API, which checks them."""
-        if self.seaglass_url is None or self._has_bundle(bundle):
+        if self.seaglass_url is None or bundle in self.bundles_known:
             return
-        at = f"bundles/{bundle}/"
-        files = {
-            rel.removeprefix(at): base64.b64encode(
-                self.store.get_bytes(prefix + rel) or b""
-            ).decode()
-            for rel in sizes
-            if rel.startswith(at)
-        }
+        if not self._has_bundle(bundle):
+            at = f"bundles/{bundle}/"
+            files = {
+                rel.removeprefix(at): base64.b64encode(
+                    self.store.get_bytes(prefix + rel) or b""
+                ).decode()
+                for rel in sizes
+                if rel.startswith(at)
+            }
+            self._put_bundle(bundle, files)
+        self.bundles_known.add(bundle)
+
+    def _put_bundle(self, bundle: str, files: dict[str, str]) -> None:
+        assert self.seaglass_url is not None
         request = urllib.request.Request(
             f"{self.seaglass_url}/api/bundles/{bundle}",
             data=json.dumps({"files": files}).encode(),

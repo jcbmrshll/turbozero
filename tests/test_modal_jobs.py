@@ -6,6 +6,7 @@ import json
 import socket
 import textwrap
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -550,6 +551,113 @@ def test_a_heartbeat_in_flight_at_the_end_doesnt_undo_the_final_status(scene):
     assert status["state"] == "done"
 
 
+class Recording(modal_store.DirStore):
+    """A bucket that notes each key written to it."""
+
+    def __init__(self, root):
+        super().__init__(root)
+        self.puts: list[str] = []
+
+    def put_file(self, key, path):
+        self.puts.append(key)
+        super().put_file(key, path)
+
+    def put_bytes(self, key, data):
+        self.puts.append(key)
+        super().put_bytes(key, data)
+
+
+def test_a_new_attempt_doesnt_send_back_the_state_it_branches_from(scene):
+    # a job's step saved a state and the job ended; a step added later branches from it
+    c = f"{scene.home}/.cache/turbozero/c"
+    scene.job(step("a", "--epochs 3 --save-state-at 3"), name="p")
+    assert scene.runner("p").run() == "done"
+    manifest_key = modal_spec.job_key("p", "manifest.json")
+    state_key = "files/.cache/turbozero/c/a/state-3.npz"
+    before = modal_store.get_json(scene.store, manifest_key)[state_key]
+    branch = step("b", f"--epochs 2 --branch-from {c}/a/state-3.npz")
+    modal_jobs.extend_job(
+        scene.store, "p", [modal_spec.parse_step(branch, str(scene.home))]
+    )
+    scene.wipe_container()
+    store = Recording(scene.store.root)
+    runner = modal_run.Runner(store, "p", scene.place(), describe_gpu=dict)
+    assert runner.run() == "done"
+    assert "branching from" in (scene.root / "l" / "b.log").read_text()
+    assert state_key not in store.puts
+    # nor does the manifest say it changed: the sync would bring it again
+    assert modal_store.get_json(scene.store, manifest_key)[state_key] == before
+
+
+def test_a_new_attempt_doesnt_send_back_what_it_resumes_from(scene):
+    scene.job(
+        step("t", "--epochs 12 --keep-every 5 --die-at 8"), name="p", resume_every=5
+    )
+    with pytest.raises(RuntimeError, match="lost"):
+        scene.runner("p").run()
+    died = scene.root / "c" / "t.died"
+    keep = died.read_text()
+    scene.wipe_container()
+    died.parent.mkdir(parents=True)
+    died.write_text(keep)
+
+    store = Recording(scene.store.root)
+    runner = modal_run.Runner(store, "p", scene.place(), describe_gpu=dict)
+    assert runner.run() == "done"
+    assert "resuming from 5" in (scene.root / "l" / "t.log").read_text()
+    resume_key = modal_spec.job_key("p", "resume", "0", "state.npz")
+    # the state it went on from was in the bucket: only the next one, of epoch 10, is sent
+    assert store.puts.count(resume_key) == 1
+    assert modal_store.get_json(scene.store, resume_key + ".json") == {"epoch": 10}
+    # a checkpoint it brought back and didn't write again
+    assert "files/.cache/turbozero/c/t/0.eqx" not in store.puts
+
+
+def test_a_state_on_its_way_doesnt_hold_up_the_rest(scene):
+    """A big state takes minutes to send: meanwhile the checkpoints, the log, the seaglass
+    rows and the manifest go on arriving."""
+    scene.job(step("t", "--epochs 6 --save-state-at 2"), name="g")
+    manifest_key = modal_spec.job_key("g", "manifest.json")
+
+    class Gate(modal_store.DirStore):
+        release = threading.Event()
+
+        def put_bytes(self, key, data):
+            if key.endswith(".npz"):
+                assert Gate.release.wait(30)
+            super().put_bytes(key, data)
+
+    seen = {}
+
+    def watch():
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            manifest = modal_store.get_json(scene.store, manifest_key) or {}
+            rows = [
+                key
+                for key, size in scene.store.sizes("jobs/g/seaglass/").items()
+                if key.endswith("metrics.jsonl") and size
+            ]
+            if "files/.cache/turbozero/c/t/5.eqx" in manifest and rows:
+                rows_there = scene.store.get_bytes(rows[0]).decode().splitlines()
+                if len(rows_there) == 6:
+                    seen["manifest"] = manifest
+                    break
+            time.sleep(0.05)
+        Gate.release.set()
+
+    thread = threading.Thread(target=watch)
+    thread.start()
+    runner = modal_run.Runner(Gate(scene.store.root), "g", scene.place(), dict)
+    assert runner.run() == "done"
+    thread.join()
+    assert "manifest" in seen, "the rest waited for the state"
+    state_key = "files/.cache/turbozero/c/t/state-2.npz"
+    assert state_key not in seen["manifest"]  # listed once it's there, not before
+    assert state_key in modal_store.get_json(scene.store, manifest_key)
+    assert scene.store.sizes(state_key)
+
+
 # --- sync
 
 
@@ -639,6 +747,86 @@ def test_a_finished_job_is_left_alone_after_its_last_sync(scene):
     sync = scene.sync()
     assert sync.run()
     assert sync.run() == []
+
+
+def test_one_jobs_failure_doesnt_stop_the_others(scene):
+    make_finished_job(scene, name="a")
+    make_finished_job(scene, name="b")
+
+    class Away(modal_store.DirStore):
+        def get_bytes(self, key, start=0):
+            if key == modal_spec.job_key("a", "manifest.json"):
+                raise TimeoutError("timed out")
+            return super().get_bytes(key, start)
+
+    sync = modal_sync.Sync(
+        Away(scene.store.root),
+        str(scene.home),
+        scene.slick,
+        scene.tmp / "sync.json",
+        None,
+    )
+    lines = sync.run()
+    assert any(line.startswith("a: sync failed") for line in lines)
+    assert sync.failed == ["a"]
+    assert (scene.root / "l" / "b.log").exists()
+    assert any("b: done, all here" in line for line in lines)
+    # tried again next time, and done then
+    lines = scene.sync().run()
+    assert any("a: done, all here" in line for line in lines)
+
+
+def test_each_bundle_is_asked_about_once(scene):
+    make_finished_job(scene)
+    status_key = modal_spec.job_key("j", "status.json")
+    status = modal_store.get_json(scene.store, status_key)
+    modal_store.put_json(scene.store, status_key, {**status, "state": "running"})
+    for rel in ("have/a.json", "have/b.json", "new/a.json", "new/b.json"):
+        key = modal_spec.job_key("j", "seaglass", "bundles", rel)
+        scene.store.put_bytes(key, b"{}")
+
+    asked: list[str] = []
+    sent: dict[str, list[str]] = {}
+
+    class Slick(modal_sync.Sync):
+        def _has_bundle(self, bundle):
+            asked.append(bundle)
+            return bundle == "have"
+
+        def _put_bundle(self, bundle, files):
+            sent[bundle] = sorted(files)
+
+    sync = Slick(
+        scene.store, str(scene.home), scene.slick, scene.tmp / "sync.json", "http://x"
+    )
+    sync.run()
+    sync.run()
+    assert sorted(asked) == ["have", "new"]
+    assert sent == {"new": ["a.json", "b.json"]}
+
+
+def test_a_job_run_again_after_its_end_is_synced_again(scene):
+    make_finished_job(scene)
+    sync = scene.sync()
+    sync.run()
+    assert sync.run() == []
+    # a status rewritten without a new attempt (a last heartbeat): still over
+    status_key = modal_spec.job_key("j", "status.json")
+    status = modal_store.get_json(scene.store, status_key)
+    modal_store.put_json(scene.store, status_key, {**status, "heartbeat": 12345678.9})
+    assert sync.run() == []
+    # `resume`: a new attempt, running
+    attempts = [*status["attempts"], {"start": 1.0, "seconds": 0.0}]
+    modal_store.put_json(scene.store, status_key, {**status, "state": "running", "attempts": attempts})  # fmt: skip
+    log_key = "files/.cache/turbozero/l/j.log"
+    scene.store.put_bytes(log_key, scene.store.get_bytes(log_key) + b"more\n")
+    manifest_key = modal_spec.job_key("j", "manifest.json")
+    manifest = modal_store.get_json(scene.store, manifest_key)
+    manifest[log_key] = [manifest[log_key][0] + 5, 1]
+    modal_store.put_json(scene.store, manifest_key, manifest)
+    lines = scene.sync().run()  # a sync started since, from what the last one saved
+    assert "j: running again" in lines
+    assert (scene.root / "l" / "j.log").read_text().endswith("more\n")
 
 
 def test_jobs_in_finds_jobs(scene):

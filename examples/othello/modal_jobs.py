@@ -419,11 +419,13 @@ def sync(args: argparse.Namespace) -> None:
                 for line in syncer.run():
                     print(line, flush=True)
             except Exception as e:
-                # the bucket or slick is away: all this is still there for the next time
+                # the bucket is away: all this is still there for the next time
                 print(f"sync failed, will retry: {e!r}", file=sys.stderr, flush=True)
                 if args.watch is None:
                     raise
             if args.watch is None:
+                if syncer.failed:
+                    raise SystemExit(f"sync failed for {', '.join(syncer.failed)}")
                 return
             time.sleep(args.watch)
 

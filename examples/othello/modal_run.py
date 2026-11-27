@@ -80,17 +80,34 @@ class Mirror:
     """Copies files to the bucket when they change: a step's checkpoint directory and log under
     their own keys, the seaglass runs and the newest state to continue from under the job's.
     The manifest lists what's live, as a local run's directories would hold it, for sync.
+
+    Saved states (GBs each with PCR trees, minutes to send) go on a lane of their own, so the
+    rest (logs, checkpoints, seaglass, the manifest) keeps arriving while one is on its way.
     """
 
     def __init__(self, store: Store, job: Job, name: str, place: Place):
         self.store, self.job, self.name, self.place = store, job, name, place
+        # bucket key -> (size, mtime) of the file here that's in the bucket under it
         self.sent: dict[str, tuple[int, int]] = {}
+        # those brought here from the bucket: their manifest entries stay as they were
+        self.restored: dict[str, tuple[int, int]] = {}
         # bucket key -> [size, mtime]: what's live and already in the bucket
         self.manifest: dict[str, list[int]] = (
             get_json(store, job_key(name, "manifest.json")) or {}
         )
-        self.lock = threading.Lock()
+        self.lock = threading.Lock()  # one tick of the rest at a time
+        self.states_lock = threading.Lock()  # one state upload at a time
+        self.manifest_lock = threading.Lock()
         self.manifest_sent: dict[str, list[int]] | None = None
+
+    def fetch(self, key: str, path: str) -> bool:
+        """Brings `key` to `path`, as get_file does, noting that the bucket has it: a new
+        attempt doesn't send back what it restored."""
+        if not self.store.get_file(key, path):
+            return False
+        stat = os.stat(path)
+        self.sent[key] = self.restored[key] = (stat.st_size, stat.st_mtime_ns)
+        return True
 
     def _send(self, key: str, path: str, sig: tuple[int, int]) -> bool:
         """Sends `path` if it changed; whether it now is in the bucket as `sig` says."""
@@ -139,22 +156,42 @@ class Mirror:
             key = job_key(self.name, "seaglass", str(path.relative_to(root)))
             self._send(key, str(path), (stat.st_size, stat.st_mtime_ns))
 
-    def _send_step(self, index: int, step: Step) -> None:
-        for path, key, implicit in self._files(step):
+    def _send_file(self, index: int, path: str, key: str, implicit: bool) -> None:
+        try:
             stat = os.stat(path)
-            sig = (stat.st_size, stat.st_mtime_ns)
-            if implicit:
-                self._send_resume_state(index, path, sig)
-            elif self._send(key, path, sig):
+        except FileNotFoundError:
+            return  # rolled off since it was listed
+        sig = (stat.st_size, stat.st_mtime_ns)
+        if implicit:
+            self._send_resume_state(index, path, sig)
+        elif self.restored.get(key) == sig:
+            # as the bucket has it: a manifest entry of it stays as it was, or the sync would
+            # bring the same file again for its new mtime
+            with self.manifest_lock:
+                self.manifest.setdefault(key, [stat.st_size, stat.st_mtime_ns])
+        elif self._send(key, path, sig):
+            with self.manifest_lock:
                 self.manifest[key] = [stat.st_size, stat.st_mtime_ns]
+
+    def _send_step(self, index: int, step: Step) -> None:
+        """A step's files but its saved states, and the manifest's entries of those it deleted."""
+        files = self._files(step)
+        for path, key, implicit in files:
+            if not STATE.fullmatch(os.path.basename(path)):
+                self._send_file(index, path, key, implicit)
         # what train.py deleted is gone from a local run too; a saved state it asked for stays,
         # sent on and needed on no disk here after a restart
-        live = {key for _, key, _ in self._files(step)}
+        live = {key for _, key, _ in files}
         prefix = self.job.key_of(step.ckpt_dir) + "/"
-        for key in list(self.manifest):
-            name = key.rsplit("/", 1)[-1]
-            if key.startswith(prefix) and key not in live and not STATE.fullmatch(name):
-                del self.manifest[key]
+        with self.manifest_lock:
+            for key in list(self.manifest):
+                name = key.rsplit("/", 1)[-1]
+                if (
+                    key.startswith(prefix)
+                    and key not in live
+                    and not STATE.fullmatch(name)
+                ):
+                    del self.manifest[key]
 
     def _send_resume_state(self, index: int, path: str, sig: tuple[int, int]) -> None:
         key = job_key(self.name, "resume", str(index), "state.npz")
@@ -168,35 +205,58 @@ class Mirror:
         self.sent[key] = sig
         put_json(self.store, key + ".json", {"epoch": epoch})
 
-    def tick(self, step: tuple[int, Step] | None) -> None:
-        """Sends what changed: the running step's files, and what earlier steps' are still to
-        send (a step's last files go on uploading while the next one runs). One at a time, so
-        a later tick picks up what this one missed."""
-        with self.lock:
-            self._send_seaglass()
-            if step is not None:
-                for index, earlier in enumerate(self.job.steps[: step[0] + 1]):
-                    self._send_step(index, earlier)
+    def _put_manifest(self) -> None:
+        with self.manifest_lock:
             if self.manifest != self.manifest_sent:
                 put_json(self.store, job_key(self.name, "manifest.json"), self.manifest)
                 self.manifest_sent = dict(self.manifest)
 
+    def _steps(self, step: tuple[int, Step] | None) -> list[tuple[int, Step]]:
+        """The running step's and earlier ones' (a step's last files go on uploading while the
+        next one runs)."""
+        return [] if step is None else list(enumerate(self.job.steps[: step[0] + 1]))
 
-def restore_seaglass(store: Store, name: str, root: str) -> None:
+    def tick_rest(self, step: tuple[int, Step] | None) -> None:
+        """Sends what changed but saved states, then the manifest. One at a time, so a later
+        tick picks up what this one missed."""
+        with self.lock:
+            self._send_seaglass()
+            for index, earlier in self._steps(step):
+                self._send_step(index, earlier)
+            self._put_manifest()
+
+    def tick_states(self, step: tuple[int, Step] | None) -> None:
+        """Sends the saved states not yet sent, oldest step's and smallest first, the manifest
+        after each."""
+        with self.states_lock:
+            for index, earlier in self._steps(step):
+                for path, key, implicit in self._files(earlier):
+                    if STATE.fullmatch(os.path.basename(path)):
+                        self._send_file(index, path, key, implicit)
+                        self._put_manifest()
+
+    def tick(self, step: tuple[int, Step] | None) -> None:
+        """Sends all that changed."""
+        self.tick_rest(step)
+        self.tick_states(step)
+
+
+def restore_seaglass(mirror: Mirror, root: str) -> None:
     """The job's seaglass runs as they are in the bucket, for a run to go on with."""
-    prefix = job_key(name, "seaglass") + "/"
-    for key in store.sizes(prefix):
+    prefix = job_key(mirror.name, "seaglass") + "/"
+    for key in mirror.store.sizes(prefix):
         path = os.path.join(root, key.removeprefix(prefix))
-        store.get_file(key, path)
+        mirror.fetch(key, path)
     # a file sent mid-line ends in part of a row: what's next would be appended to it
     for path in Path(root).rglob("*.jsonl"):
         data = path.read_bytes()
         path.write_bytes(data[: data.rfind(b"\n") + 1])
 
 
-def restore_step(store: Store, job: Job, name: str, index: int, step: Step) -> bool:
+def restore_step(mirror: Mirror, index: int, step: Step) -> bool:
     """A step's files as the bucket has them, its newest state among them. Whether there's a
     state to continue from: otherwise the step starts over, on what it sent before."""
+    store, job, name = mirror.store, mirror.job, mirror.name
     prefix = job.key_of(step.ckpt_dir) + "/"
     states: dict[int, str] = {}
     for key in store.sizes(prefix):
@@ -211,21 +271,21 @@ def restore_step(store: Store, job: Job, name: str, index: int, step: Step) -> b
     if not states:
         return False
     epoch = max(states)
-    store.get_file(states[epoch], os.path.join(step.ckpt_dir, f"state-{epoch}.npz"))
+    mirror.fetch(states[epoch], os.path.join(step.ckpt_dir, f"state-{epoch}.npz"))
     manifest = get_json(store, job_key(name, "manifest.json")) or {}
     for key in manifest:
         filename = key.removeprefix(prefix)
         if key.startswith(prefix) and not STATE.fullmatch(filename):
-            store.get_file(key, os.path.join(step.ckpt_dir, filename))
-    store.get_file(job.key_of(step.log), step.log)
+            mirror.fetch(key, os.path.join(step.ckpt_dir, filename))
+    mirror.fetch(job.key_of(step.log), step.log)
     return True
 
 
-def ensure_input(store: Store, job: Job, path: str | None) -> None:
+def ensure_input(mirror: Mirror, path: str | None) -> None:
     """A file the step reads, from the bucket if an earlier attempt or job made it."""
     if path is None or os.path.exists(path):
         return
-    if not store.get_file(job.key_of(path), path):
+    if not mirror.fetch(mirror.job.key_of(path), path):
         raise FileNotFoundError(f"{path} isn't here or in the bucket")
 
 
@@ -278,7 +338,15 @@ class Runner:
 
     def _mirror_loop(self) -> None:
         while not self.stop_thread.wait(self.place.mirror_seconds):
-            self._safe_tick()
+            self._safe_tick(states=False)
+
+    def _states_loop(self) -> None:
+        """Saved states on their own: one takes minutes to send."""
+        while not self.stop_thread.wait(self.place.mirror_seconds):
+            try:
+                self.mirror.tick_states(self.step_now)
+            except Exception as e:  # noqa: BLE001
+                print(f"modal-jobs: state upload failed, will retry: {e!r}", flush=True)
 
     def _heartbeat_loop(self) -> None:
         """The heartbeat on its own: an upload of a big state mustn't make the job look silent."""
@@ -288,10 +356,15 @@ class Runner:
             except Exception as e:  # noqa: BLE001
                 print(f"modal-jobs: heartbeat failed, will retry: {e!r}", flush=True)
 
-    def _safe_tick(self) -> bool:
-        """A trouble with the bucket mustn't stop training: the next tick tries again."""
+    def _safe_tick(self, states: bool = True) -> bool:
+        """A trouble with the bucket mustn't stop training: the next tick tries again. Without
+        `states`, all but the saved states, which may be uploading for minutes on their own
+        thread."""
         try:
-            self.mirror.tick(self.step_now)
+            if states:
+                self.mirror.tick(self.step_now)
+            else:
+                self.mirror.tick_rest(self.step_now)
             self._heartbeat()
             return True
         except Exception as e:  # noqa: BLE001
@@ -307,7 +380,7 @@ class Runner:
 
     def _start_seaglass(self) -> subprocess.Popen[bytes]:
         os.makedirs(self.place.seaglass_root, exist_ok=True)
-        restore_seaglass(self.store, self.name, self.place.seaglass_root)
+        restore_seaglass(self.mirror, self.place.seaglass_root)
         server = subprocess.Popen(
             [
                 self.place.python,
@@ -388,10 +461,10 @@ class Runner:
             return "done"
         os.makedirs(step.ckpt_dir, exist_ok=True)
         os.makedirs(os.path.dirname(step.log), exist_ok=True)
-        ensure_input(self.store, job, flag(step.argv, "--engine-set"))
+        ensure_input(self.mirror, flag(step.argv, "--engine-set"))
         for _, path in start_states(step.argv):
-            ensure_input(self.store, job, path)
-        resume = restore_step(self.store, job, self.name, index, step)
+            ensure_input(self.mirror, path)
+        resume = restore_step(self.mirror, index, step)
         if not resume:
             self._crash_runs(done.get("runs", []))
             done["runs"] = []
@@ -485,7 +558,7 @@ class Runner:
                 return False
             if index < len(self._reload().steps):
                 return True
-            self._safe_tick()
+            self._safe_tick(states=False)
             time.sleep(self.place.mirror_seconds)
         return False
 
@@ -534,12 +607,14 @@ class Runner:
         RuntimeError if the machine lost a step, for Modal to run it again."""
         job = self.job
         Path(engine_set_path(job.home)).parent.mkdir(parents=True, exist_ok=True)
-        ensure_input(self.store, job, engine_set_path(job.home))
+        ensure_input(self.mirror, engine_set_path(job.home))
         server = self._start_seaglass()
         thread = threading.Thread(target=self._mirror_loop, daemon=True)
         thread.start()
         beat = threading.Thread(target=self._heartbeat_loop, daemon=True)
         beat.start()
+        states = threading.Thread(target=self._states_loop, daemon=True)
+        states.start()
         outcome, index = "done", 0
         try:
             self._heartbeat()
@@ -577,6 +652,13 @@ class Runner:
             self.stop_thread.set()
             thread.join()
             beat.join()
+            # the rest as the job ends, before waiting on a state that may take minutes: no
+            # heartbeat, whose final status would tell the sync it's all there before it is
+            try:
+                self.mirror.tick_rest(self.step_now)
+            except Exception as e:  # noqa: BLE001
+                print(f"modal-jobs: upload failed, will retry: {e!r}", flush=True)
+            states.join()
             self._flush()
             server.terminate()
         print(f"modal-jobs: {self.name}: {outcome}", flush=True)
