@@ -13,7 +13,6 @@ import numpy as np
 import pytest
 
 from core.training.endgame_solve import EndgameSolve
-from core.training.train import CollectionStats
 
 LENGTH = 6
 # games stop before their 4th move: 4 positions stored, the stopped one included
@@ -150,7 +149,6 @@ def test_a_game_finding_every_slot_full_plays_on(
     state = collect(STOP + 1 + LENGTH)
 
     np.testing.assert_array_equal(state.pending.added, [1])
-    np.testing.assert_array_equal(state.pending.missed, [1])
     np.testing.assert_array_equal(state.episodes, [1])
     np.testing.assert_array_equal(sampleable(state), STOP + 1 + np.arange(LENGTH))
     np.testing.assert_array_equal(
@@ -194,20 +192,6 @@ def test_a_resized_buffer_keeps_its_waiting_games(
     state = solve_and_label(trainer, state)
     np.testing.assert_array_equal(sampleable(state), np.arange(4))
     np.testing.assert_array_equal(state.episodes, [2])
-
-
-def test_collection_metrics_count_missed_games(
-    fixed_length_env, make_collector, scripted, tmp_path
-):
-    env = fixed_length_env(length=LENGTH)
-    collect = collector(make_collector, env, scripted, tmp_path, slots=1)
-
-    before, after = CollectionStats.of(collect(0)), collect(STOP + 1 + LENGTH)
-    metrics = collect.trainer.collection_metrics(before, after)
-
-    assert int(metrics["solve_missed"]) == 1
-    # the played-out game; the stopped one counts when it's labelled
-    assert int((after.episodes - before.episodes).sum()) == 1
 
 
 # past the solve point: never ending early, a game plays to its end
@@ -259,7 +243,6 @@ def test_a_solve_past_the_solve_point_finding_no_slot_ends_the_game(
 
     # the solve point took the only slot; the next position is dropped, and a new game started
     np.testing.assert_array_equal(state.pending.added, [1])
-    np.testing.assert_array_equal(state.pending.missed, [1])
     np.testing.assert_array_equal(
         state.pending.entry_solve[0, : STOP + 2], [0] * (STOP + 1) + [-1]
     )

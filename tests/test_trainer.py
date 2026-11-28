@@ -2082,45 +2082,53 @@ def test_held_out_positions_are_compared_with_trained_on_ones_of_their_ages(
     )
     params = eqx.filter(trainer.nn, eqx.is_inexact_array)
 
-    metrics = trainer.holdout_metrics(
-        jax.random.PRNGKey(0), state, {"raw": (params, None)}
-    )
+    metrics = trainer.holdout_metrics(jax.random.PRNGKey(0), state, (params, None))
 
     # both sides sample the newest positions only, which are alike: nothing memorized
     for metric in ("policy_kl", "value_loss"):
-        assert metrics[f"heldout_{metric}_raw"] == pytest.approx(
-            metrics[f"seen_{metric}_raw"]
-        )
-        assert metrics[f"memorized_{metric}_raw"] == pytest.approx(0.0, abs=1e-6)
-        assert metrics[f"memorized_{metric}_raw_se"] == pytest.approx(0.0, abs=1e-6)
-    assert int(metrics["heldout_stored"]) == 3
+        assert metrics[f"heldout_{metric}"] == pytest.approx(metrics[f"seen_{metric}"])
+        assert metrics[f"memorized_{metric}"] == pytest.approx(0.0, abs=1e-6)
+        assert metrics[f"memorized_{metric}_se"] == pytest.approx(0.0, abs=1e-6)
     # held-out positions newer than every trained-on one score nothing
     populated = np.zeros((2, 8), bool)
     populated[0, :4] = True
     populated[1, 7] = True
     newer = buffer_of(trainer, new, populated)
-    assert (
-        trainer.holdout_metrics(jax.random.PRNGKey(0), newer, {"raw": (params, None)})
-        == {}
-    )
+    assert trainer.holdout_metrics(jax.random.PRNGKey(0), newer, (params, None)) == {}
 
 
-def test_the_network_and_its_average_are_scored_on_held_out_games(env, tmp_path):
+def test_the_average_is_scored_on_held_out_games(env, tmp_path, monkeypatch):
     monitor = FakeMonitor()
     trainer = held_out_trainer(env, tmp_path, average_epochs=2, monitor=monitor)
+    played, scored = [], []
+    collect_steps, holdout_metrics = trainer.collect_steps, trainer.holdout_metrics
+
+    def recording_collect(key, state, params, num_steps):
+        played.append(jax.tree.map(np.asarray, params))
+        return collect_steps(key, state, params, num_steps)
+
+    def recording_holdout(key, buffer_state, params):
+        scored.append(jax.tree.map(np.asarray, params))
+        return holdout_metrics(key, buffer_state, params)
+
+    monkeypatch.setattr(trainer, "collect_steps", recording_collect)
+    monkeypatch.setattr(trainer, "holdout_metrics", recording_holdout)
 
     trainer.train_loop(seed=0, num_epochs=3)
 
+    # the weights scored are the average self-play played with, not the network's
+    assert len(scored) == len(played) == 3
+    for p, s in zip(played, scored, strict=True):
+        jax.tree.map(np.testing.assert_array_equal, p, s)
     for name in ("policy_kl", "value_loss"):
-        for weights in ("raw", "avg"):
-            held = logged(monitor, f"heldout_{name}_{weights}")
-            seen = logged(monitor, f"seen_{name}_{weights}")
-            memorized = logged(monitor, f"memorized_{name}_{weights}")
-            assert held and set(held) == set(seen) == set(memorized)
-            for epoch in held:
-                assert memorized[epoch] == pytest.approx(
-                    held[epoch] - seen[epoch], abs=1e-6
-                )
+        held = logged(monitor, f"heldout_{name}")
+        seen = logged(monitor, f"seen_{name}")
+        memorized = logged(monitor, f"memorized_{name}")
+        assert held and set(held) == set(seen) == set(memorized)
+        for epoch in held:
+            assert memorized[epoch] == pytest.approx(
+                held[epoch] - seen[epoch], abs=1e-6
+            )
     # epoch 0's 3 trained-on positions are fewer than a batch: it trains from epoch 1
     assert set(logged(monitor, "loss")) == {1, 2}
 

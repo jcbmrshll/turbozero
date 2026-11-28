@@ -42,7 +42,6 @@ class PendingSolves:
         stops: whether the game in progress stops for solves: not once its solve point found
             every slot full
         past: whether the game in progress has passed its solve point
-        missed: solves that found every slot full (see `EndgameSolve.slots`)
     """
 
     positions: Any
@@ -52,7 +51,6 @@ class PendingSolves:
     entry_solve: jax.Array
     stops: jax.Array
     past: jax.Array
-    missed: jax.Array
 
 
 @jax.tree_util.register_dataclass
@@ -121,8 +119,7 @@ class EndgameSolve:
         slots: solves each environment can hold while they wait for their results. Results come
             once an epoch, for the solves added before its self-play, so this needs two epochs'
             worth. A game whose solve point finds every slot full is played to the end instead,
-            unsolved; one past it ends there, its unsolved position dropped (both counted in
-            `solve_missed`, see `Trainer.collection_metrics`)
+            unsolved; one past it ends there, its unsolved position dropped
         play_past: the mean number of moves a game plays past its solve point (see above);
             `math.inf` plays every game to its end, each position it stores past its solve
             point solved
@@ -163,7 +160,6 @@ class EndgameSolve:
             entry_solve=jnp.full((capacity,), -1, dtype=jnp.int32),
             stops=jnp.array(True),
             past=jnp.array(False),
-            missed=jnp.array(0, dtype=jnp.int32),
         )
 
     def move(
@@ -224,7 +220,6 @@ class EndgameSolve:
             added=pending.added + move.solve,
             stops=pending.stops & ~first_missed,
             past=pending.past | move.whole,
-            missed=pending.missed + move.missed,
         )
 
     def next_game(self, pending: PendingSolves, ended: jax.Array) -> PendingSolves:

@@ -212,7 +212,7 @@ epoch solves them at once, since it has nothing else to train on. On the 4x64 at
 epoch stores 43,000-60,000 positions at 20 or fewer empties, solved in 13-19 s on 14 cores, and
 self-play waited under 0.25 s an epoch for them (`--solve-threads`, default every core the process
 may use; on Modal, `--cpu 16`). `solve_positions` counts every solve, and `solve_draw`
-and `solve_missed` count the games.
+is the fraction of solved games drawn.
 
 `--solve-play-past MEAN` ends games early instead: each game stops past N before each further
 move with probability 1 / (1 + MEAN), MEAN moves on average, a geometric number, and skips those
@@ -319,8 +319,8 @@ A position is trained on many times while it's in the replay buffer (about 14 at
 4096 with `--playout-cap 0.25:64` and `--buffer 2250`), and the network fits what it can of each
 game's outcome there. The training loss can't tell that fit from learning.
 `--holdout-envs 32` plays 32 of the self-play environments' games like the others but never
-trains on them, and every epoch, after training, scores the network's weights (`*_raw`) and the
-weight average self-play played with (`*_avg`) on
+trains on them, and every epoch, after training, scores the weight average self-play played
+with on
 `--holdout-positions` of their positions and as many of the trained-on games' positions of the
 same ages:
 

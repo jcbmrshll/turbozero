@@ -94,7 +94,6 @@ class CollectionStats:
     episodes: jax.Array
     moves: jax.Array
     episode_metrics: dict[str, jax.Array]
-    solve_missed: jax.Array | None = None
 
     @classmethod
     def of(cls, state: CollectionState) -> "CollectionStats":
@@ -102,9 +101,6 @@ class CollectionStats:
             episodes=jnp.copy(state.episodes),
             moves=jnp.copy(state.moves),
             episode_metrics={k: jnp.copy(v) for k, v in state.episode_metrics.items()},
-            solve_missed=jnp.copy(state.pending.missed)
-            if state.pending is not None
-            else None,
         )
 
 
@@ -1080,8 +1076,7 @@ class Trainer:
         - `buffer_distinct_fraction`: the fraction of the positions training can sample that are
           distinct, those a data transform maps to one another counting as one (e.g. a board
           and its rotations): to spot self-play collapsing into the same few games
-        - with `endgame_solve`: `solve_missed`, the solves that found every slot full (the
-          training loop adds `solve_summary`'s)
+        - with `endgame_solve`, the training loop adds `solve_summary`'s
 
         Args:
             before: the collection state's counters before the epoch's self-play
@@ -1097,8 +1092,6 @@ class Trainer:
             for name, total_after in after.episode_metrics.items():
                 change = (total_after - before.episode_metrics[name]).sum()
                 metrics[f"episode_{name}"] = change / episodes
-        if after.pending is not None and before.solve_missed is not None:
-            metrics["solve_missed"] = (after.pending.missed - before.solve_missed).sum()
         return metrics
 
     # training
@@ -1316,19 +1309,18 @@ class Trainer:
         self,
         key: jax.Array,
         buffer_state: ReplayBufferState,
-        weights: Mapping[str, Any],
+        params: Any,
     ) -> dict[str, jax.Array]:
-        """Scores each of `weights` (by name: (parameters, network state)) on positions of the
-        held-out games (see `holdout_envs`) and on as many of the trained-on games' positions of
+        """Scores the network with `params` (the weight average's (parameters, network state),
+        those self-play plays and validation scores) on positions of the held-out games (see `holdout_envs`) and on as many of the trained-on games' positions of
         the same ages, `holdout_positions` each, sampled with replacement. In inference mode, so
         a BatchNorm network uses its running statistics. Empty until a held-out game has
         finished and a trained-on game's position is no older than its oldest.
 
-        For each name it logs the policy KL and value loss on both, `heldout_*_<name>` and
-        `seen_*_<name>`, and the excess on the held-out positions, `memorized_*_<name>`: what
-        training has fit in the positions it trains on that doesn't carry over to new games of
-        the same kind. Each excess has a standard error (`*_se`), from the spread of its
-        micro-batches' means. Also `heldout_stored`, the held-out positions stored."""
+        Logs the policy KL and value loss on both, `heldout_*` and `seen_*`, and the excess on
+        the held-out positions, `memorized_*`: what training has fit in the positions it trains
+        on that doesn't carry over to new games of the same kind. Each excess has a standard
+        error (`*_se`), from the spread of its micro-batches' means."""
         stored = self.memory_buffer.sample_mask(buffer_state)
         held = stored & ~self.trained_envs[:, None]
         if not bool(held.any()):
@@ -1349,19 +1341,18 @@ class Trainer:
         def se(x: jax.Array) -> jax.Array:
             return jnp.sqrt(jnp.var(x, ddof=1) / n) if n > 1 else jnp.array(jnp.nan)
 
-        out: dict[str, jax.Array] = {"heldout_stored": held.sum()}
-        for name, params in weights.items():
-            held_losses = self._probe_losses(params, held_batches)
-            seen_losses = self._probe_losses(params, seen_batches)
-            for metric, h, t in zip(
-                ("policy_kl", "value_loss"), held_losses, seen_losses, strict=True
-            ):
-                out[f"heldout_{metric}_{name}"] = h.mean()
-                out[f"seen_{metric}_{name}"] = t.mean()
-                out[f"memorized_{metric}_{name}"] = h.mean() - t.mean()
-                out[f"memorized_{metric}_{name}_se"] = jnp.sqrt(
-                    jnp.square(se(h)) + jnp.square(se(t))
-                )
+        out: dict[str, jax.Array] = {}
+        held_losses = self._probe_losses(params, held_batches)
+        seen_losses = self._probe_losses(params, seen_batches)
+        for metric, h, t in zip(
+            ("policy_kl", "value_loss"), held_losses, seen_losses, strict=True
+        ):
+            out[f"heldout_{metric}"] = h.mean()
+            out[f"seen_{metric}"] = t.mean()
+            out[f"memorized_{metric}"] = h.mean() - t.mean()
+            out[f"memorized_{metric}_se"] = jnp.sqrt(
+                jnp.square(se(h)) + jnp.square(se(t))
+            )
         return out
 
     @partial(jax.jit, static_argnums=(0,))
@@ -1858,8 +1849,8 @@ class Trainer:
         4. self-play's metrics are logged (see `collection_metrics`, `solve_summary`)
         5. the network trains `train_steps_per_epoch` steps, if the buffer can sample a batch,
            and their metrics are logged
-        6. with `holdout_envs`, the network's and the average's memorization metrics are
-           logged (see `holdout_metrics`)
+        6. with `holdout_envs`, the average's memorization metrics are logged (see
+           `holdout_metrics`)
         7. every `validate_every` epochs, the average's validation metrics are logged
         8. the average's weights are saved (see `save_weights_every`), then the whole state
            (see `save_state_every`, `save_state_at`)
@@ -2026,12 +2017,7 @@ class Trainer:
                 if self.holdout_envs:
                     holdout_key, key = jax.random.split(key)
                     holdout = self.holdout_metrics(
-                        holdout_key,
-                        collection_state.buffer_state,
-                        {
-                            "raw": (train_state.params, train_state.nn_state),
-                            "avg": params,
-                        },
+                        holdout_key, collection_state.buffer_state, params
                     )
                     if holdout:
                         self.log_metrics(holdout, cur_epoch)
