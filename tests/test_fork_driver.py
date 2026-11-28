@@ -338,13 +338,12 @@ def test_the_template_loads(tmp_path):
     assert "--grow-train-retired" not in loaded.train_args
 
 
-def test_on_modal_lines_are_jobs_that_follow_and_keep_states_in_the_bucket(
-    tmp_path, monkeypatch
-):
+def on_modal(tmp_path, monkeypatch):
+    """A driver on ModalBackend, with a directory as the bucket and spawns recorded: (driver,
+    store, spawned)."""
     # patched where fork_driver looks them up
     modal_jobs = fork_driver.modal_jobs
     (modal_store,) = load_example("othello", "modal_store")
-    Job, job_key, get_json = fork_driver.Job, fork_driver.job_key, fork_driver.get_json
     home = tmp_path / "home"
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: home)
@@ -361,6 +360,15 @@ def test_on_modal_lines_are_jobs_that_follow_and_keep_states_in_the_bucket(
     run_dir.mkdir(parents=True)
     backend = fork_driver.ModalBackend(config(hours_per_line=10))
     driver = fork_driver.Driver(run_dir, backend.config, backend, log=lambda _: None)
+    return driver, store, spawned
+
+
+def test_on_modal_lines_are_jobs_that_follow_and_keep_states_in_the_bucket(
+    tmp_path, monkeypatch
+):
+    Job, job_key, get_json = fork_driver.Job, fork_driver.job_key, fork_driver.get_json
+    driver, store, spawned = on_modal(tmp_path, monkeypatch)
+    backend, run_dir = driver.backend, driver.dir
 
     driver.tick()
     job = Job.from_dict(get_json(store, job_key("t-main", "job.json")))
@@ -506,3 +514,158 @@ def test_a_learning_rate_step_made_by_hand_stands_and_the_mainline_goes_on(run):
     step = modal.jobs["t-main"][-1]
     assert flag(step, "--lr-of") == ["r15=0.0005"] and flag(step, "--lr") == ["0.001"]
     assert driver.state.lr_steps == [(10, "r15", 1)]
+
+
+def test_a_job_resumed_on_modal_isnt_resumed_again_before_its_new_attempt_ends(
+    tmp_path, monkeypatch
+):
+    job_key, get_json, put_json = (
+        fork_driver.job_key,
+        fork_driver.get_json,
+        fork_driver.put_json,
+    )
+    driver, store, spawned = on_modal(tmp_path, monkeypatch)
+    driver.tick()
+    advance(driver, "main", 5)
+    status = {"state": "timeout", "attempts": [{"seconds": 3600}]}
+    put_json(store, job_key("t-main", "status.json"), status)
+    driver.tick()
+    assert len(spawned) == 2
+    # the new attempt hasn't started yet: its status still is the old one's, but queued
+    assert get_json(store, job_key("t-main", "status.json")) == {
+        **status,
+        "state": "queued",
+    }
+    driver.tick()
+    driver.tick()
+    assert len(spawned) == 2
+    # once that attempt ends short too, the job goes on again
+    put_json(store, job_key("t-main", "status.json"), status)
+    driver.tick()
+    assert len(spawned) == 3
+
+
+def test_runs_are_named_by_the_driver_line_and_segment(run):
+    driver, modal = run
+    driver.tick()
+    advance(driver, "main", 21)
+    modal.in_bucket.add(f"{driver.dir}/lines/main/seg10/state-20.npz")
+    driver.tick()
+    names = [flag(s, "--name") for s in modal.jobs["t-main"]]
+    assert names == [["t-main-seg0"], ["t-main-seg10"], ["t-main-seg20"]]
+    assert flag(modal.jobs["t-window0"][0], "--name") == ["t-window0-seg20"]
+
+
+def test_a_fork_isnt_killed_before_it_has_been_compared(run):
+    driver, modal = run
+    driver.tick()
+    advance(driver, "main", 21)
+    modal.in_bucket.add(f"{driver.dir}/lines/main/seg10/state-20.npz")
+    driver.tick()
+    # the mainline lags (as after a preemption): the fork plateaus level with it, at its
+    # segment's end, with no matched epochs to compare
+    advance(driver, "sims1", 30)
+    assert (
+        driver.comparison(driver.state.lines["sims1"], driver.state.lines["main"]) == []
+    )
+    assert driver.state.lines["sims1"].status == "running"
+    # nor on fewer windows than windows_ahead (5 epochs: one, not the same one twice)
+    for upto in range(22, 30):
+        advance(driver, "main", upto)
+        assert driver.state.lines["sims1"].status == "running", upto
+    # once compared, level, it is
+    advance(driver, "main", 30)
+    assert driver.state.lines["sims1"].status == "killed"
+
+
+def test_a_take_over_the_fork_hasnt_run_yet_leaves_its_comparison_alone(run):
+    driver, modal = run
+    driver.tick()
+    advance(driver, "main", 21)
+    modal.in_bucket.add(f"{driver.dir}/lines/main/seg10/state-20.npz")
+    driver.tick()
+    advance(driver, "main", 41)
+    fork, main = driver.state.lines["sims1"], driver.state.lines["main"]
+    log_epochs(driver, "sims1", {e: 0.69 for e in range(20, 30)})
+    driver.state.takeovers = [30]
+    # the fork has logged 29: the take-over at 30 is next, not yet run
+    assert driver.logged_to(fork) == 30
+    assert driver.comparison(fork, main) == [(0.69, 0.7), (0.69, 0.7)]
+    # from its first epoch the comparison starts again
+    fork.segments.append(driver.new_segment(fork, 30, fork.segments[-1].window, 1))
+    log_epochs(driver, "sims1", {30: 0.69})
+    assert driver.comparison(fork, main) == []
+
+
+def test_a_window_fork_waits_after_a_step_down_to_the_floor(run):
+    driver, _ = run
+    fork = fork_driver.Line(name="w", kind="window", job="j", start=20)
+    driver.state.lr_steps = [(40, "r11", 2)]
+    # the step to the floor at 40 is next: no epoch has run at it
+    assert not driver.ready(fork, 40)
+    assert not driver.ready(fork, 44) and driver.ready(fork, 45)
+
+
+def test_a_window_fork_that_started_at_the_floor_has_no_step_to_wait_for(tmp_path):
+    driver = fork_driver.Driver(
+        tmp_path, config(start_lrs={"r11": 2}), FakeModal(), log=lambda _: None
+    )
+    fork = fork_driver.Line(name="w", kind="window", job="j", start=20)
+    assert not driver.ready(fork, 29) and driver.ready(fork, 30)
+
+
+def test_only_growth_reports_since_the_last_take_over_count(run):
+    driver, _ = run
+    driver.tick()
+    advance(driver, "main", 26)
+    main = driver.state.lines["main"]
+
+    def caught_up_at(epoch, value):
+        segment = next(s for s in main.segments if s.start <= epoch < s.end)
+        with open(segment.log, "a") as f:
+            f.write(f"Epoch {epoch}: {{'growth_caught_up': '{value}'}}\n")
+
+    caught_up_at(15, "1.0")
+    driver.state.takeovers = [20]
+    # the one before the take-over was of the network that plays now
+    assert not driver.caught_up(main)
+    caught_up_at(24, "0.0")
+    assert not driver.caught_up(main)
+    caught_up_at(25, "1.0")
+    assert driver.caught_up(main)
+
+
+def finishing(tmp_path, **more):
+    """A run of one network, from its learning rate's floor."""
+    modal = FakeModal()
+    settings = {
+        "nets": NETS[:1],
+        "start_lrs": {"r11": 2},
+        "start_window": 3,
+        "start_sims": 2,
+        **more,
+    }
+    return fork_driver.Driver(
+        tmp_path, config(**settings), modal, log=lambda _: None
+    ), modal
+
+
+def test_the_run_ends_once_plateaued_at_the_floor_with_no_fork_to_try(tmp_path):
+    driver, modal = finishing(tmp_path)
+    driver.tick()
+    advance(driver, "main", 9)
+    assert not driver.state.done
+    # its tenth flat epoch, mid-segment: the mainline goes on no longer
+    advance(driver, "main", 10)
+    assert driver.state.done and driver.state.lines["main"].status == "done"
+    assert modal.stopped == ["t-main"]
+
+
+@pytest.mark.parametrize("window_retry_at, done", [(10**6, True), (0, False)])
+def test_the_run_waits_only_for_a_fork_that_may_start(tmp_path, window_retry_at, done):
+    # a window step left, killed and waiting to try again; no sims step left
+    driver, _ = finishing(tmp_path, start_window=2)
+    driver.state.retry_at = {"window": window_retry_at}
+    driver.tick()
+    advance(driver, "main", 10)
+    assert driver.state.done == done
