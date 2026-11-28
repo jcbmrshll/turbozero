@@ -6,7 +6,7 @@ engines, chiefly [Edax](https://github.com/abulmo/edax-reversi) and
 
 | File | |
 |---|---|
-| `train.py` | Trains a network by self-play, scoring it against Edax's scores of fixed positions as it goes, and in games against Edax if asked |
+| `train.py` | Trains a network by self-play, validating its weight average against an engine's scores of fixed positions as it goes |
 | `evaluate.py` | Every evaluation game, between any two players (networks or engines), here, on the GPU, on Google Cloud or on Modal, kept in one store |
 | `eval_players.py`, `eval_games.py` | Its players, each a config with an id of its digest, and its games: one at a time on clocks or fixed budgets, or in batches on the GPU |
 | `engines.py` | Edax and Egaroucid, each driven over GTP, and what their searches made of each position, from their logs; and Melody, Neural Reversi, ymatioun and Edax-FM |
@@ -21,9 +21,9 @@ engines, chiefly [Edax](https://github.com/abulmo/edax-reversi) and
 | `export_onnx.py` | Exports a checkpoint's network to ONNX |
 | `bench_cpu_backends.py` | Evals a second by CPU backend and batch, each checked against JAX's outputs |
 | `quantize.py`, `fidelity.py`, `bench_quantized.py` | Quantizes a network to int8 for playing on CPU, and measures its outputs and speed against bf16 |
-| `engine_set.py`, `label_positions.py`, `score_engine_set.py` | The engine-labelled set: fixed positions with every legal move scored by a strong engine, to build, and to score checkpoints on (train.py scores the network on it every epoch) |
+| `engine_set.py`, `label_positions.py`, `score_engine_set.py` | The engine-labelled set: fixed positions with every legal move scored by a strong engine, to build, and to score checkpoints on (train.py validates the weight average on it every epoch) |
 | `distill.py` | Trains a network on a saved training state's replay buffer or a dataset, with no self-play, on a teacher network's values or the games' outcomes |
-| `teacher_dataset.py` | A dataset of whole self-play games from the moves a run kept (`--log-moves`), labelled with exact endgame results |
+| `teacher_dataset.py` | A dataset of whole self-play games from a kept move log (see `core/memory/move_log.py`), labelled with exact endgame results |
 | `bench_nets.py` | Times networks on their own: a forward pass at self-play's batch, a training step at training's |
 | `game.py` | What the scripts share: the environment, board symmetries, network, evaluators |
 | `xot.py`, `xot-openings.txt` | The XOT opening list |
@@ -37,15 +37,17 @@ uv run examples/othello/train.py --monitor --ckpt-dir runs/othello --notes "the 
 `--name` names the run on the server, and `--notes` says what it's testing and why, at the
 top of its page.
 
-Self-play runs in 1024 games at once, searching 64 MCTS iterations a move. Replay memory
+Self-play runs in 1024 games at once, searching 128 MCTS iterations a move. Replay memory
 stores each position once, and training maps each position it samples through one of the
 board's 8 symmetries (rotations and reflections), drawn at random. Games start
 from XOT openings rather than the standard start, which keeps self-play varied
 (`--standard-starts` mixes in the standard start).
 
-A run is tracked by the engine-labelled set: every epoch, `train.py` scores the raw network
-on Edax's scores of 5000 fixed positions, in about 20 ms, and logs `engine_exp_regret` (the
-discs its policy gives up against Edax's best move) and the rest of the `engine_*` metrics
+Self-play plays with a weight average of the network (`--average-epochs`, below), and the run
+is tracked by validating that average on the engine-labelled set: every epoch, `train.py`
+scores it on an engine's scores of fixed positions, in about 20 ms, and logs
+`engine_exp_regret` (the discs its policy gives up against the engine's best move) and the
+rest of the `engine_*` metrics
 (see [below](#against-edaxs-scores-of-fixed-positions)). They're much finer than games: a
 difference between two checkpoints is good to about ±0.015 discs. Games measure strength
 itself: `evaluate.py` plays checkpoints against engines and each other (see [Evaluating a
@@ -54,28 +56,6 @@ checkpoint](#evaluating-a-checkpoint)), and the Elo league rates them.
 The run's page also plots `episode_draw`, the fraction of self-play games drawn, which
 `game.py`'s `episode_metrics` reports through the Trainer's `episode_metrics_fn`. See `--help` for
 the network size, search budget and number of epochs.
-
-The self-play search budget can grow over a run: `--sims-schedule 0:32,50:64,150:128`
-searches 32 iterations a move from epoch 0, 64 from epoch 50 and 128 from epoch 150,
-instead of `--sims` throughout. OLIVAW did this in three stages, doubling each time:
-100 iterations a move, 200 from about generation 4 and 400 from about generation 11,
-of 20 (`0:100,4:200,11:400`, counting its generations as epochs).
-Cheap searches are enough while the network learns the basics, and deeper ones refine
-its policy later. Each change compiles self-play again, as the first epoch does, so
-keep changes few; games in progress carry on, searching from new, empty trees.
-Evaluation games keep their own budgets. The run's page plots the budget as
-`search_iterations`.
-
-Each self-play environment searches at its own pace, a network evaluation a cycle, so a
-search needn't take a fixed number of iterations: with `--count-reused-visits` it stops
-once its root has `--sims` + 1 visits, those of the subtree it kept from the last move's
-search included. A move whose subtree the last search explored well then takes fewer
-iterations, about half of them with a trained network, and every root still ends with the
-visits of a full search. An epoch is still the compute of 128 full searches in each
-environment, so it plays more moves (logged as `moves` and `cycles_per_move`), and fills
-the replay buffer faster. `--min-iterations` sets the fewest a search takes, and
-`--advance-every` how often finished searches play their moves (5 cycles by default with
-`--count-reused-visits`; a search done in between goes on until then).
 
 `--playout-cap P:FAST` is KataGo's playout cap randomization: each move is searched with
 `--sims` iterations with probability P, and otherwise with FAST, without the root's noise.
@@ -89,11 +69,6 @@ cycles (iterations + 1) are, so that no search waits for its move to be played. 
 example, 25% of moves at 127 iterations and 75% at 43, at the compute of uniform 64:
 `--sims 127 --playout-cap 0.25:43 --selfplay-cycles 8320 --advance-every 4 --buffer 281`.
 
-By default every search starts from the subtree of the move played that the last search
-explored, and adds `--sims` iterations to its visits. `--no-persist-tree` starts each from
-an empty tree instead: an ablation of that reuse (a target then comes from `--sims` visits
-alone, all of them fresh, and the root's noise steers a whole search).
-
 `--traversal-steps` sets how many steps down the tree a search's traversal takes between
 checks for having reached its leaf: the search is the same whatever the number, but on GPU
 each check waits on the host, and the batch's traversals go on until its deepest is done.
@@ -102,9 +77,8 @@ sims), self-play 1.2 to 1.25 times as fast as with 1.
 
 `--buffer` sets replay memory, the positions kept per environment, which training samples
 from. Self-play adds 128 an epoch (a position a move), so the default 1125 is about the last
-9 epochs. The run's page plots the positions training can sample as `buffer_samples`, and
-how many of them are distinct, a position's symmetric images counting as one, as
-`buffer_distinct_positions`.
+9 epochs. The run's page plots the fraction of the positions training can sample that are
+distinct, a position's symmetric images counting as one, as `buffer_distinct_fraction`.
 
 `--buffer-window N` trains on only each environment's newest N of the positions kept, as if
 `--buffer` were N, while the older ones stay stored. A branch can then widen the window at once,
@@ -118,11 +92,11 @@ self-play adds, whatever the size. With the defaults, 256 steps of 4096 samples
 against 1024 environments adding 128 positions each, it's 8, each time in a symmetry drawn
 at random. `--train-steps` changes it (or `--train-batch`).
 
-The network computes in bfloat16 by default: in self-play and test games
+The network computes in bfloat16 by default: in self-play
 (`--inference-dtype`), and its convolutions in training (`--train-dtype`, mixed precision:
 its parameters, BatchNorm and heads stay in float32). On one RTX 5080, with the plain
 `resnet:6x128` (below) computing in float32 throughout, an epoch takes about 63 seconds.
-bfloat16 in self-play and test games brings an epoch to about 36 seconds; searching with
+bfloat16 in self-play brings an epoch to about 36 seconds; searching with
 the same checkpoint, bfloat16 and float32 play evenly. bfloat16 training then takes each training step in less
 than half the time (a 10-block, 128-channel network's from 157 to 72 ms), and trained as
 well as float32 in a two-seed comparison.
@@ -204,10 +178,9 @@ fits, but it changes training too. Two options cut the memory and keep the batch
   the mean of the micro-batches' updates: their running mean follows the whole batch's
   mean, and their running variance the micro-batches' mean variance (a little smaller
   than the whole batch's). Micro-batch i takes samples i, i + M, i + 2M, ... of the
-  batch, so each holds its share of tree positions (`--tree-positions`). M must divide
-  `--train-batch`.
+  batch. M must divide `--train-batch`.
 
-Both apply to training alone (self-play and test games are unchanged), and can be
+Both apply to training alone (self-play is unchanged), and can be
 combined. Compiled for the CPU, a training step at batch 4096 needs this much temporary
 memory (`memory_analysis()` of the compiled step; the GPU's numbers differ, but scale
 alike):
@@ -221,46 +194,6 @@ alike):
 Try `--remat` first, since it doesn't change training; `--grad-accum` is for
 networks too big even with it.
 
-### Value targets from the search
-
-By default the network learns each played position's value from the game's outcome z.
-Early in a game z says little about the position, while the search's value q is a
-better assessment, if limited by the search's horizon. Two options use q instead, after
-OLIVAW (Norelli & Panconesi, section IV-B) and "Lessons from implementing AlphaZero"
-(Young, Prasad & Abrams):
-
-- `--value-target-q W` trains played positions on `(1 - W)·z + W·q`, with q the root
-  value of the search that chose the move (for the player to move).
-- `--tree-positions K` also trains on up to K positions from each self-play search tree:
-  nodes visited at least `--tree-min-visits` times, sampled in proportion to their visits
-  (`--tree-select most-visited` takes the most visited, as OLIVAW did). Each trains on
-  the visit distribution over its children and its q, in a random symmetry each time
-  training samples it, as played positions are. They make up a share of each training batch: `--tree-ratio` tree positions per
-  played position, 1 (half the batch) by default, halving every `--tree-half-life` epochs
-  if given. Self-play reuses the played move's subtree in its next search, so a node along
-  the expected line can be stored by several searches in a row, and is often played soon
-  after; `--tree-discarded-only` only stores nodes outside that subtree, so each position
-  is stored at most once, by the last search it's in.
-
-Tree positions follow replay memory (`--buffer`): training samples those stored in the
-moves its played positions come from (the last 1125 at the default `--buffer`), however many positions each move stored. They're kept in a replay buffer of their
-own, by default K times `--buffer`, which holds that span even when every move stores K;
-`--tree-buffer` sets its size instead (a move stores fewer than K when too few nodes qualify, and about 1.3 of 2
-with `--tree-discarded-only`, so a smaller buffer can still hold the whole span).
-
-Each K adds to GPU memory what raising `--buffer` by as much again would: 0.54 GB per K at
-`--buffer 1125` (about 480 bytes a position, in each of 1024 environments). Training holds
-two copies of the replay memory (the epoch's, and the one before it, for the self-play
-metrics), and preallocates 75% of the GPU, 12 GB of a 16 GB card. 6000 positions per
-environment, played and tree positions together (2.9 GB), are known to fit. Keeping the
-buffer in host memory would make every training step copy its minibatch over; for a much
-larger K, give `--tree-buffer` less than K times `--buffer` instead.
-
-The run's page shows, each epoch, the tree positions stored (`tree_positions`, and
-`tree_positions_per_move` out of K), their mean visit count (`tree_mean_visits`), how many
-training could sample (`tree_buffer_samples`), and the share of each training batch they
-made up (`tree_batch_fraction`).
-
 ### Exact endgame labels
 
 By default every self-play position with 20 or fewer empty squares gets an exact value
@@ -270,7 +203,7 @@ takes that position's result. The labels lose the noise of endgame mistakes: in 
 self-play (the 8x128 at 511/127 sims), the played result differs from the exact one at 16-20
 empties in 17% of games, mostly a win or loss played as a draw or the reverse.
 `--solve-empties N` moves the cut to N empty squares; `--solve-empties off` plays games out and
-labels them with their played results (and is what `--resign` needs).
+labels them with their played results.
 
 The solver (`--solver native`, endgame.py, a win/draw/loss solve; `edax` for comparison)
 runs on the CPU while the GPU trains and plays. Positions stored in an epoch's self-play are solved
@@ -278,257 +211,123 @@ through its training and the next epoch's self-play, and trained on from then. A
 epoch solves them at once, since it has nothing else to train on. On the 4x64 at 128 sims, an
 epoch stores 43,000-60,000 positions at 20 or fewer empties, solved in 13-19 s on 14 cores, and
 self-play waited under 0.25 s an epoch for them (`--solve-threads`, default every core the process
-may use; on Modal, `--cpu 16`). `solve_wait_seconds` shows how long self-play waited for the
-solver, `solve_positions` counts every solve, and `solve_games`, `solve_draw` and `solve_missed`
-count the games.
+may use; on Modal, `--cpu 16`). `solve_positions` counts every solve, and `solve_draw`
+is the fraction of solved games drawn.
 
 `--solve-play-past MEAN` ends games early instead: each game stops past N before each further
 move with probability 1 / (1 + MEAN), MEAN moves on average, a geometric number, and skips those
 moves' searches to play more games in the same compute. Positions up to N keep the solved result
 at N; each position stored past N is solved on its own. With 0, games stop at N and never produce
 positions below it, though searches from just above N still reach them and the network values
-their leaves there. The default, `end`, plays every game to its end. `--solve-share P` labels
-only a fraction P of games exactly and plays the rest out, with their played results.
+their leaves there. The default, `end`, plays every game to its end.
 
 ### Policy target from the search
 
-By default the network learns each played position's policy from the search's visit
-distribution, as in AlphaZero. `--policy-target completed-q` trains it on Gumbel MuZero's
-improved policy instead (Danihelka et al., "Policy improvement by planning with Gumbel",
-ICLR 2022): `softmax(logits + σ(completed Q))`, with the network's logits at the root
-before the root's Dirichlet noise, and the children's values (unvisited children's
-estimated from the visited ones') rescaled to [0, 1] and scaled by
-`(--maxvisit-init + the most visited child's visits) · --value-scale`. The noise then
-steers only which moves the search explores, not the target. Tree positions keep the
-visit distribution, so the two options don't go together.
+The network learns each played position's policy from the search's visit distribution, as in
+AlphaZero.
 
 `policy_loss`, the cross-entropy against those targets, is their entropy (logged as
 `policy_target_entropy`), which no network can lower, plus the KL divergence from them to the
-network's policy (`policy_kl`). The search sets the first: a deeper search, a kept tree or
-the completed-Q target train toward sharper or flatter targets. So `policy_loss` doesn't
+network's policy (`policy_kl`). The search sets the first: a deeper search trains toward
+sharper targets. So `policy_loss` doesn't
 compare across runs that differ in those; `policy_kl` says how well each network fits its own
 targets, and the engine-set metrics how good its policy is.
 
-### Resuming and forking runs
+### Resuming, branching and forking runs
 
-Checkpoints hold only the network and optimizer state. `--save-state-at 50,150` also
-saves the whole training state once 50 and 150 epochs are done, as `state-50.npz` and
-`state-150.npz` in `--ckpt-dir`: the network, optimizer state, replay buffers, games in
-progress with their search trees and the rng.
-`--save-state-every 10` saves one every 10 epochs and keeps only the newest of these. A state takes about as much
-disk space as replay memory takes GPU memory, about 0.18 GB per 375 positions per
-environment, and K times that again with `--tree-positions K`.
+`--save-weights-every N` (1 by default) saves the weight average every N epochs as
+`--ckpt-dir/avg4/<epoch>.eqx`, its weights and BatchNorm statistics: what a player loads, and
+nothing for training to continue from. `--save-raw-every N` also saves the network's own weights
+as each N-th epoch starts, as `--ckpt-dir/raw/<epoch>.eqx`: the raw weights `avg4/<epoch>.eqx`
+took in, e.g. to measure what the training steps' noise costs against their average. `--save-state-at 50,150` also saves the whole training
+state once 50 and 150 epochs are done, as `state-50.npz` and `state-150.npz` in `--ckpt-dir`: the
+network, optimizer state, weight average, replay buffer, games in progress with their search
+trees and the rng. `--save-state-every 10` saves one every 10 epochs and keeps only the newest of
+these. A state takes about as much disk space as replay memory takes GPU memory, about 0.18 GB
+per 375 positions per environment.
 
 `--resume` continues the run in `--ckpt-dir` from its newest state; pass the run's own
 arguments. It carries on exactly as if it hadn't stopped (on the CPU the result is
 bit-identical; on a GPU, convolution autotuning may differ between processes). It logs
 to the same seaglass run, which then holds the epochs between the state and the stop
-twice, and deletes the checkpoints saved after the state, which it saves again.
+twice, and deletes the weights saved after the state, which it saves again.
 
 ```
 uv run examples/othello/train.py --epochs 200 --save-state-every 10 --ckpt-dir runs/long
 uv run examples/othello/train.py --epochs 200 --save-state-every 10 --ckpt-dir runs/long --resume
 ```
 
-`--init-from` forks a new run from a state (a `state-<epoch>.npz`, or a directory to take
-the newest from). The fork is a run of its own: it starts at epoch 0, with its own
-`--epochs`, seed and schedules (the learning rate's and `--sims-schedule`, both
-counted from its epoch 0), new games and search trees, and its
-own `--ckpt-dir`. It starts from the saved network, Adam's moments, and the replay
-buffers, so its first epochs train on as much data as the run it was forked from did
-(the entries of the games in progress are dropped). `--init-without-buffers` starts with
-empty buffers instead. The network size must match. The replay memory may differ in
-size: each environment's newest samples are kept, as many as fit. The seaglass run's config
-records the parent state as `parent`, and so does every state the fork saves.
-
-This makes it cheap to compare settings late in training. Short runs from scratch only
-show which settings learn fastest early on. Instead, train one long trunk at a constant
-learning rate (`--lr-final` equal to `--lr`), save its state, and fork short runs from it
-that differ in one setting each, alongside a control fork with the trunk's settings:
+The learning rate is constant, `--lr`. `--branch-from` continues a run from a state in a new
+`--ckpt-dir` with other settings: a branch of the run rather than a new one, and the way to drop
+the learning rate. It goes on at the state's epoch (`--epochs` counts the epochs before it too),
+with the network, its optimizer state (taking the branch's `--lr`, `--weight-decay` and
+`--momentum`), the weight average, the buffer, the games in progress and the rng. Only a search of
+another size starts its trees anew, its moves in progress searched again; with the run's own
+settings a branch continues it exactly. A different `--buffer` resizes the replay buffer at the
+branch's start, each environment keeping its newest positions; a different `--buffer-window` only
+changes which of them training samples. The branch logs to a seaglass run of its own, whose config
+records the state as `parent`.
 
 ```
-uv run examples/othello/train.py --epochs 150 --lr 1e-3 --lr-final 1e-3 \
-    --save-state-at 150 --ckpt-dir runs/trunk
+uv run examples/othello/train.py --epochs 250 --lr 1e-4 --weight-decay 0.05 \
+    --branch-from runs/trunk/state-150.npz --save-state-at 250 --ckpt-dir runs/trunk150-1e-4
+```
+
+Under a normalization most weights' scale doesn't change the network's output, and AdamW settles
+their norm about sqrt(learning rate / weight decay): a 10x drop with the decay held shrinks it
+about 3x over the following epochs, which raises the effective step (about the learning rate /
+the norm) back and costs the drop much of its gain. A branch at a 10x lower `--lr` holds the norm
+with a 10x higher `--weight-decay`, as above (0.5 at 1e-3, 0.05 at 1e-4: AdamW's decay of a weight
+each step is the learning rate times the decay).
+
+`--init-from` forks a new run from a state (a `state-<epoch>.npz`, or a directory to take
+the newest from). The fork is a run of its own: it starts at epoch 0, with its own
+`--epochs` and seed, and its own `--ckpt-dir`. It starts from the saved network, optimizer
+state, weight average and replay buffer, games in progress included, so its first epochs train
+on as much data as the run it was forked from did. `--init-without-buffers` starts with an empty
+buffer and new games instead. The network size and `--envs` must match. The replay memory may
+differ in size: each environment's newest samples are kept, as many as fit. The seaglass run's
+config records the parent state as `parent`, and so does every state the fork saves.
+
+This makes it cheap to compare settings late in training. Short runs from scratch only
+show which settings learn fastest early on. Instead, train one long trunk, save its state, and
+fork short runs from it that differ in one setting each, alongside a control fork with the
+trunk's settings:
+
+```
+uv run examples/othello/train.py --epochs 150 --save-state-at 150 --ckpt-dir runs/trunk
 uv run examples/othello/train.py --epochs 30 --init-from runs/trunk/state-150.npz \
     --ckpt-dir runs/trunk150-control
 uv run examples/othello/train.py --epochs 30 --init-from runs/trunk/state-150.npz \
-    --sims 128 --ckpt-dir runs/trunk150-sims128
+    --sims 256 --ckpt-dir runs/trunk150-sims256
 ```
-
-The learning rate holds `--lr`, then drops 10x at 70% of the run and again at 90% (`--lr-drops`;
-by default `--lr`/10 and `--lr`/100, so 1e-4 and 1e-5 at 1e-3).
-To read several budgets from one run, fork that same schedule: train the trunk at a constant
-learning rate to 70% of a budget, then fork the last 30%, with
-`--lr 1e-4 --weight-decay 0.05 --lr-drops 0.667:1e-5`.
-
-The weight decay follows the learning rate: `--weight-decay` is its value at `--lr`, and it is
-`--weight-decay` times the rate / `--lr` along the cosine (`--lr-final`), after each of
-`--lr-drops` and `--lr-plateau`'s drops, and after `--lr-drop`. Under a normalization most
-weights' scale doesn't change the network's output, and AdamW settles their norm about
-sqrt(learning rate / weight decay): a 10x drop with the decay held shrinks it about 3x over the
-following epochs, which raises the effective step (about the learning rate / the norm) back
-and costs the drop much of its gain (at 1e-4 with the decay held at 0.5, 4x64-class nets' norms
-halved and their engine regret rose). Dropping both holds the norm. `--constant-weight-decay`
-holds the decay instead. A fork at a lower `--lr` than its parent's passes the decay at that
-rate, as above.
-
-A drop at a share of the budget comes too late in long runs: at 1e-3, 6x96 and 8x128 nets stop
-gaining after about 120-160 epochs whatever the budget. `--lr-plateau` drops when training
-stops improving instead: from `--lr` to 1e-4, then 1e-5 (or the rates it's given), each time the
-training loss (`loss`) improved by less than `--lr-plateau-threshold` (0.004) over the last
-`--lr-plateau-window` (40) epochs, by the slope of a least-squares line through them, once
-`--lr-plateau-min-epochs` (40) have been spent at the rate. `--epochs` caps the run, and
-`--lr-plateau-stop` ends it early once the last rate plateaus. Each drop is logged as `lr_drop`
-(the new rate), at the epoch that made it, with that epoch's `lr_plateau_improvement`. A run
-resumed with `--resume` carries on with the rule where it stopped. A fork starts again at
-its own `--lr`: to carry on at 1e-4, fork with `--lr 1e-4 --lr-plateau 1e-5`.
-
-```
-uv run examples/othello/train.py --epochs 600 --lr-plateau --save-state-every 10 --ckpt-dir runs/plateau
-```
-
-`--branch-from` continues a run from a state in a new `--ckpt-dir`, with other self-play
-settings: a branch of the run rather than a new one. It goes on at the state's epoch (`--epochs`
-counts the epochs before it too), with every network and optimizer state, the learning rate
-rule's and growth's progress, the buffers, the games in progress and the rng. Only a search of
-another size starts its trees anew, its moves in progress searched again; with the run's own
-settings a branch continues it exactly. Two branches of one state, one at `--sims 128` and one
-at `--sims 64`, compare the two at the same point of the same run. It works for runs with
-`--grow`, which can't be forked, and `--take-over` hands self-play to the next network from
-the branch's first epoch. A different `--buffer` resizes the replay buffer at the branch's
-start, each environment keeping its newest positions; a different `--buffer-window` only changes
-which of them training samples. The branch logs to a seaglass run of its
-own, whose config records the state as `parent`.
-
-```
-uv run examples/othello/train.py --epochs 180 --sims 128 --branch-from runs/trunk/state-150.npz \
-    --save-state-at 180 --ckpt-dir runs/trunk150-sims128
-```
-
-### Growing the network
-
-Self-play costs far more than training. KataGo started with small nets and trained the next
-size up on the same games, switching when it caught up. `--grow NET` (repeat it for several,
-smallest first) does the same: `--net` plays self-play, and the next network trains on the same
-replay buffer each epoch without playing. When it takes over, the one before stops, and the
-one after that, if any, starts training from scratch on the buffer as it is. So two networks
-train at a time.
-
-The next network takes over when its `--grow-metric` on the engine-labelled set
-(`engine_value_mse`, scored every epoch) is at or below the playing one's, or with
-`--grow-metric loss` its training loss on the data both train on, as KataGo's rule had it.
-`avg4/engine_value_mse` compares their 4-epoch weight averages instead (`--average-epochs 4`),
-what self-play plays with `--selfplay-average 4`.
-`--grow-margin 0.01` makes the next lead by 1% of the playing one's metric, and `--grow-guard
-engine_value_mse` makes it also no worse on the engine set's value error. Each is averaged over
-the last `--grow-window` (10) epochs, and the next must have trained `--grow-min-epochs` (10) first.
-With `--grow-switch-at EPOCHS`, it takes over after fixed numbers of epochs instead. Either way,
-a playing network whose `--lr-plateau-stop` rule is done hands over rather than stopping the
-run. A waiting network trains at `--lr`, and follows `--lr-plateau` from its first rate once it
-plays. `--grow-train-retired` keeps the networks that played before training on the replay buffer,
-`--train-steps` each an epoch, without playing; a resumed or branched run turns it on or off.
-`--grow-train-steps N` has the waiting network take N training steps an epoch
-rather than `--train-steps`, e.g. what its own play would afford for the same compute. With
-`--grow-manual`, nothing takes over by itself: the run logs `growth_caught_up` (1 once
-the rule would switch), saved states record it too, and the next network takes over in a branch
-of the run, with `--branch-from` and `--take-over` (see the run controller below). A branch
-matches its networks to the saved state's by name: one the state hasn't starts from scratch, as
-one that hasn't joined a run yet does (so a run whose last network plays can go on into a bigger
-one), and one the branch leaves out is dropped, unless it plays (see the rack of students below).
-
-Each network's checkpoints go to `--ckpt-dir/<its name>` (its size unless `NAME=SPEC` names it), e.g. `runs/grow/2x32` and `runs/grow/4x64`.
-Saved states hold every network, in `--ckpt-dir`. Each network's metrics are logged as
-`<its size>/<metric>`, and the playing network's also without the prefix. The run logs which
-network played (`growth_playing`), the next's mean metric minus the playing one's (`growth_gap`),
-and the switch (`growth_switch`). Every run logs its compute per epoch, to compare runs at equal
-GPU time: `selfplay_seconds`, `train_seconds` and `test_seconds` (with `--grow`, each network's
-as `<its size>/train_seconds` and `<its size>/test_seconds`), `epoch_seconds`, and the run's total,
-`run_seconds`. It also logs it in network evaluations, which don't depend on the hardware:
-`selfplay_evals`, the positions self-play evaluated (search cycles times environments, since
-every environment pays every cycle), and `train_samples`, the samples trained on (with
-`--grow`, each network's as `<its size>/train_samples`, and the evaluations under the playing
-one's name too).
-
-```
-uv run examples/othello/train.py --net resnet:2x32,pool_every=2,heads=pooled,pool_channels=8 \
-    --grow resnet:4x64,pool_every=2,heads=pooled,pool_channels=16 --engine-eval-every 1 \
-    --lr-plateau --lr-plateau-stop --epochs 600 --ckpt-dir runs/grow
-```
-
-### A rack of students
-
-To compare candidate architectures quickly, train them side by side as students of a fixed
-teacher, on its self-play games. `--grow-frozen --grow-train-waiting` does that within one run:
-`--net` (the teacher, forked from a saved state with `--init-from`) plays and never trains, and
-every `--grow` network trains on its games each epoch, `--train-steps` steps each. `NAME=SPEC`
-names a network (`--grow r7=resnet:7x64,...`), so students of one size can sit side by side, and
-`--lr-of NAME=LR` and `--weight-decay-of NAME=WD` give one its own rate and decay. A branch
-(`--branch-from`) matches networks to the saved state's by name: it may drop students (all but
-the teacher) and add new ones, which start from scratch, while every student it keeps goes on
-exactly where it was: weights, optimizer state, step count and weight averages.
-
-`student_rack.py` runs such a rack in short segments, each ending in a saved state. Its
-roster, `rack.toml` in the rack's directory, lists the teacher, the students, their learning
-rates, and the train.py options of every segment. `run` reads it before each segment, so
-changes take effect at the next boundary: a student left out is dropped, a new one joins,
-and `stop = true` ends the run. `init` writes a roster for the ray 9x64 (run 860) as the
-teacher, with the self-play recipe it trained with, and two control students, a ray 7x64 and a
-ray 9x64.
-
-The rack is for quick iterations on architectures, not for training final networks: candidates
-are ranked on cheap metrics, and the promising ones then train in self-play from scratch and
-are evaluated in games. `status` prints each student's metrics on the engine set (its weight
-average's value error and regret, and its training loss), over its last epochs or at equal
-training (`--age N`: each student's own epochs up to N, for students that joined at different
-times). `checkpoints` lists each student's newest weight-average checkpoint and spec, for
-evaluating one further. `graduate` forks a student into a run of its own self-play from the
-newest state, with its weights, optimizer, averages and the teacher's replay buffer, which its
-games then replace.
-
-```
-uv run examples/othello/student_rack.py init runs/rack      # the 9x64 ray teacher's recipe
-$EDITOR runs/rack/rack.toml                                 # add [[students]]
-uv run examples/othello/student_rack.py run runs/rack
-uv run examples/othello/student_rack.py status runs/rack --age 40
-uv run examples/othello/student_rack.py checkpoints runs/rack
-uv run examples/othello/student_rack.py graduate runs/rack r7 --epochs 200 --ckpt-dir runs/r7
-```
-
-The rack's directory holds the roster, `ledger.json` (the segments, who trained in each, and
-when each student joined and left), `ckpt/` (each network's checkpoints in `ckpt/<name>/`, and
-the newest `keep_states` saved states) and `logs/`. A name is never reused, so each student's
-checkpoints and metrics stay its own.
 
 ### Weight averages
 
 At a constant learning rate the network's weights jitter from epoch to epoch, and so does its
-play: KataGo played and rated averaged weights. `--average-epochs 4 16` keeps averages of each
-network's weights over about 4 and 16 epochs: the mean of the epochs so far, then an exponential
-moving average that moves 1/H of the way to each epoch's weights. Training itself is unchanged,
-and so is the run's rng: a run with averages is the run without them, plus each average's
-checkpoints in `avg<H>` in the network's checkpoint directory (e.g. `runs/grow/8x128/avg4`) and
-its scores on the engine-labelled set, `avg<H>/engine_*`. Saved states keep them; a state saved
-without them starts them at its weights. `--selfplay-average 4` has self-play play with the
-4-epoch average instead of the current weights.
-
-What the jitter costs can be watched, off by default: `--fresh-positions N` scores the playing
-network every epoch on N of the positions its self-play just stored, before it trains on them,
-its raw weights and its self-play average: their policy KL and value loss (`fresh_*`), and the
-raw weights' excess (`fresh_*_gap`). N is a multiple of the micro-batch (`--train-batch` /
-`--grad-accum`), e.g. 16 of them. It draws its samples from the run's rng, so a run with it
-plays other games than the same run without.
+play: KataGo played and rated averaged weights. Here self-play plays with an average of the
+network's weights over about `--average-epochs` epochs (4 by default): the mean of the epochs so
+far, then an exponential moving average that moves 1/H of the way to each epoch's weights, its
+horizon growing from 1 early in the run (see `average_share` in core/training/train.py). Each
+epoch, before self-play, the average moves toward the network's weights and gets BatchNorm
+statistics of its own from `--average-norm-batches` micro-batches of the replay buffer through its
+weights. Training itself is unchanged. The engine-labelled set validates the average
+(`engine_*`), and the checkpoints `--save-weights-every` saves are its own. `--average-epochs
+1` plays with, validates and saves the network's own weights.
 
 ### Memorization: held-out games
 
 A position is trained on many times while it's in the replay buffer (about 14 at 256 steps of
 4096 with `--playout-cap 0.25:64` and `--buffer 2250`), and the network fits what it can of each
-game's outcome there. The training loss and fresh positions can't tell that fit from learning.
+game's outcome there. The training loss can't tell that fit from learning.
 `--holdout-envs 32` plays 32 of the self-play environments' games like the others but never
-trains on them, and every epoch, before training, scores the self-play weights on
+trains on them, and every epoch, after training, scores the weight average self-play played
+with on
 `--holdout-positions` of their positions and as many of the trained-on games' positions of the
 same ages:
 
-- `heldout_*` and `seen_*`: policy KL and value loss on each, and `memorized_*` the difference.
+- `heldout_*` and `seen_*`: policy KL and value loss on each, and `memorized_policy` and
+  `memorized_value` the differences.
   The two sets are different games, so a few thousand held-out games' own outcomes put an offset
   in the value loss that `*_se` (from micro-batch spread) doesn't include: about 0.004 at 32 of
   1024 environments, about 5,400 games. A checkpoint that never saw any of them scored
@@ -546,150 +345,6 @@ some environments' whole games held out (see distill.py). Once the held-out loss
 while the trained-on probe's keeps falling, more passes over those games only memorize them.
 Start from a checkpoint older than the state's positions, so that both sets start unseen.
 
-### Keeping every move: datasets of games
-
-`--log-moves DIR` keeps every move self-play plays, fast searches' too, in `DIR` as
-`moves-<EPOCH>.npy` (see `core/memory/move_log.py`): the position, the search's policy target and
-root value, the legal moves, the move played, whether the search was full, the ply, and the game
-it's in, about 190 bytes a move. Training is unchanged. The log isn't part of saved states, so a
-run keeping its moves doesn't `--resume` into the same directory: start another into a new one.
-
-`--train-steps 0` trains nothing: the network and its weight averages only play. With
-`--init-from` a state and `--selfplay-average`, a fixed teacher plays its own self-play settings'
-games, for a dataset that students and architectures train on from disk instead of from live
-self-play:
-
-```bash
-T=~/.cache/turbozero/othello/solo8x128/s14t-s13te340-lr2e6-511s-solve20-past3.5-tandem4x64-5e5
-uv run examples/othello/train.py --net resnet:8x128,pool_every=2,heads=pooled,pool_channels=32,norm=channel,layout=pre \
-    --init-from $T/state-380.npz --fork-into 8x128 --init-without-buffers \
-    --train-steps 0 --average-epochs 4 --selfplay-average 4 \
-    --sims 511 --playout-cap 0.25:127 --tree-factor 4 --advance-every 128 --selfplay-cycles 33280 \
-    --solve-empties 20 --solve-play-past 3.5 --engine-eval-every 0 \
-    --epochs 160 --ckpt-dir runs/teacher --log-moves runs/teacher/moves
-uv run examples/othello/teacher_dataset.py build --moves runs/teacher/moves --out runs/dataset \
-    --solve-empties 20 --threads 8
-```
-
-`build` puts the games back together, drops those the run ended in the middle of, and labels
-every position with its game's exact result for the player to move: positions with 20 empties or
-fewer are each solved on the CPU (win, draw or loss, about 37 ms of a core each), and those before
-a game's first one take its result, as self-play's exact labels do. It holds out whole games
-(`--heldout`, 3% by default). The dataset is a directory of columns, a `.npy` per field and a row
-per position, game by game (see `COLUMNS` in `teacher_dataset.py`), so a later relabelling (e.g.
-a deeper search of some positions) is another column beside them. `distill.py train --data DATASET
---heldout DATASET` trains on its training games' full searches and measures on its held-out ones;
-`--all-positions`, `--min-empties` and `--max-empties` change which positions.
-
-### The run controller
-
-`controller.py` runs a long growing run in steps, each its own entry in slick's GPU queue, so
-other work can be slotted in between them, and decides between steps what the run does next.
-Each period:
-
-1. **Trunk**: the run trains on at its current settings, for `trunk_turnovers` turnovers of
-   its replay buffer, the next network training beside the one playing, on its games. No
-   network takes over during it (`--grow-manual`); the next's training loss against the
-   playing one's is logged (`growth_gap`, `growth_caught_up`), but nothing switches on it. The
-   next network trains the steps its own play would afford for the same compute
-   (`--grow-train-steps`): the playing one's steps times the ratio of the two regimes'
-   benchmarked epoch costs, each regime with its own waiting network (solved from the last
-   back). With 8x128 playing at 255/63 sims, 12x144 takes 146 of 256 steps; the smaller steps
-   of the ladder about 40%. So when the test plays the two, the bigger one has trained about
-   what the run would have spent on it as the one playing.
-2. **Size**: if there's a next network, it plays the one playing, both as they trained in the
-   trunk, each with its weights averaged over the last `average_epochs` (4) epochs
-   (`--average-epochs`; see weight averages above). If it scores `margin_se` (2) standard
-   errors of its series or more, the run grows: the next network takes over from the trunk's
-   state at the next trunk (`--take-over`), and the period needs no branches. Growing comes
-   first: the search only goes up while the next network doesn't pay its way, a bigger network
-   being what makes more search worth it.
-3. **Sims**, otherwise: two branches of the run (`--branch-from`) at equal benchmarked compute,
-   in which no network takes over either. `double` searches twice the iterations, both budgets
-   with playout cap randomization, for `branch_turnovers` turnovers of its buffer; `stay` keeps
-   the search for as many epochs as cost the same. If `double`'s playing network scores
-   `margin_se` standard errors or more against `stay`'s, the run goes on from `double`, else
-   from `stay`; `double`'s next network plays `stay`'s too, for the record. One branch is
-   thrown away: longer trunks (`trunk_turnovers`) test less often. With `selfplay_average`,
-   self-play plays the averages too (`--selfplay-average`).
-4. **Ladder**: the network the run kept plays the league's Edax players in turn (`ladder`,
-   edax-L1 up to edax-L24), a series each, from the rung the last period lost to, on to the next
-   while it scores over half. Its games put the kept line on the league's scale.
-
-Every network is rated at 128 sims, the best model per search; for the record, the run also
-plays them at equal time. `clock_sims` gives each size the sims that take it about 1 s of one
-side's clock a game on the contest CPU path (bf16 OpenVINO, 8 threads, batched search, from the
-league's `timings.json`): 4x64 3000, 6x96 1100, 8x128 520, 12x144 250. The size step plays the next
-network against the one playing at those sims too (`size on the clock`), and the kept network
-climbs a second ladder of its own at its clock's sims (`pNNN-clock-ladder`). Those players have
-4 tree nodes an iteration (`clock_tree_factor`): at thousands of sims, the default 2 costs
-strength. Nothing is decided on the clock's games.
-
-With `train_retired`, the networks that played before keep training on the run's games, as many
-steps as the one playing (train.py `--grow-train-retired`), and the period's first test (the size
-step, or the sims step once the last network plays) plays each of them against the one playing
-(`retired <size>`): whether a smaller network keeps up on a bigger one's
-games, or falls behind for want of capacity. It isn't compute-optimal (about 10% more compute,
-15% with three retired), so it's counted in the run's compute and on its own
-(`retired_seconds`), but not in the next network's steps or any decision. It isn't part of a
-saved state: changed in controller.json, it holds from the next step, and a retired network
-takes up its training where it left it.
-
-With `"window"` in the config, the replay window grows with the positions the kept line of
-states has stored per environment, n, by the replay-window task's rule: n until `c` (256), then
-`c (1 + beta ((n / c)^alpha - 1) / alpha)` (KataGo's shape, `alpha` 0.75, `beta` 0.075, which
-reaches about 1125 at an 8x128 run's 30M positions). A step starts with the buffer resized once
-the target is 25% past its capacity. With playout cap randomization n counts the positions
-stored. Periods are in turnovers of the buffer, so they lengthen as it grows, and as the
-networks do; `trunk_hours` caps a trunk at that many GPU hours by the cost model, so the
-tests come about as often throughout.
-
-Compute is counted in network evaluations (self-play's positions evaluated, the samples each
-network trains on) and in GPU time: the first step times each network's forward pass at
-self-play's batch and its training step at training's (`bench_nets.py`), and each training
-step measures what the search's own bookkeeping adds per cycle (its epochs' self-play time
-less the forward passes, about 20% at 8x128; each search's median, the nearest budget's for a
-search not run yet). A step's time is those times its cycles and steps: branches are matched
-on it, and the waiting network's steps follow it. Compiling and tests aren't counted. The losing branch counts in what the run spent (`spent`), not
-in the line of states it kept (`kept`). Decisions, with their series, go to `decisions.jsonl`.
-
-The learning rate (`lr`, 5e-4) is constant through the run, as KataGo held its until its final
-net's last days. The config is JSON: the networks, smallest first, the search to start with
-(`full`, or with playout cap randomization `full`, `fast`, `full_probability` and `cycles`,
-train.py's `--selfplay-cycles`), train.py's other arguments, and the steps' frozen worktree
-(with `./install.sh`'s CUDA environment) and the slick task's worktree to queue from. See
-`controller.Config` for the rest.
-
-```json
-{
-  "name": "grow1",
-  "nets": ["resnet:4x64,pool_every=2,heads=pooled,pool_channels=16",
-           "resnet:6x96,pool_every=2,heads=pooled,pool_channels=24"],
-  "search": {"full": 127, "fast": 31, "full_probability": 0.25, "cycles": 8320},
-  "buffer": 256,
-  "window": {"c": 256},
-  "lr": 5e-4,
-  "worktree": "~/worktrees/turbozero/grow1-frozen",
-  "queue_cwd": "~/worktrees/turbozero/<the task's worktree>"
-}
-```
-
-```
-uv run examples/othello/controller.py init runs/grow1 --config grow1.json
-uv run examples/othello/controller.py start runs/grow1
-uv run examples/othello/controller.py status runs/grow1
-uv run examples/othello/controller.py stop runs/grow1             # after the steps queued now
-uv run examples/othello/controller.py retry runs/grow1 p003-double
-uv run examples/othello/controller.py advance runs/grow1           # what a step's end queues
-```
-
-`advance` also catches a run up after an update of the controller, e.g. a run from before the
-ladder plays each period's ladder, in order.
-
-A rating step runs the league's player in its own queue entry, playing only requested series,
-from the league's frozen worktree. If something queued at its priority or above takes the GPU
-first, the step goes back in the queue. Its players are retired once their series are done.
-
 ### Training on Modal
 
 `modal_jobs.py` runs train.py on Modal's GPUs, several at once, and brings the results to the
@@ -698,8 +353,8 @@ paths a local run would write them to, so analysis and the Elo league don't need
 ```sh
 # steps run in order on one GPU, from the commit named (it must be on GitHub)
 uv run examples/othello/modal_jobs.py launch --name trunk-a --gpu L40S --hours 4 --commit 7b52872 \
-    --step "examples/othello/train.py --epochs 93 --lr-final 1e-3 --save-state-at 93 --monitor --name a --notes why --ckpt-dir $C/trunk > $L/trunk.log" \
-    --step "examples/othello/train.py --epochs 19 --lr 1e-4 --lr-final 1e-4 --weight-decay 0.05 --init-from $C/trunk/state-93.npz --ckpt-dir $C/fork > $L/fork.log"
+    --step "examples/othello/train.py --epochs 93 --save-state-at 93 --monitor --name a --notes why --ckpt-dir $C/trunk > $L/trunk.log" \
+    --step "examples/othello/train.py --epochs 112 --lr 1e-4 --weight-decay 0.05 --branch-from $C/trunk/state-93.npz --ckpt-dir $C/branch > $L/branch.log"
 uv run examples/othello/modal_jobs.py list [--billed today]
 uv run examples/othello/modal_jobs.py stop trunk-a       # or --all; --now doesn't wait for the run to end as stopped
 uv run examples/othello/modal_jobs.py resume trunk-a     # after it ended short; --hours for a new limit
@@ -716,13 +371,12 @@ start from them, rather than bringing them here, and removes all but the newest 
 the job's disk.
 
 A step is the command as you'd write it here, with `> LOG`; paths must be under
-`~/.cache/turbozero`. `--init-from`, `--branch-from` and `--warm-start` name a `state-<EPOCH>.npz`,
-here, in the bucket, or from an earlier step: a staircase of learning rates for a `--grow` run, which
-can't be forked, is steps that each branch from the last one's final state. A job runs without this
-machine.
+`~/.cache/turbozero`. `--init-from` and `--branch-from` name a `state-<EPOCH>.npz`, here, in the
+bucket, or from an earlier step: a staircase of learning rates is steps that each branch from the
+last one's final state. A job runs without this machine.
 Files go to the bucket as they're written: the sync brings them here, and a `--monitor` run appears
 on slick's seaglass while it runs, tagged with `$SEAGLASS_TAGS` and `modal`, its chip in its
-provenance. `modal-job.json` beside the checkpoints records commit, chip, flags and wall time.
+provenance. `modal-job.json` beside the weights records commit, chip, flags and wall time.
 Nothing leaves the bucket on its own. An interrupted job continues from its newest state, saved
 every `--resume-every` epochs (10) and kept in the bucket only; it repeats the epochs since, so its
 log and metrics hold those epochs twice, the later ones the ones that count, as with `--resume`.
@@ -748,35 +402,6 @@ Modal also bills what jobs upload, $0.04/GB: about $0.36/h with `--resume-every 
 at the risk of more to redo after an interruption. Bringing a state of about 0.8 GB here costs about
 $0.10 in GCS egress, which is why states saved only to continue from stay in the bucket.
 
-### A mainline with forks on Modal
-
-`fork_driver.py` runs one long run on Modal as a mainline of segments, usually a growth run
-(`--grow`), and decides as it goes when the replay buffer's window and the sims go up, by forks:
-
-```sh
-uv run examples/othello/fork_driver.py init ~/.cache/turbozero/othello/runs/big --name big
-$EDITOR ~/.cache/turbozero/othello/runs/big/driver.toml    # nets, recipe, ladders, rules
-uv run examples/othello/fork_driver.py run ~/.cache/turbozero/othello/runs/big   # in tmux
-uv run examples/othello/fork_driver.py status ~/.cache/turbozero/othello/runs/big
-```
-
-Each line (the mainline, or a fork) is one Modal job whose steps are segments of
-`segment_epochs`, each branching from the last one's final state (see `extend` above). Between
-segments every network steps down its own learning rate (1e-3, 5e-4, 1e-4 by default, weight decay
-500 times it) once its value error on the engine-labelled set (`metric`) has plateaued. Forks, at most
-one of each ladder at a time, branch from the mainline with the buffer window or the sims a step
-up its ladder, follow
-the mainline's learning rates, and are compared with it at matched epochs: one takes over once it
-is `margin` lower over the last windows (and the other starts again from the new mainline), or is
-killed once it plateaus without that lead. A window
-fork is judged only after a learning rate step (a wider window's gain shows after the rate drops).
-With growth, train.py only reports when the next network has caught up (`--grow-manual`): the
-driver takes it over at the mainline's next segment end and in every fork at that same epoch, so
-the lines compared always play the same network; only the network playing and the next train.
-`start_from` starts the first network from a trained one's saved state, with its replay buffer.
-Decisions go to `decisions.jsonl` in the run's directory. The final checkpoints are decayed
-offline.
-
 ## Evaluating a checkpoint
 
 Every game between two players, networks or engines, goes through `evaluate.py`, and every game is
@@ -794,7 +419,7 @@ uv run examples/othello/evaluate.py run --on gcp --jobs 4 --openings 100 \
     --a net:net=NAME,clock=10,engine=1,backend=native --b edax:clock=10
 # a checkpoint on the GPU, many games at once, against Edax at level 8 (the league's way)
 uv run --extra cuda examples/othello/evaluate.py run --openings 256 \
-    --a net:checkpoint=runs/othello/199.eqx,spec=resnet:8x128,device=gpu-batched,visits=400 \
+    --a net:checkpoint=runs/othello/avg4/199.eqx,spec=resnet:8x128,device=gpu-batched,visits=400 \
     --b edax:level=8
 uv run examples/othello/evaluate.py matches                  # every match, and how far it got
 uv run examples/othello/evaluate.py show MATCH [--games]     # what it showed
@@ -1014,28 +639,31 @@ engine has scored: the disc margin it expects at the end. Sets record what score
 position (`labeller_names`): Edax at level 24 (24 moves ahead, the last squares exact), or
 Neural Reversi at level 26 (exact up to 30 empty squares, 26 moves ahead beyond).
 
-`train.py` scores the network on it every epoch and logs, for all positions and for each
-game phase (`opening`, 40-51 empty squares; `midgame`, 25-39; `endgame`, 1-24):
+`train.py` scores the weight average on it every epoch, in float32 whatever
+`--inference-dtype` self-play uses (in bfloat16 a checkpoint's value MSE is off by up to 0.006,
+more than ten epochs of a slow run's progress), and logs, as `engine_*`, for all positions and for
+each game phase (`opening`, 40-51 empty squares; `midgame`, 25-39; `endgame`,
+1-24):
 
 - `engine_top1`: how often the network's most likely move is one of the engine's best
 - `engine_regret`: discs its most likely move gives up against the engine's best
 - `engine_exp_regret`: the same, averaged over its policy: smoother, and about three times
   less noisy than `engine_regret` (a difference between two checkpoints on the same set is
   good to about ±0.015 discs). But it also measures how sharp the policy is, which the
-  search and its policy target set (more sims, or `--policy-target completed-q`, train a
-  sharper or flatter one): compare it only between runs with the same search and target,
+  search sets (more sims train a sharper one): compare it only between runs with the same search,
   and across them, `engine_regret` and `engine_value_mse`
 - `engine_value_mse`: its value's squared error against the outcome the engine predicts (±1, 0 for a
   draw)
 - `engine_value_sign`: how often its value calls the winner the engine does
 
-It logs the same metrics as `filtered_engine_*` over only the positions the network decides:
-from the XOT opening's to the exact solver's, which plays and labels positions with 20 empty
-squares or fewer. They leave out positions whose moves the solver makes in play, and are
-reported for all of them and in halves (`opening`, 36-51 empty squares; `midgame`, 21-35).
+`score_engine_set.py` also reports the same metrics as `filtered_engine_*` over only the positions
+the network decides: from the XOT opening's to the exact solver's, which plays and labels
+positions with 20 empty squares or fewer. They leave out positions whose moves the solver makes in
+play, and are reported for all of them and in halves (`opening`, 36-51 empty squares; `midgame`,
+21-35).
 
 Scoring takes a forward pass over the positions, about 20 ms for 5000 on the GPU.
-`--engine-set PATH` scores on another set, and `--engine-eval-every N` sets the cadence (0
+`--engine-set PATH` scores on another set, and `--validate-every N` sets the cadence (0
 for never). Without a set at the default path, `~/.cache/turbozero/othello/engine-sets/nr26-evals-29k.npz`,
 training warns and goes on unscored; a missing `--engine-set` is an error.
 
@@ -1069,7 +697,7 @@ squares took about 600 core-hours on Modal, about $45.
 To score saved checkpoints on a set:
 
 ```
-uv run examples/othello/score_engine_set.py runs/othello/49.eqx runs/othello/99.eqx --net resnet:10x128
+uv run examples/othello/score_engine_set.py runs/othello/avg4/49.eqx runs/othello/avg4/99.eqx --net resnet:10x128
 ```
 
 ## Playing on CPU

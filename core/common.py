@@ -146,7 +146,7 @@ def step_with_output(
         active: (optional) if not, the evaluator's state stays as `output` left it (see
             `Evaluator.next_state`); the environment's is stepped all the same, for the caller
             to keep or not
-        end: (optional) ends the episode before its move, e.g. on a resignation: the
+        end: (optional) ends the episode before its move, e.g. for an exact solve: the
             environment and evaluator are reset (with `reset`) as if it had terminated, and
             `terminated` and `truncated` are False. The caller scores it.
         step_evaluator: (optional) if not, the evaluator's state stays as `output` left it, for

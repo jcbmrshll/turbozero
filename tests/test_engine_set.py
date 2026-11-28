@@ -391,22 +391,22 @@ def test_training_skips_a_missing_default_set_but_not_a_missing_given_one(
 
     parser = argparse.ArgumentParser()
     monkeypatch.setattr(train, "DEFAULT_ENGINE_SET", tmp_path / "none.npz")
-    args = argparse.Namespace(engine_set=None, engine_eval_every=1)
+    args = argparse.Namespace(engine_set=None, validate_every=1)
     with pytest.warns(UserWarning, match="no engine-labelled set"):
         assert train.load_engine_set(parser, args) is None
 
     with pytest.raises(SystemExit):
         train.load_engine_set(
             parser,
-            argparse.Namespace(engine_set=str(tmp_path / "x.npz"), engine_eval_every=1),
+            argparse.Namespace(engine_set=str(tmp_path / "x.npz"), validate_every=1),
         )
 
     tiny_set(np.random.default_rng(0)).save(tmp_path / "given.npz")
     given = train.load_engine_set(
         parser,
-        argparse.Namespace(engine_set=str(tmp_path / "given.npz"), engine_eval_every=1),
+        argparse.Namespace(engine_set=str(tmp_path / "given.npz"), validate_every=1),
     )
     assert given is not None and len(given) == 4
-    off = argparse.Namespace(engine_set=str(tmp_path / "x.npz"), engine_eval_every=0)
+    off = argparse.Namespace(engine_set=str(tmp_path / "x.npz"), validate_every=0)
     assert train.load_engine_set(parser, off) is None
     assert engine_set.DEFAULT_PATH.name.endswith(".npz")

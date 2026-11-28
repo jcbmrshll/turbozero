@@ -1,7 +1,7 @@
 """Connect Four positions with every legal move scored exactly by the solver: a fixed set to measure
 networks against the truth (see `label_positions.py` to build one, `score_solver_set.py` to score
 checkpoints on one, and train.py's --engine-set, which scores the network on one as it trains, with
-`core.testing.scored_positions.ScoredPositionsTester`).
+`core.training.validation.ScoredPositionsValidator`).
 
 A set is an .npz of numpy arrays:
 - positions: (N,) each position, as the solver writes them
@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 from solver import CACHE_DIR, COLUMNS, ILLEGAL, PERFECT_LEVEL, ROWS, actions
 
-from core.testing.scored_positions import ScoredPositions
+from core.training.validation import ScoredPositions
 
 # where training runs look for a set unless told otherwise
 DEFAULT_PATH = CACHE_DIR / "solver-set.npz"

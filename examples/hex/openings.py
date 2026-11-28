@@ -1,4 +1,4 @@
-"""Openings for test games and matches: the first moves, played for both players, so that
+"""Openings for self-play and matches: the first moves, played for both players, so that
 deterministic players give varied games, as XOT openings do in Othello.
 
 Hex has no draws and the first player wins with perfect play, so a match has to be fair by its
@@ -13,16 +13,12 @@ the opening shouldn't already decide them either. A list has two kinds of openin
 The lists, `openings-<size>.txt`, are one opening a line in cell names, e.g. "d4" or "d4b2".
 """
 
-import dataclasses
 from pathlib import Path
-from typing import Any
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from game import HexGame, metadata
-
-from core.monitoring.episodes import with_opening
 
 NO_MOVE = -1
 
@@ -84,49 +80,3 @@ def make_opening_init_fn(
         return state, metadata(state)
 
     return init_fn
-
-
-def opening_episode_fn(game: HexGame, episode_fn):
-    """An `episode_fn` (see `BaseTester`) for games started from an opening by an init fn from
-    `make_opening_init_fn`, already played: packs the game with the opening's moves before it, by
-    `episode_fn` (`core.monitoring.episodes.pgx_two_player_episode`'s), and the run's page showing
-    it from the position the players started from.
-
-    The game's first position gives the opening's stones: none have been captured or reflected, as
-    the openings end before a swap can have happened. A game from the empty board is packed as
-    it is."""
-    step = jax.jit(game.env.step)
-
-    def packed(frames, p_ids, env_step_fn):
-        first = jax.tree.map(lambda x: np.asarray(x[0]), frames.env_state)
-        plies = int(first._step_count)
-        if plies == 0:
-            return episode_fn(frames, p_ids, env_step_fn)
-        # the first stone is the opponent's on a first position after one move, and the player
-        # to move's after two
-        board = first._x.board
-        stones = np.flatnonzero(board < 0 if plies == 1 else board > 0)
-        moves = list(stones)
-        if plies == 2:
-            moves += list(np.flatnonzero(board < 0))
-        # replayed from the empty board with the game's player ids: colour 0 moves first
-        state: Any = game.env.init(jax.random.PRNGKey(0))
-        colour0 = (
-            int(first.current_player)
-            if plies % 2 == 0
-            else 1 - int(first.current_player)
-        )
-        state = dataclasses.replace(
-            state,
-            current_player=jnp.int32(colour0),
-            _player_order=jnp.int32([colour0, 1 - colour0]),
-        )
-        states = []
-        for move in moves:
-            states.append(jax.device_get(state))
-            state = step(state, int(move))
-        return episode_fn(
-            with_opening(frames, states), p_ids, env_step_fn, start=len(states)
-        )
-
-    return packed

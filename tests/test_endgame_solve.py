@@ -13,7 +13,6 @@ import numpy as np
 import pytest
 
 from core.training.endgame_solve import EndgameSolve
-from core.training.train import CollectionStats
 
 LENGTH = 6
 # games stop before their 4th move: 4 positions stored, the stopped one included
@@ -28,12 +27,11 @@ def mover_wins(positions):
     return results
 
 
-def endgame_solve(slots=4, share=1.0, play_past=0.0):
+def endgame_solve(slots=4, play_past=0.0):
     return EndgameSolve(
         stop_fn=lambda state: state.step >= STOP,
         solve_fn=mover_wins,
         slots=slots,
-        share=share,
         play_past=play_past,
     )
 
@@ -151,24 +149,12 @@ def test_a_game_finding_every_slot_full_plays_on(
     state = collect(STOP + 1 + LENGTH)
 
     np.testing.assert_array_equal(state.pending.added, [1])
-    np.testing.assert_array_equal(state.pending.missed, [1])
     np.testing.assert_array_equal(state.episodes, [1])
     np.testing.assert_array_equal(sampleable(state), STOP + 1 + np.arange(LENGTH))
     np.testing.assert_array_equal(
         state.buffer_state.buffer.reward[0, STOP + 1 : STOP + 1 + LENGTH],
         np.tile(env.rewards, (LENGTH, 1)),
     )
-
-
-def test_with_a_share_of_zero_every_game_plays_out(
-    fixed_length_env, make_collector, scripted, tmp_path
-):
-    env = fixed_length_env(length=LENGTH)
-    state = collector(make_collector, env, scripted, tmp_path, share=0.0)(LENGTH)
-
-    np.testing.assert_array_equal(state.pending.added, [0])
-    np.testing.assert_array_equal(state.pending.missed, [0])
-    np.testing.assert_array_equal(sampleable(state), np.arange(LENGTH))
 
 
 def test_a_waiting_game_written_over_is_not_labelled(
@@ -206,21 +192,6 @@ def test_a_resized_buffer_keeps_its_waiting_games(
     state = solve_and_label(trainer, state)
     np.testing.assert_array_equal(sampleable(state), np.arange(4))
     np.testing.assert_array_equal(state.episodes, [2])
-
-
-def test_collection_metrics_count_missed_games(
-    fixed_length_env, make_collector, scripted, tmp_path
-):
-    env = fixed_length_env(length=LENGTH)
-    collect = collector(make_collector, env, scripted, tmp_path, slots=1)
-
-    metrics = collect.trainer.collection_metrics(
-        CollectionStats.of(collect(0)), collect(STOP + 1 + LENGTH)
-    )
-
-    assert int(metrics["solve_missed"]) == 1
-    # the played-out game; the stopped one counts when it's labelled
-    assert int(metrics["episodes"]) == 1
 
 
 # past the solve point: never ending early, a game plays to its end
@@ -272,7 +243,6 @@ def test_a_solve_past_the_solve_point_finding_no_slot_ends_the_game(
 
     # the solve point took the only slot; the next position is dropped, and a new game started
     np.testing.assert_array_equal(state.pending.added, [1])
-    np.testing.assert_array_equal(state.pending.missed, [1])
     np.testing.assert_array_equal(
         state.pending.entry_solve[0, : STOP + 2], [0] * (STOP + 1) + [-1]
     )
@@ -289,9 +259,7 @@ def test_past_the_solve_point_a_game_ends_before_each_move_at_one_over_one_plus_
     solve = endgame_solve(play_past=play_past)
     position, _ = env.init_fn(jax.random.PRNGKey(0))
     position = jax.tree.map(lambda x: x + STOP, position)
-    past = replace(
-        solve.init(jax.random.PRNGKey(0), position, 16), past=jnp.array(True)
-    )
+    past = replace(solve.init(position, 16), past=jnp.array(True))
     keys = jax.random.split(jax.random.PRNGKey(1), 4000)
 
     moves = jax.vmap(
@@ -303,9 +271,7 @@ def test_past_the_solve_point_a_game_ends_before_each_move_at_one_over_one_plus_
     assert not moves.solve.any()
 
 
-@pytest.mark.parametrize(
-    "kwargs", [{"slots": 0}, {"share": 1.5}, {"share": -0.1}, {"play_past": -1.0}]
-)
+@pytest.mark.parametrize("kwargs", [{"slots": 0}, {"play_past": -1.0}])
 def test_settings_out_of_range_are_rejected(kwargs):
     with pytest.raises(ValueError):
         endgame_solve(**kwargs)

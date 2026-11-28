@@ -21,8 +21,7 @@ the solver is a far better yardstick.
 
 ```
 examples/connect_four/setup_solver.sh     # once
-uv run examples/connect_four/train.py --monitor --ckpt-dir runs/connect_four --notes "the baseline" \
-    --vs-engine-last 3   # games against the solver after each of the last 3 epochs, too
+uv run examples/connect_four/train.py --monitor --ckpt-dir runs/connect_four --notes "the baseline"
 ```
 
 `--name` names the run on the server, and `--notes` says what it's testing and why, at the
@@ -37,23 +36,19 @@ empty board, varied by sampling each move from the search's visits; `--standard-
 the fraction that do, the rest starting from the opening list. See `--help` for the network size,
 search budget and number of epochs.
 
-A run is tracked by the solver-labelled set: every epoch, `train.py` scores the raw network on 5001
-fixed positions (see [below](#against-the-solvers-scores-of-fixed-positions)). Games against the
-solver measure strength, after every 10 epochs by default (`--vs-engine-every`, `--vs-engine-last`,
-see [During training](#during-training)).
+A run is tracked by the solver-labelled set: every `--validate-every` epochs (1 by default),
+`train.py` scores the raw outputs of the weight average self-play plays with (`--average-epochs`,
+1 by default: the network's own weights) on 5001 fixed positions (see
+[below](#against-the-solvers-scores-of-fixed-positions)). Games against the solver measure the
+saved weights' strength afterwards (see [Evaluating a checkpoint](#evaluating-a-checkpoint)).
 
-`--eval-every N` plays 128 test games against a random player every N epochs (10 by default), logged
-as `random_avg_outcome`, `random_win_rate` and `random_loss_rate`, our agent searching 64 iterations
-a move.
-
-With `--monitor` the run's page shows the metrics and games against the solver and the random player, to
-step through, with what each move's search explored. It also plots `episode_draw`, the fraction of
+With `--monitor` the run's page shows the metrics. It also plots `episode_draw`, the fraction of
 self-play games drawn, which `game.py`'s `episode_metrics` reports through the Trainer's
 `episode_metrics_fn`.
 
 `--search weighted` searches with weighted MCTS
 ([core/evaluators/mcts/weighted_mcts.py](../../core/evaluators/mcts/weighted_mcts.py)) instead of
-AlphaZero's PUCT MCTS, in self-play and in our agent's test games: it backs up a softmax-weighted
+AlphaZero's PUCT MCTS in self-play: it backs up a softmax-weighted
 sum of child Q-values, with its temperature set by `--q-temperature`, instead of a plain average.
 
 ```
@@ -61,10 +56,10 @@ uv run examples/connect_four/train.py --search weighted --monitor
 ```
 
 The rest of the flags are the Othello example's, and work the same: see [its
-README](../othello/README.md) for `--sims-schedule`, `--count-reused-visits`, `--no-persist-tree`,
-`--traversal-steps`, `--buffer`, `--inference-dtype`, `--remat`, `--grad-accum`,
-`--value-target-q`, `--tree-positions`, `--policy-target`, and for `--save-state-at`,
-`--save-state-every`, `--resume` and `--init-from`, which continue a run and fork others from it:
+README](../othello/README.md) for `--traversal-steps`, `--buffer`, `--lr` (constant),
+`--average-epochs`, `--inference-dtype`, `--remat`, `--grad-accum`, `--save-weights-every`, and for
+`--save-state-at`, `--save-state-every`, `--resume` and `--init-from`, which continue a run and
+fork others from it:
 
 ```
 uv run examples/connect_four/train.py --epochs 100 --save-state-every 10 --ckpt-dir runs/long
@@ -82,13 +77,14 @@ those heads output a logit per square, and here an action is a column.
 
 ## Evaluating a checkpoint
 
-Checkpoints from `train.py` are named after their epoch (`99.eqx` is the last of a 100-epoch run).
-Pass the run's `--net` if it isn't the default.
+`train.py` saves the weight average's weights to `avg<H>/<epoch>.eqx` in its `--ckpt-dir`
+(`avg1/99.eqx` is the last of a 100-epoch run at the default `--average-epochs`). Pass the run's
+`--net` if it isn't the default.
 
 ```
 examples/connect_four/setup_solver.sh     # once
-uv run examples/connect_four/vs_solver.py runs/connect_four/99.eqx --levels 0 2 4 6 8 42 --sims 256
-uv run examples/connect_four/score_solver_set.py runs/connect_four/99.eqx
+uv run examples/connect_four/vs_solver.py runs/connect_four/avg1/99.eqx --levels 0 2 4 6 8 42 --sims 256
+uv run examples/connect_four/score_solver_set.py runs/connect_four/avg1/99.eqx
 ```
 
 At level L the solver looks L moves ahead and plays what it sees there, exactly as a minimax search
@@ -106,30 +102,16 @@ Each opening's two games have a known result under perfect play, one win and one
 so **a perfect player scores exactly 0.5 against level 42**: that's the ceiling, and whatever is
 missing from it is games our agent let slip.
 
-### During training
+### Logged to a run
 
-`train.py` plays the solver after every `--vs-engine-every` epochs (10 by default), and after each
-of the last `--vs-engine-last` epochs. By default it plays 512 games (256 openings) at each of levels
-0, 4, 8 and 42, searching 256 MCTS iterations a move, the same openings every time and in every run.
-`--vs-engine-levels`, `--vs-engine-sims` and `--vs-engine-openings` set the games. If the solver
-isn't installed, it warns and goes on without them.
-
-Each level's result is logged to the run at the epoch of the network that played (counting from 0,
-so `--vs-engine-every 10` logs at epochs 9, 19, ...), as `solver_level42_sims256`, the score, with its
-standard error `solver_level42_sims256_se` and the fractions of games won, drawn and lost (`_win`,
-`_draw`, `_loss`), and a game at that level, `solver_level42_sims256_game`, to step through: our
-agent's search of each position, and the solver's verdict on it, how every legal move's game ends
-under perfect play with the line that gets there. Results also go to
-`runs/connect_four/vs_solver.jsonl`, a line per level and epoch. `--vs-engine-last K` also logs the
-mean of the last K networks' scores at the last epoch, as `solver_level42_sims256_last3` (for K = 3),
-with its standard error (`_last3_se`).
-
-The games are played between epochs, in the training process, and training waits for them: their
-time is logged as `solver_seconds`. The solver's processes (8 at most, 120 MB each) run on the cores
-the run may use, so `taskset -c 0-7` keeps them on those 8.
-
-To evaluate a checkpoint after training, `vs_solver.py` logs to its run with `--monitor --run ID` (the
-id in the run's seaglass link), at the checkpoint's epoch.
+By default `vs_solver.py` plays 512 games (256 openings) at each level, the same openings every
+time. With `--monitor --run ID` (the id in the run's seaglass link) each level's result is logged to
+the checkpoint's training run at its epoch, as `solver_level42_sims256`, the score, with its standard
+error `solver_level42_sims256_se` and the fractions of games won, drawn and lost (`_win`, `_draw`,
+`_loss`), and a game at that level, `solver_level42_sims256_game`, to step through: our agent's
+search of each position, and the solver's verdict on it, how every legal move's game ends under
+perfect play with the line that gets there. The solver's processes (8 at most, 120 MB each) run on
+the cores the process may use, so `taskset -c 0-7` keeps them on those 8.
 
 ### Against the solver's scores of fixed positions
 
@@ -142,7 +124,7 @@ position count once. It takes about 15 seconds on 8 cores, and `setup_solver.sh`
 
 A move's score from the solver is for the player making it: 0 for a draw, positive for a win, the
 sooner the bigger (a win with the last disc of the board scores 1, with the player's fourth disc 18),
-negative for a loss. `train.py` scores the network on the set every epoch in two ways, each logged
+negative for a loss. `train.py` scores the weight average on the set in two ways, each logged
 for all positions, for each game phase (`opening`, 29-42 empty squares; `midgame`, 15-28; `endgame`,
 1-14) and for `critical` positions, those whose outcome depends on the move (about half):
 
@@ -164,12 +146,12 @@ Each has:
   outcome
 - `value_sign`: how often its value calls the winner correctly, over positions that aren't draws
 
-`--engine-set PATH` scores on another set, and `--engine-eval-every N` sets the cadence (0 for never).
+`--engine-set PATH` scores on another set, and `--validate-every N` sets the cadence.
 Without a set at the default path, `~/.cache/turbozero/connect_four/solver-set.npz`, training warns
 and goes on unscored; a missing `--engine-set` is an error. To score saved checkpoints:
 
 ```
-uv run examples/connect_four/score_solver_set.py runs/connect_four/49.eqx runs/connect_four/99.eqx
+uv run examples/connect_four/score_solver_set.py runs/connect_four/avg1/49.eqx runs/connect_four/avg1/99.eqx
 ```
 
 ## What to expect
@@ -177,9 +159,10 @@ uv run examples/connect_four/score_solver_set.py runs/connect_four/49.eqx runs/c
 The default 100-epoch run hasn't been done yet, so there are no measured numbers for its strength or
 its time. A perfect player would score 1 on `outcome_top1` and 0.5 against level 42.
 
-A 20-epoch smoke run of the command above (`--epochs 20`, on one RTX 5080) took under 3 minutes, of
-which the games against the solver took 105 seconds. That shows the command works, not how strong the
-network gets, and its learning rate decayed over only those 20 epochs:
+A 20-epoch smoke run of an earlier version of the command above (`--epochs 20`, on one RTX 5080, its
+learning rate decaying over those 20 epochs, games against the solver played during training) took
+under 3 minutes, of which the games against the solver took 105 seconds. That shows the command
+works, not how strong the network gets:
 
 | | After 1 epoch | After 10 | After 20 |
 |---|---|---|---|
@@ -191,7 +174,7 @@ network gets, and its learning rate decayed over only those 20 epochs:
 | Score against level 42 (0.5 at best), searching 256 | | 0.03 | 0.08 |
 
 Searching 64 iterations a move, it won all 128 games against a random player after a single epoch, so
-that test says little about learning.
+games against a random player say little about learning.
 
 ## Credits
 

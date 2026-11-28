@@ -1,61 +1,42 @@
-"""AlphaZero on Othello, tracked by how close the raw network's moves and values come to a
-strong engine's on fixed positions.
+"""AlphaZero on Othello, tracked by how close a weight average of the network comes to a strong
+engine's moves and values on fixed positions.
 
-Self-play games are collected in parallel across a batch of environments (and across
-every available GPU), with Monte Carlo Tree Search run on each of them; the network
-then trains on minibatches sampled from replay memory. Self-play games start from XOT
-openings (see xot.py), which keeps them varied.
+Self-play games are collected in parallel across a batch of environments, with Monte Carlo
+Tree Search run on each of them, playing with a weight average of the network (see
+--average-epochs); the network then trains on batches sampled from replay memory. Self-play
+games start from XOT openings (see xot.py), which keeps them varied.
 
     uv run examples/othello/train.py
     uv run examples/othello/train.py --epochs 20 --monitor
-    uv run examples/othello/train.py --sims-schedule 0:32,50:64,150:128
 
-Every epoch it scores the network on the engine-labelled set, if there is one (see
-engine_set.py and --engine-set), logged as `engine_*`. `engine_result_change`, how likely the
-prior play's search starts from is to pick a move that worsens the result the engine predicts, is the
-one to watch: it ranks a run's checkpoints by strength. `filtered_engine_*` are the same over
-only the positions the network decides, from the XOT opening to the exact solver's 20 empty
-squares. Games measure strength:
+Every epoch it scores the average on the engine-labelled set, if there is one (see
+engine_set.py and --engine-set), logged as `engine_*`. Games measure strength:
 `evaluate.py` plays checkpoints against engines and each other, and the Elo league rates them.
 
 With --monitor the run logs to slick's seaglass server ($SEAGLASS_URL, set in a slick task;
 --monitor URL for another, e.g. `uv run seaglass serve --dir runs` at http://localhost:8008).
 The run's page shows the metrics.
 
-The first epoch is slow: nearly all of the training loop is JIT-compiled the first
-time it runs. On one RTX 5080 the rest take about 63s each (36s with
---inference-dtype bfloat16, see README.md).
+The first epoch is slow: nearly all of the training loop is JIT-compiled the first time it
+runs.
 
-Checkpoints go to --ckpt-dir; `evaluate.py` evaluates checkpoints further (see README.md). The hyperparameters here are only an example; tune them for your task and
-hardware.
+The average's weights go to --ckpt-dir/avg4/<epoch>.eqx every --save-weights-every epochs;
+`evaluate.py` evaluates them (see README.md). With --save-state-at or --save-state-every, the
+whole training state (network, optimizer, weight average, replay buffer, games in progress,
+rng) is saved there too, to continue the run exactly with --resume, to continue it with other
+settings with --branch-from (e.g. a lower --lr), or to fork new runs from with --init-from
+(see README.md):
 
-With --save-state-at or --save-state-every, the whole training state (network, optimizer,
-replay buffers, games in progress, rng) is saved there too, to continue the run exactly
-with --resume, or to fork short runs from with --init-from (see README.md):
-
-    uv run examples/othello/train.py --epochs 150 --lr-final 1e-3 --save-state-at 150 --ckpt-dir runs/trunk
-    uv run examples/othello/train.py --epochs 30 --init-from runs/trunk --ckpt-dir runs/fork-control
-    uv run examples/othello/train.py --epochs 200 --save-state-every 10 --ckpt-dir runs/long
+    uv run examples/othello/train.py --epochs 150 --save-state-at 150 --ckpt-dir runs/trunk
+    uv run examples/othello/train.py --epochs 250 --lr 1e-4 --branch-from runs/trunk --ckpt-dir runs/trunk-1e-4
+    uv run examples/othello/train.py --epochs 30 --init-from runs/trunk --ckpt-dir runs/fork
     uv run examples/othello/train.py --epochs 200 --save-state-every 10 --ckpt-dir runs/long --resume
-
-With --lr-plateau, the learning rate drops when the training loss stops improving instead,
-from --lr to each of its rates in turn, --epochs only capping the run (see README.md):
-
-    uv run examples/othello/train.py --epochs 600 --lr-plateau --save-state-every 10 --ckpt-dir runs/plateau
-
-With --log-moves, every move self-play plays is kept on disk too, for teacher_dataset.py to make
-a dataset of whole games from; --train-steps 0 plays a fixed network's games without training it
-(see README.md).
 """
 
 import argparse
-import dataclasses
-import itertools
 import math
-import re
 import tempfile
 import warnings
-from functools import partial
 from pathlib import Path
 
 from engine_set import DEFAULT_PATH as DEFAULT_ENGINE_SET
@@ -72,33 +53,25 @@ from game import (
     episode_metrics,
     make_network,
     make_optimizer,
-    make_test_evaluator,
     state_to_nn_input,
     step_fn,
 )
 from xot import load_xot, make_xot_init_fn
 
 from core.evaluators.alphazero import AlphaZero
-from core.evaluators.evaluation_fns import (
-    make_nn_eval_fn,
-)
+from core.evaluators.evaluation_fns import make_nn_eval_fn
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.mcts.mcts import MCTS, PlayoutCap
-from core.evaluators.mcts.policy_targets import CompletedQ, VisitCounts
 from core.memory.replay_memory import EpisodeReplayBuffer
 from core.monitoring import DEFAULT_URL, Monitor
-from core.testing.scored_positions import ScoredPositionsTester
-from core.testing.tester import BaseTester
 from core.training.endgame_solve import EndgameSolve
 from core.training.exploration import Exploration
-from core.training.growth import Growth, Learner
 from core.training.loss_fns import az_default_loss_fn
-from core.training.lr_drop import LRDrop
-from core.training.lr_plateau import LRPlateau
-from core.training.resignation import Resignation
-from core.training.schedule import EvaluatorSchedule, parse_schedule
 from core.training.train import Trainer
-from core.training.tree_positions import TreePositions
+from core.training.validation import ScoredPositionsValidator
+
+# self-play moves' compute an epoch, in each environment (see --selfplay-cycles)
+COLLECTION_STEPS = 128
 
 
 def epoch_list(text: str) -> list[int]:
@@ -112,96 +85,6 @@ def epoch_list(text: str) -> list[int]:
     if any(epoch < 1 for epoch in epochs):
         raise argparse.ArgumentTypeError(f"epochs must be positive, got {text!r}")
     return epochs
-
-
-# training holds --lr, then drops 10x late in the run and again near its end: AlphaGo Zero's three
-# levels, and about where Lc0's example configuration and KataGo drop. At 110 epochs of 4x64 it
-# played within noise of one drop at 83%, and far above a constant learning rate. Each is
-# (fraction of the run, multiple of --lr), so 1e-4 and 1e-5 at --lr 1e-3
-DEFAULT_LR_DROPS = [(0.7, 0.1), (0.9, 0.01)]
-
-
-def default_lr_drops(lr: float) -> list[tuple[float, float]]:
-    """--lr-drops' default for --lr `lr`: DEFAULT_LR_DROPS' multiples of it."""
-    return [(fraction, scale * lr) for fraction, scale in DEFAULT_LR_DROPS]
-
-
-def lr_drops(text: str) -> list[tuple[float, float]]:
-    """Parses --lr-drops."""
-    try:
-        drops = [
-            (float(a), float(b)) for a, b in (d.split(":") for d in text.split(","))
-        ]
-    except ValueError as e:
-        raise argparse.ArgumentTypeError(f"{text!r} isn't FRACTION:LR,...") from e
-    fractions = [fraction for fraction, _ in drops]
-    if fractions != sorted(set(fractions)) or not 0 < fractions[0] <= fractions[-1] < 1:
-        raise argparse.ArgumentTypeError(f"{text!r}: fractions rise, between 0 and 1")
-    return drops
-
-
-GROW_METRIC = re.compile(r"(avg\d+/)?engine_(value_mse|exp_regret)|loss")
-
-
-def grow_metric(text: str) -> str:
-    """Parses --grow-metric and --grow-guard: [avg<H>/]engine_value_mse,
-    [avg<H>/]engine_exp_regret or loss."""
-    if not GROW_METRIC.fullmatch(text):
-        raise argparse.ArgumentTypeError(
-            f"{text!r} isn't [avg<H>/]engine_value_mse, [avg<H>/]engine_exp_regret or loss"
-        )
-    return text
-
-
-def warm_start_spec(text: str) -> tuple[str, str]:
-    """Parses --warm-start: NAME=PATH."""
-    name, sep, path = text.partition("=")
-    if not (name and sep and path):
-        raise argparse.ArgumentTypeError(
-            f"{text!r} isn't NAME=PATH, e.g. 4x64=run/state-100.npz"
-        )
-    return name, path
-
-
-def lr_drop_spec(text: str) -> LRDrop:
-    """Parses --lr-drop: EPOCHS:FACTOR."""
-    try:
-        epochs, factor = text.split(":")
-        return LRDrop(int(epochs), float(factor))
-    except ValueError as e:
-        raise argparse.ArgumentTypeError(
-            f"{text!r} isn't EPOCHS:FACTOR, epochs at least 0 and a factor in (0, 1]"
-        ) from e
-
-
-# the rates --lr-plateau drops to from --lr's 1e-3, as --lr-drops' do. On the training losses of
-# six rated 6x96 and 8x128 phases at 1e-3 and 1e-4, the rule (40 epochs, 0.004) fired between
-# about 7 epochs before and 36 after their Elo stopped rising
-DEFAULT_LR_PLATEAU = [1e-4, 1e-5]
-
-
-def rate_list(text: str) -> list[float]:
-    """Parses --lr-plateau: learning rates separated by commas, each below the last."""
-    try:
-        rates = [float(rate) for rate in text.split(",")]
-    except ValueError:
-        raise argparse.ArgumentTypeError(
-            f"expected learning rates separated by commas, e.g. 1e-4,1e-5, got {text!r}"
-        ) from None
-    if any(rate <= 0 for rate in rates) or rates != sorted(set(rates), reverse=True):
-        raise argparse.ArgumentTypeError(f"{text!r}: rates fall, and are positive")
-    return rates
-
-
-def positive_schedule(text: str) -> list[tuple[int, int]]:
-    """Parses --sims-schedule, whose values must be positive."""
-    try:
-        schedule = parse_schedule(text)
-    except ValueError as e:
-        raise argparse.ArgumentTypeError(str(e)) from None
-    if any(value < 1 for _, value in schedule):
-        raise argparse.ArgumentTypeError(f"values must be positive, got {text!r}")
-    return schedule
 
 
 def solve_empties(text: str) -> int | None:
@@ -249,10 +132,10 @@ def playout_cap(text: str) -> PlayoutCap:
 def load_engine_set(
     parser: argparse.ArgumentParser, args: argparse.Namespace
 ) -> EngineSet | None:
-    """The engine-labelled set to score the network on, None if it isn't to be. A missing
+    """Loads the engine-labelled set to validate on, None if there's to be none. A missing
     default set is skipped with a warning (build one with label_positions.py); a missing
     --engine-set is an error."""
-    if args.engine_eval_every <= 0:
+    if args.validate_every <= 0:
         return None
     if args.engine_set is not None:
         if not Path(args.engine_set).exists():
@@ -268,188 +151,30 @@ def load_engine_set(
     return EngineSet.load(DEFAULT_ENGINE_SET)
 
 
-def net_name(spec: str) -> str:
-    """A network's short name, for --grow's metrics and checkpoint directories: the name a
-    NAME=SPEC gives it (see `named_spec`), or its size, e.g. 4x64 for resnet:4x64,pool_every=2."""
-    name, spec = named_spec(spec)
-    if name is not None:
-        return name
-    found = re.search(r"\d+x\d+", spec)
-    return found.group(0) if found else spec.split(",")[0].replace(":", "-")
-
-
-def named_spec(text: str) -> tuple[str | None, str]:
-    """A --net or --grow network: NAME=KIND:..., e.g. r7e3=resnet:7x64,expand=3, as its name
-    and spec, or an unnamed spec (KIND:...) as None and the spec."""
-    found = re.fullmatch(r"([A-Za-z0-9_.+-]+)=([a-z]+:.*)", text)
-    if found is None:
-        return None, text
-    return found.group(1), found.group(2)
-
-
-def per_network(text: str) -> tuple[str, float]:
-    """Parses --lr-of and --weight-decay-of: NAME=VALUE."""
-    name, sep, value = text.partition("=")
-    try:
-        if not (name and sep):
-            raise ValueError
-        return name, float(value)
-    except ValueError as e:
-        raise argparse.ArgumentTypeError(
-            f"{text!r} isn't NAME=VALUE, e.g. r7e3=5e-5"
-        ) from e
-
-
-def main():
+def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="AlphaZero on Othello.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument(
         "--net",
         default=DEFAULT_NET,
-        help="the network: [NAME=]KIND:DEPTHxWIDTH[,FIELD=VALUE...], e.g. resnet:10x128 for "
+        help="the network: KIND:DEPTHxWIDTH[,FIELD=VALUE...], e.g. resnet:10x128 for "
         "AlphaZero's ResNet with 10 blocks of 128 channels, resnet:10x128,pool_every=3,"
         "heads=pooled with KataGo's global pooling, or transformer:8x256 (see "
-        "core.networks.spec.network_config). With --grow, NAME (default its size) names it "
-        "in metrics, checkpoint directories and the --grow options that take a network",
+        "core.networks.spec.network_config)",
     )
+    # self-play
     parser.add_argument(
-        "--grow",
-        action="append",
-        default=[],
-        metavar="NET",
-        help="a bigger network to grow into (repeat for several, smallest first), as --net: "
-        "--net plays self-play first, and each takes over in turn, training alongside the one "
-        "playing until it does, on the same replay buffer (see core/training/growth.py). Each "
-        "network's checkpoints go to --ckpt-dir/<its name>, and its metrics are logged as "
-        "<its name>/<metric>: NAME=SPEC names it, by default its size (e.g. 4x64)",
-    )
-    parser.add_argument(
-        "--grow-metric",
-        default="engine_value_mse",
-        type=grow_metric,
-        help="with --grow, what decides when the next network takes over: its error on the "
-        "engine-labelled set (engine_value_mse or engine_exp_regret, scored every epoch, "
-        "--engine-eval-every 1), that of its weight average over H epochs (avg<H>/<metric>, "
-        "H one of --average-epochs: what self-play plays with --selfplay-average H), or its "
-        "training loss on the data both train on (KataGo's rule, loss), averaged over "
-        "--grow-window epochs, at or below the playing network's",
-    )
-    parser.add_argument(
-        "--grow-margin",
-        type=float,
-        default=0.0,
-        metavar="FRACTION",
-        help="with --grow, the lead the next network needs to take over: its mean --grow-metric "
-        "lower than the playing one's by this fraction of it, e.g. 0.01 for 1%%, so that two "
-        "networks in lockstep don't switch (default 0: at or below)",
-    )
-    parser.add_argument(
-        "--grow-train-retired",
-        action="store_true",
-        help="with --grow, the networks that played before the one playing keep training on "
-        "its games, --train-steps each an epoch (for the record: not compute-optimal); a "
-        "resumed or branched run can turn it on or off",
-    )
-    parser.add_argument(
-        "--grow-train-waiting",
-        action="store_true",
-        help="with --grow, every network after the one playing trains on its games, --train-steps "
-        "each an epoch, not only the next: a battery of students beside --net as a fixed teacher "
-        "(--grow-frozen, forked with --init-from), see student_rack.py. A resumed or branched "
-        "run can turn it on or off, and a branch can drop students and add new ones",
-    )
-    parser.add_argument(
-        "--grow-frozen",
-        action="store_true",
-        help="with --grow, the network playing self-play never trains, nor do its weight "
-        "averages move: a fixed teacher, e.g. a trained network forked into the last place "
-        "with --init-from and --fork-into, whose games the networks before it train on with "
-        "--grow-train-retired",
-    )
-    parser.add_argument(
-        "--grow-train-steps",
+        "--envs",
         type=int,
-        default=None,
-        metavar="N",
-        help="with --grow, the training steps an epoch of the network that trains without "
-        "playing (default --train-steps): fewer charge it what the run could spend on it",
+        default=1024,
+        help="self-play environments: games played at once, each with --buffer positions of "
+        "replay memory. On an L40S, 2048 played about 29%% more moves a second than 1024 "
+        "(scan 11x64), 4096 fewer again. A saved state forks into another count only with "
+        "--init-without-buffers",
     )
     parser.add_argument(
-        "--grow-guard",
-        default=None,
-        type=grow_metric,
-        help="with --grow, a second metric the next network must be no worse on over "
-        "--grow-window epochs, e.g. engine_value_mse on positions neither network trains on, "
-        "when --grow-metric is the training loss, which a bigger network can lower by "
-        "memorising the buffer (needs --engine-eval-every 1)",
-    )
-    parser.add_argument(
-        "--grow-window",
-        type=int,
-        default=10,
-        help="with --grow, the epochs --grow-metric is averaged over",
-    )
-    parser.add_argument(
-        "--grow-min-epochs",
-        type=int,
-        default=10,
-        help="with --grow, the epochs the next network trains before it can take over",
-    )
-    parser.add_argument(
-        "--grow-switch-at",
-        type=epoch_list,
-        default=None,
-        metavar="EPOCHS",
-        help="with --grow, instead of --grow-metric's rule, the numbers of epochs done after "
-        "which each network takes over, e.g. 80 (one per --grow)",
-    )
-    parser.add_argument(
-        "--grow-lr",
-        type=float,
-        default=None,
-        metavar="LR",
-        help="the --grow networks' learning rate, where --lr is the first network's (their "
-        "schedules are --lr's, scaled by --grow-lr / --lr); default --lr",
-    )
-    parser.add_argument(
-        "--lr-of",
-        type=per_network,
-        action="append",
-        default=[],
-        metavar="NAME=LR",
-        help="with --grow, one --grow network's own learning rate, in place of --grow-lr "
-        "(its schedule is --lr's, scaled). Repeatable",
-    )
-    parser.add_argument(
-        "--weight-decay-of",
-        type=per_network,
-        action="append",
-        default=[],
-        metavar="NAME=WD",
-        help="with --grow, one --grow network's own --weight-decay: its decay at its own "
-        "learning rate (--lr-of, --grow-lr), following that rate's schedule as --weight-decay "
-        "does --lr's. Repeatable",
-    )
-    parser.add_argument(
-        "--grow-manual",
-        action="store_true",
-        help="with --grow, nothing takes over by itself: the rule only logs when the next "
-        "network has caught up (growth_caught_up), and it takes over in a branch of the run "
-        "with --take-over (see controller.py)",
-    )
-    sims = parser.add_mutually_exclusive_group()
-    sims.add_argument(
         "--sims", type=int, default=128, help="MCTS iterations per self-play move"
-    )
-    sims.add_argument(
-        "--sims-schedule",
-        type=positive_schedule,
-        default=None,
-        metavar="EPOCH:SIMS,...",
-        help="MCTS iterations per self-play move by epoch instead, e.g. 0:32,50:64,150:128 "
-        "for 32 from epoch 0, 64 from epoch 50 and 128 from epoch 150. Each change "
-        "compiles self-play again, so keep them few",
     )
     parser.add_argument(
         "--tree-factor",
@@ -468,32 +193,12 @@ def main():
         "waits on the host, and more steps a check compute more past the leaf",
     )
     parser.add_argument(
-        "--count-reused-visits",
-        action="store_true",
-        help="a self-play search stops once its root has --sims + 1 visits, those of the "
-        "subtree it kept from the last move's search included, so it searches less from a "
-        "well-explored subtree (the tree is then sized for it, and --tree-factor is unused)",
-    )
-    parser.add_argument(
-        "--no-persist-tree",
-        action="store_true",
-        help="start every self-play search from an empty tree, rather than from the subtree "
-        "of the move played that the last search explored (by default kept, so a target is "
-        "built on its visits plus --sims more): an ablation of tree reuse",
-    )
-    parser.add_argument(
-        "--min-iterations",
-        type=int,
-        default=0,
-        help="with --count-reused-visits, the fewest iterations a search takes",
-    )
-    parser.add_argument(
         "--advance-every",
         type=int,
         default=None,
         help="self-play cycles between plays of the moves whose searches are done (a search "
         "done in between goes on until then): by default a whole search's, or 5 with "
-        "--count-reused-visits",
+        "--playout-cap",
     )
     parser.add_argument(
         "--playout-cap",
@@ -506,22 +211,15 @@ def main():
         "--buffer by the share stored, and see --selfplay-cycles and --advance-every",
     )
     parser.add_argument(
-        "--playout-cap-noise",
-        choices=["full", "fast"],
-        default="full",
-        help="with --playout-cap, which searches' roots take the noise: the full ones "
-        "(KataGo's), or the fast ones, so the stored searches' targets are noise-free and "
-        "the unstored moves explore",
-    )
-    parser.add_argument(
         "--selfplay-cycles",
         type=int,
         default=None,
         metavar="CYCLES",
         help="self-play's compute per epoch, in search cycles per environment (a cycle is a "
-        "network evaluation of the root or of an iteration's leaf): by default 128 moves' "
-        "searches, 128 x (--sims + 1). Holds self-play's compute fixed across settings, e.g. "
-        "with --playout-cap, whose moves take fewer on average. A multiple of --sims + 1",
+        f"network evaluation of the root or of an iteration's leaf): by default "
+        f"{COLLECTION_STEPS} moves' searches, {COLLECTION_STEPS} x (--sims + 1). Holds "
+        "self-play's compute fixed across settings, e.g. with --playout-cap, whose moves take "
+        "fewer on average. A multiple of --sims + 1",
     )
     parser.add_argument(
         "--sampling-moves",
@@ -547,25 +245,19 @@ def main():
         help="share of each self-play root's prior that is Dirichlet noise (0 for none)",
     )
     parser.add_argument(
-        "--resign",
+        "--standard-starts",
         type=float,
-        nargs="?",
-        const=0.95,
-        default=None,
-        metavar="THRESHOLD",
-        help="self-play's player to move resigns when its search's root value is at most "
-        "-THRESHOLD: 0.95 (an expected score of 2.5%%) if no threshold is given, 0.9 for "
-        "5%%. Saves the searches of decided endgames for more games at "
-        "the same compute: on 4x64 at 0.9, 1.26x the games per epoch, +7 ± 17 Elo. "
-        "Needs --solve-empties off. Default: no resigning",
+        default=0.0,
+        help="fraction of self-play games from the standard start; the rest start from "
+        "XOT openings",
     )
     parser.add_argument(
-        "--resign-calibration",
-        type=float,
-        default=0.1,
-        help="with --resign, the fraction of games played to the end anyway, to measure how "
-        "often resigning would have been wrong (logged as resign_false)",
+        "--inference-dtype",
+        default="bfloat16",
+        help="dtype the network computes in during self-play (bfloat16 is about twice as "
+        "fast as float32, and plays as well)",
     )
+    # exact endgame labels
     parser.add_argument(
         "--solve-empties",
         type=solve_empties,
@@ -577,13 +269,6 @@ def main():
         "on gets its own exact result (see exact_labels.py). A game cut in an epoch is "
         "solved during the next epoch's self-play and trained on from then. Default 20; off "
         "plays games to the end and labels them with the played result",
-    )
-    parser.add_argument(
-        "--solve-share",
-        type=float,
-        default=1.0,
-        help="with --solve-empties, the fraction of games labelled exactly; the others are "
-        "played to the end and labelled with their played result",
     )
     parser.add_argument(
         "--solve-play-past",
@@ -610,47 +295,7 @@ def main():
         help="with --solve-empties, the solver's cores (default: every core this process "
         "may run on; it runs while self-play does, which mostly waits on the GPU)",
     )
-    parser.add_argument(
-        "--train-batch",
-        type=int,
-        default=4096,
-        help="samples per training step; if training runs out of memory with a big "
-        "network, see --remat and --grad-accum, which keep the batch",
-    )
-    parser.add_argument(
-        "--train-steps",
-        type=int,
-        default=256,
-        help="training steps per epoch. 0 trains nothing: the network (and its weight "
-        "averages) only plays, e.g. a fixed teacher's games for --log-moves",
-    )
-    parser.add_argument(
-        "--remat",
-        action="store_true",
-        help="train with much less memory, for roughly a third more training compute: "
-        "keep only each residual block's input for the backward pass, and compute its "
-        "activations again (gradient checkpointing). Training is the same, up to float "
-        "rounding",
-    )
-    parser.add_argument(
-        "--grad-accum",
-        type=int,
-        default=1,
-        metavar="M",
-        help="split each training batch into M micro-batches, one after another, and make "
-        "one update with their mean gradient: activations take 1/M the memory. BatchNorm "
-        "normalizes each micro-batch by its own statistics, so training differs a little "
-        "from whole batches (see README.md). Must divide --train-batch",
-    )
-    parser.add_argument(
-        "--envs",
-        type=int,
-        default=1024,
-        help="self-play environments: games played at once, each with --buffer positions of "
-        "replay memory. On an L40S, 2048 played about 29%% more moves a second than 1024 "
-        "(scan 11x64), 4096 fewer again. A saved state forks into another count only with "
-        "--init-without-buffers",
-    )
+    # replay buffer and training
     parser.add_argument(
         "--buffer",
         type=int,
@@ -668,72 +313,40 @@ def main():
         "run already has, e.g. --buffer 9000 --buffer-window 1125. Default all of --buffer",
     )
     parser.add_argument(
-        "--lr", type=float, default=1e-3, help="the initial learning rate"
-    )
-    parser.add_argument(
-        "--lr-final",
-        type=float,
-        default=None,
-        help="instead of --lr-drops' schedule, decay along a cosine to this learning rate; "
-        "equal to --lr for a constant learning rate",
-    )
-    parser.add_argument(
-        "--lr-drops",
-        type=lr_drops,
-        default=None,
-        help="hold --lr and drop in steps: FRACTION:LR,... of the run's training steps, each "
-        "rate below the last (default two drops of 10x: 0.7:--lr/10,0.9:--lr/100, so "
-        "0.7:1e-4,0.9:1e-5 at --lr 1e-3)",
-    )
-    parser.add_argument(
-        "--lr-plateau",
-        type=rate_list,
-        nargs="?",
-        const=DEFAULT_LR_PLATEAU,
-        default=None,
-        metavar="LR,...",
-        help="instead of --lr-drops' schedule, hold --lr and drop to each of these in turn when "
-        "the training loss stops improving: when it improved by less than "
-        "--lr-plateau-threshold over the last --lr-plateau-window epochs, by the slope of a "
-        "least-squares line through the epochs' losses, after at least --lr-plateau-min-epochs "
-        "epochs at the rate (default: 1e-4,1e-5). A fork starts again at --lr",
-    )
-    parser.add_argument(
-        "--lr-plateau-window",
+        "--train-batch",
         type=int,
-        default=40,
-        metavar="EPOCHS",
-        help="with --lr-plateau, the epochs the loss's improvement is measured over",
+        default=4096,
+        help="samples per training step; if training runs out of memory with a big "
+        "network, see --grad-accum and --remat, which keep the batch",
     )
     parser.add_argument(
-        "--lr-plateau-threshold",
-        type=float,
-        default=0.004,
-        help="with --lr-plateau, the improvement over the window below which the rate drops",
+        "--train-steps", type=int, default=256, help="training steps per epoch"
     )
     parser.add_argument(
-        "--lr-plateau-min-epochs",
+        "--grad-accum",
         type=int,
-        default=40,
-        metavar="EPOCHS",
-        help="with --lr-plateau, the epochs to train at a rate before it can drop",
+        default=1,
+        metavar="M",
+        help="split each training batch into M micro-batches, one after another, and make "
+        "one update with their mean gradient: activations take 1/M the memory. BatchNorm "
+        "normalizes each micro-batch by its own statistics, so training differs a little "
+        "from whole batches (see README.md). Must divide --train-batch",
     )
     parser.add_argument(
-        "--lr-plateau-metric",
-        default="loss",
-        choices=["loss", "engine_value_mse", "engine_exp_regret"],
-        help="with --lr-plateau, what the rule watches: the training loss, or the network's raw value "
-        "error (engine_value_mse) or expected regret (engine_exp_regret) on the engine-labelled set "
-        "(see --engine-set), fixed positions whose targets don't move as the network improves. "
-        "Scored every epoch for it (--engine-eval-every 1). A conservative setting that waits for "
-        "Elo to stop rising (small Othello nets): engine_value_mse with --lr-plateau-window 60 "
-        "--lr-plateau-threshold 0.005",
-    )
-    parser.add_argument(
-        "--lr-plateau-stop",
+        "--remat",
         action="store_true",
-        help="with --lr-plateau, end the run once the last rate plateaus, before --epochs",
+        help="train with much less memory, for roughly a third more training compute: "
+        "keep only each residual block's input for the backward pass, and compute its "
+        "activations again (gradient checkpointing). --grad-accum is faster for the same "
+        "memory",
     )
+    parser.add_argument(
+        "--train-dtype",
+        default="bfloat16",
+        help="dtype the network's convolutions compute in during training: bfloat16 is mixed "
+        "precision, its parameters, BatchNorm and heads staying in float32",
+    )
+    parser.add_argument("--lr", type=float, default=1e-3, help="the learning rate")
     parser.add_argument(
         "--optimizer",
         choices=["adamw", "sgd"],
@@ -752,20 +365,11 @@ def main():
         "--weight-decay",
         type=float,
         default=None,
-        help="weight decay of the network's weights (not its biases or normalization layers) "
-        f"at --lr: AdamW's (default {WEIGHT_DECAY}), or with --optimizer sgd, w times this added "
-        f"to the gradient, an L2 penalty of half this (default {SGD_WEIGHT_DECAY}; AlphaZero's "
-        "penalty 1e-4 is 2e-4 here). It follows the learning rate, --weight-decay times the "
-        "rate / --lr, through --lr-final's cosine, --lr-drops, --lr-plateau and --lr-drop, "
-        "which holds the weight norm through a drop (see --constant-weight-decay)",
-    )
-    parser.add_argument(
-        "--constant-weight-decay",
-        action="store_true",
-        help="hold --weight-decay through the learning rate's schedule and --lr-drop instead "
-        "of dropping it with the rate (AdamW's usual, and AlphaZero's and KataGo's L2): a drop "
-        "of k then shrinks a normalized network's weight norm about sqrt(k) under AdamW, "
-        "which raises its effective step back",
+        help="weight decay of the network's weights (not its biases or normalization layers): "
+        f"AdamW's (default {WEIGHT_DECAY}), or with --optimizer sgd, w times this added to "
+        f"the gradient, an L2 penalty of half this (default {SGD_WEIGHT_DECAY}; AlphaZero's "
+        "penalty 1e-4 is 2e-4 here). A branch at a lower --lr holds the weight norm only if "
+        "this rises by as much",
     )
     parser.add_argument(
         "--decoupled-decay",
@@ -773,48 +377,37 @@ def main():
         help="with --optimizer sgd, apply weight decay to the step after momentum, as AdamW "
         "does, instead of adding it to the gradient (L2)",
     )
+    # the weight average
     parser.add_argument(
-        "--lr-drop",
-        type=lr_drop_spec,
-        default=None,
-        metavar="EPOCHS:FACTOR",
-        help="scale the playing network's learning rate by FACTOR once it has played self-play "
-        "for EPOCHS epochs (with --grow, each network counts its own, from taking over; a "
-        "network waiting to take over trains at the full rate), e.g. 150:0.1. Its weight "
-        "decay drops by FACTOR too (see --weight-decay)",
+        "--average-epochs",
+        type=float,
+        default=4.0,
+        metavar="H",
+        help="self-play plays with, validation scores and checkpoints save an average of the "
+        "network's weights over about H epochs (an exponential moving average whose horizon "
+        "grows from 1 early in the run; training is unchanged); 1 for the network's own "
+        "weights",
     )
     parser.add_argument(
-        "--noise-measure",
+        "--average-norm-batches",
         type=int,
-        default=0,
-        metavar="K",
-        help="every epoch, measure each training network's gradient noise scale at its weight "
-        "average (--selfplay-average's, else the first of --average-epochs) from K "
-        "micro-batches, logged as gns_avg_*: K 64 adds about 6%% to training. For watching; "
-        "nothing follows it",
-    )
-    parser.add_argument(
-        "--fresh-positions",
-        type=int,
-        default=0,
+        default=32,
         metavar="N",
-        help="every epoch, score the playing network on N of the positions training can sample "
-        "now and couldn't before the epoch's self-play (with --solve-empties mostly the last "
-        "epoch's games, just labelled), before it trains on them, in inference mode: its raw "
-        "weights' and its self-play average's policy KL and value loss (fresh_*), and the raw "
-        "weights' excess (fresh_*_gap), what the step's jitter costs on new data. N a multiple of the micro-batch (--train-batch / "
-        "--grad-accum), e.g. 16 of them. For watching; nothing follows it. Default 0, none",
+        help="the weight average gets BatchNorm statistics of its own each epoch, from N "
+        "training micro-batches (--train-batch / --grad-accum) of the replay buffer through "
+        "its weights (0: it uses the network's statistics, which fit only its own weights)",
     )
+    # memorization and validation
     parser.add_argument(
         "--holdout-envs",
         type=int,
         default=0,
         metavar="N",
         help="never train on the games of N of the self-play environments (e.g. 32 of 1024, "
-        "about 3%% of the games), and every epoch score the playing network on their "
+        "about 3%% of the games), and every epoch score the network and its average on their "
         "positions and on the trained-on games' of the same ages: heldout_*, seen_*, and the "
         "difference memorized_*, what training fits in its replay buffer that doesn't carry "
-        "over to new games. For watching; nothing follows it. Default 0, none",
+        "over to new games. Default 0, none",
     )
     parser.add_argument(
         "--holdout-positions",
@@ -825,187 +418,50 @@ def main():
         "to whole micro-batches: 32768 adds about 5%% to training at the defaults",
     )
     parser.add_argument(
-        "--inference-dtype",
-        default="bfloat16",
-        help="dtype the network computes in during self-play and test games (bfloat16 is "
-        "about twice as fast as float32, and plays as well)",
-    )
-    parser.add_argument(
-        "--train-dtype",
-        default="bfloat16",
-        help="dtype the network's convolutions compute in during training: bfloat16 is mixed "
-        "precision, its parameters, BatchNorm and heads staying in float32",
-    )
-    parser.add_argument(
-        "--standard-starts",
-        type=float,
-        default=0.0,
-        help="fraction of self-play games from the standard start; the rest start from "
-        "XOT openings. Every test game starts from an XOT opening, so by default none "
-        "do, and the network never learns the first 8 moves",
-    )
-    parser.add_argument(
-        "--value-target-q",
-        type=float,
-        default=0.0,
-        help="train the value of played positions on a mix of the game's outcome z and the "
-        "search's root value q: (1 - this) * z + this * q (0, the default, is z alone)",
-    )
-    parser.add_argument(
-        "--policy-target",
-        choices=["visits", "completed-q"],
-        default="visits",
-        help="train the policy of played positions on the search's visit distribution "
-        "(the default, as AlphaZero), or on Gumbel MuZero's improved policy: the "
-        "network's policy at the root, before the root's noise, shifted towards the "
-        "children the search found better (see core/evaluators/mcts/policy_targets.py)",
-    )
-    parser.add_argument(
-        "--value-scale",
-        type=float,
-        default=0.1,
-        help="with --policy-target completed-q, how far the children's values shift the "
-        "policy, per visit of the most visited child (mctx's default; Gumbel MuZero's "
-        "Go and chess agents used 1)",
-    )
-    parser.add_argument(
-        "--maxvisit-init",
-        type=float,
-        default=50.0,
-        help="with --policy-target completed-q, visits added to the most visited "
-        "child's in scaling the children's values",
-    )
-    parser.add_argument(
-        "--tree-positions",
-        type=int,
-        default=0,
-        metavar="K",
-        help="also train on up to K positions from each self-play search tree, as OLIVAW "
-        "did: each on its children's visit distribution and its search value q (0, the "
-        "default, for none; see core/training/tree_positions.py)",
-    )
-    parser.add_argument(
-        "--tree-min-visits",
-        type=int,
-        default=16,
-        help="visits a search tree node needs to be stored",
-    )
-    parser.add_argument(
-        "--tree-select",
-        choices=("sample", "most-visited"),
-        default="sample",
-        help="store nodes sampled in proportion to their visits, or the most-visited "
-        "ones (OLIVAW's)",
-    )
-    parser.add_argument(
-        "--tree-discarded-only",
-        action="store_true",
-        help="only store nodes outside the played move's subtree (which the next search "
-        "reuses), so that each position is stored at most once",
-    )
-    parser.add_argument(
-        "--tree-ratio",
-        type=float,
-        default=1.0,
-        help="tree positions per played position in training batches (OLIVAW's 1:1 by "
-        "default: half of each batch)",
-    )
-    parser.add_argument(
-        "--tree-half-life",
-        type=float,
-        default=None,
-        help="epochs over which --tree-ratio halves (by default it stays constant)",
-    )
-    parser.add_argument(
-        "--tree-buffer",
-        type=int,
-        default=None,
-        help="tree positions kept per environment (default: "
-        "K times --buffer). Training samples those stored in the replay memory's span "
-        "of self-play",
-    )
-    parser.add_argument(
         "--engine-set",
         default=None,
         metavar="PATH",
-        help="the engine-labelled set to score the network on (see engine_set.py; default "
+        help="the engine-labelled set to validate the average on (see engine_set.py; default "
         f"{DEFAULT_ENGINE_SET}, skipped with a warning if it doesn't exist)",
     )
     parser.add_argument(
-        "--engine-eval-every",
+        "--validate-every",
         type=int,
         default=1,
-        help="epochs between scoring the network on the engine-labelled set (0 for never). "
+        help="epochs between scoring the average on the engine-labelled set (0 for never). "
         "A forward pass over its positions: a fraction of a second",
     )
+    # saves
     parser.add_argument(
         "--ckpt-dir",
         default=None,
-        help="where to save checkpoints (default: a new temporary directory)",
+        help="where to save the weights and states (default: a new temporary directory)",
     )
     parser.add_argument(
-        "--keep-every",
+        "--save-weights-every",
         type=int,
-        default=None,
-        help="also keep every checkpoint whose epoch is a multiple of this (otherwise "
-        "only the 2 newest are kept)",
-    )
-    parser.add_argument(
-        "--average-epochs",
-        type=float,
-        nargs="+",
-        default=[],
-        metavar="H",
-        help="also keep averages of each network's weights over about H epochs (exponential "
-        "moving averages, see --average-warmup; training is unchanged), "
-        "checkpointed to avg<H> in its checkpoint directory and scored on the engine-labelled "
-        "set as avg<H>/engine_*. A resume, branch or fork goes on with the saved average over "
-        "each H it has, and starts any other at the network's weights",
-    )
-    parser.add_argument(
-        "--selfplay-average",
-        type=float,
-        default=None,
-        metavar="H",
-        help="self-play plays with the playing network's average over H epochs (one of "
-        "--average-epochs) rather than its current weights",
-    )
-    parser.add_argument(
-        "--average-warmup",
-        type=float,
-        default=10.0,
-        metavar="W",
-        help="an average's horizon starts at 1 epoch and grows by one every W epochs it takes "
-        "in, up to its own: early in training, when every epoch improves the network a lot, a "
-        "long average lags it (1: the plain mean of the epochs so far until the horizon). "
-        "Counted in epochs, whatever --train-steps: an average over H reaches it after "
-        "(H - 1) x W epochs, e.g. 560 for 57 at the default, and one added to a fork starts "
-        "at 1",
-    )
-    parser.add_argument(
-        "--no-average-rescale",
-        action="store_true",
-        help="weight averages are plain moving averages of the weights, not rescaled to the "
-        "network's norms every epoch",
-    )
-    parser.add_argument(
-        "--average-norm-batches",
-        type=int,
-        default=32,
+        default=1,
         metavar="N",
-        help="each weight average gets BatchNorm statistics of its own after every epoch, from N "
-        "training micro-batches (--train-batch / --grad-accum) of the replay buffer through its "
-        "weights, for self-play, tests and its checkpoints (0: averages play with the "
-        "network's statistics, which fit only its own weights)",
+        help="save the weight average (its weights and BatchNorm statistics, what a player "
+        "loads) to --ckpt-dir/avg<H>/<epoch>.eqx every N epochs, keeping them all",
+    )
+    parser.add_argument(
+        "--save-raw-every",
+        type=int,
+        default=None,
+        metavar="N",
+        help="also save the network's own weights (its raw weights, which the average takes "
+        "in) to --ckpt-dir/raw/<epoch>.eqx at the start of every N epochs, all kept: "
+        "avg<H>/<epoch>.eqx's raw counterpart",
     )
     parser.add_argument(
         "--save-state-at",
         type=epoch_list,
         default=[],
         metavar="EPOCHS",
-        help="also save the whole training state (with the replay buffers: a few GB) to "
+        help="also save the whole training state (with the replay buffer: a few GB) to "
         "--ckpt-dir as state-<EPOCH>.npz once this many epochs are done, e.g. 150 or "
-        "50,150, to fork runs from with --init-from",
+        "50,150, to branch or fork runs from",
     )
     parser.add_argument(
         "--save-state-every",
@@ -1015,53 +471,21 @@ def main():
         help="also save the whole training state every N epochs, keeping the newest, to "
         "continue the run with --resume if it stops",
     )
-    parser.add_argument(
-        "--log-moves",
-        default=None,
-        metavar="DIR",
-        help="also keep every move self-play plays, fast searches' too, in DIR (a new "
-        "directory) as moves-<EPOCH>.npy, for teacher_dataset.py: about 180 bytes a move. "
-        "Training isn't changed. The log isn't in saved states: a run that keeps its moves "
-        "doesn't --resume into the same DIR",
-    )
+    # how the run starts
     init = parser.add_mutually_exclusive_group()
     init.add_argument(
         "--init-from",
         default=None,
         metavar="PATH",
         help="fork a new run from a saved state (state-<EPOCH>.npz, or a --ckpt-dir to take "
-        "the newest from): it starts at epoch 0, with its own schedules, games and seed, "
-        "from the saved network, optimizer state (the learning rate decaying anew from "
-        "--lr), weight averages and replay buffers. Needs the same --net; --buffer may "
-        "differ (each environment's newest entries are kept)",
-    )
-    parser.add_argument(
-        "--fork-into",
-        default=None,
-        metavar="NAME",
-        help="with --init-from: the saved run's network to fork, by name (its size, e.g. 8x128, "
-        "unless NAME=SPEC named it), from a --grow run's state too. With --grow, it forks into "
-        "this run's network of that name, which plays from the start; the ones before it are retired "
-        "(training beside it with --grow-train-retired), the next waits, and the rest start from "
-        "scratch. Without --grow, it is this run's --net, trained alone",
-    )
-    parser.add_argument(
-        "--warm-start",
-        type=warm_start_spec,
-        action="append",
-        default=[],
-        metavar="NAME=PATH",
-        help="with --grow, in a new run: this run's network of that name (e.g. 4x64) starts from "
-        "a saved state's (state-<EPOCH>.npz, or a --ckpt-dir to take the newest from; a --grow "
-        "run's network of that name, or a run's one network) instead of from scratch, with its "
-        "optimizer state (the learning rate decaying anew) and weight averages, "
-        "e.g. a student beside a teacher forked with --init-from and --fork-into. Repeatable; "
-        "not the network --init-from forks into",
+        "the newest from): it starts at epoch 0, with its own games and seed, from the saved "
+        "network, optimizer state, weight average and replay buffer. Needs the same --net and "
+        "--envs; --buffer may differ (each environment's newest entries are kept)",
     )
     parser.add_argument(
         "--init-without-buffers",
         action="store_true",
-        help="with --init-from, start with empty replay buffers instead",
+        help="with --init-from, start with an empty replay buffer instead",
     )
     init.add_argument(
         "--resume",
@@ -1074,17 +498,13 @@ def main():
         default=None,
         metavar="PATH",
         help="continue a run from a saved state (state-<EPOCH>.npz, or a directory to take the "
-        "newest from) in a new --ckpt-dir, with these arguments' self-play, e.g. other --sims: "
-        "the run goes on at its epoch, with its networks, optimizers, buffers, games and rng; "
-        "only the moves in progress are searched again if the search changed, and a different "
-        "--buffer resizes the replay buffer. --epochs counts the run's epochs before the branch "
-        "too (see Trainer.branch and controller.py)",
+        "newest from) in a new --ckpt-dir with these arguments, e.g. a lower --lr or other "
+        "--sims: the run goes on at its epoch, with its network, optimizer, weight average, "
+        "buffer, games and rng; only the moves in progress are searched again if the search "
+        "changed, and a different --buffer resizes the replay buffer. --epochs counts the "
+        "run's epochs before the branch too",
     )
-    parser.add_argument(
-        "--take-over",
-        action="store_true",
-        help="with --branch-from and --grow, the next network plays from the branch's first epoch",
-    )
+    # logging
     parser.add_argument("--name", default=None, help="the run's name on the server")
     parser.add_argument(
         "--notes",
@@ -1099,6 +519,11 @@ def main():
         metavar="URL",
         help=f"log to a seaglass server (default {DEFAULT_URL}: $SEAGLASS_URL, else slick's)",
     )
+    return parser
+
+
+def main():
+    parser = make_parser()
     args = parser.parse_args()
     if args.resume and args.ckpt_dir is None:
         parser.error("--resume needs the run's --ckpt-dir")
@@ -1108,130 +533,21 @@ def main():
         args.weight_decay = (
             SGD_WEIGHT_DECAY if args.optimizer == "sgd" else WEIGHT_DECAY
         )
+    if args.average_epochs < 1:
+        parser.error("--average-epochs must be at least 1")
     micro = args.train_batch // args.grad_accum
-    if args.fresh_positions < 0 or args.fresh_positions % micro:
-        parser.error(
-            f"--fresh-positions must be a multiple of the micro-batch ({micro}, --train-batch / "
-            "--grad-accum)"
-        )
-    if args.noise_measure < 0:
-        parser.error("--noise-measure must be at least 0")
     if args.holdout_envs < 0 or args.holdout_positions <= 0:
         parser.error("--holdout-envs is at least 0, --holdout-positions positive")
     args.holdout_positions = -(-args.holdout_positions // micro) * micro
     if args.init_without_buffers and args.init_from is None:
         parser.error("--init-without-buffers needs --init-from")
-    if args.fork_into is not None and args.init_from is None:
-        parser.error("--fork-into needs --init-from")
-    if args.warm_start and not args.grow:
-        parser.error("--warm-start is for a run with --grow")
-    if args.warm_start and (args.resume or args.branch_from is not None):
-        parser.error("--warm-start is for a new run, not --resume or --branch-from")
-    if args.grow_train_steps is not None and (
-        not args.grow or args.grow_train_steps < 1
-    ):
-        parser.error("--grow-train-steps is a positive number of steps, with --grow")
-    if args.grow_train_retired and not args.grow:
-        parser.error("--grow-train-retired is for a run with --grow")
-    if args.grow_frozen and not args.grow:
-        parser.error("--grow-frozen is for a run with --grow")
-    if args.grow_train_waiting and not args.grow:
-        parser.error("--grow-train-waiting is for a run with --grow")
-    grown_names = [net_name(spec) for spec in args.grow]
-    for option, given in (
-        ("--lr-of", args.lr_of),
-        ("--weight-decay-of", args.weight_decay_of),
-    ):
-        names = [name for name, _ in given]
-        unknown = sorted(set(names) - set(grown_names))
-        if unknown:
-            parser.error(
-                f"{option}: no --grow network {', '.join(unknown)} (they are "
-                f"{', '.join(grown_names) or 'none'})"
-            )
-        if len(set(names)) != len(names):
-            parser.error(f"{option} names a network more than once")
-    if any(value <= 0 for _, value in args.lr_of):
-        parser.error("--lr-of takes positive learning rates")
-    if any(value < 0 for _, value in args.weight_decay_of):
-        parser.error("--weight-decay-of takes weight decays of at least 0")
-    if args.grow_lr is not None and (not args.grow or args.grow_lr <= 0):
-        parser.error("--grow-lr is a positive learning rate, with --grow")
-    if any(h < 1 for h in args.average_epochs) or len(set(args.average_epochs)) != len(
-        args.average_epochs
-    ):
-        parser.error("--average-epochs are distinct horizons of at least 1 epoch")
-    if (
-        args.selfplay_average is not None
-        and args.selfplay_average not in args.average_epochs
-    ):
-        parser.error("--selfplay-average must be one of --average-epochs")
-    for option, metric in (
-        ("--grow-metric", args.grow_metric),
-        ("--grow-guard", args.grow_guard),
-    ):
-        horizon = re.match(r"avg(\d+)/", metric or "")
-        if horizon and int(horizon.group(1)) not in args.average_epochs:
-            parser.error(
-                f"{option} {metric}: avg{horizon.group(1)} isn't one of --average-epochs"
-            )
-    if args.average_warmup <= 0:
-        parser.error("--average-warmup must be positive")
-    if sum(x is not None for x in (args.lr_final, args.lr_drops, args.lr_plateau)) > 1:
-        parser.error(
-            "--lr-final, --lr-drops and --lr-plateau are different schedules: pass one"
-        )
-    if args.lr_final is not None and args.lr_final > args.lr:
-        parser.error("--lr-final must be at most --lr")
-    if args.lr_drops is not None:
-        rates = [args.lr, *(rate for _, rate in args.lr_drops)]
-        if any(after >= before for before, after in itertools.pairwise(rates)):
-            parser.error("--lr-drops' rates must each be below the last, from --lr")
-    lr_plateau = None
-    if args.lr_plateau is not None:
-        if args.lr_plateau[0] >= args.lr:
-            parser.error("--lr-plateau's rates must be below --lr")
-        try:
-            lr_plateau = LRPlateau(
-                (args.lr, *args.lr_plateau),
-                window=args.lr_plateau_window,
-                threshold=args.lr_plateau_threshold,
-                min_epochs=args.lr_plateau_min_epochs,
-                stop=args.lr_plateau_stop,
-            )
-        except ValueError as e:
-            parser.error(str(e))
-    if args.lr_plateau_metric != "loss":
-        if args.lr_plateau is None:
-            parser.error("--lr-plateau-metric goes with --lr-plateau")
-        if args.engine_eval_every != 1:
-            parser.error(
-                f"--lr-plateau-metric {args.lr_plateau_metric} needs --engine-eval-every 1"
-            )
-    if args.no_persist_tree and args.count_reused_visits:
-        parser.error(
-            "--count-reused-visits counts the visits of the subtree a search keeps, which "
-            "--no-persist-tree discards"
-        )
-    if args.advance_every is None and (
-        args.count_reused_visits or args.playout_cap is not None
-    ):
+    if args.advance_every is None and args.playout_cap is not None:
         # searches of varying lengths: see Trainer's advance_every
         args.advance_every = 5
-    if args.playout_cap is not None:
-        if args.sims_schedule is not None:
-            parser.error("--playout-cap goes with --sims, not --sims-schedule")
-        if args.playout_cap.fast_iterations >= args.sims:
-            parser.error("--playout-cap's fast sims must be fewer than --sims")
-        args.playout_cap = dataclasses.replace(
-            args.playout_cap, noisy=args.playout_cap_noise
-        )
-    elif args.playout_cap_noise != "full":
-        parser.error("--playout-cap-noise goes with --playout-cap")
-    collection_steps = 128
+    if args.playout_cap is not None and args.playout_cap.fast_iterations >= args.sims:
+        parser.error("--playout-cap's fast sims must be fewer than --sims")
+    collection_steps = COLLECTION_STEPS
     if args.selfplay_cycles is not None:
-        if args.sims_schedule is not None:
-            parser.error("--selfplay-cycles goes with --sims, not --sims-schedule")
         if args.selfplay_cycles < 1 or args.selfplay_cycles % (args.sims + 1):
             parser.error(
                 f"--selfplay-cycles must be a positive multiple of --sims + 1 ({args.sims + 1})"
@@ -1240,260 +556,90 @@ def main():
         collection_steps = args.selfplay_cycles // (args.sims + 1)
     if args.buffer_window is not None and not 0 < args.buffer_window <= args.buffer:
         parser.error("--buffer-window is 1 to --buffer positions")
-    if args.resign is not None and not 0 < args.resign <= 1:
-        parser.error("--resign must be in (0, 1]")
-    if not 0 <= args.resign_calibration <= 1:
-        parser.error("--resign-calibration must be between 0 and 1")
-    if args.solve_empties is not None and args.resign is not None:
-        parser.error("--resign needs --solve-empties off")
-    if not 0 <= args.solve_share <= 1:
-        parser.error("--solve-share must be between 0 and 1")
     if args.dirichlet_alpha <= 0:
         parser.error("--dirichlet-alpha must be positive")
     if not 0 <= args.dirichlet_epsilon <= 1:
         parser.error("--dirichlet-epsilon must be between 0 and 1")
-    if args.policy_target == "completed-q" and args.tree_positions > 0:
-        # a tree position's target is its visits: the network's policy before the
-        # search isn't kept below the root
-        parser.error("--policy-target completed-q can't go with --tree-positions")
+    if args.save_weights_every < 1:
+        parser.error("--save-weights-every must be positive")
+    if args.save_raw_every is not None and args.save_raw_every < 1:
+        parser.error("--save-raw-every must be positive")
 
-    if not args.grow and (
-        args.grow_switch_at is not None
-        or args.grow_manual
-        or any(
-            getattr(args, k) != parser.get_default(k)
-            for k in (
-                "grow_metric",
-                "grow_window",
-                "grow_min_epochs",
-                "grow_margin",
-                "grow_guard",
-            )
-        )
-    ):
-        parser.error(
-            "--grow-metric, --grow-window, --grow-min-epochs, --grow-margin, --grow-guard, "
-            "--grow-switch-at and --grow-manual go with --grow"
-        )
-    if not 0 <= args.grow_margin < 1:
-        parser.error("--grow-margin is a fraction in [0, 1)")
-    if args.grow_manual and args.grow_switch_at is not None:
-        parser.error("--grow-manual and --grow-switch-at are different rules: pass one")
-    # the engine set's metrics need it every epoch; the training loss is logged every epoch
-    engine_rule = (
-        args.grow
-        and args.grow_switch_at is None
-        and (args.grow_metric != "loss" or args.grow_guard is not None)
+    network, network_state = make_network(
+        args.net,
+        seed=args.seed,
+        inference_dtype=args.inference_dtype,
+        train_dtype=args.train_dtype,
+        remat=args.remat,
     )
-    if engine_rule and args.engine_eval_every != 1:
-        parser.error(
-            "--grow's rule needs the engine set every epoch: --engine-eval-every 1"
-        )
-    if args.take_over and (args.branch_from is None or not args.grow):
-        parser.error("--take-over goes with --branch-from and --grow")
+    # AlphaZero takes an arbitrary search backend, here classic MCTS. Temperature 1.0 samples
+    # moves in proportion to visit counts, for exploration during self-play
+    evaluator = AlphaZero(MCTS)(
+        eval_fn=make_nn_eval_fn(network, state_to_nn_input),
+        num_iterations=args.sims,
+        max_nodes=int(args.tree_factor * args.sims),
+        branching_factor=env.num_actions,
+        action_selector=PUCTSelector(),
+        temperature=1.0,
+        dirichlet_alpha=args.dirichlet_alpha,
+        dirichlet_epsilon=args.dirichlet_epsilon,
+        traversal_steps=args.traversal_steps,
+        playout_cap=args.playout_cap,
+    )
 
-    # self-play starts games from XOT openings (see xot.py) for varied, balanced
-    # games
-    selfplay_init_fn = make_xot_init_fn(load_xot(), args.standard_starts)
-    # test games all start from XOT openings
-    test_init_fn = make_xot_init_fn(load_xot(), standard_start_fraction=0)
-
-    def make_net(spec: str):
-        """A network (see game.py), with its state (BatchNorm's, if it has any), from its
-        [NAME=]SPEC."""
-        return make_network(
-            named_spec(spec)[1],
-            seed=args.seed,
-            inference_dtype=args.inference_dtype,
-            train_dtype=args.train_dtype,
-            remat=args.remat,
-        )
-
-    def make_selfplay(network) -> EvaluatorSchedule:
-        """A network's self-play search. AlphaZero takes an arbitrary search backend, here
-        classic MCTS. Temperature 1.0 samples moves in proportion to visit counts, for
-        exploration during self-play. With --sims-schedule, a search for each stage: each
-        takes over at its epoch, starting from empty trees sized for it (see
-        core.training.schedule)"""
-        selfplay_eval_fn = make_nn_eval_fn(network, state_to_nn_input)
-        return EvaluatorSchedule(
-            [
-                (
-                    epoch,
-                    AlphaZero(MCTS)(
-                        eval_fn=selfplay_eval_fn,
-                        num_iterations=sims,
-                        # counting reused visits, a search's root never has more visits than
-                        # this, those of the cycles it goes on for until its move is played included
-                        max_nodes=sims + args.min_iterations + args.advance_every
-                        if args.count_reused_visits
-                        else int(args.tree_factor * sims),
-                        branching_factor=env.num_actions,
-                        action_selector=PUCTSelector(),
-                        temperature=1.0,
-                        dirichlet_alpha=args.dirichlet_alpha,
-                        dirichlet_epsilon=args.dirichlet_epsilon,
-                        persist_tree=not args.no_persist_tree,
-                        count_reused_visits=args.count_reused_visits,
-                        min_iterations=args.min_iterations,
-                        traversal_steps=args.traversal_steps,
-                        policy_target=CompletedQ(args.value_scale, args.maxvisit_init)
-                        if args.policy_target == "completed-q"
-                        else VisitCounts(),
-                        playout_cap=args.playout_cap,
-                    ),
-                )
-                for epoch, sims in args.sims_schedule or [(0, args.sims)]
-            ]
-        )
-
-    # the network's raw moves and values against an engine's, on the engine-labelled set
+    # the average's raw moves and values against an engine's, on the engine-labelled set, in
+    # float32: in bfloat16 a checkpoint's value MSE is off by up to 0.006, more than ten epochs
+    # of a slow run's progress
     engine_set = load_engine_set(parser, args)
-    if engine_set is None and args.lr_plateau_metric != "loss":
-        parser.error(
-            f"--lr-plateau-metric {args.lr_plateau_metric} needs an engine-labelled set"
-        )
-    if engine_set is None and engine_rule:
-        parser.error("--grow's rule needs an engine-labelled set")
-    ckpt_dir = args.ckpt_dir or tempfile.mkdtemp(prefix="turbozero-othello-")
-    monitor = (
-        Monitor(args.monitor, project="othello", name=args.name, notes=args.notes)
-        if args.monitor
-        else None
-    )
-
-    def make_testers(network) -> list[BaseTester]:
-        """A network's testers: the engine-labelled set, all of its positions as engine_*, and
-        those between the opening and the solver as filtered_engine_*."""
-        if engine_set is None:
-            return []
-        config = {
-            "path": str(args.engine_set or DEFAULT_ENGINE_SET),
-            **engine_set.describe(),
-        }
-        return [
-            ScoredPositionsTester(
-                engine_set.scored_positions(filtered=filtered),
-                network,
-                epochs_per_test=args.engine_eval_every,
-                name=name,
-                config=config,
+    validators = (
+        [
+            ScoredPositionsValidator(
+                engine_set.scored_positions(),
+                make_network(args.net, inference_dtype="float32")[0],
+                name="engine",
+                config={
+                    "path": str(args.engine_set or DEFAULT_ENGINE_SET),
+                    **engine_set.describe(),
+                },
                 prior_temperature=PLAY_PRIOR_TEMPERATURE,
             )
-            for name, filtered in (("engine", False), ("filtered_engine", True))
         ]
-
-    network, network_state = make_net(args.net)
-    evaluator = make_selfplay(network)
-    evaluator_test = make_test_evaluator(make_nn_eval_fn(network, state_to_nn_input))
-    # with --grow, the bigger networks, each with its own searches and testers
-    growth = None
-    if args.grow:
-        learners = []
-        lr_of, weight_decay_of = dict(args.lr_of), dict(args.weight_decay_of)
-        for spec in args.grow:
-            grown, grown_state = make_net(spec)
-            name = net_name(spec)
-            lr = lr_of.get(name, args.lr if args.grow_lr is None else args.grow_lr)
-            learners.append(
-                Learner(
-                    name=name,
-                    nn=grown,
-                    nn_state=grown_state,
-                    evaluator=make_selfplay(grown),
-                    evaluator_test=make_test_evaluator(
-                        make_nn_eval_fn(grown, state_to_nn_input)
-                    ),
-                    testers=make_testers(grown),
-                    lr_scale=lr / args.lr,
-                    hyperparams={"weight_decay": weight_decay_of[name]}
-                    if name in weight_decay_of
-                    else {},
-                )
-            )
-        try:
-            growth = Growth(
-                first=net_name(args.net),
-                learners=learners,
-                metric=args.grow_metric,
-                window=args.grow_window,
-                min_epochs=args.grow_min_epochs,
-                switch_at=args.grow_switch_at or (),
-                manual=args.grow_manual,
-                margin=args.grow_margin,
-                guard=args.grow_guard,
-            )
-        except ValueError as e:
-            parser.error(f"--grow: {e}")
-    testers = make_testers(network)
+        if engine_set is not None
+        else []
+    )
 
     endgame_solve = None
     if args.solve_empties is not None:
-        stages = [e for _, e in evaluator.stages]
         endgame_solve = EndgameSolve(
             stop_fn=stops_at(args.solve_empties),
             solve_fn=make_solve_fn(
                 args.solver, args.solve_threads or default_threads()
             ),
             slots=solve_slots(
-                max(collection_steps * e.search_cycles() for e in stages),
-                args.advance_every or min(e.search_cycles() for e in stages),
+                collection_steps * evaluator.search_cycles(),
+                args.advance_every or evaluator.search_cycles(),
                 args.solve_empties,
                 args.solve_play_past,
             ),
-            share=args.solve_share,
             play_past=args.solve_play_past,
         )
 
-    # each epoch collects `collection_steps_per_epoch` self-play steps' compute (see
-    # --selfplay-cycles) in each of `batch_size` environments, then takes
-    # `train_steps_per_epoch` training steps
+    ckpt_dir = args.ckpt_dir or tempfile.mkdtemp(prefix="turbozero-othello-")
     trainer = Trainer(
         batch_size=args.envs,
         train_batch_size=args.train_batch,
-        warmup_steps=0,
         collection_steps_per_epoch=collection_steps,
         train_steps_per_epoch=args.train_steps,
-        advance_every=args.advance_every,
-        grad_accum_steps=args.grad_accum,
-        lr_drop=None
-        if args.lr_drop is None
-        else dataclasses.replace(
-            args.lr_drop, scale_decay=not args.constant_weight_decay
-        ),
-        noise_measure=args.noise_measure,
-        fresh_positions=args.fresh_positions,
-        holdout_envs=args.holdout_envs,
-        holdout_positions=args.holdout_positions if args.holdout_envs else 0,
         nn=network,
         nn_state=network_state,
-        loss_fn=partial(az_default_loss_fn, value_target_q=args.value_target_q),
-        # decays from --lr to --lr-final over the run, drops at --lr-drops, or on plateaus
+        loss_fn=az_default_loss_fn,
         optimizer=make_optimizer(
-            args.epochs * args.train_steps,
             args.lr,
-            args.lr if args.lr_final is None else args.lr_final,
             args.weight_decay,
-            args.lr_drops
-            or (default_lr_drops(args.lr) if args.lr_final is None else ()),
-            lr_plateau=lr_plateau,
             sgd=args.optimizer == "sgd",
             momentum=args.momentum,
             decoupled=args.decoupled_decay,
-            decay_with_lr=not args.constant_weight_decay,
         ),
-        lr_plateau=lr_plateau,
-        lr_plateau_metric=args.lr_plateau_metric,
-        growth=growth,
-        waiting_train_steps=args.grow_train_steps,
-        train_retired=args.grow_train_retired,
-        train_waiting=args.grow_train_waiting,
-        train_playing=not args.grow_frozen,
-        averages=args.average_epochs,
-        selfplay_average=args.selfplay_average,
-        average_warmup=args.average_warmup,
-        average_norm_batches=args.average_norm_batches,
-        average_rescale=not args.no_average_rescale,
         evaluator=evaluator,
         # stores `capacity` positions for each of the `batch_size` environments
         memory_buffer=EpisodeReplayBuffer(
@@ -1501,37 +647,33 @@ def main():
         ),
         max_episode_steps=80,
         env_step_fn=step_fn,
-        env_init_fn=selfplay_init_fn,
-        test_env_init_fn=test_init_fn,
+        # self-play starts games from XOT openings (see xot.py) for varied, balanced games
+        env_init_fn=make_xot_init_fn(load_xot(), args.standard_starts),
         state_to_nn_input_fn=state_to_nn_input,
-        testers=testers,
-        evaluator_test=evaluator_test,
-        # training maps each sample through one of the board's 8 symmetries, at random
-        data_transform_fns=SYMMETRY_TRANSFORM_FNS,
-        tree_positions=TreePositions(
-            per_move=args.tree_positions,
-            min_visits=args.tree_min_visits,
-            capacity=args.tree_buffer or args.tree_positions * args.buffer,
-            ratio=args.tree_ratio,
-            half_life=args.tree_half_life,
-            most_visited=args.tree_select == "most-visited",
-            discarded_only=args.tree_discarded_only,
-        )
-        if args.tree_positions > 0
-        else None,
-        monitor=monitor,
-        ckpt_dir=ckpt_dir,
-        keep_every=args.keep_every,
+        grad_accum_steps=args.grad_accum,
+        average_epochs=args.average_epochs,
+        average_norm_batches=args.average_norm_batches,
+        holdout_envs=args.holdout_envs,
+        holdout_positions=args.holdout_positions if args.holdout_envs else 0,
+        validators=validators,
+        validate_every=max(args.validate_every, 1),
+        exploration=Exploration(num_sampling_moves=args.sampling_moves),
+        endgame_solve=endgame_solve,
         # how often self-play games are drawn
         episode_metrics_fn=episode_metrics,
-        exploration=Exploration(num_sampling_moves=args.sampling_moves),
-        resignation=Resignation(args.resign, args.resign_calibration)
-        if args.resign is not None
+        # training maps each sample through one of the board's 8 symmetries, at random
+        data_transform_fns=SYMMETRY_TRANSFORM_FNS,
+        advance_every=args.advance_every,
+        monitor=Monitor(
+            args.monitor, project="othello", name=args.name, notes=args.notes
+        )
+        if args.monitor
         else None,
-        endgame_solve=endgame_solve,
-        save_state_at=args.save_state_at,
+        ckpt_dir=ckpt_dir,
+        save_weights_every=args.save_weights_every,
+        save_raw_every=args.save_raw_every,
         save_state_every=args.save_state_every,
-        log_moves=args.log_moves,
+        save_state_at=args.save_state_at,
         # every argument but how the run starts (a fork or branch records its parent)
         extra_config={
             "args": {
@@ -1542,10 +684,7 @@ def main():
                     "resume",
                     "init_from",
                     "init_without_buffers",
-                    "fork_into",
-                    "warm_start",
                     "branch_from",
-                    "take_over",
                     "notes",
                 )
             }
@@ -1556,19 +695,15 @@ def main():
         initial_state = trainer.resume()
     elif args.branch_from is not None:
         try:
-            initial_state = trainer.branch(args.branch_from, take_over=args.take_over)
+            initial_state = trainer.branch(args.branch_from)
         except ValueError as e:
             parser.error(f"--branch-from: {e}")
     trainer.train_loop(
         seed=args.seed,
         num_epochs=args.epochs,
-        # each tester keeps its own cadence (--engine-eval-every)
-        eval_every=1,
         initial_state=initial_state,
         fork_from=args.init_from,
-        fork_replay_buffers=not args.init_without_buffers,
-        fork_into=args.fork_into,
-        warm_start=args.warm_start,
+        fork_replay_buffer=not args.init_without_buffers,
     )
 
 

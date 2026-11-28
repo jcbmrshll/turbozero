@@ -279,15 +279,31 @@ def make_search():
     return make
 
 
+def collect_cycle(trainer: Trainer, key, state, params=None):
+    """A self-play cycle in one environment, as `Trainer.collect_steps` runs them with an
+    `advance_every` of 1: the move's search starts if none is in progress, runs a cycle, and
+    the move is played if its search is done, the evaluator's state moving on with it."""
+    state = trainer.start_searches(key, state)
+    state = trainer.search(state, params)
+    state, (done, action, ended) = trainer.play_moves(state, params)
+    return replace(
+        state,
+        eval_state=trainer.evaluator.next_state(
+            state.eval_state, action, ended, active=done
+        ),
+    )
+
+
 class Collector:
-    """`make_collector`'s `collect`, with its `trainer`."""
+    """`make_collector`'s `collect`, with its `trainer`, and `step`, a jitted cycle of its one
+    environment (see `collect_cycle`)."""
 
     def __init__(self, trainer: Trainer):
         self.trainer = trainer
-        self.step = jax.jit(jax.vmap(partial(trainer.collect, params=None)))
+        self.step = jax.jit(jax.vmap(partial(collect_cycle, trainer)))
 
     def __call__(self, num_steps: int):
-        state = self.trainer.init_collection_state(jax.random.PRNGKey(0), batch_size=1)
+        state = self.trainer.init_collection_state(jax.random.PRNGKey(0))
         for i in range(num_steps):
             state = self.step(jax.random.split(jax.random.PRNGKey(i), 1), state)
         return state
@@ -295,11 +311,11 @@ class Collector:
 
 @pytest.fixture(scope="session")
 def make_collector():
-    """Factory for self-play collection in a single environment, through a `Trainer`'s `collect`.
+    """Factory for self-play in a single environment, a cycle at a time (see `collect_cycle`).
 
     `make_collector(env, evaluator, max_episode_steps, ckpt_dir, **trainer_kwargs)` returns
-    `collect(num_steps)`: the `CollectionState` after `num_steps` steps from the initial state.
-    `collect.trainer` is the trainer.
+    `collect(num_steps)`: the `CollectionState` after `num_steps` cycles from the initial
+    state. `collect.trainer` is the trainer.
     """
 
     def make(env, evaluator, max_episode_steps, ckpt_dir, **trainer_kwargs):
@@ -307,7 +323,6 @@ def make_collector():
         trainer = Trainer(
             batch_size=1,
             train_batch_size=1,
-            warmup_steps=0,
             collection_steps_per_epoch=1,
             train_steps_per_epoch=1,
             nn=nn,
@@ -319,7 +334,6 @@ def make_collector():
             env_step_fn=env.step_fn,
             env_init_fn=env.init_fn,
             state_to_nn_input_fn=env.state_to_nn_input,
-            testers=[],
             ckpt_dir=str(ckpt_dir),
             **trainer_kwargs,
         )

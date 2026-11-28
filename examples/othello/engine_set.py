@@ -1,9 +1,9 @@
 """Othello positions with every legal move scored by a strong engine: a fixed set to measure
 networks against (see `label_positions.py` to build one, `score_engine_set.py` to score
-checkpoints on one, and train.py's --engine-set, which scores the network on one as it trains,
-with `core.testing.scored_positions.ScoredPositionsTester`). Networks are measured on every
-position, by game phase (`PHASES`), and on the positions they decide, between the XOT opening
-and the exact solver, logged as filtered_* (`FILTERED_PHASES`).
+checkpoints on one, and train.py's --engine-set, which validates the weight average on one as it
+trains, with `core.training.validation.ScoredPositionsValidator`). Networks are measured on every
+position, by game phase (`PHASES`), and score_engine_set.py also on the positions they decide,
+between the XOT opening and the exact solver, as filtered_* (`FILTERED_PHASES`).
 
 A set is an .npz of numpy arrays:
 - obs: (N, 16) uint8, each position's (8, 8, 2) observation (as the network takes it: the
@@ -30,7 +30,7 @@ import numpy as np
 from engines import CACHE_DIR
 from game import PASS
 
-from core.testing.scored_positions import ScoredPositions
+from core.training.validation import ScoredPositions
 
 # where training runs look for a set unless told otherwise
 DEFAULT_PATH = CACHE_DIR / "engine-sets" / "nr26-evals-29k.npz"

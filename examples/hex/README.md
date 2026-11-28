@@ -13,7 +13,7 @@ model.
 | `engines.py` | MoHex, driven over GTP |
 | `setup_mohex.sh`, `benzene.patch` | Build MoHex for `vs_engine.py`, without root |
 | `engine_set.py`, `label_positions.py` | The engine-labelled set: fixed positions with every legal move scored by MoHex, to build (train.py scores the network on it every epoch) |
-| `openings.py`, `make_openings.py`, `openings-<size>.txt` | The opening lists, to start test games from, and to build them |
+| `openings.py`, `make_openings.py`, `openings-<size>.txt` | The opening lists, to start matches from, and to build them |
 | `game.py` | What the scripts share: the environment at a size, board symmetries, network, evaluators |
 
 ## The game
@@ -44,9 +44,9 @@ included, and they stay each other's images to the end.
 
 ```
 uv run --extra cuda examples/hex/train.py --size 11 --monitor --ckpt-dir runs/hex11 \
-    --notes "the baseline" --vs-engine-last 3
+    --notes "the baseline"
 uv run --extra cuda examples/hex/train.py --size 7 --monitor --ckpt-dir runs/hex7 \
-    --notes "the baseline" --vs-engine-last 3
+    --notes "the baseline"
 ```
 
 A fresh worktree's jax is CPU-only: run `./install.sh` first. `--name` names the run on the server,
@@ -63,27 +63,24 @@ position. The network and the length of the run scale with the board:
 | 11 | `resnet:6x128,pool_every=2,heads=pooled` | 150 |
 
 Self-play starts from the empty board, with the swap rule (`--standard-starts` below 1 starts some
-games from the openings instead). The other flags are Othello's: `--sims`, `--sims-schedule`,
-`--train-steps`, `--train-batch`, `--buffer`, `--lr`, `--inference-dtype`, `--tree-positions`,
-`--policy-target`, `--value-target-q` and the rest, and see
-[Othello's README](../othello/README.md) for what they do. Resuming and forking work the same:
-`--save-state-at`, `--save-state-every`, `--resume`, `--init-from`.
+games from the openings instead). The other flags are Othello's: `--sims`, `--train-steps`,
+`--train-batch`, `--buffer`, `--lr` (constant), `--average-epochs`, `--inference-dtype` and the
+rest, and see [Othello's README](../othello/README.md) for what they do. The weight average's
+weights go to `--ckpt-dir/avg<H>/<epoch>.eqx` every `--save-weights-every` epochs (1 by default).
+Resuming and forking work the same: `--save-state-at`, `--save-state-every`, `--resume`,
+`--init-from`.
 
 Board size changes game length, which Othello can't: the run's page plots `moves` and `episodes`,
 and their ratio is the positions per game. Times the 4 passes per position, that's the views each
 game's outcome gets.
 
-Every `--eval-every` epochs (5 by default) it plays 128 test games against each of a random player,
-the shortest-path evaluator (`HexGame.shortest_path_eval`: both players' shortest connections,
-searching 64 iterations a move, which beat a random player in every game we tried) and at 11 x 11
-pgx's pretrained model at 64 iterations, logged as `random_avg_outcome`, `path_avg_outcome`
-and `pgx_avg_outcome`. With `--monitor` the run's page draws a game against each on a hex board,
-each move's search to explore beside it.
+Training plays no games against other players: its validation is the engine-labelled set below.
+Saved weights play MoHex (`vs_engine.py`) and pgx's pretrained model (`eval_pgx.py`) afterwards.
 
 ## Openings
 
-Hex's first player wins with perfect play, so a match has to be fair by its construction. Test
-games and games against MoHex start from an opening, each played with both colours. A list holds
+Hex's first player wins with perfect play, so a match has to be fair by its construction. Games
+against MoHex and pgx's model start from an opening, each played with both colours. A list holds
 every single first stone, after which the player to move has the swap, as in a real game, and
 two-stone positions that MoHex judges close to even (20,000 playouts, from 0.35 to 0.65, nothing
 proven). `make_openings.py` builds them:
@@ -96,8 +93,8 @@ taskset -c 16-23 uv run examples/hex/make_openings.py --size 7 --workers 8
 
 ```
 examples/hex/setup_mohex.sh                       # once
-uv run --extra cuda examples/hex/vs_engine.py runs/hex11/149.eqx --size 11 --sims 256 --levels 100 1000 10000
-uv run --extra cuda examples/hex/eval_pgx.py runs/hex11/149.eqx --pgx-sims 64 256 1024
+uv run --extra cuda examples/hex/vs_engine.py runs/hex11/avg1/149.eqx --size 11 --sims 256 --levels 100 1000 10000
+uv run --extra cuda examples/hex/eval_pgx.py runs/hex11/avg1/149.eqx --pgx-sims 64 256 1024
 ```
 
 `setup_mohex.sh` builds MoHex and what it needs (Boost, Berkeley DB) from source into
@@ -111,19 +108,17 @@ in a quarter of the available memory, on the cores it may use (`taskset`). Our a
 temperature 0, without root noise. Each result is checked against MoHex's own board.
 `--monitor --run ID` logs a checkpoint's results to its training run.
 
-During training, `--vs-engine-every N` plays after every N epochs and `--vs-engine-last K` after
-each of the last K, by default 256 games (128 openings) at level 1000 and 256 iterations a move,
-logged as `mohex_level1000_sims256` with `_se`, `_win` and `_loss`, a game to step through as
-`mohex_level1000_sims256_game`, and the mean of the last K as `_last<K>`. `mohex_seconds` is
-the time they took, to take out of the run's wall time.
+Logged to a run, each level's score is `mohex_level1000_sims256` with `_se`, `_win` and `_loss`,
+and a game to step through as `mohex_level1000_sims256_game`.
 
 ### Against MoHex's scores of fixed positions
 
 Without search or games: thousands of fixed positions from MoHex's games against itself, each legal
-move of which MoHex has scored. `train.py` scores the raw network on them every epoch, as Othello
-does (`--engine-set`, `--engine-eval-every`), logging for all positions and for each phase (a
-share of the board's cells filled: `opening` below 20%, `midgame` to 40%, `endgame` above) `engine_top1`,
-`engine_regret`, `engine_exp_regret`, `engine_value_mse` and `engine_value_sign`.
+move of which MoHex has scored. `train.py` scores the raw outputs of the weight average on them
+every `--validate-every` epochs, as Othello does (`--engine-set`), logging for all positions and
+for each phase (a share of the board's cells filled: `opening` below 20%, `midgame` to 40%,
+`endgame` above) `engine_top1`, `engine_regret`, `engine_exp_regret`, `engine_value_mse`
+and `engine_value_sign`.
 A score here is a win or loss value, from -1 to 1, not a disc margin, so a regret of 2 is giving
 a won game away.
 

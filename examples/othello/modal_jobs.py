@@ -182,7 +182,7 @@ def spawn(job: Job, store: Store) -> None:
         image = image.add_local_file(here / f"{module}.py", f"/root/{module}.py")
     app = modal.App(f"tz-{job.name}")
     # modal_run's own entry point: the image has that module, so the function goes by
-    # reference to it, whichever script launches the job (fork_driver.py imports this one)
+    # reference to it, whichever script launches the job
     function = app.function(
         image=image,
         gpu=None if job.gpu == "CPU" else job.gpu,

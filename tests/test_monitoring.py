@@ -21,7 +21,6 @@ from core.monitoring.episodes import (
     episode_type,
     line_record,
     pgx_two_player_episode,
-    with_opening,
 )
 
 # one compilation of each environment's init and step, whichever test steps it
@@ -96,17 +95,11 @@ def declared(key, field):
         ("loss", "The loss training minimizes"),
         ("policy_target_entropy", "no network can lower"),
         ("policy_kl", "KL divergence"),
-        ("learning_rate", "The learning rate"),
-        ("episodes", "Self-play games that ended"),
         ("episode_draw", "drawn"),
-        ("tree_positions_per_move", "per self-play move"),
         ("random_avg_outcome", "mean outcome"),
-        ("ladder_rung", "rungs beaten"),
-        ("ladder_pgx16_score", "The ladder's score"),
-        ("ladder_greedy_win_rate", "won"),
+        ("random_win_rate", "won"),
+        ("buffer_distinct_fraction", "collapsing"),
         ("random_loss_rate", "lost"),
-        ("ladder_pgx16_seconds", "Seconds"),
-        ("ladder_game", "A test game"),
         ("engine_top1", "most likely action is one of the engine's best"),
         ("engine_exp_regret_opening", "expected over its policy"),
         ("engine_regret_midgame", "most likely action gives up"),
@@ -121,8 +114,6 @@ def declared(key, field):
         ("edax_level8_sims1000_last3", "the run's last epochs"),
         ("edax_level8_sims1000_last3_se", "standard error of the mean score"),
         ("edax_level4_sims1000_game", "A game the network"),
-        ("edax_seconds", "games against Edax took"),
-        ("egaroucid_seconds", "games against Egaroucid took"),
     ],
 )
 def test_runs_describe_the_metrics_turbozero_logs(key, says):
@@ -132,15 +123,20 @@ def test_runs_describe_the_metrics_turbozero_logs(key, says):
 @pytest.mark.parametrize(
     "key, headline",
     [
-        ("loss", True),
-        ("policy_loss", True),
-        ("value_loss", True),
+        ("engine_value_mse", True),
+        ("engine_top1", True),
+        ("memorized_value", True),
+        ("memorized_policy", True),
+        ("update_ratio", True),
+        ("epoch_seconds", True),
         ("random_avg_outcome", True),
+        ("loss", None),
         ("policy_kl", None),
-        ("ladder_rung", None),
+        ("engine_value_mse_endgame", None),
+        ("memorized_value_se", None),
     ],
 )
-def test_runs_headline_their_losses_and_test_outcomes(key, headline):
+def test_runs_headline_what_tracks_progress_memorization_and_cost(key, headline):
     assert declared(key, "headline") is headline
 
 
@@ -155,7 +151,6 @@ def test_runs_headline_their_losses_and_test_outcomes(key, headline):
         ("engine_result_change", "lower"),
         ("random_loss_rate", "lower"),
         ("engine_top1_opening", "higher"),
-        ("filtered_engine_regret_midgame", "lower"),
         ("engine_value_sign", "higher"),
         ("random_avg_outcome", "higher"),
         ("edax_level4_sims1000_win", "higher"),
@@ -376,33 +371,6 @@ def test_pgx_episode_carries_an_engines_lines(ttt):
     assert arrays["node_bound"].tolist() == [0, 0, 0, 0, 0, -1]
     # no visits or priors
     assert not arrays["node_visits"][1:].any() and not arrays["node_prior"][1:].any()
-
-
-def test_pgx_episode_keeps_the_opening_played_for_its_players(ttt):
-    # X's first move to the centre was played for the players, who started from the position
-    # after it: put back before their game, the opening's position is the episode's first,
-    # and the views start at theirs
-    whole = tic_tac_toe_frames(ttt, [4, 0, 8], num_frames=4, key=jax.random.PRNGKey(0))
-    played = jax.tree.map(lambda x: x[1:], whole)
-    opening = [jax.tree.map(lambda x: x[0], whole.env_state)]
-    agent = int(played.env_state.current_player[0])
-
-    episode = pgx_two_player_episode()(
-        with_opening(played, opening),
-        np.array([agent, 1 - agent]),
-        ttt.step_fn,
-        start=1,
-    )
-
-    expected = pgx_two_player_episode()(
-        whole, np.array([agent, 1 - agent]), ttt.step_fn
-    )
-    np.testing.assert_array_equal(episode.arrays["board"], expected.arrays["board"])
-    np.testing.assert_array_equal(episode.arrays["to_move"], expected.arrays["to_move"])
-    assert int(episode.arrays["agent"]) == int(expected.arrays["agent"])
-    # nobody had a value of the opening's position
-    assert episode.arrays["values"][0].tolist() == [0, 0]
-    assert (int(episode.arrays["start"]), int(expected.arrays["start"])) == (1, 0)
 
 
 @pytest.mark.parametrize("env_id", ["othello", "connect_four"])

@@ -43,19 +43,19 @@ def flag(argv: list[str], name: str) -> str | None:
 
 
 def start_states(argv: list[str]) -> list[tuple[str, str]]:
-    """The saved states a step starts from, each as (its flag, its path): --init-from's,
-    --branch-from's and every --warm-start's (NAME=PATH). The job brings them to the machine
-    the step runs on; once the step has a state of its own it resumes without them."""
+    """The saved states a step starts from, each as (its flag, its path): --init-from's and
+    --branch-from's. The job brings them to the machine the step runs on; once the step has a
+    state of its own it resumes without them."""
     out = []
     for i, arg in enumerate(argv):
         name, sep, value = arg.partition("=")
-        if name not in ("--init-from", "--branch-from", "--warm-start"):
+        if name not in ("--init-from", "--branch-from"):
             continue
         if not sep:
             if i + 1 >= len(argv):
                 continue
             value = argv[i + 1]
-        out.append((name, value.partition("=")[2] if name == "--warm-start" else value))
+        out.append((name, value))
     return out
 
 
@@ -146,11 +146,6 @@ def parse_step(text: str, home: str) -> Step:
     for name, path in start_states(argv):
         if not re.fullmatch(STATE, Path(path).name):
             raise ValueError(f"{name} names a state-<EPOCH>.npz: {path}")
-    if flag(argv, "--log-moves") is not None:
-        raise ValueError(
-            "--log-moves is for local runs: bringing the moves here from the bucket costs more "
-            "in egress than they're worth"
-        )
     root = Path(home) / ".cache" / "turbozero"
     for path in (
         ckpt_dir,

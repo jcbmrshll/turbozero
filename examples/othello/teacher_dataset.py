@@ -1,4 +1,4 @@
-"""A dataset of whole self-play games, from the moves runs kept with train.py's --log-moves (see
+"""A dataset of whole self-play games, from the moves runs kept in move logs (see
 core/memory/move_log.py), labelled with exact endgame results, for students and architecture
 experiments to train on from disk (distill.py's --data takes its directory).
 
@@ -422,10 +422,8 @@ def build(
 def main():
     parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
     commands = parser.add_subparsers(dest="command", required=True)
-    b = commands.add_parser(
-        "build", help="a dataset from runs' --log-moves directories"
-    )
-    b.add_argument("--moves", nargs="+", required=True, help="--log-moves directories")
+    b = commands.add_parser("build", help="a dataset from runs' move log directories")
+    b.add_argument("--moves", nargs="+", required=True, help="move log directories")
     b.add_argument("--out", required=True, help="the dataset's directory, new")
     b.add_argument(
         "--solve-empties",
@@ -442,7 +440,7 @@ def main():
     s = commands.add_parser(
         "solve", help="the exact solves of the moves written so far, ahead of `build`"
     )
-    s.add_argument("--moves", required=True, help="a --log-moves directory")
+    s.add_argument("--moves", required=True, help="a move log directory")
     s.add_argument("--solve-empties", type=int, default=20)
     s.add_argument("--threads", type=int, default=8, help="the solver's threads")
     args = parser.parse_args()

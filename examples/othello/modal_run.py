@@ -138,7 +138,7 @@ class Mirror:
 
     def _files(self, step: Step) -> list[tuple[str, str, bool]]:
         """A step's (path, key, whether it's a state only to continue from), smallest first: the
-        files in its --ckpt-dir and the directories in it (a growth run's networks' checkpoints)."""
+        files in its --ckpt-dir and the directories in it (the weight average's checkpoints)."""
         out = []
         for path in Path(step.ckpt_dir).rglob("*"):
             if path.name.endswith((".tmp", ".part")) or not path.is_file():
@@ -438,10 +438,7 @@ class Runner:
             # how the run started: its state has all that now
             argv = without_flag(argv, "--init-from", takes_value=True)
             argv = without_flag(argv, "--init-without-buffers", takes_value=False)
-            argv = without_flag(argv, "--fork-into", takes_value=True)
-            argv = without_flag(argv, "--warm-start", takes_value=True)
             argv = without_flag(argv, "--branch-from", takes_value=True)
-            argv = without_flag(argv, "--take-over", takes_value=False)
             argv = [*argv, "--resume"]
         if flag(step.argv, "--save-state-every") is None:
             argv = [*argv, "--save-state-every", str(self.job.resume_every)]

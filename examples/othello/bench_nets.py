@@ -144,7 +144,7 @@ def bench(net: str, args) -> dict:
     result["forward_batch"] = args.batch
 
     # a training step, as the trainer's (see Trainer.train_step)
-    optimizer = make_optimizer(10_000)
+    optimizer = make_optimizer()
     batch = random_batch(rng, args.train_batch)
 
     n = args.grad_accum
