@@ -20,6 +20,8 @@ from game import (
     load_checkpoint,
     make_network,
     make_optimizer,
+    make_position_groups,
+    position_states,
 )
 from gated_scan import GatedScan
 
@@ -288,3 +290,57 @@ def test_a_spec_names_the_gated_scan_along_the_rays():
     assert policy.shape == (3, 65) and value.shape == (3, 1)
     with pytest.raises(ValueError, match="scan=rays"):
         make_network(RAY_NET + ",scan_gates=2")
+
+
+def played_positions(moves=6, games=4):
+    """Real states after `moves` random legal moves from the standard start, `games` of them."""
+    keys = jax.random.split(jax.random.PRNGKey(0), games)
+    states = jax.vmap(env.init)(keys)
+    for i in range(moves):
+        logits = jnp.where(states.legal_action_mask, 0.0, -jnp.inf)
+        actions = jax.random.categorical(jax.random.PRNGKey(i + 1), logits)
+        states = jax.vmap(env.step)(states, actions)
+    return states
+
+
+def test_position_states_play_on_as_the_positions_would():
+    real = played_positions()
+
+    built = position_states(
+        np.asarray(real.observation), np.asarray(real.legal_action_mask)
+    )
+
+    np.testing.assert_array_equal(built.observation, real.observation)
+    actions = jnp.argmax(real.legal_action_mask, axis=1)
+    after_real = jax.vmap(env.step)(real, actions)
+    after_built = jax.vmap(env.step)(built, actions)
+    np.testing.assert_array_equal(after_built.observation, after_real.observation)
+    np.testing.assert_array_equal(
+        after_built.legal_action_mask, after_real.legal_action_mask
+    )
+
+
+def test_position_groups_split_by_empties_and_side_to_move():
+    groups = make_position_groups()
+
+    def experience(discs):
+        observation = np.zeros((8, 8, 2), bool)
+        observation.reshape(-1)[:discs] = True
+        return BaseExperience(
+            reward=jnp.zeros(2),
+            policy_weights=jnp.zeros(65),
+            policy_mask=jnp.ones(65, bool),
+            observation_nn=jnp.asarray(observation),
+            cur_player_id=jnp.zeros((), jnp.int32),
+            search_value=jnp.zeros(()),
+        )
+
+    def members(discs):
+        e = experience(discs)
+        return {name for name, fn in groups.items() if bool(fn(e))}
+
+    # an XOT opening: 12 discs, 52 empty squares, Black to move
+    assert members(12) == {"opening", "black"}
+    assert members(31) == {"midgame", "white"}
+    assert members(40) == {"late", "black"}
+    assert members(44) == {"endgame", "black"}

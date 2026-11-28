@@ -345,6 +345,31 @@ some environments' whole games held out (see distill.py). Once the held-out loss
 while the trained-on probe's keeps falling, more passes over those games only memorize them.
 Start from a checkpoint older than the state's positions, so that both sets start unseen.
 
+### What self-play's data is like
+
+Every epoch, before training, `train.py` scores `--data-positions` (default 4096) of the
+positions self-play just stored with the average that played them, and as many of the last two
+epochs' positions whose games have outcomes. It logs `data_*` for all of them and for each phase
+(`opening`, 40-60 empty squares; `midgame`, 30-39; `late`, 21-29; `endgame`, 20 or fewer) and
+side to move (`black`, `white`, from the discs' parity, which is all the network sees of it):
+
+- `data_target_entropy`, `data_prior_entropy`: how sharp the stored targets and the network's
+  prior are
+- `data_target_prior_kl`: KL(target || prior), how far search moved the policy, which is what a
+  position can still teach it; `data_top_move_change`: how often search changed the top move
+- `data_decided_share`: positions whose search value is past ±0.9. Late random moves (sampling
+  to move 40 or later) flood the late phase with them and cost value strength
+- `data_label_value_mse`: the search value's squared error against the game's outcome, label
+  noise included
+- `data_value_bias`: the network's value minus the outcome. A gap between `_black` and `_white`
+  is an offset by side to move that the outcomes don't support; `data_outcome_black` is Black's
+  real edge
+- `data_pair_distance`, `data_collision`: how far apart pairs of 512 of a group's positions are
+  (entries of the network's input that differ, at the closest symmetry: a disc that changes
+  colour counts 2), and how often two are the same
+  position: self-play collapsing into the same games shows here first
+- `data_stored`: positions the epoch stored
+
 ### Training on Modal
 
 `modal_jobs.py` runs train.py on Modal's GPUs, several at once, and brings the results to the
@@ -699,6 +724,27 @@ To score saved checkpoints on a set:
 ```
 uv run examples/othello/score_engine_set.py runs/othello/avg4/49.eqx runs/othello/avg4/99.eqx --net resnet:10x128
 ```
+
+### Label headroom: self-play's search on the set
+
+Every `--headroom-every` epochs (default 10), `train.py` searches `--headroom-positions`
+(default 4096) of the set with self-play's search at each of `--headroom-sims` (default `--sims`
+and twice it): full searches from fresh trees with self-play's root noise, the targets self-play
+stores. It scores each budget's visit distribution and root value like the network's raw
+outputs, as `search<sims>_*` (`search128_top1`, `search256_value_mse`, ...), and logs KL
+divergences between them: `search_kl_256_128`, how much the extra search changes the targets;
+`search_kl_128_repeat`, the same budget searched again with other noise, the floor that sits on;
+and `search_kl_128_prior`, how far search moves the network's prior. Every call searches with
+the same keys, so epochs differ only by the weights.
+
+The gap between `search<2N>_*` and `search<N>_*` is what doubling self-play's sims would put in
+its labels; the gap between `search<N>_*` and `engine_*` is what the network hasn't yet learned
+from its own. A bigger gap at 2N doesn't mean the network will learn it: at 4x64, 512-sim targets
+beat 128-sim ones by about 0.04 top-1 on an Edax-labelled set, and a fork trained on them gained no
+Elo. With sparse visit counts, each KL
+is mostly the 0.1% floor its second distribution gets on moves it never visited, so read the
+`_N_M` values against `_repeat`, not on their own. At the defaults with `--sims 128`, a call runs
+about an eighth of the search cycles of an epoch's self-play.
 
 ## Playing on CPU
 

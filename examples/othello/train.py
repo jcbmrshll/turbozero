@@ -39,6 +39,8 @@ import tempfile
 import warnings
 from pathlib import Path
 
+import jax
+import numpy as np
 from engine_set import DEFAULT_PATH as DEFAULT_ENGINE_SET
 from engine_set import EngineSet
 from exact_labels import SOLVERS, default_threads, make_solve_fn, solve_slots, stops_at
@@ -53,6 +55,9 @@ from game import (
     episode_metrics,
     make_network,
     make_optimizer,
+    make_position_groups,
+    metadata,
+    position_states,
     state_to_nn_input,
     step_fn,
 )
@@ -67,8 +72,12 @@ from core.monitoring import DEFAULT_URL, Monitor
 from core.training.endgame_solve import EndgameSolve
 from core.training.exploration import Exploration
 from core.training.loss_fns import az_default_loss_fn
-from core.training.train import Trainer
-from core.training.validation import ScoredPositionsValidator
+from core.training.train import Trainer, Validator
+from core.training.validation import (
+    ScoredPositions,
+    ScoredPositionsValidator,
+    SearchTargetValidator,
+)
 
 # self-play moves' compute an epoch, in each environment (see --selfplay-cycles)
 COLLECTION_STEPS = 128
@@ -431,6 +440,42 @@ def make_parser() -> argparse.ArgumentParser:
         help="epochs between scoring the average on the engine-labelled set (0 for never). "
         "A forward pass over its positions: a fraction of a second",
     )
+    parser.add_argument(
+        "--headroom-every",
+        type=int,
+        default=10,
+        metavar="N",
+        help="every N epochs, search --headroom-positions of the engine-labelled set with "
+        "self-play's search at each of --headroom-sims (fresh trees, root noise, no playout "
+        "cap) and score the targets against the engine: search<sims>_*, and the KL "
+        "divergences search_kl_* (see SearchTargetValidator). 0 for never",
+    )
+    parser.add_argument(
+        "--headroom-positions",
+        type=int,
+        default=4096,
+        metavar="N",
+        help="the engine-labelled positions --headroom-every searches, evenly spaced through "
+        "the set",
+    )
+    parser.add_argument(
+        "--headroom-sims",
+        type=int,
+        nargs="+",
+        default=None,
+        metavar="SIMS",
+        help="the budgets --headroom-every compares, the first the one the others are "
+        "compared with (default: --sims and twice it)",
+    )
+    parser.add_argument(
+        "--data-positions",
+        type=int,
+        default=4096,
+        metavar="N",
+        help="every epoch, score N of the positions self-play stored, and N of the last two "
+        "epochs' with outcomes, for what its data is like: data_* by phase and side to move "
+        "(see Trainer.data_metrics). 0 for none",
+    )
     # saves
     parser.add_argument(
         "--ckpt-dir",
@@ -522,6 +567,62 @@ def make_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def evaluator_settings(args: argparse.Namespace, network) -> dict:
+    """Self-play's search settings with `network`, but its budget, tree size and playout cap,
+    as `AlphaZero(MCTS)` takes them."""
+    return {
+        "eval_fn": make_nn_eval_fn(network, state_to_nn_input),
+        "branching_factor": env.num_actions,
+        "action_selector": PUCTSelector(),
+        "temperature": 1.0,
+        "dirichlet_alpha": args.dirichlet_alpha,
+        "dirichlet_epsilon": args.dirichlet_epsilon,
+        "traversal_steps": args.traversal_steps,
+    }
+
+
+def headroom_validator(
+    engine_set: EngineSet, network, settings: dict, args: argparse.Namespace
+) -> SearchTargetValidator:
+    """--headroom-every's validator: self-play's search (`settings`, with `network` as it
+    plays, e.g. in bfloat16) at each of --headroom-sims, on --headroom-positions of the
+    engine-labelled set, from fresh trees and without a playout cap: the full searches whose
+    targets self-play stores."""
+    scored = engine_set.scored_positions()
+    count = min(args.headroom_positions, len(scored.legal))
+    keep = np.linspace(0, len(scored.legal) - 1, count).round().astype(int)
+    positions = ScoredPositions(
+        observations=scored.observations[keep],
+        legal=scored.legal[keep],
+        scores=scored.scores[keep],
+        groups={name: group[keep] for name, group in scored.groups.items()},
+    )
+    states = position_states(positions.observations, positions.legal)
+    sims = args.headroom_sims or [args.sims, 2 * args.sims]
+    evaluators = {
+        str(n): AlphaZero(MCTS)(
+            **settings,
+            num_iterations=n,
+            # a fresh tree: every simulation adds a node
+            max_nodes=n + 1,
+        )
+        for n in sims
+    }
+    return SearchTargetValidator(
+        positions,
+        states,
+        jax.vmap(metadata)(states),
+        evaluators,
+        step_fn,
+        network,
+        every=args.headroom_every,
+        # trees of at most about 2^20 nodes at once
+        batch_size=max(64, min(1024, (1 << 20) // (max(sims) + 1))),
+        name="search",
+        config={"path": str(args.engine_set or DEFAULT_ENGINE_SET)},
+    )
+
+
 def main():
     parser = make_parser()
     args = parser.parse_args()
@@ -562,6 +663,12 @@ def main():
         parser.error("--dirichlet-epsilon must be between 0 and 1")
     if args.save_weights_every < 1:
         parser.error("--save-weights-every must be positive")
+    if args.headroom_every < 0 or args.headroom_positions < 1:
+        parser.error("--headroom-every is at least 0, --headroom-positions positive")
+    if args.headroom_sims is not None and min(args.headroom_sims) < 1:
+        parser.error("--headroom-sims must be positive")
+    if args.data_positions < 0:
+        parser.error("--data-positions can't be negative")
     if args.save_raw_every is not None and args.save_raw_every < 1:
         parser.error("--save-raw-every must be positive")
 
@@ -575,15 +682,9 @@ def main():
     # AlphaZero takes an arbitrary search backend, here classic MCTS. Temperature 1.0 samples
     # moves in proportion to visit counts, for exploration during self-play
     evaluator = AlphaZero(MCTS)(
-        eval_fn=make_nn_eval_fn(network, state_to_nn_input),
+        **evaluator_settings(args, network),
         num_iterations=args.sims,
         max_nodes=int(args.tree_factor * args.sims),
-        branching_factor=env.num_actions,
-        action_selector=PUCTSelector(),
-        temperature=1.0,
-        dirichlet_alpha=args.dirichlet_alpha,
-        dirichlet_epsilon=args.dirichlet_epsilon,
-        traversal_steps=args.traversal_steps,
         playout_cap=args.playout_cap,
     )
 
@@ -591,7 +692,7 @@ def main():
     # float32: in bfloat16 a checkpoint's value MSE is off by up to 0.006, more than ten epochs
     # of a slow run's progress
     engine_set = load_engine_set(parser, args)
-    validators = (
+    validators: list[Validator] = (
         [
             ScoredPositionsValidator(
                 engine_set.scored_positions(),
@@ -607,6 +708,12 @@ def main():
         if engine_set is not None
         else []
     )
+    if engine_set is not None and args.headroom_every:
+        validators.append(
+            headroom_validator(
+                engine_set, network, evaluator_settings(args, network), args
+            )
+        )
 
     endgame_solve = None
     if args.solve_empties is not None:
@@ -661,6 +768,8 @@ def main():
         endgame_solve=endgame_solve,
         # how often self-play games are drawn
         episode_metrics_fn=episode_metrics,
+        data_positions=args.data_positions,
+        position_groups=make_position_groups(),
         # training maps each sample through one of the board's 8 symmetries, at random
         data_transform_fns=SYMMETRY_TRANSFORM_FNS,
         advance_every=args.advance_every,

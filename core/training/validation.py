@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import partial
 from typing import Any
@@ -11,7 +12,8 @@ from jax.typing import ArrayLike
 from core.common import two_player_game
 from core.evaluators.evaluator import Evaluator
 from core.networks.utils import apply_nn
-from core.types import EnvInitFn, EnvStepFn
+from core.training.selfplay_data import floored_kl, group_means
+from core.types import EnvInitFn, EnvStepFn, StepMetadata
 
 # what `scored_position_metrics` reports, for all positions and for each group
 METRICS = ("top1", "regret", "exp_regret", "value_mse", "value_sign", "result_change")
@@ -286,4 +288,209 @@ class TwoPlayerValidator:
             f"{self.name}_avg_outcome": results[:, 0].mean(),
             f"{self.name}_win_rate": (results[:, 0] > results[:, 1]).mean(),
             f"{self.name}_loss_rate": (results[:, 0] < results[:, 1]).mean(),
+        }
+
+
+class SearchTargetValidator:
+    """Scores the policy targets self-play's search makes, at several budgets, against an
+    engine on fixed positions (see `ScoredPositions`): the headroom of its labels. Each position
+    is searched from a fresh tree by each of `evaluators` (e.g. self-play's search at N and 2N
+    simulations, root noise included), and its visit distribution and root value are scored as
+    `ScoredPositionsValidator` scores a network's raw outputs (see `scored_position_metrics`).
+    Where a bigger budget's targets beat a smaller's, more search would teach more; where the
+    network's raw scores have caught up with its own targets', its labels have little left to
+    teach at that budget.
+
+    A `Trainer` validator, costly (a search per position and budget, and one more at the first),
+    so it runs every `every` epochs. It returns, for each evaluator `<k>`, `<name><k>_<metric>`
+    for all positions and `<name><k>_<metric>_<group>` for each group; and, over the same
+    groups, `<name>_kl_<k>_<first>`, the KL divergence of each later evaluator's targets from the
+    first's (how much the extra search changes them); `<name>_kl_<first>_repeat`, of the first's
+    from a second search of its own with other noise (the floor those differences sit on); and
+    `<name>_kl_<first>_prior`, of the first's from the network's prior (how far search moves the
+    policy). Each KL spreads 0.1% of the second distribution over the legal actions (see
+    `core.training.selfplay_data.floored_kl`).
+
+    The searches' keys are drawn once from `seed`, so calls differ only by the weights."""
+
+    def __init__(
+        self,
+        positions: ScoredPositions,
+        states: Any,
+        metadata: StepMetadata,
+        evaluators: Mapping[str, Evaluator],
+        env_step_fn: EnvStepFn,
+        nn: eqx.Module,
+        every: int,
+        batch_size: int = 1024,
+        name: str = "search",
+        seed: int = 0,
+        config: dict | None = None,
+    ):
+        """
+        Args:
+            positions: the positions, as the network takes them, and the engine's scores
+            states: the same positions as environment states, with a leading axis
+            metadata: their metadata, with a leading axis
+            evaluators: the searches, by the names their metrics take, e.g. {"128": ...,
+                "256": ...}: the first is the one the others are compared with
+            env_step_fn: (env_state, action) -> (new_env_state, metadata)
+            nn: the network the searches evaluate with (only its structure is used, for the
+                prior, as `ScoredPositionsValidator`'s)
+            every: epochs between calls (see `core.training.train.Validator`)
+            batch_size: positions searched at once
+            name: prefixes the metrics
+            seed: draws the searches' keys
+            config: (optional) recorded with the validator's configuration
+        """
+        if not evaluators:
+            raise ValueError("evaluators can't be empty")
+        if every < 1:
+            raise ValueError(f"every must be positive, got {every}")
+        self.name = name
+        self.every = every
+        self.seed = seed
+        self.batch_size = batch_size
+        self.extra_config = config or {}
+        self.evaluators = dict(evaluators)
+        n = len(positions.legal)
+        self.num_positions = n
+        padded = -(-n // batch_size) * batch_size
+
+        def pad(x: Any) -> Any:
+            x = jnp.asarray(x)
+            return jnp.concatenate([x, jnp.repeat(x[:1], padded - n, axis=0)])
+
+        self.observations = pad(positions.observations)
+        self.legal = pad(positions.legal)
+        self.scores = pad(positions.scores)
+        self.states = jax.tree.map(pad, states)
+        self.metadata = jax.tree.map(pad, metadata)
+        self.group_names = ["all", *positions.groups]
+        groups = np.stack([np.ones(n, bool), *positions.groups.values()])
+        self.groups = jnp.asarray(
+            np.concatenate([groups, np.zeros((len(groups), padded - n), bool)], axis=1)
+        )
+        # a key per position for each search, the first evaluator's twice
+        searches = [*self.evaluators, f"{next(iter(self.evaluators))}_repeat"]
+        self.keys = dict(
+            zip(
+                searches,
+                jax.random.split(jax.random.PRNGKey(seed), (len(searches), padded)),
+                strict=True,
+            )
+        )
+        static = eqx.filter(nn, eqx.is_inexact_array, inverse=True)
+
+        @jax.jit
+        def prior_logits(params: Any, observations: jax.Array) -> jax.Array:
+            nn_params, nn_state = params
+            net = eqx.nn.inference_mode(eqx.combine(nn_params, static))
+            batches = observations.reshape(-1, batch_size, *observations.shape[1:])
+            logits = jax.lax.map(lambda x: apply_nn(net, nn_state, x)[0][0], batches)
+            return logits.reshape(-1, logits.shape[-1])
+
+        self._prior_logits = prior_logits
+
+        def make_search(evaluator: Evaluator):
+            def one(params: Any, key: jax.Array, state: Any, metadata: StepMetadata):
+                tree = evaluator.init(template_embedding=state)
+                output = evaluator.evaluate(
+                    key=key,
+                    eval_state=tree,
+                    env_state=state,
+                    root_metadata=metadata,
+                    params=params,
+                    env_step_fn=env_step_fn,
+                )
+                return output.policy_weights, evaluator.get_value(output.eval_state)
+
+            return jax.jit(jax.vmap(one, in_axes=(None, 0, 0, 0)))
+
+        self._searches = {k: make_search(e) for k, e in self.evaluators.items()}
+
+    def get_config(self) -> dict:
+        return {
+            "name": self.name,
+            "positions": self.num_positions,
+            "groups": self.group_names[1:],
+            "every": self.every,
+            "seed": self.seed,
+            "evaluators": {
+                k: {"class": e.__class__.__name__, **e.get_config()}
+                for k, e in self.evaluators.items()
+            },
+            **self.extra_config,
+        }
+
+    def search(
+        self, params: Any, evaluator: str, keys: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
+        """`evaluator`'s targets (visit distributions) and root values on every position, with
+        `keys`, a batch at a time."""
+        search = self._searches[evaluator]
+        targets, values = [], []
+        for i in range(0, len(self.legal), self.batch_size):
+            batch = slice(i, i + self.batch_size)
+            target, value = search(
+                params,
+                keys[batch],
+                jax.tree.map(lambda x, b=batch: x[b], self.states),
+                jax.tree.map(lambda x, b=batch: x[b], self.metadata),
+            )
+            targets.append(target)
+            values.append(value)
+        target = jnp.where(self.legal, jnp.concatenate(targets).astype(jnp.float32), 0)
+        target = target / jnp.maximum(target.sum(-1, keepdims=True), 1e-9)
+        return target, jnp.concatenate(values).astype(jnp.float32)
+
+    def __call__(self, params: Any) -> dict[str, jax.Array]:
+        """The searches' metrics with `params`, the network's (parameters, network state)."""
+        out: dict[str, jax.Array] = {}
+        targets = {}
+        for k in self.evaluators:
+            target, value = self.search(params, k, self.keys[k])
+            targets[k] = target
+            # the target as logits: its most visited action is the one played greedily, and
+            # its softmax is the target itself
+            table = scored_position_metrics(
+                jnp.log(jnp.maximum(target, 1e-30)),
+                value,
+                self.legal,
+                self.scores,
+                self.groups,
+            )
+            out.update(self._named(f"{self.name}{k}", table, METRICS))
+        first = next(iter(self.evaluators))
+        repeat, _ = self.search(params, first, self.keys[f"{first}_repeat"])
+        prior = jax.nn.softmax(
+            jnp.where(
+                self.legal,
+                self._prior_logits(params, self.observations).astype(jnp.float32),
+                -jnp.inf,
+            ),
+            -1,
+        )
+        pairs = {
+            **{
+                f"kl_{k}_{first}": (targets[k], targets[first])
+                for k in list(self.evaluators)[1:]
+            },
+            f"kl_{first}_repeat": (targets[first], repeat),
+            f"kl_{first}_prior": (targets[first], prior),
+        }
+        columns = jnp.stack(
+            [floored_kl(p, q, self.legal) for p, q in pairs.values()], -1
+        )
+        table = group_means(columns, jnp.ones(len(self.legal)), self.groups)
+        out.update(self._named(self.name, table, list(pairs)))
+        return out
+
+    def _named(
+        self, prefix: str, table: jax.Array, metrics: Any
+    ) -> dict[str, jax.Array]:
+        return {
+            f"{prefix}_{metric}" + ("" if group == "all" else f"_{group}"): table[g, m]
+            for g, group in enumerate(self.group_names)
+            for m, metric in enumerate(metrics)
         }

@@ -4,13 +4,17 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from core.evaluators.evaluator import EvalOutput, Evaluator
+from core.training.selfplay_data import KL_FLOOR
 from core.training.validation import (
     METRICS,
     ScoredPositions,
     ScoredPositionsValidator,
+    SearchTargetValidator,
     TwoPlayerValidator,
     scored_position_metrics,
 )
+from core.types import StepMetadata
 
 
 def softmax(x):
@@ -252,3 +256,108 @@ def test_two_player_validator_needs_an_even_number_of_episodes(ttt, scripted):
             num_episodes=3,
             name="baseline",
         )
+
+
+class TableSearch(Evaluator):
+    """A fake search: on the position whose state is index i, its target is `targets[i]`, with
+    `noise` times a random draw added, and its value `values[i]`."""
+
+    def __init__(self, targets, values, noise=0.0):
+        super().__init__(discount=-1.0)
+        self.targets = jnp.asarray(targets, jnp.float32)
+        self.values = jnp.asarray(values, jnp.float32)
+        self.noise = noise
+
+    def init(self, *args, **kwargs):
+        return jnp.zeros((), jnp.float32)
+
+    def reset(self, state):
+        return state
+
+    def evaluate(self, key, eval_state, env_state, root_metadata, **kwargs):
+        target = self.targets[env_state] + self.noise * jax.random.uniform(
+            key, self.targets.shape[1:]
+        )
+        return EvalOutput(
+            eval_state=self.values[env_state],
+            action=jnp.argmax(target),
+            policy_weights=target / target.sum(),
+        )
+
+    def get_value(self, state):
+        return state
+
+
+def search_positions(n):
+    """`n` positions of 3 legal actions, the first the engine's best (a win by 4), the others
+    giving up 2 and 6; observations whose logits are uniform (see `Echo`), every other one in
+    the group "odd"."""
+    observations = np.zeros((n, 4), np.float32)
+    scores = np.tile(np.array([4.0, 2.0, -2.0], np.float32), (n, 1))
+    legal = np.ones((n, 3), bool)
+    return ScoredPositions(observations, legal, scores, {"odd": np.arange(n) % 2 == 1})
+
+
+def search_validator(evaluators, n=5, batch_size=2):
+    positions = search_positions(n)
+    net, state = eqx.nn.make_with_state(Echo)()
+    metadata = StepMetadata(
+        rewards=jnp.zeros((n, 2)),
+        action_mask=jnp.asarray(positions.legal),
+        terminated=jnp.zeros(n, bool),
+        cur_player_id=jnp.zeros(n, jnp.int32),
+        step=jnp.zeros(n, jnp.int32),
+    )
+    validator = SearchTargetValidator(
+        positions,
+        jnp.arange(n),
+        metadata,
+        evaluators,
+        env_step_fn=lambda s, a: (s, metadata),
+        nn=net,
+        every=5,
+        batch_size=batch_size,
+    )
+    return validator, (eqx.filter(net, eqx.is_inexact_array), state)
+
+
+def test_search_targets_are_scored_against_the_engine_and_each_other():
+    n = 5
+    # the small budget's target is all on the second action, the bigger one's on the best
+    small = TableSearch(np.tile([0.0, 1.0, 0.0], (n, 1)), np.full(n, 0.5))
+    big = TableSearch(np.tile([1.0, 0.0, 0.0], (n, 1)), np.full(n, 1.0))
+    validator, params = search_validator({"8": small, "16": big}, n=n)
+
+    metrics = validator(params)
+
+    assert metrics["search8_top1"] == pytest.approx(0.0)
+    assert metrics["search8_regret"] == pytest.approx(2.0)
+    assert metrics["search16_top1"] == pytest.approx(1.0)
+    assert metrics["search16_regret"] == pytest.approx(0.0)
+    assert metrics["search8_value_mse"] == pytest.approx(0.25)
+    assert metrics["search16_value_mse_odd"] == pytest.approx(0.0)
+    # all of the bigger budget's target is on an action the smaller gives only the floor
+    assert metrics["search_kl_16_8"] == pytest.approx(-np.log(KL_FLOOR / 3), rel=1e-4)
+    # a search without noise repeats itself exactly: only the floor's spread costs anything
+    assert metrics["search_kl_8_repeat"] == pytest.approx(
+        -np.log(1 - KL_FLOOR + KL_FLOOR / 3), rel=1e-3
+    )
+    # the prior is uniform
+    assert metrics["search_kl_8_prior"] == pytest.approx(
+        -np.log((1 - KL_FLOOR) / 3 + KL_FLOOR / 3), rel=1e-4
+    )
+    assert validator.every == 5
+    assert set(validator.get_config()["evaluators"]) == {"8", "16"}
+
+
+def test_search_validator_searches_with_the_same_keys_every_call():
+    n = 5
+    noisy = TableSearch(np.ones((n, 3)), np.zeros(n), noise=1.0)
+    validator, params = search_validator({"8": noisy}, n=n)
+
+    first, second = validator(params), validator(params)
+
+    for name in first:
+        assert float(first[name]) == pytest.approx(float(second[name]))
+    # the repeat search draws other noise
+    assert first["search_kl_8_repeat"] > 0

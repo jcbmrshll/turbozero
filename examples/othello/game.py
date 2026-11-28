@@ -80,6 +80,60 @@ def episode_metrics(rewards):
     return {"draw": (rewards == 0).all()}
 
 
+def position_states(observations: np.ndarray, legal: np.ndarray):
+    """Environment states of positions given as the network's input, (n, 8, 8, 2) bool (the
+    player to move's discs, then the opponent's), with their legal actions (n, 65), e.g. an
+    engine-labelled set's, to search from. The move history isn't known: the step count is the
+    discs played (60 - empties), passes aside, and the last move isn't a pass."""
+    observations = np.asarray(observations, dtype=bool)
+    n = len(observations)
+    flat = observations.reshape(n, 64, 2)
+    states = jax.vmap(env.init)(jax.random.split(jax.random.PRNGKey(0), n))
+    board = flat[..., 0].astype(np.int32) - flat[..., 1].astype(np.int32)
+    return states.replace(  # type: ignore[attr-defined]
+        current_player=jnp.zeros(n, jnp.int32),
+        observation=jnp.asarray(observations),
+        legal_action_mask=jnp.asarray(legal, dtype=bool),
+        _step_count=jnp.asarray(flat.any(-1).sum(-1) - 4, dtype=jnp.int32),
+        _x=states._x._replace(  # type: ignore[attr-defined]
+            turn=jnp.zeros(n, jnp.int32),
+            board=jnp.asarray(board),
+            passed=jnp.zeros(n, bool),
+        ),
+    )
+
+
+# the groups of stored positions the training loop's self-play data metrics also report on
+# (see `Trainer`'s `position_groups`), by empty squares: an XOT opening has 52 (a standard
+# start 60), the exact solver labels positions with 20 or fewer; and by the side to move, from
+# the discs' parity (Black moves at an even count, but for passes), which is all the network
+# sees of it
+DATA_PHASES = {
+    "opening": (40, 60),
+    "midgame": (30, 39),
+    "late": (21, 29),
+    "endgame": (0, 20),
+}
+
+
+def empties(experience: BaseExperience) -> jax.Array:
+    """A stored position's empty squares."""
+    return 64 - experience.observation_nn.astype(jnp.int32).sum()
+
+
+def make_position_groups() -> dict:
+    """Othello's `position_groups`: `DATA_PHASES`, then "black" and "white" to move."""
+
+    def phase(low: int, high: int):
+        return lambda e: (empties(e) >= low) & (empties(e) <= high)
+
+    return {
+        **{name: phase(low, high) for name, (low, high) in DATA_PHASES.items()},
+        "black": lambda e: empties(e) % 2 == 0,
+        "white": lambda e: empties(e) % 2 == 1,
+    }
+
+
 def make_symmetry_transform_fn(quarter_turns: int, transpose: bool):
     """A DataTransformFn that maps a training sample through one of the board's symmetries
     (an optional transpose, then `quarter_turns` quarter turns). Othello's rules don't
