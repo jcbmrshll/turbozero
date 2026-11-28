@@ -403,7 +403,8 @@ def fake_loop(monkeypatch):
     Returns the calls, in order, as namespaces with the arguments they got: self-play's are
     `kind="collect"`, with `key`, `state`, `params`, `num_steps` and `evaluator`; training's
     `kind="train"`, with `key`, `state` (the collection state), `epoch`, `num_steps`,
-    `batch_size`, `lr_scale` and `result`, the train state it returned.
+    `batch_size`, `lr_scale`, `train_state`, the train state it got, and `result`, the one it
+    returned.
     """
 
     def install(trainer, noise_scale=None):
@@ -449,6 +450,7 @@ def fake_loop(monkeypatch):
                     learner=learner,
                     batch_size=batch_size,
                     lr_scale=lr_scale,
+                    train_state=train_state,
                     result=result,
                 )
             )
@@ -4538,7 +4540,136 @@ def test_the_playing_network_cools_once_it_has_played_its_epochs(
         2: pytest.approx(0.1),
         3: pytest.approx(0.1),
     }
-    assert trainer.get_config()["lr_drop"] == {"after_epochs": 2, "factor": 0.1}
+    assert trainer.get_config()["lr_drop"] == {
+        "after_epochs": 2,
+        "factor": 0.1,
+        "scale_decay": True,
+    }
+
+
+def adamw_optimizer(weight_decay, schedule=None):
+    """The kind of optimizer Othello trains with: weight decay `weight_decay` at learning rate
+    0.1, following `schedule` (default a constant 0.1)."""
+    return optax.inject_hyperparams(
+        train_module.adamw, static_args=("mask", "decay_lr")
+    )(
+        learning_rate=schedule or optax.constant_schedule(0.1),
+        weight_decay=weight_decay,
+        mask=train_module.weight_decay_mask,
+        decay_lr=0.1,
+    )
+
+
+def trained_decays(calls):
+    """The weight decay each training call's state held as it trained."""
+    return [
+        float(injected_hyperparams(c.train_state.opt_state)["weight_decay"])
+        for c in of_kind(calls, "train")
+    ]
+
+
+@pytest.mark.parametrize("scale_decay", [True, False])
+def test_a_drop_drops_the_weight_decay_with_the_rate(
+    env, tmp_path, fake_loop, scale_decay
+):
+    trainer = make_trainer(
+        env,
+        tmp_path,
+        optimizer=adamw_optimizer(0.5),
+        lr_drop=LRDrop(2, 0.1, scale_decay=scale_decay),
+        save_state_at=[3],
+    )
+    calls = fake_loop(trainer)
+
+    output = trainer.train_loop(seed=0, num_epochs=3)
+
+    # with the updates scaled 0.1, the decay scales 0.1 too: each step's lr * wd falls 100x
+    dropped = 0.05 if scale_decay else 0.5
+    assert trained_decays(calls) == pytest.approx([0.5, 0.5, dropped])
+    # the state keeps the run's own, which a resumed run, a branch or a fork takes
+    decay = injected_hyperparams(output.train_states[0].opt_state)["weight_decay"]
+    assert float(decay) == pytest.approx(0.5)
+    resumed = make_trainer(
+        env,
+        tmp_path,
+        optimizer=adamw_optimizer(0.5),
+        lr_drop=LRDrop(2, 0.1, scale_decay=scale_decay),
+    )
+    calls = fake_loop(resumed)
+    resumed.train_loop(seed=0, num_epochs=4, initial_state=resumed.resume())
+    assert trained_decays(calls) == pytest.approx([dropped])
+    assert trainer.get_config()["lr_drop"]["scale_decay"] == scale_decay
+
+
+def test_a_drop_drops_a_networks_own_weight_decay(env, tmp_path, fake_loop):
+    trainer, _ = growth_trainer(
+        env,
+        tmp_path,
+        SCRIPTS,
+        optimizer=adamw_optimizer(0.5),
+        hyperparams={1: {"weight_decay": 0.2}},
+        lr_drop=LRDrop(1, 0.5),
+        growth_kwargs={"manual": True},
+    )
+    calls = fake_loop(trainer)
+
+    trainer.train_loop(seed=0, num_epochs=2)
+
+    # n0 plays, and drops after an epoch; n1 waits at the full rate with its own decay
+    assert [
+        (c.learner, d) for c, d in zip(of_kind(calls, "train"), trained_decays(calls))
+    ] == [(0, 0.5), (1, pytest.approx(0.2)), (0, 0.25), (1, pytest.approx(0.2))]
+
+
+def test_without_a_weight_decay_a_drop_scales_only_the_updates(
+    env, tmp_path, fake_loop
+):
+    # optax.adam injects no weight decay: nothing to drop
+    trainer = make_trainer(
+        env,
+        tmp_path,
+        optimizer=optax.inject_hyperparams(optax.adam)(learning_rate=0.1),
+        lr_drop=LRDrop(1, 0.1),
+    )
+    calls = fake_loop(trainer)
+
+    trainer.train_loop(seed=0, num_epochs=2)
+
+    assert [c.lr_scale for c in of_kind(calls, "train")] == [1.0, 0.1]
+
+
+@pytest.mark.parametrize("start", ["resume", "branch", "fork"])
+def test_a_state_saved_with_a_held_decay_runs_on_with_one_that_follows_the_rate(
+    env, tmp_path, start
+):
+    # a run's state saved under optax.adamw, whose decay was a plain hyperparameter, goes on in
+    # one whose decay follows the learning rate: same optimizer state, nothing to convert
+    saved = optax.inject_hyperparams(optax.adamw, static_args=("mask",))(
+        learning_rate=optax.constant_schedule(0.1),
+        weight_decay=0.5,
+        mask=train_module.weight_decay_mask,
+    )
+    _, path = save_a_state(make_trainer(env, tmp_path / "saved", optimizer=saved))
+    # 0.1 for 2 steps, then 0.01: the decay 0.5, then 0.05
+    new = adamw_optimizer(0.5, optax.piecewise_constant_schedule(0.1, {2: 0.1}))
+    ckpt_dir = tmp_path / ("saved" if start == "resume" else "new")
+    trainer = make_trainer(env, ckpt_dir, optimizer=new, train_steps_per_epoch=2)
+    kwargs: dict[str, Any] = {
+        "resume": lambda: {"initial_state": trainer.resume(), "num_epochs": 3},
+        "branch": lambda: {"initial_state": trainer.branch(path), "num_epochs": 3},
+        "fork": lambda: {"fork_from": path, "num_epochs": 1},
+    }[start]()
+
+    output = trainer.train_loop(seed=0, **kwargs)
+
+    ts = output.train_states[0]
+    hyperparams = injected_hyperparams(ts.opt_state)
+    assert float(hyperparams["weight_decay"]) == pytest.approx(0.5)
+    # a fork restarts the schedule (2 steps: still 0.1); the others go on from the saved
+    # state's 2 steps (into 0.01)
+    rate = 0.1 if start == "fork" else 0.01
+    assert float(hyperparams["learning_rate"]) == pytest.approx(rate)
+    assert all(np.isfinite(x).all() for x in jax.tree.leaves(ts.params))
 
 
 def test_without_a_drop_training_is_unscaled(env, tmp_path, fake_loop):
