@@ -57,7 +57,7 @@
   "heldout_value_loss_raw": {"description": "With held-out games: the playing network's value loss on positions of games training never samples, at its raw weights, in inference mode."},
   "heldout_value_loss_avg": {"description": "The same at its self-play weight average."},
   "seen_*": {"description": "With held-out games: as heldout_*, on positions of the games training samples, of the same ages as the held-out ones."},
-  "memorized_*": {"description": "With held-out games: heldout_* minus seen_*, how much better the network does on positions it trains on than on new games of the same kind: what it has memorized of its replay buffer (with *_se, its standard error). Growing while progress_* is flat means training fits the buffer rather than learning.", "better": "lower"},
+  "memorized_*": {"description": "With held-out games: heldout_* minus seen_*, how much better the network does on positions it trains on than on new games of the same kind: what it has memorized of its replay buffer (with *_se, its standard error from micro-batch spread). The two sides are different games, so the held-out games' own outcomes add an offset *_se leaves out: about 0.004 in memorized_value_loss with 32 of 1024 environments held out (about 5,400 games); memorized_policy_kl, whose targets are per position, is cleaner.", "better": "lower"},
   "tree_batch_fraction": {"description": "The fraction of each training batch that is search tree positions rather than played positions."},
   "tree_buffer_samples": {"description": "Search tree positions in the replay buffer that training can sample."},
   "moves": {"description": "Self-play moves played this epoch, in all environments."},

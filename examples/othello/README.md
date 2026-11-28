@@ -517,7 +517,11 @@ same ages:
 
 - `heldout_*` and `seen_*`: policy KL and value loss on each, and `memorized_*` the difference.
   The two sets are different games, so a few thousand held-out games' own outcomes put an offset
-  of a few thousandths in the value loss.
+  in the value loss that `*_se` (from micro-batch spread) doesn't include: about 0.004 at 32 of
+  1024 environments, about 5,400 games. A checkpoint that never saw any of them scored
+  +0.0039 ± 0.0027 worse on the last 32 environments' games than on the rest. So value readings
+  under about 0.005 aren't resolvable at that size (hold out more environments for better), while
+  the policy KL, whose targets are per position, is cleaner.
 
 Training is unchanged apart from training on 3% fewer games. A train loop starts the held-out
 buffers empty, since a saved state's may hold positions trained on, so a fork or resume measures
