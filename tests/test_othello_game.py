@@ -20,23 +20,20 @@ from game import (
     load_checkpoint,
     make_network,
     make_optimizer,
-    weight_decay_mask,
 )
 from gated_scan import GatedScan
 
 from core.memory.replay_memory import BaseExperience
 from core.networks.azresnet import AZResnet, Depthwise, PreActConvNeXt
-from core.training.lr_plateau import LRPlateau
-from core.training.train import restart_schedules, sgdw, with_rate_index
+from core.training.train import with_hyperparams
 
 
 def save_checkpoint(path: Path, net: str):
-    """A checkpoint as the trainer saves one: params and network state first, then the
-    optimizer's state."""
+    """A checkpoint as the trainer saves one (see `Trainer.save_weights`): the network's
+    parameters and state."""
     network, network_state = make_network(net)
     params = eqx.filter(network, eqx.is_inexact_array)
-    opt_state = make_optimizer(total_steps=1).init(params)
-    eqx.tree_serialise_leaves(path, (params, network_state, opt_state))
+    eqx.tree_serialise_leaves(path, (params, network_state))
     return params
 
 
@@ -138,34 +135,18 @@ def test_symmetries_map_a_position_to_a_consistent_one():
             assert np.asarray(transform_fn(image).observation_nn).tobytes() in boards
 
 
-def test_lr_drops_hold_then_step():
-    params = {"w": jnp.zeros((2, 2))}
-    optimizer = make_optimizer(100, 1e-3, lr_drops=[(0.7, 1e-4), (0.9, 1e-5)])
-    state: Any = optimizer.init(params)
-    rates = []
-    for _ in range(100):
-        _, state = optimizer.update(jax.tree.map(jnp.ones_like, params), state, params)
-        rates.append(float(state.hyperparams["learning_rate"]))
-    assert rates[0] == pytest.approx(1e-3) and rates[69] == pytest.approx(1e-3)
-    assert rates[70] == pytest.approx(1e-4) and rates[89] == pytest.approx(1e-4)
-    assert rates[90] == pytest.approx(1e-5) and rates[99] == pytest.approx(1e-5)
-
-
 DECAYED = {"w": jnp.full((2, 2), 2.0)}
 
 
-def decays_and_rates(optimizer, steps, at=None, state=None):
+def decays_and_rates(optimizer, steps, state=None):
     """Each of `steps` zero-gradient updates' decay of a weight (-update / w: Adam and SGD move
-    nothing else without a gradient) and its learning rate, from `state` (default a new one);
-    `at(step, state)` may change the state before an update."""
+    nothing else without a gradient) and its learning rate, from `state` (default a new one)."""
     zeros = jax.tree.map(jnp.zeros_like, DECAYED)
     update = jax.jit(optimizer.update)
     if state is None:
         state = optimizer.init(DECAYED)
     out = []
-    for step in range(steps):
-        if at is not None:
-            state = at(step, state)
+    for _ in range(steps):
         updates, state = update(zeros, state, DECAYED)
         out.append(
             (
@@ -176,108 +157,39 @@ def decays_and_rates(optimizer, steps, at=None, state=None):
     return out
 
 
-def plateau_at_rate_1_from_step_5(step, state):
-    return with_rate_index(state, 1) if step == 5 else state
-
-
-SCHEDULES = {
-    "lr_drops": ({"lr_drops": [(0.3, 1e-4), (0.7, 1e-5)]}, None),
-    "cosine": ({"lr_final": 1e-5}, None),
-    "plateau": (
-        {"lr_plateau": LRPlateau((1e-3, 1e-4, 1e-5))},
-        plateau_at_rate_1_from_step_5,
-    ),
-    "constant": ({"lr_final": 1e-3}, None),
-}
+@pytest.mark.parametrize("sgd", [False, True])
+def test_the_rate_holds_and_each_step_decays_by_rate_times_weight_decay(sgd):
+    optimizer = make_optimizer(1e-3, sgd=sgd, momentum=0.0)
+    for decay, lr in decays_and_rates(optimizer, 5):
+        assert lr == pytest.approx(1e-3)
+        assert decay == pytest.approx(1e-3 * WEIGHT_DECAY, rel=1e-4)
 
 
 @pytest.mark.parametrize("sgd", [False, True])
-@pytest.mark.parametrize("schedule", SCHEDULES)
-def test_weight_decay_drops_with_the_learning_rate(schedule, sgd):
-    kwargs, at = SCHEDULES[schedule]
-    settings = {"sgd": sgd, "momentum": 0.0, **kwargs}
-    scaled = decays_and_rates(make_optimizer(10, 1e-3, **settings), 10, at)
-    rates = [lr for _, lr in scaled]
-    # the schedule moves (but a constant rate)
-    assert rates[0] == pytest.approx(1e-3)
-    assert (min(rates) < 2e-4) == (schedule != "constant")
-    # the decay is WEIGHT_DECAY at 1e-3, and the rate's share of it at any other: each step
-    # decays lr * (WEIGHT_DECAY * lr / 1e-3), so lr * decay goes as lr^2
-    for decay, lr in scaled:
-        assert decay == pytest.approx(lr * WEIGHT_DECAY * lr / 1e-3, rel=1e-4)
-    # without it, the decay is held
-    held = decays_and_rates(
-        make_optimizer(10, 1e-3, decay_with_lr=False, **settings), 10, at
-    )
-    for decay, lr in held:
-        assert decay == pytest.approx(lr * WEIGHT_DECAY, rel=1e-4)
-
-
-@pytest.mark.parametrize("sgd", [False, True])
-@pytest.mark.parametrize("schedule", SCHEDULES)
-def test_the_optimizer_state_is_the_one_saved_before_the_decay_followed_the_rate(
-    schedule, sgd
-):
-    # states saved when the decay was a fixed hyperparameter of optax.adamw (or sgdw) load,
-    # branch and fork into the new optimizer: the same structure, in either mode
-    kwargs, _ = SCHEDULES[schedule]
-    if sgd:
-        old = optax.inject_hyperparams(sgdw, static_args=("mask", "decoupled"))(
-            learning_rate=kwargs.get("lr_plateau") or optax.constant_schedule(1e-3),
-            momentum=0.9,
-            weight_decay=WEIGHT_DECAY,
-            mask=weight_decay_mask,
-        )
-    else:
-        old = optax.inject_hyperparams(optax.adamw, static_args=("mask",))(
-            learning_rate=kwargs.get("lr_plateau") or optax.constant_schedule(1e-3),
-            weight_decay=WEIGHT_DECAY,
-            mask=weight_decay_mask,
-        )
-    expected = jax.tree.structure(old.init(DECAYED))
-    for decay_with_lr in (True, False):
-        state = make_optimizer(
-            10, 1e-3, sgd=sgd, decay_with_lr=decay_with_lr, **kwargs
-        ).init(DECAYED)
-        assert jax.tree.structure(state) == expected
-    # an old state, restarted as a fork's is, steps in the new optimizer from its first rate
+def test_a_saved_state_trains_at_a_new_optimizers_rate_and_decay(sgd):
+    # as a branch at a lower --lr does: the trainer sets the state's injected hyperparameters
+    # to its own optimizer's
+    old = make_optimizer(1e-3, sgd=sgd, momentum=0.0)
     state: Any = old.init(DECAYED)
+    # zero gradients, so that Adam's moments add nothing to the decay measured
+    zeros = jax.tree.map(jnp.zeros_like, DECAYED)
     for _ in range(3):
-        _, state = old.update(DECAYED, state, DECAYED)
-    new = make_optimizer(10, 1e-3, sgd=sgd, momentum=0.9, **kwargs)
-    [(decay, lr)] = decays_and_rates(new, 1, state=restart_schedules(state))
-    assert lr == pytest.approx(1e-3)
-    assert decay > 0
+        _, state = old.update(zeros, state, DECAYED)
+    new = make_optimizer(1e-4, 2 * WEIGHT_DECAY, sgd=sgd, momentum=0.0)
+    new_state: Any = new.init(DECAYED)
+    hyperparams = new_state.hyperparams
+    assert jax.tree.structure(state) == jax.tree.structure(new_state)
+    [(decay, lr)] = decays_and_rates(new, 1, state=with_hyperparams(state, hyperparams))
+    assert lr == pytest.approx(1e-4)
+    assert decay == pytest.approx(1e-4 * 2 * WEIGHT_DECAY, rel=1e-4)
 
 
-def test_constant_rate_is_the_cosine_to_itself_and_its_program_ignores_run_length():
-    # a run in steps (controller.py) compiles each step's training once into the persistent
-    # compilation cache only if the program doesn't depend on --epochs; the updates, and the
-    # optimizer state's structure (saved states load), are a cosine from the rate to itself's
-    params = {"w": jnp.linspace(-1.0, 1.0, 12).reshape(3, 4), "b": jnp.ones(3)}
-    grads = jax.tree.map(lambda x: jnp.sin(3 * x) + 0.1, params)
-
-    def run(optimizer):
-        update = jax.jit(optimizer.update)
-        state: Any = optimizer.init(params)
-        p = params
-        for _ in range(3):
-            updates, state = update(grads, state, p)
-            p = optax.apply_updates(p, updates)
-        return p, state, update.lower(grads, optimizer.init(params), p).as_text()
-
-    constant = [run(make_optimizer(steps, 5e-4, 5e-4)) for steps in (100, 200)]
-    cosine = optax.inject_hyperparams(optax.adamw, static_args=("mask",))(
-        learning_rate=optax.cosine_decay_schedule(5e-4, decay_steps=100, alpha=1.0),
-        weight_decay=WEIGHT_DECAY,
-        mask=weight_decay_mask,
-    )
-    expected, expected_state, _ = run(cosine)
-    assert constant[0][2] == constant[1][2]
-    for p, state, _ in constant:
-        assert jax.tree.structure(state) == jax.tree.structure(expected_state)
-        for a, b in zip(jax.tree.leaves(p), jax.tree.leaves(expected), strict=True):
-            np.testing.assert_array_equal(a, b)
+def test_a_schedule_is_followed():
+    # distill.py's cosine
+    schedule = optax.cosine_decay_schedule(1e-3, decay_steps=4, alpha=0.1)
+    rates = [lr for _, lr in decays_and_rates(make_optimizer(schedule), 5)]
+    assert rates[0] == pytest.approx(1e-3)
+    assert rates == sorted(rates, reverse=True) and rates[-1] == pytest.approx(1e-4)
 
 
 def on_a_line(dy: int, dx: int) -> bool:

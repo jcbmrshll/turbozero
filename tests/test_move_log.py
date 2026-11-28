@@ -1,4 +1,4 @@
-"""The move log (core/memory/move_log.py); the trainer's `log_moves` is tested in test_trainer.py."""
+"""The move log (core/memory/move_log.py), which teacher_dataset.py reads."""
 
 import jax
 import jax.numpy as jnp

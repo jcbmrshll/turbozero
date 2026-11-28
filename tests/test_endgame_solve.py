@@ -28,12 +28,11 @@ def mover_wins(positions):
     return results
 
 
-def endgame_solve(slots=4, share=1.0, play_past=0.0):
+def endgame_solve(slots=4, play_past=0.0):
     return EndgameSolve(
         stop_fn=lambda state: state.step >= STOP,
         solve_fn=mover_wins,
         slots=slots,
-        share=share,
         play_past=play_past,
     )
 
@@ -160,17 +159,6 @@ def test_a_game_finding_every_slot_full_plays_on(
     )
 
 
-def test_with_a_share_of_zero_every_game_plays_out(
-    fixed_length_env, make_collector, scripted, tmp_path
-):
-    env = fixed_length_env(length=LENGTH)
-    state = collector(make_collector, env, scripted, tmp_path, share=0.0)(LENGTH)
-
-    np.testing.assert_array_equal(state.pending.added, [0])
-    np.testing.assert_array_equal(state.pending.missed, [0])
-    np.testing.assert_array_equal(sampleable(state), np.arange(LENGTH))
-
-
 def test_a_waiting_game_written_over_is_not_labelled(
     fixed_length_env, make_collector, scripted, tmp_path
 ):
@@ -289,9 +277,7 @@ def test_past_the_solve_point_a_game_ends_before_each_move_at_one_over_one_plus_
     solve = endgame_solve(play_past=play_past)
     position, _ = env.init_fn(jax.random.PRNGKey(0))
     position = jax.tree.map(lambda x: x + STOP, position)
-    past = replace(
-        solve.init(jax.random.PRNGKey(0), position, 16), past=jnp.array(True)
-    )
+    past = replace(solve.init(position, 16), past=jnp.array(True))
     keys = jax.random.split(jax.random.PRNGKey(1), 4000)
 
     moves = jax.vmap(
@@ -303,9 +289,7 @@ def test_past_the_solve_point_a_game_ends_before_each_move_at_one_over_one_plus_
     assert not moves.solve.any()
 
 
-@pytest.mark.parametrize(
-    "kwargs", [{"slots": 0}, {"share": 1.5}, {"share": -0.1}, {"play_past": -1.0}]
-)
+@pytest.mark.parametrize("kwargs", [{"slots": 0}, {"play_past": -1.0}])
 def test_settings_out_of_range_are_rejected(kwargs):
     with pytest.raises(ValueError):
         endgame_solve(**kwargs)

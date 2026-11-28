@@ -13,12 +13,10 @@ from core.memory.replay_memory import BaseExperience
 
 
 def save_checkpoint(path: Path, net: str):
-    """A checkpoint as the trainer saves one: params and network state first, then the
-    optimizer's state."""
+    """A checkpoint as the trainer saves its weights: params and network state."""
     network, network_state = game.make_network(net)
     params = eqx.filter(network, eqx.is_inexact_array)
-    opt_state = game.make_optimizer(total_steps=1).init(params)
-    eqx.tree_serialise_leaves(path, (params, network_state, opt_state))
+    eqx.tree_serialise_leaves(path, (params, network_state))
     return params
 
 

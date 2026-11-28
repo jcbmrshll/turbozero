@@ -3,60 +3,11 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 
 from core.common import two_player_game
 from core.evaluators.random_evaluator import RandomEvaluator
-from core.testing.two_player_baseline import TwoPlayerBaseline
-from core.testing.two_player_tester import TwoPlayerTester, TwoPlayerTestState
 
 MAX_STEPS = 10
-
-
-@pytest.mark.parametrize(
-    # every game pays both players the same, so the agent's mean outcome is the reward
-    "reward, adopted",
-    [(0.0, False), (-1.0, False), (1.0, True)],
-)
-def test_two_player_tester_adopts_the_params_only_if_they_win_on_average(
-    fixed_length_env, scripted, reward, adopted
-):
-    env = fixed_length_env(length=3, rewards=(reward, reward))
-    tester = TwoPlayerTester(num_episodes=2)
-    state = TwoPlayerTestState(best_params={"w": jnp.zeros(3)})
-
-    state, metrics, _, _ = tester.test(
-        MAX_STEPS,
-        env.step_fn,
-        env.init_fn,
-        scripted.first_legal,
-        jax.random.split(jax.random.PRNGKey(0), 2),
-        state,
-        {"w": jnp.ones(3)},
-    )
-
-    np.testing.assert_array_equal(metrics["TwoPlayerTester_avg_outcome"], reward)
-    np.testing.assert_array_equal(state.best_params["w"], np.full(3, float(adopted)))
-
-
-def test_tester_run_on_skipped_epoch_returns_state_unchanged(ttt, scripted):
-    tester = TwoPlayerTester(num_episodes=2, epochs_per_test=2)
-    state = TwoPlayerTestState(best_params={"w": jnp.zeros(3)})
-
-    new_state, metrics, rendered = tester.run(
-        key=jax.random.PRNGKey(0),
-        epoch_num=1,
-        max_steps=MAX_STEPS,
-        env_step_fn=ttt.step_fn,
-        env_init_fn=ttt.init_fn,
-        evaluator=scripted.first_legal,
-        state=state,
-        params={"w": jnp.ones(3)},
-    )
-
-    assert new_state is state
-    assert metrics == {}
-    assert rendered is None
 
 
 def test_random_evaluator_plays_legal_moves_uniformly(ttt):
@@ -77,54 +28,6 @@ def test_random_evaluator_plays_legal_moves_uniformly(ttt):
     assert counts[0] == counts[4] == 0
     # 7 legal squares, 1000 picks each expected
     np.testing.assert_allclose(counts[np.asarray(meta.action_mask)], 1000, rtol=0.1)
-
-
-@pytest.mark.parametrize(
-    "rewards, win_rate, loss_rate",
-    [
-        # won by whoever moves first: with the agent first in exactly half the games, it wins half
-        ((1.0, -1.0), 0.5, 0.5),
-        # drawn
-        ((0.0, 0.0), 0.0, 0.0),
-    ],
-)
-def test_two_player_baseline_reports_win_and_loss_rates(
-    fixed_length_env, scripted, rewards, win_rate, loss_rate
-):
-    env = fixed_length_env(length=3, rewards=rewards)
-    tester = TwoPlayerBaseline(
-        num_episodes=8,
-        baseline_evaluator=scripted.first_legal,
-        balance_first_player=True,
-        name="baseline",
-    )
-
-    _, metrics, _, _ = tester.test(
-        MAX_STEPS,
-        env.step_fn,
-        env.init_fn,
-        scripted.first_legal,
-        jax.random.split(jax.random.PRNGKey(0), 8),
-        tester.init(params=None),
-        {"w": jnp.ones(3)},
-    )
-
-    np.testing.assert_array_equal(metrics["baseline_win_rate"], win_rate)
-    np.testing.assert_array_equal(metrics["baseline_loss_rate"], loss_rate)
-
-
-def test_balanced_two_player_baseline_needs_an_even_number_of_episodes(scripted):
-    TwoPlayerBaseline(
-        num_episodes=6,
-        baseline_evaluator=scripted.first_legal,
-        balance_first_player=True,
-    )
-    with pytest.raises(ValueError, match="even number of episodes"):
-        TwoPlayerBaseline(
-            num_episodes=3,
-            baseline_evaluator=scripted.first_legal,
-            balance_first_player=True,
-        )
 
 
 def test_two_player_game_records_each_players_tree_of_each_position(ttt, make_search):
@@ -177,34 +80,24 @@ def test_two_player_game_records_each_players_tree_of_each_position(ttt, make_se
         assert carried.q[0] == before.q[child]
 
 
-def test_tester_episode_has_every_frame_up_to_the_final_state(
+def test_two_player_game_has_every_frame_up_to_the_final_state(
     fixed_length_env, scripted
 ):
     max_steps = 4
     env = fixed_length_env(length=max_steps)
-    packed = []
 
-    def episode_fn(frames, p_ids, env_step_fn):  # pylint: disable=unused-argument
-        packed.append(frames)
-        return "episode"
+    _, frames, _ = jax.jit(
+        partial(
+            two_player_game,
+            evaluator_1=scripted.first_legal,
+            evaluator_2=scripted.first_legal,
+            params_1={"w": jnp.ones(3)},
+            params_2={"w": jnp.ones(3)},
+            env_step_fn=env.step_fn,
+            env_init_fn=env.init_fn,
+            max_steps=max_steps,
+        )
+    )(jax.random.PRNGKey(0))
 
-    tester = TwoPlayerTester(num_episodes=2, episode_fn=episode_fn)
-    state = TwoPlayerTestState(best_params={"w": jnp.zeros(3)})
-
-    _, _, episode = tester.run(
-        key=jax.random.PRNGKey(0),
-        epoch_num=0,
-        max_steps=max_steps,
-        env_step_fn=env.step_fn,
-        env_init_fn=env.init_fn,
-        evaluator=scripted.first_legal,
-        state=state,
-        params={"w": jnp.ones(3)},
-    )
-
-    assert episode == "episode"
-    [frames] = packed
-    # one transfer off the device: numpy arrays stacked along time
-    assert isinstance(frames.completed, np.ndarray)
     assert frames.env_state.step.tolist() == list(range(max_steps + 1))
     assert frames.completed[-1]

@@ -8,7 +8,7 @@ from example_modules import load_example
 
 (bench_nets, game) = load_example("othello", "bench_nets", "game")
 
-# the controlled runs' kind of network, tiny: channel norm normalizes each sample on its own
+# a channel-normalized network, tiny: channel norm normalizes each sample on its own
 NET = "resnet:2x8,pool_every=2,heads=pooled,pool_channels=4,norm=channel,layout=pre"
 
 
@@ -17,7 +17,7 @@ def test_accumulated_training_step_is_the_whole_batchs():
     # batch's: the step the benchmark times with --grad-accum makes the same update
     network, state = game.make_network(NET)
     params, static = eqx.partition(network, eqx.is_inexact_array)
-    optimizer = game.make_optimizer(10)
+    optimizer = game.make_optimizer()
     batch = bench_nets.random_batch(np.random.default_rng(0), 8)
     updated = [
         jax.jit(bench_nets.training_step(static, optimizer, n))(

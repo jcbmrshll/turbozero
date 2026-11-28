@@ -110,32 +110,6 @@ def test_value_target_is_outcome_for_player_to_move():
     np.testing.assert_allclose(value_loss([-1.0, 1.0]), 0.5 * 4, rtol=1e-6)
 
 
-def test_value_target_mixes_in_the_search_value():
-    # player 0 won; the search valued the positions at 0.5 and 0.2 for the player to move
-    batch = experience(
-        rewards=[[1, -1], [1, -1]],
-        cur_player_id=[0, 1],
-        policy_weights=[[0.5, 0.5]] * 2,
-        policy_mask=[[True, True]] * 2,
-        search_value=[0.5, 0.2],
-    )
-    net = OutputAsParams(jnp.zeros((2, 2)), jnp.zeros((2, 1)))
-
-    def value_loss(value_target_q):
-        _, (metrics, _) = az_default_loss_fn(
-            net, None, batch, value_target_q=value_target_q
-        )
-        return float(metrics["value_loss"])
-
-    def expected(targets):
-        return 0.5 * np.mean(np.square(targets))
-
-    # the outcome alone by default, the search value alone at 1, and an even mix at 0.5
-    np.testing.assert_allclose(value_loss(0.0), expected([1.0, -1.0]), rtol=1e-6)
-    np.testing.assert_allclose(value_loss(1.0), expected([0.5, 0.2]), rtol=1e-6)
-    np.testing.assert_allclose(value_loss(0.5), expected([0.75, -0.4]), rtol=1e-6)
-
-
 def two_positions():
     """A batch of two positions, with a network's (made-up) outputs for them."""
     batch = experience(

@@ -1,5 +1,5 @@
-"""vs_solver.py's games against the solver: as train.py plays them, between epochs
-(`SolverMatchTester`), with a fake match, and one real game with a tiny network."""
+"""vs_solver.py's games against the solver: what a match logs, with a fake match, and one real
+game with a tiny network."""
 
 import fnmatch
 import json
@@ -7,9 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import equinox as eqx
-import jax
 import numpy as np
-import pytest
 from example_modules import load_example
 from seaglass import Arrays
 from test_connect_four_solver import OneMoveSolver
@@ -18,7 +16,6 @@ game, vs_solver, solver_module = load_example(
     "connect_four", "game", "vs_solver", "solver"
 )
 SolverMatch = vs_solver.SolverMatch
-SolverMatchTester = vs_solver.SolverMatchTester
 LevelResult = vs_solver.LevelResult
 
 
@@ -59,71 +56,20 @@ def points(results):
     return (1 + np.sign(results)) / 2
 
 
-def run(tester, epoch, state, params, logged=None):
-    return tester.run(
-        key=jax.random.PRNGKey(0),
-        epoch_num=epoch,
-        max_steps=0,
-        env_step_fn=None,
-        env_init_fn=None,
-        evaluator=None,
-        state=state,
-        params=params,
-        log_fn=None if logged is None else logged.append,
-    )
-
-
-def test_plays_at_the_epochs_it_is_set_to():
-    tester = SolverMatchTester(FakeMatch(), num_epochs=10, every=4, last=2)
-    assert [e for e in range(10) if tester.plays_at(e)] == [3, 7, 8, 9]
-    with pytest.raises(ValueError, match="between 0 and 10"):
-        SolverMatchTester(FakeMatch(), num_epochs=10, last=11)
-
-
-def test_logs_each_level_and_the_mean_of_the_last_networks(tmp_path):
-    match = FakeMatch()
-    results = tmp_path / "vs_solver.jsonl"
-    tester = SolverMatchTester(
-        match, num_epochs=3, last=2, record=True, results=results, config={"dtype": "x"}
-    )
-    state = tester.init()
-    logged: list[dict] = []
-    state, metrics, episode = run(tester, 0, state, 1, logged)
-    assert logged == [] and metrics == {} and episode is None and match.plays == []
-    for epoch, params in ((1, 2), (2, 3)):
-        state, _, _ = run(tester, epoch, state, params, logged)
-    assert match.plays == [(2, 0, True), (2, 42, True), (3, 0, True), (3, 42, True)]
-    merged = {k: v for d in logged for k, v in d.items()}
-    assert merged["solver_level42_sims256"] == points(fake_results(3, 42, 6)).mean()
-    assert merged["solver_level42_sims256_game"].arrays["x"] == [3]
-    expected = (points(fake_results(2, 42, 6)) + points(fake_results(3, 42, 6))) / 2
-    assert merged["solver_level42_sims256_last2"] == pytest.approx(expected.mean())
-    assert "solver_seconds" in merged
-    lines = [json.loads(line) for line in results.read_text().splitlines()]
-    assert [(r["epoch"], r["level"]) for r in lines] == [
-        (1, 0),
-        (1, 42),
-        (2, 0),
-        (2, 42),
-    ]
-    assert lines[0]["engine"] == "solver" and lines[0]["dtype"] == "x"
-
-
 def test_every_logged_metric_is_declared():
     declared = json.loads(
         (Path(__file__).parent.parent / "core/monitoring/declared.json").read_text()
     )
     match = FakeMatch()
-    tester = SolverMatchTester(match, num_epochs=1, last=1, record=True)
-    logged: list[dict] = []
-    run(tester, 0, tester.init(), 1, logged)
-    names = {k for d in logged for k in d}
+    names = {
+        name
+        for level in match.levels
+        for name in match.play(1, level, record=True).metrics(match.name(level))
+    }
     assert names and all(
         any(fnmatch.fnmatchcase(name, pattern) for pattern in declared)
         for name in names
     )
-    # the score alone is headed for the tiles, by describe_scores
-    assert "solver_seconds" in declared
 
 
 def test_describe_scores_declares_them_better_higher():
