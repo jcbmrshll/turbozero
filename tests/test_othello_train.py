@@ -239,6 +239,8 @@ def test_the_engine_set_validates_the_average(monkeypatch, tmp_path):
             "2",
             "--engine-set",
             str(tmp_path / "set.npz"),
+            "--headroom-every",
+            "0",
         )
     [validator] = built.value.kwargs["validators"]
     assert validator.name == "engine"
@@ -247,6 +249,79 @@ def test_the_engine_set_validates_the_average(monkeypatch, tmp_path):
     assert built.value.kwargs["validate_every"] == 2
     # self-play's network computes in bfloat16, the validator's in float32
     assert [dtype for dtype, _ in made] == ["bfloat16", "float32"]
+
+
+def test_the_headroom_probe_searches_the_engine_set_as_self_play_does(
+    monkeypatch, tmp_path
+):
+    from test_engine_set import tiny_set
+
+    tiny_set(np.random.default_rng(0)).save(tmp_path / "set.npz")
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(
+            monkeypatch,
+            "--validate-every",
+            "1",
+            "--engine-set",
+            str(tmp_path / "set.npz"),
+            "--sims",
+            "16",
+            "--playout-cap",
+            "0.25:4",
+            "--dirichlet-alpha",
+            "0.5",
+            "--headroom-every",
+            "7",
+            "--headroom-positions",
+            "3",
+        )
+    engine, headroom = built.value.kwargs["validators"]
+    assert engine.name == "engine" and headroom.name == "search"
+    assert headroom.every == 7
+    assert headroom.num_positions == 3
+    # self-play's budget and twice it, full searches from fresh trees, with its root noise
+    assert list(headroom.evaluators) == ["16", "32"]
+    for sims, evaluator in zip((16, 32), headroom.evaluators.values(), strict=True):
+        assert evaluator.num_iterations == sims
+        assert evaluator.max_nodes == sims + 1
+        assert evaluator.playout_cap is None
+        assert evaluator.dirichlet_alpha == 0.5
+    # positions keep their phases, as the engine validator's
+    assert headroom.group_names == engine.group_names
+
+
+def test_headroom_sims_choose_the_budgets(monkeypatch, tmp_path):
+    from test_engine_set import tiny_set
+
+    tiny_set(np.random.default_rng(0)).save(tmp_path / "set.npz")
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(
+            monkeypatch,
+            "--validate-every",
+            "1",
+            "--engine-set",
+            str(tmp_path / "set.npz"),
+            "--headroom-sims",
+            "64",
+            "256",
+            "512",
+        )
+    _, headroom = built.value.kwargs["validators"]
+    assert list(headroom.evaluators) == ["64", "256", "512"]
+
+
+def test_self_play_data_is_scored_by_phase_and_side_to_move(monkeypatch):
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, "--data-positions", "2048")
+    assert built.value.kwargs["data_positions"] == 2048
+    assert list(built.value.kwargs["position_groups"]) == [
+        "opening",
+        "midgame",
+        "late",
+        "endgame",
+        "black",
+        "white",
+    ]
 
 
 def test_without_an_engine_set_nothing_is_validated(monkeypatch):

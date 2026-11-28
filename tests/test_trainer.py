@@ -337,9 +337,11 @@ def logged(monitor, name):
 class FakeValidator:
     """Records the weights it scores, and scores them `top1` 1."""
 
-    def __init__(self, name="positions"):
+    def __init__(self, name="positions", every=None):
         self.name = name
         self.calls = []
+        if every is not None:
+            self.every = every
 
     def __call__(self, params):
         self.calls.append(params)
@@ -2396,3 +2398,140 @@ def test_loaded_states_are_donated_to_self_play(real, real_run, tmp_path, monkey
     assert all(x.is_deleted() for x in jax.tree.leaves(resumed.collection_state))
     assert given[0].buffer_state is resumed.collection_state.buffer_state
     assert all(x.is_deleted() for x in jax.tree.leaves(given[first_forked]))
+
+
+# self-play data metrics
+
+
+def data_buffer(trainer, env):
+    """A replay buffer of 2 environments of capacity 8, written up to place 0 (the newest place
+    is the last), every game finished with player 0 to move and winning. Places 6-7 hold the
+    newest positions: uniform targets, search value 0.95; places 4-5 older ones, one-hot
+    targets, search value 0; places 0-3 the oldest, one-hot targets, search value -1."""
+    state = buffer_of(trainer, one_position(env), np.ones((2, 8), bool))
+    place = np.arange(8)
+    uniform = np.where((place >= 6)[:, None], 0.5, np.array([1.0, 0.0]))
+    search_value = np.select([place >= 6, place >= 4], [0.95, 0.0], -1.0)
+    return replace(
+        state,
+        buffer=replace(
+            state.buffer,
+            policy_weights=jnp.asarray(
+                np.broadcast_to(uniform, (2, 8, 2)), jnp.float32
+            ),
+            policy_mask=jnp.ones((2, 8, 2), bool),
+            search_value=jnp.asarray(
+                np.broadcast_to(search_value, (2, 8)), jnp.float32
+            ),
+            reward=jnp.broadcast_to(jnp.array([1.0, -1.0]), (2, 8, 2)),
+            cur_player_id=jnp.zeros((2, 8), jnp.int32),
+        ),
+    )
+
+
+def before_writing(state, count):
+    """Counters as they stood `count` writes before `state`'s."""
+    capacity = state.populated.shape[1]
+    zeros = jnp.zeros(2, jnp.int32)
+    return CollectionStats(
+        episodes=zeros,
+        moves=zeros,
+        episode_metrics={},
+        next_idx=(state.next_idx - count) % capacity,
+    )
+
+
+def test_data_metrics_score_the_epochs_positions_and_the_last_two_epochs_outcomes(
+    env, tmp_path
+):
+    trainer = make_trainer(
+        env,
+        tmp_path,
+        data_positions=8,
+        data_pairs=4,
+        position_groups={"decided": lambda e: jnp.abs(e.search_value) > 0.5},
+    )
+    state = data_buffer(trainer, env)
+    params = (eqx.filter(trainer.nn, eqx.is_inexact_array), None)
+
+    # the epoch wrote 2 positions in each environment
+    metrics = trainer.data_metrics(
+        jax.random.PRNGKey(0), before_writing(state, 2), state, params
+    )
+
+    assert int(metrics["data_stored"]) == 4
+    # policy metrics: the 4 newest positions only (the sample of 8 has 4 of padding)
+    assert float(metrics["data_target_entropy"]) == pytest.approx(np.log(2), rel=1e-5)
+    assert float(metrics["data_decided_share"]) == pytest.approx(1.0)
+    # value metrics: places 4-7, the last two epochs', not the oldest (search value -1)
+    assert float(metrics["data_label_value_mse"]) == pytest.approx(
+        (1 + 0.05**2) / 2, rel=1e-5
+    )
+    assert float(metrics["data_label_value_mse_decided"]) == pytest.approx(
+        0.05**2, rel=1e-4
+    )
+    assert float(metrics["data_outcome"]) == pytest.approx(1.0)
+    # the 4 newest are one position: every pair collides
+    assert float(metrics["data_collision"]) == pytest.approx(1.0)
+    assert float(metrics["data_pair_distance"]) == pytest.approx(0.0)
+
+
+def test_data_metrics_are_off_by_default_and_empty_when_nothing_was_stored(
+    env, tmp_path
+):
+    state = data_buffer(make_trainer(env, tmp_path), env)
+    params = (eqx.filter(make_trainer(env, tmp_path).nn, eqx.is_inexact_array), None)
+    key = jax.random.PRNGKey(0)
+
+    assert (
+        make_trainer(env, tmp_path).data_metrics(
+            key, before_writing(state, 2), state, params
+        )
+        == {}
+    )
+    on = make_trainer(env, tmp_path, data_positions=4, data_pairs=2)
+    assert on.data_metrics(key, before_writing(state, 0), state, params) == {}
+
+
+def test_data_metrics_are_logged_with_the_weights_self_play_played_with(
+    env, tmp_path, monkeypatch
+):
+    monitor = FakeMonitor()
+    trainer = make_trainer(
+        env, tmp_path, average_epochs=2, data_positions=4, data_pairs=2, monitor=monitor
+    )
+    played, scored = [], []
+    collect_steps, data_metrics = trainer.collect_steps, trainer.data_metrics
+
+    def recording_collect(key, state, params, num_steps):
+        played.append(jax.tree.map(np.asarray, params))
+        return collect_steps(key, state, params, num_steps)
+
+    def recording_data(key, before, buffer_state, params):
+        scored.append(jax.tree.map(np.asarray, params))
+        return data_metrics(key, before, buffer_state, params)
+
+    monkeypatch.setattr(trainer, "collect_steps", recording_collect)
+    monkeypatch.setattr(trainer, "data_metrics", recording_data)
+
+    trainer.train_loop(seed=0, num_epochs=2)
+
+    assert len(scored) == len(played) == 2
+    for p, s in zip(played, scored, strict=True):
+        jax.tree.map(np.testing.assert_array_equal, p, s)
+    assert set(logged(monitor, "data_target_entropy")) == {0, 1}
+    assert set(logged(monitor, "data_stored")) == {0, 1}
+
+
+def test_a_validator_with_its_own_interval_runs_on_it(env, tmp_path, fake_loop):
+    monitor = FakeMonitor()
+    every_epoch, every_third = FakeValidator(), FakeValidator("costly", every=3)
+    trainer = make_trainer(
+        env, tmp_path, validators=[every_epoch, every_third], monitor=monitor
+    )
+    fake_loop(trainer)
+
+    trainer.train_loop(seed=0, num_epochs=4)
+
+    assert len(every_epoch.calls) == 4
+    assert len(every_third.calls) == 2

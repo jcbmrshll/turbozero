@@ -1,5 +1,6 @@
 import inspect
 import json
+import math
 import os
 import re
 import time
@@ -27,7 +28,9 @@ from core.memory.replay_memory import (
     buffer_capacity,
     transform_randomly,
 )
+from core.networks.utils import apply_nn
 from core.pytree import map_where, where_tree
+from core.training import selfplay_data
 from core.training.endgame_solve import EndgameSolve, PendingSolves, Solved
 from core.training.exploration import Exploration
 from core.types import (
@@ -47,7 +50,10 @@ if TYPE_CHECKING:
 class Validator(Protocol):
     """Scores a network's weights on data training never sees (e.g.
     `core.training.validation.ScoredPositionsValidator`): called with (parameters, network
-    state), it returns metrics by name. `get_config` describes it for the run's config."""
+    state), it returns metrics by name. `get_config` describes it for the run's config.
+
+    One with an `every` attribute runs every that many epochs, rather than the `Trainer`'s
+    `validate_every` (e.g. a costly one, see `core.training.validation.SearchTargetValidator`)."""
 
     def __call__(self, params: Any) -> dict[str, jax.Array]: ...
 
@@ -95,6 +101,7 @@ class CollectionStats:
     episodes: jax.Array
     moves: jax.Array
     episode_metrics: dict[str, jax.Array]
+    next_idx: jax.Array
     solve_missed: jax.Array | None = None
 
     @classmethod
@@ -102,6 +109,7 @@ class CollectionStats:
         return cls(
             episodes=jnp.copy(state.episodes),
             moves=jnp.copy(state.moves),
+            next_idx=jnp.copy(state.buffer_state.next_idx),
             episode_metrics={k: jnp.copy(v) for k, v in state.episode_metrics.items()},
             solve_missed=jnp.copy(state.pending.missed)
             if state.pending is not None
@@ -452,7 +460,8 @@ class Trainer:
     2. self-play plays with the average, storing its positions in the replay buffer
     3. with `endgame_solve`, the last epoch's exact solves are waited for and labelled
     4. self-play's metrics: what the epoch played and what the buffer holds (see
-       `collection_metrics`)
+       `collection_metrics`), and with `data_positions`, what its data is like (see
+       `data_metrics`)
     5. training: `train_steps_per_epoch` steps on the buffer, and their metrics
     6. with `holdout_envs`, memorization metrics (see `holdout_metrics`)
     7. with `validators`, the average's validation metrics
@@ -487,6 +496,10 @@ class Trainer:
         endgame_solve: EndgameSolve | None = None,
         episode_metrics_fn: Callable[[jax.Array], dict[str, jax.Array]] | None = None,
         data_transform_fns: Sequence[DataTransformFn] = (),
+        data_positions: int = 0,
+        data_pairs: int = 512,
+        position_groups: Mapping[str, Callable[[BaseExperience], jax.Array]]
+        | None = None,
         advance_every: int | None = None,
         moves_at_once: int = 32,
         monitor: "Monitor | None" = None,
@@ -565,8 +578,17 @@ class Trainer:
             data_transform_fns: (optional) data transforms (e.g. a board's rotations and
                 reflections, see `core.memory.replay_memory.DataTransformFn`) besides the
                 identity. Training maps each sample through one drawn uniformly at random.
-                Together they must be a group, for `buffer_distinct_positions` to count
+                Together they must be a group, for `buffer_distinct_fraction` to count
                 positions up to them
+            data_positions: (optional) each epoch, score this many of the positions self-play
+                stored, and as many of those with outcomes from its last two epochs, for what
+                its data is like (see `data_metrics`). 0 for none
+            data_pairs: with `data_positions`, the positions of each group compared pair by
+                pair (at most), for how varied they are
+            position_groups: (optional) groups of positions `data_metrics` also reports on, by
+                name: each maps a stored position (a `BaseExperience` without batch dimensions)
+                to whether it's in the group, e.g. a game's phases. Must be compatible with
+                `jax.jit`
             advance_every: (optional) self-play plays the moves whose searches are done every
                 this many cycles (see `collect_steps`); by default the evaluator's
                 `search_cycles`. With searches of varying lengths, a few cycles balance the
@@ -619,6 +641,16 @@ class Trainer:
         self.grad_accum_steps = grad_accum_steps
         self.micro_batch_size = train_batch_size // grad_accum_steps
         self.transform_fns = data_transform_fns
+        if data_positions < 0 or data_pairs < 2:
+            raise ValueError(
+                f"data_positions can't be negative, nor data_pairs under 2, got "
+                f"{data_positions} and {data_pairs}"
+            )
+        self.data_positions = data_positions
+        self.data_pairs = (
+            min(data_pairs, data_positions) if data_positions else data_pairs
+        )
+        self.position_groups = dict(position_groups or {})
         # self-play
         self.batch_size = batch_size
         self.collection_steps_per_epoch = collection_steps_per_epoch
@@ -759,6 +791,9 @@ class Trainer:
             "memory_buffer": self.memory_buffer.get_config(),
             "validators": [v.get_config() for v in self.validators],
             "validate_every": self.validate_every,
+            "data_positions": self.data_positions,
+            "data_pairs": self.data_pairs,
+            "position_groups": list(self.position_groups),
         }
 
     # self-play
@@ -1138,6 +1173,130 @@ class Trainer:
         if after.pending is not None and before.solve_missed is not None:
             metrics["solve_missed"] = (after.pending.missed - before.solve_missed).sum()
         return metrics
+
+    def data_metrics(
+        self,
+        key: jax.Array,
+        before: CollectionStats,
+        buffer_state: ReplayBufferState,
+        params: Any,
+    ) -> dict[str, jax.Array]:
+        """What an epoch's self-play data is like (see core.training.selfplay_data), for all
+        positions as `data_<metric>` and for each of `position_groups` as
+        `data_<metric>_<group>`:
+        - on `data_positions` of the positions the epoch stored, with the network that played
+          them (`params`, the average's (parameters, network state), in inference mode):
+          `selfplay_data.policy_metrics` (how sharp the targets are and how far search moved
+          them from the prior) and `selfplay_data.pair_metrics` on `data_pairs` of each group's
+          (how varied they are)
+        - on as many of the positions stored in about the last two epochs whose games have
+          outcomes: `selfplay_data.value_metrics`, how the search's and the network's values
+          agree with them
+        - `data_stored`: the positions the epoch stored
+
+        Empty without `data_positions`, or if the epoch stored nothing. An epoch that stores
+        more positions than an environment's buffer holds counts only the remainder.
+
+        Args:
+            key: rng
+            before: the collection state's counters before the epoch's self-play
+            buffer_state: the replay buffer after the epoch's self-play and solves
+            params: the network's (parameters, network state) self-play played with
+        """
+        if not self.data_positions:
+            return {}
+        capacity = buffer_capacity(buffer_state)
+        written = (buffer_state.next_idx - before.next_idx) % capacity
+        if not bool(written.any()):
+            return {}
+        return {
+            **self._data_metrics(key, buffer_state, written, params),
+            "data_stored": written.sum(),
+        }
+
+    @partial(jax.jit, static_argnums=(0,))
+    def _data_metrics(
+        self,
+        key: jax.Array,
+        buffer_state: ReplayBufferState,
+        written: jax.Array,
+        params: Any,
+    ) -> dict[str, jax.Array]:
+        """`data_metrics`' metrics but `data_stored`, given each environment's positions written
+        in the epoch."""
+        n = self.data_positions
+        capacity = buffer_capacity(buffer_state)
+        age = (buffer_state.next_idx[:, None] - 1 - jnp.arange(capacity)) % capacity
+        # this epoch's positions, whether or not their games have ended or been solved
+        newest = age < written[:, None]
+        labelled = self.memory_buffer.sample_mask(buffer_state) & (
+            age < 2 * written[:, None]
+        )
+        newest_key, labelled_key, pairs_key = jax.random.split(key, 3)
+
+        def gather(key: jax.Array, mask: jax.Array) -> tuple[BaseExperience, jax.Array]:
+            # without replacement: if `mask` marks fewer than `n`, unmarked ones fill the rest
+            flat = self.memory_buffer.sample_indices(key, mask, n)
+            indices = jnp.unravel_index(flat, mask.shape)
+            return jax.tree.map(lambda x: x[indices], buffer_state.buffer), mask[
+                indices
+            ]
+
+        positions, valid = gather(newest_key, newest)
+        finished, finished_valid = gather(labelled_key, labelled)
+
+        nn_params, nn_state = params
+        nn = eqx.nn.inference_mode(eqx.combine(nn_params, self.nn_static))
+        chunk = math.gcd(n, 1024)
+
+        def outputs(observations: jax.Array) -> tuple[jax.Array, jax.Array]:
+            batches = observations.reshape(-1, chunk, *observations.shape[1:])
+            logits, value = jax.lax.map(lambda x: apply_nn(nn, nn_state, x)[0], batches)
+            return logits.reshape(n, -1), value.reshape(n)
+
+        def groups(experiences: BaseExperience) -> jax.Array:
+            own = [jax.vmap(fn)(experiences) for fn in self.position_groups.values()]
+            return jnp.stack([jnp.ones(n, bool), *own])
+
+        names = ["all", *self.position_groups]
+        logits, _ = outputs(positions.observation_nn)
+        position_groups = groups(positions)
+        policy = selfplay_data.policy_metrics(
+            positions.policy_weights,
+            logits,
+            positions.policy_mask,
+            positions.search_value,
+            valid,
+            position_groups,
+        )
+        _, value = outputs(finished.observation_nn)
+        outcome = jnp.take_along_axis(
+            finished.reward, finished.cur_player_id[:, None].astype(jnp.int32), axis=1
+        )[:, 0]
+        values = selfplay_data.value_metrics(
+            finished.search_value, value, outcome, finished_valid, groups(finished)
+        )
+
+        def images(indices: jax.Array) -> jax.Array:
+            sample = jax.tree.map(lambda x: x[indices], positions)
+            observations = [sample.observation_nn] + [
+                jax.vmap(fn)(sample).observation_nn for fn in self.transform_fns
+            ]
+            return jnp.stack([o.reshape(o.shape[0], -1) for o in observations])
+
+        pair_rows = []
+        for g, pair_key in enumerate(jax.random.split(pairs_key, len(names))):
+            indices, members = selfplay_data.group_sample(
+                pair_key, position_groups[g] & valid, self.data_pairs
+            )
+            pair_rows.append(selfplay_data.pair_metrics(images(indices), members))
+        return {
+            **selfplay_data.named(policy, selfplay_data.POLICY_METRICS, names),
+            **selfplay_data.named(values, selfplay_data.VALUE_METRICS, names),
+            **selfplay_data.named(
+                jnp.stack(pair_rows), selfplay_data.PAIR_METRICS, names
+            ),
+        }
 
     # training
 
@@ -1902,12 +2061,14 @@ class Trainer:
            labelled, and this epoch's start. While the buffer can't sample a batch (a new
            run's first epoch, whose games nearly all stopped for solves), those are waited
            for too
-        4. self-play's metrics are logged (see `collection_metrics`, `solve_summary`)
+        4. self-play's metrics are logged (see `collection_metrics`, `solve_summary`,
+           `data_metrics`)
         5. the network trains `train_steps_per_epoch` steps, if the buffer can sample a batch,
            and their metrics are logged
         6. with `holdout_envs`, the average's memorization metrics are logged (see
            `holdout_metrics`)
-        7. every `validate_every` epochs, the average's validation metrics are logged
+        7. every `validate_every` epochs (or a validator's own `every`), the average's
+           validation metrics are logged
         8. the average's weights are saved (see `save_weights_every`), then the whole state
            (see `save_state_every`, `save_state_at`), and `epoch_seconds`, the epoch's wall
            time, is logged. With `save_raw_every`, the network's own weights are saved as the
@@ -2055,10 +2216,14 @@ class Trainer:
                         )
                     solve_metrics = solve_summary(solved)
                 # 4. self-play's metrics
+                data_key, key = jax.random.split(key)
                 self.log_metrics(
                     {
                         **self.collection_metrics(before, collection_state),
                         **solve_metrics,
+                        **self.data_metrics(
+                            data_key, before, collection_state.buffer_state, params
+                        ),
                     },
                     cur_epoch,
                 )
@@ -2090,11 +2255,16 @@ class Trainer:
                     if holdout:
                         self.log_metrics(holdout, cur_epoch)
                 # 7. validation, of the average
-                if self.validators and cur_epoch % self.validate_every == 0:
+                due = [
+                    validator
+                    for validator in self.validators
+                    if cur_epoch % getattr(validator, "every", self.validate_every) == 0
+                ]
+                if due:
                     self.set_activity(f"epoch {cur_epoch}: validation")
                     validation = {
                         name: value
-                        for validator in self.validators
+                        for validator in due
                         for name, value in validator(params).items()
                     }
                     self.log_metrics(validation, cur_epoch)

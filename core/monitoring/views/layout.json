@@ -57,6 +57,41 @@
             ],
             "split": true
           }
+        ],
+        [
+          {
+            "type": "chart",
+            "title": "Self-play data",
+            "metrics": [
+              "data_target_prior_kl",
+              "data_target_entropy",
+              "data_prior_entropy",
+              "data_top_move_change",
+              "data_decided_share",
+              "data_decided_share_late",
+              "data_label_value_mse",
+              "data_value_bias_black",
+              "data_value_bias_white",
+              "data_outcome_black",
+              "data_collision",
+              "data_pair_distance",
+              "data_stored"
+            ],
+            "split": true
+          }
+        ],
+        [
+          {
+            "type": "chart",
+            "title": "Label headroom",
+            "metrics": [
+              "search*_top1",
+              "search*_exp_regret",
+              "search*_value_mse",
+              "search_kl_*"
+            ],
+            "split": true
+          }
         ]
       ]
     },
