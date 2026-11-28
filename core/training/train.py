@@ -436,12 +436,72 @@ def weight_decay_mask(params: Any) -> Any:
     return jax.tree.map(lambda x: x.ndim >= 2, params)
 
 
+def _decay_at_rate(
+    learning_rate: optax.ScalarOrSchedule, weight_decay: Any, decay_lr: float | None
+) -> Any:
+    """`weight_decay` scaled by `learning_rate / decay_lr` (see `adamw`), or as it is without a
+    `decay_lr`."""
+    if decay_lr is None:
+        return weight_decay
+    if callable(learning_rate):
+        raise TypeError(
+            "decay_lr needs the learning rate's value: wrap the optimizer in "
+            "optax.inject_hyperparams to schedule it"
+        )
+    return weight_decay * learning_rate / decay_lr
+
+
+def adamw(
+    learning_rate: optax.ScalarOrSchedule,
+    b1: float = 0.9,
+    b2: float = 0.999,
+    eps: float = 1e-8,
+    eps_root: float = 0.0,
+    mu_dtype: Any = None,
+    weight_decay: float = 1e-4,
+    mask: Any = None,
+    *,
+    nesterov: bool = False,
+    decay_lr: float | None = None,
+) -> optax.GradientTransformation:
+    """`optax.adamw`, whose weight decay, with `decay_lr`, follows the learning rate: it's
+    `weight_decay` at learning rate `decay_lr` and `weight_decay * learning_rate / decay_lr` at
+    any other, so that a schedule's drop of k also drops the decay k (each step decays a weight by
+    learning_rate^2 * weight_decay / decay_lr).
+
+    Under a normalization, most weights' scale doesn't change what the network computes, and
+    AdamW settles their norm where decay and the steps' growth balance, about
+    sqrt(learning_rate / weight_decay): a drop of k with the decay held shrinks it about sqrt(k)
+    over the following 1 / (learning_rate * weight_decay) steps, which raises the angular step
+    (about learning_rate / norm) back and undoes much of the drop; with the decay dropped too
+    the norm holds.
+
+    For `optax.inject_hyperparams`, which passes the scheduled learning rate's value, with `mask`
+    and `decay_lr` static: `optax.inject_hyperparams(adamw, static_args=("mask", "decay_lr"))(
+    learning_rate=schedule, weight_decay=0.5, mask=weight_decay_mask, decay_lr=1e-3)`. It takes
+    `optax.adamw`'s arguments, which `optax.inject_hyperparams` injects with their defaults, so
+    that its state is `optax.adamw`'s, saved states load either way; the injected
+    `weight_decay` stays the one at `decay_lr`."""
+    return optax.adamw(
+        learning_rate,
+        b1=b1,
+        b2=b2,
+        eps=eps,
+        eps_root=eps_root,
+        mu_dtype=mu_dtype,
+        weight_decay=_decay_at_rate(learning_rate, weight_decay, decay_lr),
+        mask=mask,
+        nesterov=nesterov,
+    )
+
+
 def sgdw(
     learning_rate: optax.ScalarOrSchedule,
     momentum: float = 0.9,
     weight_decay: float = 0.0,
     decoupled: bool = False,
     mask: Any = None,
+    decay_lr: float | None = None,
 ) -> optax.GradientTransformation:
     """SGD with (heavy-ball) momentum and weight decay, as AlphaZero and KataGo trained: each step
     the momentum buffer m <- momentum * m + gradient, and the weights w <- w - learning_rate * m.
@@ -451,9 +511,15 @@ def sgdw(
     `weight_decay / 2 * |w|^2` in the loss would; with `decoupled`, to the step after momentum
     (w <- w - learning_rate * (m + weight_decay * w)), as AdamW's decay is.
 
-    For `optax.inject_hyperparams`, with `mask` and `decoupled` static, e.g.
+    With `decay_lr`, the decay follows the learning rate as `adamw`'s does: `weight_decay` at
+    learning rate `decay_lr`, `weight_decay * learning_rate / decay_lr` at any other. SGD's
+    norm settles about (learning_rate / weight_decay)^(1/4) times a constant, so a drop with the
+    decay held shrinks it too (by k^(1/4)), less than AdamW's but the same way.
+
+    For `optax.inject_hyperparams`, with `mask`, `decoupled` and `decay_lr` static, e.g.
     `optax.inject_hyperparams(sgdw, static_args=("mask", "decoupled"))(learning_rate=0.2,
     momentum=0.9, weight_decay=1e-4, mask=weight_decay_mask)`."""
+    weight_decay = _decay_at_rate(learning_rate, weight_decay, decay_lr)
     decay = optax.add_decayed_weights(weight_decay, mask)
     trace = optax.trace(decay=momentum)
     return optax.chain(
@@ -470,7 +536,8 @@ def update_size_metrics(params: Any, updates: Any) -> dict:
 
     Under BatchNorm a convolution's output doesn't depend on its weights' scale, so it's the
     relative step, not the learning rate, that says how fast such a layer moves; with AdamW's
-    weight decay it settles at about sqrt(2 * learning rate * weight decay) per step. Comparable
+    weight decay it settles at about sqrt(2 * learning rate * weight decay * (1 - b1) / (1 + b1))
+    per step (the decay applied, see `adamw`). Comparable
     across learning rates, weight decays and schedules.
     """
     mask = weight_decay_mask(params)
@@ -777,8 +844,10 @@ class Trainer:
                 Default 1: no accumulation. With 2 or more, training logs the gradient noise scale
                 from the micro-batches' gradients (see `core.training.noise_scale`), as `gns_*`.
             lr_drop: (optional) drop each network's learning rate once it has played self-play for
-                a number of epochs (see `core.training.lr_drop.LRDrop`), by scaling its updates;
-                a network waiting to take over trains at the full rate. It logs `lr_scale`.
+                a number of epochs (see `core.training.lr_drop.LRDrop`), by scaling its updates
+                (and with its `scale_decay`, the optimizer's injected `weight_decay`, while it
+                trains); a network waiting to take over trains at the full rate. It logs
+                `lr_scale`.
             noise_measure: (optional) every epoch, measure each training network's gradient noise
                 scale at its weight average (with `averages`; the self-play one's horizon, else
                 the first) from this many micro-batches, logged as `gns_avg_*`: for watching,
@@ -1224,6 +1293,24 @@ class Trainer:
                 flush=True,
             )
         return replace(train_state, opt_state=opt_state)
+
+    def with_dropped_decay(
+        self, train_state: TrainState, learner: int, drop: float
+    ) -> TrainState:
+        """`train_state` with its optimizer's unscheduled `weight_decay` (the run's, or network
+        `learner`'s own) times `drop`, the `lr_drop`'s scale, if it scales the decay: for the
+        epoch's training, after which the saved value goes back (drop 1)."""
+        decay = {**self.fixed_hyperparams, **self.learners[learner].hyperparams}.get(
+            "weight_decay"
+        )
+        if decay is None or self.lr_drop is None or not self.lr_drop.scale_decay:
+            return train_state
+        return replace(
+            train_state,
+            opt_state=with_hyperparams(
+                train_state.opt_state, {"weight_decay": np.asarray(decay) * drop}
+            ),
+        )
 
     def steps_of(self, learner: int, playing: int) -> int:
         """The training steps an epoch of a network that trains: the one waiting's
@@ -4698,6 +4785,8 @@ class Trainer:
                 drop = self.lr_drop.scale(played) if self.lr_drop is not None else None
                 own = self.learners[i].lr_scale
                 lr_scale = None if drop is None and own == 1.0 else (drop or 1.0) * own
+                if drop is not None and drop != 1.0:
+                    train_states[i] = self.with_dropped_decay(train_states[i], i, drop)
                 collection_state, train_states[i], train_metrics[i] = self.train_steps(
                     train_key,
                     collection_state,
@@ -4707,6 +4796,8 @@ class Trainer:
                     learner=i,
                     lr_scale=lr_scale,
                 )
+                if drop is not None and drop != 1.0:
+                    train_states[i] = self.with_dropped_decay(train_states[i], i, 1.0)
                 if lr_scale is not None:
                     train_metrics[i] = {
                         **train_metrics[i],

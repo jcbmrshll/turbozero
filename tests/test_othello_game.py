@@ -26,6 +26,8 @@ from gated_scan import GatedScan
 
 from core.memory.replay_memory import BaseExperience
 from core.networks.azresnet import AZResnet, Depthwise, PreActConvNeXt
+from core.training.lr_plateau import LRPlateau
+from core.training.train import restart_schedules, sgdw, with_rate_index
 
 
 def save_checkpoint(path: Path, net: str):
@@ -147,6 +149,105 @@ def test_lr_drops_hold_then_step():
     assert rates[0] == pytest.approx(1e-3) and rates[69] == pytest.approx(1e-3)
     assert rates[70] == pytest.approx(1e-4) and rates[89] == pytest.approx(1e-4)
     assert rates[90] == pytest.approx(1e-5) and rates[99] == pytest.approx(1e-5)
+
+
+DECAYED = {"w": jnp.full((2, 2), 2.0)}
+
+
+def decays_and_rates(optimizer, steps, at=None, state=None):
+    """Each of `steps` zero-gradient updates' decay of a weight (-update / w: Adam and SGD move
+    nothing else without a gradient) and its learning rate, from `state` (default a new one);
+    `at(step, state)` may change the state before an update."""
+    zeros = jax.tree.map(jnp.zeros_like, DECAYED)
+    update = jax.jit(optimizer.update)
+    if state is None:
+        state = optimizer.init(DECAYED)
+    out = []
+    for step in range(steps):
+        if at is not None:
+            state = at(step, state)
+        updates, state = update(zeros, state, DECAYED)
+        out.append(
+            (
+                float(-updates["w"][0, 0] / DECAYED["w"][0, 0]),
+                float(state.hyperparams["learning_rate"]),
+            )
+        )
+    return out
+
+
+def plateau_at_rate_1_from_step_5(step, state):
+    return with_rate_index(state, 1) if step == 5 else state
+
+
+SCHEDULES = {
+    "lr_drops": ({"lr_drops": [(0.3, 1e-4), (0.7, 1e-5)]}, None),
+    "cosine": ({"lr_final": 1e-5}, None),
+    "plateau": (
+        {"lr_plateau": LRPlateau((1e-3, 1e-4, 1e-5))},
+        plateau_at_rate_1_from_step_5,
+    ),
+    "constant": ({"lr_final": 1e-3}, None),
+}
+
+
+@pytest.mark.parametrize("sgd", [False, True])
+@pytest.mark.parametrize("schedule", SCHEDULES)
+def test_weight_decay_drops_with_the_learning_rate(schedule, sgd):
+    kwargs, at = SCHEDULES[schedule]
+    settings = {"sgd": sgd, "momentum": 0.0, **kwargs}
+    scaled = decays_and_rates(make_optimizer(10, 1e-3, **settings), 10, at)
+    rates = [lr for _, lr in scaled]
+    # the schedule moves (but a constant rate)
+    assert rates[0] == pytest.approx(1e-3)
+    assert (min(rates) < 2e-4) == (schedule != "constant")
+    # the decay is WEIGHT_DECAY at 1e-3, and the rate's share of it at any other: each step
+    # decays lr * (WEIGHT_DECAY * lr / 1e-3), so lr * decay goes as lr^2
+    for decay, lr in scaled:
+        assert decay == pytest.approx(lr * WEIGHT_DECAY * lr / 1e-3, rel=1e-4)
+    # without it, the decay is held
+    held = decays_and_rates(
+        make_optimizer(10, 1e-3, decay_with_lr=False, **settings), 10, at
+    )
+    for decay, lr in held:
+        assert decay == pytest.approx(lr * WEIGHT_DECAY, rel=1e-4)
+
+
+@pytest.mark.parametrize("sgd", [False, True])
+@pytest.mark.parametrize("schedule", SCHEDULES)
+def test_the_optimizer_state_is_the_one_saved_before_the_decay_followed_the_rate(
+    schedule, sgd
+):
+    # states saved when the decay was a fixed hyperparameter of optax.adamw (or sgdw) load,
+    # branch and fork into the new optimizer: the same structure, in either mode
+    kwargs, _ = SCHEDULES[schedule]
+    if sgd:
+        old = optax.inject_hyperparams(sgdw, static_args=("mask", "decoupled"))(
+            learning_rate=kwargs.get("lr_plateau") or optax.constant_schedule(1e-3),
+            momentum=0.9,
+            weight_decay=WEIGHT_DECAY,
+            mask=weight_decay_mask,
+        )
+    else:
+        old = optax.inject_hyperparams(optax.adamw, static_args=("mask",))(
+            learning_rate=kwargs.get("lr_plateau") or optax.constant_schedule(1e-3),
+            weight_decay=WEIGHT_DECAY,
+            mask=weight_decay_mask,
+        )
+    expected = jax.tree.structure(old.init(DECAYED))
+    for decay_with_lr in (True, False):
+        state = make_optimizer(
+            10, 1e-3, sgd=sgd, decay_with_lr=decay_with_lr, **kwargs
+        ).init(DECAYED)
+        assert jax.tree.structure(state) == expected
+    # an old state, restarted as a fork's is, steps in the new optimizer from its first rate
+    state: Any = old.init(DECAYED)
+    for _ in range(3):
+        _, state = old.update(DECAYED, state, DECAYED)
+    new = make_optimizer(10, 1e-3, sgd=sgd, momentum=0.9, **kwargs)
+    [(decay, lr)] = decays_and_rates(new, 1, state=restart_schedules(state))
+    assert lr == pytest.approx(1e-3)
+    assert decay > 0
 
 
 def test_constant_rate_is_the_cosine_to_itself_and_its_program_ignores_run_length():

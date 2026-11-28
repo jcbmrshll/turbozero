@@ -50,6 +50,7 @@ a dataset of whole games from; --train-steps 0 plays a fixed network's games wit
 
 import argparse
 import dataclasses
+import itertools
 import math
 import re
 import tempfile
@@ -115,8 +116,14 @@ def epoch_list(text: str) -> list[int]:
 
 # training holds --lr, then drops 10x late in the run and again near its end: AlphaGo Zero's three
 # levels, and about where Lc0's example configuration and KataGo drop. At 110 epochs of 4x64 it
-# played within noise of one drop at 83%, and far above a constant learning rate
-DEFAULT_LR_DROPS = [(0.7, 1e-4), (0.9, 1e-5)]
+# played within noise of one drop at 83%, and far above a constant learning rate. Each is
+# (fraction of the run, multiple of --lr), so 1e-4 and 1e-5 at --lr 1e-3
+DEFAULT_LR_DROPS = [(0.7, 0.1), (0.9, 0.01)]
+
+
+def default_lr_drops(lr: float) -> list[tuple[float, float]]:
+    """--lr-drops' default for --lr `lr`: DEFAULT_LR_DROPS' multiples of it."""
+    return [(fraction, scale * lr) for fraction, scale in DEFAULT_LR_DROPS]
 
 
 def lr_drops(text: str) -> list[tuple[float, float]]:
@@ -420,9 +427,9 @@ def main():
         action="append",
         default=[],
         metavar="NAME=WD",
-        help="with --grow, one --grow network's own --weight-decay (scaled by its learning rate "
-        "as --weight-decay is by --lr's, so drop it with the rate to hold its weight norm). "
-        "Repeatable",
+        help="with --grow, one --grow network's own --weight-decay: its decay at its own "
+        "learning rate (--lr-of, --grow-lr), following that rate's schedule as --weight-decay "
+        "does --lr's. Repeatable",
     )
     parser.add_argument(
         "--grow-manual",
@@ -674,8 +681,9 @@ def main():
         "--lr-drops",
         type=lr_drops,
         default=None,
-        help="hold --lr and drop in steps: FRACTION:LR,... of the run's training steps "
-        "(default: 0.7:1e-4,0.9:1e-5, two drops of 10x)",
+        help="hold --lr and drop in steps: FRACTION:LR,... of the run's training steps, each "
+        "rate below the last (default two drops of 10x: 0.7:--lr/10,0.9:--lr/100, so "
+        "0.7:1e-4,0.9:1e-5 at --lr 1e-3)",
     )
     parser.add_argument(
         "--lr-plateau",
@@ -744,10 +752,20 @@ def main():
         "--weight-decay",
         type=float,
         default=None,
-        help="weight decay of the network's weights (not its biases or normalization layers): "
-        f"AdamW's (default {WEIGHT_DECAY}), or with --optimizer sgd, w times this added to the "
-        f"gradient, an L2 penalty of half this (default {SGD_WEIGHT_DECAY}; AlphaZero's penalty "
-        "1e-4 is 2e-4 here)",
+        help="weight decay of the network's weights (not its biases or normalization layers) "
+        f"at --lr: AdamW's (default {WEIGHT_DECAY}), or with --optimizer sgd, w times this added "
+        f"to the gradient, an L2 penalty of half this (default {SGD_WEIGHT_DECAY}; AlphaZero's "
+        "penalty 1e-4 is 2e-4 here). It follows the learning rate, --weight-decay times the "
+        "rate / --lr, through --lr-final's cosine, --lr-drops, --lr-plateau and --lr-drop, "
+        "which holds the weight norm through a drop (see --constant-weight-decay)",
+    )
+    parser.add_argument(
+        "--constant-weight-decay",
+        action="store_true",
+        help="hold --weight-decay through the learning rate's schedule and --lr-drop instead "
+        "of dropping it with the rate (AdamW's usual, and AlphaZero's and KataGo's L2): a drop "
+        "of k then shrinks a normalized network's weight norm about sqrt(k) under AdamW, "
+        "which raises its effective step back",
     )
     parser.add_argument(
         "--decoupled-decay",
@@ -762,7 +780,8 @@ def main():
         metavar="EPOCHS:FACTOR",
         help="scale the playing network's learning rate by FACTOR once it has played self-play "
         "for EPOCHS epochs (with --grow, each network counts its own, from taking over; a "
-        "network waiting to take over trains at the full rate), e.g. 150:0.1",
+        "network waiting to take over trains at the full rate), e.g. 150:0.1. Its weight "
+        "decay drops by FACTOR too (see --weight-decay)",
     )
     parser.add_argument(
         "--noise-measure",
@@ -1162,6 +1181,12 @@ def main():
         parser.error(
             "--lr-final, --lr-drops and --lr-plateau are different schedules: pass one"
         )
+    if args.lr_final is not None and args.lr_final > args.lr:
+        parser.error("--lr-final must be at most --lr")
+    if args.lr_drops is not None:
+        rates = [args.lr, *(rate for _, rate in args.lr_drops)]
+        if any(after >= before for before, after in itertools.pairwise(rates)):
+            parser.error("--lr-drops' rates must each be below the last, from --lr")
     lr_plateau = None
     if args.lr_plateau is not None:
         if args.lr_plateau[0] >= args.lr:
@@ -1431,7 +1456,11 @@ def main():
         train_steps_per_epoch=args.train_steps,
         advance_every=args.advance_every,
         grad_accum_steps=args.grad_accum,
-        lr_drop=args.lr_drop,
+        lr_drop=None
+        if args.lr_drop is None
+        else dataclasses.replace(
+            args.lr_drop, scale_decay=not args.constant_weight_decay
+        ),
         noise_measure=args.noise_measure,
         fresh_positions=args.fresh_positions,
         holdout_envs=args.holdout_envs,
@@ -1445,11 +1474,13 @@ def main():
             args.lr,
             args.lr if args.lr_final is None else args.lr_final,
             args.weight_decay,
-            args.lr_drops or (DEFAULT_LR_DROPS if args.lr_final is None else ()),
+            args.lr_drops
+            or (default_lr_drops(args.lr) if args.lr_final is None else ()),
             lr_plateau=lr_plateau,
             sgd=args.optimizer == "sgd",
             momentum=args.momentum,
             decoupled=args.decoupled_decay,
+            decay_with_lr=not args.constant_weight_decay,
         ),
         lr_plateau=lr_plateau,
         lr_plateau_metric=args.lr_plateau_metric,
