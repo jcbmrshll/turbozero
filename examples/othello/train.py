@@ -636,6 +636,15 @@ def main():
         "from whole batches (see README.md). Must divide --train-batch",
     )
     parser.add_argument(
+        "--envs",
+        type=int,
+        default=1024,
+        help="self-play environments: games played at once, each with --buffer positions of "
+        "replay memory. On an L40S, 2048 played about 29%% more moves a second than 1024 "
+        "(scan 11x64), 4096 fewer again. A saved state forks into another count only with "
+        "--init-without-buffers",
+    )
+    parser.add_argument(
         "--buffer",
         type=int,
         default=1125,
@@ -1409,7 +1418,7 @@ def main():
     # --selfplay-cycles) in each of `batch_size` environments, then takes
     # `train_steps_per_epoch` training steps
     trainer = Trainer(
-        batch_size=1024,
+        batch_size=args.envs,
         train_batch_size=args.train_batch,
         warmup_steps=0,
         collection_steps_per_epoch=collection_steps,
