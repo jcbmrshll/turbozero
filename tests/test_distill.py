@@ -4,6 +4,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import equinox as eqx
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -119,6 +121,41 @@ def test_train_learns_and_saves_loadable_checkpoints(tmp_path):
     load_checkpoint(str(tmp_path / "ckpts" / "100.eqx"), NET)
 
 
+def test_warmup_ramps_the_first_updates_up_from_zero(tmp_path):
+    path = tmp_path / "state.npz"
+    save_state(path)
+    positions = load_positions(str(path))
+    network, nn_state = make_network(NET)
+    start = eqx.filter(network, eqx.is_inexact_array)
+
+    def trained(warmup_steps):
+        params, _ = train(
+            network,
+            nn_state,
+            positions,
+            positions,
+            None,
+            passes=1,
+            batch_size=8,
+            lr=1e-2,
+            lr_final=1e-2,
+            weight_decay=0.0,
+            value_target_q=0.0,
+            seed=0,
+            warmup_steps=warmup_steps,
+            eval_every=1,
+            train_probe_size=4,
+            ckpt_dir=None,
+            log=lambda *_: None,
+        )
+        moved = jax.tree.map(lambda a, b: jnp.abs(a - b).max(), params, start)
+        return max(float(x) for x in jax.tree.leaves(moved))
+
+    # one pass is one step here: a step at the ramp's start moves nothing, one without moves
+    assert trained(warmup_steps=10) == 0.0
+    assert trained(warmup_steps=0) > 0.0
+
+
 def test_values_then_train_with_teacher_targets(tmp_path):
     data, heldout = tmp_path / "a" / "state.npz", tmp_path / "b" / "state.npz"
     data.parent.mkdir()
@@ -148,6 +185,7 @@ def test_values_then_train_with_teacher_targets(tmp_path):
             data=str(data),
             heldout=str(heldout),
             heldout_envs=0,
+            warmup_steps=0,
             init_from=None,
             heldout_size=5,
             teacher_values=str(out),
@@ -195,6 +233,7 @@ def test_a_checkpoint_trains_on_some_of_a_states_games_and_is_measured_on_the_re
             data=str(data),
             heldout=None,
             heldout_envs=1,
+            warmup_steps=0,
             init_from=str(start),
             heldout_size=100,
             teacher_values=None,
