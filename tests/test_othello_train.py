@@ -566,6 +566,7 @@ def test_adamw_keeps_its_weight_decay(monkeypatch):
     # measurements that cost compute are off unless asked for
     assert built.value.kwargs["noise_measure"] == 0
     assert built.value.kwargs["fresh_positions"] == 0
+    assert built.value.kwargs["holdout_envs"] == 0
 
 
 def test_lr_drop_and_the_noise_metrics_reach_the_trainer(monkeypatch):
@@ -580,10 +581,16 @@ def test_lr_drop_and_the_noise_metrics_reach_the_trainer(monkeypatch):
             "64",
             "--fresh-positions",
             "8192",
+            "--holdout-envs",
+            "32",
+            "--holdout-positions",
+            "1000",
         )
     kwargs = built.value.kwargs
     assert (kwargs["lr_drop"].after_epochs, kwargs["lr_drop"].factor) == (150, 0.1)
     assert (kwargs["noise_measure"], kwargs["fresh_positions"]) == (64, 8192)
+    # held-out positions round up to whole micro-batches of 4096 / 4
+    assert (kwargs["holdout_envs"], kwargs["holdout_positions"]) == (32, 1024)
 
 
 @pytest.mark.parametrize(
@@ -749,6 +756,8 @@ def test_a_frozen_teacher_needs_grow(monkeypatch):
         ("--lr-drop", "-1:0.1"),
         ("--grad-accum", "4", "--fresh-positions", "1000"),
         ("--noise-measure", "-1"),
+        ("--holdout-envs", "-1"),
+        ("--holdout-envs", "32", "--holdout-positions", "0"),
     ],
 )
 def test_bad_optimizer_drop_and_noise_options_are_refused(monkeypatch, options):

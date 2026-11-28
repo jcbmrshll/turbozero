@@ -505,6 +505,34 @@ raw weights' excess (`fresh_*_gap`). N is a multiple of the micro-batch (`--trai
 `--grad-accum`), e.g. 16 of them. It draws its samples from the run's rng, so a run with it
 plays other games than the same run without.
 
+### Memorization: held-out games
+
+A position is trained on many times while it's in the replay buffer (about 14 at 256 steps of
+4096 with `--playout-cap 0.25:64` and `--buffer 2250`), and the network fits what it can of each
+game's outcome there. The training loss and fresh positions can't tell that fit from learning.
+`--holdout-envs 32` plays 32 of the self-play environments' games like the others but never
+trains on them, and every epoch, before training, scores the self-play weights on
+`--holdout-positions` of their positions and as many of the trained-on games' positions of the
+same ages:
+
+- `heldout_*` and `seen_*`: policy KL and value loss on each, and `memorized_*` the difference.
+  The two sets are different games, so a few thousand held-out games' own outcomes put an offset
+  in the value loss that `*_se` (from micro-batch spread) doesn't include: about 0.004 at 32 of
+  1024 environments, about 5,400 games. A checkpoint that never saw any of them scored
+  +0.0039 ± 0.0027 worse on the last 32 environments' games than on the rest. So value readings
+  under about 0.005 aren't resolvable at that size (hold out more environments for better), while
+  the policy KL, whose targets are per position, is cleaner.
+
+Training is unchanged apart from training on 3% fewer games. A train loop starts the held-out
+buffers empty, since a saved state's may hold positions trained on, so a fork or resume measures
+again from its start.
+
+What a run's games can still teach its network, offline: `distill.py train --data STATE
+--heldout-envs 64 --init-from CKPT` keeps training a checkpoint on a saved state's games, with
+some environments' whole games held out (see distill.py). Once the held-out loss stops falling
+while the trained-on probe's keeps falling, more passes over those games only memorize them.
+Start from a checkpoint older than the state's positions, so that both sets start unseen.
+
 ### Keeping every move: datasets of games
 
 `--log-moves DIR` keeps every move self-play plays, fast searches' too, in `DIR` as

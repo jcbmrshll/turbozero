@@ -520,16 +520,19 @@ def play(
     emit: Emit,
     record_run: Callable[[dict[str, Any], dict[str, Any]], None] = lambda _i, _h: None,
     parallel: int = 1,
+    batch_starts: int = 64,
 ) -> None:
-    """The games `numbers`, batched on the GPU if a network plays there, else one at a time,
-    or `parallel` at a time (`play_parallel`), games stopped at a depth scored by one solver
-    (`endgame_solve`) for them all."""
+    """The games `numbers`, batched on the GPU if a network plays there, `batch_starts` starts
+    at a time, else one at a time, or `parallel` at a time (`play_parallel`), games stopped at a
+    depth scored by one solver (`endgame_solve`) for them all."""
     if not numbers:
         return
     solver = endgame_solve(spec.solve_at) if spec.solve_at is not None else None
     try:
         if spec.batched:
-            play_batched(spec, match_id, numbers, emit, record_run, solve=solver)
+            play_batched(
+                spec, match_id, numbers, emit, record_run, batch_starts, solve=solver
+            )
         elif parallel > 1:
             play_parallel(spec, match_id, numbers, emit, parallel, solve=solver)
         else:

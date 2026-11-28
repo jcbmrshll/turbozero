@@ -777,6 +777,25 @@ def main():
         "--grad-accum), e.g. 16 of them. For watching; nothing follows it. Default 0, none",
     )
     parser.add_argument(
+        "--holdout-envs",
+        type=int,
+        default=0,
+        metavar="N",
+        help="never train on the games of N of the self-play environments (e.g. 32 of 1024, "
+        "about 3%% of the games), and every epoch score the playing network on their "
+        "positions and on the trained-on games' of the same ages: heldout_*, seen_*, and the "
+        "difference memorized_*, what training fits in its replay buffer that doesn't carry "
+        "over to new games. For watching; nothing follows it. Default 0, none",
+    )
+    parser.add_argument(
+        "--holdout-positions",
+        type=int,
+        default=32768,
+        metavar="N",
+        help="with --holdout-envs, the positions scored from each side every epoch, rounded up "
+        "to whole micro-batches: 32768 adds about 5%% to training at the defaults",
+    )
+    parser.add_argument(
         "--inference-dtype",
         default="bfloat16",
         help="dtype the network computes in during self-play and test games (bfloat16 is "
@@ -1063,6 +1082,9 @@ def main():
         )
     if args.noise_measure < 0:
         parser.error("--noise-measure must be at least 0")
+    if args.holdout_envs < 0 or args.holdout_positions <= 0:
+        parser.error("--holdout-envs is at least 0, --holdout-positions positive")
+    args.holdout_positions = -(-args.holdout_positions // micro) * micro
     if args.init_without_buffers and args.init_from is None:
         parser.error("--init-without-buffers needs --init-from")
     if args.fork_into is not None and args.init_from is None:
@@ -1397,6 +1419,8 @@ def main():
         lr_drop=args.lr_drop,
         noise_measure=args.noise_measure,
         fresh_positions=args.fresh_positions,
+        holdout_envs=args.holdout_envs,
+        holdout_positions=args.holdout_positions if args.holdout_envs else 0,
         nn=network,
         nn_state=network_state,
         loss_fn=partial(az_default_loss_fn, value_target_q=args.value_target_q),

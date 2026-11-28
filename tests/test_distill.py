@@ -4,6 +4,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import equinox as eqx
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -111,12 +113,47 @@ def test_train_learns_and_saves_loadable_checkpoints(tmp_path):
         ckpt_dir=tmp_path / "ckpts",
         log=lambda finished, metrics: logged.update({finished: metrics}),
     )
-    # the one measurement, after the last pass
-    assert list(logged) == [100]
+    # where it starts, and after the last pass
+    assert list(logged) == [0, 100]
     trained = logged[100]
     assert trained["heldout_policy_kl"] < untrained["policy_kl"] / 2
     assert trained["probe_value_mse_z"] < untrained["value_mse_z"] / 2
     load_checkpoint(str(tmp_path / "ckpts" / "100.eqx"), NET)
+
+
+def test_warmup_ramps_the_first_updates_up_from_zero(tmp_path):
+    path = tmp_path / "state.npz"
+    save_state(path)
+    positions = load_positions(str(path))
+    network, nn_state = make_network(NET)
+    start = eqx.filter(network, eqx.is_inexact_array)
+
+    def trained(warmup_steps):
+        params, _ = train(
+            network,
+            nn_state,
+            positions,
+            positions,
+            None,
+            passes=1,
+            batch_size=8,
+            lr=1e-2,
+            lr_final=1e-2,
+            weight_decay=0.0,
+            value_target_q=0.0,
+            seed=0,
+            warmup_steps=warmup_steps,
+            eval_every=1,
+            train_probe_size=4,
+            ckpt_dir=None,
+            log=lambda *_: None,
+        )
+        moved = jax.tree.map(lambda a, b: jnp.abs(a - b).max(), params, start)
+        return max(float(x) for x in jax.tree.leaves(moved))
+
+    # one pass is one step here: a step at the ramp's start moves nothing, one without moves
+    assert trained(warmup_steps=10) == 0.0
+    assert trained(warmup_steps=0) > 0.0
 
 
 def test_values_then_train_with_teacher_targets(tmp_path):
@@ -147,6 +184,9 @@ def test_values_then_train_with_teacher_targets(tmp_path):
         SimpleNamespace(
             data=str(data),
             heldout=str(heldout),
+            heldout_envs=0,
+            warmup_steps=0,
+            init_from=None,
             heldout_size=5,
             teacher_values=str(out),
             value_source="teacher",
@@ -167,3 +207,63 @@ def test_values_then_train_with_teacher_targets(tmp_path):
         )
     )
     load_checkpoint(str(tmp_path / "student" / "1.eqx"), NET)
+
+
+def test_load_positions_of_some_environments(tmp_path):
+    path = tmp_path / "state.npz"
+    valid = save_state(path)
+    second = load_positions(str(path), np.array([False, True]))
+    expected = np.arange(ENVS * CAPACITY).reshape(valid.shape)[1][valid[1]]
+    assert (second.search_value == expected).all()
+
+
+def test_a_checkpoint_trains_on_some_of_a_states_games_and_is_measured_on_the_rest(
+    tmp_path, capsys
+):
+    data = tmp_path / "state.npz"
+    save_state(data)
+    network, nn_state = make_network(NET, seed=3)
+    start = tmp_path / "start.eqx"
+    eqx.tree_serialise_leaves(
+        start, (eqx.filter(network, eqx.is_inexact_array), nn_state)
+    )
+
+    train_command(
+        SimpleNamespace(
+            data=str(data),
+            heldout=None,
+            heldout_envs=1,
+            warmup_steps=0,
+            init_from=str(start),
+            heldout_size=100,
+            teacher_values=None,
+            value_source="root",
+            value_target_q=0.0,
+            net=NET,
+            train_dtype="float32",
+            seed=0,
+            monitor=None,
+            name=None,
+            notes=None,
+            passes=1,
+            batch=4,
+            lr=1e-3,
+            lr_final=1e-3,
+            weight_decay=0.0,
+            eval_every=1,
+            ckpt_dir=None,
+        )
+    )
+
+    # before any training, the checkpoint's own measures: on the second environment's games
+    lines = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("pass 0:")
+    ]
+    logged = json.loads(lines[0].removeprefix("pass 0: "))
+    loaded, model = load_checkpoint(str(start), NET)
+    expected, _ = measure(
+        loaded, model, load_positions(str(data), np.array([False, True]))
+    )
+    assert logged["heldout_policy_kl"] == pytest.approx(expected["policy_kl"], abs=1e-5)

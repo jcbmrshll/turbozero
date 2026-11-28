@@ -18,6 +18,15 @@ its training games, --heldout measures on its held-out ones, full searches' posi
         --net resnet:4x64,pool_every=2,heads=pooled,pool_channels=16 --ckpt-dir runs/student
 
 Its checkpoints load with `game.load_checkpoint`, like train.py's.
+
+How much a network can still learn from a run's games: --init-from starts from the run's
+checkpoint, and --heldout-envs holds out some of --data's own games (its last environments')
+in place of --heldout. Where the held-out loss stops falling while the trained-on probe's
+keeps falling, more passes over these games only memorize them:
+
+    uv run examples/othello/distill.py train --data state-1800.npz --heldout-envs 64 \\
+        --init-from avg4/1740.eqx --net NET --lr 2.5e-5 --lr-final 2.5e-5 \\
+        --weight-decay 0.0125 --passes 20 --eval-every 1
 """
 
 import argparse
@@ -55,9 +64,10 @@ EVAL_BATCH = 4096
 VALUES_CHUNK = 1 << 20
 
 
-def load_positions(path: str) -> BaseExperience:
+def load_positions(path: str, environments: np.ndarray | None = None) -> BaseExperience:
     """The positions of a saved training state's replay buffer that can be sampled, in a fixed
-    order, as host arrays with one leading dimension."""
+    order, as host arrays with one leading dimension; with `environments` (bool, one per
+    self-play environment), only those environments' games'."""
     with np.load(path) as saved:
         meta = json.loads(str(saved["meta"]))
         index = {
@@ -68,11 +78,23 @@ def load_positions(path: str) -> BaseExperience:
             return saved[f"collection_state.{index['.buffer_state' + name]}"]
 
         valid = leaf(".populated") & leaf(".has_reward")
+        if environments is not None:
+            valid &= environments[:, None]
         fields: dict[str, Any] = {
             field.name: leaf(f".buffer.{field.name}")[valid]
             for field in dataclasses.fields(BaseExperience)
         }
         return BaseExperience(**fields)
+
+
+def state_environments(path: str) -> int:
+    """How many self-play environments a saved training state's replay buffer has."""
+    with np.load(path) as saved:
+        meta = json.loads(str(saved["meta"]))
+        index = [leaf[0] for leaf in meta["leaves"]["collection_state"]].index(
+            ".buffer_state.populated"
+        )
+        return len(saved[f"collection_state.{index}"])
 
 
 def load_data(
@@ -191,6 +213,7 @@ def train(
     weight_decay: float,
     value_target_q: float,
     seed: int,
+    warmup_steps: int = 0,
     eval_every: int,
     train_probe_size: int,
     ckpt_dir: Path | None,
@@ -210,6 +233,13 @@ def train(
             f"{len(positions.reward)} positions are too few for batches of {batch_size}"
         )
     optimizer = make_optimizer(passes * steps_per_pass, lr, lr_final, weight_decay)
+    if warmup_steps:
+        # a fresh Adam's first steps move every weight by about lr, whatever its gradient:
+        # from a trained network, ramp the updates up instead
+        optimizer = optax.chain(
+            optimizer,
+            optax.scale_by_schedule(optax.linear_schedule(0.0, 1.0, warmup_steps)),
+        )
     params, static = eqx.partition(network, eqx.is_inexact_array)
     opt_state = optimizer.init(params)
     step = make_train_step(optimizer, value_target_q)
@@ -223,6 +253,21 @@ def train(
         ckpt_dir.mkdir(parents=True, exist_ok=True)
     started = time.time()
     train_metrics: dict[str, jax.Array] = {}
+
+    def measured() -> dict[str, float]:
+        model = (params, nn_state)
+        return {
+            f"heldout_{name}": value
+            for name, value in measure(network, model, heldout, heldout_teacher)[
+                0
+            ].items()
+        } | {
+            f"probe_{name}": value
+            for name, value in measure(network, model, probe)[0].items()
+        }
+
+    # where it starts: from a checkpoint (--init-from), what more passes change
+    log(0, measured() | {"minutes": 0.0})
     for done in range(passes):
         order = rng.permutation(len(positions.reward))
         for i in range(steps_per_pass):
@@ -235,15 +280,7 @@ def train(
         if finished % eval_every and finished != passes:
             continue
         model = (params, nn_state)
-        metrics = {
-            f"heldout_{name}": value
-            for name, value in measure(network, model, heldout, heldout_teacher)[
-                0
-            ].items()
-        } | {
-            f"probe_{name}": value
-            for name, value in measure(network, model, probe)[0].items()
-        }
+        metrics = measured()
         metrics |= {
             f"train_{name}": float(value) for name, value in train_metrics.items()
         }
@@ -305,8 +342,21 @@ def teacher_values_path(directory: Path, state: str) -> Path:
 
 
 def train_command(args) -> None:
-    positions, data_rows = load_data(args.data, False, args)
-    heldout, heldout_rows = load_data(args.heldout, True, args)
+    if args.heldout_envs:
+        if args.heldout is not None or os.path.isdir(args.data) or args.teacher_values:
+            raise SystemExit(
+                "--heldout-envs holds out games of a saved state's --data, in place of "
+                "--heldout, without --teacher-values"
+            )
+        envs = np.arange(state_environments(args.data))
+        held = envs >= len(envs) - args.heldout_envs
+        positions, data_rows = load_positions(args.data, ~held), None
+        heldout, heldout_rows = load_positions(args.data, held), None
+    elif args.heldout is None:
+        raise SystemExit("train needs --heldout or --heldout-envs")
+    else:
+        positions, data_rows = load_data(args.data, False, args)
+        heldout, heldout_rows = load_data(args.heldout, True, args)
     if args.heldout_size < len(heldout.reward):
         chosen = np.random.default_rng(0).choice(
             len(heldout.reward), args.heldout_size, replace=False
@@ -320,6 +370,7 @@ def train_command(args) -> None:
         teacher_values = np.load(teacher_values_path(directory, args.data))
         if data_rows is not None:
             teacher_values = teacher_values[data_rows]
+        assert args.heldout is not None
         heldout_teacher = np.load(teacher_values_path(directory, args.heldout))
         if heldout_rows is not None:
             heldout_teacher = heldout_teacher[heldout_rows]
@@ -331,6 +382,11 @@ def train_command(args) -> None:
         inference_dtype="float32",
         train_dtype=args.train_dtype,
     )
+    if args.init_from is not None:
+        params, static = eqx.partition(network, eqx.is_inexact_array)
+        with open(args.init_from, "rb") as f:
+            params, nn_state = eqx.tree_deserialise_leaves(f, (params, nn_state))
+        network = eqx.combine(params, static)
     monitor = (
         Monitor(args.monitor, project="othello", name=args.name, notes=args.notes)
         if args.monitor
@@ -356,6 +412,7 @@ def train_command(args) -> None:
             lr=args.lr,
             lr_final=args.lr_final,
             weight_decay=args.weight_decay,
+            warmup_steps=args.warmup_steps,
             value_target_q=args.value_target_q,
             seed=args.seed,
             eval_every=args.eval_every,
@@ -400,9 +457,24 @@ def main():
     )
     fit.add_argument(
         "--heldout",
-        required=True,
+        default=None,
         help="a saved training state of games the network and teacher never trained on, or "
         "a dataset's directory (its held-out games)",
+    )
+    fit.add_argument(
+        "--heldout-envs",
+        type=int,
+        default=0,
+        metavar="N",
+        help="instead of --heldout, hold out the games of --data's last N self-play "
+        "environments (a saved state's): whole games, so none of their outcomes is trained on",
+    )
+    fit.add_argument(
+        "--init-from",
+        default=None,
+        metavar="CKPT",
+        help="start from this checkpoint of a --net network (e.g. train.py's), rather than "
+        "from scratch",
     )
     fit.add_argument(
         "--all-positions",
@@ -441,6 +513,12 @@ def main():
     fit.add_argument("--lr", type=float, default=1e-3)
     fit.add_argument("--lr-final", type=float, default=1e-4)
     fit.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY)
+    fit.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=0,
+        help="ramp the updates up from 0 over this many steps (from a trained --init-from)",
+    )
     fit.add_argument("--train-dtype", default="bfloat16")
     fit.add_argument("--seed", type=int, default=0)
     fit.add_argument("--eval-every", type=int, default=2, help="in passes")

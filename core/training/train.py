@@ -691,6 +691,8 @@ class Trainer:
         lr_drop: LRDrop | None = None,
         noise_measure: int = 0,
         fresh_positions: int = 0,
+        holdout_envs: int = 0,
+        holdout_positions: int = 0,
         evaluator_test: Evaluator | None = None,
         test_env_init_fn: EnvInitFn | None = None,
         exploration: Exploration | None = None,
@@ -776,6 +778,17 @@ class Trainer:
                 self-play average's policy KL and value loss, logged as `fresh_*`, and the raw
                 weights' excess over the average's, `fresh_*_gap`: how much the step's jitter
                 costs on new data (see `fresh_position_metrics`). A multiple of the micro-batch
+            holdout_envs: (optional) hold out the games of this many self-play environments (the
+                last ones): they're played and stored like the others, but never trained on, so that
+                every epoch, before training, the playing network is scored on `holdout_positions`
+                of their positions and as many of the other environments' from the same span of
+                self-play (see `holdout_metrics`). The difference is what training has fit in the
+                positions it trains on and not in new games of the same kind: memorization of the
+                replay buffer. A train loop starts their buffers empty, since a saved state's may
+                hold positions trained on. The other environments' positions train as before, from
+                fewer games
+            holdout_positions: with `holdout_envs`, the positions sampled from each side, with
+                replacement. A multiple of the micro-batch
             evaluator_test: (optional) evaluator to use during testing. If not provided, `evaluator` is used
                 (required with a schedule of several evaluators).
             test_env_init_fn: (optional) environment initialization function for test episodes, e.g. to test from
@@ -1010,6 +1023,22 @@ class Trainer:
                 f"({self.micro_batch_size})"
             )
         self.fresh_positions = fresh_positions
+        if not 0 <= holdout_envs < batch_size:
+            raise ValueError(
+                f"holdout_envs must hold out fewer than the {batch_size} environments, got "
+                f"{holdout_envs}"
+            )
+        if holdout_envs and (
+            holdout_positions <= 0 or holdout_positions % self.micro_batch_size
+        ):
+            raise ValueError(
+                f"holdout_positions ({holdout_positions}) must be a positive multiple of the "
+                f"micro-batch ({self.micro_batch_size})"
+            )
+        self.holdout_envs = holdout_envs
+        self.holdout_positions = holdout_positions
+        # the environments whose games training samples: all but the held-out ones
+        self.trained_envs = jnp.arange(batch_size) < batch_size - holdout_envs
         # micro-batches to measure the noise scale on at a weight average, every epoch
         self.noise_measure = noise_measure
         if lr_plateau is not None and train_steps_per_epoch < 1:
@@ -1227,7 +1256,7 @@ class Trainer:
         network's state."""
         if not self.average_norm_batches or train_state.nn_state is None:
             return None
-        mask = self.memory_buffer.sample_mask(buffer_state)
+        mask = self.training_mask(buffer_state)
         if not bool(mask.any()):
             return None
         keys = jax.random.split(key, len(averages))
@@ -1316,6 +1345,14 @@ class Trainer:
             **(
                 {"lr_drop": self.lr_drop.get_config()}
                 if self.lr_drop is not None
+                else {}
+            ),
+            **(
+                {
+                    "holdout_envs": self.holdout_envs,
+                    "holdout_positions": self.holdout_positions,
+                }
+                if self.holdout_envs
                 else {}
             ),
             "evaluator_train": evaluator_train.__class__.__name__,
@@ -2127,7 +2164,7 @@ class Trainer:
         if batch_size is None:
             batch_size = self.train_batch_size
         # the buffer doesn't change while training, so find which entries can be sampled once per epoch
-        mask = self.memory_buffer.sample_mask(buffer_state)
+        mask = self.training_mask(buffer_state)
         add_tree_positions = (
             self.tree_position_sampler(
                 tree_buffer_state, tree_mask, num_tree, batch_size
@@ -2252,6 +2289,32 @@ class Trainer:
             tree_written_at=_to_device(tree_written_at),
         )
 
+    def training_mask(self, buffer_state: ReplayBufferState) -> jax.Array:
+        """The replay buffer entries training samples: those the buffer can sample (see
+        `EpisodeReplayBuffer.sample_mask`), of the environments whose games aren't held out (see
+        `holdout_envs`)."""
+        return self.memory_buffer.sample_mask(buffer_state) & self.trained_envs[:, None]
+
+    def check_can_train(self, buffer_state: ReplayBufferState, batch_size: int) -> None:
+        """Checks on the host that training can sample a batch of `batch_size` entries (see
+        `training_mask`).
+
+        Raises:
+            ValueError: if no episode has finished yet, or fewer entries can be sampled
+        """
+        count = int(self.training_mask(buffer_state).sum())
+        if not count:
+            raise ValueError(
+                "Cannot sample from the replay buffer: no episodes have finished yet. "
+                "Collect more self-play steps before training (e.g. increase `warmup_steps`)."
+            )
+        if count < batch_size:
+            raise ValueError(
+                f"Cannot sample {batch_size} entries from the replay buffer: only {count} can be "
+                "sampled. Collect more self-play steps before training (e.g. increase "
+                "`warmup_steps`), or sample fewer."
+            )
+
     def tree_sample_mask(self, state: CollectionState) -> jax.Array:
         """Marks the tree positions (see `tree_positions`) training can sample: those stored within
         the replay buffer's span of self-play.
@@ -2271,7 +2334,11 @@ class Trainer:
         moves = self.memory_buffer.window or buffer_capacity(state.buffer_state)
         # positions the last move stored are 1 move old
         age = state.moves[..., None] - state.tree_written_at
-        return self.tree_buffer.sample_mask(state.tree_buffer_state) & (age <= moves)
+        return (
+            self.tree_buffer.sample_mask(state.tree_buffer_state)
+            & (age <= moves)
+            & self.trained_envs[:, None]
+        )
 
     def tree_position_sampler(
         self,
@@ -2330,7 +2397,7 @@ class Trainer:
 
         In chunks of up to 16 micro-batches: each chunk's samples are gathered by one compiled
         function and their gradients summed by another, so neither holds more than a chunk."""
-        mask = self.memory_buffer.sample_mask(buffer_state)
+        mask = self.training_mask(buffer_state)
         chunk = min(16, num_micro)
         total, micro_sq = None, jnp.zeros((), jnp.float32)
         for start in range(0, num_micro, chunk):
@@ -2446,6 +2513,7 @@ class Trainer:
             (since < written[:, None])
             & buffer_state.populated
             & buffer_state.has_reward
+            & self.trained_envs[:, None]
         )
 
     @partial(jax.jit, static_argnums=(0, 4))
@@ -2484,6 +2552,93 @@ class Trainer:
 
         _, (kl, value) = jax.lax.scan(one, None, batches)
         return kl.mean(), value.mean()
+
+    def holdout_metrics(
+        self,
+        key: jax.Array,
+        buffer_state: ReplayBufferState,
+        weights: Mapping[str, tuple[Any, eqx.nn.State | None]],
+        learner: int = 0,
+    ) -> dict[str, jax.Array]:
+        """Scores each of `weights` (by name: parameters and network state) on positions of the
+        held-out games (see `holdout_envs`) and on as many of the trained-on games' positions of
+        the same ages, `holdout_positions` each, sampled with replacement. In inference mode, so
+        a BatchNorm network uses its running statistics. Empty until a held-out game has
+        finished.
+
+        For each name it logs the policy KL and value loss on both, `heldout_*_<name>` and
+        `seen_*_<name>`, and the excess on the held-out positions, `memorized_*_<name>`: what
+        training has fit in the positions it trains on that doesn't carry over to new games of
+        the same kind.
+
+        Each has a standard error (`*_se`), from the spread of its micro-batches' means."""
+        stored = self.memory_buffer.sample_mask(buffer_state)
+        held = stored & ~self.trained_envs[:, None]
+        if not bool(held.any()):
+            return {}
+        # the held-out buffers start empty at the train loop's start: the trained-on positions
+        # compared with them are those no older than their oldest
+        capacity = stored.shape[1]
+        age = (buffer_state.next_idx[:, None] - 1 - jnp.arange(capacity)) % capacity
+        oldest = jnp.max(jnp.where(held, age, -1))
+        seen = stored & self.trained_envs[:, None] & (age <= oldest)
+        n = self.holdout_positions // self.micro_batch_size
+        held_key, seen_key = jax.random.split(key)
+        held_batches = self._gather_masked(held_key, buffer_state, held, n)
+        seen_batches = self._gather_masked(seen_key, buffer_state, seen, n)
+
+        def se(x: jax.Array) -> jax.Array:
+            return jnp.sqrt(jnp.var(x, ddof=1) / n) if n > 1 else jnp.array(jnp.nan)
+
+        out: dict[str, jax.Array] = {"heldout_stored": held.sum()}
+        for name, (params, nn_state) in weights.items():
+            held_losses = self._probe_losses(
+                params, nn_state, held_batches, learner=learner
+            )
+            seen_losses = self._probe_losses(
+                params, nn_state, seen_batches, learner=learner
+            )
+            for metric, h, t in zip(
+                ("policy_kl", "value_loss"), held_losses, seen_losses, strict=True
+            ):
+                out[f"heldout_{metric}_{name}"] = h.mean()
+                out[f"seen_{metric}_{name}"] = t.mean()
+                out[f"memorized_{metric}_{name}"] = h.mean() - t.mean()
+                out[f"memorized_{metric}_{name}_se"] = jnp.sqrt(
+                    jnp.square(se(h)) + jnp.square(se(t))
+                )
+        return out
+
+    @partial(jax.jit, static_argnums=(0,), static_argnames=("learner",))
+    def _probe_losses(
+        self,
+        params: Any,
+        nn_state: eqx.nn.State | None,
+        batches: BaseExperience,
+        learner: int = 0,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Each micro-batch's mean policy KL and value loss, for the network with `params` and
+        `nn_state` in inference mode."""
+        nn_static = eqx.filter(
+            self.learners[learner].nn, eqx.is_inexact_array, inverse=True
+        )
+        nn = eqx.nn.inference_mode(eqx.combine(params, nn_static))
+
+        def one(_, batch: BaseExperience) -> tuple[None, tuple[jax.Array, jax.Array]]:
+            _, (metrics, _) = self.loss_fn(nn, nn_state, batch)
+            return None, (metrics["policy_kl"], metrics["value_loss"])
+
+        _, (kl, value) = jax.lax.scan(one, None, batches)
+        return kl, value
+
+    def without_holdout_positions(
+        self, buffer_state: ReplayBufferState
+    ) -> ReplayBufferState:
+        """`buffer_state` with the held-out environments' finished games' positions dropped (see
+        `holdout_envs`): those of a saved state may have been trained on. Positions waiting for
+        their game's result never were, so they stay."""
+        held = ~self.trained_envs[:, None] & buffer_state.has_reward
+        return replace(buffer_state, populated=buffer_state.populated & ~held)
 
     def train_steps(
         self,
@@ -2535,7 +2690,7 @@ class Trainer:
             )
         scale = None if lr_scale is None else jnp.asarray(lr_scale, dtype=jnp.float32)
         # the buffer doesn't change while training, so checking once covers every step
-        self.memory_buffer.check_can_sample(collection_state.buffer_state, batch_size)
+        self.check_can_train(collection_state.buffer_state, batch_size)
         if self.tree_positions is None:
             train_state, metrics = self.train_epoch(
                 key,
@@ -4323,6 +4478,13 @@ class Trainer:
                 evaluator=evaluator,
             )
 
+        if self.holdout_envs:
+            collection_state = replace(
+                collection_state,
+                buffer_state=self.without_holdout_positions(
+                    collection_state.buffer_state
+                ),
+            )
         # training loop
         while cur_epoch < num_epochs:
             epoch_started = time.perf_counter()
@@ -4376,7 +4538,7 @@ class Trainer:
                     jax.tree.map(np.asarray, collection_state.pending),
                 )
                 if (
-                    self.memory_buffer.sample_mask(collection_state.buffer_state).sum()
+                    self.training_mask(collection_state.buffer_state).sum()
                     < self.train_batch_size
                 ):
                     # not a training batch to train on yet (e.g. a new run's first epoch, whose
@@ -4429,6 +4591,33 @@ class Trainer:
                     fresh_from,
                     weights,
                     train_states[playing].nn_state,
+                    learner=playing,
+                )
+            # the playing network on the held-out games' positions and the trained-on ones'
+            holdout: dict[str, jax.Array] = {}
+            if self.holdout_envs and playing in training:
+                holdout_key, key = jax.random.split(key)
+                weights = {
+                    "raw": (
+                        train_states[playing].params,
+                        train_states[playing].nn_state,
+                    )
+                }
+                if self.averages:
+                    index = self.averages.index(
+                        self.selfplay_average or self.averages[0]
+                    )
+                    states = average_states[playing]
+                    weights["avg"] = (
+                        averages[playing][index],
+                        states[index]
+                        if states is not None
+                        else train_states[playing].nn_state,
+                    )
+                holdout = self.holdout_metrics(
+                    holdout_key,
+                    collection_state.buffer_state,
+                    weights,
                     learner=playing,
                 )
             # train every network that trains, on the same replay buffer
@@ -4502,6 +4691,8 @@ class Trainer:
                     }
             if fresh_metrics and playing in train_metrics:
                 train_metrics[playing] = {**train_metrics[playing], **fresh_metrics}
+            if holdout and playing in train_metrics:
+                train_metrics[playing] = {**train_metrics[playing], **holdout}
             # the learning rate rule follows the network playing
             stop = False
             watch_loss = self.lr_plateau_metric == "loss"
