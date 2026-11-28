@@ -567,7 +567,6 @@ def test_adamw_keeps_its_weight_decay(monkeypatch):
     assert built.value.kwargs["noise_measure"] == 0
     assert built.value.kwargs["fresh_positions"] == 0
     assert built.value.kwargs["holdout_envs"] == 0
-    assert built.value.kwargs["progress_lag"] == 0
 
 
 def test_lr_drop_and_the_noise_metrics_reach_the_trainer(monkeypatch):
@@ -586,18 +585,12 @@ def test_lr_drop_and_the_noise_metrics_reach_the_trainer(monkeypatch):
             "32",
             "--holdout-positions",
             "1000",
-            "--progress-lag",
-            "10",
         )
     kwargs = built.value.kwargs
     assert (kwargs["lr_drop"].after_epochs, kwargs["lr_drop"].factor) == (150, 0.1)
     assert (kwargs["noise_measure"], kwargs["fresh_positions"]) == (64, 8192)
     # held-out positions round up to whole micro-batches of 4096 / 4
-    assert (
-        kwargs["holdout_envs"],
-        kwargs["holdout_positions"],
-        kwargs["progress_lag"],
-    ) == (32, 1024, 10)
+    assert (kwargs["holdout_envs"], kwargs["holdout_positions"]) == (32, 1024)
 
 
 @pytest.mark.parametrize(

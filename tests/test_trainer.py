@@ -4434,7 +4434,7 @@ def test_fresh_positions_must_fill_micro_batches(env, tmp_path):
         )
 
 
-# held-out games: memorization of the replay buffer, and progress on new games
+# held-out games: memorization of the replay buffer
 
 
 def held_out_trainer(env, tmp_path, **kwargs):
@@ -4544,38 +4544,6 @@ def test_held_out_positions_are_compared_with_trained_on_ones_of_their_ages(
         assert metrics[f"memorized_{metric}_raw"] == pytest.approx(0.0, abs=1e-6)
         assert metrics[f"memorized_{metric}_raw_se"] == pytest.approx(0.0, abs=1e-6)
     assert int(metrics["heldout_stored"]) == 3
-    assert "progress_policy_kl" not in metrics
-
-
-def test_progress_is_the_lagged_weights_excess_on_held_out_positions(env, tmp_path):
-    trainer = held_out_trainer(env, tmp_path)
-    position = one_position(env)
-    state = buffer_of(trainer, env, position, np.ones((2, 8), bool))
-    now = eqx.filter(trainer.nn, eqx.is_inexact_array)
-    before = eqx.filter(
-        MLP(2, env.num_actions, key=jax.random.PRNGKey(7)), eqx.is_inexact_array
-    )
-
-    metrics = trainer.holdout_metrics(
-        jax.random.PRNGKey(0),
-        state,
-        {"raw": (now, None)},
-        lagged=(before, None),
-        current="raw",
-    )
-
-    def losses(params):
-        nn = eqx.combine(
-            params, eqx.filter(trainer.nn, eqx.is_inexact_array, inverse=True)
-        )
-        batch = jax.tree.map(lambda x: jnp.stack([x, x]), position)
-        _, (aux, _) = az_default_loss_fn(nn, None, batch)
-        return aux
-
-    for metric in ("policy_kl", "value_loss"):
-        expected = float(losses(before)[metric] - losses(now)[metric])
-        assert metrics[f"progress_{metric}"] == pytest.approx(expected, abs=1e-5)
-        assert metrics[f"progress_{metric}_se"] == pytest.approx(0.0, abs=1e-6)
 
 
 def test_the_playing_network_is_scored_on_held_out_games(env, tmp_path):
@@ -4583,7 +4551,6 @@ def test_the_playing_network_is_scored_on_held_out_games(env, tmp_path):
     trainer = held_out_trainer(
         env,
         tmp_path,
-        progress_lag=1,
         warmup_steps=2 * STEPS,
         averages=(2,),
         selfplay_average=2,
@@ -4602,9 +4569,6 @@ def test_the_playing_network_is_scored_on_held_out_games(env, tmp_path):
                 assert memorized[epoch] == pytest.approx(
                     held[epoch] - seen[epoch], abs=1e-6
                 )
-        # the weights of an epoch before: from the second scored epoch on
-        progress = logged(monitor, f"progress_{name}")
-        assert progress and min(progress) > min(held)
 
 
 @pytest.mark.parametrize(
@@ -4613,8 +4577,6 @@ def test_the_playing_network_is_scored_on_held_out_games(env, tmp_path):
         {"holdout_envs": 2, "holdout_positions": 4},
         {"holdout_envs": 1, "holdout_positions": 3},
         {"holdout_envs": 1, "holdout_positions": 0},
-        {"progress_lag": 2},
-        {"holdout_envs": 1, "holdout_positions": 4, "progress_lag": -1},
     ],
 )
 def test_bad_holdout_settings_are_refused(env, tmp_path, kwargs):

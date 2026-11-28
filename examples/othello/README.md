@@ -505,7 +505,7 @@ raw weights' excess (`fresh_*_gap`). N is a multiple of the micro-batch (`--trai
 `--grad-accum`), e.g. 16 of them. It draws its samples from the run's rng, so a run with it
 plays other games than the same run without.
 
-### Memorization and real progress: held-out games
+### Memorization: held-out games
 
 A position is trained on many times while it's in the replay buffer (about 14 at 256 steps of
 4096 with `--playout-cap 0.25:64` and `--buffer 2250`), and the network fits what it can of each
@@ -518,12 +518,6 @@ same ages:
 - `heldout_*` and `seen_*`: policy KL and value loss on each, and `memorized_*` the difference.
   The two sets are different games, so a few thousand held-out games' own outcomes put an offset
   of a few thousandths in the value loss.
-- `progress_*` (with `--progress-lag 20`, the default): the self-play weights of that many epochs
-  before, kept on the host, against the current ones on the same held-out positions, which
-  neither trained on. This is how much the network really improved over the lag. Paired, it
-  resolves a few ten-thousandths. Zero or below within its `*_se` means no progress at this rate.
-- `memorized_lag_*`: how much more the current weights improved over the lag on the trained-on
-  games' positions written since than on the held-out games' of the same ages. Paired too.
 
 Training is unchanged apart from training on 3% fewer games. A train loop starts the held-out
 buffers empty, since a saved state's may hold positions trained on, so a fork or resume measures

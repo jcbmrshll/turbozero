@@ -785,8 +785,7 @@ def main():
         "about 3%% of the games), and every epoch score the playing network on their "
         "positions and on the trained-on games' of the same ages: heldout_*, seen_*, and the "
         "difference memorized_*, what training fits in its replay buffer that doesn't carry "
-        "over to new games. With --progress-lag also progress_*. For watching; nothing "
-        "follows it. Default 0, none",
+        "over to new games. For watching; nothing follows it. Default 0, none",
     )
     parser.add_argument(
         "--holdout-positions",
@@ -795,17 +794,6 @@ def main():
         metavar="N",
         help="with --holdout-envs, the positions scored from each side every epoch, rounded up "
         "to whole micro-batches: 32768 adds about 5%% to training at the defaults",
-    )
-    parser.add_argument(
-        "--progress-lag",
-        type=int,
-        default=20,
-        metavar="EPOCHS",
-        help="with --holdout-envs, also score the weights self-play played with EPOCHS epochs "
-        "before on the same held-out positions, which neither trained on: progress_policy_kl "
-        "and progress_value_loss are how much the network really improved over those epochs "
-        "(0 or below within their *_se: no progress). The first EPOCHS epochs of a run, "
-        "resumed or not, have none. 0: none",
     )
     parser.add_argument(
         "--inference-dtype",
@@ -1094,10 +1082,8 @@ def main():
         )
     if args.noise_measure < 0:
         parser.error("--noise-measure must be at least 0")
-    if args.holdout_envs < 0 or args.progress_lag < 0 or args.holdout_positions <= 0:
-        parser.error(
-            "--holdout-envs and --progress-lag are at least 0, --holdout-positions positive"
-        )
+    if args.holdout_envs < 0 or args.holdout_positions <= 0:
+        parser.error("--holdout-envs is at least 0, --holdout-positions positive")
     args.holdout_positions = -(-args.holdout_positions // micro) * micro
     if args.init_without_buffers and args.init_from is None:
         parser.error("--init-without-buffers needs --init-from")
@@ -1435,7 +1421,6 @@ def main():
         fresh_positions=args.fresh_positions,
         holdout_envs=args.holdout_envs,
         holdout_positions=args.holdout_positions if args.holdout_envs else 0,
-        progress_lag=args.progress_lag if args.holdout_envs else 0,
         nn=network,
         nn_state=network_state,
         loss_fn=partial(az_default_loss_fn, value_target_q=args.value_target_q),
