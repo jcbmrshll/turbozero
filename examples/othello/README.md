@@ -237,7 +237,9 @@ targets, and the engine-set metrics how good its policy is.
 
 `--save-weights-every N` (1 by default) saves the weight average every N epochs as
 `--ckpt-dir/avg4/<epoch>.eqx`, its weights and BatchNorm statistics: what a player loads, and
-nothing for training to continue from. `--save-state-at 50,150` also saves the whole training
+nothing for training to continue from. `--save-raw-every N` also saves the network's own weights
+as each N-th epoch starts, as `--ckpt-dir/raw/<epoch>.eqx`: the raw weights `avg4/<epoch>.eqx`
+took in, e.g. to measure what the training steps' noise costs against their average. `--save-state-at 50,150` also saves the whole training
 state once 50 and 150 epochs are done, as `state-50.npz` and `state-150.npz` in `--ckpt-dir`: the
 network, optimizer state, weight average, replay buffer, games in progress with their search
 trees and the rng. `--save-state-every 10` saves one every 10 epochs and keeps only the newest of
@@ -324,7 +326,8 @@ with on
 `--holdout-positions` of their positions and as many of the trained-on games' positions of the
 same ages:
 
-- `heldout_*` and `seen_*`: policy KL and value loss on each, and `memorized_*` the difference.
+- `heldout_*` and `seen_*`: policy KL and value loss on each, and `memorized_policy` and
+  `memorized_value` the differences.
   The two sets are different games, so a few thousand held-out games' own outcomes put an offset
   in the value loss that `*_se` (from micro-batch spread) doesn't include: about 0.004 at 32 of
   1024 environments, about 5,400 games. A checkpoint that never saw any of them scored
@@ -636,8 +639,10 @@ engine has scored: the disc margin it expects at the end. Sets record what score
 position (`labeller_names`): Edax at level 24 (24 moves ahead, the last squares exact), or
 Neural Reversi at level 26 (exact up to 30 empty squares, 26 moves ahead beyond).
 
-`train.py` scores the weight average on it every epoch and logs, as `engine_*`, for all
-positions and for each game phase (`opening`, 40-51 empty squares; `midgame`, 25-39; `endgame`,
+`train.py` scores the weight average on it every epoch, in float32 whatever
+`--inference-dtype` self-play uses (in bfloat16 a checkpoint's value MSE is off by up to 0.006,
+more than ten epochs of a slow run's progress), and logs, as `engine_*`, for all positions and for
+each game phase (`opening`, 40-51 empty squares; `midgame`, 25-39; `endgame`,
 1-24):
 
 - `engine_top1`: how often the network's most likely move is one of the engine's best

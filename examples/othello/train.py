@@ -446,6 +446,15 @@ def make_parser() -> argparse.ArgumentParser:
         "loads) to --ckpt-dir/avg<H>/<epoch>.eqx every N epochs, keeping them all",
     )
     parser.add_argument(
+        "--save-raw-every",
+        type=int,
+        default=None,
+        metavar="N",
+        help="also save the network's own weights (its raw weights, which the average takes "
+        "in) to --ckpt-dir/raw/<epoch>.eqx at the start of every N epochs, all kept: "
+        "avg<H>/<epoch>.eqx's raw counterpart",
+    )
+    parser.add_argument(
         "--save-state-at",
         type=epoch_list,
         default=[],
@@ -553,6 +562,8 @@ def main():
         parser.error("--dirichlet-epsilon must be between 0 and 1")
     if args.save_weights_every < 1:
         parser.error("--save-weights-every must be positive")
+    if args.save_raw_every is not None and args.save_raw_every < 1:
+        parser.error("--save-raw-every must be positive")
 
     network, network_state = make_network(
         args.net,
@@ -576,13 +587,15 @@ def main():
         playout_cap=args.playout_cap,
     )
 
-    # the average's raw moves and values against an engine's, on the engine-labelled set
+    # the average's raw moves and values against an engine's, on the engine-labelled set, in
+    # float32: in bfloat16 a checkpoint's value MSE is off by up to 0.006, more than ten epochs
+    # of a slow run's progress
     engine_set = load_engine_set(parser, args)
     validators = (
         [
             ScoredPositionsValidator(
                 engine_set.scored_positions(),
-                network,
+                make_network(args.net, inference_dtype="float32")[0],
                 name="engine",
                 config={
                     "path": str(args.engine_set or DEFAULT_ENGINE_SET),
@@ -658,6 +671,7 @@ def main():
         else None,
         ckpt_dir=ckpt_dir,
         save_weights_every=args.save_weights_every,
+        save_raw_every=args.save_raw_every,
         save_state_every=args.save_state_every,
         save_state_at=args.save_state_at,
         # every argument but how the run starts (a fork or branch records its parent)

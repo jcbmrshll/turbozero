@@ -262,6 +262,15 @@ def main():
         "all kept",
     )
     parser.add_argument(
+        "--save-raw-every",
+        type=int,
+        default=None,
+        metavar="N",
+        help="also save the network's own weights (its raw weights, which the average takes "
+        "in) to --ckpt-dir/raw/<epoch>.eqx at the start of every N epochs, all kept: "
+        "avg<H>/<epoch>.eqx's raw counterpart",
+    )
+    parser.add_argument(
         "--save-state-at",
         type=epoch_list,
         default=[],
@@ -358,13 +367,14 @@ def main():
         **search_kwargs,
     )
     # the average's raw moves and values against the truth, on the solver-labelled set: by
-    # the solver's scores, in which a slower win gives some up, and by outcomes alone
+    # the solver's scores, in which a slower win gives some up, and by outcomes alone. In
+    # float32, so that one checkpoint's numbers compare with the next's
     solver_set = load_engine_set(parser, args)
     validators = (
         [
             ScoredPositionsValidator(
                 solver_set.scored_positions(by_outcome),
-                network,
+                make_network(args.net, inference_dtype="float32")[0],
                 name=name,
                 config={
                     "path": str(args.engine_set or DEFAULT_ENGINE_SET),
@@ -410,6 +420,7 @@ def main():
         validators=validators,
         validate_every=args.validate_every,
         save_weights_every=args.save_weights_every,
+        save_raw_every=args.save_raw_every,
         # how often self-play games are drawn
         episode_metrics_fn=episode_metrics,
         exploration=Exploration(num_sampling_moves=args.sampling_moves)

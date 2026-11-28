@@ -2,6 +2,7 @@ import inspect
 import json
 import os
 import re
+import time
 import zipfile
 from collections.abc import Callable, Collection, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -94,6 +95,7 @@ class CollectionStats:
     episodes: jax.Array
     moves: jax.Array
     episode_metrics: dict[str, jax.Array]
+    solve_missed: jax.Array | None = None
 
     @classmethod
     def of(cls, state: CollectionState) -> "CollectionStats":
@@ -101,6 +103,9 @@ class CollectionStats:
             episodes=jnp.copy(state.episodes),
             moves=jnp.copy(state.moves),
             episode_metrics={k: jnp.copy(v) for k, v in state.episode_metrics.items()},
+            solve_missed=jnp.copy(state.pending.missed)
+            if state.pending is not None
+            else None,
         )
 
 
@@ -350,6 +355,26 @@ def update_size_metrics(params: Any, updates: Any) -> dict:
     }
 
 
+def reduce_step_metrics(metrics: dict) -> dict:
+    """An epoch's metrics from its training steps' (each array one value per step): their
+    means, and what a mean hides, the spikes that come before training blows up:
+    - `grad_norm_max`, `grad_norm_median`: the largest and the median of the steps' gradient
+      norms, and `grad_norm_spike`, their ratio
+    - `loss_spike`: the largest step's loss over the median step's
+    - `nonfinite_steps`: how many steps had a loss or gradient norm that wasn't finite"""
+    out = {name: jnp.mean(values) for name, values in metrics.items()}
+    grad_norm, loss = metrics["grad_norm"], metrics["loss"]
+    median = jnp.median(grad_norm)
+    out["grad_norm_max"] = jnp.max(grad_norm)
+    out["grad_norm_median"] = median
+    out["grad_norm_spike"] = jnp.max(grad_norm) / jnp.maximum(median, 1e-12)
+    out["loss_spike"] = jnp.max(loss) / jnp.maximum(jnp.median(loss), 1e-12)
+    out["nonfinite_steps"] = jnp.sum(
+        ~(jnp.isfinite(loss) & jnp.isfinite(grad_norm))
+    ).astype(jnp.float32)
+    return out
+
+
 def injected_hyperparams(opt_state: Any) -> dict[str, jax.Array]:
     """The hyperparameters of the `optax.inject_hyperparams` optimizers in `opt_state`, by
     name; none if the optimizer doesn't inject any."""
@@ -385,12 +410,13 @@ def with_hyperparams(opt_state: Any, hyperparams: Mapping[str, Any]) -> Any:
 
 def solve_summary(solved: Sequence[Solved]) -> dict[str, jax.Array]:
     """An epoch's metrics of exact endgame labels (see `Trainer.collection_metrics`), from its
-    solves: `solve_draw`, the fraction of the games labelled at their solve points that are
-    drawn, and `solve_positions`, every position solved."""
+    solves: `solve_games`, the games labelled at their solve points, `solve_draw`, the fraction
+    of them drawn, and `solve_positions`, every position solved."""
     whole = np.concatenate(
         [s.solves[s.whole] for s in solved if len(s.solves)] or [np.zeros((0, 0))]
     )
     return {
+        "solve_games": jnp.asarray(len(whole)),
         "solve_positions": jnp.asarray(sum(len(s.solves) for s in solved)),
         **(
             {"solve_draw": jnp.asarray((whole == 0).all(-1).mean())}
@@ -466,6 +492,7 @@ class Trainer:
         monitor: "Monitor | None" = None,
         ckpt_dir: str = "/tmp/turbozero_checkpoints",
         save_weights_every: int | None = None,
+        save_raw_every: int | None = None,
         save_state_every: int | None = None,
         save_state_at: Collection[int] = (),
         extra_config: dict | None = None,
@@ -538,7 +565,7 @@ class Trainer:
             data_transform_fns: (optional) data transforms (e.g. a board's rotations and
                 reflections, see `core.memory.replay_memory.DataTransformFn`) besides the
                 identity. Training maps each sample through one drawn uniformly at random.
-                Together they must be a group, for `buffer_distinct_fraction` to count
+                Together they must be a group, for `buffer_distinct_positions` to count
                 positions up to them
             advance_every: (optional) self-play plays the moves whose searches are done every
                 this many cycles (see `collect_steps`); by default the evaluator's
@@ -555,6 +582,10 @@ class Trainer:
             save_weights_every: (optional) save the average's weights and network state, all
                 a player needs, every this many epochs, to `<ckpt_dir>/avg<horizon>/<epoch>.eqx`
                 (see `save_weights`). Kept
+            save_raw_every: (optional) save the network's own weights and network state at the
+                start of every this many epochs, those the average took in that epoch, to
+                `<ckpt_dir>/raw/<epoch>.eqx`: `avg<horizon>/<epoch>.eqx`'s raw counterpart, e.g.
+                to measure what the steps' noise costs against it. Kept
             save_state_every: (optional) save the whole training state after every this many
                 epochs (see `save_state`), keeping only the newest of these, to `resume` the run
                 from. A state takes as much disk as the replay buffer's device memory
@@ -644,10 +675,11 @@ class Trainer:
         self.validate_every = validate_every
         # checkpoints
         self.ckpt_dir = ckpt_dir
-        for every in (save_weights_every, save_state_every):
+        for every in (save_weights_every, save_raw_every, save_state_every):
             if every is not None and every < 1:
                 raise ValueError(f"save intervals must be positive, got {every}")
         self.save_weights_every = save_weights_every
+        self.save_raw_every = save_raw_every
         self.save_state_every = save_state_every
         self.save_state_at = frozenset(save_state_at)
         os.makedirs(self.weights_dir, exist_ok=True)
@@ -662,6 +694,11 @@ class Trainer:
     def weights_dir(self) -> str:
         """Where the average's weights are saved (see `save_weights`)."""
         return os.path.join(self.ckpt_dir, average_name(self.average_epochs))
+
+    @property
+    def raw_dir(self) -> str:
+        """Where the network's own weights are saved (see `save_raw_every`)."""
+        return os.path.join(self.ckpt_dir, "raw")
 
     def init_train_state(self) -> TrainState:
         """The training state from `nn` and `nn_state`, with a new optimizer state."""
@@ -1070,13 +1107,16 @@ class Trainer:
         self, before: CollectionStats, after: CollectionState
     ) -> dict:
         """What an epoch's self-play played and what the replay buffer holds after it:
-        - `moves`: moves played in all environments
-        - with `episode_metrics_fn`: `episode_<name>`, each metric's mean over the episodes
-          finished, omitted if none did
-        - `buffer_distinct_fraction`: the fraction of the positions training can sample that are
-          distinct, those a data transform maps to one another counting as one (e.g. a board
-          and its rotations): to spot self-play collapsing into the same few games
-        - with `endgame_solve`, the training loop adds `solve_summary`'s
+        - `moves`, `episodes`: moves played and episodes finished in all environments
+        - with `episode_metrics_fn`: `episode_<name>`, each metric's mean over those episodes,
+          omitted if none finished
+        - `buffer_samples`: positions in the replay buffer training can sample
+        - `buffer_distinct_positions`: distinct observations among them, those a data transform
+          maps to one another counting as one (e.g. a board and its rotations), and
+          `buffer_distinct_fraction`, that as a fraction of `buffer_samples`: to spot self-play
+          collapsing into the same few games
+        - with `endgame_solve`: `solve_missed`, the solves that found every slot full (the
+          training loop adds `solve_summary`'s)
 
         Args:
             before: the collection state's counters before the epoch's self-play
@@ -1086,12 +1126,17 @@ class Trainer:
         distinct, total = self.count_distinct_observations(after.buffer_state)
         metrics = {
             "moves": (after.moves - before.moves).sum(),
+            "episodes": episodes,
+            "buffer_samples": total,
+            "buffer_distinct_positions": distinct,
             "buffer_distinct_fraction": distinct / jnp.maximum(total, 1),
         }
         if episodes > 0:
             for name, total_after in after.episode_metrics.items():
                 change = (total_after - before.episode_metrics[name]).sum()
                 metrics[f"episode_{name}"] = change / episodes
+        if after.pending is not None and before.solve_missed is not None:
+            metrics["solve_missed"] = (after.pending.missed - before.solve_missed).sum()
         return metrics
 
     # training
@@ -1177,7 +1222,7 @@ class Trainer:
         """`num_steps` training steps in one `jax.lax.scan`, each on a batch sampled without
         replacement from the positions training can sample (see `training_mask`), each sample
         mapped through a random data transform (see `data_transform_fns`). Returns the new
-        state and the steps' mean metrics."""
+        state and the steps' metrics (see `reduce_step_metrics`)."""
         # the buffer doesn't change while training, so find which entries can be sampled once
         mask = self.training_mask(buffer_state)
 
@@ -1200,7 +1245,7 @@ class Trainer:
         (_, train_state), metrics = jax.lax.scan(
             step, (key, train_state), length=num_steps
         )
-        return train_state, jax.tree.map(jnp.mean, metrics)
+        return train_state, reduce_step_metrics(metrics)
 
     def training_mask(self, buffer_state: ReplayBufferState) -> jax.Array:
         """The replay buffer entries training samples: those the buffer can sample (see
@@ -1317,10 +1362,12 @@ class Trainer:
         a BatchNorm network uses its running statistics. Empty until a held-out game has
         finished and a trained-on game's position is no older than its oldest.
 
-        Logs the policy KL and value loss on both, `heldout_*` and `seen_*`, and the excess on
-        the held-out positions, `memorized_*`: what training has fit in the positions it trains
-        on that doesn't carry over to new games of the same kind. Each excess has a standard
-        error (`*_se`), from the spread of its micro-batches' means."""
+        Logs the policy KL and value loss on both (`heldout_policy_kl`, `heldout_value_loss`,
+        `seen_policy_kl`, `seen_value_loss`), and the excess on the held-out positions,
+        `memorized_policy` and `memorized_value`: what training has fit in the positions it
+        trains on that doesn't carry over to new games of the same kind. Each excess has a
+        standard error (`*_se`), from the spread of its micro-batches' means. Also
+        `heldout_stored`, the held-out positions stored."""
         stored = self.memory_buffer.sample_mask(buffer_state)
         held = stored & ~self.trained_envs[:, None]
         if not bool(held.any()):
@@ -1341,16 +1388,20 @@ class Trainer:
         def se(x: jax.Array) -> jax.Array:
             return jnp.sqrt(jnp.var(x, ddof=1) / n) if n > 1 else jnp.array(jnp.nan)
 
-        out: dict[str, jax.Array] = {}
+        out: dict[str, jax.Array] = {"heldout_stored": held.sum()}
         held_losses = self._probe_losses(params, held_batches)
         seen_losses = self._probe_losses(params, seen_batches)
-        for metric, h, t in zip(
-            ("policy_kl", "value_loss"), held_losses, seen_losses, strict=True
+        for short, metric, h, t in zip(
+            ("policy", "value"),
+            ("policy_kl", "value_loss"),
+            held_losses,
+            seen_losses,
+            strict=True,
         ):
             out[f"heldout_{metric}"] = h.mean()
             out[f"seen_{metric}"] = t.mean()
-            out[f"memorized_{metric}"] = h.mean() - t.mean()
-            out[f"memorized_{metric}_se"] = jnp.sqrt(
+            out[f"memorized_{short}"] = h.mean() - t.mean()
+            out[f"memorized_{short}_se"] = jnp.sqrt(
                 jnp.square(se(h)) + jnp.square(se(t))
             )
         return out
@@ -1403,12 +1454,16 @@ class Trainer:
 
     # saving and loading
 
-    def save_weights(self, params: Any, epoch: int) -> str:
-        """Saves the average's (parameters, network state) for `epoch` to `weights_dir`: what a
-        player loads (e.g. `eqx.tree_deserialise_leaves(f, (params, nn_state))`). Written to a
-        temporary file first, so an interrupted save leaves no partial checkpoint."""
-        os.makedirs(self.weights_dir, exist_ok=True)
-        path = checkpoint_path(self.weights_dir, epoch)
+    def save_weights(
+        self, params: Any, epoch: int, directory: str | None = None
+    ) -> str:
+        """Saves (parameters, network state) for `epoch` to `directory`, by default
+        `weights_dir`, the average's: what a player loads (e.g.
+        `eqx.tree_deserialise_leaves(f, (params, nn_state))`). Written to a temporary file
+        first, so an interrupted save leaves no partial checkpoint."""
+        directory = self.weights_dir if directory is None else directory
+        os.makedirs(directory, exist_ok=True)
+        path = checkpoint_path(directory, epoch)
         with open(path + ".tmp", "wb") as f:
             eqx.tree_serialise_leaves(f, params)
         os.replace(path + ".tmp", path)
@@ -1656,9 +1711,10 @@ class Trainer:
         self.parent = meta["parent"]
         if self.monitor is not None and self.monitor.run_id is None:
             self.monitor.run_id = meta["monitor_run"]
-        for epoch in checkpoint_epochs(self.weights_dir):
-            if epoch >= state.cur_epoch:
-                os.remove(checkpoint_path(self.weights_dir, epoch))
+        for directory in (self.weights_dir, self.raw_dir):
+            for epoch in checkpoint_epochs(directory):
+                if epoch >= state.cur_epoch:
+                    os.remove(checkpoint_path(directory, epoch))
         print(f"resuming from {path}: {state.cur_epoch} epochs done", flush=True)
         return state
 
@@ -1853,7 +1909,9 @@ class Trainer:
            `holdout_metrics`)
         7. every `validate_every` epochs, the average's validation metrics are logged
         8. the average's weights are saved (see `save_weights_every`), then the whole state
-           (see `save_state_every`, `save_state_at`)
+           (see `save_state_every`, `save_state_at`), and `epoch_seconds`, the epoch's wall
+           time, is logged. With `save_raw_every`, the network's own weights are saved as the
+           epoch starts
 
         A network whose optimizer state comes from a saved state trains with this trainer's
         injected hyperparameters (see `with_fixed_hyperparams`).
@@ -1936,6 +1994,16 @@ class Trainer:
             )
         try:
             while cur_epoch < num_epochs:
+                started = time.perf_counter()
+                if (
+                    self.save_raw_every is not None
+                    and cur_epoch % self.save_raw_every == 0
+                ):
+                    self.save_weights(
+                        (train_state.params, train_state.nn_state),
+                        cur_epoch,
+                        self.raw_dir,
+                    )
                 # 1. the weight average, with its own network state
                 share = average_share(
                     averaged, self.average_epochs, self.average_warmup
@@ -2052,6 +2120,10 @@ class Trainer:
                             cur_epoch=cur_epoch,
                         )
                     )
+                # the epoch's wall time, self-play, solves, training, probes and saves
+                self.log_metrics(
+                    {"epoch_seconds": time.perf_counter() - started}, cur_epoch - 1
+                )
         finally:
             if solver is not None:
                 solver.shutdown(wait=False, cancel_futures=True)

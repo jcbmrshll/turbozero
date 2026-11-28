@@ -92,6 +92,22 @@ class Echo(eqx.Module):
         return (x[:3] * self.scale, x[3] * self.scale), state
 
 
+class RoundingEcho(eqx.Module):
+    """Echo computing in a dtype it holds as a static field, as a network's inference dtype
+    is."""
+
+    scale: jax.Array
+    dtype: str = eqx.field(static=True)
+
+    def __init__(self, dtype):
+        self.scale = jnp.ones(())
+        self.dtype = dtype
+
+    def __call__(self, x, state):
+        x = (x * self.scale).astype(self.dtype)
+        return (x[:3].astype(jnp.float32), x[3].astype(jnp.float32)), state
+
+
 def make_positions(rng, n):
     legal = rng.random((n, 3)) < 0.7
     legal[:, 0] = True
@@ -149,6 +165,25 @@ def test_the_validator_measures_the_parameters_it_is_given():
     )
     assert validator.get_config()["positions"] == 5
     assert validator.get_config()["groups"] == ["odd"]
+
+
+def test_the_validator_scores_weights_of_a_copy_computing_in_another_dtype():
+    # a run's weights carry its network's bfloat16 setting; the validator's float32 copy
+    # scores them in float32
+    positions = make_positions(np.random.default_rng(2), 6)
+    run_net, state = eqx.nn.make_with_state(RoundingEcho)("bfloat16")
+    params = (eqx.filter(run_net, eqx.is_inexact_array), state)
+    float32_net, _ = eqx.nn.make_with_state(RoundingEcho)("float32")
+    echo, _ = eqx.nn.make_with_state(Echo)()
+
+    in_float32 = ScoredPositionsValidator(positions, float32_net)(params)
+    in_bfloat16 = ScoredPositionsValidator(positions, run_net)(params)
+    exact = ScoredPositionsValidator(positions, echo)(
+        (eqx.filter(echo, eqx.is_inexact_array), state)
+    )
+
+    assert in_float32["engine_value_mse"] == exact["engine_value_mse"]
+    assert in_bfloat16["engine_value_mse"] != exact["engine_value_mse"]
 
 
 MAX_STEPS = 10

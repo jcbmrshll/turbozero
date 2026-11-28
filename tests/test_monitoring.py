@@ -123,14 +123,20 @@ def test_runs_describe_the_metrics_turbozero_logs(key, says):
 @pytest.mark.parametrize(
     "key, headline",
     [
-        ("loss", True),
-        ("policy_loss", True),
-        ("value_loss", True),
+        ("engine_value_mse", True),
+        ("engine_top1", True),
+        ("memorized_value", True),
+        ("memorized_policy", True),
+        ("update_ratio", True),
+        ("epoch_seconds", True),
         ("random_avg_outcome", True),
+        ("loss", None),
         ("policy_kl", None),
+        ("engine_value_mse_endgame", None),
+        ("memorized_value_se", None),
     ],
 )
-def test_runs_headline_their_losses_and_validation_outcomes(key, headline):
+def test_runs_headline_what_tracks_progress_memorization_and_cost(key, headline):
     assert declared(key, "headline") is headline
 
 

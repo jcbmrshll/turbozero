@@ -232,6 +232,15 @@ def main():
         "all kept",
     )
     parser.add_argument(
+        "--save-raw-every",
+        type=int,
+        default=None,
+        metavar="N",
+        help="also save the network's own weights (its raw weights, which the average takes "
+        "in) to --ckpt-dir/raw/<epoch>.eqx at the start of every N epochs, all kept: "
+        "avg<H>/<epoch>.eqx's raw counterpart",
+    )
+    parser.add_argument(
         "--save-state-at",
         type=epoch_list,
         default=[],
@@ -319,14 +328,15 @@ def main():
         temperature=1.0,
         traversal_steps=args.traversal_steps,
     )
-    # the average's raw moves and values against MoHex's, on the engine-labelled set
+    # the average's raw moves and values against MoHex's, on the engine-labelled set, in
+    # float32, so that one checkpoint's numbers compare with the next's
     validators = []
     engine_set = load_engine_set(parser, args, args.size)
     if engine_set is not None:
         validators.append(
             ScoredPositionsValidator(
                 engine_set.scored_positions(),
-                network,
+                game.make_network(args.net, inference_dtype="float32")[0],
                 config={
                     "path": str(args.engine_set or default_path(args.size)),
                     **engine_set.describe(),
@@ -367,6 +377,7 @@ def main():
         validators=validators,
         validate_every=args.validate_every,
         save_weights_every=args.save_weights_every,
+        save_raw_every=args.save_raw_every,
         exploration=Exploration(num_sampling_moves=args.sampling_moves)
         if args.sampling_moves is not None
         else None,

@@ -150,6 +150,8 @@ def test_average_and_save_options_reach_the_trainer(monkeypatch):
             "0",
             "--save-weights-every",
             "10",
+            "--save-raw-every",
+            "5",
             "--save-state-every",
             "20",
             "--save-state-at",
@@ -159,6 +161,7 @@ def test_average_and_save_options_reach_the_trainer(monkeypatch):
     assert kwargs["average_epochs"] == 8.0
     assert kwargs["average_norm_batches"] == 0
     assert kwargs["save_weights_every"] == 10
+    assert kwargs["save_raw_every"] == 5
     assert kwargs["save_state_every"] == 20
     assert kwargs["save_state_at"] == [50, 150]
 
@@ -168,6 +171,7 @@ def test_average_and_save_options_reach_the_trainer(monkeypatch):
     [
         ("--average-epochs", "0.5"),
         ("--save-weights-every", "0"),
+        ("--save-raw-every", "0"),
         ("--holdout-envs", "-1"),
         ("--decoupled-decay",),
         ("--init-without-buffers",),
@@ -219,6 +223,15 @@ def test_the_engine_set_validates_the_average(monkeypatch, tmp_path):
     from test_engine_set import tiny_set
 
     tiny_set(np.random.default_rng(0)).save(tmp_path / "set.npz")
+    made = []
+    make_network = train.make_network
+
+    def recording_make_network(*args, **kwargs):
+        network = make_network(*args, **kwargs)
+        made.append((kwargs.get("inference_dtype"), network[0]))
+        return network
+
+    monkeypatch.setattr(train, "make_network", recording_make_network)
     with pytest.raises(BuiltTrainer) as built:
         run_main(
             monkeypatch,
@@ -232,6 +245,8 @@ def test_the_engine_set_validates_the_average(monkeypatch, tmp_path):
     assert validator.prior_temperature == train.PLAY_PRIOR_TEMPERATURE
     assert validator.get_config()["path"] == str(tmp_path / "set.npz")
     assert built.value.kwargs["validate_every"] == 2
+    # self-play's network computes in bfloat16, the validator's in float32
+    assert [dtype for dtype, _ in made] == ["bfloat16", "float32"]
 
 
 def test_without_an_engine_set_nothing_is_validated(monkeypatch):

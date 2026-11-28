@@ -452,6 +452,7 @@ def test_grad_accum_must_divide_the_batch(env, tmp_path, grad_accum_steps):
         ({"validate_every": 0}, "validate_every"),
         ({"save_weights_every": 0}, "save intervals"),
         ({"save_state_every": 0}, "save intervals"),
+        ({"save_raw_every": 0}, "save intervals"),
         ({"advance_every": 0}, "advance_every"),
         ({"moves_at_once": 0}, "moves_at_once"),
         ({"holdout_envs": 2, "holdout_positions": 4}, "holdout_envs"),
@@ -705,13 +706,43 @@ def test_saved_weights_are_the_averages_with_its_own_statistics(
         assert leaves_equal(c.params[1], marked(None, None, None))
 
 
+def test_raw_weights_are_saved_as_the_average_takes_them_in(env, tmp_path, fake_loop):
+    trainer = make_trainer(env, tmp_path, average_epochs=2, save_raw_every=2)
+    calls = fake_loop(trainer)
+
+    trainer.train_loop(seed=0, num_epochs=4)
+
+    # at the start of every 2nd epoch, the network's weights its training starts from
+    assert checkpoint_epochs(trainer.raw_dir) == [0, 2]
+    assert trainer.raw_dir == str(tmp_path / "raw")
+    template = (trainer.init_train_state().params, trainer.nn_state)
+    for epoch in (0, 2):
+        with open(checkpoint_path(trainer.raw_dir, epoch), "rb") as f:
+            saved = eqx.tree_deserialise_leaves(f, template)
+        trained = of_kind(calls, "train")[epoch].train_state
+        assert leaves_equal(saved, (trained.params, trained.nn_state))
+    # and no average's weights unless asked for
+    assert checkpoint_epochs(trainer.weights_dir) == []
+
+
+def test_epoch_seconds_are_logged_each_epoch(env, tmp_path, fake_loop):
+    monitor = FakeMonitor()
+    trainer = make_trainer(env, tmp_path, monitor=monitor)
+    fake_loop(trainer)
+
+    trainer.train_loop(seed=0, num_epochs=2)
+
+    seconds = logged(monitor, "epoch_seconds")
+    assert set(seconds) == {0, 1} and all(s > 0 for s in seconds.values())
+
+
 def test_resume_loads_the_newest_state_and_drops_the_weights_after_it(env, tmp_path):
     trainer = make_trainer(env, tmp_path, monitor=FakeMonitor(run_id="the-run"))
     trainer.parent = {"path": "elsewhere"}
     for epoch in range(4):
-        trainer.save_weights(
-            (trainer.init_train_state().params, trainer.nn_state), epoch
-        )
+        weights = (trainer.init_train_state().params, trainer.nn_state)
+        trainer.save_weights(weights, epoch)
+        trainer.save_weights(weights, epoch, trainer.raw_dir)
     saved, _ = save_a_state(trainer)
     # as in a new process
     resumed = make_trainer(env, tmp_path, monitor=FakeMonitor())
@@ -722,6 +753,7 @@ def test_resume_loads_the_newest_state_and_drops_the_weights_after_it(env, tmp_p
     assert jax.tree.all(jax.tree.map(np.array_equal, snapshot(state), saved))
     # the continued run saves its weights from the state on again
     assert checkpoint_epochs(resumed.weights_dir) == [0, 1]
+    assert checkpoint_epochs(resumed.raw_dir) == [0, 1]
     # it goes on logging to the run's monitor run, and records the same parent
     assert resumed.monitor is not None and resumed.monitor.run_id == "the-run"
     assert resumed.parent == {"path": "elsewhere"}
@@ -1536,7 +1568,10 @@ def test_collection_metrics(env, tmp_path):
     assert {k: float(v) for k, v in metrics.items()} == pytest.approx(
         {
             "moves": 8,
+            "episodes": 4,
             "episode_draw": 0.25,
+            "buffer_samples": 5,
+            "buffer_distinct_positions": 3,
             "buffer_distinct_fraction": 0.6,
         }
     )
@@ -2087,8 +2122,10 @@ def test_held_out_positions_are_compared_with_trained_on_ones_of_their_ages(
     # both sides sample the newest positions only, which are alike: nothing memorized
     for metric in ("policy_kl", "value_loss"):
         assert metrics[f"heldout_{metric}"] == pytest.approx(metrics[f"seen_{metric}"])
-        assert metrics[f"memorized_{metric}"] == pytest.approx(0.0, abs=1e-6)
-        assert metrics[f"memorized_{metric}_se"] == pytest.approx(0.0, abs=1e-6)
+    for short in ("policy", "value"):
+        assert metrics[f"memorized_{short}"] == pytest.approx(0.0, abs=1e-6)
+        assert metrics[f"memorized_{short}_se"] == pytest.approx(0.0, abs=1e-6)
+    assert int(metrics["heldout_stored"]) == 3
     # held-out positions newer than every trained-on one score nothing
     populated = np.zeros((2, 8), bool)
     populated[0, :4] = True
@@ -2120,10 +2157,10 @@ def test_the_average_is_scored_on_held_out_games(env, tmp_path, monkeypatch):
     assert len(scored) == len(played) == 3
     for p, s in zip(played, scored, strict=True):
         jax.tree.map(np.testing.assert_array_equal, p, s)
-    for name in ("policy_kl", "value_loss"):
+    for name, short in (("policy_kl", "policy"), ("value_loss", "value")):
         held = logged(monitor, f"heldout_{name}")
         seen = logged(monitor, f"seen_{name}")
-        memorized = logged(monitor, f"memorized_{name}")
+        memorized = logged(monitor, f"memorized_{short}")
         assert held and set(held) == set(seen) == set(memorized)
         for epoch in held:
             assert memorized[epoch] == pytest.approx(
@@ -2200,6 +2237,9 @@ def test_a_real_run_trains_and_reports_its_metrics(real_run):
     for epoch in range(4):
         assert real_run.logged[epoch].keys() == {
             "moves",
+            "episodes",
+            "buffer_samples",
+            "buffer_distinct_positions",
             "buffer_distinct_fraction",
             "loss",
             "policy_loss",
@@ -2209,7 +2249,13 @@ def test_a_real_run_trains_and_reports_its_metrics(real_run):
             "weight_norm",
             "update_ratio",
             "grad_norm",
+            "grad_norm_max",
+            "grad_norm_median",
+            "grad_norm_spike",
+            "loss_spike",
+            "nonfinite_steps",
             "engine_top1",
+            "epoch_seconds",
         }
     assert real_run.weights == [0, 1, 2, 3] and real_run.states == [2]
 
@@ -2246,6 +2292,8 @@ def test_a_run_resumed_from_its_saved_state_is_bit_identical(
     for epoch in (2, 3):
         assert logged[epoch].keys() == real_run.logged[epoch].keys()
         for name, value in logged[epoch].items():
+            if name == "epoch_seconds":
+                continue
             np.testing.assert_array_equal(
                 value, real_run.logged[epoch][name], err_msg=f"epoch {epoch}: {name}"
             )

@@ -10,10 +10,78 @@
     {
       "title": "Run",
       "rows": [
-        [{"type": "tiles"}],
-        [{"type": "media", "title": "Test games", "keys": ["*"]}],
-        [{"type": "chart", "title": "Metrics", "metrics": ["*_avg_outcome", "loss", "policy_loss", "value_loss", "*"], "split": true}],
-        [{"type": "config"}]
+        [
+          {
+            "type": "tiles"
+          }
+        ],
+        [
+          {
+            "type": "chart",
+            "title": "Headline",
+            "metrics": [
+              "engine_value_mse",
+              "engine_top1",
+              "memorized_value",
+              "memorized_policy",
+              "update_ratio",
+              "epoch_seconds",
+              "*_avg_outcome"
+            ],
+            "split": true
+          }
+        ],
+        [
+          {
+            "type": "config"
+          }
+        ]
+      ]
+    },
+    {
+      "title": "Health",
+      "rows": [
+        [
+          {
+            "type": "chart",
+            "title": "Health",
+            "metrics": [
+              "policy_loss",
+              "value_loss",
+              "grad_norm",
+              "grad_norm_spike",
+              "loss_spike",
+              "nonfinite_steps",
+              "episode_draw",
+              "buffer_distinct_fraction"
+            ],
+            "split": true
+          }
+        ]
+      ]
+    },
+    {
+      "title": "All metrics",
+      "rows": [
+        [
+          {
+            "type": "chart",
+            "title": "All metrics",
+            "metrics": [
+              "*"
+            ],
+            "split": true
+          }
+        ],
+        [
+          {
+            "type": "media",
+            "title": "Media",
+            "keys": [
+              "*"
+            ]
+          }
+        ]
       ]
     }
   ]

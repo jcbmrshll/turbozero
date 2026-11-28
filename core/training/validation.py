@@ -124,7 +124,10 @@ class ScoredPositionsValidator:
         Args:
             positions: the positions and the engine's scores
             nn: the network (an equinox module, see core.networks.utils.apply_nn); only its
-                structure is used, the weights it's scored with are passed in each call
+                structure is used, the weights it's scored with are passed in each call. They
+                may come from a copy of it that differs only in static settings, e.g. one
+                computing in bfloat16 where `nn` computes in float32: they're put in `nn`'s
+                structure, leaf for leaf
             batch_size: positions per forward pass
             name: prefixes the metrics
             config: (optional) recorded with the validator's configuration, e.g. where the
@@ -156,10 +159,12 @@ class ScoredPositionsValidator:
         self.extra_config = config or {}
         self.prior_temperature = prior_temperature
         static = eqx.filter(nn, eqx.is_inexact_array, inverse=True)
+        structure = jax.tree.structure(eqx.filter(nn, eqx.is_inexact_array))
 
         @jax.jit
         def evaluate(params, observations, legal, scores, groups):
             nn_params, nn_state = params
+            nn_params = jax.tree.unflatten(structure, jax.tree.leaves(nn_params))
             net = eqx.nn.inference_mode(eqx.combine(nn_params, static))
             batches = observations.reshape(-1, batch_size, *observations.shape[1:])
             logits, value = jax.lax.map(
