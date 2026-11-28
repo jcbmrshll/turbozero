@@ -412,12 +412,15 @@ class Driver:
 
     def caught_up(self, main: Line) -> bool:
         """Whether the mainline's next network has caught up with the one playing, by train.py's
-        rule (--grow-metric, --grow-window, --grow-min-epochs), as of its last epoch logged."""
+        rule (--grow-metric, --grow-window, --grow-min-epochs), as of its last epoch logged.
+        Only epochs since the last take-over count: before it, "next" was the network that now
+        plays."""
+        since = max([0, *self.state.takeovers])
         metrics = self.metrics(main)
         caught = [
             v["growth_caught_up"]
-            for _, v in sorted(metrics.items())
-            if "growth_caught_up" in v
+            for e, v in sorted(metrics.items())
+            if e >= since and "growth_caught_up" in v
         ]
         return bool(caught) and caught[-1] == 1
 
@@ -486,7 +489,7 @@ class Driver:
             segment.ckpt_dir,
             "--monitor",
             "--name",
-            f"{Path(segment.ckpt_dir).parent.name}-{Path(segment.ckpt_dir).name}",
+            f"{c.name}-{Path(segment.ckpt_dir).parent.name}-{Path(segment.ckpt_dir).name}",
             "--notes",
             f"fork_driver {c.name}: line {Path(segment.ckpt_dir).parent.name}, epochs "
             f"{segment.start}-{segment.end - 1}, window {c.windows[segment.window]}, "
@@ -670,18 +673,18 @@ class Driver:
         """The last `windows_ahead` windows of matched epochs: (fork's mean, mainline's)."""
         rules = self.config.rules
         theirs, ours = self.series(fork, None), self.series(main, None)
-        # from the last take-over: both lines' playing network is the same one from there
+        # from the last take-over the fork has run: both lines' playing network is the same
+        # one from there (logged_to is the epoch after its last, so one there hasn't run yet)
         since = max(
-            [0, *(at for at in self.state.takeovers if at <= self.logged_to(fork))]
+            [0, *(at for at in self.state.takeovers if at < self.logged_to(fork))]
         )
         matched = sorted(e for e in theirs if e in ours and e >= since)
         out = []
         for w in range(rules.windows_ahead):
-            window = matched[len(matched) - (w + 1) * rules.window_epochs :][
-                : rules.window_epochs
-            ]
-            if len(window) < rules.window_epochs:
-                break
+            start = len(matched) - (w + 1) * rules.window_epochs
+            if start < 0:
+                break  # (a negative start would wrap round to the newest epochs again)
+            window = matched[start : start + rules.window_epochs]
             out.append(
                 (
                     sum(theirs[e] for e in window) / len(window),
@@ -691,7 +694,8 @@ class Driver:
         return out
 
     def ready(self, fork: Line, latest: int) -> bool:
-        """Whether the fork has run long enough to judge."""
+        """Whether the fork has run long enough to judge, as of `latest`, the epoch after the
+        last it has logged."""
         rules = self.config.rules
         if latest - fork.start < rules.min_epochs:
             return False
@@ -704,10 +708,11 @@ class Driver:
             for e, net, _ in self.state.lr_steps
             if fork.start < e <= latest and net == names[self.playing_at(e)]
         ]
-        if steps and latest - steps[-1] >= rules.after_lr_step:
-            return True
+        if steps:
+            return latest - steps[-1] >= rules.after_lr_step
+        # no step to wait for: a fork that started at the floor has no step coming
         floor = len(self.config.lrs) - 1
-        return self.lrs_at(latest)[names[self.playing_at(latest)]] == floor
+        return self.lrs_at(fork.start)[names[self.playing_at(latest - 1)]] == floor
 
     def judge(self, fork: Line, main: Line) -> None:
         rules = self.config.rules
@@ -715,7 +720,8 @@ class Driver:
         windows = self.comparison(fork, main)
         if not self.ready(fork, latest) and latest - fork.start < rules.max_fork_epochs:
             return
-        ahead = len(windows) == rules.windows_ahead and all(
+        compared = len(windows) == rules.windows_ahead
+        ahead = compared and all(
             theirs <= ours - rules.margin for theirs, ours in windows
         )
         means = [[round(t, 5), round(o, 5)] for t, o in windows]
@@ -728,10 +734,15 @@ class Driver:
             slope_per_100(recent) > -rules.plateau_per_100
         )
         # a plateau ends it only without a lead worth waiting on: at a constant low learning
-        # rate every curve is flat, and a fork just short of the margin may yet clear it
+        # rate every curve is flat, and a fork just short of the margin may yet clear it. Nor
+        # does it before the fork has been compared at all: the mainline may lag it (a
+        # preemption), or a take-over has just started the comparison again
         lead = sum(ours - theirs for theirs, ours in windows) / max(len(windows), 1)
         if latest - fork.start >= rules.max_fork_epochs or (
-            self.ready(fork, latest) and plateaued and lead < rules.margin / 2
+            self.ready(fork, latest)
+            and compared
+            and plateaued
+            and lead < rules.margin / 2
         ):
             fork.status, fork.ended_at = "killed", time.time()
             self.backend.stop(fork.job)
@@ -768,15 +779,18 @@ class Driver:
                 )
 
     def maybe_finish(self, main: Line) -> None:
-        """The run ends when every network is at its last learning rate and plateaued there,
-        and no fork is left to try."""
-        if main.status != "running" or not self.due(main):
+        """The run ends when the last network plays at the last learning rate and has plateaued
+        there, and no fork is left to try. Looked at every tick, as of the epoch logged last:
+        the mainline's newest segment (added ahead of its start) doesn't count until it runs."""
+        if main.status != "running":
             return
+        latest = self.logged_to(main)
         floor = len(self.config.lrs) - 1
-        playing = self.playing_at(main.end)
+        playing = self.playing_at(latest - 1)
         if playing + 1 < len(self.config.nets):
             return  # a bigger network is still to take over
-        if self.lrs_at(main.end)[self.config.nets[playing][0]] != floor:
+        net = self.config.nets[playing][0]
+        if self.lrs_at(latest - 1)[net] != floor:
             return
         if any(
             l.status == "running" and l.kind != "main"
@@ -784,13 +798,23 @@ class Driver:
         ):
             return
         last = main.segments[-1]
-        if any(self.next_index(last, kind) is not None for kind in KINDS) and any(
-            self.state.retry_at.get(k, 0) <= self.logged_to(main) for k in KINDS
+        if any(
+            self.next_index(last, k) is not None
+            and self.state.retry_at.get(k, 0) <= latest
+            for k in KINDS
         ):
-            return
+            return  # a fork may start
         rules = self.config.rules
+        # at the floor, and with the network playing now
+        changes = [
+            *self.state.takeovers,
+            *(e for e, n, _ in self.state.lr_steps if n == net),
+        ]
+        since = max([0, *(e for e in changes if e < latest)])
         series = self.lineage_series(main, None)
-        recent = [series[e] for e in sorted(series)[-rules.plateau_epochs :]]
+        recent = [series[e] for e in sorted(series) if e >= since][
+            -rules.plateau_epochs :
+        ]
         if (
             len(recent) < rules.plateau_epochs
             or slope_per_100(recent) <= -rules.plateau_per_100
@@ -860,14 +884,21 @@ class ModalBackend:
         return status.get("state", "queued")
 
     def resume(self, job: str) -> None:
-        """Runs the job again, with `hours_per_line` more than it has spent."""
+        """Runs the job again, with `hours_per_line` more than it has spent. Its status reads
+        queued until the new attempt starts, so the next tick doesn't run it once more."""
         data = get_json(self.store, job_key(job, "job.json"))
         status = get_json(self.store, job_key(job, "status.json")) or {}
         spent = sum(a["seconds"] for a in status.get("attempts", [])) / 3600
         data["hours"] = spent + self.config.hours_per_line
         put_json(self.store, job_key(job, "job.json"), data)
         put_json(self.store, job_key(job, "stop.json"), {"stop": False})
-        modal_jobs.spawn(Job.from_dict(data), self.store)
+        # before the spawn: the new attempt writes its own status as it starts
+        put_json(self.store, job_key(job, "status.json"), {**status, "state": "queued"})
+        try:
+            modal_jobs.spawn(Job.from_dict(data), self.store)
+        except BaseException:
+            put_json(self.store, job_key(job, "status.json"), status)
+            raise
 
     def has_state(self, path: str) -> bool:
         return bool(self.store.sizes(Job("", "", "", 0, self.home, []).key_of(path)))

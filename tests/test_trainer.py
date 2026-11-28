@@ -1535,6 +1535,25 @@ def test_collect_stores_the_searchs_root_value(
     )
 
 
+def test_collect_stores_no_uninitialized_rewards(
+    fixed_length_env, scripted, make_collector, tmp_path
+):
+    # games cut off after 2 of their 3 moves: their entries keep the reward they were stored with
+    env = fixed_length_env(length=3)
+    collect = make_collector(env, scripted.first_legal, 2, tmp_path)
+    state = collect.trainer.init_collection_state(jax.random.PRNGKey(0), batch_size=1)
+
+    # on GPU, `empty` is uninitialized memory; on CPU it's zeros, so only the trace shows it
+    jaxpr = jax.make_jaxpr(collect.step)(
+        jax.random.split(jax.random.PRNGKey(0), 1), state
+    )
+    assert not re.search(r"\bempty\[", str(jaxpr))
+    # two games, both cut off: nothing to sample, but their entries' rewards stay in the buffer
+    buffer_state = collect(num_steps=4).buffer_state
+    assert not buffer_state.populated.any()
+    np.testing.assert_array_equal(buffer_state.buffer.reward, 0.0)
+
+
 def test_collect_steps_runs_the_evaluator_it_is_given(env, tmp_path):
     # evaluators whose states have the same shapes: if self-play kept running the first one's
     # compiled code, only the values it stores would show it

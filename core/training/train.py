@@ -1658,7 +1658,9 @@ class Trainer:
                 observation_nn=self.state_to_nn_input_fn(state.env_state),
                 policy_mask=state.metadata.action_mask,
                 policy_weights=eval_output.policy_weights,
-                reward=jnp.empty_like(state.metadata.rewards),
+                # its game's result replaces it; zeros, not `empty_like`: on GPU that's
+                # uninitialized memory, which stays in the entries of games set aside or cut off
+                reward=jnp.zeros_like(state.metadata.rewards),
                 cur_player_id=state.metadata.cur_player_id,
                 search_value=search_value,
             ),
