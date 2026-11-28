@@ -145,6 +145,58 @@ def test_sample_indices_with_replacement_from_fewer_entries():
     np.testing.assert_array_equal(indices, [8 + 3] * 5)
 
 
+def trainer_sized_masks():
+    """Sample masks the size of a trainer's buffer, 1024 environments of 2250 entries: the
+    trained-on environments' (all but the last 32, older entries not yet written) and the held-out
+    ones' (only the last 32)."""
+    rng = np.random.default_rng(0)
+    written = rng.random((1024, 2250)) < 0.9
+    trained = np.arange(1024)[:, None] < 1024 - 32
+    return {"trained": written & trained, "held out": written & ~trained}
+
+
+@pytest.mark.parametrize("replace", [True, False])
+@pytest.mark.parametrize("which", ["trained", "held out"])
+def test_sample_indices_draws_only_marked_entries_of_millions(which, replace):
+    mask = trainer_sized_masks()[which]
+    buffer = EpisodeReplayBuffer(capacity=2250)
+    # without replacement, fewer than the held-out environments' 65,000 or so
+    size = 1 << 17 if replace else 1 << 15
+    sample = jax.jit(lambda key, mask: buffer.sample_indices(key, mask, size, replace))
+
+    for seed in range(4):
+        indices = np.asarray(sample(jax.random.PRNGKey(seed), jnp.asarray(mask)))
+        assert mask.reshape(-1)[indices].all()
+
+
+@pytest.mark.parametrize(
+    "marked",
+    [
+        [3],
+        [0],
+        [47],
+        [0, 47],
+        [1, 2, 3, 40, 41],
+        list(range(10, 48)),
+        list(range(48)),
+    ],
+)
+def test_sample_indices_with_replacement_draws_marked_entries_uniformly(marked):
+    mask = np.zeros((3, 16), dtype=bool)
+    mask.reshape(-1)[marked] = True
+    buffer = EpisodeReplayBuffer(capacity=16)
+    draws = 20_000 * len(marked)
+
+    indices = jax.jit(
+        lambda key, mask: buffer.sample_indices(key, mask, draws, replace=True)
+    )(jax.random.PRNGKey(0), jnp.asarray(mask))
+
+    counts = np.bincount(np.asarray(indices), minlength=mask.size)
+    assert counts[~mask.reshape(-1)].sum() == 0
+    # each about 20,000 times: within 5 standard deviations
+    np.testing.assert_allclose(counts[marked], 20_000, atol=5 * np.sqrt(20_000))
+
+
 def test_sample_only_returns_finished_populated_entries():
     buffer = EpisodeReplayBuffer(capacity=4)
     # two environments, as the trainer stores them (batch, capacity, ...)
