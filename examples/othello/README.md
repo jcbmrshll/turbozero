@@ -355,9 +355,22 @@ uv run examples/othello/train.py --epochs 30 --init-from runs/trunk/state-150.np
     --sims 128 --ckpt-dir runs/trunk150-sims128
 ```
 
-The learning rate holds `--lr`, then drops 10x at 70% of the run and again at 90% (`--lr-drops`).
+The learning rate holds `--lr`, then drops 10x at 70% of the run and again at 90% (`--lr-drops`;
+by default `--lr`/10 and `--lr`/100, so 1e-4 and 1e-5 at 1e-3).
 To read several budgets from one run, fork that same schedule: train the trunk at a constant
-learning rate to 70% of a budget, then fork the last 30%, with `--lr 1e-4 --lr-drops 0.667:1e-5`.
+learning rate to 70% of a budget, then fork the last 30%, with
+`--lr 1e-4 --weight-decay 0.05 --lr-drops 0.667:1e-5`.
+
+The weight decay follows the learning rate: `--weight-decay` is its value at `--lr`, and it is
+`--weight-decay` times the rate / `--lr` along the cosine (`--lr-final`), after each of
+`--lr-drops` and `--lr-plateau`'s drops, and after `--lr-drop`. Under a normalization most
+weights' scale doesn't change the network's output, and AdamW settles their norm about
+sqrt(learning rate / weight decay): a 10x drop with the decay held shrinks it about 3x over the
+following epochs, which raises the effective step (about the learning rate / the norm) back
+and costs the drop much of its gain (at 1e-4 with the decay held at 0.5, 4x64-class nets' norms
+halved and their engine regret rose). Dropping both holds the norm. `--constant-weight-decay`
+holds the decay instead. A fork at a lower `--lr` than its parent's passes the decay at that
+rate, as above.
 
 A drop at a share of the budget comes too late in long runs: at 1e-3, 6x96 and 8x128 nets stop
 gaining after about 120-160 epochs whatever the budget. `--lr-plateau` drops when training
@@ -686,7 +699,7 @@ paths a local run would write them to, so analysis and the Elo league don't need
 # steps run in order on one GPU, from the commit named (it must be on GitHub)
 uv run examples/othello/modal_jobs.py launch --name trunk-a --gpu L40S --hours 4 --commit 7b52872 \
     --step "examples/othello/train.py --epochs 93 --lr-final 1e-3 --save-state-at 93 --monitor --name a --notes why --ckpt-dir $C/trunk > $L/trunk.log" \
-    --step "examples/othello/train.py --epochs 19 --lr 1e-4 --lr-final 1e-4 --init-from $C/trunk/state-93.npz --ckpt-dir $C/fork > $L/fork.log"
+    --step "examples/othello/train.py --epochs 19 --lr 1e-4 --lr-final 1e-4 --weight-decay 0.05 --init-from $C/trunk/state-93.npz --ckpt-dir $C/fork > $L/fork.log"
 uv run examples/othello/modal_jobs.py list [--billed today]
 uv run examples/othello/modal_jobs.py stop trunk-a       # or --all; --now doesn't wait for the run to end as stopped
 uv run examples/othello/modal_jobs.py resume trunk-a     # after it ended short; --hours for a new limit

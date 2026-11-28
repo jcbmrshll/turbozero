@@ -16,13 +16,20 @@ class LRDrop:
     takes over counts its own epochs from 0, starting warm on the new data its play brings.
     Without growth, the network plays from the run's first epoch (a fork's, after `fork_from`).
 
+    Scaling the updates alone scales the weight decay's step with them (learning rate * weight
+    decay), as a drop with the decay held would, and that shrinks a normalized network's weight
+    norm (see `core.training.train.adamw`): with `scale_decay` the optimizer's injected
+    `weight_decay`, if it has one, is scaled by `factor` too, as dropping both would.
+
     Attributes:
         after_epochs: epochs a network plays at the full rate
         factor: the learning rate's scale from then on, e.g. 0.1
+        scale_decay: scale the optimizer's weight decay by `factor` too
     """
 
     after_epochs: int
     factor: float
+    scale_decay: bool = True
 
     def __post_init__(self):
         if self.after_epochs < 0 or not 0 < self.factor <= 1:
@@ -36,4 +43,8 @@ class LRDrop:
         return self.factor if played >= self.after_epochs else 1.0
 
     def get_config(self) -> dict:
-        return {"after_epochs": self.after_epochs, "factor": self.factor}
+        return {
+            "after_epochs": self.after_epochs,
+            "factor": self.factor,
+            "scale_decay": self.scale_decay,
+        }

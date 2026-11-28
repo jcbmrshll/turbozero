@@ -1,9 +1,11 @@
 """train.py's command line, up to the trainer it builds, with a fake trainer."""
 
+import itertools
 import math
 import sys
 from types import SimpleNamespace
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -126,6 +128,85 @@ def test_lr_plateau_steps_from_lr_to_its_rates(monkeypatch):
     )
     state = built.value.kwargs["optimizer"].init({"w": jnp.zeros(2)})
     assert float(state.hyperparams["learning_rate"]) == pytest.approx(3e-3)
+
+
+def rates_and_decays(optimizer, steps):
+    """The learning rate and the weight decay applied (the zero gradient's update over -w,
+    over the rate) of each of `steps` updates of `optimizer`."""
+    params = {"w": jnp.ones((2, 2))}
+    zeros = {"w": jnp.zeros((2, 2))}
+    update = jax.jit(optimizer.update)
+    state = optimizer.init(params)
+    out = []
+    for _ in range(steps):
+        updates, state = update(zeros, state, params)
+        lr = float(state.hyperparams["learning_rate"])
+        out.append((lr, float(-updates["w"][0, 0]) / lr))
+    return out
+
+
+def built_rates(monkeypatch, *options):
+    """The learning rates and decays of train.py's optimizer over a run of 2 epochs of 50
+    steps."""
+    with pytest.raises(BuiltTrainer) as built:
+        run_main(monkeypatch, "--epochs", "2", "--train-steps", "50", *options)
+    return rates_and_decays(built.value.kwargs["optimizer"], 100)
+
+
+def test_the_default_drops_are_from_lr(monkeypatch):
+    # 10x at 70% of the run, 100x at 90%, from whatever --lr is: a low --lr never rises
+    for lr in (1e-3, 2.5e-5):
+        rates = [rate for rate, _ in built_rates(monkeypatch, "--lr", str(lr))]
+        assert rates[:70] == pytest.approx([lr] * 70)
+        assert rates[70:90] == pytest.approx([lr / 10] * 20)
+        assert rates[90:] == pytest.approx([lr / 100] * 10)
+        assert all(b <= a for a, b in itertools.pairwise(rates))
+
+
+@pytest.mark.parametrize(
+    "schedule",
+    [(), ("--lr-drops", "0.5:2e-4"), ("--lr-final", "1e-5")],
+)
+def test_the_weight_decay_follows_the_learning_rate(monkeypatch, schedule):
+    # --weight-decay at --lr, the rate's share of it at any other
+    scaled = built_rates(
+        monkeypatch, "--lr", "1e-3", "--weight-decay", "0.4", *schedule
+    )
+    assert min(rate for rate, _ in scaled) < 5e-4
+    for rate, decay in scaled:
+        assert decay == pytest.approx(0.4 * rate / 1e-3, rel=1e-4)
+    held = built_rates(
+        monkeypatch,
+        "--lr",
+        "1e-3",
+        "--weight-decay",
+        "0.4",
+        "--constant-weight-decay",
+        *schedule,
+    )
+    for _, decay in held:
+        assert decay == pytest.approx(0.4, rel=1e-4)
+
+
+def test_an_lr_drop_drops_the_weight_decay_unless_it_is_held(monkeypatch):
+    for options, scale_decay in (((), True), (("--constant-weight-decay",), False)):
+        with pytest.raises(BuiltTrainer) as built:
+            run_main(monkeypatch, "--lr-drop", "150:0.1", *options)
+        assert built.value.kwargs["lr_drop"].scale_decay == scale_decay
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ("--lr", "2.5e-5", "--lr-drops", "0.7:1e-4"),
+        ("--lr-drops", "0.5:1e-4,0.7:1e-4"),
+        ("--lr", "1e-4", "--lr-drops", "0.5:1e-4"),
+        ("--lr", "1e-4", "--lr-final", "1e-3"),
+    ],
+)
+def test_a_schedule_that_raises_the_rate_is_refused(monkeypatch, options):
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, *options)
 
 
 def test_without_lr_plateau_the_rule_is_off(monkeypatch):

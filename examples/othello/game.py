@@ -22,6 +22,7 @@ from core.networks.spec import make_network as build_network
 from core.networks.spec import network_config
 from core.training.lr_plateau import LRPlateau
 from core.training.train import (
+    adamw,
     sgdw,
     weight_decay_mask,
 )
@@ -122,7 +123,8 @@ SYMMETRY_TRANSFORM_FNS = [
 ]
 
 
-# AdamW's decay of a weight each step is learning rate * WEIGHT_DECAY * weight. An L2 penalty
+# AdamW's decay of a weight each step is learning rate * WEIGHT_DECAY * weight at the first
+# learning rate (the decay drops with the rate, see make_optimizer). An L2 penalty
 # of 1e-4 in the loss, which training used before, came to about this under Adam on the
 # convolutions (from 0.3 to 0.8, Adam's normalization making it uneven between weights)
 WEIGHT_DECAY = 0.5
@@ -231,6 +233,7 @@ def make_optimizer(
     sgd: bool = False,
     momentum: float = 0.9,
     decoupled: bool = False,
+    decay_with_lr: bool = True,
 ) -> optax.GradientTransformation:
     """AdamW, or with `sgd` SGD with `momentum` (see `core.training.train.sgdw`: its weight decay
     L2 or, with `decoupled`, AdamW's kind), with the learning rate decaying from `lr` to `lr_final` over
@@ -239,8 +242,10 @@ def make_optimizer(
     with `lr_plateau`, its rates, dropping when training stops improving (the trainer's
     `lr_plateau` too; `lr`, `lr_final` and `lr_drops` are unused). And
     weight decay on the network's weights, not its biases or BatchNorm scales and offsets (see
-    `weight_decay_mask`). Its hyperparameters are injected, for the trainer to record them and
-    log the learning rate."""
+    `weight_decay_mask`): `weight_decay` at the first rate, and with `decay_with_lr` following
+    the rate from there (see `core.training.train.adamw`), so that a drop holds the weight norm;
+    without it, `weight_decay` throughout. Its hyperparameters are injected, for the trainer to
+    record them and log the learning rate; the injected `weight_decay` is the first rate's."""
     schedule = (
         # constant: its program then doesn't depend on the run's length, so a run in steps
         # (controller.py) compiles its training once, into the persistent compilation cache
@@ -262,18 +267,24 @@ def make_optimizer(
             },
         )
     learning_rate = schedule if lr_plateau is None else lr_plateau
+    first = lr if lr_plateau is None else lr_plateau.rates[0]
+    decay_lr = first if decay_with_lr else None
     if sgd:
-        return optax.inject_hyperparams(sgdw, static_args=("mask", "decoupled"))(
+        return optax.inject_hyperparams(
+            sgdw, static_args=("mask", "decoupled", "decay_lr")
+        )(
             learning_rate=learning_rate,
             momentum=momentum,
             weight_decay=weight_decay,
             decoupled=decoupled,
             mask=weight_decay_mask,
+            decay_lr=decay_lr,
         )
-    return optax.inject_hyperparams(optax.adamw, static_args=("mask",))(
+    return optax.inject_hyperparams(adamw, static_args=("mask", "decay_lr"))(
         learning_rate=learning_rate,
         weight_decay=weight_decay,
         mask=weight_decay_mask,
+        decay_lr=decay_lr,
     )
 
 
