@@ -202,13 +202,12 @@ def test_collection_metrics_count_missed_games(
     env = fixed_length_env(length=LENGTH)
     collect = collector(make_collector, env, scripted, tmp_path, slots=1)
 
-    metrics = collect.trainer.collection_metrics(
-        CollectionStats.of(collect(0)), collect(STOP + 1 + LENGTH)
-    )
+    before, after = CollectionStats.of(collect(0)), collect(STOP + 1 + LENGTH)
+    metrics = collect.trainer.collection_metrics(before, after)
 
     assert int(metrics["solve_missed"]) == 1
     # the played-out game; the stopped one counts when it's labelled
-    assert int(metrics["episodes"]) == 1
+    assert int((after.episodes - before.episodes).sum()) == 1
 
 
 # past the solve point: never ending early, a game plays to its end

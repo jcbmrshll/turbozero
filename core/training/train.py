@@ -389,13 +389,12 @@ def with_hyperparams(opt_state: Any, hyperparams: Mapping[str, Any]) -> Any:
 
 def solve_summary(solved: Sequence[Solved]) -> dict[str, jax.Array]:
     """An epoch's metrics of exact endgame labels (see `Trainer.collection_metrics`), from its
-    solves: `solve_games`, the games labelled at their solve points, `solve_draw`, the fraction
-    of them drawn, and `solve_positions`, every position solved."""
+    solves: `solve_draw`, the fraction of the games labelled at their solve points that are
+    drawn, and `solve_positions`, every position solved."""
     whole = np.concatenate(
         [s.solves[s.whole] for s in solved if len(s.solves)] or [np.zeros((0, 0))]
     )
     return {
-        "solve_games": jnp.asarray(len(whole)),
         "solve_positions": jnp.asarray(sum(len(s.solves) for s in solved)),
         **(
             {"solve_draw": jnp.asarray((whole == 0).all(-1).mean())}
@@ -543,7 +542,7 @@ class Trainer:
             data_transform_fns: (optional) data transforms (e.g. a board's rotations and
                 reflections, see `core.memory.replay_memory.DataTransformFn`) besides the
                 identity. Training maps each sample through one drawn uniformly at random.
-                Together they must be a group, for `buffer_distinct_positions` to count
+                Together they must be a group, for `buffer_distinct_fraction` to count
                 positions up to them
             advance_every: (optional) self-play plays the moves whose searches are done every
                 this many cycles (see `collect_steps`); by default the evaluator's
@@ -1075,14 +1074,12 @@ class Trainer:
         self, before: CollectionStats, after: CollectionState
     ) -> dict:
         """What an epoch's self-play played and what the replay buffer holds after it:
-        - `moves`, `episodes`: moves played and episodes finished in all environments
-        - with `episode_metrics_fn`: `episode_<name>`, each metric's mean over those episodes,
-          omitted if none finished
-        - `buffer_samples`: positions in the replay buffer training can sample
-        - `buffer_distinct_positions`: distinct observations among them, those a data transform
-          maps to one another counting as one (e.g. a board and its rotations), and
-          `buffer_distinct_fraction`, that as a fraction of `buffer_samples`: to spot self-play
-          collapsing into the same few games
+        - `moves`: moves played in all environments
+        - with `episode_metrics_fn`: `episode_<name>`, each metric's mean over the episodes
+          finished, omitted if none did
+        - `buffer_distinct_fraction`: the fraction of the positions training can sample that are
+          distinct, those a data transform maps to one another counting as one (e.g. a board
+          and its rotations): to spot self-play collapsing into the same few games
         - with `endgame_solve`: `solve_missed`, the solves that found every slot full (the
           training loop adds `solve_summary`'s)
 
@@ -1094,9 +1091,6 @@ class Trainer:
         distinct, total = self.count_distinct_observations(after.buffer_state)
         metrics = {
             "moves": (after.moves - before.moves).sum(),
-            "episodes": episodes,
-            "buffer_samples": total,
-            "buffer_distinct_positions": distinct,
             "buffer_distinct_fraction": distinct / jnp.maximum(total, 1),
         }
         if episodes > 0:

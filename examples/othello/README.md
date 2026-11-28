@@ -77,9 +77,8 @@ sims), self-play 1.2 to 1.25 times as fast as with 1.
 
 `--buffer` sets replay memory, the positions kept per environment, which training samples
 from. Self-play adds 128 an epoch (a position a move), so the default 1125 is about the last
-9 epochs. The run's page plots the positions training can sample as `buffer_samples`, and
-how many of them are distinct, a position's symmetric images counting as one, as
-`buffer_distinct_positions`.
+9 epochs. The run's page plots the fraction of the positions training can sample that are
+distinct, a position's symmetric images counting as one, as `buffer_distinct_fraction`.
 
 `--buffer-window N` trains on only each environment's newest N of the positions kept, as if
 `--buffer` were N, while the older ones stay stored. A branch can then widen the window at once,
@@ -212,8 +211,8 @@ through its training and the next epoch's self-play, and trained on from then. A
 epoch solves them at once, since it has nothing else to train on. On the 4x64 at 128 sims, an
 epoch stores 43,000-60,000 positions at 20 or fewer empties, solved in 13-19 s on 14 cores, and
 self-play waited under 0.25 s an epoch for them (`--solve-threads`, default every core the process
-may use; on Modal, `--cpu 16`). `solve_positions` counts every solve, and `solve_games`,
-`solve_draw` and `solve_missed` count the games.
+may use; on Modal, `--cpu 16`). `solve_positions` counts every solve, and `solve_draw`
+and `solve_missed` count the games.
 
 `--solve-play-past MEAN` ends games early instead: each game stops past N before each further
 move with probability 1 / (1 + MEAN), MEAN moves on average, a geometric number, and skips those

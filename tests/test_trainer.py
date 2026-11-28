@@ -403,7 +403,7 @@ def fake_loop(monkeypatch):
             trainer,
             "collection_metrics",
             lambda before, after: {
-                "episodes": (after.episodes - before.episodes).sum()
+                "fake_episodes": (after.episodes - before.episodes).sum()
             },
         )
         if can_train is not None:
@@ -605,7 +605,7 @@ def test_train_loop_reports_to_the_monitor(env, tmp_path, fake_loop):
     for epoch in range(2):
         metrics = monitor.by_epoch()[epoch]
         assert metrics["loss"] == 0 and metrics["top1"] == 1
-        assert metrics["episodes"] == 2
+        assert metrics["fake_episodes"] == 2
     assert monitor.finished == ["finished"]
 
 
@@ -1536,10 +1536,7 @@ def test_collection_metrics(env, tmp_path):
     assert {k: float(v) for k, v in metrics.items()} == pytest.approx(
         {
             "moves": 8,
-            "episodes": 4,
             "episode_draw": 0.25,
-            "buffer_samples": 5,
-            "buffer_distinct_positions": 3,
             "buffer_distinct_fraction": 0.6,
         }
     )
@@ -1909,7 +1906,6 @@ def test_games_waiting_for_solves_are_solved_during_self_play_and_labelled_after
     assert [c.kind for c in calls] == ["collect", "label", "train"] * 2
     for c in of_kind(calls, "label"):
         np.testing.assert_array_equal(c.counts, [1, 0])
-    assert logged(monitor, "solve_games") == {0: 1.0, 1: 1.0}
     assert logged(monitor, "solve_positions") == {0: 1.0, 1: 1.0}
     assert logged(monitor, "solve_draw") == {0: 0.0, 1: 0.0}
 
@@ -1984,7 +1980,7 @@ def test_without_a_batch_to_train_on_the_games_just_stopped_are_solved_at_once(
     # epoch 0: none waiting during its self-play, then the games it stopped, at once; epoch 1:
     # none left over, then its own, for epoch 2
     assert_solved(solved, [[0, 0], [1, 1], [1, 1], [2, 2]])
-    assert logged(monitor, "solve_games") == {0: 2.0, 1: 0.0}
+    assert logged(monitor, "solve_positions") == {0: 2.0, 1: 0.0}
     # both epochs train, once the games are labelled
     assert [c.kind for c in calls] == ["collect", "train"] * 2
 
@@ -2196,9 +2192,6 @@ def test_a_real_run_trains_and_reports_its_metrics(real_run):
     for epoch in range(4):
         assert real_run.logged[epoch].keys() == {
             "moves",
-            "episodes",
-            "buffer_samples",
-            "buffer_distinct_positions",
             "buffer_distinct_fraction",
             "loss",
             "policy_loss",

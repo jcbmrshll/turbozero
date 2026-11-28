@@ -95,7 +95,6 @@ def declared(key, field):
         ("loss", "The loss training minimizes"),
         ("policy_target_entropy", "no network can lower"),
         ("policy_kl", "KL divergence"),
-        ("episodes", "Self-play games that ended"),
         ("episode_draw", "drawn"),
         ("random_avg_outcome", "mean outcome"),
         ("random_win_rate", "won"),
