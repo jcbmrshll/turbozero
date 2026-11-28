@@ -820,6 +820,57 @@ def test_a_planned_solve_takes_its_moves_and_reserve_out_of_the_budget():
     assert solving.depth(1e-9) == 0
 
 
+def late_position(empties: int, seed: int = 0) -> tuple[int, int]:
+    """A random game's position (the mover's discs, the other's) with at most `empties` empty
+    squares, its mover with two moves or more."""
+    from cpu_search import Search
+
+    rng = np.random.default_rng(seed)
+    while True:
+        search = Search()
+        while not search.terminated():
+            me, opp, _, _ = search.position()
+            if 64 - (me | opp).bit_count() <= empties and search.num_legal() > 1:
+                return me, opp
+            search.play(int(rng.choice(np.flatnonzero(search.legal()))))
+
+
+def test_a_solve_given_up_leaves_the_rest_of_the_clock_to_search(monkeypatch):
+    """Past the planned solve (it gave up), nothing is kept for it: the move is searched on the
+    clock left, even one shorter than the solve's reserve."""
+    import cpu_match
+    from cpu_match import NetPlayer, Solving, expected_use, move_budget
+    from cpu_search import Search, SearchSettings
+
+    budgets = []
+    real_timed_move = cpu_match.timed_move
+
+    def timed_move(search, seconds, *args, **kwargs):
+        budgets.append(seconds)
+        return real_timed_move(search, seconds, *args, **kwargs)
+
+    monkeypatch.setattr(cpu_match, "timed_move", timed_move)
+    solving = Solving(empties=20, exact=False)
+    player = NetPlayer(
+        SearchSettings(batch=2), fake_eval, solving=solving, stop_decided=True
+    )
+    monkeypatch.setattr(player, "solve", lambda *args: None)
+    me, opp = late_position(18)
+    player.set_position(me, opp, "b")
+    player.solve_from = 20
+    empties = 64 - (me | opp).bit_count()
+    # less on the clock than the solve's reserve
+    assert solving.kept(20, 1.0) > 1.0
+    move = player.move("b", 1.0)
+    assert budgets == [
+        pytest.approx(min(move_budget(1.0, empties) / expected_use([]), 0.95), rel=1e-3)
+    ]
+    assert player.search.total_visits() > 0
+    position = Search()
+    position.set_position(me, opp)
+    assert position.legal()[move]
+
+
 def test_net_players_play_a_game_through_the_clock_driver():
     from clock_match import play_game
     from cpu_match import NetPlayer
@@ -1023,6 +1074,43 @@ def test_a_timed_search_stops_at_its_time(tiny_model):
     engine.search(search, seconds=0.05)
     assert 0.05 <= time.perf_counter() - start < 0.5
     assert search.total_visits() > 10
+
+
+@pytest.mark.parametrize("stop_decided", [False, True])
+def test_a_search_of_no_time_still_expands_its_root(tiny_model, stop_decided):
+    """With no time (a contest's clock run out), a search still evaluates its root, on its own
+    loop or an `Engine`'s: its move is the best prior's, a legal one."""
+    from cpu_match import timed_move
+    from cpu_search import Engine, Search, SearchSettings
+
+    engine = Engine.openvino(tiny_model, 2, 2)
+    for run in (
+        lambda s: timed_move(
+            s, 0.0, np.empty((2, 2, 8, 8), np.float32), fake_eval, stop_decided
+        ),
+        lambda s: engine.search(s, seconds=0.0, stop_decided=stop_decided),
+    ):
+        search = Search(SearchSettings(batch=2, virtual_loss="visit"))
+        for action in (19, 18, 26):
+            search.play(action)
+        assert not search.expanded()
+        run(search)
+        assert search.expanded()
+        action = search.best_action()
+        priors = search.priors()
+        assert search.legal()[action] and priors[action] == priors.max()
+
+
+def test_an_unexpanded_root_plays_its_first_legal_move(tiny_model):
+    """A search halted before its root's evaluation has the first legal move to play."""
+    from cpu_search import Engine, Search, SearchSettings
+
+    search = Search(SearchSettings(batch=2))
+    search.play(19)
+    assert search.best_action() == search.first_legal()
+    search.halt()
+    Engine.openvino(tiny_model, 2, 2).search(search, seconds=0.0)
+    assert not search.expanded() and search.best_action() == search.first_legal()
 
 
 def test_a_timed_search_stops_once_its_move_is_decided(tiny_model):
@@ -1354,6 +1442,19 @@ def test_seven_bit_avx2_changes_only_convnext_blocks(spec, monkeypatch):
     eight_bit = np.abs(want_logits - float_logits).mean()
     assert np.abs(logits - float_logits).mean() < max(3 * eight_bit, 0.02)
     assert np.abs(values - float_values).mean() < 0.05
+
+
+def test_a_network_too_big_for_the_native_buffers_is_refused():
+    import cpu_net
+
+    if not native_supported():
+        pytest.skip("needs AVX2 or NEON's dot product")
+    program = cpu_net.extract(
+        *random_network("resnet:1x16,heads=pooled,head_channels=144")
+    )
+    x = (np.random.default_rng(0).random((16, 2, 8, 8)) < 0.3).astype(np.float32)
+    with pytest.raises(ValueError, match="head_channels"):
+        cpu_net.NativeNet(*cpu_net.quantize(program, x))
 
 
 def test_an_engine_of_the_native_network_searches_as_a_batch_of_one():

@@ -950,6 +950,8 @@ class NativeNet:
         linear("value_out", -1, p.value_out)
         conv("head", 0, q["head"])
         lib.net_set_heads(self.handle, ptr(p.square_w))
+        if too_big := lib.net_check(self.handle):
+            raise ValueError(f"too big for the native network: {too_big.decode()}")
 
     def __del__(self) -> None:
         if getattr(self, "handle", None):

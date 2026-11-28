@@ -107,6 +107,7 @@ def load_library() -> ctypes.CDLL:
         "search_num_legal": (ctypes.c_int, [Search]),
         "search_first_legal": (ctypes.c_int, [Search]),
         "search_best_action": (ctypes.c_int, [Search]),
+        "search_expanded": (ctypes.c_int, [Search]),
         "search_visits": (None, [Search, ints]),
         "search_legal": (None, [Search, ints]),
         "search_priors": (
@@ -176,6 +177,7 @@ def load_library() -> ctypes.CDLL:
             + [floats, floats],
         ),
         "net_set_heads": (None, [ctypes.c_void_p, floats]),
+        "net_check": (ctypes.c_char_p, [ctypes.c_void_p]),
         "net_set_depthwise": (
             ctypes.c_int,
             [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
@@ -317,8 +319,12 @@ class Search:
             self.apply(logits, values)
 
     def best_action(self) -> int:
-        """The most visited action."""
+        """The most visited action; the first legal one if the root isn't expanded."""
         return LIB.search_best_action(self.handle)
+
+    def expanded(self) -> bool:
+        """Whether the root has its edges (or is the game's end, with none)."""
+        return bool(LIB.search_expanded(self.handle))
 
     def num_legal(self) -> int:
         return LIB.search_num_legal(self.handle)
@@ -508,7 +514,8 @@ class Engine:
         with nothing left to evaluate is theirs too. With `stop_decided`, a search on a clock ends once its move can't
         change in the time left at the rate it has searched (its most visited move leads every
         other by more than the visits still to come), leaving the rest of the time unspent.
-        Returns the leaves evaluated."""
+        Either way it searches at least until the root is expanded, so that there's a move to
+        choose. Returns the leaves evaluated."""
         return LIB.engine_search(
             self.handle, search.handle, visits, seconds, int(stop_decided)
         )
