@@ -277,7 +277,7 @@ struct Segments {
         std::free(table);
     }
 
-    T& operator[](int64_t i) const { return relaxed(table[i >> SHIFT])[i & (SIZE - 1)]; }
+    T& operator[](int64_t i) const { return acquired(table[i >> SHIFT])[i & (SIZE - 1)]; }
 
     static T* fresh() {
         T* segment = static_cast<T*>(std::aligned_alloc(HUGE_PAGE, BYTES));
@@ -963,7 +963,15 @@ int search_first_legal(const Search* s) {
     return legal ? __builtin_ctzll(legal) : PASS;
 }
 
-// The most visited action, the higher prior of equals.
+// Whether the root has its edges, or is the game's end and has none to have (or there's no root).
+int search_expanded(const Search* s) {
+    if (s->root < 0) return 1;
+    const Node& root = s->nodes[s->root];
+    return acquired(root.num_edges) > 0 || root.position.terminated;
+}
+
+// The most visited action, the higher prior of equals; with the root not yet expanded (a search
+// halted before its first evaluation), the first legal one.
 int search_best_action(const Search* s) {
     const Node& root = s->nodes[s->root];
     int best = -1;
@@ -977,7 +985,7 @@ int search_best_action(const Search* s) {
             best = e.action;
         }
     }
-    return best;
+    return best >= 0 ? best : search_first_legal(s);
 }
 
 // `out`, (65): the root's edges' visits
@@ -1271,8 +1279,9 @@ static bool decided_on_clock(const Search& s, long visits_before, double elapsed
 }
 
 // Searches `s`'s tree with all the engine's workers: `visits` visits, or with none, until `seconds`
-// pass (or, with `stop_decided`, its move is decided: `decided_on_clock`), or either way until
-// halted (`search_halt`). Batches in flight then are finished. Returns the leaves evaluated.
+// pass and the root is expanded (or, with `stop_decided`, its move is decided: `decided_on_clock`), or
+// either way until halted (`search_halt`). Batches in flight then are finished. Returns the leaves
+// evaluated.
 long engine_search(Engine* engine, Search* s, int visits, double seconds, int stop_decided) {
     using clock = std::chrono::steady_clock;
     auto start = clock::now();
@@ -1296,7 +1305,7 @@ long engine_search(Engine* engine, Search* s, int visits, double seconds, int st
             auto now = timed ? clock::now() : start;
             bool check = watch && mine.calls % DECIDED_CHECK_EVERY == 0;
             if (stop.load(std::memory_order_relaxed) || s->halted.on.load(std::memory_order_relaxed) ||
-                (timed && now >= deadline) ||
+                (timed && now >= deadline && search_expanded(s)) ||
                 (check && decided_on_clock(*s, visits_before, std::chrono::duration<double>(now - start).count(),
                                            std::chrono::duration<double>(deadline - now).count()))) {
                 stop.store(true, std::memory_order_relaxed);
@@ -1505,6 +1514,9 @@ int net_set_scan(net::Net* n, int block, int length, int gates, const float* w, 
 
 // The policy's last 1x1 convolution, `square_w` (head_channels).
 void net_set_heads(net::Net* n, const float* square_w) { n->square_w.assign(square_w, square_w + n->head_channels); }
+
+// What of the network is too big for the native forward's buffers, or null if none is (`net::too_big`).
+const char* net_check(const net::Net* n) { return net::too_big(*n); }
 
 // `count` positions, (count, 2, 8, 8), to (count, 65) logits and (count) values, split over `threads`.
 void net_forward(const net::Net* n, int count, const float* obs, float* logits, float* values, int threads) {

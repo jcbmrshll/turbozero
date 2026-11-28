@@ -128,14 +128,15 @@ def timed_move(
 ) -> tuple[int, int]:
     """Searches until `seconds` have passed, finishing the batch in flight (all of them, as
     `Engine.search` does), or with `stop_decided`, until its move can't change in the time left
-    at the rate it has searched, as `Engine.search` does. Returns the leaves evaluated and the
-    visits."""
+    at the rate it has searched, as `Engine.search` does; either way at least until the root is
+    expanded. Returns the leaves evaluated and the visits."""
     start = time.perf_counter()
     before = search.total_visits()
     leaves = 0
     batches = 0
     search.begin(1 << 30)
-    while (now := time.perf_counter()) - start < seconds:
+    # (past `seconds`, still until the root is expanded: a move to choose from its priors)
+    while (now := time.perf_counter()) - start < seconds or not search.expanded():
         if (
             stop_decided
             and batches % 16 == 0
@@ -397,17 +398,15 @@ class NetPlayer:
             if per_move > 0:
                 seconds = max(seconds_left, 0.0)
             else:
+                # the solve still to come: none once one has been tried and given up
+                ahead = solve_from if empties > solve_from else 0
                 reserve = (
-                    self.solving.kept(solve_from, seconds_left)
-                    if self.solving is not None and solve_from
+                    self.solving.kept(ahead, seconds_left)
+                    if self.solving is not None and ahead
                     else 0.0
                 )
                 seconds = move_budget(
-                    max(seconds_left, 0.0),
-                    empties,
-                    self.taper,
-                    solve_from,
-                    reserve,
+                    max(seconds_left, 0.0), empties, self.taper, ahead, reserve
                 )
                 if self.stop_decided:
                     # planned on what such searches use, never more than all there is

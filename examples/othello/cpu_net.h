@@ -261,6 +261,30 @@ struct Net {
     std::vector<float> square_w;  // (head_channels)
 };
 
+// The most `forward`'s buffers on the stack hold: a block's pooled channels, a block's widths after its
+// pool's bias (a ConvNeXt block's expanded channels, a basic block's conv2 inputs), the heads' channels,
+// the value's hidden units, and the pass's and value's outputs.
+constexpr int MAX_POOLED = 512, MAX_WIDTH = 1024, MAX_HEAD = 128, MAX_HEAD_OUT = 16;
+
+// What of `n` is too big for `forward`'s buffers (`MAX_POOLED` and the rest), or nullptr if none is.
+inline const char* too_big(const Net& n) {
+    const auto fits = [](const Linear& l, int in, int out) { return l.in <= in && l.out <= out; };
+    for (const Block& b : n.blocks) {
+        if (b.pool_channels > MAX_POOLED) return "a block's pool_channels";
+        if (b.convnext && b.expand.cout > MAX_WIDTH) return "a block's expanded channels";
+        if (!b.convnext && b.pool_channels &&
+            (n.channels - b.conv2.cin > MAX_POOLED || b.conv2.cin > MAX_WIDTH))
+            return "a block's pool-biased channels";
+        if (!fits(b.pool, 2 * MAX_POOLED, MAX_WIDTH)) return "a block's pool";
+    }
+    if (n.head_channels > MAX_HEAD) return "head_channels";
+    if (!fits(n.pool_linear, 2 * MAX_HEAD, MAX_HEAD)) return "the heads' pool";
+    if (!fits(n.pass_linear, 2 * MAX_HEAD, MAX_HEAD_OUT)) return "the pass";
+    if (!fits(n.value_hidden, 2 * MAX_HEAD, MAX_WIDTH)) return "the value's hidden layer";
+    if (!fits(n.value_out, MAX_WIDTH, MAX_HEAD_OUT)) return "the value's output";
+    return nullptr;
+}
+
 // `l` of `in` inputs and `out` outputs, `w` (out, in) and `b` (out), with its packed weights
 inline void set_linear(Linear& l, int in, int out, const float* w, const float* b) {
     l.in = in;
@@ -325,6 +349,7 @@ struct Scratch {
     std::vector<float, Aligned<float>> gates, gate_x;
     int patterns[10 * 8];  // `stem`'s rows' patterns of discs
     explicit Scratch(const Net& n) {
+        if (const char* what = too_big(n)) throw std::length_error(std::string("too big for net::forward: ") + what);
         int c = std::max(n.channels, 4), hidden = 0, most_gates = 0;
         for (const Block& b : n.blocks) hidden = std::max(hidden, b.expand.cout);
         for (const Block& b : n.blocks) most_gates = std::max(most_gates, b.dw.gates);
@@ -1703,7 +1728,7 @@ inline void pool_bias_quantize(const Norm& n, const Linear& pool, const float* y
     const Quantizer quantize(c);
     const int kept = c.cin, count = ch - kept;
     with_norm(n, y, stride, ch, [&](const auto& norm) {
-        float pooled[2 * 512], bias[1024];
+        float pooled[2 * MAX_POOLED], bias[MAX_WIDTH];
         // 16 channels at a time from the 16 the first pooled one is in (whole vectors, all within the
         // `ch`); only the pooled ones' kept
         for (int first = kept & ~15; first < ch; first += 16) {
@@ -2339,7 +2364,7 @@ inline void convnext_block(const Block& b, Scratch& s, float* x, int C) {
     const int P = b.pool_channels, H = b.expand.cout;
     ExpandInput* expand_in = s.expand_in.data();
     Input1* project_in = s.project_in.data();
-    alignas(64) float pooled[2 * 512], bias[1024];
+    alignas(64) float pooled[2 * MAX_POOLED], bias[MAX_WIDTH];
     const Quantizer quantize(b.expand);
     if (b.dw.scan) {
         scan_gates(b.dw, x, s.patterns, C, s.gates.data(), s.gate_x.data(), s.gate_x.data() + (size_t)C * SQUARES);
@@ -2361,7 +2386,7 @@ inline void convnext_block(const Block& b, Scratch& s, float* x, int C) {
     const float* expand_scale = b.expand.scale.data();
 #if NET_ISA == 3
     // the project's inverse (positive: it commutes with the ReLU) folded in, for `ExpandOut::put8`
-    alignas(16) float scaled[1024];
+    alignas(16) float scaled[MAX_WIDTH];
     const float* inverse = b.project.inverse.data();
     for (int o = 0; o < H; o++) {
         scaled[o] = expand_scale[o] * inverse[o];
@@ -2412,7 +2437,7 @@ inline void heads(const Net& n, float* h, float* logits, float* value) {
     const int H = n.head_channels, H3 = 3 * H;
     // each part normalized, of its own channels: the pooled part's and the value's pooled as they go
     // (out: a vector of outputs, as `linear` writes them, though it takes 1)
-    alignas(64) float pooled[256], bias[128], hidden[1024], out[16];
+    alignas(64) float pooled[2 * MAX_HEAD], bias[MAX_HEAD], hidden[MAX_WIDTH], out[MAX_HEAD_OUT];
     normalize_pool(n.pool_norm, h + H, H3, H, pooled);
     linear(n.pool_linear, pooled, bias);
     NET_STAGE("head policy pool");

@@ -2,6 +2,8 @@
 
 import io
 import json
+import math
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -397,3 +399,27 @@ def test_a_game_keeps_what_each_players_search_said_of_its_moves(clock):
         {"score": 3},
     ]
     assert all(info is None for info, black in said if not black)
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="needs g++")
+def test_net_players_out_of_time_on_a_contest_clock_play_legal_moves_to_the_end():
+    """Told it has no time left (as after a contest clock runs out), each search still evaluates
+    its root and plays a legal move (`play_game` plays them on its own board)."""
+    import numpy as np
+    from cpu_match import NetPlayer
+    from cpu_search import SearchSettings
+
+    def fake_eval(x):
+        # logits by a hash of the board, no value
+        mix = x.reshape(len(x), 128) @ np.sin(np.arange(128) * 1.3)
+        logits = np.sin(mix[:, None] * np.arange(1, 66)).astype(np.float32)
+        return logits, np.zeros(len(x), np.float32)
+
+    black = NetPlayer(SearchSettings(batch=2), fake_eval, stop_decided=True)
+    white = NetPlayer(SearchSettings(batch=1), fake_eval, seed=1)
+    # no time from the start: every move is told it has none
+    game = play_game(black, white, (), Clock(0.0, 0, math.inf))
+    board = Board()
+    for move in game.moves:
+        board.play(move)
+    assert not board.legal()
