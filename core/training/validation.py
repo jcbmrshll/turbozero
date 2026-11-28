@@ -8,7 +8,6 @@ import numpy as np
 from jax.typing import ArrayLike
 
 from core.networks.utils import apply_nn
-from core.testing.tester import BaseTester, TestState
 
 # what `scored_position_metrics` reports, for all positions and for each group
 METRICS = ("top1", "regret", "exp_regret", "value_mse", "value_sign", "result_change")
@@ -17,7 +16,7 @@ METRICS = ("top1", "regret", "exp_regret", "value_mse", "value_sign", "result_ch
 @dataclass(frozen=True)
 class ScoredPositions:
     """Fixed positions with a strong engine's score for every legal action, to measure a network
-    against (see `ScoredPositionsTester`).
+    against (see `ScoredPositionsValidator`).
 
     Attributes:
         observations: (N, ...) the positions, as the network takes them
@@ -102,20 +101,17 @@ def scored_position_metrics(
     return sums / jnp.maximum(counts, 1)
 
 
-class ScoredPositionsTester(BaseTester):
-    """Measures the network against an engine on fixed positions (see `ScoredPositions` and
-    `scored_position_metrics`): a forward pass over them, no games, so it's cheap enough to run
-    every epoch. Logs `<name>_<metric>` for all positions and `<name>_<metric>_<group>` for each
-    group."""
-
-    stateless = True
+class ScoredPositionsValidator:
+    """Scores a network against an engine on fixed positions (see `ScoredPositions` and
+    `scored_position_metrics`): one forward pass over them, no games, so it's cheap enough to
+    run every epoch. A `Trainer` validator: called with the weights, it returns
+    `<name>_<metric>` for all positions and `<name>_<metric>_<group>` for each group."""
 
     def __init__(
         self,
         positions: ScoredPositions,
         nn: eqx.Module,
         batch_size: int = 1024,
-        epochs_per_test: int = 1,
         name: str = "engine",
         config: dict | None = None,
         prior_temperature: float = 1.0,
@@ -124,17 +120,16 @@ class ScoredPositionsTester(BaseTester):
         Args:
             positions: the positions and the engine's scores
             nn: the network (an equinox module, see core.networks.utils.apply_nn); only its
-                structure is used, the parameters it's measured with are passed to `run`
+                structure is used, the weights it's scored with are passed in each call
             batch_size: positions per forward pass
-            epochs_per_test: epochs between measurements
             name: prefixes the metrics
-            config: (optional) recorded with the tester's configuration, e.g. where the
+            config: (optional) recorded with the validator's configuration, e.g. where the
                 positions came from
             prior_temperature: the temperature of the prior `result_change` is measured under
                 (see `scored_position_metrics`): the one the play search flattens the policy
                 with, so that it measures the prior the search starts from
         """
-        super().__init__(num_keys=1, epochs_per_test=epochs_per_test, name=name)
+        self.name = name
         n = len(positions.legal)
         # padded to whole batches; the padding belongs to no group
         padded = -(-n // batch_size) * batch_size
@@ -176,16 +171,15 @@ class ScoredPositionsTester(BaseTester):
 
     def get_config(self) -> dict:
         return {
-            **super().get_config(),
+            "name": self.name,
             "positions": self.num_positions,
             "groups": self.group_names[1:],
             "prior_temperature": self.prior_temperature,
             **self.extra_config,
         }
 
-    def evaluate(self, params: Any) -> dict[str, jax.Array]:
-        """The metrics of the network with `params` ((nn_params, nn_state), as
-        core.training.train.extract_params gives them)."""
+    def __call__(self, params: Any) -> dict[str, jax.Array]:
+        """The metrics of the network with `params`, its (parameters, network state)."""
         table = self._evaluate(
             params, self.observations, self.legal, self.scores, self.groups
         )
@@ -196,22 +190,3 @@ class ScoredPositionsTester(BaseTester):
             for g, group in enumerate(self.group_names)
             for m, metric in enumerate(METRICS)
         }
-
-    def run(
-        self,
-        key: jax.Array,
-        epoch_num: int,
-        max_steps: int,
-        env_step_fn: Any,
-        env_init_fn: Any,
-        evaluator: Any,
-        state: TestState,
-        params: Any,
-        *args,
-        **kwargs,
-    ) -> tuple[TestState, dict, None]:
-        """Measures the network every `epochs_per_test` epochs (see `BaseTester.run`); plays no
-        games, so the episode is always None."""
-        if epoch_num % self.epochs_per_test != 0:
-            return state, {}, None
-        return state, self.evaluate(params), None
