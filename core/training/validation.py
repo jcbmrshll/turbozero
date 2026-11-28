@@ -12,7 +12,7 @@ from jax.typing import ArrayLike
 from core.common import two_player_game
 from core.evaluators.evaluator import Evaluator
 from core.networks.utils import apply_nn
-from core.training.selfplay_data import floored_kl, group_means
+from core.training.selfplay_data import floored_kl
 from core.types import EnvInitFn, EnvStepFn, StepMetadata
 
 # what `scored_position_metrics` reports, for all positions and for each group
@@ -30,12 +30,116 @@ class ScoredPositions:
         scores: (N, A) each legal action's score from the engine for the player to move, higher
             better, e.g. the final margin it expects after the action; ignored where illegal
         groups: subsets to report metrics for besides all positions, by name: (N,) bool each
+        clusters: (optional) (N,) int, positions too alike to count as independent samples
+            (e.g. those of one game) share an id, and a standard error resamples them together
+            (see `clustered_means`); a negative id, or None for every position, puts a position
+            in a cluster of its own
     """
 
     observations: np.ndarray
     legal: np.ndarray
     scores: np.ndarray
     groups: dict[str, np.ndarray]
+    clusters: np.ndarray | None = None
+
+    def subset(self, keep: np.ndarray) -> "ScoredPositions":
+        """The positions `keep` (an index or a bool mask) selects."""
+        return ScoredPositions(
+            observations=self.observations[keep],
+            legal=self.legal[keep],
+            scores=self.scores[keep],
+            groups={name: group[keep] for name, group in self.groups.items()},
+            clusters=None if self.clusters is None else self.clusters[keep],
+        )
+
+
+def cluster_index(clusters: np.ndarray | None, n: int) -> np.ndarray:
+    """(n,) int32 each of `n` positions' cluster (see `ScoredPositions.clusters`) as 0..C-1,
+    C the number of clusters: positions sharing an id >= 0 together, every other alone."""
+    if clusters is None:
+        return np.arange(n, dtype=np.int32)
+    clusters = np.asarray(clusters)
+    known = clusters >= 0
+    index = np.empty(n, np.int32)
+    _, index[known] = np.unique(clusters[known], return_inverse=True)
+    start = index[known].max() + 1 if known.any() else 0
+    index[~known] = start + np.arange((~known).sum())
+    return index
+
+
+def clustered_means(
+    values: ArrayLike,
+    weights: ArrayLike,
+    groups: ArrayLike,
+    clusters: ArrayLike,
+    num_clusters: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Each group's weighted mean of each column of `values`, and its standard error with the
+    positions of a cluster resampled together: sqrt(sum over clusters c of (sum over c's
+    positions of w (x - mean))^2) / sum of w. Positions of one cluster that move together widen
+    it, which an independent-samples error would miss. With `values` a per-position difference
+    (e.g. one search budget's metric minus another's on the same positions), the error of a
+    paired comparison.
+
+    Args:
+        values: (N, M) per-position values
+        weights: (N, M) each value's weight (0 leaves it out)
+        groups: (G, N) bool, which positions each group has
+        clusters: (N,) int, each position's cluster, 0..num_clusters-1 (see `cluster_index`)
+        num_clusters: how many clusters there are
+
+    Returns:
+        (means, standard errors), each (G, M); 0 for an empty group
+    """
+    values = jnp.asarray(values, jnp.float32)
+    w = jnp.asarray(groups, jnp.float32)[:, :, None] * jnp.asarray(weights, jnp.float32)
+    total = jnp.maximum(w.sum(1), 1e-9)
+    means = (w * values).sum(1) / total
+    deviations = w * (values - means[:, None])
+    sums = jax.ops.segment_sum(
+        jnp.moveaxis(deviations, 1, 0), jnp.asarray(clusters), num_clusters
+    )
+    return means, jnp.sqrt((sums**2).sum(0)) / total
+
+
+def scored_position_columns(
+    logits: ArrayLike,
+    value: ArrayLike,
+    legal: ArrayLike,
+    scores: ArrayLike,
+    prior_temperature: float = 1.0,
+) -> tuple[jax.Array, jax.Array]:
+    """`scored_position_metrics` position by position: (values, weights), each (N, len(METRICS)),
+    each metric's value on each position and whether it counts there (`value_sign` counts only
+    where the engine doesn't call a draw)."""
+    logits, value, legal = jnp.asarray(logits), jnp.asarray(value), jnp.asarray(legal)
+    scores = jnp.asarray(scores, dtype=jnp.float32)
+    best = jnp.max(jnp.where(legal, scores, -jnp.inf), axis=1)
+    # what each action gives up against the best
+    loss = jnp.where(legal, best[:, None] - scores, 0.0)
+    logits = jnp.where(legal, logits.astype(jnp.float32), -jnp.inf)
+    top = jnp.argmax(logits, axis=1)
+    regret = jnp.take_along_axis(loss, top[:, None], axis=1)[:, 0]
+    exp_regret = jnp.sum(jax.nn.softmax(logits, axis=1) * loss, axis=1)
+    z = jnp.sign(best)
+    decided = z != 0
+    worsens = legal & (jnp.sign(scores) < z[:, None])
+    prior = jax.nn.softmax(logits / prior_temperature, axis=1)
+    result_change = jnp.sum(jnp.where(worsens, prior, 0.0), axis=1)
+    values = jnp.stack(
+        [
+            (regret == 0).astype(jnp.float32),
+            regret,
+            exp_regret,
+            (value - z) ** 2,
+            (jnp.sign(value) == z).astype(jnp.float32),
+            result_change,
+        ],
+        axis=1,
+    )
+    ones = jnp.ones_like(regret)
+    weights = jnp.stack([ones] * 4 + [decided.astype(jnp.float32), ones], axis=1)
+    return values, weights
 
 
 def scored_position_metrics(
@@ -71,40 +175,11 @@ def scored_position_metrics(
     Returns:
         jax.Array: (G, len(METRICS)), each group's metrics, in the order of `METRICS`
     """
-    logits, value, legal = jnp.asarray(logits), jnp.asarray(value), jnp.asarray(legal)
-    scores, groups = jnp.asarray(scores, dtype=jnp.float32), jnp.asarray(groups)
-    best = jnp.max(jnp.where(legal, scores, -jnp.inf), axis=1)
-    # what each action gives up against the best
-    loss = jnp.where(legal, best[:, None] - scores, 0.0)
-    logits = jnp.where(legal, logits.astype(jnp.float32), -jnp.inf)
-    top = jnp.argmax(logits, axis=1)
-    regret = jnp.take_along_axis(loss, top[:, None], axis=1)[:, 0]
-    exp_regret = jnp.sum(jax.nn.softmax(logits, axis=1) * loss, axis=1)
-    z = jnp.sign(best)
-    decided = z != 0
-    worsens = legal & (jnp.sign(scores) < z[:, None])
-    prior = jax.nn.softmax(logits / prior_temperature, axis=1)
-    result_change = jnp.sum(jnp.where(worsens, prior, 0.0), axis=1)
-    per_position = jnp.stack(
-        [
-            (regret == 0).astype(jnp.float32),
-            regret,
-            exp_regret,
-            (value - z) ** 2,
-            (jnp.sign(value) == z).astype(jnp.float32),
-            result_change,
-        ],
-        axis=1,
+    values, weights = scored_position_columns(
+        logits, value, legal, scores, prior_temperature
     )
-    # value_sign only counts the positions the engine doesn't call a draw
-    weights = groups.astype(jnp.float32)
-    counted = [weights] * 4 + [weights * decided, weights]
-    counts = jnp.stack([w.sum(axis=1) for w in counted], axis=1)
-    sums = jnp.stack(
-        [w @ per_position[:, i] for i, w in enumerate(counted)],
-        axis=1,
-    )
-    return sums / jnp.maximum(counts, 1)
+    w = jnp.asarray(groups, jnp.float32)[:, :, None] * weights
+    return (w * values).sum(1) / jnp.maximum(w.sum(1), 1)
 
 
 class ScoredPositionsValidator:
@@ -303,13 +378,18 @@ class SearchTargetValidator:
 
     A `Trainer` validator, costly (a search per position and budget, and one more at the first),
     so it runs every `every` epochs. It returns, for each evaluator `<k>`, `<name><k>_<metric>`
-    for all positions and `<name><k>_<metric>_<group>` for each group; and, over the same
-    groups, `<name>_kl_<k>_<first>`, the KL divergence of each later evaluator's targets from the
-    first's (how much the extra search changes them); `<name>_kl_<first>_repeat`, of the first's
-    from a second search of its own with other noise (the floor those differences sit on); and
-    `<name>_kl_<first>_prior`, of the first's from the network's prior (how far search moves the
-    policy). Each KL spreads 0.1% of the second distribution over the legal actions (see
-    `core.training.selfplay_data.floored_kl`).
+    for all positions and `<name><k>_<metric>_<group>` for each group; for each later
+    evaluator, `<name><k>_minus_<first>_<metric>[_<group>]`, its metric minus the first's,
+    paired position by position; and, over the same groups, `<name>_kl_<k>_<first>`, the KL
+    divergence of each later evaluator's targets from the first's (how much the extra search
+    changes them); `<name>_kl_<first>_repeat`, of the first's from a second search of its own
+    with other noise (the floor those differences sit on); and `<name>_kl_<first>_prior`, of the
+    first's from the network's prior (how far search moves the policy). Each KL spreads 0.1% of
+    the second distribution over the legal actions (see
+    `core.training.selfplay_data.floored_kl`). Each difference and KL comes with `..._se`, its
+    standard error over the positions, clustered by `positions.clusters` (see
+    `clustered_means`): how much it would move on another sample of the positions, so a gap
+    between budgets can be read against it.
 
     The searches' keys are drawn once from `seed`, so calls differ only by the weights."""
 
@@ -329,7 +409,8 @@ class SearchTargetValidator:
     ):
         """
         Args:
-            positions: the positions, as the network takes them, and the engine's scores
+            positions: the positions, as the network takes them, the engine's scores, and the
+                clusters the standard errors resample
             states: the same positions as environment states, with a leading axis
             metadata: their metadata, with a leading axis
             evaluators: the searches, by the names their metrics take, e.g. {"128": ...,
@@ -371,6 +452,10 @@ class SearchTargetValidator:
         self.groups = jnp.asarray(
             np.concatenate([groups, np.zeros((len(groups), padded - n), bool)], axis=1)
         )
+        clusters = cluster_index(positions.clusters, n)
+        self.num_clusters = int(clusters.max()) + 1 if n else 0
+        # the padding belongs to no group, so any cluster will do
+        self.clusters = jnp.asarray(np.pad(clusters, (0, padded - n)))
         # a key per position for each search, the first evaluator's twice
         searches = [*self.evaluators, f"{next(iter(self.evaluators))}_repeat"]
         self.keys = dict(
@@ -413,6 +498,7 @@ class SearchTargetValidator:
         return {
             "name": self.name,
             "positions": self.num_positions,
+            "clusters": self.num_clusters,
             "groups": self.group_names[1:],
             "every": self.every,
             "seed": self.seed,
@@ -447,21 +533,25 @@ class SearchTargetValidator:
     def __call__(self, params: Any) -> dict[str, jax.Array]:
         """The searches' metrics with `params`, the network's (parameters, network state)."""
         out: dict[str, jax.Array] = {}
-        targets = {}
+        targets, columns, weights = {}, {}, {}
         for k in self.evaluators:
             target, value = self.search(params, k, self.keys[k])
             targets[k] = target
             # the target as logits: its most visited action is the one played greedily, and
             # its softmax is the target itself
-            table = scored_position_metrics(
-                jnp.log(jnp.maximum(target, 1e-30)),
-                value,
-                self.legal,
-                self.scores,
-                self.groups,
+            columns[k], weights[k] = scored_position_columns(
+                jnp.log(jnp.maximum(target, 1e-30)), value, self.legal, self.scores
             )
-            out.update(self._named(f"{self.name}{k}", table, METRICS))
-        first = next(iter(self.evaluators))
+            means, _ = self._clustered(columns[k], weights[k])
+            out.update(self._named(f"{self.name}{k}", means, METRICS))
+        first, *later = self.evaluators
+        for k in later:
+            # which metrics count where depends only on the position, so the budgets' weights
+            # are the same
+            means, errors = self._clustered(columns[k] - columns[first], weights[k])
+            prefix = f"{self.name}{k}_minus_{first}"
+            out.update(self._named(prefix, means, METRICS))
+            out.update(self._named(prefix, errors, METRICS, "_se"))
         repeat, _ = self.search(params, first, self.keys[f"{first}_repeat"])
         prior = jax.nn.softmax(
             jnp.where(
@@ -472,25 +562,30 @@ class SearchTargetValidator:
             -1,
         )
         pairs = {
-            **{
-                f"kl_{k}_{first}": (targets[k], targets[first])
-                for k in list(self.evaluators)[1:]
-            },
+            **{f"kl_{k}_{first}": (targets[k], targets[first]) for k in later},
             f"kl_{first}_repeat": (targets[first], repeat),
             f"kl_{first}_prior": (targets[first], prior),
         }
-        columns = jnp.stack(
-            [floored_kl(p, q, self.legal) for p, q in pairs.values()], -1
-        )
-        table = group_means(columns, jnp.ones(len(self.legal)), self.groups)
-        out.update(self._named(self.name, table, list(pairs)))
+        kl = jnp.stack([floored_kl(p, q, self.legal) for p, q in pairs.values()], -1)
+        means, errors = self._clustered(kl, jnp.ones_like(kl))
+        out.update(self._named(self.name, means, list(pairs)))
+        out.update(self._named(self.name, errors, list(pairs), "_se"))
         return out
 
+    def _clustered(
+        self, values: jax.Array, weights: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
+        return clustered_means(
+            values, weights, self.groups, self.clusters, self.num_clusters
+        )
+
     def _named(
-        self, prefix: str, table: jax.Array, metrics: Any
+        self, prefix: str, table: jax.Array, metrics: Any, suffix: str = ""
     ) -> dict[str, jax.Array]:
         return {
-            f"{prefix}_{metric}" + ("" if group == "all" else f"_{group}"): table[g, m]
+            f"{prefix}_{metric}"
+            + ("" if group == "all" else f"_{group}")
+            + suffix: table[g, m]
             for g, group in enumerate(self.group_names)
             for m, metric in enumerate(metrics)
         }

@@ -164,8 +164,9 @@ class EngineSet:
     def scored_positions(
         self, by_source: bool = False, filtered: bool = False
     ) -> ScoredPositions:
-        """The positions and scores to measure networks on, with the groups of `groups`: every
-        position, by `PHASES`; with `filtered`, only those of a phase of `FILTERED_PHASES`."""
+        """The positions and scores to measure networks on, with the groups of `groups`, clustered
+        by game: every position, by `PHASES`; with `filtered`, only those of a phase of
+        `FILTERED_PHASES`."""
         phases = FILTERED_PHASES if filtered else PHASES
         groups = self.groups(by_source, phases)
         keep = (
@@ -178,6 +179,7 @@ class EngineSet:
             legal=self.legal[keep],
             scores=self.scores[keep].astype(np.float32),
             groups={name: group[keep] for name, group in groups.items()},
+            clusters=self.game[keep],
         )
 
     def describe(self) -> dict:

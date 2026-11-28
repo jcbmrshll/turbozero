@@ -731,14 +731,18 @@ Every `--headroom-every` epochs (default 10), `train.py` searches `--headroom-po
 (default 4096) of the set with self-play's search at each of `--headroom-sims` (default `--sims`
 and twice it): full searches from fresh trees with self-play's root noise, the targets self-play
 stores. It scores each budget's visit distribution and root value like the network's raw
-outputs, as `search<sims>_*` (`search128_top1`, `search256_value_mse`, ...), and logs KL
-divergences between them: `search_kl_256_128`, how much the extra search changes the targets;
-`search_kl_128_repeat`, the same budget searched again with other noise, the floor that sits on;
-and `search_kl_128_prior`, how far search moves the network's prior. Every call searches with
-the same keys, so epochs differ only by the weights.
+outputs, as `search<sims>_*` (`search128_top1`, `search256_value_mse`, ...), and each bigger
+budget against the first position by position, as `search<k>_minus_<first>_*`
+(`search256_minus_128_top1`, ...). It logs KL divergences between them too:
+`search_kl_256_128`, how much the extra search changes the targets; `search_kl_128_repeat`, the
+same budget searched again with other noise, the floor that sits on; and `search_kl_128_prior`,
+how far search moves the network's prior. Each difference and KL has a standard error, `_se`
+(`search256_minus_128_top1_se`), clustered by game: the positions of a game, being alike, are
+resampled together, so a gap of 2 standard errors is about the edge of what other positions and
+other search noise could give. Every call searches with the same keys, so epochs differ only by
+the weights, and an epoch-to-epoch change is less noisy than `_se`.
 
-The gap between `search<2N>_*` and `search<N>_*` is what doubling self-play's sims would put in
-its labels; the gap between `search<N>_*` and `engine_*` is what the network hasn't yet learned
+`search<2N>_minus_<N>_*` is what doubling self-play's sims would put in its labels; the gap between `search<N>_*` and `engine_*` is what the network hasn't yet learned
 from its own. A bigger gap at 2N doesn't mean the network will learn it: at 4x64, 512-sim targets
 beat 128-sim ones by about 0.04 top-1 on an Edax-labelled set, and a fork trained on them gained no
 Elo. With sparse visit counts, each KL

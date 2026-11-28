@@ -108,6 +108,8 @@ def test_a_set_reports_its_phases_and_on_request_its_sources():
     assert positions.scores.dtype == np.float32
     assert positions.observations.shape == (4, 8, 8, 2)
     assert list(positions.groups) == ["opening", "midgame", "endgame"]
+    # standard errors resample games whole
+    np.testing.assert_array_equal(positions.clusters, s.game)
     assert list(s.scored_positions(by_source=True).groups)[:2] == [
         "vs-engines",
         "head_to_head",
@@ -125,6 +127,7 @@ def test_filtered_positions_are_those_the_network_decides_in_halves():
     np.testing.assert_array_equal(filtered.observations, s.obs[[0, 1, 3]])
     np.testing.assert_array_equal(filtered.scores, s.scores[[0, 1, 3]])
     np.testing.assert_array_equal(filtered.legal, s.legal[[0, 1, 3]])
+    np.testing.assert_array_equal(filtered.clusters, s.game[[0, 1, 3]])
     assert {k: v.tolist() for k, v in filtered.groups.items()} == {
         "opening": [True, False, False],
         "midgame": [False, True, True],

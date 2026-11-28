@@ -114,6 +114,11 @@ def declared(key, field):
         ("edax_level8_sims1000_last3", "the run's last epochs"),
         ("edax_level8_sims1000_last3_se", "standard error of the mean score"),
         ("edax_level4_sims1000_game", "A game the network"),
+        ("search128_top1_opening", "self-play's search at that many sims"),
+        ("search256_minus_128_exp_regret", "minus the first budget's"),
+        ("search256_minus_128_top1_endgame_se", "standard error"),
+        ("search_kl_256_128", "KL divergences"),
+        ("search_kl_128_repeat_se", "standard error"),
     ],
 )
 def test_runs_describe_the_metrics_turbozero_logs(key, says):
@@ -160,6 +165,11 @@ def test_runs_headline_what_tracks_progress_memorization_and_cost(key, headline)
         ("edax_level4_sims1000_draw", None),
         ("edax_level4_sims1000_se", None),
         ("policy_target_entropy", None),
+        # a budget's gain is better in its metric's direction; its error is better small
+        ("search256_minus_128_top1", "higher"),
+        ("search256_minus_128_regret_midgame", "lower"),
+        ("search256_minus_128_top1_se", "lower"),
+        ("search_kl_256_128", None),
     ],
 )
 def test_runs_say_which_way_their_metrics_are_better(key, better):

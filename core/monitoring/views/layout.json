@@ -85,9 +85,19 @@
             "type": "chart",
             "title": "Label headroom",
             "metrics": [
+              "search*_minus_*_top1",
+              "search*_minus_*_top1_se",
+              "search*_minus_*_exp_regret",
+              "search*_minus_*_exp_regret_se",
+              "search*_minus_*_value_mse",
+              "search*_minus_*_value_mse_se",
               "search*_top1",
               "search*_exp_regret",
               "search*_value_mse",
+              "search_kl_*_repeat",
+              "search_kl_*_repeat_se",
+              "search_kl_*_prior",
+              "search_kl_*_prior_se",
               "search_kl_*"
             ],
             "split": true

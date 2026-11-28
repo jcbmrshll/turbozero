@@ -286,8 +286,9 @@ def test_the_headroom_probe_searches_the_engine_set_as_self_play_does(
         assert evaluator.max_nodes == sims + 1
         assert evaluator.playout_cap is None
         assert evaluator.dirichlet_alpha == 0.5
-    # positions keep their phases, as the engine validator's
+    # positions keep their phases, as the engine validator's, and their games
     assert headroom.group_names == engine.group_names
+    assert headroom.num_clusters == 3
 
 
 def test_headroom_sims_choose_the_budgets(monkeypatch, tmp_path):

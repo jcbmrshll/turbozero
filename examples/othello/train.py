@@ -74,7 +74,6 @@ from core.training.exploration import Exploration
 from core.training.loss_fns import az_default_loss_fn
 from core.training.train import Trainer, Validator
 from core.training.validation import (
-    ScoredPositions,
     ScoredPositionsValidator,
     SearchTargetValidator,
 )
@@ -587,16 +586,11 @@ def headroom_validator(
     """--headroom-every's validator: self-play's search (`settings`, with `network` as it
     plays, e.g. in bfloat16) at each of --headroom-sims, on --headroom-positions of the
     engine-labelled set, from fresh trees and without a playout cap: the full searches whose
-    targets self-play stores."""
+    targets self-play stores. Its standard errors resample the set's games whole."""
     scored = engine_set.scored_positions()
     count = min(args.headroom_positions, len(scored.legal))
     keep = np.linspace(0, len(scored.legal) - 1, count).round().astype(int)
-    positions = ScoredPositions(
-        observations=scored.observations[keep],
-        legal=scored.legal[keep],
-        scores=scored.scores[keep],
-        groups={name: group[keep] for name, group in scored.groups.items()},
-    )
+    positions = scored.subset(keep)
     states = position_states(positions.observations, positions.legal)
     sims = args.headroom_sims or [args.sims, 2 * args.sims]
     evaluators = {

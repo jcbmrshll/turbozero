@@ -12,6 +12,8 @@ from core.training.validation import (
     ScoredPositionsValidator,
     SearchTargetValidator,
     TwoPlayerValidator,
+    cluster_index,
+    clustered_means,
     scored_position_metrics,
 )
 from core.types import StepMetadata
@@ -288,18 +290,19 @@ class TableSearch(Evaluator):
         return state
 
 
-def search_positions(n):
+def search_positions(n, clusters=None):
     """`n` positions of 3 legal actions, the first the engine's best (a win by 4), the others
     giving up 2 and 6; observations whose logits are uniform (see `Echo`), every other one in
     the group "odd"."""
     observations = np.zeros((n, 4), np.float32)
     scores = np.tile(np.array([4.0, 2.0, -2.0], np.float32), (n, 1))
     legal = np.ones((n, 3), bool)
-    return ScoredPositions(observations, legal, scores, {"odd": np.arange(n) % 2 == 1})
+    odd = {"odd": np.arange(n) % 2 == 1}
+    return ScoredPositions(observations, legal, scores, odd, clusters)
 
 
-def search_validator(evaluators, n=5, batch_size=2):
-    positions = search_positions(n)
+def search_validator(evaluators, n=5, batch_size=2, clusters=None):
+    positions = search_positions(n, clusters)
     net, state = eqx.nn.make_with_state(Echo)()
     metadata = StepMetadata(
         rewards=jnp.zeros((n, 2)),
@@ -361,3 +364,100 @@ def test_search_validator_searches_with_the_same_keys_every_call():
         assert float(first[name]) == pytest.approx(float(second[name]))
     # the repeat search draws other noise
     assert first["search_kl_8_repeat"] > 0
+
+
+def clustered_reference(d, clusters):
+    """The mean of `d` and its standard error, the positions of a cluster resampled together,
+    each negative id alone: sqrt(sum over clusters of (sum of d - mean)^2) / N."""
+    clusters = np.where(clusters < 0, clusters.max() + 1 + np.arange(len(d)), clusters)
+    _, clusters = np.unique(clusters, return_inverse=True)
+    sums = np.bincount(clusters, weights=d - d.mean())
+    return d.mean(), np.sqrt((sums**2).sum()) / len(d)
+
+
+def test_a_subset_keeps_each_positions_groups_and_cluster():
+    positions = search_positions(4, clusters=np.array([2, 2, -1, 5]))
+
+    subset = positions.subset(np.array([1, 3]))
+
+    assert subset.groups["odd"].tolist() == [True, True]
+    assert subset.clusters is not None and subset.clusters.tolist() == [2, 5]
+    assert search_positions(4).subset(np.array([0])).clusters is None
+
+
+def test_cluster_index_keeps_shared_ids_together_and_unknown_ones_apart():
+    ids = np.array([5, 5, -1, 7, -1, 5])
+    assert cluster_index(ids, 6).tolist() == [0, 0, 2, 1, 3, 0]
+    assert cluster_index(np.array([-1, -1]), 2).tolist() == [0, 1]
+    assert cluster_index(None, 3).tolist() == [0, 1, 2]
+
+
+def test_clustered_means_resample_whole_clusters():
+    rng = np.random.default_rng(0)
+    n = 40
+    values = rng.normal(size=(n, 2))
+    # clusters of unequal sizes, some positions alone, one column counting on only some
+    ids = rng.integers(-1, 6, size=n)
+    weights = np.ones((n, 2))
+    weights[:, 1] = rng.random(n) < 0.6
+    groups = np.stack([np.ones(n, bool), np.arange(n) % 3 == 0])
+
+    clusters = cluster_index(ids, n)
+    means, errors = clustered_means(
+        values, weights, groups, clusters, int(clusters.max()) + 1
+    )
+
+    for g, group in enumerate(groups):
+        for m in range(2):
+            keep = group & (weights[:, m] > 0)
+            mean, error = clustered_reference(values[keep, m], ids[keep])
+            assert means[g, m] == pytest.approx(mean, abs=1e-5)
+            assert errors[g, m] == pytest.approx(error, rel=1e-4)
+    # positions that move together widen the error past an independent-samples one
+    alike = np.repeat(np.arange(4), 10)
+    together = np.repeat(rng.normal(size=4), 10)[:, None]
+    _, clustered = clustered_means(together, np.ones((n, 1)), groups[:1], alike, 4)
+    _, alone = clustered_means(together, np.ones((n, 1)), groups[:1], np.arange(n), n)
+    assert clustered[0, 0] == pytest.approx(np.sqrt(10) * alone[0, 0], rel=1e-4)
+
+
+def test_search_budgets_are_compared_position_by_position_with_clustered_errors():
+    n = 7
+    # the small budget finds the engine's best on some positions, the big one on all
+    small_found = np.array([1, 0, 0, 1, 0, 1, 0], bool)
+    small = TableSearch(
+        np.where(small_found[:, None], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+        np.linspace(-0.5, 0.9, n),
+    )
+    big_values = np.linspace(0.2, 1.0, n)
+    big = TableSearch(np.tile([1.0, 0.0, 0.0], (n, 1)), big_values)
+    # clusters of 2 and 3 positions, two positions alone
+    clusters = np.array([3, 3, -1, 8, 8, 8, -1])
+    validator, params = search_validator(
+        {"8": small, "16": big}, n=n, batch_size=2, clusters=clusters
+    )
+
+    metrics = validator(params)
+
+    odd = np.arange(n) % 2 == 1
+    differences = {
+        "top1": 1.0 - small_found,
+        "regret": -2.0 * ~small_found,
+        "value_mse": (big_values - 1) ** 2 - (np.linspace(-0.5, 0.9, n) - 1) ** 2,
+    }
+    for metric, d in differences.items():
+        for suffix, keep in (("", np.ones(n, bool)), ("_odd", odd)):
+            mean, error = clustered_reference(d[keep], clusters[keep])
+            name = f"search16_minus_8_{metric}{suffix}"
+            assert metrics[name] == pytest.approx(mean, abs=1e-5)
+            assert metrics[f"{name}_se"] == pytest.approx(error, rel=1e-4)
+    # the KL's per-position values: the floor alone where the budgets agree
+    kl = np.where(
+        small_found, -np.log(1 - KL_FLOOR + KL_FLOOR / 3), -np.log(KL_FLOOR / 3)
+    )
+    mean, error = clustered_reference(kl, clusters)
+    assert metrics["search_kl_16_8"] == pytest.approx(mean, rel=1e-4)
+    assert metrics["search_kl_16_8_se"] == pytest.approx(error, rel=1e-4)
+    # a search without noise repeats itself: every position's KL is the same
+    assert metrics["search_kl_8_repeat_se"] == pytest.approx(0.0, abs=1e-5)
+    assert validator.get_config()["clusters"] == 4
