@@ -19,7 +19,7 @@ def make_nn_eval_fn(
 
     Returns:
         Callable: A function that evaluates the state using the neural network (state, params) -> (policy_logits, value)
-            - `params` is (nn_params, nn_state), as returned by core.training.train.extract_params
+            - `params` is (nn_params, nn_state), as the trainer passes them
     """
     static = eqx.filter(nn, eqx.is_inexact_array, inverse=True)
 

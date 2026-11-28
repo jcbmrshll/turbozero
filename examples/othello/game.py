@@ -2,7 +2,6 @@
 turbozero talks to it, board symmetries, the network and optimizer, evaluators for
 test games, square names, and loading checkpoints."""
 
-from collections.abc import Sequence
 from dataclasses import replace
 from typing import cast
 
@@ -20,12 +19,7 @@ from core.evaluators.mcts.mcts import MCTS
 from core.memory.replay_memory import BaseExperience
 from core.networks.spec import make_network as build_network
 from core.networks.spec import network_config
-from core.training.lr_plateau import LRPlateau
-from core.training.train import (
-    adamw,
-    sgdw,
-    weight_decay_mask,
-)
+from core.training.train import sgdw, weight_decay_mask
 from core.types import StepMetadata
 
 # vectorized environments pair well with batched AlphaZero; pgx has many more:
@@ -123,8 +117,7 @@ SYMMETRY_TRANSFORM_FNS = [
 ]
 
 
-# AdamW's decay of a weight each step is learning rate * WEIGHT_DECAY * weight at the first
-# learning rate (the decay drops with the rate, see make_optimizer). An L2 penalty
+# AdamW's decay of a weight each step is learning rate * WEIGHT_DECAY * weight. An L2 penalty
 # of 1e-4 in the loss, which training used before, came to about this under Adam on the
 # convolutions (from 0.3 to 0.8, Adam's normalization making it uneven between weights)
 WEIGHT_DECAY = 0.5
@@ -224,67 +217,32 @@ def make_network(
 
 
 def make_optimizer(
-    total_steps: int,
-    lr: float = 1e-3,
-    lr_final: float = 1e-4,
+    lr: optax.ScalarOrSchedule = 1e-3,
     weight_decay: float = WEIGHT_DECAY,
-    lr_drops: Sequence[tuple[float, float]] = (),
-    lr_plateau: LRPlateau | None = None,
     sgd: bool = False,
     momentum: float = 0.9,
     decoupled: bool = False,
-    decay_with_lr: bool = True,
 ) -> optax.GradientTransformation:
-    """AdamW, or with `sgd` SGD with `momentum` (see `core.training.train.sgdw`: its weight decay
-    L2 or, with `decoupled`, AdamW's kind), with the learning rate decaying from `lr` to `lr_final` over
-    `total_steps` training steps, along a cosine, or with `lr_drops`, held at `lr` and then
-    dropping in steps: each (fraction of `total_steps`, the learning rate from there on), or
-    with `lr_plateau`, its rates, dropping when training stops improving (the trainer's
-    `lr_plateau` too; `lr`, `lr_final` and `lr_drops` are unused). And
-    weight decay on the network's weights, not its biases or BatchNorm scales and offsets (see
-    `weight_decay_mask`): `weight_decay` at the first rate, and with `decay_with_lr` following
-    the rate from there (see `core.training.train.adamw`), so that a drop holds the weight norm;
-    without it, `weight_decay` throughout. Its hyperparameters are injected, for the trainer to
-    record them and log the learning rate; the injected `weight_decay` is the first rate's."""
-    schedule = (
-        # constant: its program then doesn't depend on the run's length, so a run in steps
-        # (controller.py) compiles its training once, into the persistent compilation cache
-        optax.constant_schedule(lr)
-        if lr_final == lr
-        else optax.cosine_decay_schedule(
-            lr, decay_steps=max(total_steps, 1), alpha=lr_final / lr
-        )
-    )
-    if lr_drops:
-        rates = [lr, *(rate for _, rate in lr_drops)]
-        schedule = optax.piecewise_constant_schedule(
-            lr,
-            {
-                round(fraction * total_steps): after / before
-                for (fraction, _), before, after in zip(
-                    lr_drops, rates[:-1], rates[1:], strict=True
-                )
-            },
-        )
-    learning_rate = schedule if lr_plateau is None else lr_plateau
-    first = lr if lr_plateau is None else lr_plateau.rates[0]
-    decay_lr = first if decay_with_lr else None
+    """AdamW at learning rate `lr`, or with `sgd` SGD with `momentum` (see
+    `core.training.train.sgdw`: its weight decay L2 or, with `decoupled`, AdamW's kind), with
+    `weight_decay` on the network's weights, not its biases or BatchNorm scales and offsets (see
+    `weight_decay_mask`). `lr` may be a schedule (distill.py's cosine); training's is constant.
+
+    Its hyperparameters are injected, so the trainer records them, and a run branched or forked
+    from a saved state trains at this optimizer's learning rate and weight decay rather than the
+    state's (see `core.training.train.with_hyperparams`)."""
     if sgd:
-        return optax.inject_hyperparams(
-            sgdw, static_args=("mask", "decoupled", "decay_lr")
-        )(
-            learning_rate=learning_rate,
+        return optax.inject_hyperparams(sgdw, static_args=("mask", "decoupled"))(
+            learning_rate=lr,
             momentum=momentum,
             weight_decay=weight_decay,
             decoupled=decoupled,
             mask=weight_decay_mask,
-            decay_lr=decay_lr,
         )
-    return optax.inject_hyperparams(adamw, static_args=("mask", "decay_lr"))(
-        learning_rate=learning_rate,
+    return optax.inject_hyperparams(optax.adamw, static_args=("mask",))(
+        learning_rate=lr,
         weight_decay=weight_decay,
         mask=weight_decay_mask,
-        decay_lr=decay_lr,
     )
 
 
@@ -301,8 +259,8 @@ def load_checkpoint(path: str, net: str, inference_dtype: str = "float32"):
     """
     network, network_state = make_network(net, inference_dtype=inference_dtype)
     params = eqx.filter(network, eqx.is_inexact_array)
-    # a checkpoint is a TrainState's arrays in order, params and network state first: read
-    # just those, so that it loads whatever optimizer trained it
+    # a checkpoint is the network's parameters and state (see Trainer.save_weights); older
+    # ones are a whole TrainState, which starts with the same arrays
     with open(path, "rb") as f:
         try:
             params, network_state = eqx.tree_deserialise_leaves(

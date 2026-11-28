@@ -132,21 +132,13 @@ def make_symmetry_transform_fn(size: int, rotate: bool, reflect: bool):
 
 
 def make_optimizer(
-    total_steps: int,
-    lr: float = 1e-3,
-    lr_final: float = 1e-4,
-    weight_decay: float = WEIGHT_DECAY,
+    lr: float = 1e-3, weight_decay: float = WEIGHT_DECAY
 ) -> optax.GradientTransformation:
-    """AdamW, with the learning rate decaying from `lr` to `lr_final` over `total_steps`
-    training steps, along a cosine, and weight decay on the network's weights, not its biases or
-    BatchNorm scales and offsets (see `weight_decay_mask`). Its hyperparameters are injected, for
-    the trainer to record them and log the learning rate."""
+    """AdamW at a constant learning rate, with weight decay on the network's weights, not its
+    biases or BatchNorm scales and offsets (see `weight_decay_mask`). Its hyperparameters are
+    injected, for the trainer to record them and set them on a saved optimizer state."""
     return optax.inject_hyperparams(optax.adamw, static_args=("mask",))(
-        learning_rate=optax.cosine_decay_schedule(
-            lr, decay_steps=max(total_steps, 1), alpha=lr_final / lr
-        ),
-        weight_decay=weight_decay,
-        mask=weight_decay_mask,
+        learning_rate=lr, weight_decay=weight_decay, mask=weight_decay_mask
     )
 
 
@@ -297,8 +289,8 @@ class HexGame:
         net = net or SIZES[self.size].net
         network, network_state = self.make_network(net, inference_dtype=inference_dtype)
         params = eqx.filter(network, eqx.is_inexact_array)
-        # a checkpoint is a TrainState's arrays in order, params and network state first: read
-        # just those, so that it loads whatever optimizer trained it
+        # a checkpoint is the weights' params and network state (see the Trainer's
+        # save_weights)
         with open(path, "rb") as f:
             try:
                 params, network_state = eqx.tree_deserialise_leaves(

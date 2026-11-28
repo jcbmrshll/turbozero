@@ -12,7 +12,6 @@ the games.
 import argparse
 import time
 
-import jax
 import numpy as np
 import pgx
 from engines import CACHE_DIR
@@ -23,8 +22,7 @@ from core.evaluators.evaluation_fns import (
     make_nn_eval_fn,
     make_nn_eval_fn_no_params_callable,
 )
-from core.testing.tester import TestState
-from core.testing.two_player_baseline import TwoPlayerBaseline
+from core.training.validation import TwoPlayerValidator
 
 
 def main():
@@ -67,24 +65,19 @@ def main():
         flush=True,
     )
     for sims in args.pgx_sims:
-        tester = TwoPlayerBaseline(
-            num_episodes=args.games,
-            baseline_evaluator=game.make_test_evaluator(pretrained, sims),
-            balance_first_player=True,
-            name="pgx",
-        )
-        start = time.perf_counter()
-        keys = tester.split_keys(jax.random.PRNGKey(args.seed))
-        _, metrics, _, _ = tester.test(
-            game.max_moves,
+        match = TwoPlayerValidator(
+            agent,
+            game.make_test_evaluator(pretrained, sims),
             game.step_fn,
             init_fn,
-            agent,
-            keys,
-            TestState(),
-            params,
+            game.max_moves,
+            args.games,
+            name="pgx",
+            seed=args.seed,
         )
-        win = float(metrics["pgx_win_rate"].mean())
+        start = time.perf_counter()
+        metrics = match(params)
+        win = float(metrics["pgx_win_rate"])
         # standard error of the mean score
         se = np.sqrt(win * (1 - win) / args.games)
         print(

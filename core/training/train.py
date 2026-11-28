@@ -877,7 +877,7 @@ class Trainer:
                 pending, state.env_state, entries, solve_move
             )
             pending = self.endgame_solve.next_game(
-                jax.random.fold_in(key, 2), pending, terminated | truncated | stopped
+                pending, terminated | truncated | stopped
             )
         buffer_state = where_tree(
             terminated,
@@ -1422,6 +1422,7 @@ class Trainer:
         """Saves the average's (parameters, network state) for `epoch` to `weights_dir`: what a
         player loads (e.g. `eqx.tree_deserialise_leaves(f, (params, nn_state))`). Written to a
         temporary file first, so an interrupted save leaves no partial checkpoint."""
+        os.makedirs(self.weights_dir, exist_ok=True)
         path = checkpoint_path(self.weights_dir, epoch)
         with open(path + ".tmp", "wb") as f:
             eqx.tree_serialise_leaves(f, params)
@@ -1496,11 +1497,6 @@ class Trainer:
                 f"{path} is a saved state of format {meta.get('format')}, this version reads "
                 f"format {STATE_FORMAT}"
             )
-        if meta["num_envs"] != self.batch_size:
-            raise ValueError(
-                f"{path} was saved with {meta['num_envs']} self-play environments, this run "
-                f"has {self.batch_size}: they must be the same"
-            )
         return meta
 
     def _load_part(self, saved: Any, meta: dict, part: str, template: Any) -> Any:
@@ -1530,12 +1526,18 @@ class Trainer:
         )
 
     def _load_collection_state(
-        self, saved: Any, meta: dict, keep_search: bool = True
+        self, path: str, saved: Any, meta: dict, strict: bool = False
     ) -> tuple[CollectionState, bool]:
-        """A saved collection state, at its saved capacity: with `keep_search`, its search
-        states if they have this evaluator's shapes, else new ones, the moves in progress
-        searched again. With `endgame_solve`, the saved pending solves if they have this run's
-        shapes, else none waiting. Returns it, and whether the search states were kept."""
+        """A saved collection state, at its saved capacity: its search states if they have this
+        evaluator's shapes, else new ones, the moves in progress searched again; with
+        `endgame_solve`, the saved pending solves if they have this run's shapes, else none
+        waiting. With `strict`, every array must fit, as an exact continuation needs. Returns
+        it, and whether the search states were kept."""
+        if meta["num_envs"] != self.batch_size:
+            raise ValueError(
+                f"{path} was saved with {meta['num_envs']} self-play environments, this run "
+                f"has {self.batch_size}: they must be the same"
+            )
         template = jax.eval_shape(
             lambda: self.init_collection_state(
                 jax.random.PRNGKey(0), meta["buffer_capacity"]
@@ -1548,7 +1550,7 @@ class Trainer:
         ]
         index = {leaf_path: i for i, (leaf_path, _, _) in enumerate(described)}
         # the parts that start anew when the saved ones don't fit; the rest must
-        groups = [".eval_state", ".pending"]
+        groups = [] if strict else [".eval_state", ".pending"]
 
         def group(leaf_path: str) -> str | None:
             return next((g for g in groups if leaf_path.startswith(g)), None)
@@ -1559,7 +1561,6 @@ class Trainer:
             ]
 
         kept = {name: fits(name) for name in groups}
-        kept[".eval_state"] = keep_search and kept[".eval_state"]
         mismatched = [
             f"  {leaf_path}: saved "
             + (
@@ -1587,7 +1588,7 @@ class Trainer:
             for leaf_path, shape, dtype in expected
         ]
         state = jax.tree.unflatten(jax.tree.structure(template), leaves)
-        if not kept[".pending"]:
+        if not kept.get(".pending", True):
             if any(group(d[0]) == ".pending" for d in described):
                 print(
                     "the saved games waiting for solves don't fit this run's, so they're "
@@ -1596,20 +1597,16 @@ class Trainer:
                 )
             state = replace(
                 state,
-                pending=self.init_pending(
-                    jax.random.PRNGKey(meta["epoch"]),
-                    state.env_state,
-                    meta["buffer_capacity"],
-                ),
+                pending=self.init_pending(state.env_state, meta["buffer_capacity"]),
             )
-        if not kept[".eval_state"]:
+        if not kept.get(".eval_state", True):
             # the moves in progress start their searches again
             state = replace(
                 state,
                 eval_state=self.init_eval_state(),
                 search_cycles=jnp.zeros_like(state.search_cycles),
             )
-        return state, kept[".eval_state"]
+        return state, kept.get(".eval_state", True)
 
     def _load_networks(self, saved: Any, meta: dict) -> tuple[TrainState, Any]:
         """A saved state's train state and weight average."""
@@ -1632,12 +1629,15 @@ class Trainer:
 
     def load_state(self, path: str) -> TrainLoopOutput:
         """Loads a state saved by `save_state`, to continue its run exactly (see `resume`). The
-        trainer must be configured as the run's was, so that every array fits; the replay
-        buffer keeps the capacity it was saved with."""
+        trainer must be configured as the run's was, so that every array fits (`branch`
+        continues one with other settings); the replay buffer keeps the capacity it was saved
+        with."""
         with np.load(path) as saved:
             meta = self._read_state(path, saved)
             train_state, average = self._load_networks(saved, meta)
-            collection_state, _ = self._load_collection_state(saved, meta)
+            collection_state, _ = self._load_collection_state(
+                path, saved, meta, strict=True
+            )
             key = _to_device(saved["key"])
         return TrainLoopOutput(
             collection_state=collection_state,
@@ -1689,7 +1689,9 @@ class Trainer:
         with np.load(path) as saved:
             meta = self._read_state(path, saved)
             train_state, average = self._load_networks(saved, meta)
-            collection_state, kept_search = self._load_collection_state(saved, meta)
+            collection_state, kept_search = self._load_collection_state(
+                path, saved, meta
+            )
             key = _to_device(saved["key"])
         collection_state = self._fit_buffer(collection_state, "branch")
         self.parent = {
@@ -1726,7 +1728,9 @@ class Trainer:
             meta = self._read_state(path, saved)
             train_state, average = self._load_networks(saved, meta)
             if replay_buffer:
-                collection_state, kept_search = self._load_collection_state(saved, meta)
+                collection_state, kept_search = self._load_collection_state(
+                    path, saved, meta
+                )
                 if not kept_search:
                     print(
                         "fork: the saved search states don't fit, the moves in progress "
@@ -1825,21 +1829,16 @@ class Trainer:
             # each environment's first cycle starts a move, and sets its key
             move_key=jnp.zeros_like(jax.random.split(key, self.batch_size)),
             search_cycles=jnp.zeros((self.batch_size,), dtype=jnp.int32),
-            pending=self.init_pending(key, env_state, memory_buffer.capacity),
+            pending=self.init_pending(env_state, memory_buffer.capacity),
         )
 
-    def init_pending(
-        self, key: jax.Array, env_state: Any, capacity: int
-    ) -> PendingSolves | None:
+    def init_pending(self, env_state: Any, capacity: int) -> PendingSolves | None:
         """`CollectionState`'s pending solves, with nothing waiting, for environments whose games
         are `env_state` and a replay buffer of `capacity`; None without `endgame_solve`."""
         if self.endgame_solve is None:
             return None
         endgame_solve = self.endgame_solve
-        keys = jax.random.split(jax.random.fold_in(key, 2), self.batch_size)
-        return jax.vmap(lambda k, e: endgame_solve.init(k, e, capacity))(
-            keys, env_state
-        )
+        return jax.vmap(lambda e: endgame_solve.init(e, capacity))(env_state)
 
     # the loop
 

@@ -53,27 +53,22 @@ def make_trainer(args) -> tuple[Trainer, tuple]:
     evaluator = AlphaZero(MCTS)(
         eval_fn=make_nn_eval_fn(resnet, state_to_nn_input),
         num_iterations=args.sims,
-        max_nodes=args.sims + args.min_iterations + args.advance_every
-        if args.count_reused_visits
-        else int(args.tree_factor * args.sims),
+        max_nodes=int(args.tree_factor * args.sims),
         branching_factor=env.num_actions,
         action_selector=PUCTSelector(),
         temperature=1.0,
-        count_reused_visits=args.count_reused_visits,
-        min_iterations=args.min_iterations,
         traversal_steps=args.traversal_steps,
         playout_cap=PlayoutCap(*args.playout_cap) if args.playout_cap else None,
     )
     trainer = Trainer(
         batch_size=args.envs,
         train_batch_size=4096,
-        warmup_steps=0,
         collection_steps_per_epoch=args.steps,
         train_steps_per_epoch=0,
         nn=resnet,
         nn_state=params[1],
         loss_fn=az_default_loss_fn,
-        optimizer=make_optimizer(1),
+        optimizer=make_optimizer(),
         evaluator=evaluator,
         # by default room for every step's position, and no more
         memory_buffer=EpisodeReplayBuffer(
@@ -83,7 +78,6 @@ def make_trainer(args) -> tuple[Trainer, tuple]:
         env_step_fn=step_fn,
         env_init_fn=make_xot_init_fn(load_xot(), 0.0),
         state_to_nn_input_fn=state_to_nn_input,
-        testers=[],
         data_transform_fns=SYMMETRY_TRANSFORM_FNS,
         advance_every=args.advance_every,
         **({"moves_at_once": args.moves_at_once} if args.moves_at_once else {}),
@@ -107,18 +101,7 @@ def main():
         type=int,
         default=None,
         help="as train.py's: cycles between plays of the moves whose searches are done, by "
-        "default a whole search's, or 5 with --count-reused-visits",
-    )
-    parser.add_argument(
-        "--count-reused-visits",
-        action="store_true",
-        help="as train.py's: searches stop at --sims + 1 root visits, reused ones counted",
-    )
-    parser.add_argument(
-        "--min-iterations",
-        type=int,
-        default=0,
-        help="with --count-reused-visits, the fewest iterations a search takes",
+        "default a whole search's, or 5 with --playout-cap",
     )
     parser.add_argument(
         "--traversal-steps",
@@ -171,14 +154,14 @@ def main():
         "--compare", default=None, help="compare the warmup steps' results to a --save"
     )
     args = parser.parse_args()
-    if args.advance_every is None and (args.count_reused_visits or args.playout_cap):
+    if args.advance_every is None and args.playout_cap:
         args.advance_every = 5
 
     trainer, params = make_trainer(args)
     collect = trainer.collect_steps
     key = jax.random.PRNGKey(args.seed)
     init_key, key = jax.random.split(key)
-    state = trainer.init_collection_state(init_key, args.envs)
+    state = trainer.init_collection_state(init_key)
 
     def keys(k):
         return jax.random.split(k, args.envs)
@@ -218,7 +201,7 @@ def main():
         moves += int(state.moves.sum()) - before
     # a call runs the cycles of `steps` moves' searches; searches done between plays of the
     # moves (see --advance-every) go on until the next, so fewer moves may be played
-    cycles = args.steps * trainer.collection_schedule.at(0).search_cycles()
+    cycles = args.steps * trainer.evaluator.search_cycles()
     per_step = np.array(times) / args.steps
     print(
         f"{args.envs} envs, {args.sims} sims, {args.net}, advance every "

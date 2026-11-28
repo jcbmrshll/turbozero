@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 import equinox as eqx
@@ -7,7 +8,10 @@ import jax.numpy as jnp
 import numpy as np
 from jax.typing import ArrayLike
 
+from core.common import two_player_game
+from core.evaluators.evaluator import Evaluator
 from core.networks.utils import apply_nn
+from core.types import EnvInitFn, EnvStepFn
 
 # what `scored_position_metrics` reports, for all positions and for each group
 METRICS = ("top1", "regret", "exp_regret", "value_mse", "value_sign", "result_change")
@@ -189,4 +193,92 @@ class ScoredPositionsValidator:
             ]
             for g, group in enumerate(self.group_names)
             for m, metric in enumerate(METRICS)
+        }
+
+
+class TwoPlayerValidator:
+    """Plays `num_episodes` games of `evaluator`, with the weights it's called with, against
+    `baseline_evaluator`. A `Trainer` validator: it returns `<name>_avg_outcome` (the mean
+    final reward), `<name>_win_rate` and `<name>_loss_rate` (the rest are draws).
+
+    The games' keys are drawn once from `seed`, so every call plays from the same starts with
+    the same noise, and calls differ only by the weights. The agent moves first in exactly half
+    of the games: with the turn order fixed across each half, each step runs only the
+    evaluator whose turn it is."""
+
+    def __init__(
+        self,
+        evaluator: Evaluator,
+        baseline_evaluator: Evaluator,
+        env_step_fn: EnvStepFn,
+        env_init_fn: EnvInitFn,
+        max_steps: int,
+        num_episodes: int,
+        name: str,
+        baseline_params: Any = None,
+        seed: int = 0,
+    ):
+        """
+        Args:
+            evaluator: the agent's evaluator, e.g. a search with the network's evaluation
+            baseline_evaluator: the opponent's
+            env_step_fn: (env_state, action) -> (new_env_state, metadata)
+            env_init_fn: (key) -> (env_state, metadata), the games' starts
+            max_steps: games still running after this many moves are scored as they stand
+                (see `core.common.two_player_game`)
+            num_episodes: games per call, an even number
+            name: prefixes the metrics
+            baseline_params: (optional) the opponent's parameters
+            seed: draws the games' keys
+        """
+        if num_episodes % 2:
+            raise ValueError(f"num_episodes must be even, got {num_episodes}")
+        self.name = name
+        self.num_episodes = num_episodes
+        self.evaluator = evaluator
+        self.baseline_evaluator = baseline_evaluator
+        self.seed = seed
+        keys = jax.random.split(jax.random.PRNGKey(seed), num_episodes)
+        baseline_params = jnp.array([]) if baseline_params is None else baseline_params
+        game_fn = partial(
+            two_player_game,
+            evaluator_1=evaluator,
+            evaluator_2=baseline_evaluator,
+            params_2=baseline_params,
+            env_step_fn=env_step_fn,
+            env_init_fn=env_init_fn,
+            max_steps=max_steps,
+        )
+        half = num_episodes // 2
+
+        @jax.jit
+        def play(params: Any) -> jax.Array:
+            first, _, _ = jax.vmap(
+                lambda k: game_fn(k, params_1=params, p1_first=True)
+            )(keys[:half])
+            second, _, _ = jax.vmap(
+                lambda k: game_fn(k, params_1=params, p1_first=False)
+            )(keys[half:])
+            return jnp.concatenate([first, second])
+
+        self._play = play
+
+    def get_config(self) -> dict:
+        return {
+            "name": self.name,
+            "num_episodes": self.num_episodes,
+            "seed": self.seed,
+            "evaluator": self.evaluator.__class__.__name__,
+            "evaluator_config": self.evaluator.get_config(),
+            "baseline_evaluator": self.baseline_evaluator.__class__.__name__,
+            "baseline_evaluator_config": self.baseline_evaluator.get_config(),
+        }
+
+    def __call__(self, params: Any) -> dict[str, jax.Array]:
+        """The games' results with `params`, the agent's (parameters, network state)."""
+        results = self._play(params)
+        return {
+            f"{self.name}_avg_outcome": results[:, 0].mean(),
+            f"{self.name}_win_rate": (results[:, 0] > results[:, 1]).mean(),
+            f"{self.name}_loss_rate": (results[:, 0] < results[:, 1]).mean(),
         }

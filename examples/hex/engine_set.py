@@ -1,6 +1,6 @@
 """Hex positions with every legal move scored by MoHex: a fixed set to measure networks against
 a far stronger player (see `label_positions.py` to build one, and train.py's --engine-set, which
-scores the network on one as it trains, with `core.testing.scored_positions.ScoredPositionsTester`).
+scores the network on one as it trains, with `core.training.validation.ScoredPositionsValidator`).
 
 Scores are the value of a move for the player making it, from -1 to 1. At sizes MoHex's solver can
 finish they're exact wins and losses (`level` 0); otherwise its search's values (`level` its
@@ -21,7 +21,7 @@ from pathlib import Path
 import numpy as np
 from engines import CACHE_DIR
 
-from core.testing.scored_positions import ScoredPositions
+from core.training.validation import ScoredPositions
 
 # the score of an illegal action
 ILLEGAL = -999.0

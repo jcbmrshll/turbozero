@@ -157,52 +157,6 @@ class EpisodeReplayBuffer:
             has_reward=state.has_reward.at[index].set(False, mode="drop"),
         )
 
-    def add_experiences(
-        self, state: ReplayBufferState, experiences: BaseExperience, valid: jax.Array
-    ) -> ReplayBufferState:
-        """Adds experiences whose targets are already known (e.g. positions from a search tree, see
-        `core.training.tree_positions`), which can be sampled right away.
-
-        Only the experiences marked in `valid` are added, in order, one after another. Keep them in a
-        buffer of their own: `truncate` would discard them along with an episode in progress.
-
-        Args:
-            state: replay buffer state
-            experiences: experiences to add, with a leading dimension of at most `capacity`
-            valid: (num experiences,) which of them to add
-
-        Returns:
-            ReplayBufferState: updated replay buffer state
-        """
-        index = self.write_indices(state, valid)
-        next_idx = (state.next_idx + valid.sum()) % buffer_capacity(state)
-        return replace(
-            state,
-            buffer=jax.tree_util.tree_map(
-                lambda x, y: x.at[index].set(y, mode="drop"), state.buffer, experiences
-            ),
-            next_idx=next_idx,
-            episode_start_idx=next_idx,
-            populated=state.populated.at[index].set(True, mode="drop"),
-            has_reward=state.has_reward.at[index].set(True, mode="drop"),
-        )
-
-    def write_indices(self, state: ReplayBufferState, valid: jax.Array) -> jax.Array:
-        """Where `add_experiences` writes each of the experiences marked in `valid`.
-
-        Args:
-            state: replay buffer state
-            valid: which experiences are added
-
-        Returns:
-            jax.Array: each experience's index in the buffer; the buffer's capacity (out of
-                bounds) for those not added
-        """
-        capacity = buffer_capacity(state)
-        # the i-th valid experience goes i places after `next_idx`
-        offsets = jnp.cumsum(valid) - 1
-        return jnp.where(valid, (state.next_idx + offsets) % capacity, capacity)
-
     def assign_rewards(
         self, state: ReplayBufferState, reward: jax.Array
     ) -> ReplayBufferState:
@@ -299,8 +253,8 @@ class EpisodeReplayBuffer:
         Args:
             state: replay buffer state, with a batch dimension in front of the capacity dimension
             entry_data: (optional) more arrays with an entry per place in the buffer, shaped
-                (batch size, capacity, ...), to copy along with it (e.g. `Trainer`'s
-                `tree_written_at`)
+                (batch size, capacity, ...), to copy along with it (e.g. which waiting solve
+                each entry is)
 
         Returns:
             Tuple[ReplayBufferState, list[np.ndarray]]: the resized state, and `entry_data`
@@ -375,14 +329,13 @@ class EpisodeReplayBuffer:
         if not self.sample_mask(state).any():
             raise ValueError(
                 "Cannot sample from the replay buffer: no episodes have finished yet. "
-                "Collect more self-play steps before training (e.g. increase `warmup_steps`)."
+                "Collect more self-play steps before sampling."
             )
         count = int(self.sample_mask(state).sum())
         if count < sample_size:
             raise ValueError(
                 f"Cannot sample {sample_size} entries from the replay buffer: only {count} can be "
-                "sampled. Collect more self-play steps before training (e.g. increase "
-                "`warmup_steps`), or sample fewer."
+                "sampled. Collect more self-play steps before sampling, or sample fewer."
             )
 
     def sample_indices(

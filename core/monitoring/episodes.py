@@ -1,11 +1,11 @@
-"""Packing test episodes for a seaglass server, whose run pages draw them in the browser.
+"""Packing played games for a seaglass server, whose run pages draw them in the browser.
 
-A training run packs an episode's raw arrays into seaglass `Arrays` of type
-`episode_type(env)` (with a packer here, passed to a tester as its `episode_fn`); the server
-stores them as they are, and the run's page plays them with turbozero's views (`views/`, whose
-`episode.js` renders the type), so neither the training run nor the server draws anything.
+Whoever plays a game for a run (e.g. a match against an engine) packs its raw arrays into
+seaglass `Arrays` of type `episode_type(env)` with a packer here; the server stores them as they
+are, and the run's page plays them with turbozero's views (`views/`, whose `episode.js` renders
+the type), so neither the player nor the server draws anything.
 
-When the test recorded its searches (`two_player_game`'s `record_search`), the episode also
+When the game recorded its searches (`two_player_game`'s `record_search`), the episode also
 carries what each player's search explored at each position, for the views' search explorer:
 every node's statistics and, replayed through the environment here, its board. A player that
 only scores moves, each with the line it expects after it (an engine's analysis), records them
@@ -22,7 +22,6 @@ import jax.numpy as jnp
 import numpy as np
 from seaglass import Arrays
 
-from core.common import GameFrame
 from core.evaluators.mcts.state import SearchRecord
 from core.trees.tree import Tree
 from core.types import EnvStepFn
@@ -274,47 +273,17 @@ def _searches(
     }
 
 
-def with_opening(frames: GameFrame, states: Sequence[Any]) -> GameFrame:
-    """`frames` (`GameFrame`s stacked along a leading time axis) after the positions of an
-    opening that led to their first: `states`, each the one before the next, the last one
-    move before `frames`' first. Nobody searched the opening's positions.
-    """
-    num = len(states)
-    opening = jax.tree.map(lambda *xs: np.stack(xs), *states)
-
-    def before(x, opening_x=None):
-        x = np.asarray(x)
-        head = (
-            np.zeros((num, *x.shape[1:]), x.dtype) if opening_x is None else opening_x
-        )
-        return np.concatenate([head, x])
-
-    return GameFrame(
-        env_state=jax.tree.map(before, frames.env_state, opening),
-        p1_value_estimate=jnp.asarray(before(frames.p1_value_estimate)),
-        p2_value_estimate=jnp.asarray(before(frames.p2_value_estimate)),
-        completed=jnp.asarray(before(frames.completed)),
-        outcomes=jnp.asarray(before(frames.outcomes)),
-        # frame t + 1 holds the record of position t; no records hold zeros
-        p1_search=None
-        if frames.p1_search is None
-        else jax.tree.map(before, frames.p1_search),
-        p2_search=None
-        if frames.p2_search is None
-        else jax.tree.map(before, frames.p2_search),
-    )
-
-
 def pgx_two_player_episode() -> Callable[..., Arrays]:
-    """An `episode_fn` for testers of two-player pgx board games (those in `BOARDS`):
-    packs the first test episode for the views to play, as `Arrays` of the game's
+    """A packer for two-player pgx board games (those in `BOARDS`): packs a game, as
+    `core.common.two_player_game` plays it, for the views to play, as `Arrays` of the game's
     `episode_type`. Whoever packs it can name the trained agent's opponent in its attrs,
     `{"opponent": "edax level 8"}`.
 
     Returns:
-        Callable: `episode_fn(frames, p_ids, env_step_fn, start=0) -> Arrays`, see
-        `BaseTester`; `start` is the frame the players started playing from, after an
-        opening played for them (see `with_opening`), where the views show the game from
+        Callable: `episode_fn(frames, p_ids, env_step_fn, start=0) -> Arrays`: the game's
+        frames (stacked along a leading time axis) and its player ids, as numpy arrays, and
+        the environment's step function; `start` is the frame the players started playing
+        from, after an opening played for them, where the views show the game from
     """
 
     def episode_fn(frames, p_ids, env_step_fn, start: int = 0) -> Arrays:

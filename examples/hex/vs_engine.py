@@ -17,9 +17,7 @@ moves are searched together on the accelerator. Each game's result is checked ag
 engine's own board. The engine processes run on the cores this process may use (e.g. with
 `taskset`), as many searching at once as there are cores.
 
-train.py plays these games as it trains (`EngineMatchTester`, see its --vs-engine-every and
---vs-engine-last), logging them to the run. Here, with --monitor and --run, a checkpoint's
-results are logged to its training run afterwards, at the checkpoint's epoch, as
+With --monitor and --run, a checkpoint's results are logged to its training run, at the checkpoint's epoch, as
 `{engine}_level{L}_sims{S}` (the score, and `_se`, `_win`, `_draw` and `_loss`), the first game at
 each level with them, as `{engine}_level{L}_sims{S}_game`: its positions, what our agent's search
 made of each, and what the engine's made of those it moved from (see `engines.MoHex.analysis`).
@@ -29,7 +27,6 @@ import argparse
 import json
 import os
 import time
-from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from operator import methodcaller
@@ -48,7 +45,6 @@ from core.common import GameFrame
 from core.evaluators.evaluation_fns import make_nn_eval_fn
 from core.monitoring import DEFAULT_URL, Monitor
 from core.monitoring.episodes import line_record, pgx_two_player_episode
-from core.testing.tester import BaseTester, TestState
 
 
 def select(which, on_true, on_false):
@@ -369,11 +365,10 @@ class EngineMatch:
     """Our agent, `network` searching `sims` MCTS iterations a move, against an engine at each of
     `levels`: 2 * `openings` games a level, from openings each played with both colours. The
     openings are drawn level by level from `seed`, so every network it plays plays the same
-    games, and so does every match with the same levels and seed, here or in train.py (see
-    `EngineMatchTester`).
+    games, and so does every match with the same levels and seed.
 
-    The search is compiled once, for whatever parameters it's given: train.py plays the network
-    as it trains, epoch after epoch, without compiling again.
+    The search is compiled once, for whatever parameters it's given: checkpoint after
+    checkpoint play without compiling again.
     """
 
     def __init__(
@@ -548,175 +543,6 @@ def describe_scores(monitor: Monitor, names: list[str]) -> None:
     up."""
     for name in names:
         monitor.describe(name, better="higher", headline=True)
-
-
-@jax.tree_util.register_dataclass
-@dataclass(frozen=True)
-class EngineMatchState(TestState):
-    """What an `EngineMatchTester` keeps of the last networks of a run it's played, to log their
-    mean once it has played them all. Kept with the run's saved state, so a resumed run has them
-    too.
-
-    Attributes:
-        results: (last, levels, games) our result in each game (+1, -1) of the network after each
-            of the run's last epochs, the oldest first
-        played: (last,) which of them it has played
-    """
-
-    results: jax.Array
-    played: jax.Array
-
-
-class EngineMatchTester(BaseTester):
-    """Plays an `EngineMatch` as a run trains: on the network after every `every` epochs (epochs
-    every - 1, 2 * every - 1, ... counting from 0, as the run logs them), and after each of the
-    last `last` epochs of a run of `num_epochs`, logging the mean of those too, at the last epoch,
-    as `<name>_last<last>`, with its standard error (`_last<last>_se`): how much it would move
-    with other openings, each game's results averaged over the networks first, since they all
-    play the same games.
-
-    Each level's result is logged as soon as it's played (see `LevelResult.metrics`), at the epoch
-    of the network that played, then the time all of them took, as `<engine>_seconds`, so that a
-    run's training time can be told from its time playing. With `results`, each is also appended
-    to that file, as a line of JSON.
-
-    It plays in the training process, on the same accelerator, between epochs: the search takes
-    its memory from what the run has, and the engine processes it starts run on the cores the run
-    may use (see `available_cpus`).
-    """
-
-    def __init__(
-        self,
-        match: EngineMatch,
-        num_epochs: int,
-        every: int = 0,
-        last: int = 0,
-        record: bool = False,
-        results: Path | None = None,
-        config: dict | None = None,
-    ):
-        """
-        Args:
-            match: the games to play
-            num_epochs: epochs in the run
-            every: play after every this many epochs (0 for never)
-            last: play after each of the run's last this many epochs (0 for none)
-            record: record a game at each level for the monitor
-            results: (optional) also append each level's result to this file
-            config: (optional) recorded with the tester's configuration, e.g. the dtype the
-                network plays in; added to each result in `results` too
-        """
-        super().__init__(num_keys=1, name=match.engine.name)
-        if not 0 <= last <= num_epochs:
-            raise ValueError(f"last must be between 0 and {num_epochs}, got {last}")
-        self.match = match
-        self.num_epochs = num_epochs
-        self.every = every
-        self.last = last
-        self.record = record
-        self.results = results
-        self.extra_config = config or {}
-
-    def plays_at(self, epoch: int) -> bool:
-        """Whether it plays the network after `epoch` (counting from 0)."""
-        return (self.every > 0 and (epoch + 1) % self.every == 0) or (
-            epoch >= self.num_epochs - self.last
-        )
-
-    def mean_name(self, level: int) -> str:
-        return f"{self.match.name(level)}_last{self.last}"
-
-    def score_names(self) -> list[str]:
-        """The scores it logs (see `describe_scores`)."""
-        names = [self.match.name(level) for level in self.match.levels]
-        if self.last > 0:
-            names += [self.mean_name(level) for level in self.match.levels]
-        return names
-
-    def get_config(self) -> dict:
-        return {
-            **super().get_config(),
-            **self.match.describe(),
-            "every": self.every,
-            "last": self.last,
-            **self.extra_config,
-        }
-
-    def init(self, *args, **kwargs) -> EngineMatchState:
-        shape = (self.last, len(self.match.levels), self.match.num_games)
-        return EngineMatchState(
-            results=jnp.zeros(shape, dtype=jnp.int8),
-            played=jnp.zeros((self.last,), dtype=bool),
-        )
-
-    def last_metrics(self, state: EngineMatchState) -> dict[str, float]:
-        """The mean of each level's scores over the last networks played, and its standard
-        error."""
-        played = np.asarray(state.played)
-        results = np.asarray(state.results)[played]
-        metrics = {}
-        for i, level in enumerate(self.match.levels):
-            # each game's points, averaged over the networks
-            points = ((1 + np.sign(results[:, i])) / 2).mean(axis=0)
-            name = self.mean_name(level)
-            metrics[name] = float(points.mean())
-            metrics[f"{name}_se"] = float(points.std() / np.sqrt(len(points)))
-        return metrics
-
-    def run(  # pyright: ignore[reportIncompatibleMethodOverride]
-        self,
-        key: jax.Array,
-        epoch_num: int,
-        max_steps: int,
-        env_step_fn: Any,
-        env_init_fn: Any,
-        evaluator: Any,
-        state: EngineMatchState,
-        params: Any,
-        *args,
-        log_fn: Callable[[dict], None] | None = None,
-        activity_fn: Callable[[str], None] | None = None,
-    ) -> tuple[EngineMatchState, dict, None]:
-        """Plays the match at the epochs it's set to (see `BaseTester.run`), logging its results
-        with `log_fn` as they come; returns no metrics or episode of its own."""
-        if not self.plays_at(epoch_num):
-            return state, {}, None
-        start = time.perf_counter()
-        results = []
-        for level in self.match.levels:
-            if activity_fn is not None:
-                activity_fn(
-                    f"{self.match.num_games} games against {self.match.engine.name} "
-                    f"level {level}, {self.match.sims} sims"
-                )
-            result = self.match.play(params, level, record=self.record)
-            print(f"epoch {epoch_num}: {self.match.engine.name} {result.summary()}")
-            if log_fn is not None:
-                log_fn(result.metrics(self.match.name(level)))
-            if self.results is not None:
-                with open(self.results, "a") as f:
-                    record = result.record(
-                        epoch=epoch_num,
-                        engine=self.match.engine.name,
-                        sims=self.match.sims,
-                        **self.extra_config,
-                    )
-                    f.write(json.dumps(record) + "\n")
-            results.append(result.results)
-        metrics: dict[str, Any] = {
-            f"{self.match.engine.name}_seconds": time.perf_counter() - start
-        }
-        slot = epoch_num - (self.num_epochs - self.last)
-        if 0 <= slot < self.last:
-            state = EngineMatchState(
-                results=state.results.at[slot].set(np.stack(results).astype(np.int8)),
-                played=state.played.at[slot].set(True),
-            )
-            if epoch_num == self.num_epochs - 1:
-                metrics.update(self.last_metrics(state))
-        if log_fn is not None:
-            log_fn(metrics)
-        return state, {}, None
 
 
 def main():

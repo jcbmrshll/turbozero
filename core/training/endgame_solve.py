@@ -39,7 +39,8 @@ class PendingSolves:
         labelled: solves labelled so far: those from `labelled` to `added` are waiting
         entry_solve: (replay buffer capacity,) for each buffer entry, the number of the solve
             (counting from 0, as `added` does) whose result it waits for; -1 for none
-        stops: whether the game in progress stops for solves (see `EndgameSolve.share`)
+        stops: whether the game in progress stops for solves: not once its solve point found
+            every slot full
         past: whether the game in progress has passed its solve point
         missed: solves that found every slot full (see `EndgameSolve.slots`)
     """
@@ -122,8 +123,6 @@ class EndgameSolve:
             worth. A game whose solve point finds every slot full is played to the end instead,
             unsolved; one past it ends there, its unsolved position dropped (both counted in
             `solve_missed`, see `Trainer.collection_metrics`)
-        share: the fraction of games solved, each drawn as it starts; the others are played to
-            the end, as without solving
         play_past: the mean number of moves a game plays past its solve point (see above);
             `math.inf` plays every game to its end, each position it stores past its solve
             point solved
@@ -132,29 +131,24 @@ class EndgameSolve:
     stop_fn: Callable[[Any], jax.Array]
     solve_fn: Callable[[Any], np.ndarray]
     slots: int
-    share: float = 1.0
     play_past: float = 0.0
 
     def __post_init__(self):
         if self.slots < 1:
             raise ValueError(f"slots must be positive, got {self.slots}")
-        if not 0 <= self.share <= 1:
-            raise ValueError(f"share must be in [0, 1], got {self.share}")
         if self.play_past < 0:
             raise ValueError(f"play_past must be at least 0, got {self.play_past}")
 
     def get_config(self) -> dict:
         return {
             "slots": self.slots,
-            "share": self.share,
             "play_past": "end" if math.isinf(self.play_past) else self.play_past,
         }
 
-    def init(self, key: jax.Array, env_state: Any, capacity: int) -> PendingSolves:
+    def init(self, env_state: Any, capacity: int) -> PendingSolves:
         """An environment's `PendingSolves`, with nothing waiting.
 
         Args:
-            key: rng, to draw whether the game in progress is solved
             env_state: an environment state (one environment's), for the positions' shapes
             capacity: the replay buffer's capacity, entries per environment
         """
@@ -167,16 +161,10 @@ class EndgameSolve:
             added=jnp.array(0, dtype=jnp.int32),
             labelled=jnp.array(0, dtype=jnp.int32),
             entry_solve=jnp.full((capacity,), -1, dtype=jnp.int32),
-            stops=self.draw(key),
+            stops=jnp.array(True),
             past=jnp.array(False),
             missed=jnp.array(0, dtype=jnp.int32),
         )
-
-    def draw(self, key: jax.Array) -> jax.Array:
-        """Whether a game starting now is solved (see `share`)."""
-        if self.share >= 1:
-            return jnp.array(True)
-        return jax.random.uniform(key) < self.share
 
     def move(
         self,
@@ -239,14 +227,12 @@ class EndgameSolve:
             missed=pending.missed + move.missed,
         )
 
-    def next_game(
-        self, key: jax.Array, pending: PendingSolves, ended: jax.Array
-    ) -> PendingSolves:
+    def next_game(self, pending: PendingSolves, ended: jax.Array) -> PendingSolves:
         """Starts the next game's state, if the game in progress `ended` (an environment's):
-        whether it's solved, drawn, and not past its solve point."""
+        it stops for solves, and isn't past its solve point."""
         return replace(
             pending,
-            stops=jnp.where(ended, self.draw(key), pending.stops),
+            stops=pending.stops | ended,
             past=pending.past & ~ended,
         )
 

@@ -35,7 +35,6 @@ import json
 import os
 import time
 from dataclasses import replace
-from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -180,16 +179,34 @@ def with_value_source(
     return replace(positions, search_value=teacher_values)
 
 
+def with_value_target(batch: BaseExperience, value_target_q: float) -> BaseExperience:
+    """`batch` with each position's outcome for the player to move, z, replaced by its mix with
+    the position's stored value q, (1 - value_target_q) * z + value_target_q * q: the value
+    target `az_default_loss_fn` trains on."""
+    if not value_target_q:
+        return batch
+    rows = jnp.arange(batch.reward.shape[0])
+    z = batch.reward[rows, batch.cur_player_id]
+    mixed = (1 - value_target_q) * z + value_target_q * batch.search_value
+    return replace(
+        batch,
+        reward=batch.reward.at[rows, batch.cur_player_id].set(
+            mixed.astype(batch.reward.dtype)
+        ),
+    )
+
+
 def make_train_step(optimizer, value_target_q: float):
     """One supervised step on a batch, under a random symmetry for each position; the loss is
-    self-play training's (see `az_default_loss_fn`), so the steps differ only in their data."""
-    loss_fn = partial(az_default_loss_fn, value_target_q=value_target_q)
+    self-play training's (see `az_default_loss_fn`) on a value target of z mixed with q (see
+    `with_value_target`), so the steps differ only in their data."""
 
     @eqx.filter_jit
     def step(params, static, nn_state, opt_state, positions, indices, key):
         batch = jax.tree.map(lambda x: x[indices], positions)
         batch = transform_randomly(key, batch, SYMMETRY_TRANSFORM_FNS)
-        grad_fn = eqx.filter_value_and_grad(loss_fn, has_aux=True)
+        batch = with_value_target(batch, value_target_q)
+        grad_fn = eqx.filter_value_and_grad(az_default_loss_fn, has_aux=True)
         (_, (metrics, nn_state)), grads = grad_fn(
             eqx.combine(params, static), nn_state, batch
         )
@@ -219,7 +236,8 @@ def train(
     ckpt_dir: Path | None,
     log=print,
 ):
-    """Trains `network` for `passes` passes over `positions`, with self-play training's optimizer.
+    """Trains `network` for `passes` passes over `positions`, with self-play training's optimizer,
+    its learning rate decaying from `lr` to `lr_final` along a cosine.
     Each `eval_every` passes, and after the last, it measures the network on `heldout` and on a
     probe of `train_probe_size` of the positions it trains on, whose gap to `heldout` shows
     memorisation, and saves a checkpoint to `ckpt_dir`.
@@ -232,7 +250,15 @@ def train(
         raise ValueError(
             f"{len(positions.reward)} positions are too few for batches of {batch_size}"
         )
-    optimizer = make_optimizer(passes * steps_per_pass, lr, lr_final, weight_decay)
+    total_steps = passes * steps_per_pass
+    schedule = (
+        lr
+        if lr_final == lr
+        else optax.cosine_decay_schedule(
+            lr, decay_steps=max(total_steps, 1), alpha=lr_final / lr
+        )
+    )
+    optimizer = make_optimizer(schedule, weight_decay)
     if warmup_steps:
         # a fresh Adam's first steps move every weight by about lr, whatever its gradient:
         # from a trained network, ramp the updates up instead

@@ -7,8 +7,8 @@ with turbozero's views.
     Trainer(..., monitor=monitor)
 
 `Monitor` is seaglass's, with turbozero's bundle (`VIEWS`), which the server keeps with each
-run: its page plays the run's test games (see `episodes.pgx_two_player_episode`) and explores
-the searches behind their moves. Each run declares what the metrics and media keys turbozero
+run: its page plays the games logged to the run (see `episodes.pgx_two_player_episode`) and
+explores the searches behind their moves. Each run declares what the metrics and media keys turbozero
 logs are (`DECLARED`, from declared.json: a new metric needs a description there), and which
 are its headline numbers. Inside a slick task, $SEAGLASS_URL and $SEAGLASS_TAGS are set, so a
 run logs to slick and lists under the task that started it.
