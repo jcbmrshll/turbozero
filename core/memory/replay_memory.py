@@ -391,7 +391,12 @@ class EpisodeReplayBuffer:
         """Samples entries uniformly (by default without replacement) from those marked in `mask`.
 
         Compatible with `jax.jit`. Without replacement, `mask` must mark at least `sample_size` entries,
-        else unmarked ones fill the rest of the sample; use `check_can_sample` to check.
+        else unmarked ones fill the rest of the sample; use `check_can_sample` to check. With
+        replacement, it must mark at least one.
+
+        With replacement, a draw picks the marked entries by their count, in integers: drawn from
+        float32 cumulative probabilities, about one in 10,000 draws over 1024 x 2250 entries
+        landed on an unmarked one.
 
         Args:
             key: rng
@@ -403,9 +408,15 @@ class EpisodeReplayBuffer:
             jax.Array: indices into the flattened `mask`, shape (sample_size,)
         """
         mask = mask.reshape(-1)
-        return jax.random.choice(
-            key, mask.size, shape=(sample_size,), replace=replace, p=mask / mask.sum()
-        )
+        if not replace:
+            # Gumbel top-k: every marked entry has the same log-probability, unmarked ones -inf
+            return jax.random.choice(
+                key, mask.size, shape=(sample_size,), replace=False, p=mask / mask.sum()
+            )
+        # the draw-th marked entry is the first with more than `draw` marked up to it
+        marked = jnp.cumsum(mask, dtype=jnp.int32)
+        draws = jax.random.randint(key, (sample_size,), 0, marked[-1])
+        return jnp.searchsorted(marked, draws, side="right")
 
     def sample(
         self,

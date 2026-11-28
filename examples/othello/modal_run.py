@@ -99,6 +99,9 @@ class Mirror:
         self.states_lock = threading.Lock()  # one state upload at a time
         self.manifest_lock = threading.Lock()
         self.manifest_sent: dict[str, list[int]] | None = None
+        # the steps that ran on this container: only their directories here are as train.py
+        # left them (a step finished on an earlier attempt's container isn't on this disk)
+        self.ran: set[int] = set()
 
     def fetch(self, key: str, path: str) -> bool:
         """Brings `key` to `path`, as get_file does, noting that the bucket has it: a new
@@ -174,11 +177,14 @@ class Mirror:
                 self.manifest[key] = [stat.st_size, stat.st_mtime_ns]
 
     def _send_step(self, index: int, step: Step) -> None:
-        """A step's files but its saved states, and the manifest's entries of those it deleted."""
+        """A step's files but its saved states, and the manifest's entries of those it deleted
+        (if it ran here: what isn't on this disk of a step that didn't, it didn't delete)."""
         files = self._files(step)
         for path, key, implicit in files:
             if not STATE.fullmatch(os.path.basename(path)):
                 self._send_file(index, path, key, implicit)
+        if index not in self.ran:
+            return
         # what train.py deleted is gone from a local run too; a saved state it asked for stays,
         # sent on and needed on no disk here after a restart
         live = {key for _, key, _ in files}
@@ -465,6 +471,7 @@ class Runner:
         for _, path in start_states(step.argv):
             ensure_input(self.mirror, path)
         resume = restore_step(self.mirror, index, step)
+        self.mirror.ran.add(index)
         if not resume:
             self._crash_runs(done.get("runs", []))
             done["runs"] = []

@@ -369,6 +369,41 @@ def test_a_preempted_job_goes_on_from_its_state_on_a_new_machine(scene):
     assert t["step"] == 11
 
 
+def test_steps_finished_before_a_preemption_keep_their_files_in_the_manifest(scene):
+    # two segments done, the third branched from the second's end and preempted
+    c = f"{scene.home}/.cache/turbozero/c"
+    scene.job(
+        step("a", "--epochs 2 --save-state-at 2"),
+        step("b", f"--epochs 4 --save-state-at 4 --branch-from {c}/a/state-2.npz"),
+        step("t", f"--epochs 12 --die-at 8 --branch-from {c}/b/state-4.npz"),
+        name="p",
+        resume_every=5,
+    )
+    with pytest.raises(RuntimeError, match="lost"):
+        scene.runner("p").run()
+    manifest_key = modal_spec.job_key("p", "manifest.json")
+    before = modal_store.get_json(scene.store, manifest_key)
+    earlier = sorted(k for k in before if "/c/a/" in k or "/c/b/" in k)
+    assert any(k.endswith("/c/a/1.eqx") for k in earlier)
+    assert any(k.endswith("/c/b/modal-job.json") for k in earlier)
+    died = scene.root / "c" / "t.died"
+    keep = died.read_text()
+    scene.wipe_container()
+    died.parent.mkdir(parents=True)
+    died.write_text(keep)
+
+    # the new machine runs only the third; the first two's files aren't on its disk (but
+    # b's final state, which the third branches from), and aren't gone from the run
+    assert scene.runner("p").run() == "done"
+    assert not (scene.root / "c" / "a").exists()
+    after = modal_store.get_json(scene.store, manifest_key)
+    assert {k: after.get(k) for k in earlier} == {k: before[k] for k in earlier}
+    scene.wipe_container()
+    scene.sync().run()
+    assert {p.name for p in (scene.root / "c" / "a").iterdir()} == {"0.eqx", "1.eqx", "state-2.npz", "modal-job.json"}  # fmt: skip
+    assert {p.name for p in (scene.root / "c" / "b").iterdir()} == {"2.eqx", "3.eqx", "state-4.npz", "modal-job.json"}  # fmt: skip
+
+
 def test_a_forked_step_takes_its_states_and_resumes_without_them(scene):
     # states of runs here, which the launch uploads
     trunk = f"{scene.home}/.cache/turbozero/c/trunk/state-20.npz"
