@@ -779,10 +779,11 @@ def main():
         type=int,
         default=0,
         metavar="N",
-        help="every epoch, score the playing network on N of the positions its self-play just "
-        "stored, before it trains on them: its raw weights' and its self-play average's policy "
-        "KL and value loss (fresh_*), and the raw weights' excess (fresh_*_gap), what the "
-        "step's jitter costs on new data. N a multiple of the micro-batch (--train-batch / "
+        help="every epoch, score the playing network on N of the positions training can sample "
+        "now and couldn't before the epoch's self-play (with --solve-empties mostly the last "
+        "epoch's games, just labelled), before it trains on them, in inference mode: its raw "
+        "weights' and its self-play average's policy KL and value loss (fresh_*), and the raw "
+        "weights' excess (fresh_*_gap), what the step's jitter costs on new data. N a multiple of the micro-batch (--train-batch / "
         "--grad-accum), e.g. 16 of them. For watching; nothing follows it. Default 0, none",
     )
     parser.add_argument(
@@ -939,7 +940,8 @@ def main():
         help="also keep averages of each network's weights over about H epochs (exponential "
         "moving averages, see --average-warmup; training is unchanged), "
         "checkpointed to avg<H> in its checkpoint directory and scored on the engine-labelled "
-        "set as avg<H>/engine_*",
+        "set as avg<H>/engine_*. A resume, branch or fork goes on with the saved average over "
+        "each H it has, and starts any other at the network's weights",
     )
     parser.add_argument(
         "--selfplay-average",
@@ -956,7 +958,10 @@ def main():
         metavar="W",
         help="an average's horizon starts at 1 epoch and grows by one every W epochs it takes "
         "in, up to its own: early in training, when every epoch improves the network a lot, a "
-        "long average lags it (1: the plain mean of the epochs so far until the horizon)",
+        "long average lags it (1: the plain mean of the epochs so far until the horizon). "
+        "Counted in epochs, whatever --train-steps: an average over H reaches it after "
+        "(H - 1) x W epochs, e.g. 560 for 57 at the default, and one added to a fork starts "
+        "at 1",
     )
     parser.add_argument(
         "--no-average-rescale",
@@ -970,8 +975,9 @@ def main():
         default=32,
         metavar="N",
         help="each weight average gets BatchNorm statistics of its own after every epoch, from N "
-        "training batches of the replay buffer through its weights, for self-play, tests and its "
-        "checkpoints (0: averages play with the network's statistics, which fit only its own weights)",
+        "training micro-batches (--train-batch / --grad-accum) of the replay buffer through its "
+        "weights, for self-play, tests and its checkpoints (0: averages play with the "
+        "network's statistics, which fit only its own weights)",
     )
     parser.add_argument(
         "--save-state-at",

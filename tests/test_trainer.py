@@ -9,6 +9,7 @@ trainer, see `real`) a whole run, its exact resumption, and the donation of the 
 import fnmatch
 import gc
 import itertools
+import json
 import os
 import re
 import warnings
@@ -61,6 +62,7 @@ from core.training.train import (
     lr_plateau_states,
     read_state_meta,
     reduce_step_metrics,
+    saved_average_counts,
     saved_growth,
     state_epochs,
     state_path,
@@ -2761,12 +2763,15 @@ def test_a_fork_takes_a_run_without_growths_weight_averages(env, tmp_path, fake_
 
     for output in (forked, into):
         assert leaves_equal(output.averages[0], saved.averages[0])
-        assert output.averaged[0] == saved.averaged[0] == 3
+        assert output.averaged[0] == saved.averaged[0] == (3,)
     # the growth run's other networks start theirs at their own weights
-    assert into.averaged[1:] == (0, 0)
+    assert into.averaged[1:] == ((0,), (0,))
     # a fork whose trainer averages over other horizons starts them anew
     other = make_trainer(env, tmp_path / "other", averages=(4,))
-    assert other.fork_averages(path, 0) is None
+    ts = other.init_train_state()
+    averages, counts = other.fork_averages(path, 0, ts)
+    assert counts == (0,)
+    assert leaves_equal(averages, (ts.params,))
 
 
 def test_a_growth_run_forks_from_a_run_without(env, tmp_path, fake_loop):
@@ -3187,7 +3192,7 @@ def test_a_branch_can_add_networks_past_the_saved_runs(
     assert leaves_equal(
         start.averages[2], branch.fresh_averages(branch.init_train_state(2))
     )
-    assert start.averaged == (*saved.averaged, 0)
+    assert start.averaged == (*saved.averaged, (0,))
     assert len(start.test_states) == 3
     # n1 plays, and n2 trains beside it from the branch's first epoch
     output = branch.train_loop(seed=0, num_epochs=9, initial_state=start)
@@ -3231,9 +3236,8 @@ def test_a_fork_puts_a_saved_growth_runs_network_in_play(env, tmp_path, fake_loo
     # n1 as the trunk left it, its step count back at 0; its averages go on with it
     assert leaves_equal(forked.params, saved.train_states[1].params)
     assert int(forked.step) == 0
-    averages = fork.fork_averages(path, 1)
-    assert averages is not None
-    assert leaves_equal(averages[0], saved.averages[1]) and averages[1] == 3
+    averages = fork.fork_averages(path, 1, forked)
+    assert leaves_equal(averages[0], saved.averages[1]) and averages[1] == (3,)
     # n1's search plays throughout, the warmup's games too
     assert {c.evaluator.tag for c in of_kind(calls, "collect")} == {1.0}
     assert [(c.epoch, c.learner) for c in of_kind(calls, "train")] == [
@@ -3305,7 +3309,7 @@ def test_a_warm_start_takes_a_network_from_another_saved_state(
     # a growth run's network brings its weight averages; one without growth's start at its weights
     assert leaves_equal(output.averages[2], at_3_state.averages[2])
     assert leaves_equal(output.averages[0], (n0.params,))
-    assert output.averaged == (0, saved.averaged[1], at_3_state.averaged[2])
+    assert output.averaged == ((0,), saved.averaged[1], at_3_state.averaged[2])
     assert monitor.started[0]["warm_start"] == [
         {
             "network": "n2",
@@ -3432,9 +3436,8 @@ def test_a_run_without_growth_forks_one_network_of_a_growth_run(
 
     # n1 as the trunk left it, with its averages; only it trains
     assert leaves_equal(forked.params, saved.train_states[1].params)
-    averages = alone.fork_averages(path, 0, "n1")
-    assert averages is not None
-    assert leaves_equal(averages[0], saved.averages[1]) and averages[1] == 3
+    averages = alone.fork_averages(path, 0, forked, "n1")
+    assert leaves_equal(averages[0], saved.averages[1]) and averages[1] == (3,)
     assert [c.learner for c in of_kind(calls, "train")] == [0, 0]
     assert output.growth is None
     with pytest.raises(ValueError, match="no network n2 to fork"):
@@ -3698,7 +3701,7 @@ def test_averages_follow_each_epochs_weights_and_are_checkpointed_and_scored(
         assert offset_from(raw, initial) == pytest.approx(epoch + 1)
         assert leaves_equal(avg1, raw)
         assert offset_from(avg4, initial) == pytest.approx(expected)
-    assert output.averaged == (5,)
+    assert output.averaged == ((5, 5),)
     assert offset_from(output.averages[0][1], initial) == pytest.approx(3.125)
     # the stateless tester also scores both averages, after the network; the other only it
     assert len(stateless.calls) == 3 * 5 and len(stateful.calls) == 5
@@ -3743,6 +3746,141 @@ def test_self_play_can_play_an_average(env, tmp_path, fake_loop):
     assert [
         offset_from(c.params[0], initial) for c in of_kind(calls, "collect")
     ] == pytest.approx([0, 0, 1, 1.5, 2.25])
+
+
+def averaging_trunk(env, tmp_path, fake_loop, averages=(2, 4)):
+    """A run with weight averages over `averages` epochs (a warmup of 1), its state saved after
+    3 epochs of `fake_loop`'s training: its weights 3 above their initial ones, its 4-epoch
+    average the mean of epochs 1-3 (2) and its 2-epoch one 1, 1.5, then 2.25.
+
+    Returns the run's output and its saved state's path."""
+    trunk = make_trainer(
+        env, tmp_path / "trunk", averages=averages, average_warmup=1, save_state_at=[3]
+    )
+    fake_loop(trunk)
+    output = trunk.train_loop(seed=0, num_epochs=3)
+    return output, state_path(str(tmp_path / "trunk"), 3)
+
+
+def rewrite_meta(path, change):
+    """Rewrites a saved state's metadata with `change`, a function that edits it in place."""
+    with np.load(path) as saved:
+        arrays = dict(saved)
+    meta = json.loads(str(arrays["meta"]))
+    change(meta)
+    arrays["meta"] = np.array(json.dumps(meta))
+    np.savez(path, **arrays)
+
+
+def test_a_saved_state_counts_each_averages_epochs(env, tmp_path, fake_loop):
+    saved, path = averaging_trunk(env, tmp_path, fake_loop)
+    assert saved.averaged == ((3, 3),)
+    info = read_state_meta(path)["averages"]
+    assert info == {"horizons": [2.0, 4.0], "averaged": [[3, 3]]}
+    assert saved_average_counts(info, 0) == [3, 3]
+    # a state saved with one count per network: every horizon's
+    assert saved_average_counts({"horizons": [2, 4], "averaged": [5, 7]}, 1) == [7, 7]
+
+
+def test_a_fork_goes_on_with_each_saved_horizon_and_starts_the_others(
+    env, tmp_path, fake_loop, capsys
+):
+    saved, path = averaging_trunk(env, tmp_path, fake_loop)
+    fork = make_trainer(env, tmp_path / "fork", averages=(8, 4), average_warmup=1)
+    fake_loop(fork)
+    initial = fork.init_train_state().params
+    capsys.readouterr()
+
+    output = fork.train_loop(seed=0, num_epochs=1, fork_from=path)
+
+    out = capsys.readouterr().out
+    assert (
+        "weight averages: avg8 starts at its weights (reaching horizon 8 after 7 epochs); avg4 "
+        "goes on from the saved state's (3 epochs in it, horizon 4 of 4); the saved avg2 "
+        "is dropped"
+    ) in out
+    # one more epoch: the new average is the weights it started at moved all the way to the
+    # epoch's (a share of 1), the saved one a quarter of the way from its mean of 2
+    avg8, avg4 = output.averages[0]
+    assert offset_from(output.train_state.params, initial) == pytest.approx(4)
+    assert offset_from(avg8, initial) == pytest.approx(4)
+    assert offset_from(avg4, initial) == pytest.approx(0.75 * 2 + 0.25 * 4)
+    assert output.averaged == ((1, 4),)
+    assert leaves_equal(
+        fork.fork_averages(path, 0, saved.train_state)[0][1], saved.averages[0][1]
+    )
+
+
+def test_a_fork_into_a_growth_run_goes_on_with_each_saved_horizon(
+    env, tmp_path, fake_loop
+):
+    saved, path = averaging_trunk(env, tmp_path, fake_loop)
+    grown, _ = growth_trainer(env, tmp_path / "grown", SCRIPTS, averages=(4, 6))
+    fake_loop(grown)
+
+    start = grown.train_loop(seed=0, num_epochs=0, fork_from=path, fork_into="n0")
+
+    assert start.averaged == ((3, 0), (0, 0), (0, 0))
+    assert leaves_equal(start.averages[0][0], saved.averages[0][1])
+    assert leaves_equal(start.averages[0][1], start.train_states[0].params)
+
+
+def test_a_branch_and_a_resume_take_the_saved_averages_by_horizon(
+    env, tmp_path, fake_loop, capsys
+):
+    saved, path = averaging_trunk(env, tmp_path, fake_loop)
+    (avg2, avg4), (count2, count4) = saved.averages[0], saved.averaged[0]
+    for averages, expected, counts in (
+        # reordered: each goes on with its own
+        ((4, 2), (avg4, avg2), (count4, count2)),
+        # one dropped, one added at the weights
+        ((4, 16), (avg4, saved.train_state.params), (count4, 0)),
+    ):
+        trainer = make_trainer(env, tmp_path / str(averages), averages=averages)
+        for start in (trainer.branch(path), trainer.load_state(path)):
+            assert leaves_equal(start.averages[0], expected)
+            assert start.averaged == (counts,)
+    assert "avg16 starts at its weights (reaching horizon 16 after 150 epochs)" in (
+        capsys.readouterr().out
+    )
+
+
+def test_a_state_saved_with_one_count_per_network_gives_it_to_each_horizon(
+    env, tmp_path, fake_loop
+):
+    saved, path = averaging_trunk(env, tmp_path, fake_loop)
+
+    def one_count(meta):
+        meta["averages"]["averaged"] = [3]
+
+    rewrite_meta(path, one_count)
+    same = make_trainer(env, tmp_path / "same", averages=(2, 4))
+    other = make_trainer(env, tmp_path / "other", averages=(4, 8))
+
+    assert same.load_state(path).averaged == ((3, 3),)
+    assert same.branch(path).averaged == ((3, 3),)
+    averages, counts = other.fork_averages(path, 0, saved.train_state)
+    assert counts == (3, 0)
+    assert leaves_equal(averages[0], saved.averages[0][1])
+
+
+def test_an_averages_horizon_grows_from_its_own_epochs(env, tmp_path, fake_loop):
+    # the saved 4-epoch average holds 3 epochs, a new 2-epoch one none: with a warmup of 2,
+    # their shares are those of their own counts, 1 / min(4, 2.5) and 1
+    _, path = averaging_trunk(env, tmp_path, fake_loop, averages=(4,))
+    fork = make_trainer(env, tmp_path / "fork", averages=(2, 4), average_warmup=2)
+    calls = fake_loop(fork)
+    initial = fork.init_train_state().params
+
+    output = fork.train_loop(seed=0, num_epochs=2, fork_from=path)
+
+    assert len(of_kind(calls, "train")) == 2
+    avg2, avg4 = output.averages[0]
+    # avg2: 4 (share 1), then 4 + (5 - 4) / 1.5; avg4: 2 + (4 - 2) / 2.5, then / 3
+    first4 = 2 + (4 - 2) / 2.5
+    assert offset_from(avg2, initial) == pytest.approx(4 + 1 / 1.5)
+    assert offset_from(avg4, initial) == pytest.approx(first4 + (5 - first4) / 3)
+    assert output.averaged == ((2, 5),)
 
 
 def norm_trainer(env, tmp_path, **kwargs):
@@ -3814,6 +3952,85 @@ def test_without_an_average_norm_option_or_a_buffer_averages_use_the_networks_st
     )
     with pytest.raises(ValueError, match="average_norm_batches"):
         norm_trainer(env, tmp_path, averages=(2,), average_norm_batches=-1)
+
+
+def test_an_averages_statistics_come_from_micro_batches_of_enough_positions(
+    env, tmp_path
+):
+    # micro-batches of 4: BatchNorm's batches in training, and sampled without replacement
+    trainer = norm_trainer(
+        env,
+        tmp_path,
+        averages=(2,),
+        average_norm_batches=2,
+        train_batch_size=8,
+        grad_accum_steps=2,
+    )
+    ts = trainer.init_train_state()
+    empty = trainer.memory_buffer.init(
+        trainer.batch_size, trainer.make_template_experience()
+    )
+    sizes = []
+    loss_fn = trainer.loss_fn
+
+    def recording(nn, state, batch):
+        sizes.append(batch.reward.shape[0])
+        return loss_fn(nn, state, batch)
+
+    trainer.loss_fn = recording
+    key = jax.random.PRNGKey(0)
+
+    # 2 positions (one per environment), then 4
+    assert trainer.average_norm_states(key, written(empty, 1), (ts.params,), ts) is None
+    states = trainer.average_norm_states(key, written(empty, 2), (ts.params,), ts)
+    assert states is not None
+    assert sizes == [4]
+
+
+def test_a_forks_average_gets_its_own_statistics_once_self_play_stores_a_micro_batch(
+    env, tmp_path, fake_loop, monkeypatch
+):
+    # a network that only plays its average, forked without the saved replay buffers: it has
+    # nothing to estimate its average's statistics on until its first self-play
+    trunk = norm_trainer(env, tmp_path / "trunk", averages=(2,), save_state_at=[2])
+    fake_loop(trunk)
+    trunk.train_loop(seed=0, num_epochs=2)
+    fork = norm_trainer(
+        env,
+        tmp_path / "fork",
+        averages=(2,),
+        selfplay_average=2,
+        average_norm_batches=2,
+        train_steps_per_epoch=0,
+        warmup_steps=0,
+    )
+    calls = fake_loop(fork)
+    fake_collect = fork.collect_steps
+
+    def collect_steps(key, state, params, num_steps, *, evaluator=None):
+        state = fake_collect(key, state, params, num_steps, evaluator=evaluator)
+        if not num_steps:
+            return state
+        return replace(state, buffer_state=written(state.buffer_state, 4))
+
+    monkeypatch.setattr(fork, "collect_steps", collect_steps)
+
+    output = fork.train_loop(
+        seed=0,
+        num_epochs=3,
+        fork_from=state_path(str(tmp_path / "trunk"), 2),
+        fork_replay_buffers=False,
+    )
+
+    network_state = output.train_state.nn_state
+    played = [c.params[1] for c in of_kind(calls, "collect")]
+    # the (empty) warmup and epoch 0 play the average with the network's statistics, then
+    # with its own
+    assert len(played) == 4
+    for state in played[:2]:
+        assert leaves_equal(state, network_state)
+    for state in played[2:]:
+        assert not leaves_equal(state, network_state)
 
 
 def test_an_average_plays_tests_and_is_saved_with_its_own_statistics(
@@ -3893,8 +4110,9 @@ def test_a_branch_of_a_state_without_averages_starts_them_at_its_weights(
     initial = averaging.init_train_state().params
 
     start = averaging.branch(state_path(str(tmp_path / "plain"), 2))
-    assert start.averages == ()
-    assert "start at its networks' weights" in capsys.readouterr().out
+    assert start.averaged == ((0,),)
+    assert leaves_equal(start.averages[0], (start.train_states[0].params,))
+    assert "weight averages: avg2 starts at its weights" in capsys.readouterr().out
     averaging.train_loop(seed=0, num_epochs=4, initial_state=start)
 
     # the weights after epoch 2, then the mean of epochs 2 and 3
@@ -4020,7 +4238,7 @@ def test_a_frozen_network_plays_while_the_others_train_on_its_games(
         )
     )
     assert output.averaged[1] == start.averaged[1]
-    assert output.averaged[0] == start.averaged[0] + 1
+    assert output.averaged[0] == tuple(c + 1 for c in start.averaged[0])
     assert frozen.get_config()["train_playing"] is False
 
 
@@ -4069,7 +4287,7 @@ def test_every_waiting_network_trains_beside_a_frozen_teacher(env, tmp_path, fak
     assert [(c.epoch, c.learner) for c in of_kind(calls, "train")] == [
         (e, i) for e in (0, 1) for i in (1, 2, 3)
     ]
-    assert output.averaged == (0, 2, 2, 2)
+    assert output.averaged == ((0,), (2,), (2,), (2,))
     assert trainer.get_config()["train_waiting"] is True
 
 
@@ -4101,7 +4319,7 @@ def test_a_branch_drops_and_adds_networks_by_name(env, tmp_path, fake_loop, caps
         assert leaves_equal(start.test_states[kept], saved.test_states[theirs])
         assert start.averaged[kept] == saved.averaged[theirs]
     assert leaves_equal(start.train_states[1], branch.init_train_state(1))
-    assert start.averaged[1] == 0
+    assert start.averaged[1] == (0,)
     assert leaves_equal(start.collection_state, saved.collection_state)
     assert branch.parent is not None
     assert (branch.parent["added"], branch.parent["dropped"]) == (["n3"], ["n1"])
@@ -4111,7 +4329,11 @@ def test_a_branch_drops_and_adds_networks_by_name(env, tmp_path, fake_loop, caps
         (e, i) for e in (3, 4) for i in (1, 2)
     ]
     assert int(output.train_states[2].step) == int(saved.train_states[2].step) + 2
-    assert output.averaged == (saved.averaged[0], 2, saved.averaged[2] + 2)
+    assert output.averaged == (
+        saved.averaged[0],
+        (2,),
+        tuple(c + 2 for c in saved.averaged[2]),
+    )
 
 
 def test_a_branch_cant_drop_the_network_playing(env, tmp_path, fake_loop):
@@ -4396,10 +4618,141 @@ def test_fresh_positions_are_those_stored_since_the_write_indices(env, tmp_path)
     )
 
     # env 0 wrote slots 1 and 2 since its index was 1; env 1 wrapped round from capacity - 1
-    mask = trainer._fresh_mask(state, jnp.array([1, capacity - 1]))
+    mask = trainer._fresh_mask(
+        state, jnp.array([1, capacity - 1]), jnp.ones_like(state.populated)
+    )
 
     assert np.flatnonzero(mask[0]).tolist() == [1]
     assert np.flatnonzero(mask[1]).tolist() == [0, capacity - 1]
+
+
+def test_fresh_positions_include_games_labelled_since(env, tmp_path):
+    # games waiting for their exact solves aren't sampleable until labelled: once they are,
+    # they're fresh though written before
+    trainer = make_trainer(env, tmp_path)
+    state = trainer.memory_buffer.init(
+        2, random_batch(env, jax.random.PRNGKey(0), size=1)
+    )
+    capacity = state.populated.shape[1]
+    before = np.ones((2, capacity), bool)
+    before[0, 4:6] = False
+    before[1, 0] = False
+    state = replace(
+        state,
+        next_idx=jnp.array([2, 0]),
+        populated=jnp.ones_like(state.populated),
+        has_reward=jnp.ones_like(state.has_reward),
+    )
+
+    # env 0 wrote slot 1 since, and labelled 4 and 5; env 1 wrote nothing, and labelled 0
+    mask = trainer._fresh_mask(state, jnp.array([1, 0]), jnp.asarray(before))
+
+    assert np.flatnonzero(mask[0]).tolist() == [1, 4, 5]
+    assert np.flatnonzero(mask[1]).tolist() == [0]
+
+
+def test_fresh_positions_are_scored_in_inference_mode_with_each_ones_state(
+    env, tmp_path
+):
+    trainer = norm_trainer(env, tmp_path, fresh_positions=4)
+    ts = trainer.init_train_state()
+    state = buffer_of(trainer, env, one_position(env), np.ones((2, 8), bool))
+    state = replace(
+        state,
+        buffer=replace(
+            state.buffer,
+            observation_nn=jax.random.normal(
+                jax.random.PRNGKey(3), state.buffer.observation_nn.shape
+            ),
+        ),
+    )
+    # running statistics far from the batch's: in training mode they wouldn't count
+    shifted = jax.tree.map(
+        lambda x: x + 5 if jnp.issubdtype(x.dtype, jnp.inexact) else x, ts.nn_state
+    )
+    never = jnp.zeros_like(state.populated)
+
+    metrics = trainer.fresh_position_metrics(
+        jax.random.PRNGKey(0),
+        state,
+        jnp.zeros_like(state.next_idx),
+        never,
+        {"raw": (ts.params, ts.nn_state), "avg": (ts.params, shifted)},
+    )
+
+    for name in ("policy_kl", "value_loss"):
+        assert metrics[f"fresh_{name}_raw"] != pytest.approx(
+            float(metrics[f"fresh_{name}_avg"])
+        )
+        assert metrics[f"fresh_{name}_gap"] == pytest.approx(
+            float(metrics[f"fresh_{name}_raw"] - metrics[f"fresh_{name}_avg"])
+        )
+
+
+def test_the_probes_score_the_average_with_its_own_statistics(
+    env, tmp_path, fake_loop, monkeypatch
+):
+    trainer = norm_trainer(
+        env,
+        tmp_path,
+        averages=(2,),
+        average_norm_batches=2,
+        fresh_positions=4,
+        holdout_envs=1,
+        holdout_positions=4,
+    )
+    calls = fake_loop(trainer)
+
+    def marked(key, buffer_state, averages, train_state, learner=0):
+        return tuple(
+            jax.tree.map(
+                lambda x: x + 7 if jnp.issubdtype(x.dtype, jnp.inexact) else x,
+                train_state.nn_state,
+            )
+            for _ in averages
+        )
+
+    probed = []
+    monkeypatch.setattr(trainer, "average_norm_states", marked)
+    monkeypatch.setattr(
+        trainer,
+        "fresh_position_metrics",
+        lambda key, buffer_state, start, sampleable, weights, learner=0: (
+            probed.append(("fresh", weights)) or {}
+        ),
+    )
+    monkeypatch.setattr(
+        trainer,
+        "holdout_metrics",
+        lambda key, buffer_state, weights, learner=0: (
+            probed.append(("holdout", weights)) or {}
+        ),
+    )
+
+    trainer.train_loop(seed=0, num_epochs=2)
+
+    network_state = of_kind(calls, "train")[0].result.nn_state
+    # epoch 1's, after the average took in epoch 0
+    assert [kind for kind, _ in probed[2:]] == ["fresh", "holdout"]
+    for _, weights in probed[2:]:
+        assert leaves_equal(weights["raw"][1], network_state)
+        own = jax.tree.map(
+            lambda x: x + 7 if jnp.issubdtype(x.dtype, jnp.inexact) else x,
+            network_state,
+        )
+        assert leaves_equal(weights["avg"][1], own)
+
+
+def test_fresh_positions_with_exact_solves_are_the_games_just_labelled(env, tmp_path):
+    # every game stops for its solve, its positions labelled after the next self-play
+    monitor = FakeMonitor()
+    trainer = solving_trainer(
+        env, tmp_path, monitor=monitor, train_batch_size=2, fresh_positions=2
+    )
+
+    trainer.train_loop(seed=0, num_epochs=3)
+
+    assert set(logged(monitor, "fresh_value_loss_raw")) == {0, 1, 2}
 
 
 def test_the_playing_network_is_scored_on_its_fresh_positions(env, tmp_path):
@@ -4544,6 +4897,24 @@ def test_held_out_positions_are_compared_with_trained_on_ones_of_their_ages(
         assert metrics[f"memorized_{metric}_raw"] == pytest.approx(0.0, abs=1e-6)
         assert metrics[f"memorized_{metric}_raw_se"] == pytest.approx(0.0, abs=1e-6)
     assert int(metrics["heldout_stored"]) == 3
+
+
+def test_held_out_positions_newer_than_every_trained_on_one_score_nothing(
+    env, tmp_path
+):
+    # the newest place is the last (next_idx 0): the held-out environment has its newest
+    # position only, the trained-on one only older ones
+    trainer = held_out_trainer(env, tmp_path)
+    populated = np.zeros((2, 8), bool)
+    populated[0, :4] = True
+    populated[1, 7] = True
+    state = buffer_of(trainer, env, one_position(env), populated)
+    params = eqx.filter(trainer.nn, eqx.is_inexact_array)
+
+    assert (
+        trainer.holdout_metrics(jax.random.PRNGKey(0), state, {"raw": (params, None)})
+        == {}
+    )
 
 
 def test_the_playing_network_is_scored_on_held_out_games(env, tmp_path):
