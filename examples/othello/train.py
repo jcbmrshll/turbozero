@@ -10,7 +10,7 @@ games start from XOT openings (see xot.py), which keeps them varied.
     uv run examples/othello/train.py --epochs 20 --monitor
 
 Every epoch it scores the average on the engine-labelled set, if there is one (see
-engine_set.py and --engine-set), logged as `avg4/engine_*`. Games measure strength:
+engine_set.py and --engine-set), logged as `engine_*`. Games measure strength:
 `evaluate.py` plays checkpoints against engines and each other, and the Elo league rates them.
 
 With --monitor the run logs to slick's seaglass server ($SEAGLASS_URL, set in a slick task;

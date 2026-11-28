@@ -9,7 +9,7 @@ openings.py and --standard-starts).
     uv run --extra cuda examples/hex/train.py --size 11 --monitor
 
 If there's an engine-labelled set (see engine_set.py and --engine-set), every --validate-every
-epochs the average is scored on it, logged as `avg<H>/engine_*`. Games against MoHex
+epochs the average is scored on it, logged as `engine_*`. Games against MoHex
 (vs_engine.py) and pgx's pretrained model (eval_pgx.py) evaluate saved weights afterwards (see
 README.md).
 

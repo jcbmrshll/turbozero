@@ -11,8 +11,8 @@ memory.
     uv run examples/connect_four/train.py --search weighted --monitor
 
 Every --validate-every epochs it scores the average on the solver-labelled set, if there is one
-(see solver_set.py and --engine-set), logged as `avg<H>/engine_*`, against the solver's scores,
-and `avg<H>/outcome_*`, against how each move's game ends: `outcome_top1_critical`, how often
+(see solver_set.py and --engine-set), logged as `engine_*`, against the solver's scores,
+and `outcome_*`, against how each move's game ends: `outcome_top1_critical`, how often
 its first choice keeps the game's result where the move matters, and `engine_value_mse`, its
 value's squared error against the true result, are the ones to watch. Games against the solver
 (vs_solver.py) measure the saved weights' strength afterwards (see README.md).

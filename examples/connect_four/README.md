@@ -128,9 +128,9 @@ negative for a loss. `train.py` scores the weight average on the set in two ways
 for all positions, for each game phase (`opening`, 29-42 empty squares; `midgame`, 15-28; `endgame`,
 1-14) and for `critical` positions, those whose outcome depends on the move (about half):
 
-- `avg<H>/engine_*`, by the solver's scores, the same metrics as the Othello example's against Edax, in
+- `engine_*`, by the solver's scores, the same metrics as the Othello example's against Edax, in
   which winning later than a move could gives some up
-- `avg<H>/outcome_*`, by how each move's game ends alone (+1, 0, -1), which is what AlphaZero's value
+- `outcome_*`, by how each move's game ends alone (+1, 0, -1), which is what AlphaZero's value
   trains towards, with no reward for winning soon. `outcome_top1_critical`, how often the network's
   first choice keeps the game's result where the move matters, is the one to watch
 

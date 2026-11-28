@@ -117,7 +117,7 @@ Without search or games: thousands of fixed positions from MoHex's games against
 move of which MoHex has scored. `train.py` scores the raw outputs of the weight average on them
 every `--validate-every` epochs, as Othello does (`--engine-set`), logging for all positions and
 for each phase (a share of the board's cells filled: `opening` below 20%, `midgame` to 40%,
-`endgame` above) `avg<H>/engine_top1`, `engine_regret`, `engine_exp_regret`, `engine_value_mse`
+`endgame` above) `engine_top1`, `engine_regret`, `engine_exp_regret`, `engine_value_mse`
 and `engine_value_sign`.
 A score here is a win or loss value, from -1 to 1, not a disc margin, so a regret of 2 is giving
 a won game away.

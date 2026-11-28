@@ -134,8 +134,8 @@ class TrainLoopOutput:
 
 
 def average_name(horizon: float) -> str:
-    """The name of a weight average over about `horizon` epochs: its checkpoints' directory and
-    its validation metrics' prefix, e.g. avg4."""
+    """The name of a weight average over about `horizon` epochs, its checkpoints' directory,
+    e.g. avg4."""
     return f"avg{horizon:g}"
 
 
@@ -525,8 +525,8 @@ class Trainer:
                 hold positions trained on
             holdout_positions: with `holdout_envs`, the positions sampled from each side, with
                 replacement. A multiple of the micro-batch
-            validators: score the average each `validate_every` epochs, logged as
-                `avg<horizon>/<metric>` (see `average_name`)
+            validators: score the average each `validate_every` epochs, logged by the names
+                they return
             validate_every: epochs between validations
             exploration: (optional) chooses the move self-play plays from the search's output,
                 e.g. sampling from its policy early in the game (see core.training.exploration).
@@ -2044,9 +2044,8 @@ class Trainer:
                 # 7. validation, of the average
                 if self.validators and cur_epoch % self.validate_every == 0:
                     self.set_activity(f"epoch {cur_epoch}: validation")
-                    prefix = average_name(self.average_epochs)
                     validation = {
-                        f"{prefix}/{name}": value
+                        name: value
                         for validator in self.validators
                         for name, value in validator(params).items()
                     }

@@ -46,8 +46,8 @@ from XOT openings rather than the standard start, which keeps self-play varied
 Self-play plays with a weight average of the network (`--average-epochs`, below), and the run
 is tracked by validating that average on the engine-labelled set: every epoch, `train.py`
 scores it on an engine's scores of fixed positions, in about 20 ms, and logs
-`avg4/engine_exp_regret` (the discs its policy gives up against the engine's best move) and the
-rest of the `avg4/engine_*` metrics
+`engine_exp_regret` (the discs its policy gives up against the engine's best move) and the
+rest of the `engine_*` metrics
 (see [below](#against-edaxs-scores-of-fixed-positions)). They're much finer than games: a
 difference between two checkpoints is good to about ±0.015 discs. Games measure strength
 itself: `evaluate.py` plays checkpoints against engines and each other (see [Evaluating a
@@ -311,7 +311,7 @@ horizon growing from 1 early in the run (see `average_share` in core/training/tr
 epoch, before self-play, the average moves toward the network's weights and gets BatchNorm
 statistics of its own from `--average-norm-batches` micro-batches of the replay buffer through its
 weights. Training itself is unchanged. The engine-labelled set validates the average
-(`avg4/engine_*`), and the checkpoints `--save-weights-every` saves are its own. `--average-epochs
+(`engine_*`), and the checkpoints `--save-weights-every` saves are its own. `--average-epochs
 1` plays with, validates and saves the network's own weights.
 
 ### Memorization: held-out games
@@ -637,7 +637,7 @@ engine has scored: the disc margin it expects at the end. Sets record what score
 position (`labeller_names`): Edax at level 24 (24 moves ahead, the last squares exact), or
 Neural Reversi at level 26 (exact up to 30 empty squares, 26 moves ahead beyond).
 
-`train.py` scores the weight average on it every epoch and logs, as `avg4/engine_*`, for all
+`train.py` scores the weight average on it every epoch and logs, as `engine_*`, for all
 positions and for each game phase (`opening`, 40-51 empty squares; `midgame`, 25-39; `endgame`,
 1-24):
 

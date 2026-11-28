@@ -523,7 +523,7 @@ def test_each_epoch_averages_plays_trains_validates_and_saves(env, tmp_path, fak
         "epoch 2: saving weights",
     ]
     # validated every other epoch, logged under the average's name
-    assert logged(monitor, "avg1/top1") == {0: 1.0, 2: 1.0}
+    assert logged(monitor, "top1") == {0: 1.0, 2: 1.0}
     assert len(validator.calls) == 2
     assert checkpoint_epochs(trainer.weights_dir) == [0, 2]
     assert trainer.weights_dir == os.path.join(str(tmp_path), "avg1")
@@ -604,7 +604,7 @@ def test_train_loop_reports_to_the_monitor(env, tmp_path, fake_loop):
     assert "parent" not in config
     for epoch in range(2):
         metrics = monitor.by_epoch()[epoch]
-        assert metrics["loss"] == 0 and metrics["avg1/top1"] == 1
+        assert metrics["loss"] == 0 and metrics["top1"] == 1
         assert metrics["episodes"] == 2
     assert monitor.finished == ["finished"]
 
@@ -2208,7 +2208,7 @@ def test_a_real_run_trains_and_reports_its_metrics(real_run):
             "weight_norm",
             "update_ratio",
             "grad_norm",
-            "avg2/engine_top1",
+            "engine_top1",
         }
     assert real_run.weights == [0, 1, 2, 3] and real_run.states == [2]
 
